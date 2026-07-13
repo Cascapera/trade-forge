@@ -1,0 +1,21 @@
+{
+  "schema_version": "1.0",
+  "name": "candle[-0] não existe",
+  "description": "candle[-0] seria o candle atual sob outro nome. Duas grafias para a mesma coisa é como uma DSL apodrece.",
+  "timeframe": "H1",
+  "indicators": [],
+  "entry": {
+    "long": {
+      "op": "breaks_above",
+      "left": { "ref": "price.high" },
+      "right": { "ref": "candle[-0].high" }
+    },
+    "short": null
+  },
+  "exit": {
+    "stop_loss": { "type": "candle_extreme", "params": { "lookback": 1, "side": "low" } },
+    "take_profit": null,
+    "conditions": []
+  },
+  "risk": { "sizing": { "type": "percent_risk", "params": { "percent": 1.0 } } }
+}

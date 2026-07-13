@@ -1,0 +1,14 @@
+{
+  "schema_version": "1.0",
+  "name": "Estratégia que nunca entra",
+  "description": "long e short nulos: um documento impecável que descreve uma estratégia que jamais abre posição.",
+  "timeframe": "D1",
+  "indicators": [{ "id": "sma", "type": "SMA", "params": { "period": 20, "source": "close" } }],
+  "entry": { "long": null, "short": null },
+  "exit": {
+    "stop_loss": { "type": "candle_extreme", "params": { "lookback": 1, "side": "low" } },
+    "take_profit": null,
+    "conditions": []
+  },
+  "risk": { "sizing": { "type": "percent_risk", "params": { "percent": 1.0 } } }
+}

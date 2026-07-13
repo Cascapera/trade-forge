@@ -1,0 +1,56 @@
+# Local development services. The core (api, engine) stays portable; only the
+# collector and the executor are bound to Windows, and neither runs here.
+#
+# Config comes from .env (copy .env.example). Compose reads it automatically.
+# The `:?` syntax below fails the command outright if a variable is missing —
+# an unset password must be a loud error, never an empty string that quietly
+# becomes a passwordless database.
+
+services:
+  postgres:
+    # Pinned to a minor, not `16-alpine`: floating tags mean two developers can
+    # run different databases while believing they run the same one.
+    image: postgres:16.14-alpine
+    container_name: tradeforge-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    ports:
+      - '${POSTGRES_PORT:-5432}:5432'
+    volumes:
+      # A named volume, not a bind mount: the database owns its own storage, with
+      # its own uid/permissions, and does not leak files into the repo.
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # Postgres accepts TCP connections seconds before it will answer a query.
+      # `pg_isready` is the difference between "the process started" and "the
+      # database is usable" — and everything downstream waits on the second one.
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  redis:
+    image: redis:7.4.9-alpine
+    container_name: tradeforge-redis
+    restart: unless-stopped
+    # Persist to disk: Redis carries order and fill events. Losing them on a
+    # restart during a live session would mean losing the audit trail.
+    command: ['redis-server', '--appendonly', 'yes']
+    ports:
+      - '${REDIS_PORT:-6379}:6379'
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+volumes:
+  postgres-data:
+  redis-data:

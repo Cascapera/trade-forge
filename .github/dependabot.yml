@@ -25,6 +25,15 @@ updates:
       python-prod:
         dependency-type: production
 
+  # Same reasoning as the SHA-pinned actions: we pin image minors (postgres:16.14),
+  # so something has to propose the bumps.
+  - package-ecosystem: docker-compose
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: 'chore(deps)'
+
   - package-ecosystem: npm
     directory: /
     schedule:

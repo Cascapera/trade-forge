@@ -57,6 +57,7 @@ select = [
     "ANN",  # flake8-annotations — type hints are mandatory (AGENTS.md §6)
     "S",    # flake8-bandit — security lint
     "B",    # flake8-bugbear
+    "BLE",  # flake8-blind-except — catching bare Exception must be argued for
     "A",    # flake8-builtins
     "C4",   # flake8-comprehensions
     "DTZ",  # flake8-datetimez — naive datetimes are a bug class in trading
@@ -74,9 +75,22 @@ select = [
 [tool.ruff.lint.per-file-ignores]
 # Tests may assert, use magic numbers, and skip return annotations.
 "**/tests/**" = ["S101", "PLR2004", "ANN201"]
+# A CLI's stdout *is* its interface; print is the right call there, not logging.
+"**/cli.py" = ["T201"]
 
 [tool.ruff.lint.flake8-tidy-imports]
 ban-relative-imports = "all"
+
+[tool.ruff.lint.isort]
+# Without this, our own packages get sorted in with third-party libraries — the
+# import block stops showing, at a glance, what is ours and what we depend on.
+known-first-party = [
+    "tradeforge_api",
+    "tradeforge_collector",
+    "tradeforge_engine",
+    "tradeforge_executor",
+    "tradeforge_schema",
+]
 
 [tool.ruff.format]
 docstring-code-format = true
@@ -90,6 +104,10 @@ docstring-code-format = true
 [tool.mypy]
 python_version = "3.12"
 strict = true
+# Teaches mypy how pydantic builds models. Without it, mypy synthesises a strict
+# __init__ from the field list and rejects `Settings()` — even though a BaseSettings
+# legitimately takes every value from the environment.
+plugins = ["pydantic.mypy"]
 warn_unreachable = true
 warn_unused_configs = true
 enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
@@ -125,6 +143,15 @@ addopts = [
     "--cov-report=term-missing",
     "--cov-report=xml",
     "--cov-fail-under=90",
+    # Integration tests need real containers, so they are deselected by default:
+    # `uv run pytest` must stay runnable without Docker. CI opts in explicitly
+    # with `-m integration`, where a failure to reach Postgres is a red build —
+    # never a silent skip.
+    "-m",
+    "not integration",
+]
+markers = [
+    "integration: exercises a real Postgres/Redis. Requires `docker compose up`.",
 ]
 
 [tool.coverage.run]

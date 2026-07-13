@@ -7,7 +7,13 @@ license = "Apache-2.0"
 dependencies = [
     "tradeforge-engine",
     "tradeforge-schema",
+    "pydantic-settings>=2.7",
+    "psycopg[binary]>=3.2",
+    "redis>=5.2",
 ]
+
+[project.scripts]
+tradeforge-health = "tradeforge_api.cli:main"
 
 [build-system]
 requires = ["hatchling"]

@@ -60,6 +60,64 @@ jobs:
           fail_ci_if_error: true
           token: ${{ secrets.CODECOV_TOKEN }}
 
+  # The unit suite proves the health-check logic against fakes. This job proves the
+  # wiring: that psycopg and redis-py actually reach the images we pin. Nothing here
+  # is allowed to skip — an unreachable database must be a red build, because a
+  # suite that skips when the stack is down reports green on a broken stack.
+  integration:
+    name: Integration — real Postgres and Redis
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16.14-alpine
+        env:
+          POSTGRES_DB: tradeforge
+          POSTGRES_USER: tradeforge
+          POSTGRES_PASSWORD: tradeforge # throwaway, for an ephemeral container
+        ports: ['5432:5432']
+        # GitHub holds the steps until these report healthy — the same reason the
+        # compose file has healthchecks: "started" is not "ready".
+        options: >-
+          --health-cmd "pg_isready -U tradeforge -d tradeforge"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+      redis:
+        image: redis:7.4.9-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: tradeforge
+      POSTGRES_USER: tradeforge
+      POSTGRES_PASSWORD: tradeforge
+      REDIS_HOST: localhost
+      REDIS_PORT: 6379
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install workspace
+        run: uv sync --locked
+
+      # --no-cov: this run exercises a couple of connection paths, so its coverage
+      # number would be meaningless. The 90% gate lives in the unit job.
+      - name: Pytest (integration only)
+        run: uv run pytest -m integration --no-cov
+
   web:
     name: Web — lint, types, tests, build
     runs-on: ubuntu-latest

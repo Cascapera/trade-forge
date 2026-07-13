@@ -1,0 +1,10 @@
+# Extends the built-in ruleset (~170 detectors) rather than replacing it.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Files that are supposed to contain credential-shaped placeholders."
+paths = [
+  '''^\.env\.example$''',
+  '''^\.gitleaks\.toml$''',
+]

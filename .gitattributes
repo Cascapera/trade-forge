@@ -1,0 +1,15 @@
+# One line ending everywhere. The author develops on Windows and CI runs on Linux;
+# without this, every file touched on one side shows up as fully rewritten on the
+# other, and `mixed-line-ending` fights git's own conversion on every commit.
+* text=auto eol=lf
+
+# Never touch these.
+*.parquet binary
+*.png binary
+*.jpg binary
+*.ico binary
+*.woff2 binary
+
+# Lockfiles: generated, not reviewed line by line.
+uv.lock linguist-generated=true
+package-lock.json linguist-generated=true

@@ -1,0 +1,24 @@
+{
+  "name": "tradeforge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Event-driven backtesting and live execution platform for trading strategies.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "workspaces": [
+    "apps/web",
+    "packages/schema"
+  ],
+  "scripts": {
+    "lint": "npm run lint --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "test:cov": "npm run test:cov --workspaces --if-present",
+    "build": "npm run build --workspaces --if-present",
+    "dev": "npm run dev -w @tradeforge/web"
+  },
+  "devDependencies": {
+    "@commitlint/cli": "^21.2.1",
+    "@commitlint/config-conventional": "^21.2.0"
+  }
+}

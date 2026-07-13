@@ -1,0 +1,13 @@
+---
+description: Regras centrais do projeto TradeForge — sempre aplicar
+alwaysApply: true
+---
+
+Leia e siga `AGENTS.md` na raiz — ele é o documento canônico (modo professor, política de aprovação, invariantes de arquitetura, fluxo de PRs). A fonte de verdade do design é `sdd.md`; os planos de execução estão em `specs/`.
+
+Resumo do que é inegociável:
+
+1. **Modo professor**: antes de implementar, explique decisão → alternativas → trade-off → escolha. Explique conceitos novos. Ao final de cada PR, gere a lição em `docs/aulas/PR-XXX-<slug>.md` (estrutura em AGENTS.md §2).
+2. **Aprovação**: leitura/verificação (git status/diff/log, testes, linters) não precisa perguntar. Tudo que altera estado (commit, push, delete, install, migration, docker up/down, qualquer coisa que toque conta MT5) precisa de aprovação explícita.
+3. **Invariantes** (AGENTS.md §5): anti-lookahead (decisão no fechamento do candle N, execução no open do N+1), determinismo do backtest, estratégia única backtest/live via interface Broker, core sem imports de MetaTrader5, DSL JSON versionada, custos só via CostModel.
+4. Um PR = um escopo. Conventional commits. Nunca finalizar com testes falhando.

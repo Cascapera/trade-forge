@@ -1,0 +1,12 @@
+---
+description: Convenções frontend (React + TypeScript)
+globs: ["**/*.ts", "**/*.tsx"]
+alwaysApply: false
+---
+
+- TypeScript strict, sem `any`. Vite + React 18.
+- Estado de servidor via React Query; estado de UI via Zustand; estilo via Tailwind.
+- Gráficos de candles/trades com lightweight-charts (TradingView).
+- Tipos da DSL de estratégia são GERADOS a partir do JSON Schema em `packages/schema` — nunca redigitados à mão. Se o schema mudar, regenerar.
+- Componentes do Strategy Builder devem ser dirigidos pelo schema (render por tipo de bloco), não hard-coded por indicador.
+- Validação client-side usa o mesmo JSON Schema do backend.

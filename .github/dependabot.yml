@@ -1,0 +1,38 @@
+version: 2
+
+updates:
+  # Pinning actions by SHA is only safe if something keeps them fresh. That is
+  # this block: it rewrites the pins (and the trailing version comment) for us.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: 'chore(deps)'
+    groups:
+      actions:
+        patterns: ['*']
+
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: 'chore(deps)'
+    groups:
+      python-dev:
+        dependency-type: development
+      python-prod:
+        dependency-type: production
+
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: 'chore(deps)'
+    groups:
+      js-dev:
+        dependency-type: development
+      js-prod:
+        dependency-type: production

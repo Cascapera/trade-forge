@@ -1,0 +1,57 @@
+# Local mirror of the CI gates: whatever fails here would fail in CI four minutes
+# later. Install once with `uv run pre-commit install --install-hooks -t pre-commit -t commit-msg`.
+default_install_hook_types: [pre-commit, commit-msg]
+fail_fast: false
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: mixed-line-ending
+        args: [--fix=lf]
+      - id: check-yaml
+      - id: check-toml
+      - id: check-json
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: [--maxkb=512]
+      - id: detect-private-key
+      # Integration branches receive merges, never direct commits. Work happens on
+      # feat/*, fix/*, chore/* and lands through a pull request.
+      - id: no-commit-to-branch
+        args: [--branch, main, --branch, develop]
+
+  # Secrets: the staged diff only. CI scans the full history, which is the scan
+  # that actually matters — a secret is leaked the moment it exists in any commit.
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.21
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+
+  # mypy runs from the project venv, not an isolated one: it must see the
+  # editable workspace packages to resolve `tradeforge_*` imports at all.
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy (strict)
+        entry: uv run mypy
+        language: system
+        types: [python]
+        pass_filenames: false
+
+      # pre-commit appends the commit-message file path, so this runs as
+      # `commitlint --edit <path-to-COMMIT_EDITMSG>`.
+      - id: commitlint
+        name: commitlint (conventional commits)
+        entry: npx --no -- commitlint --edit
+        language: system
+        stages: [commit-msg]

@@ -1,0 +1,7 @@
+{
+  "name": "@tradeforge/schema",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "TypeScript types generated from the strategy DSL JSON Schema. Populated in PR-004."
+}

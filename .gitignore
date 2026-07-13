@@ -1,0 +1,39 @@
+# --- Secrets (never, ever) ---
+.env
+.env.*
+!.env.example
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+requirements.txt
+
+# --- Node ---
+node_modules/
+coverage/
+apps/web/dist/
+*.tsbuildinfo
+
+# --- Market data (large, regenerable from MT5) ---
+data/
+*.parquet
+
+# --- Teaching notes: generated for the author, not part of the public repo ---
+docs/aulas/
+
+# --- Editors / OS ---
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

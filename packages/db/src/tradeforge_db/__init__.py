@@ -10,6 +10,7 @@ What is stored here is metadata and results. The candles themselves live in Parq
 
 from tradeforge_db.base import MONEY, PRICE, RATIO, VOLUME, Base
 from tradeforge_db.config import PostgresSettings
+from tradeforge_db.instruments import InstrumentSpec, upsert_dataset, upsert_instruments
 from tradeforge_db.migrate import alembic_config, downgrade, heads, upgrade
 from tradeforge_db.models import (
     AssetClass,
@@ -23,7 +24,7 @@ from tradeforge_db.models import (
     Strategy,
     Trade,
 )
-from tradeforge_db.seeds import INSTRUMENT_SEEDS, InstrumentSeed, seed_instruments
+from tradeforge_db.seeds import INSTRUMENT_SEEDS, seed_instruments
 from tradeforge_db.session import create_db_engine, create_session_factory, session_scope
 
 __all__ = [
@@ -41,7 +42,7 @@ __all__ = [
     "Direction",
     "ExitReason",
     "Instrument",
-    "InstrumentSeed",
+    "InstrumentSpec",
     "PostgresSettings",
     "Strategy",
     "Trade",
@@ -54,6 +55,8 @@ __all__ = [
     "seed_instruments",
     "session_scope",
     "upgrade",
+    "upsert_dataset",
+    "upsert_instruments",
 ]
 
 __version__ = "0.1.0"

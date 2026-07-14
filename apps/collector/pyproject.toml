@@ -5,11 +5,17 @@ description = "MetaTrader 5 data collector (Windows-only): OHLCV backfill, live 
 requires-python = ">=3.12,<3.13"
 license = "Apache-2.0"
 dependencies = [
+    "tradeforge-db",
+    "tradeforge-schema",
+    "pyarrow>=18.1",
     # The official MT5 library ships Windows wheels only. The environment marker is
     # what turns ADR-02 (isolate the broker dependency) into a build-time fact:
     # Linux CI simply cannot resolve this package outside collector/executor.
     "MetaTrader5>=5.0.45; sys_platform == 'win32'",
 ]
+
+[project.scripts]
+tradeforge-collector = "tradeforge_collector.cli:main"
 
 [build-system]
 requires = ["hatchling"]

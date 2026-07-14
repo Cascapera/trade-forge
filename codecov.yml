@@ -1,0 +1,21 @@
+coverage:
+  status:
+    project:
+      default:
+        target: 90%
+        threshold: 0%
+    patch:
+      default:
+        # New code is held to a higher bar than the codebase average: this is how
+        # coverage climbs instead of slowly decaying.
+        target: 95%
+
+flags:
+  python:
+    paths: [apps/api, apps/collector, apps/executor, packages/engine, packages/schema]
+  web:
+    paths: [apps/web]
+
+comment:
+  layout: 'reach, diff, flags, files'
+  require_changes: true

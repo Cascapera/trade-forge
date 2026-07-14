@@ -1,0 +1,30 @@
+{
+  "schema_version": "1.0",
+  "name": "EMA breakdown (short only)",
+  "description": "Vende no rompimento da mínima anterior contra tendência de baixa. Sem alvo: sai por condição.",
+  "timeframe": "M15",
+  "indicators": [{ "id": "ema", "type": "EMA", "params": { "period": 50, "source": "close" } }],
+  "entry": {
+    "long": null,
+    "short": {
+      "all": [
+        { "op": "lt", "left": { "ref": "price.close" }, "right": { "ref": "ema" } },
+        {
+          "op": "breaks_below",
+          "left": { "ref": "price.low" },
+          "right": { "ref": "candle[-1].low" }
+        }
+      ]
+    }
+  },
+  "exit": {
+    "stop_loss": { "type": "candle_extreme", "params": { "lookback": 2, "side": "high" } },
+    "take_profit": null,
+    "conditions": [{ "op": "crosses_above", "left": { "ref": "price.close" }, "right": { "ref": "ema" } }]
+  },
+  "risk": {
+    "sizing": { "type": "percent_risk", "params": { "percent": 0.5 } },
+    "max_open_positions": 2,
+    "max_daily_loss_percent": 2.0
+  }
+}

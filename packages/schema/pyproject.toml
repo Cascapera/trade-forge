@@ -1,0 +1,21 @@
+[project]
+name = "tradeforge-schema"
+version = "0.1.0"
+description = "Strategy DSL: Pydantic models (source of truth), generated JSON Schema and TypeScript types."
+requires-python = ">=3.12,<3.13"
+license = "Apache-2.0"
+dependencies = [
+    "pydantic>=2.10",
+]
+
+[project.scripts]
+tradeforge-schema-gen = "tradeforge_schema.generate:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tradeforge_schema"]
+# The schema ships with the package: consumers must never have to guess where it is.
+artifacts = ["src/tradeforge_schema/strategy.schema.json"]

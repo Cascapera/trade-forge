@@ -1,0 +1,30 @@
+{
+  "name": "@tradeforge/schema",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Strategy DSL: generated JSON Schema, generated TypeScript types, and the frontend validator.",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "scripts": {
+    "generate:types": "json2ts --input src/tradeforge_schema/strategy.schema.json --output src/generated/strategy.ts --additionalProperties false",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:cov": "vitest run --coverage"
+  },
+  "dependencies": {
+    "ajv": "^8.20.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^26.1.1",
+    "@vitest/coverage-v8": "^4.1.10",
+    "eslint": "^10.7.0",
+    "globals": "^17.7.0",
+    "json-schema-to-typescript": "^15.0.4",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.64.0",
+    "vitest": "^4.1.10"
+  }
+}

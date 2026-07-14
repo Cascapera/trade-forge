@@ -1,0 +1,42 @@
+{
+  "schema_version": "1.0",
+  "name": "Nested logic",
+  "description": "Exercita a árvore de expressão em profundidade: all > any > not > comparison.",
+  "timeframe": "D1",
+  "indicators": [
+    { "id": "sma_fast", "type": "SMA", "params": { "period": 10, "source": "close" } },
+    { "id": "sma_slow", "type": "SMA", "params": { "period": 200, "source": "close" } },
+    { "id": "ema_mid", "type": "EMA", "params": { "period": 50, "source": "high" } }
+  ],
+  "entry": {
+    "long": {
+      "all": [
+        { "op": "gte", "left": { "ref": "sma_fast" }, "right": { "ref": "sma_slow" } },
+        {
+          "any": [
+            {
+              "op": "breaks_above",
+              "left": { "ref": "price.close" },
+              "right": { "ref": "candle[-3].high" }
+            },
+            { "op": "crosses_above", "left": { "ref": "sma_fast" }, "right": { "ref": "ema_mid" } }
+          ]
+        },
+        {
+          "not": { "op": "lte", "left": { "ref": "price.close" }, "right": { "ref": "candle[-1].low" } }
+        }
+      ]
+    },
+    "short": null
+  },
+  "exit": {
+    "stop_loss": { "type": "candle_extreme", "params": { "lookback": 5, "side": "low" } },
+    "take_profit": { "type": "risk_multiple", "params": { "rr": 3.5 } },
+    "conditions": []
+  },
+  "risk": {
+    "sizing": { "type": "percent_risk", "params": { "percent": 2.0 } },
+    "max_open_positions": 1,
+    "max_daily_loss_percent": 5.0
+  }
+}

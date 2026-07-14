@@ -1,0 +1,13 @@
+---
+description: Convenções Python (engine, API, collector, executor)
+globs: ["**/*.py"]
+alwaysApply: false
+---
+
+- Python 3.12+, type hints completos. `packages/engine` deve passar `mypy --strict`.
+- Interfaces da engine via `typing.Protocol` (Broker, Indicator, Condition, CostModel, RiskManager — ver sdd.md §3.3.2).
+- Pydantic v2 para modelos de API; dataclasses (frozen quando possível) para objetos de domínio da engine.
+- Testes: pytest. Todo comportamento novo da engine exige teste de ouro (resultado calculado à mão) ou property-based (hypothesis). Invariantes permanentes: soma dos P&L dos trades == variação do equity; rodar 2× ⇒ resultado idêntico; nenhum acesso a candle futuro.
+- Nunca importar `MetaTrader5` fora de `apps/collector` e `apps/executor`.
+- Custos de transação sempre via `CostModel` — nunca inline.
+- Lint/format: ruff. Código e comentários em inglês.

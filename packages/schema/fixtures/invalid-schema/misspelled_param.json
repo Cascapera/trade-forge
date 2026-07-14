@@ -1,0 +1,17 @@
+{
+  "schema_version": "1.0",
+  "name": "Parâmetro com typo",
+  "description": "\"perod\" em vez de \"period\". Sem additionalProperties:false, o indicador rodaria com o default e o backtest sairia silenciosamente errado.",
+  "timeframe": "H1",
+  "indicators": [{ "id": "sma", "type": "SMA", "params": { "perod": 9, "source": "close" } }],
+  "entry": {
+    "long": { "op": "gt", "left": { "ref": "price.close" }, "right": { "ref": "sma" } },
+    "short": null
+  },
+  "exit": {
+    "stop_loss": { "type": "candle_extreme", "params": { "lookback": 1, "side": "low" } },
+    "take_profit": null,
+    "conditions": []
+  },
+  "risk": { "sizing": { "type": "percent_risk", "params": { "percent": 1.0 } } }
+}

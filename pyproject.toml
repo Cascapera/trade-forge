@@ -1,0 +1,174 @@
+[project]
+name = "tradeforge"
+version = "0.1.0"
+description = "Event-driven backtesting and live execution platform for trading strategies."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = "Apache-2.0"
+dependencies = [
+    "tradeforge-api",
+    "tradeforge-collector",
+    "tradeforge-engine",
+    "tradeforge-executor",
+    "tradeforge-schema",
+]
+
+# The repository root is a virtual project: it owns the tooling and the lockfile,
+# but ships no code of its own. Its dependencies exist to install every workspace
+# member into the shared venv in editable mode.
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = ["apps/api", "apps/collector", "apps/executor", "packages/engine", "packages/schema"]
+
+[tool.uv.sources]
+tradeforge-api = { workspace = true }
+tradeforge-collector = { workspace = true }
+tradeforge-engine = { workspace = true }
+tradeforge-executor = { workspace = true }
+tradeforge-schema = { workspace = true }
+
+[dependency-groups]
+dev = [
+    "mypy>=1.14",
+    "pre-commit>=4.6.0",
+    "pytest>=8.3",
+    "pytest-cov>=6.0",
+    "ruff>=0.9",
+]
+
+# --------------------------------------------------------------------------- #
+# Ruff — linter + formatter                                                     #
+# --------------------------------------------------------------------------- #
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+extend-exclude = [".venv", "node_modules"]
+
+[tool.ruff.lint]
+select = [
+    "F",    # pyflakes
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "I",    # isort
+    "N",    # pep8-naming
+    "UP",   # pyupgrade
+    "ANN",  # flake8-annotations — type hints are mandatory (AGENTS.md §6)
+    "S",    # flake8-bandit — security lint
+    "B",    # flake8-bugbear
+    "BLE",  # flake8-blind-except — catching bare Exception must be argued for
+    "A",    # flake8-builtins
+    "C4",   # flake8-comprehensions
+    "DTZ",  # flake8-datetimez — naive datetimes are a bug class in trading
+    "T20",  # flake8-print — no stray prints; use logging
+    "PT",   # flake8-pytest-style
+    "RET",  # flake8-return
+    "SIM",  # flake8-simplify
+    "ARG",  # flake8-unused-arguments
+    "PTH",  # flake8-use-pathlib
+    "ERA",  # eradicate — no commented-out code
+    "PL",   # pylint
+    "RUF",  # ruff-specific
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests may assert, use magic numbers, and skip return annotations.
+"**/tests/**" = ["S101", "PLR2004", "ANN201"]
+# A CLI's stdout *is* its interface; print is the right call there, not logging.
+"**/cli.py" = ["T201"]
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"
+
+[tool.ruff.lint.isort]
+# Without this, our own packages get sorted in with third-party libraries — the
+# import block stops showing, at a glance, what is ours and what we depend on.
+known-first-party = [
+    "tradeforge_api",
+    "tradeforge_collector",
+    "tradeforge_engine",
+    "tradeforge_executor",
+    "tradeforge_schema",
+]
+
+[tool.ruff.format]
+docstring-code-format = true
+
+# --------------------------------------------------------------------------- #
+# Mypy — static types                                                           #
+# --------------------------------------------------------------------------- #
+# `strict` is a global-only flag in mypy: it cannot be enabled per-module. So we
+# invert the rule from AGENTS.md §6 — strict everywhere, relaxed only where a
+# framework forces our hand — which is strictly safer than the other direction.
+[tool.mypy]
+python_version = "3.12"
+strict = true
+# Teaches mypy how pydantic builds models. Without it, mypy synthesises a strict
+# __init__ from the field list and rejects `Settings()` — even though a BaseSettings
+# legitimately takes every value from the environment.
+plugins = ["pydantic.mypy"]
+warn_unreachable = true
+warn_unused_configs = true
+enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
+explicit_package_bases = true
+mypy_path = [
+    "apps/api/src",
+    "apps/collector/src",
+    "apps/executor/src",
+    "packages/engine/src",
+    "packages/schema/src",
+]
+files = ["apps/api", "apps/collector", "apps/executor", "packages", "tests"]
+exclude = ["apps/web"]
+
+# --------------------------------------------------------------------------- #
+# Pytest + coverage                                                             #
+# --------------------------------------------------------------------------- #
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = [
+    "tests",
+    "apps/api/tests",
+    "apps/collector/tests",
+    "apps/executor/tests",
+    "packages/engine/tests",
+    "packages/schema/tests",
+]
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+    "--cov",
+    "--cov-report=term-missing",
+    "--cov-report=xml",
+    "--cov-fail-under=90",
+    # Integration tests need real containers, so they are deselected by default:
+    # `uv run pytest` must stay runnable without Docker. CI opts in explicitly
+    # with `-m integration`, where a failure to reach Postgres is a red build —
+    # never a silent skip.
+    "-m",
+    "not integration",
+]
+markers = [
+    "integration: exercises a real Postgres/Redis. Requires `docker compose up`.",
+]
+
+[tool.coverage.run]
+branch = true
+relative_files = true
+source = [
+    "tradeforge_api",
+    "tradeforge_collector",
+    "tradeforge_engine",
+    "tradeforge_executor",
+    "tradeforge_schema",
+]
+
+[tool.coverage.report]
+show_missing = true
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "\\.\\.\\.",
+]

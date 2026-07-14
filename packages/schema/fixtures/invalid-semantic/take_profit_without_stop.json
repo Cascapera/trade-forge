@@ -1,0 +1,17 @@
+{
+  "schema_version": "1.0",
+  "name": "Alvo 2:1 sem stop",
+  "description": "Um alvo por múltiplo de risco precisa de um risco para multiplicar. Sem stop_loss, 2:1 não significa nada — mas as duas chaves são opcionais no schema.",
+  "timeframe": "H4",
+  "indicators": [{ "id": "sma", "type": "SMA", "params": { "period": 20, "source": "close" } }],
+  "entry": {
+    "long": { "op": "crosses_above", "left": { "ref": "price.close" }, "right": { "ref": "sma" } },
+    "short": null
+  },
+  "exit": {
+    "stop_loss": null,
+    "take_profit": { "type": "risk_multiple", "params": { "rr": 2.0 } },
+    "conditions": []
+  },
+  "risk": { "sizing": { "type": "percent_risk", "params": { "percent": 1.0 } } }
+}

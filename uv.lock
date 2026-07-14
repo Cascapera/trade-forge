@@ -559,6 +559,12 @@ requires-dist = [{ name = "metatrader5", marker = "sys_platform == 'win32'", spe
 name = "tradeforge-schema"
 version = "0.1.0"
 source = { editable = "packages/schema" }
+dependencies = [
+    { name = "pydantic" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "pydantic", specifier = ">=2.10" }]
 
 [[package]]
 name = "typing-extensions"

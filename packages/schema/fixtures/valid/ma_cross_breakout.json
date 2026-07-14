@@ -1,0 +1,35 @@
+{
+  "schema_version": "1.0",
+  "name": "MA Cross + Breakout da máxima anterior",
+  "description": "Compra quando o preço rompe a máxima do candle anterior com tendência de alta pela média móvel",
+  "timeframe": "H1",
+  "indicators": [
+    { "id": "sma_fast", "type": "SMA", "params": { "period": 9, "source": "close" } },
+    { "id": "sma_slow", "type": "SMA", "params": { "period": 21, "source": "close" } }
+  ],
+  "entry": {
+    "long": {
+      "all": [
+        { "op": "gt", "left": { "ref": "sma_fast" }, "right": { "ref": "sma_slow" } },
+        {
+          "op": "breaks_above",
+          "left": { "ref": "price.high" },
+          "right": { "ref": "candle[-1].high" }
+        }
+      ]
+    },
+    "short": null
+  },
+  "exit": {
+    "stop_loss": { "type": "candle_extreme", "params": { "lookback": 1, "side": "low" } },
+    "take_profit": { "type": "risk_multiple", "params": { "rr": 2.0 } },
+    "conditions": [
+      { "op": "crosses_below", "left": { "ref": "sma_fast" }, "right": { "ref": "sma_slow" } }
+    ]
+  },
+  "risk": {
+    "sizing": { "type": "percent_risk", "params": { "percent": 1.0 } },
+    "max_open_positions": 1,
+    "max_daily_loss_percent": 3.0
+  }
+}

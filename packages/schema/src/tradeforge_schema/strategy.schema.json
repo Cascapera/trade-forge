@@ -1,0 +1,501 @@
+{
+  "$defs": {
+    "AllOf": {
+      "additionalProperties": false,
+      "description": "Logical AND.",
+      "properties": {
+        "all": {
+          "items": {
+            "$ref": "#/$defs/Condition"
+          },
+          "minItems": 1,
+          "title": "All",
+          "type": "array"
+        }
+      },
+      "required": [
+        "all"
+      ],
+      "title": "AllOf",
+      "type": "object"
+    },
+    "AnyOf": {
+      "additionalProperties": false,
+      "description": "Logical OR.",
+      "properties": {
+        "any": {
+          "items": {
+            "$ref": "#/$defs/Condition"
+          },
+          "minItems": 1,
+          "title": "Any",
+          "type": "array"
+        }
+      },
+      "required": [
+        "any"
+      ],
+      "title": "AnyOf",
+      "type": "object"
+    },
+    "CandleExtremeParams": {
+      "additionalProperties": false,
+      "properties": {
+        "lookback": {
+          "maximum": 100,
+          "minimum": 1,
+          "title": "Lookback",
+          "type": "integer"
+        },
+        "side": {
+          "enum": [
+            "low",
+            "high"
+          ],
+          "title": "Side",
+          "type": "string"
+        }
+      },
+      "required": [
+        "lookback",
+        "side"
+      ],
+      "title": "CandleExtremeParams",
+      "type": "object"
+    },
+    "CandleExtremeStop": {
+      "additionalProperties": false,
+      "description": "Stop at the low (or high) of the last N closed candles.",
+      "properties": {
+        "params": {
+          "$ref": "#/$defs/CandleExtremeParams"
+        },
+        "type": {
+          "const": "candle_extreme",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "params"
+      ],
+      "title": "CandleExtremeStop",
+      "type": "object"
+    },
+    "Comparison": {
+      "additionalProperties": false,
+      "description": "A leaf: two operands and an operator.\n\n`gt` asks about this candle. `crosses_above` asks about this candle *and the\nprevious one* — it is true only on the bar where the relation flips, which is\nwhat stops a strategy from re-entering on every bar of a trend it already owns.",
+      "properties": {
+        "left": {
+          "$ref": "#/$defs/Ref"
+        },
+        "op": {
+          "$ref": "#/$defs/ComparisonOp"
+        },
+        "right": {
+          "$ref": "#/$defs/Ref"
+        }
+      },
+      "required": [
+        "op",
+        "left",
+        "right"
+      ],
+      "title": "Comparison",
+      "type": "object"
+    },
+    "ComparisonOp": {
+      "enum": [
+        "gt",
+        "lt",
+        "gte",
+        "lte",
+        "crosses_above",
+        "crosses_below",
+        "breaks_above",
+        "breaks_below"
+      ],
+      "type": "string"
+    },
+    "Condition": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Comparison"
+        },
+        {
+          "$ref": "#/$defs/AllOf"
+        },
+        {
+          "$ref": "#/$defs/AnyOf"
+        },
+        {
+          "$ref": "#/$defs/NotOf"
+        }
+      ]
+    },
+    "EMA": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "maxLength": 40,
+          "pattern": "^[a-z_][a-z0-9_]*$",
+          "title": "Id",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/$defs/MovingAverageParams"
+        },
+        "type": {
+          "const": "EMA",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "params"
+      ],
+      "title": "EMA",
+      "type": "object"
+    },
+    "Entry": {
+      "additionalProperties": false,
+      "description": "Entry conditions per side. A strategy must trade at least one of them.",
+      "properties": {
+        "long": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Condition"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "short": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Condition"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "title": "Entry",
+      "type": "object"
+    },
+    "Exit": {
+      "additionalProperties": false,
+      "properties": {
+        "conditions": {
+          "items": {
+            "$ref": "#/$defs/Condition"
+          },
+          "title": "Conditions",
+          "type": "array"
+        },
+        "stop_loss": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CandleExtremeStop"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "take_profit": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RiskMultipleTakeProfit"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "title": "Exit",
+      "type": "object"
+    },
+    "Indicator": {
+      "discriminator": {
+        "mapping": {
+          "EMA": "#/$defs/EMA",
+          "SMA": "#/$defs/SMA"
+        },
+        "propertyName": "type"
+      },
+      "oneOf": [
+        {
+          "$ref": "#/$defs/SMA"
+        },
+        {
+          "$ref": "#/$defs/EMA"
+        }
+      ]
+    },
+    "MovingAverageParams": {
+      "additionalProperties": false,
+      "properties": {
+        "period": {
+          "maximum": 1000,
+          "minimum": 1,
+          "title": "Period",
+          "type": "integer"
+        },
+        "source": {
+          "$ref": "#/$defs/PriceSource",
+          "default": "close"
+        }
+      },
+      "required": [
+        "period"
+      ],
+      "title": "MovingAverageParams",
+      "type": "object"
+    },
+    "NotOf": {
+      "additionalProperties": false,
+      "description": "Logical NOT. Serialised as `not`, which is a Python keyword — hence the alias.",
+      "properties": {
+        "not": {
+          "$ref": "#/$defs/Condition"
+        }
+      },
+      "required": [
+        "not"
+      ],
+      "title": "NotOf",
+      "type": "object"
+    },
+    "PercentRiskParams": {
+      "additionalProperties": false,
+      "properties": {
+        "percent": {
+          "exclusiveMinimum": 0,
+          "maximum": 100,
+          "title": "Percent",
+          "type": "number"
+        }
+      },
+      "required": [
+        "percent"
+      ],
+      "title": "PercentRiskParams",
+      "type": "object"
+    },
+    "PercentRiskSizing": {
+      "additionalProperties": false,
+      "description": "Size the position so that hitting the stop costs `percent` of the account.",
+      "properties": {
+        "params": {
+          "$ref": "#/$defs/PercentRiskParams"
+        },
+        "type": {
+          "const": "percent_risk",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "params"
+      ],
+      "title": "PercentRiskSizing",
+      "type": "object"
+    },
+    "PriceSource": {
+      "enum": [
+        "open",
+        "high",
+        "low",
+        "close"
+      ],
+      "type": "string"
+    },
+    "Ref": {
+      "additionalProperties": false,
+      "description": "A reference to a value the engine can resolve at evaluation time.",
+      "properties": {
+        "ref": {
+          "examples": [
+            "sma_fast",
+            "price.close",
+            "candle[-1].high"
+          ],
+          "pattern": "^(?:[a-z_][a-z0-9_]*|price\\.(?:open|high|low|close)|candle\\[-[1-9][0-9]*\\]\\.(?:open|high|low|close))$",
+          "title": "Ref",
+          "type": "string"
+        }
+      },
+      "required": [
+        "ref"
+      ],
+      "title": "Ref",
+      "type": "object"
+    },
+    "Risk": {
+      "additionalProperties": false,
+      "properties": {
+        "max_daily_loss_percent": {
+          "default": 3.0,
+          "exclusiveMinimum": 0,
+          "maximum": 100,
+          "title": "Max Daily Loss Percent",
+          "type": "number"
+        },
+        "max_open_positions": {
+          "default": 1,
+          "maximum": 100,
+          "minimum": 1,
+          "title": "Max Open Positions",
+          "type": "integer"
+        },
+        "sizing": {
+          "$ref": "#/$defs/PercentRiskSizing"
+        }
+      },
+      "required": [
+        "sizing"
+      ],
+      "title": "Risk",
+      "type": "object"
+    },
+    "RiskMultipleParams": {
+      "additionalProperties": false,
+      "properties": {
+        "rr": {
+          "exclusiveMinimum": 0,
+          "maximum": 100,
+          "title": "Rr",
+          "type": "number"
+        }
+      },
+      "required": [
+        "rr"
+      ],
+      "title": "RiskMultipleParams",
+      "type": "object"
+    },
+    "RiskMultipleTakeProfit": {
+      "additionalProperties": false,
+      "description": "Target at N times the distance to the stop.\n\nMeaningless without a stop — there is no risk to take a multiple of. The schema\ncannot say that; `semantic.py` does.",
+      "properties": {
+        "params": {
+          "$ref": "#/$defs/RiskMultipleParams"
+        },
+        "type": {
+          "const": "risk_multiple",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "params"
+      ],
+      "title": "RiskMultipleTakeProfit",
+      "type": "object"
+    },
+    "SMA": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "maxLength": 40,
+          "pattern": "^[a-z_][a-z0-9_]*$",
+          "title": "Id",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/$defs/MovingAverageParams"
+        },
+        "type": {
+          "const": "SMA",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "params"
+      ],
+      "title": "SMA",
+      "type": "object"
+    },
+    "Timeframe": {
+      "enum": [
+        "M1",
+        "M5",
+        "M15",
+        "M30",
+        "H1",
+        "H4",
+        "D1",
+        "W1"
+      ],
+      "type": "string"
+    }
+  },
+  "$id": "https://tradeforge.dev/schema/strategy/v1.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "A complete, self-contained strategy definition.",
+  "properties": {
+    "description": {
+      "default": "",
+      "title": "Description",
+      "type": "string"
+    },
+    "entry": {
+      "$ref": "#/$defs/Entry"
+    },
+    "exit": {
+      "$ref": "#/$defs/Exit"
+    },
+    "indicators": {
+      "items": {
+        "$ref": "#/$defs/Indicator"
+      },
+      "maxItems": 20,
+      "title": "Indicators",
+      "type": "array"
+    },
+    "name": {
+      "maxLength": 120,
+      "minLength": 1,
+      "title": "Name",
+      "type": "string"
+    },
+    "risk": {
+      "$ref": "#/$defs/Risk"
+    },
+    "schema_version": {
+      "const": "1.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "timeframe": {
+      "$ref": "#/$defs/Timeframe"
+    }
+  },
+  "required": [
+    "schema_version",
+    "name",
+    "timeframe",
+    "entry",
+    "exit",
+    "risk"
+  ],
+  "title": "Strategy",
+  "type": "object"
+}

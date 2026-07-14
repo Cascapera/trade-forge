@@ -132,6 +132,16 @@ jobs:
       - name: Install (from lockfile)
         run: npm ci
 
+      # The TypeScript types are generated from the JSON Schema, which is itself
+      # generated from the Pydantic models (a pytest asserts that half). If the
+      # regenerated file differs from the committed one, the contract the frontend
+      # types against has drifted from the one the backend enforces.
+      - name: Generated types match the schema
+        run: |
+          npm run generate:types -w @tradeforge/schema
+          git diff --exit-code -- packages/schema/src/generated \
+            || { echo '::error::Types are stale. Run: npm run generate:types -w @tradeforge/schema'; exit 1; }
+
       - name: ESLint
         run: npm run lint
 

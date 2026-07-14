@@ -34,7 +34,7 @@ services:
       start_period: 10s
 
   redis:
-    image: redis:7.4.9-alpine
+    image: redis:8.8.0-alpine
     container_name: tradeforge-redis
     restart: unless-stopped
     # Persist to disk: Redis carries order and fill events. Losing them on a

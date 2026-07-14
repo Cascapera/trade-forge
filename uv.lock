@@ -521,7 +521,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
+    { name = "psycopg", extras = ["binary"], specifier = ">=3.3.4" },
     { name = "pydantic-settings", specifier = ">=2.7" },
     { name = "redis", specifier = ">=5.2" },
     { name = "tradeforge-engine", editable = "packages/engine" },

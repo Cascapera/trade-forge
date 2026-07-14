@@ -16,8 +16,8 @@ from decimal import Decimal
 
 from sqlalchemy.orm import Session
 
-from tradeforge_db.instruments import InstrumentSpec, upsert_instruments
-from tradeforge_db.models import AssetClass
+from tradeforge_db.instruments import upsert_instruments
+from tradeforge_engine.domain import AssetClass, InstrumentSpec
 
 INSTRUMENT_SEEDS: tuple[InstrumentSpec, ...] = (
     # Forex: one standard lot is 100 000 units of the base currency, quoted to five

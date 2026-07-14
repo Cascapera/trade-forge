@@ -13,34 +13,13 @@ the path production uses.
 """
 
 import datetime as dt
-from dataclasses import asdict, dataclass
-from decimal import Decimal
+from dataclasses import asdict
 
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
-from tradeforge_db.models import AssetClass, Dataset, Instrument
-
-
-@dataclass(frozen=True, slots=True)
-class InstrumentSpec:
-    """Everything needed to price a position in a symbol.
-
-    Pure data: no session, no I/O. That is what lets the collector build one from
-    MT5 in a Windows-only code path, and the tests build one from nothing.
-    """
-
-    symbol: str
-    name: str
-    asset_class: AssetClass
-    currency_quote: str
-    tick_size: Decimal
-    tick_value: Decimal
-    contract_size: Decimal
-    digits: int
-    exchange: str | None = None
-    currency_base: str | None = None
-
+from tradeforge_db.models import Dataset, Instrument
+from tradeforge_engine.domain import InstrumentSpec
 
 # Everything except the natural key. Re-running a backfill after a broker changes a
 # contract size must update the row, not silently keep the stale number that every

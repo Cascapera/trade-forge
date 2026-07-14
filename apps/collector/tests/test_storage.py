@@ -18,11 +18,19 @@ from tradeforge_collector.storage import (
 
 
 def a_candle(moment: dt.datetime, close: str = "1.10500") -> Candle:
+    """The extremes are derived from the body, not hard-coded.
+
+    They used to be fixed at 1.11000/1.09000 while `close` varied — so a test that passed
+    close="1.20500" was building a bar whose high sat below its own close. The engine's
+    `Candle` now refuses that, which is how the fixture got found: a candle the market could
+    never have printed, sitting in a test suite that was green.
+    """
+    body = [Decimal("1.10000"), Decimal(close)]
     return Candle(
         time=moment,
         open=Decimal("1.10000"),
-        high=Decimal("1.11000"),
-        low=Decimal("1.09000"),
+        high=max(body) + Decimal("0.00500"),
+        low=min(body) - Decimal("0.00500"),
         close=Decimal(close),
         tick_volume=100,
         spread=2,

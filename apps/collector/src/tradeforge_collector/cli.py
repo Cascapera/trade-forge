@@ -21,8 +21,8 @@ from tradeforge_collector.gaps import format_report
 from tradeforge_collector.source import MarketDataSource
 from tradeforge_collector.synthetic import SyntheticSource
 from tradeforge_collector.timeframes import TIMEFRAME_STEP
-from tradeforge_db.models import AssetClass
 from tradeforge_db.session import create_db_engine, create_session_factory, session_scope
+from tradeforge_engine.domain import AssetClass
 
 DEFAULT_DATA_DIR = Path("data/ohlcv")
 

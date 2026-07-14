@@ -10,9 +10,8 @@ from decimal import Decimal
 
 import pytest
 
-from tradeforge_db.instruments import InstrumentSpec
-from tradeforge_db.models import AssetClass
 from tradeforge_db.seeds import INSTRUMENT_SEEDS
+from tradeforge_engine.domain import AssetClass, InstrumentSpec
 
 
 def test_symbols_are_unique() -> None:

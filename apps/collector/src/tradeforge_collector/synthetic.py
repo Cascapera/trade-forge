@@ -19,10 +19,8 @@ import datetime as dt
 from decimal import Decimal
 from random import Random
 
-from tradeforge_collector.source import Candle
 from tradeforge_collector.timeframes import step
-from tradeforge_db.instruments import InstrumentSpec
-from tradeforge_db.models import AssetClass
+from tradeforge_engine.domain import AssetClass, Candle, InstrumentSpec
 
 # The market is shut from Friday evening to Sunday evening. Modelled as "no bar whose
 # opening instant falls on a Saturday or a Sunday" — close enough to a real feed for

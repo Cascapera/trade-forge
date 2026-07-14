@@ -45,6 +45,7 @@ from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from tradeforge_db.base import MONEY, PRICE, RATIO, VOLUME, Base
+from tradeforge_engine.domain import AssetClass, Side
 from tradeforge_schema.models import TIMEFRAMES
 
 # --------------------------------------------------------------------------- #
@@ -58,24 +59,11 @@ from tradeforge_schema.models import TIMEFRAMES
 # few bytes per row over an enum's four; at this scale, nothing.
 
 
-class AssetClass(StrEnum):
-    FOREX = "forex"
-    STOCK = "stock"
-    INDEX = "index"
-    FUTURE = "future"
-    CRYPTO = "crypto"
-
-
 class BacktestStatus(StrEnum):
     QUEUED = "queued"
     RUNNING = "running"
     DONE = "done"
     FAILED = "failed"
-
-
-class Direction(StrEnum):
-    LONG = "long"
-    SHORT = "short"
 
 
 class ExitReason(StrEnum):
@@ -482,7 +470,7 @@ class Trade(Base):
         ForeignKey("instruments.id", ondelete="RESTRICT"), nullable=False
     )
 
-    direction: Mapped[Direction] = mapped_column(_enum(Direction, "direction"), nullable=False)
+    direction: Mapped[Side] = mapped_column(_enum(Side, "direction"), nullable=False)
 
     entry_time: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     entry_price: Mapped[Decimal] = mapped_column(PRICE, nullable=False)

@@ -40,6 +40,11 @@ tradeforge-schema = { workspace = true }
 
 [dependency-groups]
 dev = [
+    # Property-based testing. AGENTS.md §6 requires it in the engine: the invariants there
+    # ("the trades reconcile with the equity curve", "the same input gives the same output")
+    # are universally quantified statements, and an example-based test can only ever check
+    # the examples someone thought of.
+    "hypothesis>=6.120",
     "mypy>=1.14",
     "pre-commit>=4.6.0",
     "pytest>=8.3",

@@ -10,8 +10,9 @@ from decimal import Decimal
 
 import pytest
 
+from tradeforge_db.instruments import InstrumentSpec
 from tradeforge_db.models import AssetClass
-from tradeforge_db.seeds import INSTRUMENT_SEEDS, InstrumentSeed
+from tradeforge_db.seeds import INSTRUMENT_SEEDS
 
 
 def test_symbols_are_unique() -> None:
@@ -31,7 +32,7 @@ def test_more_than_one_asset_class_is_represented() -> None:
 
 
 @pytest.mark.parametrize("seed", INSTRUMENT_SEEDS, ids=lambda seed: seed.symbol)
-def test_seed_survives_the_check_constraints(seed: InstrumentSeed) -> None:
+def test_seed_survives_the_check_constraints(seed: InstrumentSpec) -> None:
     """Every value the database would reject, asserted here — where the message is clearer."""
     assert seed.tick_size > 0
     assert seed.tick_value > 0
@@ -40,7 +41,7 @@ def test_seed_survives_the_check_constraints(seed: InstrumentSeed) -> None:
 
 
 @pytest.mark.parametrize("seed", INSTRUMENT_SEEDS, ids=lambda seed: seed.symbol)
-def test_digits_agree_with_tick_size(seed: InstrumentSeed) -> None:
+def test_digits_agree_with_tick_size(seed: InstrumentSpec) -> None:
     """`digits` and `tick_size` are two statements of the same fact, and must agree.
 
     Five digits means the smallest move is 0.00001. If they disagree, price rounding and
@@ -51,7 +52,7 @@ def test_digits_agree_with_tick_size(seed: InstrumentSeed) -> None:
 
 
 @pytest.mark.parametrize("seed", INSTRUMENT_SEEDS, ids=lambda seed: seed.symbol)
-def test_only_forex_has_a_base_currency(seed: InstrumentSeed) -> None:
+def test_only_forex_has_a_base_currency(seed: InstrumentSpec) -> None:
     """A stock settles in one currency. A pair is a ratio between two."""
     if seed.asset_class is AssetClass.FOREX:
         assert seed.currency_base is not None

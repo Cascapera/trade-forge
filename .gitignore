@@ -37,3 +37,6 @@ docs/aulas/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Downloaded OHLCV. Reproducible from a backfill; never a repository artefact.
+data/

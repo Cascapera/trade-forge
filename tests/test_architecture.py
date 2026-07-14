@@ -20,6 +20,9 @@ APP_IMPORT = re.compile(
     r"^\s*(?:import|from)\s+tradeforge_(api|collector|executor)\b", re.MULTILINE
 )
 
+# The engine is pure. Persistence is somebody else's problem (ADR-0009).
+DB_IMPORT = re.compile(r"^\s*(?:import|from)\s+tradeforge_db\b", re.MULTILINE)
+
 
 def _source_files(*roots: str) -> list[Path]:
     """Every Python source file under the given repo-relative roots."""
@@ -74,4 +77,27 @@ def test_shared_packages_never_depend_on_apps(source: Path) -> None:
     assert match is None, (
         f"{relative} imports the '{match.group(1)}' app. "
         f"Shared packages must not depend on deployable apps."
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    _source_files("packages/engine"),
+    ids=_relative,
+)
+def test_the_engine_never_reaches_for_the_database(source: Path) -> None:
+    """The core is pure: candles in, orders out (ADR-0009).
+
+    An engine that can read the database is an engine whose result depends on what is
+    in it — and determinism (AGENTS.md §5.2) is gone the moment that is true. The same
+    strategy, the same candles and the same costs must produce the same trades, whether
+    the run happens today or on a restored dump next year.
+
+    Data reaches the engine as arguments. It is never fetched.
+    """
+    relative = _relative(source)
+
+    assert not DB_IMPORT.search(source.read_text(encoding="utf-8")), (
+        f"{relative} imports tradeforge_db. The engine takes its inputs as arguments; "
+        f"a core that queries a database is a core that cannot be replayed (ADR-0009)."
     )

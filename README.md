@@ -79,6 +79,10 @@ uv run tradeforge-health    # asks both services whether they are actually up
 uv run tradeforge-db upgrade # create the schema (Alembic)
 uv run tradeforge-db seed    # example instruments; safe to re-run
 
+# Download history. The default source is deterministic synthetic data, so this
+# works on any platform, with no broker account. --source mt5 needs Windows.
+uv run tradeforge-collector backfill EURUSD H1 2024-01-01 2024-12-31
+
 uv run pytest               # unit tests + 90% coverage gate (no Docker needed)
 uv run pytest -m integration # connects to the real services
 npm run test:cov

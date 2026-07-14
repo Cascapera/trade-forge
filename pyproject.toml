@@ -133,6 +133,14 @@ mypy_path = [
 files = ["apps/api", "apps/collector", "apps/executor", "packages", "tests"]
 exclude = ["apps/web"]
 
+# Two third-party libraries ship no type information: MetaTrader5 (which has no Linux
+# wheel at all, so on CI mypy cannot even find it) and pyarrow. Silencing *only these
+# imports* keeps every line we write under --strict — the untyped edges stay thin and
+# are covered by tests instead.
+[[tool.mypy.overrides]]
+module = ["MetaTrader5", "pyarrow.*"]
+ignore_missing_imports = true
+
 # --------------------------------------------------------------------------- #
 # Pytest + coverage                                                             #
 # --------------------------------------------------------------------------- #

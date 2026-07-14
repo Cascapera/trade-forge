@@ -6,40 +6,23 @@ data is convenience: it must be re-runnable, it is dev-only, and it has no busin
 in the schema's version history. Mixing the two is how a production deploy ends up
 inserting four fake symbols.
 
-The numbers below are plausible placeholders. The collector overwrites them with
-the truth from MT5 `symbol_info` on the first backfill (PR-102) — which is why the
-writer upserts on `symbol` instead of failing on conflict.
+The numbers below are plausible placeholders. The collector overwrites them with the
+truth from MT5 `symbol_info` on the first backfill (PR-102) — through the very same
+`upsert_instruments`, which is why the seeds are not a special case with its own
+write path that nobody else exercises.
 """
 
-from dataclasses import dataclass
 from decimal import Decimal
 
-from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
-from tradeforge_db.models import AssetClass, Instrument
+from tradeforge_db.instruments import InstrumentSpec, upsert_instruments
+from tradeforge_db.models import AssetClass
 
-
-@dataclass(frozen=True, slots=True)
-class InstrumentSeed:
-    """Pure data: no session, no I/O — so the table below is unit-testable."""
-
-    symbol: str
-    name: str
-    asset_class: AssetClass
-    currency_quote: str
-    tick_size: Decimal
-    tick_value: Decimal
-    contract_size: Decimal
-    digits: int
-    exchange: str | None = None
-    currency_base: str | None = None
-
-
-INSTRUMENT_SEEDS: tuple[InstrumentSeed, ...] = (
+INSTRUMENT_SEEDS: tuple[InstrumentSpec, ...] = (
     # Forex: one standard lot is 100 000 units of the base currency, quoted to five
     # decimals. One tick (0.00001) on that lot is worth $1.
-    InstrumentSeed(
+    InstrumentSpec(
         symbol="EURUSD",
         name="Euro vs US Dollar",
         asset_class=AssetClass.FOREX,
@@ -50,7 +33,7 @@ INSTRUMENT_SEEDS: tuple[InstrumentSeed, ...] = (
         contract_size=Decimal("100000"),
         digits=5,
     ),
-    InstrumentSeed(
+    InstrumentSpec(
         symbol="GBPUSD",
         name="Great Britain Pound vs US Dollar",
         asset_class=AssetClass.FOREX,
@@ -64,7 +47,7 @@ INSTRUMENT_SEEDS: tuple[InstrumentSeed, ...] = (
     # A stock has no base currency, trades in whole shares, and moves in cents. Same
     # engine, same table, entirely different arithmetic — which is the point of
     # keeping these numbers in the database instead of in the engine.
-    InstrumentSeed(
+    InstrumentSpec(
         symbol="AAPL",
         name="Apple Inc.",
         asset_class=AssetClass.STOCK,
@@ -75,7 +58,7 @@ INSTRUMENT_SEEDS: tuple[InstrumentSeed, ...] = (
         contract_size=Decimal("1"),
         digits=2,
     ),
-    InstrumentSeed(
+    InstrumentSpec(
         symbol="US500",
         name="S&P 500 Index",
         asset_class=AssetClass.INDEX,
@@ -89,51 +72,6 @@ INSTRUMENT_SEEDS: tuple[InstrumentSeed, ...] = (
 )
 
 
-def seed_instruments(session: Session, seeds: tuple[InstrumentSeed, ...] = INSTRUMENT_SEEDS) -> int:
-    """Insert the example instruments, updating any that already exist.
-
-    Idempotent by construction: running it twice leaves the same four rows, and it
-    never collides with a symbol the collector has already written for real. Returns
-    the number of rows written.
-    """
-    if not seeds:
-        return 0
-
-    rows = [
-        {
-            "symbol": seed.symbol,
-            "name": seed.name,
-            "asset_class": seed.asset_class,
-            "exchange": seed.exchange,
-            "currency_base": seed.currency_base,
-            "currency_quote": seed.currency_quote,
-            "tick_size": seed.tick_size,
-            "tick_value": seed.tick_value,
-            "contract_size": seed.contract_size,
-            "digits": seed.digits,
-        }
-        for seed in seeds
-    ]
-
-    statement = insert(Instrument).values(rows)
-    statement = statement.on_conflict_do_update(
-        index_elements=[Instrument.symbol],
-        set_={
-            column: statement.excluded[column]
-            for column in (
-                "name",
-                "asset_class",
-                "exchange",
-                "currency_base",
-                "currency_quote",
-                "tick_size",
-                "tick_value",
-                "contract_size",
-                "digits",
-            )
-        },
-    )
-    session.execute(statement)
-    # Every seed is written on every run — inserted the first time, updated after —
-    # so the count is simply how many we were given.
-    return len(rows)
+def seed_instruments(session: Session, seeds: tuple[InstrumentSpec, ...] = INSTRUMENT_SEEDS) -> int:
+    """Insert the example instruments. Safe to re-run; returns how many were written."""
+    return upsert_instruments(session, seeds)

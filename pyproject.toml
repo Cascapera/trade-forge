@@ -8,6 +8,7 @@ license = "Apache-2.0"
 dependencies = [
     "tradeforge-api",
     "tradeforge-collector",
+    "tradeforge-db",
     "tradeforge-engine",
     "tradeforge-executor",
     "tradeforge-schema",
@@ -20,11 +21,19 @@ dependencies = [
 package = false
 
 [tool.uv.workspace]
-members = ["apps/api", "apps/collector", "apps/executor", "packages/engine", "packages/schema"]
+members = [
+    "apps/api",
+    "apps/collector",
+    "apps/executor",
+    "packages/db",
+    "packages/engine",
+    "packages/schema",
+]
 
 [tool.uv.sources]
 tradeforge-api = { workspace = true }
 tradeforge-collector = { workspace = true }
+tradeforge-db = { workspace = true }
 tradeforge-engine = { workspace = true }
 tradeforge-executor = { workspace = true }
 tradeforge-schema = { workspace = true }
@@ -87,6 +96,7 @@ ban-relative-imports = "all"
 known-first-party = [
     "tradeforge_api",
     "tradeforge_collector",
+    "tradeforge_db",
     "tradeforge_engine",
     "tradeforge_executor",
     "tradeforge_schema",
@@ -116,6 +126,7 @@ mypy_path = [
     "apps/api/src",
     "apps/collector/src",
     "apps/executor/src",
+    "packages/db/src",
     "packages/engine/src",
     "packages/schema/src",
 ]
@@ -132,6 +143,7 @@ testpaths = [
     "apps/api/tests",
     "apps/collector/tests",
     "apps/executor/tests",
+    "packages/db/tests",
     "packages/engine/tests",
     "packages/schema/tests",
 ]
@@ -139,6 +151,12 @@ addopts = [
     "-ra",
     "--strict-markers",
     "--strict-config",
+    # Import test modules by path, not by module name. Without this, `apps/api/tests/
+    # test_config.py` and `packages/db/tests/test_config.py` both want to be the module
+    # `test_config`, and pytest refuses to collect the second one. The alternative —
+    # prefixing every file with its package — makes the file tree shout what the
+    # directory already says.
+    "--import-mode=importlib",
     "--cov",
     "--cov-report=term-missing",
     "--cov-report=xml",
@@ -160,6 +178,7 @@ relative_files = true
 source = [
     "tradeforge_api",
     "tradeforge_collector",
+    "tradeforge_db",
     "tradeforge_engine",
     "tradeforge_executor",
     "tradeforge_schema",

@@ -54,6 +54,7 @@ apps/api          FastAPI + async workers        (Linux/Docker)
 apps/web          React + TypeScript             (Vite)
 apps/collector    MT5 → Parquet/Redis            (Windows only)
 apps/executor     Orders → MT5, with safeguards  (Windows only)
+packages/db       SQLAlchemy models + Alembic migrations
 packages/engine   Event-driven engine — the core
 packages/schema   Strategy DSL: JSON Schema + generated types
 ```
@@ -67,13 +68,16 @@ Requires [uv](https://docs.astral.sh/uv/), Node 22+ and Docker.
 
 ```bash
 cp .env.example .env        # then set POSTGRES_PASSWORD — there is no default
-uv sync                     # one venv at the root, all five packages editable
+uv sync                     # one venv at the root, all six packages editable
 npm ci
 
 uv run pre-commit install --install-hooks   # mirrors the CI gates locally
 
 docker compose up -d        # Postgres + Redis, with healthchecks
 uv run tradeforge-health    # asks both services whether they are actually up
+
+uv run tradeforge-db upgrade # create the schema (Alembic)
+uv run tradeforge-db seed    # example instruments; safe to re-run
 
 uv run pytest               # unit tests + 90% coverage gate (no Docker needed)
 uv run pytest -m integration # connects to the real services

@@ -5,6 +5,7 @@ description = "FastAPI backend: strategies, backtests, live sessions. Portable (
 requires-python = ">=3.12,<3.13"
 license = "Apache-2.0"
 dependencies = [
+    "tradeforge-db",
     "tradeforge-engine",
     "tradeforge-schema",
     "pydantic-settings>=2.7",

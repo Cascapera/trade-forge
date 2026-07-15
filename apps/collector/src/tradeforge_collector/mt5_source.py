@@ -16,10 +16,8 @@ from decimal import Decimal
 from types import TracebackType
 from typing import Any, Self
 
-from tradeforge_collector.source import Candle
 from tradeforge_collector.storage import normalise
-from tradeforge_db.instruments import InstrumentSpec
-from tradeforge_db.models import AssetClass
+from tradeforge_engine.domain import AssetClass, Candle, InstrumentSpec
 
 logger = logging.getLogger(__name__)
 

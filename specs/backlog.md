@@ -19,3 +19,20 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
 - [origem: PR-001] **Branch protection no GitHub** — exigir CI verde + 1 aprovação para mergear em
   `main` e `develop`. Precisa ser configurado na UI do GitHub (não é código); fazer junto do
   primeiro push.
+- [origem: PR-103] **Quarentena de candle corrompido no collector** — a validação nova de `Candle`
+  (tz-aware, extremos contendo o corpo) faz o backfill abortar inteiro num único candle sujo do
+  MT5, sem relatório. Falhar alto é melhor que persistir lixo, mas o operador de um backfill de
+  dez anos fica sem saída. Precisa pular a barra e reportá-la no gap report que já existe.
+  Adiado: escopo do PR-102, não do núcleo.
+- [origem: PR-103] **`Broker.trades()` sem escopo explícito** — o contrato diz "os round trips
+  desta execução", e o `MT5Broker` da Fase 2 terá que filtrar por magic number para honrá-lo,
+  senão o histórico de deals da conta inteira (outros EAs, outros símbolos, sessões anteriores)
+  entra no resultado e a propriedade de reconciliação vira falsa em live. Decidir no PR de
+  `MT5Broker`: `trades(symbol)` ou filtro por magic number.
+- [origem: PR-103] **Preço negativo** — `Fill.price > 0` é correto para forex e ações, e será
+  errado quando entrar futuro: o WTI fechou a -37 dólares em abril de 2020, e spreads de
+  calendário são rotineiramente negativos. Revisar quando `AssetClass.FUTURE` sair do papel.
+- [origem: PR-103] **Fill parcial** — hoje o `Portfolio` **recusa** (`EngineError`), porque
+  aceitá-lo em silêncio inflava o P&L pelo volume inteiro da posição. Fill parcial é
+  comportamento normal do MT5 em mercado fino, então a Fase 2 precisa decidir: ou o `MT5Broker`
+  agrega os parciais antes de devolver um `Fill`, ou o ledger passa a suportar posição parcial.

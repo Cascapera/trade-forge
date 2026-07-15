@@ -25,7 +25,7 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.dataset as ds
 
-from tradeforge_collector.source import Candle
+from tradeforge_engine.domain import Candle
 
 # Scale 10 matches the PRICE type in packages/db: one definition of "a price" across
 # the file, the wire and the table.

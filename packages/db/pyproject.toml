@@ -5,6 +5,10 @@ description = "Persistence: SQLAlchemy models and Alembic migrations, shared by 
 requires-python = ">=3.12,<3.13"
 license = "Apache-2.0"
 dependencies = [
+    # The domain vocabulary — Candle, Side, AssetClass, InstrumentSpec — is defined by
+    # the engine, and the persistence layer conforms to it. The core owns the language;
+    # the adapters speak it (ADR-0009). The dependency never points the other way.
+    "tradeforge-engine",
     # The DSL is the source of truth for what a timeframe is. The database checks
     # against that list instead of keeping a second copy of it.
     "tradeforge-schema",

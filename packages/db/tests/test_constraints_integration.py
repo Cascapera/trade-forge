@@ -18,18 +18,17 @@ from sqlalchemy.exc import IntegrityError, ProgrammingError
 from sqlalchemy.orm import Session
 
 from tradeforge_db.models import (
-    AssetClass,
     Backtest,
     BacktestMetrics,
     BacktestStatus,
     Dataset,
-    Direction,
     ExitReason,
     Instrument,
     Strategy,
     Trade,
 )
 from tradeforge_db.seeds import seed_instruments
+from tradeforge_engine.domain import AssetClass, Side
 
 pytestmark = pytest.mark.integration
 
@@ -205,7 +204,7 @@ def test_deleting_a_backtest_takes_its_results_with_it(session: Session) -> None
         Trade(
             backtest_id=backtest.id,
             instrument_id=backtest.instrument_id,
-            direction=Direction.LONG,
+            direction=Side.LONG,
             entry_time=JAN,
             entry_price=Decimal("1.10000"),
             volume=Decimal("0.1"),
@@ -321,7 +320,7 @@ def test_a_trade_cannot_be_half_closed(session: Session) -> None:
         Trade(
             backtest_id=backtest.id,
             instrument_id=backtest.instrument_id,
-            direction=Direction.LONG,
+            direction=Side.LONG,
             entry_time=JAN,
             entry_price=Decimal("1.10000"),
             volume=Decimal("0.1"),
@@ -340,7 +339,7 @@ def test_an_open_trade_is_allowed(session: Session) -> None:
         Trade(
             backtest_id=backtest.id,
             instrument_id=backtest.instrument_id,
-            direction=Direction.SHORT,
+            direction=Side.SHORT,
             entry_time=JAN,
             entry_price=Decimal("1.10000"),
             volume=Decimal("0.1"),

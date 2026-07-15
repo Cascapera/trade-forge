@@ -19,11 +19,12 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from tradeforge_collector.gaps import Gap, find_gaps
-from tradeforge_collector.source import Candle, MarketDataSource
+from tradeforge_collector.source import MarketDataSource
 from tradeforge_collector.storage import write_candles
 from tradeforge_collector.timeframes import step
-from tradeforge_db.instruments import InstrumentSpec, upsert_dataset, upsert_instruments
+from tradeforge_db.instruments import upsert_dataset, upsert_instruments
 from tradeforge_db.models import Instrument
+from tradeforge_engine.domain import Candle, InstrumentSpec
 
 logger = logging.getLogger(__name__)
 

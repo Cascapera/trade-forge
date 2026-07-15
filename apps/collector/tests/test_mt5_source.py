@@ -18,7 +18,7 @@ from typing import Any
 import pytest
 
 from tradeforge_collector.mt5_source import MT5Source, asset_class_from_path, infer_server_offset
-from tradeforge_db.models import AssetClass
+from tradeforge_engine.domain import AssetClass
 
 UTC_NOON = dt.datetime(2024, 6, 3, 12, 0, tzinfo=dt.UTC)
 

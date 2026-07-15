@@ -10,15 +10,13 @@ What is stored here is metadata and results. The candles themselves live in Parq
 
 from tradeforge_db.base import MONEY, PRICE, RATIO, VOLUME, Base
 from tradeforge_db.config import PostgresSettings
-from tradeforge_db.instruments import InstrumentSpec, upsert_dataset, upsert_instruments
+from tradeforge_db.instruments import upsert_dataset, upsert_instruments
 from tradeforge_db.migrate import alembic_config, downgrade, heads, upgrade
 from tradeforge_db.models import (
-    AssetClass,
     Backtest,
     BacktestMetrics,
     BacktestStatus,
     Dataset,
-    Direction,
     ExitReason,
     Instrument,
     Strategy,
@@ -33,16 +31,13 @@ __all__ = [
     "PRICE",
     "RATIO",
     "VOLUME",
-    "AssetClass",
     "Backtest",
     "BacktestMetrics",
     "BacktestStatus",
     "Base",
     "Dataset",
-    "Direction",
     "ExitReason",
     "Instrument",
-    "InstrumentSpec",
     "PostgresSettings",
     "Strategy",
     "Trade",

@@ -21,6 +21,7 @@ That refusal lives on the first line of `compile_strategy`.
 import datetime as dt
 from collections import deque
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import Final
 
 from tradeforge_engine.domain import (
@@ -69,6 +70,31 @@ def _max_lookback(condition: Condition) -> int:
     return _max_lookback(condition.condition)  # NotOf
 
 
+@dataclass(frozen=True, slots=True)
+class StopRule:
+    """A `candle_extreme` stop, compiled: the low (or high) of the last `lookback` closed bars.
+
+    The level is resolved on the **decision** bar, from candles the strategy has already seen —
+    which is what keeps the stop anti-lookahead-safe. A stop the broker computed at fill time
+    would peek at the fill bar; this one is fixed the instant the entry is decided.
+    """
+
+    lookback: int
+    side: str  # "low" (a stop below a long) or "high" (a stop above a short)
+
+    def level(self, candles: Sequence[Candle]) -> Money | None:
+        """The extreme over the last `lookback` closed candles (newest-first), or `None` while
+        there are not yet that many — in which case percent-risk sizing declines the trade,
+        because a stop measured over fewer bars than asked is not the stop that was asked for.
+        """
+        if len(candles) < self.lookback:
+            return None
+        window = list(candles)[: self.lookback]
+        if self.side == "low":
+            return min(candle.low for candle in window)
+        return max(candle.high for candle in window)
+
+
 class CompiledStrategy:
     """A DSL strategy compiled into the engine's `Strategy` protocol.
 
@@ -78,9 +104,13 @@ class CompiledStrategy:
     while already in the trade is not this phase's business — one position at a time). Flat ⇒
     entry conditions decide, long taking precedence over short on the rare bar both fire.
 
-    Stops, targets and sizing are declared in the DSL but *not* resolved here: they belong to
-    the broker and risk manager of PR-105, which is the seam that executes them intrabar. This
-    class emits condition-driven intent and nothing else — the clean half of the boundary.
+    The **stop level** is resolved here (PR-105): a `candle_extreme` stop is an extreme over
+    closed candles, and the strategy is the only place that both has that history and is
+    forbidden from seeing the future — so the entry `Signal` leaves here already carrying its
+    stop price. The **target** (a risk multiple of that stop) and the **size** are still not
+    resolved here: the target needs the fill price and the size needs the account, and both
+    belong to the broker and risk manager. This class fixes intent and the one level that must
+    be anti-lookahead-safe; the rest is executed downstream.
     """
 
     def __init__(  # noqa: PLR0913 — keyword-only; each names one compiled part of a strategy
@@ -92,6 +122,7 @@ class CompiledStrategy:
         entry_long: Condition | None,
         entry_short: Condition | None,
         exit_conditions: tuple[Condition, ...],
+        stop_rule: StopRule | None,
         history_depth: int,
     ) -> None:
         self.name = name
@@ -100,6 +131,7 @@ class CompiledStrategy:
         self._entry_long = entry_long
         self._entry_short = entry_short
         self._exit_conditions = exit_conditions
+        self._stop_rule = stop_rule
         # Newest-first, bounded: the deepest ref plus one bar for the edge operators' "previous
         # bar", plus the current bar. A window any shorter would resolve a legal ref to None.
         self._candles: deque[Candle] = deque(maxlen=history_depth)
@@ -143,12 +175,13 @@ class CompiledStrategy:
             return [self._entry(Side.SHORT, candle)]
         return []
 
-    @staticmethod
-    def _entry(side: Side, candle: Candle) -> Signal:
+    def _entry(self, side: Side, candle: Candle) -> Signal:
+        stop = self._stop_rule.level(self._candles) if self._stop_rule is not None else None
         return Signal(
             kind=SignalKind.ENTRY,
             side=side,
             reference_price=candle.close,
+            stop_loss=stop,
             reason=f"entry.{side.value}",
         )
 
@@ -215,10 +248,14 @@ def compile_strategy(document: Mapping[str, object]) -> CompiledStrategy:
     exit_conditions = tuple(
         compile_condition(_require_mapping(node, "exit condition")) for node in raw_exit_conditions
     )
+    stop_rule = _compile_stop(exit_block)
 
     trees = [tree for tree in (entry_long, entry_short, *exit_conditions) if tree is not None]
-    # +2: the current bar (index 0) and the one bar back every edge operator can reach.
-    history_depth = max((_max_lookback(tree) for tree in trees), default=0) + 2
+    tree_lookback = max((_max_lookback(tree) for tree in trees), default=0)
+    stop_lookback = stop_rule.lookback if stop_rule is not None else 0
+    # +2: the current bar (index 0) and the one bar back every edge operator can reach. The
+    # stop's own lookback competes for the same window — a stop over 20 bars needs 20 kept.
+    history_depth = max(tree_lookback, stop_lookback) + 2
 
     return CompiledStrategy(
         name=name,
@@ -227,8 +264,34 @@ def compile_strategy(document: Mapping[str, object]) -> CompiledStrategy:
         entry_long=entry_long,
         entry_short=entry_short,
         exit_conditions=exit_conditions,
+        stop_rule=stop_rule,
         history_depth=history_depth,
     )
+
+
+def _compile_stop(exit_block: Mapping[str, object]) -> StopRule | None:
+    """Compile `exit.stop_loss`, or `None` if the strategy carries no stop.
+
+    Only `candle_extreme` exists in v1. A stop type the engine cannot resolve is refused, not
+    ignored — a strategy that meant to trade with a stop must not run without one.
+    """
+    raw = exit_block.get("stop_loss")
+    if raw is None:
+        return None
+    stop = _require_mapping(raw, "exit.stop_loss")
+    stop_type = stop.get("type")
+    if stop_type != "candle_extreme":
+        raise EngineError(
+            f"unsupported stop type {stop_type!r}; this engine builds 'candle_extreme'"
+        )
+    params = _require_mapping(stop.get("params"), "exit.stop_loss.params")
+    lookback = params.get("lookback")
+    side = params.get("side")
+    if not isinstance(lookback, int) or lookback < 1:
+        raise EngineError(f"candle_extreme lookback must be a positive int, got {lookback!r}")
+    if side not in ("low", "high"):
+        raise EngineError(f"candle_extreme side must be 'low' or 'high', got {side!r}")
+    return StopRule(lookback=lookback, side=side)
 
 
 __all__ = [

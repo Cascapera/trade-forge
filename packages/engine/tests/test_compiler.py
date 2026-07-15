@@ -21,8 +21,8 @@ from tradeforge_engine.domain import Candle, SignalKind
 from tradeforge_engine.errors import EngineError
 from tradeforge_engine.indicators import SMA
 from tradeforge_engine.loop import run
-from tradeforge_engine.strategy import compile_strategy
-from tradeforge_engine.testing import EURUSD, HOUR, START, FixedRisk, ImmediateFillBroker
+from tradeforge_engine.strategy import StopRule, compile_strategy
+from tradeforge_engine.testing import EURUSD, HOUR, START, FixedRisk, ImmediateFillBroker, bar
 
 _FIXTURES = Path(__file__).resolve().parents[2] / "schema" / "fixtures"
 
@@ -238,6 +238,52 @@ def test_exit_conditions_that_are_not_a_list_is_refused() -> None:
     document["exit"] = {"conditions": {"op": "gt"}}
     with pytest.raises(EngineError, match=r"exit\.conditions must be a list"):
         compile_strategy(document)
+
+
+# --------------------------------------------------------------------------- #
+# candle_extreme stop compilation                                               #
+# --------------------------------------------------------------------------- #
+
+
+def _with_stop(**params: object) -> dict[str, object]:
+    document = _crossover_strategy()
+    document["exit"] = {"stop_loss": {"type": "candle_extreme", "params": params}, "conditions": []}
+    return document
+
+
+def test_the_stop_is_compiled_and_sizes_the_window() -> None:
+    strategy = compile_strategy(_with_stop(lookback=5, side="low"))
+    assert strategy._stop_rule == StopRule(lookback=5, side="low")
+    assert strategy._candles.maxlen == 7  # max(condition lookback 0, stop 5) + 2
+
+
+def test_an_unsupported_stop_type_is_refused() -> None:
+    document = _crossover_strategy()
+    document["exit"] = {"stop_loss": {"type": "trailing", "params": {}}, "conditions": []}
+    with pytest.raises(EngineError, match="unsupported stop type"):
+        compile_strategy(document)
+
+
+def test_a_bad_stop_lookback_is_refused() -> None:
+    with pytest.raises(EngineError, match="lookback must be a positive int"):
+        compile_strategy(_with_stop(lookback=0, side="low"))
+
+
+def test_a_bad_stop_side_is_refused() -> None:
+    with pytest.raises(EngineError, match="side must be 'low' or 'high'"):
+        compile_strategy(_with_stop(lookback=2, side="middle"))
+
+
+def test_stop_rule_level_over_low_and_high() -> None:
+    """The extreme over the last N bars, newest-first — and `None` before there are N."""
+    candles = [
+        bar(2, open_="1.10", close="1.11", high="1.12", low="1.09"),
+        bar(1, open_="1.09", close="1.10", high="1.11", low="1.07"),
+        bar(0, open_="1.08", close="1.09", high="1.10", low="1.06"),
+    ]
+    assert StopRule(lookback=3, side="low").level(candles) == Decimal("1.06")
+    assert StopRule(lookback=2, side="high").level(candles) == Decimal("1.12")
+    assert StopRule(lookback=5, side="low").level(candles) is None  # not enough history yet
 
 
 def test_a_duplicate_indicator_id_is_refused() -> None:

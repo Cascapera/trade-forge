@@ -18,6 +18,8 @@ Three invariants hold here and are enforced by tests (AGENTS.md §5):
 * **Broker agnosticism** — the engine never learns where an order is executed.
 """
 
+from tradeforge_engine.backtest_broker import BacktestBroker
+from tradeforge_engine.costs import CommissionCostModel, NoCostModel, SpreadCostModel
 from tradeforge_engine.domain import (
     AccountState,
     AssetClass,
@@ -49,6 +51,7 @@ from tradeforge_engine.protocols import (
     RiskManager,
     Strategy,
 )
+from tradeforge_engine.risk import PercentRiskManager
 from tradeforge_engine.strategy import CompiledStrategy, compile_strategy
 
 __all__ = [
@@ -56,9 +59,11 @@ __all__ = [
     "SMA",
     "AccountState",
     "AssetClass",
+    "BacktestBroker",
     "Broker",
     "Candle",
     "ClosedTrade",
+    "CommissionCostModel",
     "CompiledStrategy",
     "Condition",
     "Context",
@@ -71,8 +76,10 @@ __all__ = [
     "InstrumentSpec",
     "LookaheadError",
     "Money",
+    "NoCostModel",
     "OrderRequest",
     "OrderResult",
+    "PercentRiskManager",
     "Portfolio",
     "Position",
     "RiskManager",
@@ -80,6 +87,7 @@ __all__ = [
     "Side",
     "Signal",
     "SignalKind",
+    "SpreadCostModel",
     "Strategy",
     "Volume",
     "__version__",

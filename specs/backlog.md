@@ -36,3 +36,17 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
   aceitá-lo em silêncio inflava o P&L pelo volume inteiro da posição. Fill parcial é
   comportamento normal do MT5 em mercado fino, então a Fase 2 precisa decidir: ou o `MT5Broker`
   agrega os parciais antes de devolver um `Fill`, ou o ledger passa a suportar posição parcial.
+- [origem: PR-105] **Fiação do `take_profit`/`risk_multiple` (rr) no worker** — o compilador só
+  consome `exit.stop_loss`; o `rr` do `take_profit` é passado à mão ao construir o `BacktestBroker`
+  (o golden faz `take_profit_rr=Decimal(2)`). Isso é coerente com a fronteira 104/105 (o alvo é do
+  broker), mas um documento com `rr` **compila sem erro** e, se o worker do PR-107 construir o
+  broker sem o `rr`, a posição roda sem alvo — divergência silenciosa. O worker deve ler o `rr` da
+  DSL e/ou assertar consistência ao montar broker+estratégia.
+- [origem: PR-105] **Slippage em exits protetivos** — stop/alvo preenchem no nível exato, sem
+  derrapagem (só o gap-through-stop via `min(open, stop)` modela pessimismo). Um stop real é ordem
+  a mercado e derrapa; o comportamento atual é levemente otimista. Travado por teste explícito
+  (`test_a_protective_exit_fills_at_the_level_without_slippage`). Modelar derrapagem no stop quando
+  houver dado de tick/spread para calibrá-la.
+- [origem: PR-105] **`RiskManager.allow` é sempre `True`** — o veto (limite de perda diária, kill
+  switch) precisa de estado que o método ainda não recebe: o equity de abertura do dia e o relógio
+  da barra. É concern de sessão (salvaguardas do `sdd.md §11`); fiar quando o worker/sessão existir.

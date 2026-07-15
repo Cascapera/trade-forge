@@ -22,6 +22,7 @@ Money is `Decimal`, never `float` — see ADR-0011.
 """
 
 import datetime as dt
+from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import StrEnum
@@ -337,3 +338,46 @@ class Context:
     instrument: InstrumentSpec
     account: AccountState
     position: Position | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class EvalContext:
+    """What a DSL condition is allowed to read on one bar — and how far back.
+
+    Richer than `Context`, which hands the strategy a single candle. A condition speaks the
+    DSL's reference grammar, and that grammar reaches named indicators and closed candles N
+    bars back — neither of which fits in a one-candle view. But it is the *same*
+    anti-lookahead rule, not a relaxation of it: `candles[0]` is the bar that just closed,
+    and there is no index into this object that reaches a bar which has not.
+
+    **Newest-first**, deliberately. `candles[0]` is the current bar N, `candles[1]` is N-1,
+    and `candle[-1]` in the DSL is `candles[1]` here. Indicator values follow the same
+    convention: `indicator_values["sma_fast"][0]` is this bar's value, `[1]` the previous
+    bar's, and `None` anywhere the indicator was still warming up.
+
+    Holding only resolved *values* — candles and decimals, never indicator objects — is what
+    keeps the domain free of the indicator machinery. The strategy owns the indicators and
+    the rolling windows; by the time a condition sees an `EvalContext`, everything is a plain
+    number the anti-lookahead rule has already vouched for.
+    """
+
+    candles: tuple[Candle, ...]
+    indicator_values: Mapping[str, tuple[Money | None, ...]]
+    position: Position | None = None
+
+    def candle_at(self, offset: int) -> Candle | None:
+        """The bar `offset` steps back from the current one (0 = now), or `None` past the
+        edge of what has been seen. A ref reaching past the horizon is not an error — early
+        in a run there simply is no candle there, and the condition that asked is false."""
+        if 0 <= offset < len(self.candles):
+            return self.candles[offset]
+        return None
+
+    def indicator_at(self, indicator_id: str, offset: int) -> Money | None:
+        """This indicator's value `offset` bars back (0 = now), or `None` if it is unknown —
+        the indicator was warming up, or there is not yet that much history to look back on.
+        An unknown id resolves to `None`; the compiler is what proves ids exist, not this."""
+        history = self.indicator_values.get(indicator_id)
+        if history is None or not (0 <= offset < len(history)):
+            return None
+        return history[offset]

@@ -25,6 +25,7 @@ from tradeforge_engine.domain import (
     ClosedTrade,
     Context,
     EquityPoint,
+    EvalContext,
     Fill,
     InstrumentSpec,
     Money,
@@ -37,6 +38,7 @@ from tradeforge_engine.domain import (
     Volume,
 )
 from tradeforge_engine.errors import EngineError, LookaheadError
+from tradeforge_engine.indicators import EMA, SMA, build_indicator
 from tradeforge_engine.loop import RunResult, run
 from tradeforge_engine.portfolio import Portfolio
 from tradeforge_engine.protocols import (
@@ -47,18 +49,23 @@ from tradeforge_engine.protocols import (
     RiskManager,
     Strategy,
 )
+from tradeforge_engine.strategy import CompiledStrategy, compile_strategy
 
 __all__ = [
+    "EMA",
+    "SMA",
     "AccountState",
     "AssetClass",
     "Broker",
     "Candle",
     "ClosedTrade",
+    "CompiledStrategy",
     "Condition",
     "Context",
     "CostModel",
     "EngineError",
     "EquityPoint",
+    "EvalContext",
     "Fill",
     "Indicator",
     "InstrumentSpec",
@@ -76,6 +83,8 @@ __all__ = [
     "Strategy",
     "Volume",
     "__version__",
+    "build_indicator",
+    "compile_strategy",
     "run",
 ]
 

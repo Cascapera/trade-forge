@@ -25,6 +25,7 @@ from tradeforge_engine.domain import (
     Candle,
     ClosedTrade,
     Context,
+    EvalContext,
     Fill,
     InstrumentSpec,
     Money,
@@ -138,9 +139,15 @@ class Indicator(Protocol):
 
 @runtime_checkable
 class Condition(Protocol):
-    """One node of the strategy's expression tree, evaluated once per candle."""
+    """One node of the strategy's expression tree, evaluated once per closed candle.
 
-    def evaluate(self, context: Context) -> bool: ...
+    Takes an `EvalContext`, not the loop's `Context` (sdd.md §3.3.2). A condition can name
+    an indicator and reach a candle N bars back, and neither of those lives in the
+    single-candle view the loop hands the strategy. Same anti-lookahead discipline, wider
+    vocabulary — and the wider vocabulary is precisely why it needs its own context.
+    """
+
+    def evaluate(self, context: EvalContext) -> bool: ...
 
 
 @runtime_checkable

@@ -104,6 +104,45 @@ class FillsExactlyAtTheDecision(ImmediateFillBroker):
         return fills
 
 
+class FillsAtAPriceTheBarNeverTraded(ImmediateFillBroker):
+    """Books the fill at a price outside the bar's own range.
+
+    The most expensive fantasy in backtesting: "the stop always fills at the stop level".
+    A long position has its stop above where the bar opens; price gaps up through it, and
+    the bar's whole range sits below the stop. A naive broker reports the fill *at the stop*
+    anyway — a price nobody in the market ever paid — and the backtest books a gain the tape
+    would never have handed you. The fill's time is honest (inside the bar) and its
+    `decided_at` is honest (an earlier bar), so it clears both the floor and the ceiling.
+    Only the range guard sees it.
+    """
+
+    def on_bar(self, candle: Candle) -> Sequence[Fill]:
+        fills = [
+            Fill(
+                order=order,
+                time=candle.time,
+                price=candle.high + Decimal("0.00500"),  # above everything the bar traded at
+                volume=order.volume,
+                costs=Decimal(0),
+            )
+            for order in self._pending
+        ]
+        self._pending.clear()
+        return fills
+
+
+def test_a_fill_at_a_price_the_bar_never_traded_is_refused() -> None:
+    """The range guard, and the only test that reaches it.
+
+    The floor and the ceiling both pass — the fill is stamped inside the bar being processed
+    and the order was decided on an earlier one. Every other lookahead test fills at
+    `candle.open` or `candle.close`, always within `[low, high]`, so the range check has
+    never once fired. Line coverage said it ran; it never ran *true*.
+    """
+    with pytest.raises(LookaheadError, match="nobody traded there"):
+        a_run(FillsAtAPriceTheBarNeverTraded())
+
+
 def test_a_fill_inside_the_decision_candle_is_refused() -> None:
     """A price the strategy had already read is not a price it can trade at.
 

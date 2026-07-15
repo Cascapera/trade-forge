@@ -105,6 +105,20 @@ def test_a_fill_at_a_price_of_zero_is_refused() -> None:
         )
 
 
+def test_a_fill_for_no_volume_is_refused() -> None:
+    """A fill that moved zero lots did not happen. The order's volume invariant does not
+    reach here — a broker builds a `Fill` itself, and a bug that fills nothing must not slip
+    into the ledger as a real execution."""
+    with pytest.raises(ValueError, match="volume must be positive"):
+        Fill(
+            order=an_order(),
+            time=T0 + dt.timedelta(hours=1),
+            price=Decimal("1.10000"),
+            volume=Decimal(0),
+            costs=Decimal(0),
+        )
+
+
 def test_a_naive_candle_is_refused() -> None:
     """ "2024-01-01 09:00" is not an instant until you say where.
 

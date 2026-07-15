@@ -10,8 +10,8 @@ from decimal import Decimal
 
 import pytest
 
-from tradeforge_engine.domain import Candle, OrderRequest, OrderResult, Side, SignalKind
-from tradeforge_engine.errors import LookaheadError
+from tradeforge_engine.domain import Candle, OrderRequest, OrderResult, Position, Side, SignalKind
+from tradeforge_engine.errors import EngineError, LookaheadError
 from tradeforge_engine.loop import run
 from tradeforge_engine.testing import (
     EURUSD,
@@ -301,6 +301,39 @@ def test_a_weekend_gap_fills_at_the_monday_open() -> None:
     [fill] = result.fills
     assert fill.time == monday.time
     assert fill.price == monday.open
+
+
+def test_two_open_positions_in_the_traded_symbol_are_refused() -> None:
+    """Phase 1 holds one position at a time, and the engine will not quietly pick one.
+
+    If a broker reports two open positions in the symbol being traded, `_open_position` has
+    no honest answer to "what is my position?" — building an exit out of either one throws
+    away the other. It raises rather than guess, because guessing is how a strategy ends up
+    closing half of a book it did not know it had.
+    """
+
+    def a_position(price: str) -> Position:
+        return Position(
+            symbol="EURUSD",
+            side=Side.LONG,
+            volume=Decimal(1),
+            entry_price=Decimal(price),
+            entry_time=dt.datetime(2024, 1, 1, tzinfo=dt.UTC),
+        )
+
+    class AccountWithTwoEurusdPositions(ImmediateFillBroker):
+        def positions(self, symbol: str) -> list[Position]:  # noqa: ARG002
+            return [a_position("1.10000"), a_position("1.10100")]
+
+    with pytest.raises(EngineError, match="phase 1 holds one at a time"):
+        run(
+            timeframe=HOUR,
+            candles=rising(4),
+            instrument=EURUSD,
+            strategy=ScriptedStrategy(),
+            broker=AccountWithTwoEurusdPositions(),
+            risk=FixedRisk(),
+        )
 
 
 def test_the_broker_is_reached_only_through_the_protocol() -> None:

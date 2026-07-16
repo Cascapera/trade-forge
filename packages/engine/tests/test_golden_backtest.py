@@ -11,6 +11,7 @@ concrete assertion on the golden (which ends flat) and a property-based one over
 """
 
 import csv
+import datetime as dt
 from decimal import Decimal
 from pathlib import Path
 
@@ -21,6 +22,7 @@ from tradeforge_engine.backtest_broker import BacktestBroker
 from tradeforge_engine.costs import NoCostModel, SpreadCostModel
 from tradeforge_engine.domain import Candle, Side
 from tradeforge_engine.loop import run
+from tradeforge_engine.metrics import compute_metrics
 from tradeforge_engine.risk import PercentRiskManager
 from tradeforge_engine.strategy import compile_strategy
 from tradeforge_engine.testing import EURUSD, HOUR, START
@@ -107,6 +109,67 @@ def test_golden_matches_the_hand_worked_spreadsheet() -> None:
     # Reconciliation: the run ends flat, so the trades account for the whole equity change.
     assert sum((trade.net_pnl for trade in result.trades), Decimal(0)) == Decimal("100.00")
     assert broker.positions("EURUSD") == ()
+
+
+def test_golden_r_multiple_and_context() -> None:
+    """Each trade's result in R and the indicator snapshot that justified its entry.
+
+    Trade 1 risked $100 (1% of $10 000) and made +$200 ⇒ +2R; trade 2 risked $100 and lost
+    it ⇒ -1R. The context is the SMA pair on the decision bar (bar 3, then bar 10)."""
+    broker = BacktestBroker(
+        instrument=EURUSD,
+        initial_capital=Decimal(10_000),
+        cost_model=NoCostModel(),
+        take_profit_rr=Decimal(2),
+    )
+    result = run(
+        candles=_golden_candles(),
+        timeframe=HOUR,
+        instrument=EURUSD,
+        strategy=compile_strategy(_ma_cross_strategy()),
+        broker=broker,
+        risk=PercentRiskManager(percent=Decimal(1)),
+    )
+
+    win, loss = result.trades
+    assert win.r_multiple == Decimal("2")
+    assert loss.r_multiple == Decimal("-1")
+    assert win.context == {"fast": Decimal("1.09925"), "slow": Decimal("1.09900")}
+    assert loss.context == {"fast": Decimal("1.10550"), "slow": Decimal("1.10400")}
+
+
+def test_golden_metrics_by_hand() -> None:
+    """The §5 metrics over the golden — the spec's hand-verified acceptance criteria."""
+    broker = BacktestBroker(
+        instrument=EURUSD,
+        initial_capital=Decimal(10_000),
+        cost_model=NoCostModel(),
+        take_profit_rr=Decimal(2),
+    )
+    result = run(
+        candles=_golden_candles(),
+        timeframe=HOUR,
+        instrument=EURUSD,
+        strategy=compile_strategy(_ma_cross_strategy()),
+        broker=broker,
+        risk=PercentRiskManager(percent=Decimal(1)),
+    )
+    metrics = compute_metrics(
+        trades=result.trades,
+        equity_curve=result.equity_curve,
+        initial_capital=Decimal(10_000),
+    )
+
+    assert metrics.net_profit == Decimal("100.00")
+    assert metrics.win_rate == Decimal("0.5")
+    assert metrics.payoff == Decimal("2")
+    assert metrics.profit_factor == Decimal("2")
+    assert metrics.expectancy == Decimal("50.00")
+    # Peak equity $10 200 after trade 1, down to $10 100 after trade 2's stop.
+    assert metrics.max_drawdown_abs == Decimal("100.00")
+    # Trade 1 lasts one bar, trade 2 stops on its entry bar ⇒ average 30 minutes.
+    assert metrics.avg_trade_duration == dt.timedelta(minutes=30)
+    assert metrics.cagr is None  # 15-hour span is not annualised
 
 
 def test_costs_come_straight_off_the_bottom_line() -> None:

@@ -29,7 +29,7 @@ class PercentRiskManager:
 
     The arithmetic, and why each part is there:
 
-        risk_budget   = equity · percent/100          # the money you are willing to lose
+        risk_budget   = equity * percent/100          # the money you are willing to lose
         risk_per_lot  = money_for(|entry - stop|, 1)   # what one lot loses if the stop hits
         volume        = risk_budget / risk_per_lot
 

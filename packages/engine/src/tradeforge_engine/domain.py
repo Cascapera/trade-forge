@@ -193,6 +193,13 @@ class Signal:
     stop_loss: Money | None = None
     take_profit: Money | None = None
     reason: str = ""
+    context: Mapping[str, Money | None] | None = None
+    """What the indicators read at the instant this was decided.
+
+    Captured here, at the entry, and carried untouched all the way to the `ClosedTrade` — it
+    is the training material for the phase-3 analysis ("does this only work when ADX > 25?"),
+    and recomputing it afterwards would mean re-running the engine and trusting nothing moved.
+    None on an exit, and on any strategy with no indicators."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,6 +224,8 @@ class OrderRequest:
     stop_loss: Money | None = None
     take_profit: Money | None = None
     reason: str = ""
+    context: Mapping[str, Money | None] | None = None
+    """The indicator snapshot from the signal that produced this order. See `Signal.context`."""
 
     def __post_init__(self) -> None:
         _require_utc(self.decided_at, "OrderRequest.decided_at")
@@ -272,6 +281,8 @@ class Position:
     entry_costs: Money = ZERO
     stop_loss: Money | None = None
     take_profit: Money | None = None
+    context: Mapping[str, Money | None] | None = None
+    """The indicator snapshot from the entry that opened this position. See `Signal.context`."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -315,6 +326,15 @@ class ClosedTrade:
     costs: Money
     net_pnl: Money
     reason: str = ""
+    stop_loss: Money | None = None
+    take_profit: Money | None = None
+    r_multiple: Money | None = None
+    """Net result in multiples of the risk taken: `net_pnl / (money risked at the stop)`. The
+    unit that lets trades with different sizes and stops be compared — a +2R win is the same
+    edge whether it made $200 or $2 000. None when the position carried no stop to measure
+    risk against."""
+    context: Mapping[str, Money | None] | None = None
+    """The indicator snapshot from the entry. See `Signal.context`."""
 
 
 @dataclass(frozen=True, slots=True)

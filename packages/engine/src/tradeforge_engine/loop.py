@@ -209,6 +209,7 @@ def _to_order(
         stop_loss=signal.stop_loss,
         take_profit=signal.take_profit,
         reason=signal.reason,
+        context=signal.context,
     )
 
 

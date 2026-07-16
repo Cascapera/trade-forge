@@ -42,6 +42,7 @@ from tradeforge_engine.domain import (
 from tradeforge_engine.errors import EngineError, LookaheadError
 from tradeforge_engine.indicators import EMA, SMA, build_indicator
 from tradeforge_engine.loop import RunResult, run
+from tradeforge_engine.metrics import BacktestMetrics, compute_metrics
 from tradeforge_engine.portfolio import Portfolio
 from tradeforge_engine.protocols import (
     Broker,
@@ -60,6 +61,7 @@ __all__ = [
     "AccountState",
     "AssetClass",
     "BacktestBroker",
+    "BacktestMetrics",
     "Broker",
     "Candle",
     "ClosedTrade",
@@ -93,6 +95,7 @@ __all__ = [
     "__version__",
     "build_indicator",
     "compile_strategy",
+    "compute_metrics",
     "run",
 ]
 

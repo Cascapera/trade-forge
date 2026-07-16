@@ -50,3 +50,20 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
 - [origem: PR-105] **`RiskManager.allow` é sempre `True`** — o veto (limite de perda diária, kill
   switch) precisa de estado que o método ainda não recebe: o equity de abertura do dia e o relógio
   da barra. É concern de sessão (salvaguardas do `sdd.md §11`); fiar quando o worker/sessão existir.
+- [origem: PR-106] **Drawdown máximo abs e pct de vales diferentes** — em `metrics._drawdown` o maior
+  recuo em dinheiro e o maior recuo percentual são maximizados **independentemente**, então podem vir
+  de eventos distintos quando os picos estão em níveis diferentes. Cada métrica é o máximo real na sua
+  unidade (defensável), mas se a Fase 3 quiser reportar "o drawdown" como um evento único, os dois
+  precisam virar um par acoplado (o vale que maximiza um, não os dois separados).
+- [origem: PR-106] **Base do CAGR vs janela** — `_cagr` usa `initial_capital` como base mas o span
+  começa em `equity_curve[0].time`. Consistente enquanto a 1ª barra não tem posição aberta (o normal);
+  se algum dia a série começar já marcada a mercado, a taxa mistura base e janela. Rever se/quando o
+  worker gerar curvas que não começam no capital inicial.
+- [origem: PR-106] **Sharpe/Sortino não anualizados** — são calculados sobre retorno por-trade
+  (`net/initial`), sem composição nem fator de anualização. Escolha determinística e documentada, mas
+  a UI (PR-108) precisa rotular como "por trade", não confundir com o Sharpe anualizado padrão de
+  mercado. Decidir na UI se anualizamos (precisa de frequência de trades) ou só rotulamos.
+- [origem: PR-106] **Property-tests faltando nas métricas** — falta (a) reconciliação
+  `net_profit == sum(net_pnl)` sobre sequências aleatórias de trades e (b) r_multiple para short num
+  property-test dedicado. A aritmética de short é coberta indiretamente e os goldens/bordas são fartos,
+  mas um property fecharia a lacuna. Fazer junto do próximo PR que tocar `metrics.py`.

@@ -22,6 +22,7 @@ from tradeforge_db.models import (
     Strategy,
     Trade,
 )
+from tradeforge_db.results import to_rows
 from tradeforge_db.seeds import INSTRUMENT_SEEDS, seed_instruments
 from tradeforge_db.session import create_db_engine, create_session_factory, session_scope
 
@@ -49,6 +50,7 @@ __all__ = [
     "heads",
     "seed_instruments",
     "session_scope",
+    "to_rows",
     "upgrade",
     "upsert_dataset",
     "upsert_instruments",

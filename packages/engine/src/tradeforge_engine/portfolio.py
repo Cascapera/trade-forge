@@ -118,6 +118,7 @@ class Portfolio:
             entry_costs=fill.costs,
             stop_loss=fill.order.stop_loss,
             take_profit=fill.order.take_profit,
+            context=fill.order.context,
         )
 
     def _close(self, fill: Fill) -> ClosedTrade:
@@ -147,6 +148,7 @@ class Portfolio:
         self._position = None
 
         costs = position.entry_costs + fill.costs
+        net = gross - costs
         trade = ClosedTrade(
             symbol=position.symbol,
             side=position.side,
@@ -157,11 +159,30 @@ class Portfolio:
             exit_price=fill.price,
             gross_pnl=gross,
             costs=costs,
-            net_pnl=gross - costs,
+            net_pnl=net,
             reason=fill.order.reason,
+            stop_loss=position.stop_loss,
+            take_profit=position.take_profit,
+            r_multiple=self._r_multiple(position, net),
+            context=position.context,
         )
         self._trades.append(trade)
         return trade
+
+    def _r_multiple(self, position: Position, net_pnl: Money) -> Money | None:
+        """The result in multiples of the money risked at the stop, or None with no stop.
+
+        The risk is measured at the *entry* — `|entry - stop| * per-lot value * volume` — which
+        is the money the position stood to lose when it was opened. Dividing the net result by
+        it turns a dollar figure into a comparable unit: +2R is the same edge on any size.
+        """
+        if position.stop_loss is None:
+            return None
+        distance = abs(position.entry_price - position.stop_loss)
+        risk = self._instrument.money_for(distance, position.volume)
+        if risk <= ZERO:
+            return None
+        return net_pnl / risk
 
     def _pnl(self, position: Position, entry: Money, exit_price: Money) -> Money:
         """Written once, for a long, and flipped by the side's sign.

@@ -177,12 +177,16 @@ class CompiledStrategy:
 
     def _entry(self, side: Side, candle: Candle) -> Signal:
         stop = self._stop_rule.level(self._candles) if self._stop_rule is not None else None
+        # Snapshot every indicator at the instant of the decision — this is the trade's
+        # `context`, captured here because nowhere downstream can see these values again.
+        context = {name: indicator.value() for name, indicator in self._indicators.items()}
         return Signal(
             kind=SignalKind.ENTRY,
             side=side,
             reference_price=candle.close,
             stop_loss=stop,
             reason=f"entry.{side.value}",
+            context=context or None,
         )
 
 

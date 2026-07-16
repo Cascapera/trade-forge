@@ -30,6 +30,7 @@ def order(
     *,
     volume: str = "1",
     symbol: str = "EURUSD",
+    stop: str | None = None,
 ) -> OrderRequest:
     return OrderRequest(
         symbol=symbol,
@@ -37,6 +38,7 @@ def order(
         intent=intent,
         volume=Decimal(volume),
         decided_at=T0,
+        stop_loss=Decimal(stop) if stop is not None else None,
     )
 
 
@@ -164,6 +166,33 @@ def test_a_flat_account_marks_to_market_at_its_balance() -> None:
     portfolio.mark_to_market(bar(1, open_="1.10000", close="9.99999"))
 
     assert portfolio.account().equity == Decimal(10_000)
+
+
+def test_r_multiple_measures_the_result_against_the_risk_at_the_stop() -> None:
+    """Entry 1.10000, stop 1.09500 ⇒ risk 50 pips = $500 on one lot. A +100-pip win of $1 000
+    is +2R; the R-multiple is what makes that comparable across sizes and stops."""
+    portfolio = a_portfolio()
+    portfolio.apply(fill(order(stop="1.09500"), price="1.10000", time=T1))
+    trade = portfolio.apply(fill(order(intent=SignalKind.EXIT), price="1.11000", time=T2))
+    assert trade is not None
+    assert trade.net_pnl == Decimal("1000")
+    assert trade.r_multiple == Decimal("2")
+
+
+def test_r_multiple_is_undefined_without_a_stop_or_with_zero_risk() -> None:
+    """No stop, or a stop sitting on the entry, leaves no risk to divide by — `None`, not a
+    division by zero."""
+    no_stop = a_portfolio()
+    no_stop.apply(fill(order(), price="1.10000", time=T1))
+    trade = no_stop.apply(fill(order(intent=SignalKind.EXIT), price="1.11000", time=T2))
+    assert trade is not None
+    assert trade.r_multiple is None
+
+    zero_risk = a_portfolio()
+    zero_risk.apply(fill(order(stop="1.10000"), price="1.10000", time=T1))
+    trade = zero_risk.apply(fill(order(intent=SignalKind.EXIT), price="1.11000", time=T2))
+    assert trade is not None
+    assert trade.r_multiple is None
 
 
 def test_opening_a_second_position_is_refused() -> None:

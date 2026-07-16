@@ -127,7 +127,12 @@ class EMA:
             return
         if self._alpha is None:
             self._alpha = Decimal(2) / (self._period + 1)
-        self._value = price * self._alpha + self._value * (Decimal(1) - self._alpha)
+        # Written as `prev + alpha·(price - prev)`, not `price·alpha + prev·(1 - alpha)`.
+        # The two are algebraically identical, but the latter rounds `price·alpha` and
+        # `prev·(1 - alpha)` separately, and on a flat series (price == prev) the two ULPs
+        # do not cancel — the EMA of a constant drifts a last place off that constant. This
+        # form collapses to `prev + alpha·0 = prev` exactly, so a flat input stays flat.
+        self._value = self._value + self._alpha * (price - self._value)
 
     def value(self) -> Money | None:
         return self._value

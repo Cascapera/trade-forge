@@ -67,3 +67,20 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
   `net_profit == sum(net_pnl)` sobre sequências aleatórias de trades e (b) r_multiple para short num
   property-test dedicado. A aritmética de short é coberta indiretamente e os goldens/bordas são fartos,
   mas um property fecharia a lacuna. Fazer junto do próximo PR que tocar `metrics.py`.
+- [origem: PR-107] **Extrair o leitor de Parquet para um pacote compartilhado** — `apps/api` depende de
+  `tradeforge-collector` só pelo `read_candles`, e o collector é uma borda Windows-bound (importa MT5,
+  ainda que lazy). O leitor Parquet↔Candle é concern de dados, não de coleta; movê-lo para um
+  `packages/data` (ou `packages/db`) do qual collector E api dependem removeria a dependência app→app.
+  Adiado: refactor fora do escopo do PR-107 (mexeria no collector já mergeado).
+- [origem: PR-107] **Slippage no venue config** — o worker passa `slippage_ticks=0` fixo; a API não
+  expõe slippage porque não há onde persisti-lo (o `Backtest` não tem coluna). Reprodutibilidade exige
+  que tudo do "venue simulado" fique gravado. Incluir slippage no `cost_model` JSONB (ou coluna nova)
+  e ler no worker. Fazer quando slippage configurável importar (comparar cenários otimista/pessimista).
+- [origem: PR-107] **Progresso do worker é grosso** — publica só `running` (0%) e `done` (1%); não há
+  progresso intra-run (ex.: % de candles processados). O event loop do WS e o canal pub/sub já
+  suportam; falta o worker publicar no meio do `run`. Fazer quando um backtest longo tornar o "0→100"
+  frustrante na UI (PR-108).
+- [origem: PR-107] **Worker roda SQLAlchemy síncrono dentro do arq async** — bloqueia o event loop do
+  worker durante o `run` (CPU-bound) e as queries. Aceitável na Fase 1 (um job por vez, processo
+  dedicado), mas ao escalar concorrência do worker, mover o trabalho pesado para um executor de threads
+  ou usar sessão async. Anotar como dívida de escala, não de correção.

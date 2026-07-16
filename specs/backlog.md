@@ -84,3 +84,12 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
   worker durante o `run` (CPU-bound) e as queries. Aceitável na Fase 1 (um job por vez, processo
   dedicado), mas ao escalar concorrência do worker, mover o trabalho pesado para um executor de threads
   ou usar sessão async. Anotar como dívida de escala, não de correção.
+- [origem: PR-108] **Gráfico de candles com entradas/saídas** — a tela de resultados entrega cards +
+  curva de capital + tabela de trades, mas NÃO o gráfico de candles com marcadores de entrada/saída
+  (lightweight-charts). Falta o dado: OHLCV mora em Parquet (ADR-05), não no Postgres, e não há endpoint
+  que o sirva. Fatia seguinte: `GET /instruments/{symbol}/candles?tf&from&to` na API (lê via
+  `read_candles`, pagina/decima) + a série de candlestick na UI com os trades plotados. Escopo próprio.
+- [origem: PR-108] **Builder recursivo de condições** — o form guiado do PR-108 cobre comparações e UM
+  nível de all/any (o caso das estratégias-demo). A DSL suporta all/any/not aninhados em qualquer
+  profundidade; um editor de árvore recursivo (visual, arrastar/soltar) é o design final da Fase 2
+  (`sdd.md §3.3.5`). Fazer quando setups compostos exigirem aninhamento profundo.

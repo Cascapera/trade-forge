@@ -50,6 +50,12 @@ dev = [
     "pytest>=8.3",
     "pytest-cov>=6.0",
     "ruff>=0.9",
+    # FastAPI's TestClient is an httpx client driving the ASGI app in-process — no socket,
+    # no running server, so the router tests stay fast and hermetic.
+    "httpx>=0.28",
+    # Property-based API testing: schemathesis reads the app's own OpenAPI schema and
+    # generates requests that try to break each contract. Required by the PR-107 spec.
+    "schemathesis>=3.38",
 ]
 
 # --------------------------------------------------------------------------- #
@@ -87,8 +93,12 @@ select = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-# Tests may assert, use magic numbers, and skip return annotations.
-"**/tests/**" = ["S101", "PLR2004", "ANN201"]
+# Tests may assert, use magic numbers, and skip return annotations. They also lean on
+# test-idiomatic shapes a strict source would refuse: `Any` in generic fixtures/params
+# (ANN401), unused arguments in fakes and fixtures (ARG001/ARG002), throwaway credentials
+# for objects that never connect (S106), and nested `with` for a client-then-socket setup
+# (SIM117).
+"**/tests/**" = ["S101", "PLR2004", "ANN201", "ANN401", "ARG001", "ARG002", "S106", "SIM117"]
 # A CLI's stdout *is* its interface; print is the right call there, not logging.
 "**/cli.py" = ["T201"]
 

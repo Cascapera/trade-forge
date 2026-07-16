@@ -10,6 +10,8 @@ mode of a drifted DSN is not a crash, it is an application quietly reading the
 wrong database.
 """
 
+from pathlib import Path
+
 from tradeforge_db.config import PostgresSettings
 
 
@@ -18,6 +20,11 @@ class Settings(PostgresSettings):
 
     redis_host: str = "localhost"
     redis_port: int = 6379
+
+    # Where the collector wrote the Parquet candles (ADR-05). The worker reads a backtest's
+    # bars from here; the `datasets` row only proves coverage, the bytes live on disk under
+    # this root as `symbol/timeframe/...`. Env-driven so dev, CI and prod each point their own.
+    parquet_root: Path = Path("data/parquet")
 
     @property
     def redis_url(self) -> str:

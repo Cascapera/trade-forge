@@ -5,7 +5,7 @@ import globals from 'globals'
 import tseslint from 'typescript-eslint'
 
 export default tseslint.config(
-  { ignores: ['dist', 'coverage'] },
+  { ignores: ['dist', 'coverage', 'e2e', 'playwright.config.ts'] },
   js.configs.recommended,
   // Type-aware linting: these rules read the type graph, so they catch what a
   // purely syntactic linter cannot (floating promises, unsafe `any` flow).
@@ -26,4 +26,15 @@ export default tseslint.config(
   reactRefresh.configs.vite,
   // Config files are plain JS and have no project to type-check against.
   { files: ['**/*.js'], extends: [tseslint.configs.disableTypeChecked] },
+  // Test files and the render helper are never fast-refreshed, so the components-only export
+  // rule does not apply — the helper legitimately exports a render function.
+  {
+    files: ['**/*.test.{ts,tsx}', 'src/test-utils.tsx'],
+    rules: {
+      'react-refresh/only-export-components': 'off',
+      // Tests index into query results (`getAllBy…()[i]`), which is `T | undefined` under
+      // noUncheckedIndexedAccess; a `!` is the terse, accepted way to assert the element is there.
+      '@typescript-eslint/no-non-null-assertion': 'off',
+    },
+  },
 )

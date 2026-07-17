@@ -8,6 +8,7 @@ license = "Apache-2.0"
 dependencies = [
     "tradeforge-api",
     "tradeforge-collector",
+    "tradeforge-db",
     "tradeforge-engine",
     "tradeforge-executor",
     "tradeforge-schema",
@@ -20,22 +21,41 @@ dependencies = [
 package = false
 
 [tool.uv.workspace]
-members = ["apps/api", "apps/collector", "apps/executor", "packages/engine", "packages/schema"]
+members = [
+    "apps/api",
+    "apps/collector",
+    "apps/executor",
+    "packages/db",
+    "packages/engine",
+    "packages/schema",
+]
 
 [tool.uv.sources]
 tradeforge-api = { workspace = true }
 tradeforge-collector = { workspace = true }
+tradeforge-db = { workspace = true }
 tradeforge-engine = { workspace = true }
 tradeforge-executor = { workspace = true }
 tradeforge-schema = { workspace = true }
 
 [dependency-groups]
 dev = [
+    # Property-based testing. AGENTS.md §6 requires it in the engine: the invariants there
+    # ("the trades reconcile with the equity curve", "the same input gives the same output")
+    # are universally quantified statements, and an example-based test can only ever check
+    # the examples someone thought of.
+    "hypothesis>=6.120",
     "mypy>=1.14",
     "pre-commit>=4.6.0",
     "pytest>=8.3",
     "pytest-cov>=6.0",
     "ruff>=0.9",
+    # FastAPI's TestClient is an httpx client driving the ASGI app in-process — no socket,
+    # no running server, so the router tests stay fast and hermetic.
+    "httpx>=0.28",
+    # Property-based API testing: schemathesis reads the app's own OpenAPI schema and
+    # generates requests that try to break each contract. Required by the PR-107 spec.
+    "schemathesis>=3.38",
 ]
 
 # --------------------------------------------------------------------------- #
@@ -73,8 +93,12 @@ select = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-# Tests may assert, use magic numbers, and skip return annotations.
-"**/tests/**" = ["S101", "PLR2004", "ANN201"]
+# Tests may assert, use magic numbers, and skip return annotations. They also lean on
+# test-idiomatic shapes a strict source would refuse: `Any` in generic fixtures/params
+# (ANN401), unused arguments in fakes and fixtures (ARG001/ARG002), throwaway credentials
+# for objects that never connect (S106), and nested `with` for a client-then-socket setup
+# (SIM117).
+"**/tests/**" = ["S101", "PLR2004", "ANN201", "ANN401", "ARG001", "ARG002", "S106", "SIM117"]
 # A CLI's stdout *is* its interface; print is the right call there, not logging.
 "**/cli.py" = ["T201"]
 
@@ -87,6 +111,7 @@ ban-relative-imports = "all"
 known-first-party = [
     "tradeforge_api",
     "tradeforge_collector",
+    "tradeforge_db",
     "tradeforge_engine",
     "tradeforge_executor",
     "tradeforge_schema",
@@ -116,11 +141,20 @@ mypy_path = [
     "apps/api/src",
     "apps/collector/src",
     "apps/executor/src",
+    "packages/db/src",
     "packages/engine/src",
     "packages/schema/src",
 ]
 files = ["apps/api", "apps/collector", "apps/executor", "packages", "tests"]
 exclude = ["apps/web"]
+
+# Two third-party libraries ship no type information: MetaTrader5 (which has no Linux
+# wheel at all, so on CI mypy cannot even find it) and pyarrow. Silencing *only these
+# imports* keeps every line we write under --strict — the untyped edges stay thin and
+# are covered by tests instead.
+[[tool.mypy.overrides]]
+module = ["MetaTrader5", "pyarrow.*"]
+ignore_missing_imports = true
 
 # --------------------------------------------------------------------------- #
 # Pytest + coverage                                                             #
@@ -132,6 +166,7 @@ testpaths = [
     "apps/api/tests",
     "apps/collector/tests",
     "apps/executor/tests",
+    "packages/db/tests",
     "packages/engine/tests",
     "packages/schema/tests",
 ]
@@ -139,6 +174,12 @@ addopts = [
     "-ra",
     "--strict-markers",
     "--strict-config",
+    # Import test modules by path, not by module name. Without this, `apps/api/tests/
+    # test_config.py` and `packages/db/tests/test_config.py` both want to be the module
+    # `test_config`, and pytest refuses to collect the second one. The alternative —
+    # prefixing every file with its package — makes the file tree shout what the
+    # directory already says.
+    "--import-mode=importlib",
     "--cov",
     "--cov-report=term-missing",
     "--cov-report=xml",
@@ -160,6 +201,7 @@ relative_files = true
 source = [
     "tradeforge_api",
     "tradeforge_collector",
+    "tradeforge_db",
     "tradeforge_engine",
     "tradeforge_executor",
     "tradeforge_schema",

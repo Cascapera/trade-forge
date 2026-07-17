@@ -5,7 +5,8 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from tradeforge_api.config import Settings
+from tradeforge_api.config import RedisConfig, Settings
+from tradeforge_api.queue import redis_settings
 
 
 @pytest.fixture(autouse=True)
@@ -39,6 +40,21 @@ def test_redis_url_is_composed_from_its_parts(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setenv("REDIS_PORT", "6380")
 
     assert Settings().redis_url == "redis://cache.internal:6380/0"
+
+
+def test_redis_settings_need_no_database_password(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The worker builds arq's redis settings in its class body, at import time.
+
+    Regression: it used to build the full `Settings` there — which requires POSTGRES_PASSWORD —
+    so importing the worker (as any test reaching `process_backtest` does) failed wherever the
+    password was unset, and that broke pytest collection in CI. Redis needs only host and port,
+    so `redis_settings(RedisConfig())` must succeed with no database credential in the room.
+    """
+    monkeypatch.delenv("POSTGRES_PASSWORD", raising=False)
+
+    settings = redis_settings(RedisConfig())
+
+    assert settings.port == RedisConfig().redis_port
 
 
 def test_refuses_to_start_without_a_password(monkeypatch: pytest.MonkeyPatch) -> None:

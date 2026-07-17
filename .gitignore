@@ -25,6 +25,11 @@ coverage/
 apps/web/dist/
 *.tsbuildinfo
 
+# --- Playwright ---
+apps/web/test-results/
+apps/web/playwright-report/
+apps/web/.playwright/
+
 # --- Market data (large, regenerable from MT5) ---
 data/
 *.parquet
@@ -37,3 +42,6 @@ docs/aulas/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Downloaded OHLCV. Reproducible from a backfill; never a repository artefact.
+data/

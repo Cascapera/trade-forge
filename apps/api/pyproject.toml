@@ -5,8 +5,19 @@ description = "FastAPI backend: strategies, backtests, live sessions. Portable (
 requires-python = ">=3.12,<3.13"
 license = "Apache-2.0"
 dependencies = [
+    "tradeforge-db",
     "tradeforge-engine",
     "tradeforge-schema",
+    # The collector owns the Parquet reader (`read_candles`); the worker reuses it rather
+    # than duplicating pyarrow. Safe on Linux: the collector imports `MetaTrader5` lazily,
+    # only inside `connect()`, so depending on the package never pulls the Windows-only wheel.
+    "tradeforge-collector",
+    "fastapi>=0.115",
+    # `[standard]` brings the websockets and httptools that the WS endpoint and a production
+    # server need; without it uvicorn runs but cannot speak WebSocket.
+    "uvicorn[standard]>=0.34",
+    # The async job queue (spec: arq). Redis is the broker; arq is the runner.
+    "arq>=0.26",
     "pydantic-settings>=2.7",
     "psycopg[binary]>=3.2",
     "redis>=5.2",

@@ -11,7 +11,7 @@ and tell whether a 2:1 take-profit means anything without a stop-loss to measure
 risk against. JSON Schema validates *shape*, never *meaning*.
 """
 
-from typing import Annotated, Literal
+from typing import Annotated, Final, Literal, get_args
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -33,6 +33,12 @@ INDICATOR_ID_PATTERN = r"^[a-z_][a-z0-9_]*$"
 
 type Timeframe = Literal["M1", "M5", "M15", "M30", "H1", "H4", "D1", "W1"]
 type PriceSource = Literal["open", "high", "low", "close"]
+
+# The same list, as a runtime value. The database needs it for a CHECK constraint
+# and the engine will need it to parse a bar interval; deriving both from the type
+# alias means a new timeframe is one edit above, never three edits in three places
+# that drift apart the day someone forgets the third.
+TIMEFRAMES: Final[tuple[Timeframe, ...]] = get_args(Timeframe.__value__)
 
 
 class _Node(BaseModel):

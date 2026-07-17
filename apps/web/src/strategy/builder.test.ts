@@ -6,6 +6,7 @@ import {
   emptyForm,
   maCrossForm,
   OPS,
+  rsiOversoldForm,
   TIMEFRAMES,
   type SideForm,
 } from './builder'
@@ -21,17 +22,29 @@ describe('buildCondition', () => {
   })
 
   it('collapses a single row to a bare comparison', () => {
-    expect(buildCondition(side([{ left: 'fast', op: 'gt', right: 'slow' }]))).toEqual({
+    expect(
+      buildCondition(side([{ left: 'fast', op: 'gt', right: 'slow', rightKind: 'ref' }])),
+    ).toEqual({
       op: 'gt',
       left: { ref: 'fast' },
       right: { ref: 'slow' },
     })
   })
 
+  it('folds a value operand into a literal constant', () => {
+    expect(
+      buildCondition(side([{ left: 'rsi', op: 'lt', right: '30', rightKind: 'value' }])),
+    ).toEqual({
+      op: 'lt',
+      left: { ref: 'rsi' },
+      right: { value: 30 },
+    })
+  })
+
   it('wraps several rows in all or any', () => {
     const rows = [
-      { left: 'a', op: 'gt' as const, right: 'b' },
-      { left: 'c', op: 'lt' as const, right: 'd' },
+      { left: 'a', op: 'gt' as const, right: 'b', rightKind: 'ref' as const },
+      { left: 'c', op: 'lt' as const, right: 'd', rightKind: 'ref' as const },
     ]
     expect(buildCondition(side(rows, 'all'))).toEqual({
       all: [
@@ -47,6 +60,16 @@ describe('buildStrategy', () => {
   it('produces a valid MA-cross document from the template', () => {
     const result = validateStrategy(buildStrategy(maCrossForm()))
     expect(result.valid).toBe(true)
+  })
+
+  it('produces a valid RSI document with literal thresholds from the template', () => {
+    const document = buildStrategy(rsiOversoldForm())
+    expect(validateStrategy(document).valid).toBe(true)
+    expect(document.entry.long).toEqual({
+      op: 'crosses_below',
+      left: { ref: 'rsi' },
+      right: { value: 30 },
+    })
   })
 
   it('omits indicators when there are none and includes them when present', () => {

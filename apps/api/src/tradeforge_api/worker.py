@@ -23,7 +23,7 @@ from typing import Any
 from redis.asyncio import Redis
 from sqlalchemy.orm import Session
 
-from tradeforge_api.config import Settings
+from tradeforge_api.config import RedisConfig, Settings
 from tradeforge_api.queue import progress_channel, redis_settings
 from tradeforge_api.runner import execute_backtest
 from tradeforge_collector import read_candles
@@ -157,7 +157,9 @@ class WorkerSettings:
     """`arq tradeforge_api.worker.WorkerSettings` starts the worker from this."""
 
     functions = (run_backtest,)
-    redis_settings = redis_settings(Settings())
+    # Built from RedisConfig, not Settings: this line runs at import, and importing the worker
+    # must not require the Postgres password. The DB config is read later, in `startup`.
+    redis_settings = redis_settings(RedisConfig())
     on_startup = startup
     on_shutdown = shutdown
 

@@ -13,7 +13,7 @@ from typing import Protocol
 
 from arq.connections import RedisSettings
 
-from tradeforge_api.config import Settings
+from tradeforge_api.config import RedisConfig
 
 # The job name. The worker registers a coroutine under exactly this string (see `worker.py`),
 # and the router enqueues by it — a mismatch would enqueue jobs no worker ever claims.
@@ -28,8 +28,12 @@ class JobQueue(Protocol):
     async def enqueue_job(self, function: str, *args: object) -> object: ...
 
 
-def redis_settings(settings: Settings) -> RedisSettings:
-    """arq's own connection settings, built from the same host/port the rest of the app uses."""
+def redis_settings(settings: RedisConfig) -> RedisSettings:
+    """arq's own connection settings, built from the same host/port the rest of the app uses.
+
+    Takes `RedisConfig`, not the full `Settings`, so the worker can build these at import time
+    without a Postgres password on hand — a full `Settings` still satisfies it by inheritance.
+    """
     return RedisSettings(host=settings.redis_host, port=settings.redis_port)
 
 

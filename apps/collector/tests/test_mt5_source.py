@@ -65,7 +65,7 @@ class _FakeTerminal:
     def symbol_info(self, symbol: str) -> _SymbolInfo | None:
         return _SymbolInfo(name=symbol) if symbol == "EURUSD" else None
 
-    def symbol_info_tick(self, symbol: str) -> Any:  # noqa: ANN401, ARG002
+    def symbol_info_tick(self, symbol: str) -> Any:
         # A tick timestamped in the server's clock — which is the only way to find out
         # what that clock is.
         server_now = dt.datetime.now(tz=dt.UTC) + SERVER_OFFSET

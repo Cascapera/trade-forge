@@ -322,7 +322,7 @@ def test_two_open_positions_in_the_traded_symbol_are_refused() -> None:
         )
 
     class AccountWithTwoEurusdPositions(ImmediateFillBroker):
-        def positions(self, symbol: str) -> list[Position]:  # noqa: ARG002
+        def positions(self, symbol: str) -> list[Position]:
             return [a_position("1.10000"), a_position("1.10100")]
 
     with pytest.raises(EngineError, match="phase 1 holds one at a time"):

@@ -19,9 +19,13 @@ from tradeforge_engine.structure import (
     FairValueGap,
     FVGDetector,
     FVGKind,
+    MarketStructure,
+    StructureBreak,
+    StructureKind,
     Swing,
     SwingDetector,
     SwingKind,
+    Trend,
 )
 from tradeforge_engine.testing import HOUR, START, bar
 
@@ -297,3 +301,197 @@ def test_the_detector_reports_exactly_the_strict_three_candle_gaps(
             assert first.low > third.high
             assert gap.top == first.low
             assert gap.bottom == third.high
+
+
+# --------------------------------------------------------------------------- #
+# Market structure — BOS and CHoCH                                              #
+# --------------------------------------------------------------------------- #
+
+
+def _breaks(candles: list[Candle]) -> list[tuple[int, StructureBreak]]:
+    structure = MarketStructure()
+    found: list[tuple[int, StructureBreak]] = []
+    for index, candle in enumerate(candles):
+        event = structure.update(candle)
+        if event is not None:
+            found.append((index, event))
+    return found
+
+
+# The author's hand-worked example: a bullish BOS bootstraps the trend, then a bearish CHoCH turns
+# it. high, low, close per bar (open = close for simplicity).
+_STRUCTURE_GOLDEN = [
+    bar(0, open_="99", close="99", high="100", low="95"),
+    bar(1, open_="104", close="104", high="105", low="99"),  # top = 105
+    bar(2, open_="99", close="99", high="103", low="98"),  # correction 1
+    bar(3, open_="97", close="97", high="101", low="96"),  # correction 2 -> armed
+    bar(4, open_="103", close="103", high="104", low="100"),  # bounce, no break
+    bar(5, open_="106", close="106", high="107", low="103"),  # close 106 > 105 -> BOS up
+    bar(6, open_="101", close="101", high="105", low="100"),  # correction
+    bar(7, open_="99", close="99", high="103", low="98"),  # correction
+    bar(8, open_="95", close="95", high="100", low="94"),  # close 95 < 96 -> CHoCH down
+]
+
+
+def test_structure_matches_the_hand_worked_example() -> None:
+    """A bullish BOS on bar 5 (close 106 above the 105 top, after two correction bars and a
+    bounce), then a bearish CHoCH on bar 8 (close 95 below 96 — the lowest low the up-move
+    defended). Exactly the two events the method's author marked."""
+    assert _breaks(_STRUCTURE_GOLDEN) == [
+        (5, StructureBreak(StructureKind.BOS, Trend.BULLISH, Decimal("105"), _at(5))),
+        (8, StructureBreak(StructureKind.CHOCH, Trend.BEARISH, Decimal("96"), _at(8))),
+    ]
+
+
+def test_trend_is_none_until_the_first_bos() -> None:
+    structure = MarketStructure()
+    for candle in _STRUCTURE_GOLDEN[:5]:
+        structure.update(candle)
+        assert structure.trend is None
+    structure.update(_STRUCTURE_GOLDEN[5])
+    assert structure.trend is Trend.BULLISH
+
+
+def test_the_bearish_mirror_bootstraps_down_then_chochs_up() -> None:
+    """The symmetric case: a bearish BOS on bar 5 (close 89 below the 90 bottom, after two up
+    correction bars), then a bullish CHoCH on bar 8 (close 104 above 103, the high the down-move
+    defended)."""
+    mirror = [
+        bar(0, open_="96", close="96", high="100", low="95"),
+        bar(1, open_="91", close="91", high="99", low="90"),  # bottom = 90
+        bar(2, open_="100", close="100", high="101", low="92"),  # up-correction 1
+        bar(3, open_="102", close="102", high="103", low="94"),  # up-correction 2 -> armed
+        bar(4, open_="95", close="95", high="100", low="93"),  # bounce, no break
+        bar(5, open_="89", close="89", high="97", low="88"),  # close 89 < 90 -> BOS down
+        bar(6, open_="94", close="94", high="95", low="92"),  # correction
+        bar(7, open_="98", close="98", high="99", low="95"),  # correction
+        bar(8, open_="104", close="104", high="105", low="100"),  # close 104 > 103 -> CHoCH up
+    ]
+    assert _breaks(mirror) == [
+        (5, StructureBreak(StructureKind.BOS, Trend.BEARISH, Decimal("90"), _at(5))),
+        (8, StructureBreak(StructureKind.CHOCH, Trend.BULLISH, Decimal("103"), _at(8))),
+    ]
+
+
+def test_one_correction_bar_does_not_arm_a_bos() -> None:
+    """Two consecutive correction bars are required. With only one, the top is unarmed and a close
+    above it is not a break of structure."""
+    candles = [
+        bar(0, open_="99", close="99", high="100", low="95"),
+        bar(1, open_="104", close="104", high="105", low="99"),  # top 105
+        bar(2, open_="99", close="99", high="103", low="98"),  # a single correction bar
+        bar(3, open_="106", close="106", high="107", low="102"),  # closes above 105 but unarmed
+    ]
+    assert _breaks(candles) == []
+
+
+def test_a_wick_through_the_top_without_a_close_is_no_bos() -> None:
+    """The break is by close, not by pierce: a bar whose high tags the top but whose close stays
+    below it does not confirm a BOS (here it simply lifts the top)."""
+    candles = [
+        bar(0, open_="99", close="99", high="100", low="95"),
+        bar(1, open_="104", close="104", high="105", low="99"),  # top 105
+        bar(2, open_="99", close="99", high="103", low="98"),  # correction 1
+        bar(3, open_="97", close="97", high="101", low="96"),  # correction 2 -> armed
+        bar(4, open_="103", close="104", high="107", low="100"),  # high 107 > 105, close 104 < 105
+    ]
+    assert _breaks(candles) == []
+
+
+def test_a_non_correction_bar_becomes_the_next_correction_reference() -> None:
+    """The author's rule, pinned: after the top, a bar that is not a correction becomes the
+    reference, and correction is measured against it, and so on. Bar 2 has a higher low than the
+    105 top (not a correction), so it is the reference; bars 3 and 4 step down from it and arm the
+    top — a BOS — even though neither dipped below the top's own low of 99."""
+    candles = [
+        bar(0, open_="99", close="99", high="100", low="95"),
+        bar(1, open_="104", close="104", high="105", low="99"),  # top 105, low 99
+        bar(2, open_="103", close="103", high="104", low="100"),  # low 100 > 99: not a correction
+        bar(
+            3, open_="99.8", close="99.8", high="103", low="99.5"
+        ),  # steps down from bar 2 -> corr 1
+        bar(
+            4, open_="99.5", close="99.5", high="102", low="99.2"
+        ),  # steps down from bar 3 -> corr 2
+        bar(5, open_="106", close="106", high="107", low="103"),  # close 106 > 105 -> BOS
+    ]
+    assert _breaks(candles) == [
+        (5, StructureBreak(StructureKind.BOS, Trend.BULLISH, Decimal("105"), _at(5))),
+    ]
+
+
+def test_a_close_exactly_at_the_top_is_not_a_break() -> None:
+    """Strict inequality for structure too: a close landing exactly on the top does not confirm."""
+    candles = [
+        bar(0, open_="99", close="99", high="100", low="95"),
+        bar(1, open_="104", close="104", high="105", low="99"),  # top 105
+        bar(2, open_="99", close="99", high="103", low="98"),  # correction 1
+        bar(3, open_="97", close="97", high="101", low="96"),  # correction 2 -> armed
+        bar(4, open_="104", close="105", high="105", low="100"),  # close 105 == top, not above
+    ]
+    assert _breaks(candles) == []
+
+
+def test_a_second_bos_raises_the_choch_anchor() -> None:
+    """Continuation, the core of the method: a second bullish BOS re-anchors the CHoCH higher (96
+    -> 99), so a later close below 99 but above the old 96 is a CHoCH against the *new* anchor. If
+    the anchor had not moved, bar 10 would be no reversal at all."""
+    candles = [
+        bar(0, open_="99", close="99", high="100", low="95"),
+        bar(1, open_="104", close="104", high="105", low="99"),
+        bar(2, open_="99", close="99", high="103", low="98"),
+        bar(3, open_="97", close="97", high="101", low="96"),
+        bar(4, open_="103", close="103", high="104", low="100"),
+        bar(5, open_="106", close="106", high="107", low="103"),  # BOS #1: top->107, anchor 96
+        bar(6, open_="101", close="101", high="105", low="100"),  # correction 1
+        bar(7, open_="100", close="100", high="103", low="99"),  # correction 2 -> armed, low 99
+        bar(
+            8, open_="108", close="108", high="109", low="104"
+        ),  # close 108 > 107 -> BOS #2: anchor->99
+        bar(9, open_="102", close="102", high="106", low="101"),  # correction
+        bar(
+            10, open_="98", close="98", high="103", low="97"
+        ),  # close 98 < 99 -> CHoCH at the new anchor
+    ]
+    assert _breaks(candles) == [
+        (5, StructureBreak(StructureKind.BOS, Trend.BULLISH, Decimal("105"), _at(5))),
+        (8, StructureBreak(StructureKind.BOS, Trend.BULLISH, Decimal("107"), _at(8))),
+        (10, StructureBreak(StructureKind.CHOCH, Trend.BEARISH, Decimal("99"), _at(10))),
+    ]
+
+
+def test_a_choch_can_flip_back() -> None:
+    """After the bearish CHoCH the bias is bearish and the next CHoCH points up at the high the
+    failed up-move made (107). A close back above 107 flips it bullish again."""
+    extended = [
+        *_STRUCTURE_GOLDEN,
+        bar(9, open_="96", close="96", high="99", low="93"),  # bearish leg makes a new low
+        bar(10, open_="108", close="108", high="109", low="100"),  # close 108 > 107 -> CHoCH up
+    ]
+    assert _breaks(extended)[-1] == (
+        10,
+        StructureBreak(StructureKind.CHOCH, Trend.BULLISH, Decimal("107"), _at(10)),
+    )
+
+
+def test_one_correction_bar_does_not_arm_a_bearish_bos() -> None:
+    """The bearish mirror: one up-correction bar does not arm the bottom for a break."""
+    candles = [
+        bar(0, open_="96", close="96", high="100", low="95"),
+        bar(1, open_="91", close="91", high="99", low="90"),  # bottom 90
+        bar(2, open_="100", close="100", high="101", low="92"),  # a single up-correction bar
+        bar(3, open_="89", close="89", high="94", low="88"),  # closes below 90 but unarmed
+    ]
+    assert _breaks(candles) == []
+
+
+def test_a_wick_through_the_bottom_without_a_close_is_no_bearish_bos() -> None:
+    """The bearish mirror: a low piercing the bottom while the close holds above it is no BOS."""
+    candles = [
+        bar(0, open_="96", close="96", high="100", low="95"),
+        bar(1, open_="91", close="91", high="99", low="90"),  # bottom 90
+        bar(2, open_="100", close="100", high="101", low="92"),  # up-correction 1
+        bar(3, open_="102", close="102", high="103", low="94"),  # up-correction 2 -> armed
+        bar(4, open_="97", close="96", high="100", low="88"),  # low 88 < 90, close 96 > 90
+    ]
+    assert _breaks(candles) == []

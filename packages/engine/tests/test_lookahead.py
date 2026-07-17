@@ -89,7 +89,7 @@ class FillsFromTheFuture(ImmediateFillBroker):
 class FillsExactlyAtTheDecision(ImmediateFillBroker):
     """Stamps the fill at the decision instant itself — the boundary case."""
 
-    def on_bar(self, candle: Candle) -> Sequence[Fill]:  # noqa: ARG002
+    def on_bar(self, candle: Candle) -> Sequence[Fill]:
         fills = [
             Fill(
                 order=order,

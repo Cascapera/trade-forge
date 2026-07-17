@@ -12,20 +12,39 @@ wrong database.
 
 from pathlib import Path
 
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
 from tradeforge_db.config import PostgresSettings
 
 
-class Settings(PostgresSettings):
-    """Connection settings for the services the API depends on."""
+class RedisConfig(BaseSettings):
+    """Where Redis lives — host and port, nothing secret.
+
+    Deliberately free-standing rather than folded into `Settings`. The worker builds arq's
+    connection settings in its class body, which runs at *import* time; if these fields lived
+    on `Settings` (which inherits a required Postgres password), merely importing the worker —
+    as any test reaching `process_backtest` does — would demand a database credential. Keeping
+    the Redis half on its own lets that import succeed with nothing configured.
+    """
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
     redis_host: str = "localhost"
     redis_port: int = 6379
+
+    @property
+    def redis_url(self) -> str:
+        return f"redis://{self.redis_host}:{self.redis_port}/0"
+
+
+class Settings(PostgresSettings, RedisConfig):
+    """Connection settings for the services the API depends on."""
 
     # Where the collector wrote the Parquet candles (ADR-05). The worker reads a backtest's
     # bars from here; the `datasets` row only proves coverage, the bytes live on disk under
     # this root as `symbol/timeframe/...`. Env-driven so dev, CI and prod each point their own.
     parquet_root: Path = Path("data/parquet")
-
-    @property
-    def redis_url(self) -> str:
-        return f"redis://{self.redis_host}:{self.redis_port}/0"

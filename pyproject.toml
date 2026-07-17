@@ -45,11 +45,11 @@ dev = [
     # are universally quantified statements, and an example-based test can only ever check
     # the examples someone thought of.
     "hypothesis>=6.120",
-    "mypy>=1.14",
+    "mypy>=2.3.0",
     "pre-commit>=4.6.0",
     "pytest>=8.3",
     "pytest-cov>=6.0",
-    "ruff>=0.9",
+    "ruff>=0.15.22",
     # FastAPI's TestClient is an httpx client driving the ASGI app in-process — no socket,
     # no running server, so the router tests stay fast and hermetic.
     "httpx>=0.28",

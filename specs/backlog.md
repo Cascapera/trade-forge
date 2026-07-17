@@ -93,3 +93,8 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
   nível de all/any (o caso das estratégias-demo). A DSL suporta all/any/not aninhados em qualquer
   profundidade; um editor de árvore recursivo (visual, arrastar/soltar) é o design final da Fase 2
   (`sdd.md §3.3.5`). Fazer quando setups compostos exigirem aninhamento profundo.
+- [origem: PR-109] **GIF animado da vitrine** — o README embute uma screenshot estática da tela de
+  resultados (gerada via `npm run screenshot`, reusa o mock do E2E). O spec pedia um GIF; um GIF do
+  fluxo (builder → run → results) precisaria de gravação de tela animada, que não dá pra gerar
+  headless. Gravar quando houver ambiente com screen capture (ou usar `playwright` com vídeo do
+  contexto e converter para GIF).

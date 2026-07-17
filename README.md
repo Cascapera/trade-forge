@@ -21,6 +21,30 @@ is something the strategy never learns.
 
 > ⚠️ Analysis tooling, not investment advice. Trading carries risk of loss.
 
+![The results screen: metric cards, equity curve and the trade-by-trade table](docs/assets/results.png)
+
+*Build a strategy in the browser, run it against the engine, and read the metrics, the equity
+curve and every trade — the whole loop, no MetaTrader account required (see [Quickstart](#quickstart)).*
+
+## How it fits together
+
+A strategy is written once and interpreted by one engine. The API never runs a backtest in the
+request path — it enqueues a job and a separate worker does the heavy work, so a ten-year run
+never blocks another request.
+
+```mermaid
+flowchart LR
+  UI["apps/web<br/>React UI"] -->|"POST /backtests (202)"| API["apps/api<br/>FastAPI"]
+  API -->|"enqueue id"| Q["Redis queue"]
+  Q --> W["arq worker"]
+  W -->|"compile + run"| E["packages/engine<br/>event-driven core"]
+  W -->|"read candles"| PQ["Parquet"]
+  W -->|"persist trades + metrics"| DB["Postgres"]
+  API -->|"status · metrics · trades · equity"| UI
+  W -.->|"progress (Redis pub/sub)"| API -.->|"WebSocket"| UI
+  COL["apps/collector<br/>MT5 or mock"] -->|"OHLCV"| PQ
+```
+
 ## Design decisions
 
 The trade-offs that shaped the system, in one line each. The long form lives in
@@ -62,30 +86,57 @@ packages/schema   Strategy DSL: JSON Schema + generated types
 `apps/` are deployable; `packages/` are libraries shared between them. Dependencies point
 from apps into packages, never the reverse.
 
-## Getting started
+## Quickstart
+
+From a clean clone to a backtest on screen in under ten minutes — **no MetaTrader account and
+no Windows required**. The market data is deterministic synthetic OHLCV, so every step below
+runs the same on Linux, macOS and Windows.
 
 Requires [uv](https://docs.astral.sh/uv/), Node 22+ and Docker.
+
+**1. Install and bring up the services.**
 
 ```bash
 cp .env.example .env        # then set POSTGRES_PASSWORD — there is no default
 uv sync                     # one venv at the root, all six packages editable
 npm ci
 
-uv run pre-commit install --install-hooks   # mirrors the CI gates locally
-
 docker compose up -d        # Postgres + Redis, with healthchecks
 uv run tradeforge-health    # asks both services whether they are actually up
+```
 
-uv run tradeforge-db upgrade # create the schema (Alembic)
-uv run tradeforge-db seed    # example instruments; safe to re-run
+**2. Create the schema and some demo data.**
 
-# Download history. The default source is deterministic synthetic data, so this
-# works on any platform, with no broker account. --source mt5 needs Windows.
+```bash
+uv run tradeforge-db upgrade   # create the schema (Alembic)
+uv run tradeforge-db seed      # example instruments; safe to re-run
+
+# Synthetic OHLCV into Parquet. `--source mock` is the default, so no broker is involved;
+# `--source mt5` would need a Windows terminal. This is the data the backtest will run on.
 uv run tradeforge-collector backfill EURUSD H1 2024-01-01 2024-12-31
+```
 
-uv run pytest               # unit tests + 90% coverage gate (no Docker needed)
-uv run pytest -m integration # connects to the real services
-npm run test:cov
+**3. Run the API, the worker and the web app** — three terminals (or background them):
+
+```bash
+uv run uvicorn tradeforge_api.main:create_app --factory --port 8000   # the API
+uv run arq tradeforge_api.worker.WorkerSettings                       # the backtest worker
+npm run dev -w @tradeforge/web                                        # the UI at :5173
+```
+
+**4. Open [http://localhost:5173](http://localhost:5173).** The builder opens on a ready-made
+MA-cross template — click **Save & configure backtest**, pick `EURUSD` and your dates, and
+**Run backtest**. The results screen above is what you get: metrics, the equity curve and every
+trade. (Prefer the terminal? The same flow is three `curl`s — `POST /strategies`,
+`POST /backtests`, then poll `GET /backtests/{id}`.)
+
+### Running the tests
+
+```bash
+uv run pytest                # Python unit tests + 90% coverage gate (no Docker needed)
+uv run pytest -m integration # the tests that connect to the real Postgres/Redis
+npm run test:cov -w @tradeforge/web   # the UI unit tests + coverage
+npm run e2e   -w @tradeforge/web      # the Playwright happy-path (needs `e2e:install` once)
 ```
 
 ## Quality gates
@@ -121,11 +172,17 @@ GitHub). Automated deploys will hang off these two branches.
 
 | Phase | Scope | Status |
 |---|---|---|
-| 0 | Monorepo, CI, strategy DSL schema | in progress |
-| 1 | Backtest MVP: engine, collector, API, UI | — |
-| 2 | More indicators, grid search, walk-forward | — |
-| 3 | Paper → live execution, LLM analyst | — |
-| 4 | Multi-user product | — |
+| 0 | Monorepo, CI, strategy DSL schema | ✅ done |
+| 1 | Backtest MVP: engine, collector, API, UI | ✅ done |
+| 2 | More indicators, grid search, walk-forward | 🔜 next |
+| 3 | Paper → live execution, LLM analyst | planned |
+| 4 | Multi-user product | planned |
+
+## Contributing
+
+The setup is the [Quickstart](#quickstart) above; the workflow and the gates every pull request
+must clear are in [`CONTRIBUTING.md`](CONTRIBUTING.md). The full design rationale lives in
+[`sdd.md`](sdd.md), and per-PR teaching notes in [`docs/aulas/`](docs/aulas/).
 
 ## License
 

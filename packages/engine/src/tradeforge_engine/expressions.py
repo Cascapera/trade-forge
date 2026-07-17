@@ -22,6 +22,7 @@ operator is one entry in `OPERATORS`; adding a node kind is one branch in
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Final
 
 from tradeforge_engine.domain import Candle, EvalContext, Money
@@ -95,6 +96,25 @@ def compile_operand(ref: str) -> Operand:
         return context.indicator_at(ref, shift)
 
     return Operand(resolve=resolve_indicator, lookback=0)
+
+
+def compile_constant(value: object) -> Operand:
+    """Compile a literal number — the `30` in `RSI < 30` — into a fixed operand.
+
+    A constant resolves to the same value on every bar and at every shift, so it is never `None`
+    (a number always exists) and an edge operator like `crosses_below 30` sees a steady level to
+    cross. Parsed through `str` into `Decimal`, never `float(...)`: a threshold typed as `0.1`
+    must be exactly 0.1 in the comparison, not the binary approximation ADR-0011 keeps out.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        # bool is an int subclass; a `true` threshold is a mistake, not the number 1.
+        raise EngineError(f"comparison operand value must be a number, got {value!r}")
+    constant = Decimal(str(value))
+
+    def resolve_constant(_context: EvalContext, _shift: int) -> Money | None:
+        return constant
+
+    return Operand(resolve=resolve_constant, lookback=0)
 
 
 # --------------------------------------------------------------------------- #
@@ -218,12 +238,16 @@ Condition = Comparison | AllOf | AnyOf | NotOf
 
 def _operand_of(node: Mapping[str, object], side: str) -> Operand:
     operand = node[side]
-    if not isinstance(operand, Mapping) or "ref" not in operand:
-        raise EngineError(f"comparison {side!r} operand is not a ref: {operand!r}")
-    ref = operand["ref"]
-    if not isinstance(ref, str):
-        raise EngineError(f"comparison {side!r} ref must be a string, got {ref!r}")
-    return compile_operand(ref)
+    if not isinstance(operand, Mapping):
+        raise EngineError(f"comparison {side!r} operand is not an object: {operand!r}")
+    if "ref" in operand:
+        ref = operand["ref"]
+        if not isinstance(ref, str):
+            raise EngineError(f"comparison {side!r} ref must be a string, got {ref!r}")
+        return compile_operand(ref)
+    if "value" in operand:
+        return compile_constant(operand["value"])
+    raise EngineError(f"comparison {side!r} operand needs a 'ref' or a 'value': {operand!r}")
 
 
 def compile_condition(node: Mapping[str, object]) -> Condition:
@@ -280,5 +304,6 @@ __all__ = [
     "Operand",
     "Operator",
     "compile_condition",
+    "compile_constant",
     "compile_operand",
 ]

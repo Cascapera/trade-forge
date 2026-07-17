@@ -93,6 +93,13 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
   nível de all/any (o caso das estratégias-demo). A DSL suporta all/any/not aninhados em qualquer
   profundidade; um editor de árvore recursivo (visual, arrastar/soltar) é o design final da Fase 2
   (`sdd.md §3.3.5`). Fazer quando setups compostos exigirem aninhamento profundo.
+- [origem: PR-201] **Indicadores do spec adiados** — o spec da Fase 2 lista RSI, ATR, Bandas de
+  Bollinger, ADX e máx/mín de N períodos. Este slice do PR-201 entregou **RSI + operando literal**
+  (`RSI < 30`); o Guilherme decidiu testar com esses antes de adicionar mais. Adiados para fatias
+  seguintes (ou PR-201b): **MACD** (composto de EMAs, multi-saída — não estava no spec, adição
+  aditiva via ADR-03/ADR-13), **ATR**, **Bollinger**, **ADX**, **máx/mín de N períodos**. ATR/ADX
+  exigem True Range (dependência do candle anterior) + suavização de Wilder — a mesma base do RSI já
+  implementada. Novos operadores do spec (`between`, `rising`, `falling`) também pendentes.
 - [origem: PR-109] **GIF animado da vitrine** — o README embute uma screenshot estática da tela de
   resultados (gerada via `npm run screenshot`, reusa o mock do E2E). O spec pedia um GIF; um GIF do
   fluxo (builder → run → results) precisaria de gravação de tela animada, que não dá pra gerar

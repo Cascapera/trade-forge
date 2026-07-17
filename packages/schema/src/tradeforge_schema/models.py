@@ -68,6 +68,19 @@ class Ref(_Node):
     ]
 
 
+class Constant(_Node):
+    """A literal number — the fixed side of a threshold like `RSI < 30`. It references nothing,
+    so the semantic layer skips it; `inf`/`nan` are rejected because no comparison means them."""
+
+    value: Annotated[float, Field(allow_inf_nan=False, examples=[30, 70, 0.0])]
+
+
+# An operand is a value the engine reads each bar, or a constant it does not. Untagged: a `ref`
+# key selects the first, a `value` key the second, and `_Node`'s `extra="forbid"` is what keeps
+# any one object from matching both.
+type Operand = Ref | Constant
+
+
 type ComparisonOp = Literal[
     "gt",
     "lt",
@@ -89,8 +102,8 @@ class Comparison(_Node):
     """
 
     op: ComparisonOp
-    left: Ref
-    right: Ref
+    left: Operand
+    right: Operand
 
 
 class AllOf(_Node):
@@ -121,7 +134,11 @@ type Condition = Comparison | AllOf | AnyOf | NotOf
 # --------------------------------------------------------------------------- #
 
 
-class MovingAverageParams(_Node):
+class PeriodSourceParams(_Node):
+    """A window length and which price it reads — shared by every single-period indicator
+    (SMA, EMA, RSI, and ATR to come). Named for its shape, not for one indicator, because a
+    period over a price source is exactly what they all take."""
+
     period: Annotated[int, Field(ge=1, le=1000)]
     source: PriceSource = "close"
 
@@ -129,20 +146,31 @@ class MovingAverageParams(_Node):
 class SMA(_Node):
     id: Annotated[str, Field(pattern=INDICATOR_ID_PATTERN, max_length=40)]
     type: Literal["SMA"]
-    params: MovingAverageParams
+    params: PeriodSourceParams
 
 
 class EMA(_Node):
     id: Annotated[str, Field(pattern=INDICATOR_ID_PATTERN, max_length=40)]
     type: Literal["EMA"]
-    params: MovingAverageParams
+    params: PeriodSourceParams
+
+
+class RSI(_Node):
+    """Relative Strength Index — a bounded 0-100 momentum oscillator (Wilder). Same params as a
+    moving average; the engine smooths gains and losses with Wilder's method (ADR-13: adding it
+    is additive, so `schema_version` stays 1.0)."""
+
+    id: Annotated[str, Field(pattern=INDICATOR_ID_PATTERN, max_length=40)]
+    type: Literal["RSI"]
+    params: PeriodSourceParams
 
 
 # Discriminated on `type`: the generated JSON Schema gets a proper `oneOf` with a
-# discriminator, and a new indicator (phase 2: RSI, ATR, ADX...) is a new member —
+# discriminator, and a new indicator (phase 2: ATR, ADX, MACD...) is a new member —
 # an additive change that leaves every strategy already saved still valid. That is
-# ADR-03 working as designed: new blocks without touching the core.
-type Indicator = Annotated[SMA | EMA, Field(discriminator="type")]
+# ADR-03 working as designed: new blocks without touching the core (and ADR-13:
+# additive members keep the schema_version, they do not bump it).
+type Indicator = Annotated[SMA | EMA | RSI, Field(discriminator="type")]
 
 
 # --------------------------------------------------------------------------- #

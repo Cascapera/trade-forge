@@ -88,13 +88,13 @@
       "description": "A leaf: two operands and an operator.\n\n`gt` asks about this candle. `crosses_above` asks about this candle *and the\nprevious one* — it is true only on the bar where the relation flips, which is\nwhat stops a strategy from re-entering on every bar of a trend it already owns.",
       "properties": {
         "left": {
-          "$ref": "#/$defs/Ref"
+          "$ref": "#/$defs/Operand"
         },
         "op": {
           "$ref": "#/$defs/ComparisonOp"
         },
         "right": {
-          "$ref": "#/$defs/Ref"
+          "$ref": "#/$defs/Operand"
         }
       },
       "required": [
@@ -134,6 +134,26 @@
         }
       ]
     },
+    "Constant": {
+      "additionalProperties": false,
+      "description": "A literal number — the fixed side of a threshold like `RSI < 30`. It references nothing,\nso the semantic layer skips it; `inf`/`nan` are rejected because no comparison means them.",
+      "properties": {
+        "value": {
+          "examples": [
+            30,
+            70,
+            0.0
+          ],
+          "title": "Value",
+          "type": "number"
+        }
+      },
+      "required": [
+        "value"
+      ],
+      "title": "Constant",
+      "type": "object"
+    },
     "EMA": {
       "additionalProperties": false,
       "properties": {
@@ -144,7 +164,7 @@
           "type": "string"
         },
         "params": {
-          "$ref": "#/$defs/MovingAverageParams"
+          "$ref": "#/$defs/PeriodSourceParams"
         },
         "type": {
           "const": "EMA",
@@ -230,6 +250,7 @@
       "discriminator": {
         "mapping": {
           "EMA": "#/$defs/EMA",
+          "RSI": "#/$defs/RSI",
           "SMA": "#/$defs/SMA"
         },
         "propertyName": "type"
@@ -240,28 +261,11 @@
         },
         {
           "$ref": "#/$defs/EMA"
+        },
+        {
+          "$ref": "#/$defs/RSI"
         }
       ]
-    },
-    "MovingAverageParams": {
-      "additionalProperties": false,
-      "properties": {
-        "period": {
-          "maximum": 1000,
-          "minimum": 1,
-          "title": "Period",
-          "type": "integer"
-        },
-        "source": {
-          "$ref": "#/$defs/PriceSource",
-          "default": "close"
-        }
-      },
-      "required": [
-        "period"
-      ],
-      "title": "MovingAverageParams",
-      "type": "object"
     },
     "NotOf": {
       "additionalProperties": false,
@@ -276,6 +280,16 @@
       ],
       "title": "NotOf",
       "type": "object"
+    },
+    "Operand": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Ref"
+        },
+        {
+          "$ref": "#/$defs/Constant"
+        }
+      ]
     },
     "PercentRiskParams": {
       "additionalProperties": false,
@@ -313,6 +327,27 @@
       "title": "PercentRiskSizing",
       "type": "object"
     },
+    "PeriodSourceParams": {
+      "additionalProperties": false,
+      "description": "A window length and which price it reads — shared by every single-period indicator\n(SMA, EMA, RSI, and ATR to come). Named for its shape, not for one indicator, because a\nperiod over a price source is exactly what they all take.",
+      "properties": {
+        "period": {
+          "maximum": 1000,
+          "minimum": 1,
+          "title": "Period",
+          "type": "integer"
+        },
+        "source": {
+          "$ref": "#/$defs/PriceSource",
+          "default": "close"
+        }
+      },
+      "required": [
+        "period"
+      ],
+      "title": "PeriodSourceParams",
+      "type": "object"
+    },
     "PriceSource": {
       "enum": [
         "open",
@@ -321,6 +356,33 @@
         "close"
       ],
       "type": "string"
+    },
+    "RSI": {
+      "additionalProperties": false,
+      "description": "Relative Strength Index — a bounded 0-100 momentum oscillator (Wilder). Same params as a\nmoving average; the engine smooths gains and losses with Wilder's method (ADR-13: adding it\nis additive, so `schema_version` stays 1.0).",
+      "properties": {
+        "id": {
+          "maxLength": 40,
+          "pattern": "^[a-z_][a-z0-9_]*$",
+          "title": "Id",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/$defs/PeriodSourceParams"
+        },
+        "type": {
+          "const": "RSI",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "params"
+      ],
+      "title": "RSI",
+      "type": "object"
     },
     "Ref": {
       "additionalProperties": false,
@@ -416,7 +478,7 @@
           "type": "string"
         },
         "params": {
-          "$ref": "#/$defs/MovingAverageParams"
+          "$ref": "#/$defs/PeriodSourceParams"
         },
         "type": {
           "const": "SMA",

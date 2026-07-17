@@ -15,7 +15,14 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from tradeforge_engine.domain import Candle
-from tradeforge_engine.structure import Swing, SwingDetector, SwingKind
+from tradeforge_engine.structure import (
+    FairValueGap,
+    FVGDetector,
+    FVGKind,
+    Swing,
+    SwingDetector,
+    SwingKind,
+)
 from tradeforge_engine.testing import HOUR, START, bar
 
 
@@ -170,3 +177,123 @@ def test_reports_exactly_the_strict_window_extremes(
             expected.add((candles[i].time, SwingKind.LOW))
 
     assert detected == expected
+
+
+# --------------------------------------------------------------------------- #
+# Fair value gaps — the three-candle imbalance                                  #
+# --------------------------------------------------------------------------- #
+
+
+def _fvgs(candles: list[Candle]) -> list[FairValueGap | None]:
+    detector = FVGDetector()
+    return [detector.update(candle) for candle in candles]
+
+
+def test_a_bullish_fvg_is_the_untraded_band_below_a_leap_up() -> None:
+    """c1.high 10 < c3.low 12: the middle bar leapt up, leaving 10-12 untraded. It takes three
+    candles, so the gap surfaces on c3, and the zone is [bottom 10, top 12]."""
+    bullish = [
+        bar(0, open_="9", close="9", high="10", low="8"),
+        bar(1, open_="12", close="14", high="15", low="11"),  # impulse up
+        bar(2, open_="13", close="15", high="16", low="12"),
+    ]
+    results = _fvgs(bullish)
+    assert results[:2] == [None, None]
+    assert results[2] == FairValueGap(
+        kind=FVGKind.BULLISH, top=Decimal("12"), bottom=Decimal("10"), time=_at(2)
+    )
+
+
+def test_a_bearish_fvg_is_the_untraded_band_above_a_leap_down() -> None:
+    """The mirror: c1.low 14 > c3.high 12, an untraded band from 12 up to 14."""
+    bearish = [
+        bar(0, open_="15", close="15", high="16", low="14"),
+        bar(1, open_="12", close="10", high="13", low="9"),  # impulse down
+        bar(2, open_="11", close="9", high="12", low="8"),
+    ]
+    assert _fvgs(bearish)[2] == FairValueGap(
+        kind=FVGKind.BEARISH, top=Decimal("14"), bottom=Decimal("12"), time=_at(2)
+    )
+
+
+def test_overlapping_candles_leave_no_gap() -> None:
+    candles = [bar(i, open_="10", close="10", high="11", low="9") for i in range(3)]
+    assert _fvgs(candles) == [None, None, None]
+
+
+def test_a_touch_is_not_a_gap() -> None:
+    """Strict inequality: c1.high 12 exactly meeting c3.low 12 is a touch, not an untraded band."""
+    touch = [
+        bar(0, open_="11", close="11", high="12", low="10"),
+        bar(1, open_="13", close="15", high="16", low="12"),
+        bar(2, open_="14", close="15", high="17", low="12"),  # c3.low 12 == c1.high 12
+    ]
+    assert _fvgs(touch)[2] is None
+
+
+def test_a_bearish_touch_is_not_a_gap() -> None:
+    """The mirror of the bullish touch: c1.low 12 exactly meeting c3.high 12 is no gap either."""
+    touch = [
+        bar(0, open_="13", close="13", high="14", low="12"),
+        bar(1, open_="11", close="9", high="12", low="8"),
+        bar(2, open_="10", close="9", high="12", low="7"),  # c3.high 12 == c1.low 12
+    ]
+    assert _fvgs(touch)[2] is None
+
+
+def test_the_gap_spans_the_last_three_candles_not_the_first_ever() -> None:
+    """The window slides: bars 0-1-2 overlap, but 1-2-3 leap, so the gap is between bar 1 and bar 3.
+    Its first candle is the window's first, not the run's: the detector uses the last three."""
+    series = [
+        bar(0, open_="13", close="13", high="14", low="12"),
+        bar(1, open_="12", close="12", high="13", low="11"),  # c1 of the gap
+        bar(2, open_="14", close="16", high="17", low="13"),  # impulse
+        bar(3, open_="15", close="17", high="18", low="14"),  # c3.low 14 > c1.high 13
+    ]
+    results = _fvgs(series)
+    assert results[:3] == [None, None, None]
+    assert results[3] == FairValueGap(
+        kind=FVGKind.BULLISH, top=Decimal("14"), bottom=Decimal("13"), time=_at(3)
+    )
+
+
+@given(
+    bars=st.lists(
+        st.tuples(st.integers(min_value=0, max_value=100), st.integers(min_value=0, max_value=20)),
+        min_size=0,
+        max_size=40,
+    )
+)
+def test_the_detector_reports_exactly_the_strict_three_candle_gaps(
+    bars: list[tuple[int, int]],
+) -> None:
+    """The full biconditional. A reported gap is a strict inefficiency between the first and third
+    candle of its window, zoned exactly by their wicks and timed to the third bar (soundness); and
+    where it reports nothing, neither inequality held (completeness) — so a flipped bound, a
+    non-strict compare, or a stray filter on the middle candle would fail one half or the other."""
+    candles = [
+        bar(index, open_=str(low), close=str(low), high=str(low + span), low=str(low))
+        for index, (low, span) in enumerate(bars)
+    ]
+    detector = FVGDetector()
+    for index, candle in enumerate(candles):
+        gap = detector.update(candle)
+        if index < 2:
+            assert gap is None  # no full window yet
+            continue
+        first, third = candles[index - 2], candle
+        if gap is None:
+            # completeness: a silent bar must hide no gap.
+            assert not first.high < third.low
+            assert not first.low > third.high
+            continue
+        assert gap.time == third.time
+        assert gap.top > gap.bottom
+        if gap.kind is FVGKind.BULLISH:
+            assert first.high < third.low
+            assert gap.bottom == first.high
+            assert gap.top == third.low
+        else:
+            assert first.low > third.high
+            assert gap.top == first.low
+            assert gap.bottom == third.high

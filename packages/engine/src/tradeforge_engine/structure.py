@@ -105,4 +105,66 @@ class SwingDetector:
         return self._last_low
 
 
-__all__ = ["Swing", "SwingDetector", "SwingKind"]
+class FVGKind(StrEnum):
+    """Which way a fair value gap points — the direction the impulse that left it was heading."""
+
+    BULLISH = "bullish"
+    BEARISH = "bearish"
+
+
+@dataclass(frozen=True, slots=True)
+class FairValueGap:
+    """A three-candle imbalance: a band of price the market moved through too fast to trade fairly.
+
+    `top` and `bottom` bound the untraded zone the market tends to return to and "fill". `time` is
+    the bar that completed the pattern (the third candle) — the moment the gap becomes known.
+    """
+
+    kind: FVGKind
+    top: Money
+    bottom: Money
+    time: datetime
+
+
+class FVGDetector:
+    """Reports fair value gaps as their third candle closes.
+
+    A gap is a strict inefficiency across three consecutive candles: bullish when the first
+    candle's high is below the third's low (the middle bar leapt up and left a hole beneath it),
+    bearish when the first's low is above the third's high. Unlike a swing, it needs no bars to
+    its right — it is defined by the three that end on the current one — so it confirms with no
+    lag and no lookahead: a rule acting on it acts on the next open. Only Decimal highs and lows
+    are compared, so it is exact and context-independent.
+    """
+
+    def __init__(self) -> None:
+        self._window: deque[Candle] = deque(maxlen=3)
+
+    def update(self, candle: Candle) -> FairValueGap | None:
+        """Fold in the newest candle; return the gap that completes on it, or `None`."""
+        self._window.append(candle)
+        if len(self._window) < 3:  # noqa: PLR2004 — a gap is a three-candle pattern
+            return None
+
+        first, _middle, third = self._window
+        if first.high < third.low:
+            # Bullish: an untraded band from the first high up to the third low.
+            return FairValueGap(
+                kind=FVGKind.BULLISH, top=third.low, bottom=first.high, time=third.time
+            )
+        if first.low > third.high:
+            # Bearish: an untraded band from the third high up to the first low.
+            return FairValueGap(
+                kind=FVGKind.BEARISH, top=first.low, bottom=third.high, time=third.time
+            )
+        return None
+
+
+__all__ = [
+    "FVGDetector",
+    "FVGKind",
+    "FairValueGap",
+    "Swing",
+    "SwingDetector",
+    "SwingKind",
+]

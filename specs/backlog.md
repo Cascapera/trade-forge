@@ -93,6 +93,13 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
   nível de all/any (o caso das estratégias-demo). A DSL suporta all/any/not aninhados em qualquer
   profundidade; um editor de árvore recursivo (visual, arrastar/soltar) é o design final da Fase 2
   (`sdd.md §3.3.5`). Fazer quando setups compostos exigirem aninhamento profundo.
+- [origem: PR-202] **Plugar AnchoredVWAP na DSL** — a classe de engine existe e conforma ao protocolo
+  `Indicator`, mas NÃO está em `INDICATOR_BUILDERS` nem no `strategy.schema.json`. Hoje só os testes
+  garantem o `ENGINE_CONTEXT` (via `localcontext` manual); em produção, o wiring precisa passar por
+  `run()`. Ao ligar: (a) nó de schema com params próprios (source + volume, sem period); (b) alinhar
+  o enum de `source` — `_price_reader` aceita `close`/`open` além dos 3 pedidos (hlc3/high/low), então
+  o schema deve restringir ou o engine relaxar, senão a validação de 2 camadas diverge; (c) decidir a
+  âncora na DSL (fixa? no último swing? re-ancorável). O `SwingDetector` também não tem exposição DSL.
 - [origem: PR-201] **Indicadores do spec adiados** — o spec da Fase 2 lista RSI, ATR, Bandas de
   Bollinger, ADX e máx/mín de N períodos. Este slice do PR-201 entregou **RSI + operando literal**
   (`RSI < 30`); o Guilherme decidiu testar com esses antes de adicionar mais. Adiados para fatias

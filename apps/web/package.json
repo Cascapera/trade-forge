@@ -11,8 +11,9 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:cov": "vitest run --coverage",
-    "e2e": "playwright test",
-    "e2e:install": "playwright install chromium"
+    "e2e": "playwright test happy-path.spec.ts",
+    "e2e:install": "playwright install chromium",
+    "screenshot": "playwright test screenshot.spec.ts"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.101.2",

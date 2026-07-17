@@ -46,5 +46,7 @@ class Settings(PostgresSettings, RedisConfig):
 
     # Where the collector wrote the Parquet candles (ADR-05). The worker reads a backtest's
     # bars from here; the `datasets` row only proves coverage, the bytes live on disk under
-    # this root as `symbol/timeframe/...`. Env-driven so dev, CI and prod each point their own.
-    parquet_root: Path = Path("data/parquet")
+    # this root as `symbol/timeframe/...`. The default matches the collector's own default
+    # `--data-dir` (`data/ohlcv`) so a fresh clone's backfill and backtest line up with no
+    # configuration. Env-driven (`PARQUET_ROOT`) so dev, CI and prod each point their own.
+    parquet_root: Path = Path("data/ohlcv")

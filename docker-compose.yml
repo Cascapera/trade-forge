@@ -6,6 +6,20 @@
 # an unset password must be a loud error, never an empty string that quietly
 # becomes a passwordless database.
 
+# Shared connection settings for the Python services (api, worker, migrate). They point at the
+# in-network service names and internal ports, overriding the .env values — which target localhost
+# and the published ports, for processes a developer runs on the host instead of in compose.
+x-backend-env: &backend-env
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: '5432'
+  POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
+  POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+  REDIS_HOST: redis
+  REDIS_PORT: '6379'
+  # Where the collector wrote the Parquet candles, inside the mounted ./data volume (ADR-05).
+  PARQUET_ROOT: /data/ohlcv
+
 services:
   postgres:
     # Pinned to a minor, not `16-alpine`: floating tags mean two developers can
@@ -50,6 +64,89 @@ services:
       timeout: 3s
       retries: 10
       start_period: 5s
+
+  # One-shot: bring the schema to head and seed the example instruments, then exit. api and worker
+  # wait on it completing, so migrations run exactly once — never a race between two replicas each
+  # trying to migrate the same database on startup.
+  migrate:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    image: tradeforge-api
+    command: ['sh', '-c', 'tradeforge-db upgrade && tradeforge-db seed']
+    environment: *backend-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: 'no'
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    image: tradeforge-api
+    command:
+      - uvicorn
+      - tradeforge_api.main:create_app
+      - --factory
+      - --host
+      - '0.0.0.0'
+      - --port
+      - '8000'
+    environment: *backend-env
+    ports:
+      - '8000:8000'
+    volumes:
+      # Read-only: the API serves candles the collector wrote; it never writes into this tree.
+      - ./data:/data:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    image: tradeforge-api
+    command: ['arq', 'tradeforge_api.worker.WorkerSettings']
+    environment: *backend-env
+    volumes:
+      - ./data:/data:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    image: tradeforge-web
+    ports:
+      - '${WEB_PORT:-5173}:80'
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
 
 volumes:
   postgres-data:

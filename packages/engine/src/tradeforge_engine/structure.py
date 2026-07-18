@@ -390,10 +390,152 @@ class MarketStructure:
         self._dn_bottom, self._dn_high, self._dn_corr, self._dn_armed = None, None, 0, False
 
 
+class LiquiditySide(StrEnum):
+    """Where a run of equal swings stacks the stops a later sweep will hunt."""
+
+    BUY_SIDE = "buy_side"  # equal highs — buy stops rest above
+    SELL_SIDE = "sell_side"  # equal lows — sell stops rest below
+
+
+@dataclass(frozen=True, slots=True)
+class LiquidityPool:
+    """A cluster of swings resting on one level — a pool of stops the market tends to raid.
+
+    `level` is the cluster's *extreme* (the highest of the equal highs, the lowest of the equal
+    lows): the line a sweep must pierce to take every stop behind it. `touches` are the swings that
+    built it, oldest first — two make a pool, and each further touch deepens it. `time` is the touch
+    that created or last extended the pool, i.e. the moment it became known.
+    """
+
+    side: LiquiditySide
+    level: Money
+    touches: tuple[Swing, ...]
+    time: datetime
+
+
+@dataclass(slots=True)
+class _LiquidityCluster:
+    """A running cluster of touches on one level.
+
+    `anchor` is the price of the *first* touch and never moves — every later swing is measured
+    against it, so the whole pool stays within `tolerance` of one point and a staircase of higher
+    highs cannot chain into it. `level` is the running *extreme* (the reported line); `last_bar`
+    is the bar of the most recent touch, for staleness.
+    """
+
+    anchor: Money
+    level: Money
+    touches: list[Swing]
+    last_bar: int
+
+
+class LiquidityDetector:
+    """Groups equal swing highs (and equal swing lows) into liquidity pools.
+
+    Where the `SwingDetector` *rejects* two highs at the same level — its strict `>` means equal
+    highs form no pivot — this is where those equal highs belong: a pool of resting stops. Feed it
+    the swings the detector confirms, in order, each with the index of the bar it occurred on. Two
+    swings of the same kind whose prices sit within `tolerance` points of the pool's *first* touch
+    form a pool; a third or fourth within tolerance deepens it (more touches, more stops — a
+    stronger pool). The pool's `level` is the extreme, the line a sweep must clear to sweep every
+    stop behind it.
+
+    The tolerance is measured against that first touch (a fixed **anchor**), not the running
+    extreme, so the whole pool stays within `tolerance` of one price. That is deliberate: a
+    staircase of higher highs (100, 103, 106, … each a step within tolerance of the last) is a
+    trend, not equal highs — the old steps have already been swept — so it must *not* collapse into
+    one pool. Anchoring to the first touch breaks the staircase into separate levels while a true
+    double or triple top still stacks into one.
+
+    `tolerance` is absolute, in the instrument's price points, so the detector stays exact and
+    deterministic — only Decimals are compared, nothing is rounded — at the cost of one knob per
+    instrument. A pool goes stale after `lookback_bars` with no fresh touch: some setups take a long
+    time to arm, so the window is wide by default (200 bars). And because every swing it consumes is
+    already confirmed `strength` bars late, the pool inherits the anti-lookahead guarantee for free
+    — it can only form on a level the market has already revealed.
+    """
+
+    _MIN_TOUCHES_FLOOR: Final = 2
+
+    def __init__(self, *, tolerance: Money, min_touches: int = 2, lookback_bars: int = 200) -> None:
+        if tolerance < 0:
+            raise ValueError(f"liquidity tolerance must be >= 0, got {tolerance}")
+        if min_touches < self._MIN_TOUCHES_FLOOR:
+            raise ValueError(f"a pool needs at least 2 touches, got min_touches={min_touches}")
+        if lookback_bars < 1:
+            raise ValueError(f"lookback_bars must be >= 1, got {lookback_bars}")
+        self._tolerance = tolerance
+        self._min_touches = min_touches
+        self._lookback = lookback_bars
+        self._clusters: dict[SwingKind, list[_LiquidityCluster]] = {
+            SwingKind.HIGH: [],
+            SwingKind.LOW: [],
+        }
+
+    def update(self, swing: Swing, bar: int) -> LiquidityPool | None:
+        """Fold in one confirmed swing (occurring on `bar`); return the pool it forms or deepens.
+
+        Returns the `LiquidityPool` when this swing brings a cluster to `min_touches` or extends one
+        already there, and `None` while a level is still a lone swing. `bar` is the index of the
+        candle the swing occurred on — it drives staleness, not the pattern itself.
+        """
+        # Drop pools whose last touch has aged out of the window — both sides, so a long run of one
+        # kind cannot let the other's stale clusters pile up unbounded.
+        for kind_clusters in self._clusters.values():
+            kind_clusters[:] = [c for c in kind_clusters if bar - c.last_bar <= self._lookback]
+
+        clusters = self._clusters[swing.kind]
+        cluster = self._nearest_cluster(clusters, swing.price)
+        if cluster is None:
+            # No level within tolerance: this swing starts a lone candidate, not yet a pool. Its
+            # price is both the anchor (fixed) and the first extreme.
+            clusters.append(
+                _LiquidityCluster(
+                    anchor=swing.price, level=swing.price, touches=[swing], last_bar=bar
+                )
+            )
+            return None
+
+        cluster.touches.append(swing)
+        cluster.last_bar = bar
+        # The level tracks the extreme, so it stays the line a sweep must clear to take every stop.
+        cluster.level = (
+            max(cluster.level, swing.price)
+            if swing.kind is SwingKind.HIGH
+            else min(cluster.level, swing.price)
+        )
+        if len(cluster.touches) < self._min_touches:
+            return None
+
+        side = LiquiditySide.BUY_SIDE if swing.kind is SwingKind.HIGH else LiquiditySide.SELL_SIDE
+        return LiquidityPool(
+            side=side, level=cluster.level, touches=tuple(cluster.touches), time=swing.time
+        )
+
+    def _nearest_cluster(
+        self, clusters: list[_LiquidityCluster], price: Money
+    ) -> _LiquidityCluster | None:
+        """The cluster whose anchor is within tolerance and closest to `price`; ties break to the
+        oldest. `None` if none matches. Matching against the fixed anchor (not the drifting extreme)
+        keeps a pool inside `tolerance` of one point."""
+        best: _LiquidityCluster | None = None
+        best_key: tuple[Money, int] | None = None
+        for index, cluster in enumerate(clusters):
+            distance = abs(price - cluster.anchor)
+            if distance <= self._tolerance:
+                key = (distance, index)
+                if best_key is None or key < best_key:
+                    best, best_key = cluster, key
+        return best
+
+
 __all__ = [
     "FVGDetector",
     "FVGKind",
     "FairValueGap",
+    "LiquidityDetector",
+    "LiquidityPool",
+    "LiquiditySide",
     "MarketStructure",
     "StructureBreak",
     "StructureKind",

@@ -6,8 +6,10 @@ import { useCreateStrategy } from '../api/hooks'
 import { useSession } from '../store'
 import {
   buildStrategy,
+  INDICATOR_KINDS,
   maCrossForm,
   OPS,
+  rsiOversoldForm,
   SOURCES,
   TIMEFRAMES,
   type ConditionRow,
@@ -82,10 +84,22 @@ function ConditionRows(props: {
                 </option>
               ))}
             </select>
+            <select
+              aria-label={`${label} right kind ${String(index)}`}
+              className={inputClass}
+              value={row.rightKind}
+              onChange={(event) => {
+                setRow(index, { rightKind: event.target.value as ConditionRow['rightKind'] })
+              }}
+            >
+              <option value="ref">ref</option>
+              <option value="value">value</option>
+            </select>
             <input
               aria-label={`${label} right ${String(index)}`}
               className={inputClass}
-              placeholder="slow"
+              type={row.rightKind === 'value' ? 'number' : 'text'}
+              placeholder={row.rightKind === 'value' ? '30' : 'slow'}
               value={row.right}
               onChange={(event) => {
                 setRow(index, { right: event.target.value })
@@ -107,7 +121,10 @@ function ConditionRows(props: {
           type="button"
           className="text-sm text-sky-400 hover:text-sky-300"
           onClick={() => {
-            onChange({ ...side, rows: [...side.rows, { left: '', op: 'gt', right: '' }] })
+            onChange({
+              ...side,
+              rows: [...side.rows, { left: '', op: 'gt', right: '', rightKind: 'ref' }],
+            })
           }}
         >
           + condition
@@ -143,15 +160,26 @@ export function StrategyBuilder(): React.JSX.Element {
     <div className="space-y-6">
       <div className="flex items-center justify-between">
         <h2 className="text-xl font-semibold">Build a strategy</h2>
-        <button
-          type="button"
-          className="text-sm text-slate-400 hover:text-slate-200"
-          onClick={() => {
-            setForm(maCrossForm())
-          }}
-        >
-          Load MA-cross template
-        </button>
+        <div className="flex gap-4">
+          <button
+            type="button"
+            className="text-sm text-slate-400 hover:text-slate-200"
+            onClick={() => {
+              setForm(maCrossForm())
+            }}
+          >
+            Load MA-cross template
+          </button>
+          <button
+            type="button"
+            className="text-sm text-slate-400 hover:text-slate-200"
+            onClick={() => {
+              setForm(rsiOversoldForm())
+            }}
+          >
+            Load RSI template
+          </button>
+        </div>
       </div>
 
       <section className={sectionClass}>
@@ -379,8 +407,11 @@ function IndicatorRow(props: {
           onChange({ ...indicator, kind: event.target.value as IndicatorForm['kind'] })
         }}
       >
-        <option value="SMA">SMA</option>
-        <option value="EMA">EMA</option>
+        {INDICATOR_KINDS.map((kind) => (
+          <option key={kind} value={kind}>
+            {kind}
+          </option>
+        ))}
       </select>
       <input
         aria-label="indicator period"

@@ -18,8 +18,9 @@ from hypothesis import strategies as st
 
 from tradeforge_engine.domain import Candle
 from tradeforge_engine.errors import EngineError
-from tradeforge_engine.indicators import EMA, SMA, build_indicator
+from tradeforge_engine.indicators import EMA, RSI, SMA, build_indicator
 from tradeforge_engine.loop import ENGINE_CONTEXT
+from tradeforge_engine.protocols import Indicator
 from tradeforge_engine.testing import HOUR, START, bar
 
 
@@ -34,7 +35,7 @@ def _closes(*values: str) -> list[Candle]:
     return candles
 
 
-def _values(indicator: SMA | EMA, candles: list[Candle]) -> list[Decimal | None]:
+def _values(indicator: Indicator, candles: list[Candle]) -> list[Decimal | None]:
     out: list[Decimal | None] = []
     with localcontext(ENGINE_CONTEXT):
         for candle in candles:
@@ -66,6 +67,59 @@ def test_ema_matches_hand_calculation() -> None:
     """
     values = _values(EMA(period=3), _closes(*_GOLDEN))
     assert values == [None, None, Decimal("17"), Decimal("29.5"), Decimal("29.75")]
+
+
+# RSI goldens. period=2 keeps the arithmetic on paper; Wilder's 1/period (0.5 here) is still
+# distinct from EMA's 2/(period+1) = 0.667, so a bug that reached for the EMA weight would read
+# 83.33 at the last bar, not 80 — the golden fails loudly on that swap.
+_RSI_GOLDEN = ["100", "103", "102", "102.5"]
+
+
+def test_rsi_matches_hand_calculation() -> None:
+    """RSI(2) of 100, 103, 102, 102.5.
+
+    Changes: +3 (gain), -1 (loss), +0.5 (gain). None while fewer than `period` changes exist.
+    Seed at bar 3 (two changes): avg_gain = (3+0)/2 = 1.5, avg_loss = (0+1)/2 = 0.5,
+    RS = 1.5/0.5 = 3, RSI = 100 - 100/(1+3) = 75.
+    Bar 4, Wilder (alpha = 1/2): avg_gain = 1.5 + (0.5-1.5)/2 = 1.0; avg_loss = 0.5 + (0-0.5)/2 =
+    0.25; RS = 1.0/0.25 = 4, RSI = 100 - 100/5 = 80.
+    """
+    values = _values(RSI(period=2), _closes(*_RSI_GOLDEN))
+    assert values == [None, None, Decimal("75"), Decimal("80")]
+
+
+def test_rsi_pins_to_100_when_there_are_no_losses() -> None:
+    """An only-rising window has avg_loss = 0: RS → ∞, and RSI pins to 100 instead of dividing by
+    zero. The same branch is what a flat series reads — no move is a gain or a loss."""
+    values = _values(RSI(period=3), _closes("1", "2", "3", "4", "5"))
+    assert values[-1] == Decimal("100")
+
+
+def test_rsi_pins_to_0_when_there_are_no_gains() -> None:
+    """The mirror image: an only-falling window has avg_gain = 0, so RS = 0 and RSI = 0."""
+    values = _values(RSI(period=3), _closes("5", "4", "3", "2", "1"))
+    assert values[-1] == Decimal("0")
+
+
+def test_rsi_reads_100_on_a_perfectly_flat_series() -> None:
+    """A market that never moves has no gains *and* no losses: avg_loss is 0, so RSI pins to 100
+    — this engine's convention, not the 50 some libraries return for 0/0. A flat tape tripping
+    `RSI > 70 -> sell` is a real consequence, made visible by a test rather than left to a
+    comment. (The only-rising golden above shares the branch; this is the distinct 0/0 case.)"""
+    values = _values(RSI(period=3), _closes("100", "100", "100", "100", "100"))
+    assert values[-1] == Decimal("100")
+
+
+def test_rsi_is_none_until_it_has_seen_period_plus_one_closes() -> None:
+    """RSI needs `period` changes, and a change needs two closes: `value()` is None through the
+    first `period` closes and a number only from close `period + 1` on."""
+    assert _values(RSI(period=4), _closes("1", "2", "3", "4")) == [None, None, None, None]
+    assert _values(RSI(period=4), _closes("1", "2", "1", "2", "1"))[-1] is not None
+
+
+def test_rsi_refuses_a_non_positive_period() -> None:
+    with pytest.raises(ValueError, match="RSI period must be >= 1"):
+        RSI(period=0)
 
 
 def test_an_indicator_is_none_until_it_has_seen_period_candles() -> None:
@@ -106,7 +160,7 @@ def test_build_indicator_refuses_an_unknown_type() -> None:
     """A strategy naming an indicator the engine cannot compute must fail at compile, not run
     on a default and produce a plausible, wrong backtest."""
     with pytest.raises(EngineError, match="unknown indicator type"):
-        build_indicator({"id": "x", "type": "RSI", "params": {"period": 14}})
+        build_indicator({"id": "x", "type": "STOCHASTIC", "params": {"period": 14}})
 
 
 def test_build_indicator_refuses_non_object_params() -> None:
@@ -196,3 +250,29 @@ def test_value_is_none_exactly_during_warmup(period: int, length: int) -> None:
         values = _values(indicator, candles)
         for index, value in enumerate(values):
             assert (value is None) == (index + 1 < period)
+
+
+@given(
+    period=st.integers(min_value=1, max_value=10),
+    moves=st.lists(st.integers(min_value=-5, max_value=5), min_size=0, max_size=40),
+)
+def test_rsi_stays_within_0_and_100_and_warms_up_on_schedule(period: int, moves: list[int]) -> None:
+    """RSI is bounded to [0, 100] the instant it exists, and it exists from exactly the
+    `period`-th close on — one change per bar after the first, `period` changes to seed, so the
+    warm-up ends one bar later than an SMA/EMA of the same period (which is why RSI cannot simply
+    join the moving-average property tests above).
+
+    The single hand-worked golden cannot reach this whole class: a gain/loss swap in a future
+    refactor would keep that golden green yet push some series out of [0, 100] — this is the test
+    that would fail. The walk starts at 1000 so flat candles stay strictly positive.
+    """
+    prices = [1000]
+    for move in moves:
+        prices.append(prices[-1] + move)
+    values = _values(RSI(period=period), _closes(*[str(price) for price in prices]))
+    for index, value in enumerate(values):
+        if index < period:
+            assert value is None
+        else:
+            assert value is not None
+            assert Decimal(0) <= value <= Decimal(100)

@@ -35,6 +35,7 @@ from typing import Final
 
 from tradeforge_engine.domain import ZERO, Candle, Money
 from tradeforge_engine.errors import EngineError
+from tradeforge_engine.protocols import Indicator
 
 _PRICE_SOURCES: Final = frozenset({"open", "high", "low", "close"})
 
@@ -138,12 +139,85 @@ class EMA:
         return self._value
 
 
-# The registry. A DSL indicator names a `type`; this maps it to a constructor. `Indicator`
-# (the Protocol) is satisfied structurally — SMA and EMA inherit nothing.
-def _build_moving_average(
-    cls: type[SMA] | type[EMA],
-) -> Callable[[Mapping[str, object]], SMA | EMA]:
-    def build(spec: Mapping[str, object]) -> SMA | EMA:
+class RSI:
+    """Relative Strength Index (Wilder, 1978) — momentum as a bounded 0-100 oscillator.
+
+    Each bar's close-to-close change is a gain (an up move) or a loss (a down move, taken as a
+    positive magnitude) — never both. RSI compares their smoothed averages:
+
+        RS  = avg_gain / avg_loss
+        RSI = 100 - 100 / (1 + RS)
+
+    so a run of only gains drives RSI toward 100 and only losses toward 0.
+
+    **Wilder smoothing — not the `EMA` in this file.** The averages use Wilder's method, an EMA
+    whose weight is `1 / period`, not the `2 / (period + 1)` of `EMA`. For period 14 that is
+    ~0.071 against ~0.133 — nearly double — and swapping one for the other is the most common
+    reason an RSI disagrees with every charting tool. It is written in the same stable
+    `prev + (x - prev) / period` form `EMA` uses, so a flat stretch neither drifts nor surprises.
+
+    **Seeding** mirrors the EMA: the first average is the simple mean of the first `period` gains
+    (and of the first `period` losses), which needs `period` changes — `period + 1` closes — so
+    `value()` is `None` until then.
+
+    **avg_loss == 0.** No down move in the window makes RS a division by zero; the limit is
+    RSI = 100 (RS → ∞), which is also what an only-rising or flat series should read. Pinned here
+    and checked by a golden.
+    """
+
+    def __init__(self, *, period: int, source: str = "close") -> None:
+        if period < 1:
+            raise ValueError(f"RSI period must be >= 1, got {period}")
+        self._period = period
+        self._source = source
+        self._previous: Money | None = None
+        self._seed_count = 0
+        self._seed_gain: Money = ZERO
+        self._seed_loss: Money = ZERO
+        self._avg_gain: Money | None = None
+        self._avg_loss: Money | None = None
+
+    def update(self, candle: Candle) -> None:
+        price = _price(candle, self._source)
+        if self._previous is None:
+            # The first bar is a level with no prior close to change from — no gain, no loss.
+            self._previous = price
+            return
+        change = price - self._previous
+        self._previous = price
+        gain = change if change > ZERO else ZERO
+        loss = -change if change < ZERO else ZERO
+        if self._avg_gain is None or self._avg_loss is None:
+            # Seeding: the first average is the simple mean of the first `period` moves.
+            self._seed_count += 1
+            self._seed_gain += gain
+            self._seed_loss += loss
+            if self._seed_count == self._period:
+                self._avg_gain = self._seed_gain / self._period
+                self._avg_loss = self._seed_loss / self._period
+            return
+        # Wilder smoothing: an EMA with alpha = 1/period, in the stable increment form. The
+        # division runs under `run()`'s pinned context, like every other number in the engine.
+        self._avg_gain = self._avg_gain + (gain - self._avg_gain) / self._period
+        self._avg_loss = self._avg_loss + (loss - self._avg_loss) / self._period
+
+    def value(self) -> Money | None:
+        if self._avg_gain is None or self._avg_loss is None:
+            return None
+        if self._avg_loss == ZERO:
+            # No losses in the window: RS → ∞, RSI → 100. Also the only-rising / flat case.
+            return Decimal(100)
+        rs = self._avg_gain / self._avg_loss
+        return Decimal(100) - Decimal(100) / (Decimal(1) + rs)
+
+
+# The registry. A DSL indicator names a `type`; this maps it to a constructor. Each indicator
+# satisfies the `Indicator` Protocol structurally — none inherits anything — so the registry is
+# typed against the Protocol, and a new indicator is genuinely one new class plus one line here.
+def _period_source_builder(
+    cls: Callable[..., Indicator],
+) -> Callable[[Mapping[str, object]], Indicator]:
+    def build(spec: Mapping[str, object]) -> Indicator:
         params = spec["params"]
         if not isinstance(params, Mapping):
             raise EngineError(f"indicator {spec.get('id')!r}: params must be an object")
@@ -154,13 +228,14 @@ def _build_moving_average(
     return build
 
 
-INDICATOR_BUILDERS: Final[dict[str, Callable[[Mapping[str, object]], SMA | EMA]]] = {
-    "SMA": _build_moving_average(SMA),
-    "EMA": _build_moving_average(EMA),
+INDICATOR_BUILDERS: Final[dict[str, Callable[[Mapping[str, object]], Indicator]]] = {
+    "SMA": _period_source_builder(SMA),
+    "EMA": _period_source_builder(EMA),
+    "RSI": _period_source_builder(RSI),
 }
 
 
-def build_indicator(spec: Mapping[str, object]) -> tuple[str, SMA | EMA]:
+def build_indicator(spec: Mapping[str, object]) -> tuple[str, Indicator]:
     """Turn one DSL indicator spec into `(id, indicator)`.
 
     Raises rather than guess on a `type` the engine was not built for: a strategy naming an
@@ -180,4 +255,4 @@ def build_indicator(spec: Mapping[str, object]) -> tuple[str, SMA | EMA]:
     return indicator_id, builder(spec)
 
 
-__all__ = ["EMA", "INDICATOR_BUILDERS", "SMA", "build_indicator"]
+__all__ = ["EMA", "INDICATOR_BUILDERS", "RSI", "SMA", "build_indicator"]

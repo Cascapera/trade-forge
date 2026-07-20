@@ -9,6 +9,7 @@ goldens pin exactly which update confirms which swing, so a change that let a sw
 
 from datetime import datetime
 from decimal import Decimal
+from itertools import pairwise
 
 import pytest
 from hypothesis import given
@@ -25,10 +26,13 @@ from tradeforge_engine.structure import (
     MarketStructure,
     StructureBreak,
     StructureKind,
+    Sweep,
+    SweepDetector,
     Swing,
     SwingDetector,
     SwingKind,
     Trend,
+    _WedgeTracker,
 )
 from tradeforge_engine.testing import HOUR, START, bar
 
@@ -695,3 +699,745 @@ def test_highs_within_tolerance_of_the_anchor_collapse_to_one_pool_at_their_max(
     assert last is not None
     assert last.level == Decimal(base + max(deltas))
     assert len(last.touches) == len(deltas)
+
+
+# --- Sweeps -------------------------------------------------------------------------------------
+#
+# The author's wedge, bar by bar: minor pivot lows 90, 92, 94.5, 97 climb while the corrections
+# that separate them shrink monotonically (94-92=2.0, 96-94.5=1.5, 98-97=1.0). That is price
+# grinding into a shelf of stops with less and less give — the setup a sweep needs before it means
+# anything.
+_WEDGE = [
+    bar(0, open_="92", close="92", high="93", low="91"),  # lead-in
+    bar(1, open_="92", close="91", high="92", low="90"),  # low 1: 90
+    bar(2, open_="93", close="93.5", high="94", low="93"),  # high 94
+    bar(3, open_="93", close="92.5", high="93", low="92"),  # low 2: 92    correction 2.0
+    bar(4, open_="95", close="95.5", high="96", low="95"),  # high 96
+    bar(5, open_="95", close="95", high="95.5", low="94.5"),  # low 3: 94.5 correction 1.5
+    bar(6, open_="97.5", close="97.8", high="98", low="97.5"),  # high 98
+    bar(7, open_="97.5", close="97.2", high="97.5", low="97"),  # low 4: 97   correction 1.0
+    bar(8, open_="99", close="99.8", high="100", low="99"),  # wedge complete
+]
+
+_POOL_101 = LiquidityPool(
+    side=LiquiditySide.BUY_SIDE,
+    level=Decimal("101"),
+    touches=(_swing(SwingKind.HIGH, "101", 0), _swing(SwingKind.HIGH, "100.5", 1)),
+    time=_at(1),
+)
+
+
+def _sweeps(
+    detector: SweepDetector, pools: LiquidityPool | list[LiquidityPool], candles: list[Candle]
+) -> list[tuple[int, Sweep]]:
+    """Track the pool(s), feed the candles in order; return (bar_index, sweep) for each sweep."""
+    for pool in pools if isinstance(pools, list) else [pools]:
+        detector.track(pool)
+    found: list[tuple[int, Sweep]] = []
+    for index, candle in enumerate(candles):
+        found.extend((index, sweep) for sweep in detector.update(candle))
+    return found
+
+
+def test_sweep_golden_the_authors_wedge_pierces_the_pool_and_closes_back_inside() -> None:
+    """Author's example: the wedge climbs into a pool at 101, b9 wicks to 102, b10 closes back in.
+
+    This is the case the whole primitive exists for, and it pins the two rules that separate a
+    sweep from a break of structure. b9 goes *through* 101 (high 102) but closes at 101.5 — above
+    the level, so nothing is decided yet. b10 closes at 100.5, back inside: the stops above 101
+    were filled and the level was rejected. Had price instead held above 101 for the whole window,
+    the same wick would have been acceptance, not a trap.
+
+    The reported wedge is the four rising lows — the trendline of stops the cascade will now run
+    through — and `extreme` is 102, the furthest the raid reached.
+    """
+    candles = [
+        *_WEDGE,
+        bar(9, open_="100", close="101.5", high="102", low="99.5"),  # pierces, closes above
+        bar(10, open_="101", close="100.5", high="101.6", low="100"),  # closes back inside
+    ]
+    sweeps = _sweeps(SweepDetector(), _POOL_101, candles)
+
+    assert len(sweeps) == 1
+    index, sweep = sweeps[0]
+    assert index == 10  # confirmed on the bar that closed back inside, not the bar that pierced
+    assert sweep.side is LiquiditySide.BUY_SIDE
+    assert sweep.level == Decimal("101")
+    assert sweep.extreme == Decimal("102")
+    assert sweep.pierced_at == _at(9)
+    assert sweep.time == _at(10)
+    assert [low.price for low in sweep.wedge] == [
+        Decimal("90"),
+        Decimal("92"),
+        Decimal("94.5"),
+        Decimal("97"),
+    ]
+
+
+def test_a_pierce_and_a_recovery_on_the_same_bar_is_a_sweep() -> None:
+    """One bar can do both: wick through the level and close back inside before it ever ends."""
+    candles = [*_WEDGE, bar(9, open_="100", close="100", high="102", low="99")]
+    sweeps = _sweeps(SweepDetector(), _POOL_101, candles)
+
+    assert len(sweeps) == 1
+    _, sweep = sweeps[0]
+    assert sweep.pierced_at == sweep.time == _at(9)
+
+
+def test_the_wick_keeps_extending_while_the_window_is_open() -> None:
+    """`extreme` is the furthest point of the whole raid, not just the bar that first pierced."""
+    candles = [
+        *_WEDGE,
+        bar(9, open_="100", close="101.2", high="101.5", low="99.5"),  # pierces to 101.5
+        bar(10, open_="101", close="100.5", high="103", low="100"),  # runs to 103, then closes in
+    ]
+    sweeps = _sweeps(SweepDetector(), _POOL_101, candles)
+
+    assert len(sweeps) == 1
+    _, sweep = sweeps[0]
+    assert sweep.extreme == Decimal("103")
+    assert sweep.pierced_at == _at(9)
+
+
+def test_a_level_held_past_the_window_is_acceptance_not_a_sweep() -> None:
+    """Three bars without a close back inside means the market took the level and kept it.
+
+    With `recovery_bars=3` the window covers b9, b10 and b11. Price closes above 101 on all three,
+    so by b12 the pool is gone — and the close back below on b12 reports nothing. That deadline is
+    what keeps a sweep meaningful: without it every break of structure would eventually be
+    relabelled a sweep by a late enough pullback.
+    """
+    candles = [
+        *_WEDGE,
+        bar(9, open_="100", close="101.5", high="102", low="99.5"),  # pierce, window opens
+        bar(10, open_="101.5", close="101.8", high="102", low="101.2"),
+        bar(11, open_="101.8", close="102", high="102.5", low="101.5"),  # window closes here
+        bar(12, open_="101.5", close="100.5", high="102", low="100"),  # too late
+    ]
+    assert _sweeps(SweepDetector(), _POOL_101, candles) == []
+
+
+def test_a_close_exactly_at_the_level_has_not_recovered() -> None:
+    """Strict comparisons, as everywhere else here: a close *at* 101 is neither in nor out."""
+    candles = [
+        *_WEDGE,
+        bar(9, open_="100", close="101.5", high="102", low="99.5"),
+        bar(10, open_="101", close="101", high="101.6", low="100.5"),  # exactly at the level
+        bar(11, open_="101", close="100", high="101.2", low="100"),  # strictly inside
+    ]
+    sweeps = _sweeps(SweepDetector(), _POOL_101, candles)
+
+    assert [index for index, _ in sweeps] == [11]
+
+
+def test_a_pierce_without_a_wedge_is_not_a_sweep() -> None:
+    """The wedge is a precondition: a wick through a level out of nowhere reports nothing.
+
+    These bars walk straight up to the pool with no minor pivots at all — no rising lows, no
+    shrinking corrections, no trendline of trapped stops. Price closes inside the level first (so
+    the pool is live and armed), then pierces 101 and closes back inside, and the detector still
+    stays silent. Only the missing wedge separates this from the golden.
+    """
+    candles = [
+        bar(0, open_="98", close="98.5", high="99", low="98"),
+        bar(1, open_="98.5", close="99.5", high="100", low="98.5"),
+        bar(2, open_="99.5", close="100", high="100.5", low="99.5"),  # closes inside: pool armed
+        bar(3, open_="100", close="101.5", high="102", low="100"),  # pierces
+        bar(4, open_="101.5", close="100.5", high="101.5", low="100"),  # closes back inside
+    ]
+    assert _sweeps(SweepDetector(), _POOL_101, candles) == []
+
+
+def test_a_correction_that_grows_breaks_the_wedge() -> None:
+    """Corrections must shrink monotonically — 2.0, 1.0, 1.5 is not a wedge losing volatility.
+
+    The lows still rise (90, 92, 94.5, 97), so a rule that only checked the rising trendline would
+    accept this. It is the volatility decay that makes the pattern a squeeze rather than an
+    ordinary uptrend, and here only two lows survive the scan back — one short of the minimum.
+    """
+    candles = [
+        bar(0, open_="92", close="92", high="93", low="91"),
+        bar(1, open_="92", close="91", high="92", low="90"),  # low 90
+        bar(2, open_="93", close="93.5", high="94", low="93"),  # high 94
+        bar(3, open_="93", close="92.5", high="93", low="92"),  # low 92    correction 2.0
+        bar(4, open_="95", close="95.2", high="95.5", low="95"),  # high 95.5
+        bar(5, open_="95", close="94.8", high="95.2", low="94.5"),  # low 94.5 correction 1.0
+        bar(6, open_="97.5", close="98", high="98.5", low="97.5"),  # high 98.5
+        bar(7, open_="97.5", close="97.2", high="97.5", low="97"),  # low 97   correction 1.5 (grew)
+        bar(8, open_="99", close="99.8", high="100", low="99"),
+        bar(9, open_="100", close="101.5", high="102", low="99.5"),
+        bar(10, open_="101", close="100.5", high="101.6", low="100"),
+    ]
+    assert _sweeps(SweepDetector(), _POOL_101, candles) == []
+
+
+def test_two_rising_lows_are_one_short_of_a_wedge() -> None:
+    """Three lows are the floor: two lows show one correction, and one correction cannot shrink."""
+    candles = [
+        bar(0, open_="93", close="93.5", high="94", low="93"),
+        bar(1, open_="93", close="92.5", high="93", low="92"),  # low 92
+        bar(2, open_="95", close="95.5", high="96", low="95"),  # high 96
+        bar(3, open_="95", close="95", high="95.5", low="94.5"),  # low 94.5 — only two lows
+        bar(4, open_="99", close="99.8", high="100", low="99"),
+        bar(5, open_="100", close="101.5", high="102", low="99.5"),
+        bar(6, open_="101", close="100.5", high="101.6", low="100"),
+    ]
+    assert _sweeps(SweepDetector(), _POOL_101, candles) == []
+
+
+def test_the_bearish_mirror_sweeps_a_sell_side_pool() -> None:
+    """The author's wedge reflected: falling highs, shrinking rallies, a wick below and a close in.
+
+    Every bar is the golden mirrored about 200, so the highs descend 110, 108, 105.5, 103 with
+    rallies of 2.0, 1.5, 1.0. The pool of sell stops sits at 99; b9 wicks down to 98 and b10 closes
+    back above. Same machine, opposite sign — which is the point of testing it: the sell side must
+    not be a second, subtly different implementation.
+    """
+    pool = LiquidityPool(
+        side=LiquiditySide.SELL_SIDE,
+        level=Decimal("99"),
+        touches=(_swing(SwingKind.LOW, "99", 0), _swing(SwingKind.LOW, "99.5", 1)),
+        time=_at(1),
+    )
+    candles = [
+        bar(0, open_="108", close="108", high="109", low="107"),
+        bar(1, open_="108", close="109", high="110", low="108"),  # high 110
+        bar(2, open_="107", close="106.5", high="107", low="106"),  # low 106
+        bar(3, open_="107", close="107.5", high="108", low="107"),  # high 108   rally 2.0
+        bar(4, open_="105", close="104.5", high="105", low="104"),  # low 104
+        bar(5, open_="105", close="105", high="105.5", low="104.5"),  # high 105.5 rally 1.5
+        bar(6, open_="102.5", close="102.2", high="102.5", low="102"),  # low 102
+        bar(7, open_="102.5", close="102.8", high="103", low="102.5"),  # high 103  rally 1.0
+        bar(8, open_="101", close="100.2", high="101", low="100"),
+        bar(9, open_="100", close="98.5", high="100.5", low="98"),  # pierces below 99
+        bar(10, open_="99", close="99.5", high="100", low="98.4"),  # closes back above
+    ]
+    sweeps = _sweeps(SweepDetector(), pool, candles)
+
+    assert len(sweeps) == 1
+    index, sweep = sweeps[0]
+    assert index == 10
+    assert sweep.side is LiquiditySide.SELL_SIDE
+    assert sweep.extreme == Decimal("98")
+    assert [high.price for high in sweep.wedge] == [
+        Decimal("110"),
+        Decimal("108"),
+        Decimal("105.5"),
+        Decimal("103"),
+    ]
+
+
+def test_a_deepened_pool_replaces_its_earlier_level() -> None:
+    """Re-tracking a pool that gained a touch moves the line to defend instead of watching both."""
+    detector = SweepDetector()
+    detector.track(_POOL_101)
+    deeper = LiquidityPool(
+        side=LiquiditySide.BUY_SIDE,
+        level=Decimal("103"),  # a third equal high lifted the extreme
+        touches=(*_POOL_101.touches, _swing(SwingKind.HIGH, "103", 2)),
+        time=_at(2),
+    )
+    detector.track(deeper)
+
+    for candle in _WEDGE:
+        assert detector.update(candle) == ()
+    # 102 pierced the old level but not the new one, so nothing arms and nothing is reported.
+    assert detector.update(bar(9, open_="100", close="101.5", high="102", low="99.5")) == ()
+    assert detector.update(bar(10, open_="101", close="100.5", high="101.6", low="100")) == ()
+
+
+def test_a_longer_recovery_window_catches_a_slower_trap() -> None:
+    """`recovery_bars` is the knob: the same bars that time out at 3 still confirm at 5."""
+    candles = [
+        *_WEDGE,
+        bar(9, open_="100", close="101.5", high="102", low="99.5"),
+        bar(10, open_="101.5", close="101.8", high="102", low="101.2"),
+        bar(11, open_="101.8", close="102", high="102.5", low="101.5"),
+        bar(12, open_="101.5", close="100.5", high="102", low="100"),
+    ]
+    assert _sweeps(SweepDetector(), _POOL_101, candles) == []
+
+    patient = _sweeps(SweepDetector(recovery_bars=5), _POOL_101, candles)
+    assert [index for index, _ in patient] == [12]
+
+
+def test_a_pool_goes_stale_and_stops_being_watched() -> None:
+    """A pool nothing has approached for `lookback_bars` is dropped rather than watched forever."""
+    detector = SweepDetector(lookback_bars=4)
+    detector.track(_POOL_101)
+    for candle in _WEDGE:  # nine quiet bars, well past the four-bar window
+        assert detector.update(candle) == ()
+    assert detector.update(bar(9, open_="100", close="101.5", high="102", low="99.5")) == ()
+    assert detector.update(bar(10, open_="101", close="100.5", high="101.6", low="100")) == ()
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"recovery_bars": 0}, "recovery_bars must be >= 1"),
+        ({"min_wedge_pivots": 2}, "a wedge needs at least 3 pivots"),
+        ({"lookback_bars": 0}, "lookback_bars must be >= 1"),
+    ],
+)
+def test_nonsensical_sweep_settings_are_refused(kwargs: dict[str, int], message: str) -> None:
+    """Bad configuration fails at construction, not silently at the first missed sweep."""
+    with pytest.raises(ValueError, match=message):
+        SweepDetector(**kwargs)
+
+
+def test_two_lows_without_a_high_between_them_collapse_to_the_lower() -> None:
+    """A doubled low is one pivot, not two — the wedge measures from 90, never from 91.
+
+    Bars 1 and 3 both print minor lows (90, then 91) with no minor high between them, because bar
+    2's high never clears its neighbours. They belong to the same leg down, so the sequence has to
+    keep the extreme and drop the other; otherwise the wedge would later measure a "correction"
+    across two lows with no high dividing them. The assertion is the wedge's first low: 90 if the
+    zig-zag collapsed correctly, 91 if both were kept.
+    """
+    candles = [
+        bar(0, open_="93", close="93", high="95", low="91"),
+        bar(1, open_="93", close="92", high="95", low="90"),  # low 90
+        bar(2, open_="93", close="93.5", high="94", low="93"),  # no high: 94 < bar 1's 95
+        bar(3, open_="93", close="92", high="93", low="91"),  # low 91 — same leg, discarded
+        bar(4, open_="93", close="93.5", high="94", low="93"),  # high 94
+        bar(5, open_="93", close="92.5", high="93", low="92"),  # low 92     correction 2.0
+        bar(6, open_="95", close="95.5", high="96", low="95"),  # high 96
+        bar(7, open_="95", close="95", high="95.5", low="94.5"),  # low 94.5 correction 1.5
+        bar(8, open_="97.5", close="97.8", high="98", low="97.5"),  # high 98
+        bar(9, open_="97.5", close="97.2", high="97.5", low="97"),  # low 97   correction 1.0
+        bar(10, open_="99", close="99.8", high="100", low="99"),
+        bar(11, open_="100", close="101.5", high="102", low="99.5"),  # pierces
+        bar(12, open_="101", close="100.5", high="101.6", low="100"),  # closes back inside
+    ]
+    sweeps = _sweeps(SweepDetector(), _POOL_101, candles)
+
+    assert len(sweeps) == 1
+    _, sweep = sweeps[0]
+    assert [low.price for low in sweep.wedge] == [
+        Decimal("90"),
+        Decimal("92"),
+        Decimal("94.5"),
+        Decimal("97"),
+    ]
+
+
+def test_the_pivot_history_stays_bounded_over_a_long_series() -> None:
+    """A wedge only ever reads a tail of the zig-zag, so the history must not grow with the series.
+
+    Without the cap a live session would accumulate one pivot every few bars forever. This drives a
+    clean sawtooth: each even bar sits entirely above its neighbours (a minor high) and each odd
+    bar entirely below (a minor low), so the sequence grows by one pivot per bar and comfortably
+    passes the cap. Deliberately *not* outside bars — those collapse into the previous pivot, which
+    would keep the sequence short and quietly stop this test from exercising the cap at all.
+    """
+    tracker = _WedgeTracker(min_pivots=3)
+    for index in range(140):
+        low = index % 2 == 1
+        tracker.update(
+            bar(
+                index,
+                open_="98" if low else "100",
+                close="98" if low else "100",
+                high="99" if low else "101",
+                low="98" if low else "100",
+            )
+        )
+
+    assert len(tracker._pivots) > 1  # the series really did produce pivots to cap
+    assert len(tracker._pivots) <= _WedgeTracker._MAX_PIVOTS
+    # A flat sawtooth has no shrinking corrections, so it is still correctly not a wedge.
+    assert tracker.bullish_wedge() is None
+    assert tracker.bearish_wedge() is None
+
+
+def test_a_doubled_low_keeps_the_later_pivot_when_that_one_is_deeper() -> None:
+    """The mirror of the collapse: 91 then 90 keeps 90, so the extreme wins regardless of order.
+
+    Same shape as the test above with the two lows swapped. Whichever arrives first, the leg's real
+    pivot is its lowest point — a rule that just kept the first (or just kept the last) would put
+    the wedge's trendline in the wrong place half the time.
+    """
+    candles = [
+        bar(0, open_="93", close="93", high="95", low="92"),
+        bar(1, open_="93", close="92", high="95", low="91"),  # low 91
+        bar(2, open_="93", close="93.5", high="94", low="93"),  # no high: 94 < bar 1's 95
+        bar(3, open_="93", close="92", high="93", low="90"),  # low 90 — deeper, so it replaces 91
+        bar(4, open_="93", close="93.5", high="94", low="93"),  # high 94
+        bar(5, open_="93", close="92.5", high="93", low="92"),  # low 92     correction 2.0
+        bar(6, open_="95", close="95.5", high="96", low="95"),  # high 96
+        bar(7, open_="95", close="95", high="95.5", low="94.5"),  # low 94.5 correction 1.5
+        bar(8, open_="97.5", close="97.8", high="98", low="97.5"),  # high 98
+        bar(9, open_="97.5", close="97.2", high="97.5", low="97"),  # low 97   correction 1.0
+        bar(10, open_="99", close="99.8", high="100", low="99"),
+        bar(11, open_="100", close="101.5", high="102", low="99.5"),  # pierces
+        bar(12, open_="101", close="100.5", high="101.6", low="100"),  # closes back inside
+    ]
+    sweeps = _sweeps(SweepDetector(), _POOL_101, candles)
+
+    assert len(sweeps) == 1
+    _, sweep = sweeps[0]
+    assert sweep.wedge[0].price == Decimal("90")
+
+
+def test_a_pool_the_market_already_broke_cannot_be_swept() -> None:
+    """Price trading *above* a buy-side pool means those stops are long gone — nothing left to raid.
+
+    Every bar here is the golden wedge shifted up 15 points, so the whole approach happens between
+    105 and 113 and never once closes below the pool at 101. The wedge is valid, the highs are far
+    above the level, and bar 6 eventually sells off through 101. That is a market breaking down
+    through an old, already-taken level — not a trap. Reporting it would hand the strategy a
+    reversal signal 13 points into the move, systematically at the worst possible price.
+    """
+    candles = [
+        bar(0, open_="107", close="107", high="108", low="106"),
+        bar(1, open_="107", close="106", high="107", low="105"),  # low 105
+        bar(2, open_="108", close="108.5", high="109", low="108"),  # high 109
+        bar(3, open_="108", close="107.5", high="108", low="107"),  # low 107     correction 2.0
+        bar(4, open_="110", close="110.5", high="111", low="110"),  # high 111
+        bar(5, open_="110", close="110", high="110.5", low="109.5"),  # low 109.5 correction 1.5
+        bar(6, open_="112.5", close="112.8", high="113", low="112.5"),  # wedge valid, high 113
+        bar(7, open_="112.5", close="100", high="113", low="99.5"),  # sells through 101
+    ]
+    assert _sweeps(SweepDetector(), _POOL_101, candles) == []
+
+
+def test_one_bar_sweeping_two_pools_reports_both() -> None:
+    """A single push can clear stops at 101 and at 103 — both are real events, both come back.
+
+    Reporting only one would silently lose the other, and a strategy anchored on the deeper pool
+    would simply never fire. They are returned ordered by level, so the output does not depend on
+    which pool happened to be tracked first.
+    """
+    higher = LiquidityPool(  # its own first touch, so it is a distinct pool, not the same one
+        side=LiquiditySide.BUY_SIDE,
+        level=Decimal("103"),
+        touches=(_swing(SwingKind.HIGH, "103", 2), _swing(SwingKind.HIGH, "102.5", 3)),
+        time=_at(3),
+    )
+    candles = [*_WEDGE, bar(9, open_="100", close="100.5", high="104", low="99.5")]
+
+    for order in ([_POOL_101, higher], [higher, _POOL_101]):
+        sweeps = _sweeps(SweepDetector(), order, candles)
+        assert [(index, sweep.level) for index, sweep in sweeps] == [
+            (9, Decimal("101")),
+            (9, Decimal("103")),
+        ]
+        # Each carries its own extent: the raid ran to 104 past both levels.
+        assert {sweep.extreme for _, sweep in sweeps} == {Decimal("104")}
+
+
+def test_a_pool_cannot_be_swept_by_the_bar_that_created_it() -> None:
+    """The bar that completes a pool has only just closed — it cannot also have raided it.
+
+    A caller wiring `LiquidityDetector` into `SweepDetector` naturally tracks the pool and feeds
+    the same candle in the same iteration. Without the guard, bar 9's high would sweep a level that
+    bar 9 itself had just established: a decision using information from its own bar, which is the
+    anti-lookahead invariant broken outright.
+    """
+    born_on_bar_9 = LiquidityPool(
+        side=LiquiditySide.BUY_SIDE,
+        level=Decimal("101"),
+        touches=(_swing(SwingKind.HIGH, "101", 7), _swing(SwingKind.HIGH, "100.5", 9)),
+        time=_at(9),
+    )
+    detector = SweepDetector()
+    for candle in _WEDGE:
+        detector.update(candle)
+    detector.track(born_on_bar_9)
+
+    assert detector.update(bar(9, open_="100", close="100", high="102", low="99")) == ()
+
+
+def test_a_recovery_window_of_one_bar_allows_no_follow_through() -> None:
+    """`recovery_bars=1` is the strictest setting: the piercing bar must close back inside itself.
+
+    The golden's b9 pierces and closes *above* 101, so with a one-bar window it has already failed
+    by the time b10 drags price back. The same bars confirm at the default of 3.
+    """
+    candles = [
+        *_WEDGE,
+        bar(9, open_="100", close="101.5", high="102", low="99.5"),
+        bar(10, open_="101", close="100.5", high="101.6", low="100"),
+    ]
+    assert _sweeps(SweepDetector(recovery_bars=1), _POOL_101, candles) == []
+    assert [index for index, _ in _sweeps(SweepDetector(), _POOL_101, candles)] == [10]
+
+
+def test_the_wedge_may_be_completed_by_the_piercing_bar_itself() -> None:
+    """The last low can confirm on the very bar that springs the trap — and that is not lookahead.
+
+    A minor pivot needs one bar on each side, so the wedge's final low (bar 7) is only confirmed
+    when bar 8 closes. Here bar 8 is also the bar that pierces 101. Both facts are known at bar 8's
+    close, and the sweep it completes acts at bar 9's open, so the invariant holds: the wedge never
+    contains a pivot from a bar that has not closed.
+    """
+    candles = [
+        *_WEDGE[:8],  # through bar 7 — the wedge's last low, not yet confirmed
+        bar(8, open_="99", close="101.5", high="102", low="99"),  # confirms low 97 *and* pierces
+        bar(9, open_="101", close="100.5", high="101.6", low="100"),  # closes back inside
+    ]
+    sweeps = _sweeps(SweepDetector(), _POOL_101, candles)
+
+    assert len(sweeps) == 1
+    index, sweep = sweeps[0]
+    assert index == 9
+    assert sweep.pierced_at == _at(8)
+    assert [low.price for low in sweep.wedge] == [
+        Decimal("90"),
+        Decimal("92"),
+        Decimal("94.5"),
+        Decimal("97"),
+    ]
+
+
+def test_an_outside_bar_does_not_become_its_own_correction() -> None:
+    """An outside bar prints both extremes; taking both would measure a correction inside one bar.
+
+    Bar 4 engulfs its neighbours, so `SwingDetector` confirms a high *and* a low on it. If both
+    entered the zig-zag, the "correction" between the lows either side would be that single bar's
+    range rather than a move between legs — a wedge measured against noise. Only the pivot that
+    continues the alternation is kept, so the sequence stays a strict zig-zag and the corrections
+    stay the 2.0 / 1.5 / 1.0 the golden expects.
+    """
+    tracker = _WedgeTracker(min_pivots=3)
+    candles = [
+        *_WEDGE[:4],
+        bar(4, open_="95", close="95.5", high="96", low="88"),  # outside bar: high 96 and low 88
+        *_WEDGE[5:],
+    ]
+    for candle in candles:
+        tracker.update(candle)
+
+    kinds = [pivot.kind for pivot in tracker._pivots]
+    assert all(a is not b for a, b in pairwise(kinds))  # strictly alternating
+
+
+@given(
+    bars=st.lists(
+        st.tuples(st.integers(min_value=0, max_value=40), st.integers(min_value=0, max_value=12)),
+        min_size=6,
+        max_size=40,
+    ),
+    level=st.integers(min_value=5, max_value=35),
+)
+def test_every_reported_sweep_pierced_the_level_and_closed_back_inside(
+    bars: list[tuple[int, int]], level: int
+) -> None:
+    """Over random series: whatever comes out really is a wick beyond the level and a close inside.
+
+    The two defining facts of a sweep, asserted directly rather than through a hand-built series —
+    `extreme` strictly beyond `level`, the closing bar strictly inside it, and the pierce never
+    later than the confirmation. A regression that reported a break as a sweep, or stamped
+    `pierced_at` with a bar that never went through, fails here on some series even if every
+    golden still passes.
+    """
+    candles = [
+        bar(index, open_=str(low), close=str(low), high=str(low + span), low=str(low))
+        for index, (low, span) in enumerate(bars)
+    ]
+    pool = LiquidityPool(
+        side=LiquiditySide.BUY_SIDE,
+        level=Decimal(level),
+        touches=(_swing(SwingKind.HIGH, str(level), 0), _swing(SwingKind.HIGH, str(level), 0)),
+        time=_at(0) - HOUR,  # older than every candle, so nothing is blocked by the birth guard
+    )
+    by_time = {candle.time: candle for candle in candles}
+
+    for _, sweep in _sweeps(SweepDetector(), pool, candles):
+        assert sweep.extreme > sweep.level  # the wick really went through
+        assert by_time[sweep.time].close < sweep.level  # and price really came back
+        assert sweep.pierced_at <= sweep.time
+        assert by_time[sweep.pierced_at].high > sweep.level  # the stamped bar really pierced
+        # The raid came from the protected side: some earlier bar closed at or inside the level.
+        # Without this the whole class of "pool the market broke long ago" passes every other
+        # assertion here — its piercing bar's high clears the level too, from above.
+        assert any(
+            candle.close <= sweep.level for candle in candles if candle.time < sweep.pierced_at
+        )
+
+
+@given(
+    bars=st.lists(
+        st.tuples(st.integers(min_value=0, max_value=40), st.integers(min_value=0, max_value=12)),
+        min_size=6,
+        max_size=40,
+    ),
+    level=st.integers(min_value=5, max_value=35),
+)
+def test_the_same_series_always_produces_the_same_sweeps(
+    bars: list[tuple[int, int]], level: int
+) -> None:
+    """Determinism, the engine's second invariant: same input, same output, every run."""
+    candles = [
+        bar(index, open_=str(low), close=str(low), high=str(low + span), low=str(low))
+        for index, (low, span) in enumerate(bars)
+    ]
+    pool = LiquidityPool(
+        side=LiquiditySide.BUY_SIDE,
+        level=Decimal(level),
+        touches=(_swing(SwingKind.HIGH, str(level), 0), _swing(SwingKind.HIGH, str(level), 0)),
+        time=_at(0) - HOUR,
+    )
+
+    assert _sweeps(SweepDetector(), pool, candles) == _sweeps(SweepDetector(), pool, candles)
+
+
+def test_re_tracking_a_pool_at_the_same_level_keeps_what_it_already_knows() -> None:
+    """A pool that deepens without moving is the same line, so its armed state must survive.
+
+    `LiquidityDetector` re-reports a pool every time a touch is added. If that reset the "price is
+    inside" flag, a pool touched again just before the raid would be disarmed at exactly the moment
+    it mattered, and the sweep would be missed.
+    """
+    detector = SweepDetector()
+    detector.track(_POOL_101)
+    for candle in _WEDGE:  # price closes inside 101 throughout: the pool arms
+        detector.update(candle)
+
+    deepened = LiquidityPool(  # a third touch, same extreme, same first touch -> same pool
+        side=LiquiditySide.BUY_SIDE,
+        level=Decimal("101"),
+        touches=(*_POOL_101.touches, _swing(SwingKind.HIGH, "99", 2)),
+        time=_at(2),
+    )
+    detector.track(deepened)
+
+    assert detector.update(bar(9, open_="100", close="101.5", high="102", low="99.5")) == ()
+    sweeps = detector.update(bar(10, open_="101", close="100.5", high="101.6", low="100"))
+    assert [sweep.level for sweep in sweeps] == [Decimal("101")]
+
+
+def test_a_pool_can_be_raided_on_the_very_next_bar_after_it_is_tracked() -> None:
+    """A pool confirmed at one bar's close and raided at the next is the *cleanest* case, not a
+    corner one — the detector must not need a warm-up bar to see it.
+
+    This is the real call order: feed the bar, track what it produced, feed the next bar. Arming a
+    new pool from `False` would blind it for exactly one candle and lose precisely this pattern,
+    while the very same series still reported a sweep if the pool happened to be tracked earlier.
+    Same candles, same pool, same answer, regardless of when tracking began.
+    """
+    late = SweepDetector()
+    for candle in _WEDGE:
+        late.update(candle)
+    late.track(_POOL_101)  # only known now, at the close of bar 8
+    assert late.update(bar(9, open_="100", close="101.5", high="102", low="99.5")) == ()
+    swept = late.update(bar(10, open_="101", close="100.5", high="101.6", low="100"))
+    assert [sweep.level for sweep in swept] == [Decimal("101")]
+
+    candles = [
+        *_WEDGE,
+        bar(9, open_="100", close="101.5", high="102", low="99.5"),
+        bar(10, open_="101", close="100.5", high="101.6", low="100"),
+    ]
+    early = _sweeps(SweepDetector(), _POOL_101, candles)
+    assert [index for index, _ in early] == [10]
+
+
+def test_a_pool_that_deepens_to_a_new_level_stays_armed() -> None:
+    """A triple top swept: two equal highs at 101, a third at 102, and the next bar raids 102.
+
+    When the level moves the pierce in flight is rightly discarded — it was aimed at another line.
+    But the *arming* must carry over: a buy-side level only ever rises, so price sitting below 101
+    is a fortiori below 102. Re-arming from scratch here would kill the highest-quality instance of
+    the pattern the primitive detects.
+    """
+    detector = SweepDetector()
+    detector.track(_POOL_101)
+    for candle in _WEDGE:
+        detector.update(candle)
+
+    raised = LiquidityPool(  # same pool, third touch lifts the extreme to 102
+        side=LiquiditySide.BUY_SIDE,
+        level=Decimal("102"),
+        touches=(*_POOL_101.touches, _swing(SwingKind.HIGH, "102", 6)),
+        time=_at(6),
+    )
+    detector.track(raised)
+
+    assert detector.update(bar(9, open_="100", close="102.5", high="103", low="99.5")) == ()
+    swept = detector.update(bar(10, open_="102", close="101", high="102.4", low="100"))
+    assert [sweep.level for sweep in swept] == [Decimal("102")]
+
+
+def test_a_close_exactly_at_the_level_leaves_the_pool_armed() -> None:
+    """Sitting *on* the level is not acceptance, so a doji there must not disarm the pool.
+
+    `inside` deliberately uses a non-strict comparison while the pierce and the recovery stay
+    strict — they answer different questions. Round numbers are where stops gather and where a
+    close lands exactly on the level, so reusing the strict test would disarm pools precisely
+    where the pattern matters most.
+    """
+    candles = [
+        *_WEDGE[:8],
+        bar(8, open_="100.5", close="101", high="101", low="100"),  # closes exactly on 101
+        bar(9, open_="101", close="101.5", high="102", low="100.5"),  # pierces
+        bar(10, open_="101", close="100.5", high="101.6", low="100"),  # closes back inside
+    ]
+    sweeps = _sweeps(SweepDetector(), _POOL_101, candles)
+
+    assert [index for index, _ in sweeps] == [10]
+
+
+def test_pools_sharing_a_level_and_side_are_ordered_by_their_first_touch() -> None:
+    """Two distinct pools can settle on the same price, so level and side alone do not order them.
+
+    An aged-out cluster and a fresh one can both sit at 101. Sorting on `(level, side)` alone would
+    leave the tie to insertion order, making the output depend on which was tracked first — the
+    exact non-determinism the sort exists to remove. The first touch is the tiebreak.
+    """
+    twin = LiquidityPool(
+        side=LiquiditySide.BUY_SIDE,
+        level=Decimal("101"),
+        touches=(_swing(SwingKind.HIGH, "101", 4), _swing(SwingKind.HIGH, "100.8", 5)),
+        time=_at(5),
+    )
+    candles = [
+        *_WEDGE,
+        bar(9, open_="100", close="101.5", high="102", low="99.5"),
+        bar(10, open_="101", close="100.5", high="101.6", low="100"),
+    ]
+
+    for order in ([_POOL_101, twin], [twin, _POOL_101]):
+        sweeps = _sweeps(SweepDetector(), order, candles)
+        assert [sweep.pool.touches[0].time for _, sweep in sweeps] == [_at(0), _at(4)]
+
+
+def test_an_outside_bar_keeps_its_extreme_instead_of_dropping_it() -> None:
+    """The outside bar's new high must survive, or the next correction is measured too small.
+
+    Bar 4 makes both a higher high (99) and a lower low than its neighbours. Discarding the high
+    because it does not alternate would leave the previous, lower high in place, so the following
+    correction (high minus next low) would be understated — and a wedge is defined by corrections
+    that *shrink*, so understating one can manufacture a shrink that never happened. The sequence
+    must stay strictly alternating and still carry 99.
+    """
+    tracker = _WedgeTracker(min_pivots=3)
+    candles = [
+        *_WEDGE[:4],
+        bar(4, open_="95", close="95.5", high="99", low="88"),  # outside bar: high 99, low 88
+        *_WEDGE[5:],
+    ]
+    for candle in candles:
+        tracker.update(candle)
+
+    kinds = [pivot.kind for pivot in tracker._pivots]
+    assert all(a is not b for a, b in pairwise(kinds))  # still a strict zig-zag
+    assert Decimal("99") in [pivot.price for pivot in tracker._pivots]  # the real high survived
+
+
+def test_an_outside_bar_cannot_open_the_zig_zag() -> None:
+    """With no earlier pivot there is no tail to order the pair against, so neither is taken.
+
+    Accepting both would seed the sequence with a high and a low from the *same* bar — precisely
+    the degenerate shape the ordering rule exists to prevent — and there is no principled way to
+    pick one without a tail to alternate from. The sequence starts at the next unambiguous pivot.
+    """
+    tracker = _WedgeTracker(min_pivots=3)
+    for candle in [
+        bar(0, open_="93", close="93", high="95", low="92"),
+        bar(1, open_="93", close="93", high="99", low="88"),  # outside bar, first pivot of all
+        bar(2, open_="93", close="93", high="96", low="91"),
+    ]:
+        tracker.update(candle)
+
+    assert tracker._pivots == []

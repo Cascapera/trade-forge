@@ -112,3 +112,14 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
   fluxo (builder → run → results) precisaria de gravação de tela animada, que não dá pra gerar
   headless. Gravar quando houver ambiente com screen capture (ou usar `playwright` com vídeo do
   contexto e converter para GIF).
+- [origem: PR-202] **`confirmed_at` no `LiquidityPool` para blindar o sweep contra lookahead** — o
+  `SweepDetector` só pode ser varrido por uma barra posterior à poça, mas hoje o backstop compara com
+  `pool.time`, que é o tempo do *swing* (ocorrência), não o da confirmação. Como um swing de força N é
+  confirmado N barras depois, `pool.time` está sempre no passado e o check nunca dispara na prática — a
+  garantia real é o **contrato do chamador** (alimentar a barra em `update`, só então `track` das poças
+  que ela produziu), documentado na docstring de `SweepDetector`. Se o chamador inverter, uma poça pode
+  ser varrida pela barra que a revelou, sem nada falhar alto. Correção definitiva: o `LiquidityDetector`
+  sabe o instante da confirmação (é quando `update` devolve a poça) — carimbar `confirmed_at` no
+  `LiquidityPool` e trocar o backstop por `candle.time > pool.confirmed_at`. Fecha o buraco sem
+  aquecimento e sem depender de ordem de chamada. **Fazer no PR que fizer a fiação** dos detectores
+  (hoje `SweepDetector` e `LiquidityDetector` não têm chamador fora dos testes).

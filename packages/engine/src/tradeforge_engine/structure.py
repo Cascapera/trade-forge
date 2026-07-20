@@ -529,6 +529,348 @@ class LiquidityDetector:
         return best
 
 
+@dataclass(frozen=True, slots=True)
+class Sweep:
+    """A liquidity pool raided and rejected — the market took the stops and refused the level.
+
+    This is the mirror image of a break of structure. A BOS *closes* beyond a level: the market
+    accepted the price and the move continues. A sweep *wicks* beyond it and closes back inside:
+    the stops behind the level were filled, nobody defended the new price, and the move was a trap.
+    Same pierce, opposite meaning — and the difference is only ever visible at the close.
+
+    `wedge` is the payload the setup actually trades. It holds the rising lows (for a buy-side
+    sweep) that carried price into the pool: the trendline of stops belonging to everyone who
+    bought the approach. Once the pool is swept and price turns, those are the levels where the
+    cascade accelerates. `extreme` is how far the wick reached beyond `level`, and `pierced_at` is
+    the bar that reached it — which may be earlier than `time`, the bar that closed back inside and
+    made the sweep known.
+    """
+
+    side: LiquiditySide
+    pool: LiquidityPool
+    level: Money
+    extreme: Money
+    wedge: tuple[Swing, ...]
+    pierced_at: datetime
+    time: datetime
+
+
+@dataclass(slots=True)
+class _Pierce:
+    """A pool whose level has been wicked through, still waiting for a close back inside."""
+
+    extreme: Money
+    pierced_at: datetime
+    wedge: tuple[Swing, ...]
+    deadline: int  # last bar index on which a recovery close still counts
+
+
+@dataclass(slots=True)
+class _Watch:
+    """Everything the detector knows about one pool it is watching.
+
+    `inside` is the state that makes a sweep a *sweep*: price must be on the protected side of the
+    level (at or below a buy-side pool) before going through it can mean anything. Without it a
+    pool the market broke long ago — one it has been trading above for a hundred bars — would
+    report a sweep on the first pullback that closed under it.
+
+    Note the comparison is *not* strict, unlike the pierce and the recovery. Those ask "did price
+    reject the level?"; this asks "is price on the protected side?", and a close exactly at the
+    level is not acceptance. Reusing the strict test here would let a single doji closing on the
+    level disarm a pool — most likely on a round number, which is exactly where stops pile up.
+    """
+
+    pool: LiquidityPool
+    tracked_at: int  # bar index of the most recent `track`, for staleness
+    inside: bool
+    pierce: _Pierce | None = None
+
+
+class _WedgeTracker:
+    """The zig-zag of minor pivots, and whether its tail forms a wedge losing volatility.
+
+    A wedge here is the author's definition: at least `min_pivots` **ascending lows** (a rising
+    trendline) whose **corrections shrink monotonically** — 2.0, then 1.5, then 1.0 — i.e. price
+    grinding higher while giving back less and less. That decay is the tell: buyers are being
+    squeezed into a smaller and smaller range right under a shelf of stops. The bearish mirror is
+    descending highs with shrinking rallies.
+
+    The pivots are `SwingDetector(strength=1)` swings, not the layer's usual strength-2 ones. A
+    wedge is made of *minor* pivots — one bar on each side — so it is recognised a single bar after
+    its last leg instead of two or three, which matters when the sweep follows immediately. Reusing
+    the swing detector rather than writing a second pivot rule keeps one definition of "a low" in
+    the codebase and inherits its anti-lookahead confirmation for free.
+
+    Pivots are normalised into a strict zig-zag: two lows in a row collapse to the lower, two highs
+    to the higher. Without that a wedge could be measured against a "correction" that never had a
+    high between its two lows.
+    """
+
+    # The wedge only ever reads a tail of the sequence, so the history stays bounded.
+    _MAX_PIVOTS: Final = 64
+    # An outside bar is the only candle that confirms two pivots — a high and a low — at once.
+    _OUTSIDE_BAR_PIVOTS: Final = 2
+
+    def __init__(self, *, min_pivots: int) -> None:
+        self._detector = SwingDetector(strength=1)
+        self._pivots: list[Swing] = []
+        self._min_pivots = min_pivots
+
+    def update(self, candle: Candle) -> None:
+        """Fold in one closed candle, confirming any minor pivot it completes."""
+        pivots = self._detector.update(candle)
+        if len(pivots) == self._OUTSIDE_BAR_PIVOTS:
+            if not self._pivots:
+                # No tail to order the pair against, and taking both would seed the sequence with a
+                # high and a low from the same bar — the degenerate shape the ordering below
+                # exists to avoid. An outside bar cannot open a zig-zag; wait for a clean pivot.
+                return
+            # An outside bar prints both extremes at once. Feed the one matching the current tail
+            # first, so it collapses into it under the "keep the extreme" rule and the other lands
+            # on top: the sequence stays alternating *and* keeps the real high or low.
+            #
+            # This is the author's rule (an outside bar's range is real price movement), not a
+            # safe default — it is not one. Keeping the extreme can *raise* the turning point of an
+            # older counter-move, and because the backward scan requires each earlier counter-move
+            # to be larger, inflating an old one can turn a growing sequence into a shrinking one
+            # and admit a wedge that is not there. Dropping the pivot instead understates the next
+            # counter-move, which fabricates a shrink just as easily. Both directions can flip the
+            # verdict either way; there is no conservative choice here, only a stated one.
+            last_kind = self._pivots[-1].kind
+            pivots = tuple(sorted(pivots, key=lambda pivot: pivot.kind is not last_kind))
+        for pivot in pivots:
+            self._append(pivot)
+
+    def _append(self, pivot: Swing) -> None:
+        if self._pivots and self._pivots[-1].kind is pivot.kind:
+            # Same kind twice: keep the more extreme one so the sequence stays a strict zig-zag.
+            last = self._pivots[-1]
+            more_extreme = (
+                pivot.price > last.price
+                if pivot.kind is SwingKind.HIGH
+                else pivot.price < last.price
+            )
+            if more_extreme:
+                self._pivots[-1] = pivot
+            return
+        self._pivots.append(pivot)
+        if len(self._pivots) > self._MAX_PIVOTS:
+            del self._pivots[: -self._MAX_PIVOTS]
+
+    def bullish_wedge(self) -> tuple[Swing, ...] | None:
+        """The rising lows of the current bullish wedge, oldest first — `None` if there is none."""
+        return self._wedge(SwingKind.LOW)
+
+    def bearish_wedge(self) -> tuple[Swing, ...] | None:
+        """The falling highs of the current bearish wedge, oldest first — `None` if none."""
+        return self._wedge(SwingKind.HIGH)
+
+    def _wedge(self, kind: SwingKind) -> tuple[Swing, ...] | None:
+        """Longest tail of same-kind pivots advancing in `kind`'s direction with shrinking
+        counter-moves. Walks backwards from the newest pivot: read forwards the counter-moves must
+        shrink, so read backwards each one must be strictly larger than the one after it."""
+        anchors = [index for index, pivot in enumerate(self._pivots) if pivot.kind is kind]
+        if len(anchors) < self._min_pivots:
+            return None
+
+        start = len(anchors) - 1
+        counter_moves: list[Money] = []
+        while start > 0:
+            # `update` keeps the sequence strictly alternating, so consecutive same-kind anchors are
+            # always two apart and the pivot between them is the counter-move's turning point.
+            earlier, later = anchors[start - 1], anchors[start]
+            first, second = self._pivots[earlier], self._pivots[later]
+            advancing = (
+                second.price > first.price if kind is SwingKind.LOW else second.price < first.price
+            )
+            if not advancing:
+                break
+            turn = self._pivots[earlier + 1]
+            move = turn.price - second.price if kind is SwingKind.LOW else second.price - turn.price
+            if counter_moves and move <= counter_moves[-1]:
+                break
+            counter_moves.append(move)
+            start -= 1
+
+        if len(anchors) - start < self._min_pivots:
+            return None
+        return tuple(self._pivots[index] for index in anchors[start:])
+
+
+class SweepDetector:
+    """Detects liquidity sweeps: a wedge into a pool, a wick through it, a close back inside.
+
+    Feed it every closed candle via `update`, and every pool the `LiquidityDetector` reports via
+    `track`. It reports a `Sweep` on the bar that completes the pattern:
+
+    1. **Price inside the level.** A bar must first close on the protected side — at or below a
+       buy-side pool, at or above a sell-side one. Stops only rest behind a level the market has
+       not yet taken, so a pool price is already trading beyond was broken long ago and can no
+       longer be swept.
+    2. **A wedge into the pool.** Ascending lows with shrinking corrections for a buy-side pool
+       (the mirror below). This is a *precondition*, by the author's rule: a wick through a level
+       out of nowhere is noise, while a wick through a level that a squeezed, low-volatility grind
+       walked into is a trap with a trendline of stops beneath it.
+    3. **A pierce.** A bar's high goes strictly above the pool's `level` (low below, for sell-side),
+       coming from inside. The wedge is checked at this bar — the moment the trap is sprung.
+    4. **A close back inside**, on the piercing bar or within `recovery_bars - 1` bars after it.
+       Rejection can take more than one candle: one bar overshoots, the next drags price back. If
+       the window expires with no close back inside, the market *accepted* the level — that is a
+       break, not a sweep, and the pool is dropped rather than reported.
+
+    The pierce and the recovery are strict, matching the rest of this module: a close exactly at
+    the level has neither pierced nor recovered. Step 1 is the deliberate exception — being *on*
+    the level is not being beyond it, so it leaves a pool armed; see `_Watch`. Pools are keyed by
+    their first touch, so a pool that deepens (a third or fourth equal high) updates the tracked
+    level in place instead of stacking a duplicate, and any pool not re-tracked for
+    `lookback_bars` is discarded.
+
+    **Caller contract.** Feed a bar to `update`, then `track` whatever pools that bar produced —
+    a pool is not known until the bar confirming its last touch has closed. Following that order
+    is what keeps the anti-lookahead invariant intact, and a raid on the very next bar is then
+    detected normally.
+
+    As a backstop the detector also refuses to sweep a pool with a bar at or before the pool's
+    last *touch*, which catches the grossest violation. It is only a backstop: a touch is
+    confirmed `strength` bars after it occurs, so `pool.time` sits in the past by construction and
+    this check cannot police the confirmation lag. The call order above is the real guarantee.
+    """
+
+    _MIN_WEDGE_FLOOR: Final = 3
+
+    def __init__(
+        self, *, recovery_bars: int = 3, min_wedge_pivots: int = 3, lookback_bars: int = 200
+    ) -> None:
+        if recovery_bars < 1:
+            raise ValueError(f"recovery_bars must be >= 1, got {recovery_bars}")
+        if min_wedge_pivots < self._MIN_WEDGE_FLOOR:
+            raise ValueError(
+                f"a wedge needs at least 3 pivots to show two shrinking corrections, "
+                f"got min_wedge_pivots={min_wedge_pivots}"
+            )
+        if lookback_bars < 1:
+            raise ValueError(f"lookback_bars must be >= 1, got {lookback_bars}")
+        self._recovery = recovery_bars
+        self._lookback = lookback_bars
+        self._wedges = _WedgeTracker(min_pivots=min_wedge_pivots)
+        self._watches: dict[tuple[LiquiditySide, datetime], _Watch] = {}
+        self._last_close: Money | None = None
+        self._bar = -1
+
+    def track(self, pool: LiquidityPool) -> None:
+        """Watch `pool` for a sweep, replacing any earlier state for the same pool.
+
+        Pools are identified by their first touch, so re-reporting a deepened pool refreshes its
+        level rather than tracking the same stops twice. A pool whose level moved is a different
+        line to defend, so any pierce in flight against the old level is discarded.
+
+        A newly watched pool is armed from the last close already seen, not from scratch. Waiting
+        for one more bar would blind the detector for exactly one candle — and the raid on the bar
+        right after a pool confirms is the cleanest instance of the pattern, not an edge case.
+        """
+        key = (pool.side, pool.touches[0].time)
+        known = self._watches.get(key)
+        if known is not None and known.pool.level == pool.level:
+            known.pool = pool
+            known.tracked_at = self._bar
+            return
+        self._watches[key] = _Watch(
+            pool=pool, tracked_at=self._bar, inside=self._is_inside(pool, self._last_close)
+        )
+
+    @staticmethod
+    def _is_inside(pool: LiquidityPool, close: Money | None) -> bool:
+        """Whether `close` sits on the pool's protected side — at the level counts as inside."""
+        if close is None:
+            return False
+        return close <= pool.level if pool.side is LiquiditySide.BUY_SIDE else close >= pool.level
+
+    def update(self, candle: Candle) -> tuple[Sweep, ...]:
+        """Fold in one closed candle; return every sweep it completes, oldest level first.
+
+        One bar can raid more than one pool — a single push can clear stops at 101 and at 103 — and
+        each is its own event with its own stops and its own extreme. Reporting only one would
+        silently drop the other, so the result is a tuple, like `SwingDetector.update`. It is
+        ordered by level so the output does not depend on the order pools were tracked in.
+        """
+        self._bar += 1
+        self._wedges.update(candle)
+        self._expire()
+
+        completed: list[Sweep] = []
+        for key, watch in list(self._watches.items()):
+            sweep = self._advance(watch, candle)
+            if sweep is not None:
+                completed.append(sweep)
+                del self._watches[key]
+
+        self._last_close = candle.close
+        # Level and side alone can tie — an aged-out pool and a fresh one can share a price — so
+        # the first touch breaks it, keeping the order independent of how pools were tracked.
+        completed.sort(key=lambda sweep: (sweep.level, sweep.side, sweep.pool.touches[0].time))
+        return tuple(completed)
+
+    def _advance(self, watch: _Watch, candle: Candle) -> Sweep | None:
+        """Move one pool through the state machine on this candle."""
+        pool = watch.pool
+        # Backstop only: a bar cannot raid a pool built on a touch it has not yet reached. The
+        # real anti-lookahead guarantee is the caller contract in the class docstring.
+        if candle.time <= pool.time:
+            return None
+
+        buy_side = pool.side is LiquiditySide.BUY_SIDE
+        recovered = candle.close < pool.level if buy_side else candle.close > pool.level
+
+        if watch.pierce is None:
+            # Read `inside` as it stood *before* this bar, then let this bar's close set it: a
+            # pierce has to come from the protected side, not merely end up there.
+            was_inside = watch.inside
+            watch.inside = self._is_inside(pool, candle.close)
+            if not was_inside:
+                return None
+            pierced = candle.high > pool.level if buy_side else candle.low < pool.level
+            if not pierced:
+                return None
+            # The wedge is a precondition, checked exactly here: at the bar that springs the trap.
+            wedge = self._wedges.bullish_wedge() if buy_side else self._wedges.bearish_wedge()
+            if wedge is None:
+                return None
+            watch.pierce = _Pierce(
+                extreme=candle.high if buy_side else candle.low,
+                pierced_at=candle.time,
+                wedge=wedge,
+                deadline=self._bar + self._recovery - 1,
+            )
+        else:
+            # Still in the window: the wick can run further before price is dragged back.
+            watch.pierce.extreme = (
+                max(watch.pierce.extreme, candle.high)
+                if buy_side
+                else min(watch.pierce.extreme, candle.low)
+            )
+
+        if not recovered:
+            return None
+
+        return Sweep(
+            side=pool.side,
+            pool=pool,
+            level=pool.level,
+            extreme=watch.pierce.extreme,
+            wedge=watch.pierce.wedge,
+            pierced_at=watch.pierce.pierced_at,
+            time=candle.time,
+        )
+
+    def _expire(self) -> None:
+        """Drop pools whose recovery window has run out — the market accepted the level, so it was
+        a break, not a sweep — and pools not re-tracked for `lookback_bars`."""
+        for key, watch in list(self._watches.items()):
+            timed_out = watch.pierce is not None and self._bar > watch.pierce.deadline
+            if timed_out or self._bar - watch.tracked_at > self._lookback:
+                del self._watches[key]
+
+
 __all__ = [
     "FVGDetector",
     "FVGKind",
@@ -539,6 +881,8 @@ __all__ = [
     "MarketStructure",
     "StructureBreak",
     "StructureKind",
+    "Sweep",
+    "SweepDetector",
     "Swing",
     "SwingDetector",
     "SwingKind",

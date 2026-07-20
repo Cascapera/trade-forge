@@ -123,3 +123,25 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
   `LiquidityPool` e trocar o backstop por `candle.time > pool.confirmed_at`. Fecha o buraco sem
   aquecimento e sem depender de ordem de chamada. **Fazer no PR que fizer a fiação** dos detectores
   (hoje `SweepDetector` e `LiquidityDetector` não têm chamador fora dos testes).
+- [origem: PR-202] **Toque de raspão desarma o flip — CONFIRMAR REGRA COM O GUILHERME antes do setup
+  de flip.** O toque de uma zona é não estrito (`low <= top` na demanda), então uma barra cuja mínima
+  é *exatamente* o topo — que nunca entrou na zona — já conta como toque. Se ela fechar acima, a zona
+  vira `departed` e perde `flippable` para sempre, e o rompimento posterior deixa de ser flip.
+  Verificado: com `low=100.00` numa zona [90,100] o flip some; com `low=100.01` ele existe. Um tick
+  numa barra anterior decide se o setup arma. O código segue a regra ditada ao pé da letra (ele disse
+  "não pode tocar nela, subir, e depois vir flipar"), então não é bug — mas em gráfico real quase toda
+  zona de demanda é raspada e abandonada antes de ser rompida de verdade, e o flip pode quase nunca
+  armar. **Ação:** medir a frequência de `flipped` em dados reais e perguntar a ele se "tocar", para
+  efeito de `departed`, exige penetração real (`low < top`) em vez de encostar. É pré-requisito do
+  setup de flip, não dívida técnica.
+- [origem: PR-202] **Order block — arestas conhecidas do detector, todas de baixo impacto.** (a) Um gap
+  de direção *oposta* entre dois gaps a favor conta como "pausa" no agrupamento de runs, gerando duas
+  zonas onde a regra literal ("uma barra sem gap basta") diria que a barra do meio tem gap; exige
+  `c9.low > c11.high` e `c10.high < c12.low` no mesmo trecho, e o espírito da regra favorece o
+  comportamento atual. (b) Se um run de gaps consecutivos começa antes do `origin_time`, o filtro de
+  perna remove o prefixo e a zona é marcada no primeiro gap *sobrevivente*, não no primeiro do run
+  (verificado que o filtro só remove prefixo, nunca fragmenta o meio). (c) Não há limite de zonas por
+  rompimento: uma perna com N gaps pode devolver ~N/2 zonas num único `update` (pior caso ~250 com
+  `_MAX_LOOKBACK=500`), o que é um contrato surpreendente. (d) A origem de um CHoCH numa barra externa
+  usa o topo anterior, não o desta barra — a janela da perna começa cedo demais, o que é permissivo,
+  não vazante.

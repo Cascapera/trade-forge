@@ -19,8 +19,10 @@ instant it printed would be trading a level the market had not yet revealed — 
 window. Two bars sharing the same high therefore form no swing there — equal highs are not a
 pivot, they are **liquidity** (a cluster of stops), a distinct SMC concept handled elsewhere.
 
-**Determinism.** Only `Decimal` highs and lows are compared; there is no arithmetic to round, so
-the detector is exact and independent of the engine's decimal context.
+**Determinism.** Comparisons are between `Decimal` prices throughout. The only arithmetic in the
+module is a zone's width and the levels derived from it (`top - bottom`, `top + size`), which is
+exact for any `Decimal` pair — no rounding, so results do not depend on the engine's decimal
+context.
 """
 
 from collections import deque
@@ -181,12 +183,21 @@ class StructureBreak:
 
     `trend` is the bias the break leaves in force: a BOS keeps it, a CHoCH flips it. `level` is
     the price a candle closed beyond, and `time` is that candle.
+
+    `origin` and `origin_time` mark where the impulse that broke structure *started*: the lowest
+    low the up-move came from, or the highest high the down-move came from. Together with `time`
+    they bound the impulse leg — the stretch of chart an order block must be found in, and the
+    level an entry region is anchored near. It is the same price the next opposite CHoCH is
+    anchored to, which is no coincidence: the move begins where the structure it broke was last
+    defended.
     """
 
     kind: StructureKind
     trend: Trend
     level: Money
     time: datetime
+    origin: Money
+    origin_time: datetime
 
 
 class MarketStructure:
@@ -216,18 +227,27 @@ class MarketStructure:
         self._trend: Trend | None = None
         self._previous: Candle | None = None
         # Up-leg tracking (toward a bullish BOS): top, the lowest low since it, correction count.
+        # Each extreme carries the bar it happened on, so a break can report where its impulse
+        # started — the window an order block has to be found in.
         self._up_top: Money | None = None
+        self._up_top_time: datetime | None = None
         self._up_low: Money | None = None
+        self._up_low_time: datetime | None = None
         self._up_corr = 0
         self._up_armed = False
         # Down-leg tracking (toward a bearish BOS).
         self._dn_bottom: Money | None = None
+        self._dn_bottom_time: datetime | None = None
         self._dn_high: Money | None = None
+        self._dn_high_time: datetime | None = None
         self._dn_corr = 0
         self._dn_armed = False
-        # CHoCH anchors: the level a *closing* candle must cross to turn the trend.
+        # CHoCH anchors: the level a *closing* candle must cross to turn the trend. After a break
+        # the anchor facing back the way it came *is* that break's origin.
         self._choch_down: Money | None = None  # break below -> bearish CHoCH (while bullish)
+        self._choch_down_time: datetime | None = None
         self._choch_up: Money | None = None  # break above -> bullish CHoCH (while bearish)
+        self._choch_up_time: datetime | None = None
 
     def update(self, candle: Candle) -> StructureBreak | None:
         """Fold in one closed candle; return the structure break it confirms, or `None`."""
@@ -240,32 +260,56 @@ class MarketStructure:
             and self._choch_down is not None
             and candle.close < self._choch_down
         ):
-            break_ = StructureBreak(
-                StructureKind.CHOCH, Trend.BEARISH, self._choch_down, candle.time
-            )
+            level = self._choch_down
             self._flip_to_bearish(candle)
-            return break_
+            return self._break(StructureKind.CHOCH, Trend.BEARISH, level, candle)
         if (
             self._trend is Trend.BEARISH
             and self._choch_up is not None
             and candle.close > self._choch_up
         ):
-            break_ = StructureBreak(StructureKind.CHOCH, Trend.BULLISH, self._choch_up, candle.time)
+            level = self._choch_up
             self._flip_to_bullish(candle)
-            return break_
+            return self._break(StructureKind.CHOCH, Trend.BULLISH, level, candle)
 
         # Continuation / bootstrap: a BOS in whichever direction the trend allows (either, if none).
         if self._trend in (Trend.BULLISH, None):
             broken = self._update_up_leg(candle, previous)
             if broken is not None:
                 self._on_bullish_bos(candle)
-                return StructureBreak(StructureKind.BOS, Trend.BULLISH, broken, candle.time)
+                return self._break(StructureKind.BOS, Trend.BULLISH, broken, candle)
         if self._trend in (Trend.BEARISH, None):
             broken = self._update_down_leg(candle, previous)
             if broken is not None:
                 self._on_bearish_bos(candle)
-                return StructureBreak(StructureKind.BOS, Trend.BEARISH, broken, candle.time)
+                return self._break(StructureKind.BOS, Trend.BEARISH, broken, candle)
         return None
+
+    def _break(
+        self, kind: StructureKind, trend: Trend, level: Money, candle: Candle
+    ) -> StructureBreak:
+        """Build the break, reading its origin from the anchor the handler just planted.
+
+        Call this *after* the state handler has run: settling the new trend is what records where
+        the impulse came from, as the anchor an opposite CHoCH would now have to cross. A bullish
+        break leaves `_choch_down` on the low it rose from; a bearish one leaves `_choch_up` on the
+        high it fell from.
+        """
+        if trend is Trend.BULLISH:
+            origin, origin_time = self._choch_down, self._choch_down_time
+        else:
+            origin, origin_time = self._choch_up, self._choch_up_time
+        # Both are planted by the handler that just ran; narrowing here is for the type checker.
+        assert origin is not None  # noqa: S101
+        assert origin_time is not None  # noqa: S101
+        return StructureBreak(
+            kind=kind,
+            trend=trend,
+            level=level,
+            time=candle.time,
+            origin=origin,
+            origin_time=origin_time,
+        )
 
     @property
     def trend(self) -> Trend | None:
@@ -277,25 +321,15 @@ class MarketStructure:
     def _update_up_leg(self, candle: Candle, previous: Candle | None) -> Money | None:
         """Advance the up-leg; return the broken top level if a bullish BOS confirms, else None."""
         if self._up_top is None or self._up_low is None:
-            self._up_top, self._up_low, self._up_corr, self._up_armed = (
-                candle.high,
-                candle.low,
-                0,
-                False,
-            )
+            self._restart_up_leg(candle)
             return None
         if self._up_armed and candle.close > self._up_top:
-            self._up_low = min(self._up_low, candle.low)  # the break bar closes the move
+            self._lower_up_low(candle)  # the break bar closes the move
             return self._up_top
         if candle.high > self._up_top:  # a new high lifts the top and restarts the correction
-            self._up_top, self._up_low, self._up_corr, self._up_armed = (
-                candle.high,
-                candle.low,
-                0,
-                False,
-            )
+            self._restart_up_leg(candle)
             return None
-        self._up_low = min(self._up_low, candle.low)
+        self._lower_up_low(candle)
         if previous is not None and candle.high < previous.high and candle.low < previous.low:
             self._up_corr += 1
             if self._up_corr >= self._MIN_CORRECTION:
@@ -304,56 +338,54 @@ class MarketStructure:
             self._up_corr = 0  # a bar that is not a correction breaks the streak; arming stands
         return None
 
-    def _on_bullish_bos(self, candle: Candle) -> None:
-        self._trend = Trend.BULLISH
-        self._choch_down = self._up_low  # the low the up-move defended is the next CHoCH anchor
-        self._choch_up = None
+    def _restart_up_leg(self, candle: Candle) -> None:
+        """Start the up-leg over from `candle`: it is both the new top and the new low."""
         self._up_top, self._up_low, self._up_corr, self._up_armed = (
             candle.high,
             candle.low,
             0,
             False,
         )
+        self._up_top_time = self._up_low_time = candle.time
+
+    def _lower_up_low(self, candle: Candle) -> None:
+        """Drop the up-leg's low to this candle if it went lower. Ties keep the earlier bar — the
+        move began the first time price reached that level, not the last."""
+        if self._up_low is None or candle.low < self._up_low:
+            self._up_low, self._up_low_time = candle.low, candle.time
+
+    def _on_bullish_bos(self, candle: Candle) -> None:
+        self._trend = Trend.BULLISH
+        # The low the up-move defended is both the next CHoCH anchor and this break's origin.
+        self._choch_down, self._choch_down_time = self._up_low, self._up_low_time
+        self._choch_up = self._choch_up_time = None
+        self._restart_up_leg(candle)
         self._reset_down_leg()
 
     def _flip_to_bullish(self, candle: Candle) -> None:
         self._trend = Trend.BULLISH
-        self._choch_down = self._dn_bottom  # the low the failed down-move made
-        self._choch_up = None
-        self._up_top, self._up_low, self._up_corr, self._up_armed = (
-            candle.high,
-            candle.low,
-            0,
-            False,
-        )
+        self._choch_down, self._choch_down_time = self._dn_bottom, self._dn_bottom_time
+        self._choch_up = self._choch_up_time = None
+        self._restart_up_leg(candle)
         self._reset_down_leg()
 
     def _reset_up_leg(self) -> None:
         self._up_top, self._up_low, self._up_corr, self._up_armed = None, None, 0, False
+        self._up_top_time = self._up_low_time = None
 
     # -- down leg (bearish BOS) ------------------------------------------------ #
 
     def _update_down_leg(self, candle: Candle, previous: Candle | None) -> Money | None:
         if self._dn_bottom is None or self._dn_high is None:
-            self._dn_bottom, self._dn_high, self._dn_corr, self._dn_armed = (
-                candle.low,
-                candle.high,
-                0,
-                False,
-            )
+            self._restart_down_leg(candle)
             return None
         if self._dn_armed and candle.close < self._dn_bottom:
-            self._dn_high = max(self._dn_high, candle.high)
+            self._raise_dn_high(candle)
             return self._dn_bottom
         if candle.low < self._dn_bottom:
-            self._dn_bottom, self._dn_high, self._dn_corr, self._dn_armed = (
-                candle.low,
-                candle.high,
-                0,
-                False,
-            )
+            self._restart_down_leg(candle)
             return None
-        self._dn_high = max(self._dn_high, candle.high)
+        self._raise_dn_high(candle)
         if previous is not None and candle.high > previous.high and candle.low > previous.low:
             self._dn_corr += 1
             if self._dn_corr >= self._MIN_CORRECTION:
@@ -362,32 +394,39 @@ class MarketStructure:
             self._dn_corr = 0
         return None
 
-    def _on_bearish_bos(self, candle: Candle) -> None:
-        self._trend = Trend.BEARISH
-        self._choch_up = self._dn_high
-        self._choch_down = None
+    def _restart_down_leg(self, candle: Candle) -> None:
+        """Start the down-leg over from `candle`: it is both the new bottom and the new high."""
         self._dn_bottom, self._dn_high, self._dn_corr, self._dn_armed = (
             candle.low,
             candle.high,
             0,
             False,
         )
+        self._dn_bottom_time = self._dn_high_time = candle.time
+
+    def _raise_dn_high(self, candle: Candle) -> None:
+        """Lift the down-leg's high to this candle if it went higher; ties keep the earlier bar."""
+        if self._dn_high is None or candle.high > self._dn_high:
+            self._dn_high, self._dn_high_time = candle.high, candle.time
+
+    def _on_bearish_bos(self, candle: Candle) -> None:
+        self._trend = Trend.BEARISH
+        # The high the down-move defended is both the next CHoCH anchor and this break's origin.
+        self._choch_up, self._choch_up_time = self._dn_high, self._dn_high_time
+        self._choch_down = self._choch_down_time = None
+        self._restart_down_leg(candle)
         self._reset_up_leg()
 
     def _flip_to_bearish(self, candle: Candle) -> None:
         self._trend = Trend.BEARISH
-        self._choch_up = self._up_top  # the high the failed up-move made
-        self._choch_down = None
-        self._dn_bottom, self._dn_high, self._dn_corr, self._dn_armed = (
-            candle.low,
-            candle.high,
-            0,
-            False,
-        )
+        self._choch_up, self._choch_up_time = self._up_top, self._up_top_time
+        self._choch_down = self._choch_down_time = None
+        self._restart_down_leg(candle)
         self._reset_up_leg()
 
     def _reset_down_leg(self) -> None:
         self._dn_bottom, self._dn_high, self._dn_corr, self._dn_armed = None, None, 0, False
+        self._dn_bottom_time = self._dn_high_time = None
 
 
 class LiquiditySide(StrEnum):
@@ -871,6 +910,294 @@ class SweepDetector:
                 del self._watches[key]
 
 
+class ZoneKind(StrEnum):
+    """Which side of the book an order block marks."""
+
+    DEMAND = "demand"  # left by a buy impulse — price broke structure upward
+    SUPPLY = "supply"  # left by a sell impulse
+
+
+@dataclass(frozen=True, slots=True)
+class OrderBlock:
+    """A supply or demand zone: the last candle before the institutions moved price away.
+
+    Marked the author's way, **by price inefficiency**. Where an impulse breaks structure *and*
+    leaves a gap, the candle immediately before that gap is where the size was worked — the
+    footprint of the position that caused the move. (The book notes a second, popular convention,
+    the last opposite candle before the break, and says to pick one and stay with it. This is the
+    one.)
+
+    `top` and `bottom` bound the zone. For demand the base is the marking candle's own range,
+    extended *down* to the gap candle's low whenever that low ran deeper — the wick is part of
+    where they worked, and dropping it would put the zone above where price actually turned.
+    Supply mirrors it upward.
+
+    `time` is the bar the zone is drawn on; `confirmed_at` is the bar whose close broke structure
+    and revealed it. Both matter and they differ: the zone belongs to the past, but nothing could
+    know it was a zone until the break confirmed, so a strategy may only act from `confirmed_at`.
+
+    `primary` marks the first gap event of the impulse. One impulse can leave several zones, but
+    only when the gapping *pauses* — a bar that opens no new gap — and then resumes; an unbroken
+    run of gaps is one event, not one zone per bar. The first is the primary, the rest secondary,
+    and whether secondaries may be traded is a decision for the strategy, not for this detector.
+    """
+
+    kind: ZoneKind
+    top: Money
+    bottom: Money
+    time: datetime
+    confirmed_at: datetime
+    break_kind: StructureKind
+    primary: bool
+
+
+@dataclass(slots=True)
+class TrackedZone:
+    """An order block and what price has since done to it.
+
+    Two marks, both permanent once set, and they answer different questions.
+
+    `mitigated` says the zone is spent **for its own side**. It happens either the healthy way —
+    price came back, touched it, and then *closed* a full zone-width clear of it, so the orders
+    resting there have been filled and the move they fund is already underway — or the failed way:
+    price closed straight through, so whatever was defending the level is gone.
+
+    A touch is a wick; everything that *decides* is a close. That split is what lets a zone survive
+    a news spike: a bar can trade far outside it and still end up inside, and the market has not
+    left. It also removes the intrabar guess — a single bar whose wick both reaches the zone and
+    runs a width past it says nothing about which came first, so nothing is inferred from it.
+
+    `flipped` says price went *through* the zone, by wick or by close. A demand zone that price
+    traded down through has trapped every buyer who took it, and on the way back those buyers sell
+    to get out flat. That is the raw material of the flip setup: a zone marked flipped is where a
+    trade *against* the prevailing trend becomes reasonable. A wick through is enough to mark it
+    and leaves the zone still usable; a close through marks it **and** mitigates it.
+    """
+
+    block: OrderBlock
+    touched: bool = False
+    departed: bool = False
+    flipped: bool = False
+    mitigated: bool = False
+
+    @property
+    def usable(self) -> bool:
+        """Whether the zone still stands for the side it was marked on."""
+        return not self.mitigated
+
+    @property
+    def flippable(self) -> bool:
+        """Whether breaking this zone would still count as a flip.
+
+        A flip has to be *abrupt* — one move that arrives and takes the zone out. Price that came
+        in, backed away, and only later returned to break it is a different story: the zone was
+        already being negotiated, so breaking it traps nobody the way a single decisive drive
+        does. A zone price has left after touching, or that is already mitigated, is past that.
+        """
+        return not self.departed and not self.mitigated
+
+
+@dataclass(frozen=True, slots=True)
+class _GapEvent:
+    """One confirmed gap, kept with the two candles a zone would be marked from."""
+
+    index: int  # bar index of the gap's third candle — adjacency is what groups a run
+    kind: FVGKind
+    time: datetime
+    first: Candle  # c1 — the candle the zone is drawn on
+    second: Candle  # c2 — the impulse candle whose wick may extend the zone
+
+
+class OrderBlockDetector:
+    """Marks supply and demand zones from the impulse legs that break structure.
+
+    Feed it every closed candle together with whatever `MarketStructure.update` returned for that
+    same candle. On a break it looks back over the impulse leg — from `origin_time` to the breaking
+    bar, the stretch the break itself reports — for gaps pointing the same way as the break, and
+    returns the zones they mark, primary first.
+
+    Three rules, all the author's:
+
+    * **The gap must be in the impulse leg.** A gap left somewhere else is not the footprint of the
+      move that broke structure, so it marks nothing here.
+    * **The zone is the candle before the gap**, widened by the gap candle's wick when that wick
+      ran past it.
+    * **Consecutive gaps are one event.** Price gapping on bar after bar is one continuous push;
+      it takes a pause — a bar that completes no gap — before a fresh gap starts a second zone.
+      Without this an impulsive leg would mark a zone on nearly every bar of itself.
+
+    Nothing is reported until a break confirms on a closed candle, so a zone is only ever known
+    from `confirmed_at` onward, and a strategy acting on it acts at the next open.
+
+    Every zone it marks is then kept and followed — see `zones` and `TrackedZone` — because a zone
+    that has been used up, or traded through, is not thereby uninteresting: the flip setup trades
+    exactly those.
+
+    **A zone is born clean.** The impulse leg that revealed it is not replayed against it, and the
+    breaking bar does not touch it either. That is deliberate twice over. Nobody could know the
+    zone existed until the break confirmed, so counting the leg against it would be acting on
+    hindsight; and the leg *is* price leaving the zone — by the gap's own construction the impulse
+    candle overlaps the marking candle, so replaying it would mark almost every zone touched, and
+    often mitigated, at birth.
+    """
+
+    # A leg longer than this is not an impulse any more; the cap also bounds memory when a long
+    # stretch of chart passes with no break at all.
+    _MAX_LOOKBACK: Final = 500
+    # Zones outlive their usefulness but stay readable for the flip setup; keep the recent ones.
+    _MAX_ZONES: Final = 200
+
+    def __init__(self) -> None:
+        self._fvgs = FVGDetector()
+        self._window: deque[Candle] = deque(maxlen=3)
+        self._gaps: list[_GapEvent] = []
+        self._zones: list[TrackedZone] = []
+        self._index = -1
+
+    @property
+    def zones(self) -> tuple[TrackedZone, ...]:
+        """Every zone marked so far, oldest first, each with what price has done to it since."""
+        return tuple(self._zones)
+
+    def update(self, candle: Candle, break_: StructureBreak | None) -> tuple[OrderBlock, ...]:
+        """Fold in one closed candle and the break it confirmed (if any); return the zones marked.
+
+        Pass the `StructureBreak` that `MarketStructure.update` returned for *this* candle, or
+        `None`. Returns the zones the break reveals, primary first, and `()` on every other bar.
+        """
+        self._index += 1
+        self._window.append(candle)
+        # Advance the zones already on the book *before* marking new ones: a zone cannot be
+        # touched or broken by the very bar whose close first revealed it.
+        for tracked in self._zones:
+            self._advance(tracked, candle)
+
+        gap = self._fvgs.update(candle)
+        if gap is not None and len(self._window) == self._window.maxlen:
+            first, second, _third = self._window
+            self._gaps.append(
+                _GapEvent(
+                    index=self._index, kind=gap.kind, time=gap.time, first=first, second=second
+                )
+            )
+        self._gaps = [g for g in self._gaps if self._index - g.index <= self._MAX_LOOKBACK]
+
+        if break_ is None:
+            return ()
+
+        wanted = FVGKind.BULLISH if break_.trend is Trend.BULLISH else FVGKind.BEARISH
+        in_leg = [
+            gap_event
+            for gap_event in self._gaps
+            if gap_event.kind is wanted
+            and gap_event.first.time >= break_.origin_time
+            and gap_event.time <= break_.time
+        ]
+        # Every gap up to this break belongs to the leg that just ended: a new leg starts at the
+        # breaking bar, so none of these can qualify again.
+        self._gaps = [g for g in self._gaps if g.time > break_.time]
+
+        marked = tuple(
+            self._zone(run[0], break_, primary=position == 0)
+            for position, run in enumerate(self._runs(in_leg))
+        )
+        self._zones.extend(TrackedZone(block=block) for block in marked)
+        if len(self._zones) > self._MAX_ZONES:
+            del self._zones[: -self._MAX_ZONES]
+        return marked
+
+    @staticmethod
+    def _advance(tracked: TrackedZone, candle: Candle) -> None:
+        """Fold one candle into a zone's state. Every mark is permanent once set."""
+        block = tracked.block
+        size = block.top - block.bottom
+        demand = block.kind is ZoneKind.DEMAND
+
+        # Read before this bar changes anything. A bar that closes clean through both flips the
+        # zone and spends it, so the flip has to be judged on the history *behind* the bar — if
+        # this bar's own mitigation counted first, it would veto its own flip.
+        was_flippable = tracked.flippable
+
+        # Closing beyond the far side always spends the zone, whatever else is true of it. A level
+        # the market has closed through is gone: whether it was flippable, already departed, or
+        # untouched makes no difference to that.
+        through = candle.close < block.bottom if demand else candle.close > block.top
+        tracked.mitigated = tracked.mitigated or through
+
+        # The flip mark is the narrow one: only a still-flippable zone can be flipped, and the
+        # pierce is by wick — the drive has to arrive and take the zone out in one go.
+        pierced = candle.low < block.bottom if demand else candle.high > block.top
+        if was_flippable and pierced:
+            tracked.flipped = True
+
+        # Reaching the zone at all counts as a touch — by wick, like everything else here.
+        reached = candle.low <= block.top if demand else candle.high >= block.bottom
+        tracked.touched = tracked.touched or reached
+        # Leaving it is judged on the *close*, not the wick — the same line this module draws
+        # everywhere else. News can spike price far out of a zone and drag it straight back inside
+        # within one bar; that spike is not the market backing away from the level. Only a bar
+        # that ends up beyond the near edge has actually left. So a bar closing lower inside the
+        # zone, then one that pokes up but closes down and carries on through, is still one drive.
+        #
+        # `touched` is updated first on purpose: a single bar that dips into the zone and closes
+        # clear of it has touched and left, exactly as two bars doing the same would. Reading the
+        # old value here would make the flip mark depend on whether the move happened to land in
+        # one candle or two — the same strategy would flip on M5 and not on M15.
+        # Set *after* the flip mark above, and that ordering is semantic, not cosmetic: a bar that
+        # arrives, takes the zone out and closes clear must not use its own departure to veto its
+        # own flip. Same principle as reading `was_flippable` at the top. Moving this block up
+        # would silently break it.
+        cleared = candle.close > block.top if demand else candle.close < block.bottom
+        if tracked.touched and cleared:
+            tracked.departed = True
+
+        # Spent the healthy way: touched, then driven off by a full zone-width. The zone did its
+        # job, and the orders that were resting in it are now in the market.
+        #
+        # Measured on the close, like every other decision in this module. A news wick can throw
+        # price a long way past a zone and bring it back inside the same bar; treating that spike
+        # as the zone having worked would kill a level the market never actually left — and with
+        # it any flip that level still had in it, since a mitigated zone can no longer flip.
+        if not tracked.touched:
+            return
+        driven_off = (
+            candle.close > block.top + size if demand else candle.close < block.bottom - size
+        )
+        tracked.mitigated = tracked.mitigated or driven_off
+
+    @staticmethod
+    def _runs(gaps: list[_GapEvent]) -> list[list[_GapEvent]]:
+        """Split gaps into runs of consecutive bars. A break in the indices is the pause that
+        separates one gap event from the next."""
+        runs: list[list[_GapEvent]] = []
+        for gap in gaps:
+            if runs and gap.index == runs[-1][-1].index + 1:
+                runs[-1].append(gap)
+            else:
+                runs.append([gap])
+        return runs
+
+    @staticmethod
+    def _zone(gap: _GapEvent, break_: StructureBreak, *, primary: bool) -> OrderBlock:
+        """Mark the zone on the candle before `gap`, extended by the gap candle's wick."""
+        marking, impulse = gap.first, gap.second
+        if gap.kind is FVGKind.BULLISH:
+            kind = ZoneKind.DEMAND
+            top, bottom = marking.high, min(marking.low, impulse.low)
+        else:
+            kind = ZoneKind.SUPPLY
+            top, bottom = max(marking.high, impulse.high), marking.low
+        return OrderBlock(
+            kind=kind,
+            top=top,
+            bottom=bottom,
+            time=marking.time,
+            confirmed_at=break_.time,
+            break_kind=break_.kind,
+            primary=primary,
+        )
+
+
 __all__ = [
     "FVGDetector",
     "FVGKind",
@@ -879,6 +1206,8 @@ __all__ = [
     "LiquidityPool",
     "LiquiditySide",
     "MarketStructure",
+    "OrderBlock",
+    "OrderBlockDetector",
     "StructureBreak",
     "StructureKind",
     "Sweep",
@@ -886,5 +1215,7 @@ __all__ = [
     "Swing",
     "SwingDetector",
     "SwingKind",
+    "TrackedZone",
     "Trend",
+    "ZoneKind",
 ]

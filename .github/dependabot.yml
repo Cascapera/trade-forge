@@ -5,6 +5,7 @@ updates:
   # this block: it rewrites the pins (and the trailing version comment) for us.
   - package-ecosystem: github-actions
     directory: /
+    target-branch: develop
     schedule:
       interval: weekly
     commit-message:
@@ -15,6 +16,7 @@ updates:
 
   - package-ecosystem: uv
     directory: /
+    target-branch: develop
     schedule:
       interval: weekly
     commit-message:
@@ -29,6 +31,7 @@ updates:
   # so something has to propose the bumps.
   - package-ecosystem: docker-compose
     directory: /
+    target-branch: develop
     schedule:
       interval: weekly
     commit-message:
@@ -36,6 +39,7 @@ updates:
 
   - package-ecosystem: npm
     directory: /
+    target-branch: develop
     schedule:
       interval: weekly
     commit-message:

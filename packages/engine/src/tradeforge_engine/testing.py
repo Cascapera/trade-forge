@@ -148,6 +148,12 @@ class ImmediateFillBroker:
         self.submitted.append(order)
         return OrderResult(order=order, accepted=True)
 
+    def cancel(self, client_id: str) -> bool:  # noqa: ARG002
+        """Nothing ever rests here: everything pending fills at the very next open, so by the
+        time anyone could withdraw an order it has already executed. Always false, which is
+        the same answer the real broker gives for an order it cannot find."""
+        return False
+
     def on_bar(self, candle: Candle) -> Sequence[Fill]:
         # Exits before entries: a reversal on one bar has to close before it opens, or the
         # ledger refuses the second position on a sequence that was merely mis-sorted.

@@ -145,3 +145,15 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
   `_MAX_LOOKBACK=500`), o que é um contrato surpreendente. (d) A origem de um CHoCH numa barra externa
   usa o topo anterior, não o desta barra — a janela da perna começa cedo demais, o que é permissivo,
   não vazante.
+- [origem: PR-203] **`OrderRequest` não valida ordem limite do lado errado** — uma compra limite
+  *acima* do mercado (ou uma venda *abaixo*) é recusada no `Signal`, mas não no `OrderRequest`. Quem
+  submeter direto ao broker a vê preencher na abertura, virando uma ordem a mercado silenciosa. Hoje
+  todo caminho passa pelo `Signal` (o `run()` constrói o `OrderRequest` a partir dele), então a engine
+  está protegida — mas a proteção é geográfica, não estrutural. Fechar quando o broker ganhar um
+  segundo chamador (o `MT5Broker` da Fase 2, ou a maquinaria de entrada se ela submeter direto).
+- [origem: PR-203] **Condução de stop: breakeven no 1º BOS a favor, depois atrás dos topos/fundos
+  válidos** — decisão fechada com o Guilherme em 21/07/2026, deliberadamente FATIADA para depois da
+  maquinaria de entrada. Hoje o stop é fixo: armado no fill dentro do `_Protection` e nunca mais
+  tocado. Mover o stop de uma posição aberta é **peça nova no protocolo `Broker`** (`modify_stop` ou
+  equivalente), logo exige ADR próprio + `engine-guardian`. Parciais entram na mesma fatia. Motivo de
+  adiar: primeiro ver os setups abrindo e fechando operação com stop fixo; gestão de trade depois.

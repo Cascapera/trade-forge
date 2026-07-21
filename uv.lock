@@ -1113,7 +1113,7 @@ requires-dist = [
     { name = "tradeforge-db", editable = "packages/db" },
     { name = "tradeforge-engine", editable = "packages/engine" },
     { name = "tradeforge-schema", editable = "packages/schema" },
-    { name = "uvicorn", extras = ["standard"], specifier = ">=0.34" },
+    { name = "uvicorn", extras = ["standard"], specifier = ">=0.51.0" },
 ]
 
 [[package]]
@@ -1153,7 +1153,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "alembic", specifier = ">=1.14" },
-    { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
+    { name = "psycopg", extras = ["binary"], specifier = ">=3.3.4" },
     { name = "pydantic-settings", specifier = ">=2.7" },
     { name = "sqlalchemy", specifier = ">=2.0.36" },
     { name = "tradeforge-engine", editable = "packages/engine" },

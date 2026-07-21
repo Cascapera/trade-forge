@@ -15,7 +15,7 @@ dependencies = [
     "fastapi>=0.115",
     # `[standard]` brings the websockets and httptools that the WS endpoint and a production
     # server need; without it uvicorn runs but cannot speak WebSocket.
-    "uvicorn[standard]>=0.34",
+    "uvicorn[standard]>=0.51.0",
     # The async job queue (spec: arq). Redis is the broker; arq is the runner.
     "arq>=0.26",
     "pydantic-settings>=2.7",

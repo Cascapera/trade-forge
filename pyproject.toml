@@ -44,18 +44,18 @@ dev = [
     # ("the trades reconcile with the equity curve", "the same input gives the same output")
     # are universally quantified statements, and an example-based test can only ever check
     # the examples someone thought of.
-    "hypothesis>=6.120",
-    "mypy>=1.14",
+    "hypothesis>=6.157.2",
+    "mypy>=2.3.0",
     "pre-commit>=4.6.0",
     "pytest>=8.3",
     "pytest-cov>=6.0",
-    "ruff>=0.9",
+    "ruff>=0.15.22",
     # FastAPI's TestClient is an httpx client driving the ASGI app in-process — no socket,
     # no running server, so the router tests stay fast and hermetic.
     "httpx>=0.28",
     # Property-based API testing: schemathesis reads the app's own OpenAPI schema and
     # generates requests that try to break each contract. Required by the PR-107 spec.
-    "schemathesis>=3.38",
+    "schemathesis>=4.24.0",
 ]
 
 # --------------------------------------------------------------------------- #

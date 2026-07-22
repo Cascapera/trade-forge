@@ -57,7 +57,14 @@ class PercentRiskManager:
             logger.debug("percent-risk sizing with no stop at %s; no trade", signal.reference_price)
             return ZERO
 
-        stop_distance = abs(signal.reference_price - signal.stop_loss)
+        # The stop distance is measured from the price this order expects to be *filled* at,
+        # and for a resting limit order that is the limit, not the close that decided it
+        # (ADR-0014). Sizing against the close would put the wrong amount of money behind a
+        # trade whose entry the strategy already named: a buy limit two hundred points below
+        # the close would be sized as if the stop were two hundred points further away than
+        # it is, and every structure setup enters at a level like that.
+        entry = signal.limit_price if signal.limit_price is not None else signal.reference_price
+        stop_distance = abs(entry - signal.stop_loss)
         if stop_distance <= ZERO:
             logger.debug("stop distance is zero at %s; no trade", signal.reference_price)
             return ZERO

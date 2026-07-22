@@ -86,10 +86,16 @@ class AssetClass(StrEnum):
 
 
 class SignalKind(StrEnum):
-    """Open a position, or close the one that is open."""
+    """Open a position, close the one that is open, or withdraw an order still waiting.
+
+    `CANCEL` is the odd one out on purpose: it is the only kind that never becomes an
+    `OrderRequest`. A resting limit order outlives the bar that placed it, so something has
+    to be able to take it back — see `Signal.client_id` and `Broker.cancel` (ADR-0014).
+    """
 
     ENTRY = "entry"
     EXIT = "exit"
+    CANCEL = "cancel"
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,14 +207,58 @@ class Signal:
     and recomputing it afterwards would mean re-running the engine and trusting nothing moved.
     None on an exit, and on any strategy with no indicators."""
 
+    limit_price: Money | None = None
+    """Where the order should wait, or `None` to take the next open at market (ADR-0014).
+
+    An indicator setup has no preferred price — "RSI crossed 30, buy" is answered by whatever
+    the next open is. A structure setup is the opposite: it enters *at the edge of a region*,
+    which is a price and not an instant, and filling it at the next open measures a trade the
+    method would never have taken."""
+
+    client_id: str | None = None
+    """The name this signal gives its order, so a later bar can take it back.
+
+    A resting order outlives the bar that placed it, and only the strategy knows when it
+    stopped making sense — its zone was mitigated, or aged out of the window. To say *that
+    one*, it needs a name, and the name has to come from the strategy: the engine hands out
+    no ids, because the engine is not the side that can carry one across bars. Required on a
+    `CANCEL`, and on anything that rests."""
+
+    def __post_init__(self) -> None:
+        # A cancel that names nothing is a strategy asking the broker to guess which order it
+        # meant. Refused here rather than downstream: by the time it reaches the broker the
+        # bar that could have explained it is gone.
+        if self.kind is SignalKind.CANCEL and self.client_id is None:
+            raise ValueError("a CANCEL names the order it withdraws: client_id is required")
+        if self.limit_price is not None and self.limit_price <= ZERO:
+            raise ValueError(f"limit price must be positive, got {self.limit_price}")
+        # A limit rests on the side price has to come back to: a buy waits *below*, a sell
+        # *above*. The wrong side is not an exotic order, it is a sign error — and it does not
+        # announce itself, because a buy limit above the market simply fills at the next open
+        # while being sized against a price that never existed. The structure layer computes
+        # these levels from zone edges, which is exactly where a top/bottom swap happens.
+        if self.kind is SignalKind.ENTRY and self.limit_price is not None:
+            wrong_side = (
+                self.limit_price > self.reference_price
+                if self.side is Side.LONG
+                else self.limit_price < self.reference_price
+            )
+            if wrong_side:
+                raise ValueError(
+                    f"a {self.side.value} limit at {self.limit_price} is on the wrong side of "
+                    f"{self.reference_price}: a buy limit rests below the market, a sell above"
+                )
+
 
 @dataclass(frozen=True, slots=True)
 class OrderRequest:
-    """A sized, submittable order. Market orders only in phase 1.
+    """A sized, submittable order: at market, or resting at a `limit_price` (ADR-0014).
 
     `decided_at` is the **opening instant of the candle the strategy was looking at** when
     it decided. It exists so the engine can *prove* the anti-lookahead rule rather than
     trust it: a fill may only land on a strictly later bar (see `loop._reject_lookahead`).
+    That proof matters most to a limit order, which is the one fill in the engine priced
+    *inside* a bar rather than at its open.
 
     One subtlety, and PR-105 depends on it: a protective exit (a stop or a target hit
     intrabar) inherits the `decided_at` of the **entry** that placed it. That is honest —
@@ -227,10 +277,23 @@ class OrderRequest:
     context: Mapping[str, Money | None] | None = None
     """The indicator snapshot from the signal that produced this order. See `Signal.context`."""
 
+    limit_price: Money | None = None
+    """The price this order waits at, or `None` for "fill at the next open". See `Signal`."""
+
+    client_id: str | None = None
+    """The strategy's name for this order, so it can be cancelled later. See `Signal`."""
+
     def __post_init__(self) -> None:
         _require_utc(self.decided_at, "OrderRequest.decided_at")
         if self.volume <= ZERO:
             raise ValueError(f"order volume must be positive, got {self.volume}")
+        # A cancel withdraws an order; it is not one. It carries no volume, no side and no
+        # fill, and letting it be built as an `OrderRequest` would put it in the queue the
+        # broker fills — which is exactly the queue it is supposed to empty.
+        if self.intent is SignalKind.CANCEL:
+            raise ValueError("a cancel is not an order: withdraw it through Broker.cancel")
+        if self.limit_price is not None and self.limit_price <= ZERO:
+            raise ValueError(f"limit price must be positive, got {self.limit_price}")
 
 
 @dataclass(frozen=True, slots=True)

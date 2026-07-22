@@ -6,7 +6,7 @@ from decimal import Decimal
 
 import pytest
 
-from tradeforge_engine.domain import Candle, Side
+from tradeforge_engine.domain import Candle, OrderRequest, Side, Signal, SignalKind
 from tradeforge_engine.testing import AAPL, EURUSD
 
 
@@ -60,3 +60,49 @@ def test_a_candle_cannot_be_rewritten_after_the_fact() -> None:
 
     with pytest.raises(dataclasses.FrozenInstanceError):
         candle.close = Decimal("9.99999")  # type: ignore[misc]
+
+
+# --------------------------------------------------------------------------- #
+# What a limit order and a cancel are allowed to be (ADR-0014)                  #
+# --------------------------------------------------------------------------- #
+
+
+def test_a_cancel_must_name_the_order_it_withdraws() -> None:
+    """Refused at the vocabulary, not at the broker: by the time an anonymous cancel arrived
+    there, the bar that could have explained which order it meant is gone."""
+    with pytest.raises(ValueError, match="client_id is required"):
+        Signal(kind=SignalKind.CANCEL, side=Side.LONG, reference_price=Decimal("1.10000"))
+
+
+def test_a_cancel_is_not_an_order() -> None:
+    """Building one as an `OrderRequest` would put it in the very queue it exists to empty."""
+    with pytest.raises(ValueError, match="not an order"):
+        OrderRequest(
+            symbol="EURUSD",
+            side=Side.LONG,
+            intent=SignalKind.CANCEL,
+            volume=Decimal(1),
+            decided_at=dt.datetime(2024, 1, 1, tzinfo=dt.UTC),
+            client_id="zone-1",
+        )
+
+
+def test_a_limit_price_must_be_a_price() -> None:
+    """Zero or negative is not a level anyone can rest an order at, on either object."""
+    with pytest.raises(ValueError, match="limit price must be positive"):
+        Signal(
+            kind=SignalKind.ENTRY,
+            side=Side.LONG,
+            reference_price=Decimal("1.10000"),
+            limit_price=Decimal(0),
+        )
+    with pytest.raises(ValueError, match="limit price must be positive"):
+        OrderRequest(
+            symbol="EURUSD",
+            side=Side.LONG,
+            intent=SignalKind.ENTRY,
+            volume=Decimal(1),
+            decided_at=dt.datetime(2024, 1, 1, tzinfo=dt.UTC),
+            limit_price=Decimal("-1.10000"),
+            client_id="zone-1",
+        )

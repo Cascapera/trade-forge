@@ -75,6 +75,29 @@ def test_the_lot_step_floors_the_size() -> None:
     assert volume == Decimal("0.20")
 
 
+def test_a_limit_order_is_sized_against_its_limit_not_the_close() -> None:
+    """A resting order will fill at its level, so that is the price the stop distance is
+    measured from (ADR-0014). Sizing against the close that decided it would size a trade the
+    strategy is not placing: here the close is 1.10000 and the limit 1.09500, so the real risk
+    is 50 pips ($500/lot) and 1% of $10 000 buys 0.20 lots — not the 0.10 a 100-pip distance
+    would give. Every structure setup enters at a level away from the close, so this is the
+    normal case for them, not an edge one."""
+    risk = PercentRiskManager(percent=Decimal(1))
+    signal = Signal(
+        kind=SignalKind.ENTRY,
+        side=Side.LONG,
+        reference_price=Decimal("1.10000"),
+        stop_loss=Decimal("1.09000"),
+        limit_price=Decimal("1.09500"),
+        client_id="zone-1",
+    )
+    assert risk.size(signal, ACCOUNT, EURUSD) == Decimal("0.2")
+    # and the market version of the same signal still measures from the close
+    assert risk.size(a_signal(reference="1.10000", stop="1.09000"), ACCOUNT, EURUSD) == Decimal(
+        "0.1"
+    )
+
+
 def test_allow_is_the_veto_and_is_open_in_phase_1() -> None:
     risk = PercentRiskManager(percent=Decimal(1))
     order = OrderRequest(

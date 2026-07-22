@@ -24,6 +24,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from decimal import ROUND_HALF_EVEN, localcontext
 from decimal import Context as DecimalContext
+from typing import cast
 
 from tradeforge_engine.domain import (
     ZERO,
@@ -145,13 +146,30 @@ def _run(  # noqa: PLR0913 — see run()
 
         # 3-4. Intent -> size -> veto -> queue. Never intent -> fill.
         for signal in strategy.on_bar(context):
+            # A cancel is the one intent that never becomes an order — it withdraws one. It
+            # skips sizing and the veto for the same reason an exit skips sizing: there is
+            # nothing to size, and a risk manager that could refuse a cancel would be a risk
+            # manager that keeps an order alive after the strategy disowned it.
+            if signal.kind is SignalKind.CANCEL:
+                # `Signal.__post_init__` has already refused a cancel with no name, so this
+                # is a `str`. Narrowing it again would add a branch no test could enter.
+                broker.cancel(cast(str, signal.client_id))
+                continue
+
             order = _to_order(signal, context, instrument, risk)
             if order is None:
                 continue
             if not risk.allow(order, account):
                 logger.debug("risk manager vetoed %s at %s", order.reason, candle.time)
                 continue
-            broker.submit(order)
+            result = broker.submit(order)
+            # A refusal is the broker declining to take the order at all — a duplicate name, an
+            # order it cannot rest. Silence here would look exactly like a trade that simply
+            # never triggered, which is the one failure the strategy author cannot debug.
+            if not result.accepted:
+                logger.debug(
+                    "broker refused %s at %s: %s", order.reason, candle.time, result.reason
+                )
 
         # 5. The account is worth what it is worth at the close of this bar.
         equity_curve.append(EquityPoint(time=candle.time, equity=account.equity))
@@ -186,6 +204,16 @@ def _to_order(
             logger.debug("exit signal with no open position at %s", context.candle.time)
             return None
 
+        # An exit does not rest at a price: the broker's own protective levels are the only
+        # thing that closes a position at a level, and two paths closing one position is where
+        # the ledger stops adding up (`BacktestBroker._reject_resting`). Said out loud, because
+        # an exit that quietly became a market order is a strategy measuring something else.
+        if signal.limit_price is not None:
+            logger.debug(
+                "exit signal at %s carries a limit price; exits fill at the open",
+                context.candle.time,
+            )
+
         return OrderRequest(
             symbol=instrument.symbol,
             side=position.side,
@@ -210,6 +238,8 @@ def _to_order(
         take_profit=signal.take_profit,
         reason=signal.reason,
         context=signal.context,
+        limit_price=signal.limit_price,
+        client_id=signal.client_id,
     )
 
 

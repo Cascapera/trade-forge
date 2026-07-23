@@ -43,6 +43,7 @@ from tradeforge_engine.structure import (
     OrderBlock,
     OrderBlockDetector,
     StructureBreak,
+    StructureKind,
     TrackedZone,
     ZoneKind,
 )
@@ -76,6 +77,20 @@ class SetupContext:
     marked: tuple[OrderBlock, ...]
     zones: tuple[TrackedZone, ...]
 
+    stopped: OrderBlock | None = None
+    """The zone whose trade the stop ended on this bar, if any.
+
+    The author's ladder rule — "stopou → ordem na primária" — is a condition on the *trade's*
+    outcome, and the zone's own marks cannot carry it: a trade one width in profit has already
+    mitigated its zone the healthy way while still open, and a mitigated zone is frozen, so the
+    stop that later takes the trade out leaves no new mark to read. The machinery watches the
+    fills (ADR-0015), so it reports the outcome itself.
+    """
+
+    won: OrderBlock | None = None
+    """The zone whose trade ended in profit on this bar — the target, or any exit that is not
+    the stop."""
+
 
 class SetupQualifier(Protocol):
     """A setup, reduced to the only question that distinguishes it from the others.
@@ -91,6 +106,65 @@ class SetupQualifier(Protocol):
     def qualify(self, context: SetupContext) -> OrderBlock | None:
         """Name the zone this bar qualified, or `None`."""
         ...
+
+
+class ChochQualifier:
+    """The choch setup: trade the zone the change of character left behind.
+
+    A change of character confirms — price closes through the anchor and the trend inverts — and
+    the leg that broke it left a region on the way. Price comes back, touches it, and the trade
+    is taken in the *new* trend's direction. Deliberately nothing more is waited for: a setup
+    that also wants a break in the new trend's favour is the continuation setup, not this one.
+    And a leg that left no inefficiency marks no zone, so it offers no trade (the author's rule:
+    "sem ineficiência não tem trade").
+
+    **The ladder** (the author's rule for legs that leave more than one zone). The pullback
+    meets the zones in reverse order of marking — the last secondary is the nearest, the primary
+    at the leg's origin is the farthest — so the order hangs on the *nearest* zone first. What
+    moves the ladder is the **trade's outcome**, not the zone's marks: a rung whose trade the
+    stop took out hands the order to the next zone toward the origin ("stopou a venda → ordem na
+    primária"), and a rung whose trade won ends the ladder — no order waits behind a winner. The
+    outcome has to come from the machinery (`SetupContext.stopped` / `won`), because the zone
+    cannot tell the two apart: a trade one width in profit has already mitigated its zone the
+    healthy way while still open, and the stop that later ends it leaves no new mark. A rung
+    that dies with no trade taken — aged out, or spent before price ever reached the order — is
+    simply skipped. With `allow_secondary` off the machinery offers only the primary, and the
+    ladder is a single rung.
+
+    A new change of character replaces the ladder wholesale, whichever direction it points. That
+    is not a special case, it is the setup reapplied: a contrary choch had to come through the
+    old region to happen (stopping whatever was resting there — the machinery already withdrew
+    or filled it), and the zones *its* leg left are simply the next trade.
+    """
+
+    def __init__(self) -> None:
+        self._ladder: list[OrderBlock] = []
+
+    def qualify(self, context: SetupContext) -> OrderBlock | None:
+        """Name the ladder's current rung, advancing on the outcome the machinery reported."""
+        # The outcome belongs to the regime that produced the trade, so it is settled before a
+        # new change of character replaces the ladder on this same bar.
+        if context.won is not None:
+            self._ladder = []
+        elif context.stopped is not None and self._ladder and self._ladder[0] == context.stopped:
+            self._ladder.pop(0)
+
+        break_ = context.break_
+        if break_ is not None and break_.kind is StructureKind.CHOCH:
+            # Nearest zone first, the leg's origin last. `marked` arrives in marking order —
+            # origin first — so the ladder is its reverse.
+            self._ladder = list(reversed(context.marked))
+
+        while self._ladder:
+            rung = self._ladder[0]
+            tracked = next((zone for zone in context.zones if zone.block == rung), None)
+            if tracked is not None and tracked.usable:
+                return rung
+            # Dead with no trade taken — aged out of the tracker, or spent before price ever
+            # came back to the order. The next zone toward the origin answers; the machinery
+            # would refuse this one anyway.
+            self._ladder.pop(0)
+        return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,6 +240,10 @@ class StructureStrategy:
         # Zones whose order became a trade. Membership only — never iterated — so it cannot
         # leak set ordering into a result (`AGENTS.md §5.2`).
         self._traded: set[OrderBlock] = set()
+        # The zone whose trade is currently open (or ended on a bar not yet reported). This is
+        # what lets the machinery tell the qualifier *how* a trade ended — see
+        # `SetupContext.stopped`.
+        self._filled: OrderBlock | None = None
 
     def on_bar(self, context: Context) -> tuple[Signal, ...]:
         candle = context.candle
@@ -183,6 +261,7 @@ class StructureStrategy:
             return ()
 
         signals: list[Signal] = []
+        stopped, won = self._trade_outcome(context)
 
         # A zone that no longer stands takes its order with it, before anything else this bar:
         # the order was only ever an expression of that region's validity.
@@ -197,6 +276,8 @@ class StructureStrategy:
                 break_=break_,
                 marked=candidates,
                 zones=self._blocks.zones,
+                stopped=stopped,
+                won=won,
             )
         )
         if chosen is not None and self._may_arm(chosen):
@@ -249,7 +330,30 @@ class StructureStrategy:
         filled = any(fill.order.client_id == armed.client_id for fill in context.fills)
         if filled or context.position is not None:
             self._traded.add(armed.block)
+            self._filled = armed.block
             self._armed = None
+
+    def _trade_outcome(self, context: Context) -> tuple[OrderBlock | None, OrderBlock | None]:
+        """`(stopped, won)` — the zone whose trade ended on this bar, by how it ended.
+
+        The broker's protective exits stamp their reason on the order (`"sl"` / `"tp"`), and the
+        exit fill arrives in `Context.fills` like any other. Anything that is not the stop ends
+        the trade on the trader's terms, so it counts as won — the distinction the ladder needs
+        is only "did the market throw the trade out through the far side".
+
+        This phase holds one position at a time, so the exit necessarily belongs to the zone in
+        `_filled`; the name is consumed with the report, and a bar with no exit reports nothing.
+        """
+        block = self._filled
+        if block is None:
+            return None, None
+        for fill in context.fills:
+            if fill.order.intent is SignalKind.EXIT:
+                self._filled = None
+                if fill.order.reason == "sl":
+                    return block, None
+                return None, block
+        return None, None
 
     def _may_arm(self, block: OrderBlock) -> bool:
         """May an order be put on this zone at all?

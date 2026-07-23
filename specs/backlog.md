@@ -169,7 +169,21 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
   e o nome armado fica fantasma — backtest conservador vs. live, onde daria fill+stop (scratch
   trade que queimaria a região); (d) nota do `client_id`: o formato `%Y%m%dT%H%M` trunca segundos
   e é o **contador** que garante unicidade abaixo da resolução de minuto — irrelevante com piso M1
-  do MT5, mas não "simplificar" o contador no futuro.
+  do MT5, mas não "simplificar" o contador no futuro. **(e) [PR-205] O executor MT5 precisa mapear
+  exit de stop para `reason == "sl"` literalmente** — `_trade_outcome` classifica o desfecho por
+  essa string, e a escada do choch lê stop como "avança para a próxima zona" e qualquer outro
+  exit como "venceu, encerra a escada". Um rótulo diferente inverte a regra do autor em silêncio.
+  **(f) [PR-205] `won` hoje = qualquer exit que não é `"sl"`.** Só existem `"sl"`/`"tp"`; quando
+  nascer um `exit.condition` de estratégia, perguntar ao Guilherme se saída por condição encerra
+  a escada (tratamento atual) ou a faz avançar.
+- [origem: PR-205] **CHoCH contrário confirmado com posição aberta é perdido pelo qualifier** —
+  `StructureStrategy.on_bar` retorna cedo quando há posição, então o `break_` daquela barra nunca
+  chega ao `qualify` e a escada nova não é instalada; o setup fica em silêncio até o próximo CHoCH.
+  Janela estreita mas real: exige a âncora do CHoCH entre o topo da zona e o topo + buffer (o
+  fechamento confirma a virada sem acionar o stop). Conservador e determinístico — a escada velha
+  se auto-cura (o fechamento contrário fica além do topo de todo degrau da perna, mitigando todos),
+  então nunca há trade errado, só um trade do método que o backtest não toma. Decidir com o
+  Guilherme se um choch perdido deve ser re-qualificado quando a posição fechar.
 - [origem: PR-204] **Churn de ping-pong entre duas zonas vivas** — com a queima no fill (ADR-0015),
   um qualifier patológico que alterna os nomes entre duas zonas vivas cancela/rearma a cada barra.
   Nenhum invariante quebra (uma ordem viva por vez, cancel antes de entry na mesma barra, fill

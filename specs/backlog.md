@@ -184,6 +184,19 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
   se auto-cura (o fechamento contrário fica além do topo de todo degrau da perna, mitigando todos),
   então nunca há trade errado, só um trade do método que o backtest não toma. Decidir com o
   Guilherme se um choch perdido deve ser re-qualificado quando a posição fechar.
+- [origem: PR-206] **Fiação da DSL para os setups de estrutura (choch, continuação) + `max_bos`** —
+  hoje `ChochQualifier`/`ContinuationQualifier` e o `StructureStrategy` só existem na engine; o JSON
+  Schema (`packages/schema`) e os tipos TS ainda não têm um nó de estratégia de estrutura, nem os
+  parâmetros `allow_secondary`/`stop_buffer`/`max_bos`. Quando entrar, é mudança **aditiva** (novo
+  membro da união de estratégia) → mantém `schema_version` (ADR-0013). O `max_bos` da continuação é
+  `int | None` (None = ilimitado, 1 = one-shot) — expor como opcional com default null. Fazer no PR
+  que ligar os setups de estrutura à API/builder, não antes (nenhuma tela os usa ainda).
+- [origem: PR-206] **Continuação com posição aberta perde o BOS a favor** — mesmo padrão do CHoCH
+  contrário acima: `on_bar` retorna cedo com posição aberta, então um BOS que confirmaria uma nova
+  perna de continuação enquanto um trade da perna anterior ainda está aberto nunca chega ao
+  `qualify`. Conservador (não instala escada nova cedo demais), mas é um trade do método que o
+  backtest pode não tomar. Mesma decisão pendente do item do CHoCH contrário — resolver os dois
+  juntos se/quando o early-return por posição for revisitado.
 - [origem: PR-204] **Churn de ping-pong entre duas zonas vivas** — com a queima no fill (ADR-0015),
   um qualifier patológico que alterna os nomes entre duas zonas vivas cancela/rearma a cada barra.
   Nenhum invariante quebra (uma ordem viva por vez, cancel antes de entry na mesma barra, fill

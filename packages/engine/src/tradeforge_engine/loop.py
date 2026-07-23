@@ -127,10 +127,12 @@ def _run(  # noqa: PLR0913 — see run()
         # 1. The bar arrives. Whatever was decided on an earlier bar executes now, inside
         #    this one, at a price the strategy had not seen when it decided. This is the
         #    ONLY place a fill can be born.
+        born: list[Fill] = []
         for fill in broker.on_bar(candle):
             _reject_lookahead(fill, candle, timeframe)
             _reject_foreign_symbol(fill, instrument)
-            fills.append(fill)
+            born.append(fill)
+        fills.extend(born)
 
         # 2. Only now is the strategy allowed to look at this candle — and at nothing else.
         #    The account is read once: against a live terminal, two reads are two round
@@ -142,6 +144,10 @@ def _run(  # noqa: PLR0913 — see run()
             instrument=instrument,
             account=account,
             position=_open_position(broker, instrument.symbol),
+            # This bar's fills, not the run's: what step 1 just did is part of what the
+            # bar revealed, and it is the only way a strategy learns of a trade that
+            # opened and died inside one bar (ADR-0015).
+            fills=tuple(born),
         )
 
         # 3-4. Intent -> size -> veto -> queue. Never intent -> fill.

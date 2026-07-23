@@ -197,11 +197,13 @@ class ScriptedStrategy:
     script: dict[int, list[Signal]] = field(default_factory=dict)
     seen: list[Candle] = field(default_factory=list)
     positions_seen: list[Side | None] = field(default_factory=list)
+    fills_seen: list[tuple[Fill, ...]] = field(default_factory=list)
 
     def on_bar(self, context: Context) -> Sequence[Signal]:
         index = len(self.seen)
         self.seen.append(context.candle)
         self.positions_seen.append(context.position.side if context.position else None)
+        self.fills_seen.append(context.fills)
         return self.script.get(index, [])
 
 

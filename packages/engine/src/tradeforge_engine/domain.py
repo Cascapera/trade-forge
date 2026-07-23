@@ -422,6 +422,18 @@ class Context:
     account: AccountState
     position: Position | None = None
 
+    fills: tuple[Fill, ...] = ()
+    """The fills born inside this bar, before the strategy saw its close (ADR-0015).
+
+    Not a relaxation of the anti-lookahead rule: these are bar-N events handed to a
+    strategy deciding on bar N's close — the same thing a live terminal does when it
+    pushes a fill notification the moment it happens. The field exists because
+    `position` alone cannot report one real outcome: a limit order that fills and is
+    stopped out inside a single bar opens a position that is already gone by the time
+    this object is built, and a strategy that never learns its order became a trade
+    will treat the order as still resting.
+    """
+
 
 @dataclass(frozen=True, slots=True)
 class EvalContext:

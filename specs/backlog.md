@@ -157,3 +157,26 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
   tocado. Mover o stop de uma posição aberta é **peça nova no protocolo `Broker`** (`modify_stop` ou
   equivalente), logo exige ADR próprio + `engine-guardian`. Parciais entram na mesma fatia. Motivo de
   adiar: primeiro ver os setups abrindo e fechando operação com stop fixo; gestão de trade depois.
+- [origem: PR-204] **Reconciliação estratégia↔broker em live** — o `Signal` é fire-and-forget: a
+  `StructureStrategy` não tem canal de confirmação do que o broker/loop fez com a intenção. Quatro
+  sub-casos com a mesma causa raiz, para resolver juntos no PR do `MT5Broker` (provavelmente com
+  eventos de ordem no `Context`, na linha do ADR-0015): (a) trade manual no mesmo símbolo faz o
+  fallback de `position` em `_observe_fill` queimar a zona errada e esquecer `_armed`, deixando
+  ordem órfã no book; (b) veto do risk manager ou sizing zero descartam a ordem com `placed=True`
+  já gravado — a estratégia acredita ter ordem no book (fantasma; desde o ADR-0015 a zona não é
+  mais queimada nesse caso, só o fantasma persiste, com cancel espúrio inofensivo ao morrer);
+  (c) descarte do ADR-0014 (barra que atravessa ordem + stop juntos): sem fill, a zona não queima
+  e o nome armado fica fantasma — backtest conservador vs. live, onde daria fill+stop (scratch
+  trade que queimaria a região); (d) nota do `client_id`: o formato `%Y%m%dT%H%M` trunca segundos
+  e é o **contador** que garante unicidade abaixo da resolução de minuto — irrelevante com piso M1
+  do MT5, mas não "simplificar" o contador no futuro.
+- [origem: PR-204] **Churn de ping-pong entre duas zonas vivas** — com a queima no fill (ADR-0015),
+  um qualifier patológico que alterna os nomes entre duas zonas vivas cancela/rearma a cada barra.
+  Nenhum invariante quebra (uma ordem viva por vez, cancel antes de entry na mesma barra, fill
+  duplo impossível), mas em live é round trip de cancelamento por barra. O freio (histerese ou
+  cooldown por zona) é decisão de método do Guilherme, não da maquinaria — decidir quando um
+  qualifier real exibir o padrão.
+- [origem: PR-204] **`side` do CANCEL sempre resolvível (M19)** — o loop ignora o `side` de um
+  `Signal` de cancel (`broker.cancel(client_id)` não roteia por lado). Mutante equivalente hoje;
+  vira relevante num futuro `MT5Broker` que roteie cancelamentos por lado. Testar quando existir
+  um consumidor que leia o campo.

@@ -167,6 +167,98 @@ class ChochQualifier:
         return None
 
 
+class ContinuationQualifier:
+    """The continuation setup: trade the zone a break *in the trend's favour* leaves behind.
+
+    Where the choch trades the reversal itself, continuation trades what comes after it. A change
+    of character turns the trend; then the market resumes that new trend and **breaks structure in
+    its favour** (a BOS), and the leg of that break leaves a region. Price pulls back into it and
+    the trade is taken with the trend. Two things therefore have to have happened, in order: the
+    turn, and then a break confirming it — a BOS with no change of character before it is just an
+    old trend continuing, which this setup deliberately leaves to no one. And, as everywhere in the
+    method, a leg that left no inefficiency marks no zone and offers no trade ("sem ineficiência
+    não tem trade").
+
+    A BOS always continues the trend in force — that is what distinguishes it from a choch — so
+    "in the trend's favour" needs no direction check: *any* BOS is in favour of the trend it
+    breaks. The only question is whether that trend was **born of a change of character**. So the
+    qualifier arms on a BOS once a choch has been seen, and never before — the very first break in
+    a fresh dataset is a bootstrap BOS with no reversal behind it, and it is not a continuation.
+
+    **How many BOS per reversal** (`max_bos`). A trend that a choch opened will usually break
+    structure in its favour more than once as it runs, and each such break leaves its own leg's
+    zones — the classic continuation trades the pullback into *each* new leg. That is the default
+    (`max_bos=None`). Set `max_bos=n` to trade only the first *n* breaks after each change of
+    character: `1` is the strict reading, "the BOS that confirms the new trend", and nothing after
+    it until the trend turns again. Only a break that actually leaves a zone counts toward the cap
+    — a BOS with no inefficiency is a non-event, and letting it burn a slot would silently cost a
+    configured trade. The count resets on every change of character.
+
+    **The ladder** is the choch's, unchanged: with more than one zone the pullback meets them
+    nearest-first, the order hangs on the nearest, a stopped rung hands the order to the next
+    toward the origin, a winning rung ends the ladder, and a rung that dies untraded is skipped.
+    `allow_secondary` off leaves a single rung, the primary at the leg's origin. See
+    `ChochQualifier` for why the outcome has to come from the machinery and not the zone's marks.
+
+    A change of character replaces the ladder wholesale and re-opens the count, whichever way it
+    points: the reversal came back through the region the continuation was resting in, and the
+    zones its own next BOS leaves are simply the next trades. The choch that turns the trend is not
+    itself a continuation entry — its region is the choch setup's to trade, not this one's.
+    """
+
+    def __init__(self, *, max_bos: int | None = None) -> None:
+        if max_bos is not None and max_bos < 1:
+            raise ValueError(f"max_bos is a count of breaks to trade, got {max_bos}")
+        self._max_bos = max_bos
+        self._ladder: list[OrderBlock] = []
+        # Breaks armed since the last change of character; `None` until the first choch is seen,
+        # which is the "not eligible yet" state — a bootstrap BOS has no reversal behind it.
+        self._since_choch: int | None = None
+
+    def qualify(self, context: SetupContext) -> OrderBlock | None:
+        """Name the ladder's current rung, arming on a favourable break once a choch has opened
+        the trend and the cap still allows it."""
+        # The outcome belongs to the regime that produced the trade, settled before a new break
+        # touches the ladder on this same bar (see `ChochQualifier.qualify`).
+        if context.won is not None:
+            self._ladder = []
+        elif context.stopped is not None and self._ladder and self._ladder[0] == context.stopped:
+            self._ladder.pop(0)
+
+        break_ = context.break_
+        if break_ is not None and break_.kind is StructureKind.CHOCH:
+            # The turn cancels the continuation context and re-opens the count. The choch's own
+            # region is not ours to trade.
+            self._since_choch = 0
+            self._ladder = []
+        elif (
+            break_ is not None
+            # Only a BOS can reach here — the branch above consumed the CHoCH, and those are the
+            # only two kinds — so this test is redundant *today*. It is kept as a deliberate guard,
+            # mirroring the choch qualifier's positive discriminator: were a third kind of break
+            # ever added, the safe default is for continuation to ignore it rather than silently
+            # treat it as a favourable break. No test can kill removing it while two kinds exist.
+            and break_.kind is StructureKind.BOS
+            and self._since_choch is not None
+            and context.marked
+            and (self._max_bos is None or self._since_choch < self._max_bos)
+        ):
+            # A favourable break that leaves zones, within the cap: it counts, and its leg's zones
+            # become the new ladder — nearest zone first, the leg's origin last.
+            self._since_choch += 1
+            self._ladder = list(reversed(context.marked))
+
+        while self._ladder:
+            rung = self._ladder[0]
+            tracked = next((zone for zone in context.zones if zone.block == rung), None)
+            if tracked is not None and tracked.usable:
+                return rung
+            # Dead with no trade taken — aged out, or spent before price returned. The next zone
+            # toward the origin answers; the machinery would refuse this one anyway.
+            self._ladder.pop(0)
+        return None
+
+
 @dataclass(frozen=True, slots=True)
 class ZoneEntry:
     """Where an order rests on a zone, and where its stop goes."""

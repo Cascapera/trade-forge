@@ -27,7 +27,13 @@ from tradeforge_engine.domain import (
     SignalKind,
 )
 from tradeforge_engine.loop import ENGINE_CONTEXT, run
-from tradeforge_engine.setups import ChochQualifier, SetupContext, StructureStrategy, _to_tick
+from tradeforge_engine.setups import (
+    ChochQualifier,
+    ContinuationQualifier,
+    SetupContext,
+    StructureStrategy,
+    _to_tick,
+)
 from tradeforge_engine.structure import (
     OrderBlock,
     StructureBreak,
@@ -1308,3 +1314,328 @@ def test_an_outcome_and_a_new_choch_on_one_bar_settle_in_order() -> None:
         )
     )
     assert named is demand
+
+
+# --------------------------------------------------------------------------- #
+# The continuation setup                                                        #
+# --------------------------------------------------------------------------- #
+
+# Measured, not invented (probe against the real detectors). After the impulse's bootstrap BOS up
+# (bar 9) and the fall through the 90 anchor to a change of character (bar 13, supply [120, 125]),
+# price corrects up two bars and breaks structure downward again on bar 17 — a BOS *in favour of*
+# the new bearish trend, whose leg leaves the supply zone [96, 100]. That zone is the continuation
+# setup's, and the two breaks before it are not.
+_CONT_LEG = [
+    bar(14, open_="88", close="95", high="96", low="88"),  # correction up 1
+    bar(15, open_="96", close="99", high="100", low="96"),  # correction up 2 -> armed
+    bar(16, open_="99", close="92", high="100", low="91"),
+    bar(
+        17, open_="91", close="82", high="92", low="80"
+    ),  # close 82 < 87 -> BOS down; zone [96,100]
+]
+
+_BOS_DOWN = StructureBreak(
+    kind=StructureKind.BOS,
+    trend=Trend.BEARISH,
+    level=Decimal("87"),
+    time=_at(17),
+    origin=Decimal("100"),
+    origin_time=_at(15),
+)
+
+
+def _bos_zone(bottom: str, top: str, index: int, *, primary: bool) -> OrderBlock:
+    """A supply zone left by a continuation's favourable break (`break_kind` BOS, not CHoCH)."""
+    return OrderBlock(
+        kind=ZoneKind.SUPPLY,
+        top=Decimal(top),
+        bottom=Decimal(bottom),
+        time=_at(index),
+        confirmed_at=_at(17),
+        break_kind=StructureKind.BOS,
+        primary=primary,
+    )
+
+
+def test_continuation_arms_the_bos_zone_after_a_change_of_character() -> None:
+    """The setup end to end on the real detectors. Two earlier breaks are pointedly ignored — the
+    bootstrap BOS on bar 9 (a trend with no reversal behind it) and the change of character on bar
+    13 (whose region is the choch setup's) — and the sell goes on only when a break *in the new
+    trend's favour* confirms on bar 17, resting on the [96, 100] its leg left, stop a tenth of the
+    width past the top."""
+    strategy = StructureStrategy(qualifier=ContinuationQualifier(), name="continuation")
+    signals = _drive(strategy, [*_IMPULSE, *_CHOCH_LEG, *_CONT_LEG])
+
+    assert all(bar_signals == [] for bar_signals in signals[:17])
+    [signal] = signals[17]
+    assert signal.kind is SignalKind.ENTRY
+    assert signal.side is Side.SHORT
+    assert (signal.limit_price, signal.stop_loss) == (Decimal("96"), Decimal("100.40"))
+    assert signal.reason == "entry.continuation"
+
+
+def test_continuation_ignores_a_break_with_no_change_of_character_behind_it() -> None:
+    """The impulse alone is a bootstrap BOS up — a trend appearing from nothing. Continuation
+    needs the turn first, so it stays silent through a break that a choch never opened."""
+    signals = _drive(StructureStrategy(qualifier=ContinuationQualifier()), _IMPULSE)
+
+    assert all(bar_signals == [] for bar_signals in signals)
+
+
+def test_a_change_of_character_opens_continuation_but_does_not_arm_it() -> None:
+    """The choch is what makes continuation eligible, yet it is not itself a continuation entry:
+    the region it leaves belongs to the choch setup. The bar it confirms names nothing here, even
+    though it marked a zone."""
+    qualifier = ContinuationQualifier()
+    zone = _supply("120", "125", 9, primary=True)
+
+    named = qualifier.qualify(
+        _ctx(break_=_CHOCH_DOWN, marked=(zone,), zones=(TrackedZone(block=zone),))
+    )
+
+    assert named is None
+
+
+def test_a_favourable_break_after_the_turn_arms_its_zone() -> None:
+    """The turn, then a break confirming it: a BOS after a change of character arms the region its
+    leg left."""
+    qualifier = ContinuationQualifier()
+    qualifier.qualify(_ctx(break_=_CHOCH_DOWN))  # the turn — now eligible
+
+    zone = _bos_zone("96", "100", 15, primary=True)
+    named = qualifier.qualify(
+        _ctx(break_=_BOS_DOWN, marked=(zone,), zones=(TrackedZone(block=zone),))
+    )
+
+    assert named is zone
+
+
+def test_a_break_before_any_turn_arms_nothing() -> None:
+    """A bootstrap BOS — a break with no change of character before it — is an old trend running
+    on, not a continuation. It arms nothing even when its leg left a zone."""
+    qualifier = ContinuationQualifier()
+    zone = _bos_zone("96", "100", 15, primary=True)
+
+    named = qualifier.qualify(
+        _ctx(break_=_BOS_DOWN, marked=(zone,), zones=(TrackedZone(block=zone),))
+    )
+
+    assert named is None
+
+
+def test_a_continuation_break_without_inefficiency_offers_no_trade() -> None:
+    """ "sem ineficiência não tem trade" holds for the continuation break too: a favourable BOS
+    that left no zone names nothing, rather than inventing a region."""
+    qualifier = ContinuationQualifier()
+    qualifier.qualify(_ctx(break_=_CHOCH_DOWN))
+
+    assert qualifier.qualify(_ctx(break_=_BOS_DOWN, marked=(), zones=())) is None
+
+
+def test_the_continuation_ladder_meets_the_nearest_zone_first() -> None:
+    """The choch's ladder, reused. With two zones the pullback reaches the last-marked (nearest)
+    first, so the order hangs there; `marked` arrives origin-first, so the ladder is its reverse."""
+    qualifier = ContinuationQualifier()
+    qualifier.qualify(_ctx(break_=_CHOCH_DOWN))
+
+    primary = _bos_zone("96", "100", 15, primary=True)
+    secondary = _bos_zone("84", "88", 19, primary=False)
+    named = qualifier.qualify(
+        _ctx(
+            break_=_BOS_DOWN,
+            marked=(primary, secondary),
+            zones=(TrackedZone(block=primary), TrackedZone(block=secondary)),
+        )
+    )
+
+    assert named is secondary
+
+
+def test_a_stopped_continuation_rung_hands_the_order_to_the_next_zone() -> None:
+    """The ladder advances on the trade's outcome, exactly as the choch's does: the rung whose
+    trade the stop took out passes the order to the next zone toward the origin."""
+    qualifier = ContinuationQualifier()
+    qualifier.qualify(_ctx(break_=_CHOCH_DOWN))
+
+    primary = _bos_zone("96", "100", 15, primary=True)
+    secondary = _bos_zone("84", "88", 19, primary=False)
+    zones = (TrackedZone(block=primary), TrackedZone(block=secondary))
+    assert (
+        qualifier.qualify(_ctx(break_=_BOS_DOWN, marked=(primary, secondary), zones=zones))
+        is secondary
+    )
+
+    # The secondary's trade is stopped out: the order moves to the primary at the leg's origin.
+    assert qualifier.qualify(_ctx(zones=zones, stopped=secondary)) is primary
+
+
+def test_a_winning_continuation_rung_ends_the_ladder() -> None:
+    """No order waits behind a winner — not even at the primary the ladder had yet to reach."""
+    qualifier = ContinuationQualifier()
+    qualifier.qualify(_ctx(break_=_CHOCH_DOWN))
+
+    primary = _bos_zone("96", "100", 15, primary=True)
+    secondary = _bos_zone("84", "88", 19, primary=False)
+    zones = (TrackedZone(block=primary), TrackedZone(block=secondary))
+    assert (
+        qualifier.qualify(_ctx(break_=_BOS_DOWN, marked=(primary, secondary), zones=zones))
+        is secondary
+    )
+
+    assert qualifier.qualify(_ctx(zones=zones, won=secondary)) is None
+
+
+def test_max_bos_one_trades_only_the_first_break_after_a_turn() -> None:
+    """`max_bos=1` is the strict reading — the one BOS that confirms the new trend, nothing after
+    it until the trend turns again. The second favourable break is ignored and the first leg's
+    ladder is left standing."""
+    qualifier = ContinuationQualifier(max_bos=1)
+    qualifier.qualify(_ctx(break_=_CHOCH_DOWN))
+
+    first = _bos_zone("96", "100", 15, primary=True)
+    second = _bos_zone("70", "74", 21, primary=True)
+    assert (
+        qualifier.qualify(
+            _ctx(break_=_BOS_DOWN, marked=(first,), zones=(TrackedZone(block=first),))
+        )
+        is first
+    )
+
+    both = (TrackedZone(block=first), TrackedZone(block=second))
+    assert qualifier.qualify(_ctx(break_=_BOS_DOWN, marked=(second,), zones=both)) is first
+
+
+def test_by_default_every_favourable_break_re_arms() -> None:
+    """The default (`max_bos=None`) trades the pullback into each new leg: a second favourable
+    break replaces the ladder with its own zone."""
+    qualifier = ContinuationQualifier()
+    qualifier.qualify(_ctx(break_=_CHOCH_DOWN))
+
+    first = _bos_zone("96", "100", 15, primary=True)
+    second = _bos_zone("70", "74", 21, primary=True)
+    assert (
+        qualifier.qualify(
+            _ctx(break_=_BOS_DOWN, marked=(first,), zones=(TrackedZone(block=first),))
+        )
+        is first
+    )
+
+    both = (TrackedZone(block=first), TrackedZone(block=second))
+    assert qualifier.qualify(_ctx(break_=_BOS_DOWN, marked=(second,), zones=both)) is second
+
+
+def test_a_zoneless_break_does_not_spend_a_cap_slot() -> None:
+    """The cap counts trades, not breaks: a favourable BOS that left no inefficiency is a
+    non-event, so with `max_bos=1` a zoneless break does not use up the one allowed trade."""
+    qualifier = ContinuationQualifier(max_bos=1)
+    qualifier.qualify(_ctx(break_=_CHOCH_DOWN))
+
+    # A favourable break that marked nothing — it must not burn the slot.
+    assert qualifier.qualify(_ctx(break_=_BOS_DOWN, marked=(), zones=())) is None
+
+    zone = _bos_zone("96", "100", 15, primary=True)
+    named = qualifier.qualify(
+        _ctx(break_=_BOS_DOWN, marked=(zone,), zones=(TrackedZone(block=zone),))
+    )
+    assert named is zone
+
+
+def test_a_new_turn_re_opens_the_cap() -> None:
+    """The count resets on every change of character: after `max_bos=1` has spent its trade, a
+    fresh choch drops the old ladder and lets continuation arm again on the next favourable
+    break."""
+    qualifier = ContinuationQualifier(max_bos=1)
+    qualifier.qualify(_ctx(break_=_CHOCH_DOWN))
+
+    first = _bos_zone("96", "100", 15, primary=True)
+    assert (
+        qualifier.qualify(
+            _ctx(break_=_BOS_DOWN, marked=(first,), zones=(TrackedZone(block=first),))
+        )
+        is first
+    )
+
+    qualifier.qualify(_ctx(break_=_CHOCH_DOWN))  # the count re-opens, the old ladder is dropped
+    second = _bos_zone("70", "74", 21, primary=True)
+    named = qualifier.qualify(
+        _ctx(break_=_BOS_DOWN, marked=(second,), zones=(TrackedZone(block=second),))
+    )
+    assert named is second
+
+
+def test_a_turn_drops_the_standing_continuation_ladder() -> None:
+    """A change of character came back through the region the continuation was resting in. The old
+    ladder is dropped wholesale; a bare choch arms nothing of its own here."""
+    qualifier = ContinuationQualifier()
+    qualifier.qualify(_ctx(break_=_CHOCH_DOWN))
+
+    zone = _bos_zone("96", "100", 15, primary=True)
+    zones = (TrackedZone(block=zone),)
+    assert qualifier.qualify(_ctx(break_=_BOS_DOWN, marked=(zone,), zones=zones)) is zone
+
+    assert qualifier.qualify(_ctx(break_=_CHOCH_DOWN, zones=zones)) is None
+
+
+def test_a_continuation_outcome_and_a_fresh_break_on_one_bar_settle_in_order() -> None:
+    """A win reported on the very bar a fresh favourable break confirms belongs to the old leg: it
+    ends the old ladder, and the new leg's zone is named as if the bar were clean."""
+    qualifier = ContinuationQualifier()
+    qualifier.qualify(_ctx(break_=_CHOCH_DOWN))
+
+    first = _bos_zone("96", "100", 15, primary=True)
+    second = _bos_zone("70", "74", 21, primary=True)
+    assert (
+        qualifier.qualify(
+            _ctx(break_=_BOS_DOWN, marked=(first,), zones=(TrackedZone(block=first),))
+        )
+        is first
+    )
+
+    both = (TrackedZone(block=first), TrackedZone(block=second))
+    named = qualifier.qualify(_ctx(break_=_BOS_DOWN, marked=(second,), zones=both, won=first))
+    assert named is second
+
+
+def test_a_continuation_rung_dropped_by_the_tracker_passes_to_the_next() -> None:
+    """One half of the dead-rung skip: a rung the tracker no longer holds at all — aged out of the
+    window — is skipped, and the next zone toward the origin answers."""
+    qualifier = ContinuationQualifier()
+    qualifier.qualify(_ctx(break_=_CHOCH_DOWN))
+    primary = _bos_zone("96", "100", 15, primary=True)
+    secondary = _bos_zone("84", "88", 19, primary=False)
+    qualifier.qualify(
+        _ctx(
+            break_=_BOS_DOWN,
+            marked=(primary, secondary),
+            zones=(TrackedZone(block=primary), TrackedZone(block=secondary)),
+        )
+    )
+
+    # The nearest rung is gone from the tracker; only the primary remains.
+    assert qualifier.qualify(_ctx(zones=(TrackedZone(block=primary),))) is primary
+
+
+def test_a_mitigated_continuation_rung_passes_to_the_next() -> None:
+    """The other half: a rung still tracked but no longer usable — mitigated with no trade of its
+    own taken — is skipped just the same."""
+    qualifier = ContinuationQualifier()
+    qualifier.qualify(_ctx(break_=_CHOCH_DOWN))
+    primary = _bos_zone("96", "100", 15, primary=True)
+    secondary = _bos_zone("84", "88", 19, primary=False)
+    qualifier.qualify(
+        _ctx(
+            break_=_BOS_DOWN,
+            marked=(primary, secondary),
+            zones=(TrackedZone(block=primary), TrackedZone(block=secondary)),
+        )
+    )
+
+    zones = (TrackedZone(block=primary), TrackedZone(block=secondary, mitigated=True))
+    assert qualifier.qualify(_ctx(zones=zones)) is primary
+
+
+def test_max_bos_below_one_is_refused() -> None:
+    """A cap of zero would mean "trade nothing", which is not a continuation setup at all — it is
+    almost always a mistake, so it is refused rather than silently armed to never fire."""
+    with pytest.raises(ValueError, match="count of breaks"):
+        ContinuationQualifier(max_bos=0)

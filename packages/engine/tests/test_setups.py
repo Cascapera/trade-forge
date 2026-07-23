@@ -27,8 +27,15 @@ from tradeforge_engine.domain import (
     SignalKind,
 )
 from tradeforge_engine.loop import ENGINE_CONTEXT, run
-from tradeforge_engine.setups import SetupContext, StructureStrategy, _to_tick
-from tradeforge_engine.structure import OrderBlock, StructureKind, ZoneKind
+from tradeforge_engine.setups import ChochQualifier, SetupContext, StructureStrategy, _to_tick
+from tradeforge_engine.structure import (
+    OrderBlock,
+    StructureBreak,
+    StructureKind,
+    TrackedZone,
+    Trend,
+    ZoneKind,
+)
 from tradeforge_engine.testing import AAPL, HOUR, START, FixedRisk, ImmediateFillBroker, bar
 
 _ACCOUNT = ImmediateFillBroker(instrument=AAPL).account()
@@ -885,3 +892,419 @@ def test_a_one_bar_round_trip_through_the_real_broker_spends_the_zone() -> None:
     assert [(f.time, f.price) for f in entries] == [(_at(12), Decimal("100"))]  # once, not twice
     [trade] = result.trades
     assert (trade.entry_price, trade.exit_price) == (Decimal("100"), Decimal("89"))
+
+
+# --------------------------------------------------------------------------- #
+# The choch setup                                                               #
+# --------------------------------------------------------------------------- #
+
+# The impulse's mirror image: after the bar-9 BOS, a leg down through the 90 anchor. One gap on
+# the way (bars 9-10-11: 120 > 118), so the change of character marks the supply zone [120, 125]
+# — the c1 of the inefficiency, the candle the leg fell from.
+_CHOCH_LEG = [
+    bar(10, open_="124", close="116", high="125", low="114"),
+    bar(11, open_="116", close="100", high="117", low="98"),
+    bar(12, open_="96", close="92", high="96", low="91"),
+    bar(13, open_="92", close="88", high="93", low="87"),  # closes under 90: CHoCH
+]
+
+# The same reversal with two separated gap runs, so the leg leaves a primary at its origin
+# ([120, 125], bar 9) and a secondary on the pause candle ([103, 109], bar 13).
+_TWO_ZONE_LEG = [
+    bar(10, open_="124", close="118", high="125", low="117"),
+    bar(11, open_="118", close="110", high="119", low="108"),
+    bar(12, open_="110", close="106", high="112", low="105"),  # 117 > 112: run one's gap
+    bar(13, open_="106", close="104", high="109", low="103"),  # the pause between runs
+    bar(14, open_="104", close="94", high="105", low="92"),
+    bar(15, open_="94", close="88", high="95", low="87"),  # 103 > 95: run two; CHoCH at 90
+]
+
+# The same fall with every three-bar window overlapping — no inefficiency anywhere, so the
+# change of character marks nothing and the setup has nothing to trade.
+_GAPLESS_LEG = [
+    bar(10, open_="124", close="116", high="125", low="114"),
+    bar(11, open_="116", close="108", high="121", low="106"),
+    bar(12, open_="108", close="100", high="115", low="99"),
+    bar(13, open_="100", close="93", high="107", low="92"),
+    bar(14, open_="93", close="88", high="100", low="87"),  # CHoCH, empty-handed
+]
+
+_CHOCH_DOWN = StructureBreak(
+    kind=StructureKind.CHOCH,
+    trend=Trend.BEARISH,
+    level=Decimal("90"),
+    time=_at(15),
+    origin=Decimal("125"),
+    origin_time=_at(9),
+)
+
+
+def _supply(bottom: str, top: str, index: int, *, primary: bool) -> OrderBlock:
+    return OrderBlock(
+        kind=ZoneKind.SUPPLY,
+        top=Decimal(top),
+        bottom=Decimal(bottom),
+        time=_at(index),
+        confirmed_at=_at(15),
+        break_kind=StructureKind.CHOCH,
+        primary=primary,
+    )
+
+
+def _ctx(
+    *,
+    break_: StructureBreak | None = None,
+    marked: tuple[OrderBlock, ...] = (),
+    zones: tuple[TrackedZone, ...] = (),
+    stopped: OrderBlock | None = None,
+    won: OrderBlock | None = None,
+) -> SetupContext:
+    return SetupContext(
+        candle=bar(20, open_="100", close="100", high="101", low="99"),
+        break_=break_,
+        marked=marked,
+        zones=zones,
+        stopped=stopped,
+        won=won,
+    )
+
+
+def test_choch_arms_the_zone_its_break_marked() -> None:
+    """The setup end to end on the machinery: the change of character confirms on bar 13 and the
+    sell goes straight onto the region the leg fell from — [120, 125], sold at its bottom edge
+    with the stop a tenth of the width past its top. Nothing more is waited for: waiting for a
+    break in the new trend's favour is the continuation setup, not this one.
+
+    Every bar before the choch is silence, and that includes bar 9: the BOS marks two demand
+    zones, and this setup is not interested in a continuation's leavings.
+    """
+    strategy = StructureStrategy(qualifier=ChochQualifier(), name="choch")
+    signals = _drive(strategy, [*_IMPULSE, *_CHOCH_LEG])
+
+    assert all(bar_signals == [] for bar_signals in signals[:13])
+    [signal] = signals[13]
+    assert signal.kind is SignalKind.ENTRY
+    assert signal.side is Side.SHORT
+    assert (signal.limit_price, signal.stop_loss) == (Decimal("120"), Decimal("125.50"))
+    assert signal.reason == "entry.choch"
+
+
+def test_a_choch_without_inefficiency_offers_no_trade() -> None:
+    """The author's rule verbatim: "sem ineficiência não tem trade". The same fall through the
+    same anchor, but every three-bar window overlaps — no gap, no zone, and the change of
+    character goes untraded rather than inventing a region to sell from."""
+    signals = _drive(StructureStrategy(qualifier=ChochQualifier()), [*_IMPULSE, *_GAPLESS_LEG])
+
+    assert all(bar_signals == [] for bar_signals in signals)
+
+
+def test_the_choch_order_fills_on_the_pullback() -> None:
+    """Through `run()` with the real broker: the sell rests at 120 and fills there when the
+    pullback's wick reaches the zone three bars later — not at any bar's open, and not before
+    price actually came back."""
+    pullback = [
+        bar(14, open_="88", close="100", high="101", low="87"),
+        bar(15, open_="100", close="112", high="113", low="99"),
+        bar(16, open_="112", close="116", high="121", low="111"),  # reaches the 120 edge
+    ]
+    result = run(
+        candles=[*_IMPULSE, *_CHOCH_LEG, *pullback],
+        timeframe=HOUR,
+        instrument=AAPL,
+        strategy=StructureStrategy(qualifier=ChochQualifier()),
+        broker=BacktestBroker(instrument=AAPL, initial_capital=Decimal(10_000)),
+        risk=FixedRisk(volume=Decimal(1)),
+    )
+
+    [fill] = [f for f in result.fills if f.order.intent is SignalKind.ENTRY]
+    assert (fill.time, fill.price) == (_at(16), Decimal("120"))
+    assert fill.order.side is Side.SHORT
+    assert fill.order.stop_loss == Decimal("125.50")
+
+
+def test_the_ladder_starts_at_the_zone_nearest_to_price() -> None:
+    """With `allow_secondary` on and a leg that left two zones, the single live order hangs on
+    the secondary — the pullback reaches it first; an order at the primary could only fill after
+    price traversed the secondary whole. With the flag off the ladder is the primary alone."""
+    on = _drive(
+        StructureStrategy(qualifier=ChochQualifier(), allow_secondary=True),
+        [*_IMPULSE, *_TWO_ZONE_LEG],
+    )
+    [signal] = on[15]
+    assert (signal.limit_price, signal.stop_loss) == (Decimal("103"), Decimal("109.60"))
+
+    off = _drive(StructureStrategy(qualifier=ChochQualifier()), [*_IMPULSE, *_TWO_ZONE_LEG])
+    [signal] = off[15]
+    assert (signal.limit_price, signal.stop_loss) == (Decimal("120"), Decimal("125.50"))
+
+
+def test_a_stopped_rung_hands_the_order_to_the_primary() -> None:
+    """The author's sequence end to end: "secundária primeiro … e após, caso tenha stopado,
+    ordem na primária."
+
+    The sell fills at the secondary's edge (103) on bar 16; bar 17 runs through the stop at
+    109.60, and the very same bar the machinery re-arms on the primary, whose order then fills at
+    120 on bar 18. Two trades, one per region, worked toward the leg's origin.
+
+    Watch what the zone does here, because it is the whole reason the ladder advances on the
+    reported outcome rather than on the region's own state: bar 16 closes at 96, a full width
+    clear of the zone below, so the secondary is **already mitigated while the trade is still
+    open** — the healthy kind of mitigation, which reads as a winner. The stop on bar 17 leaves
+    no mark at all (a mitigated zone is frozen, and `flippable` is long gone), so a ladder
+    reading the zone would see a win here and end. Only `SetupContext.stopped` tells the truth.
+    """
+    after = [
+        bar(16, open_="88", close="96", high="104", low="87"),  # fills at 103, and mitigates
+        bar(17, open_="96", close="112", high="113", low="95"),  # stops at 109.60 — no new mark
+        bar(18, open_="112", close="116", high="121", low="111"),  # fills the primary at 120
+    ]
+    result = run(
+        candles=[*_IMPULSE, *_TWO_ZONE_LEG, *after],
+        timeframe=HOUR,
+        instrument=AAPL,
+        strategy=StructureStrategy(qualifier=ChochQualifier(), allow_secondary=True),
+        broker=BacktestBroker(instrument=AAPL, initial_capital=Decimal(10_000)),
+        risk=FixedRisk(volume=Decimal(1)),
+    )
+
+    entries = [f for f in result.fills if f.order.intent is SignalKind.ENTRY]
+    assert [(f.time, f.price) for f in entries] == [
+        (_at(16), Decimal("103")),
+        (_at(18), Decimal("120")),
+    ]
+    [first] = result.trades  # the second trade is still open when the series ends
+    assert (first.entry_price, first.exit_price) == (Decimal("103"), Decimal("109.60"))
+
+
+def test_a_winning_trade_leaves_no_order_on_the_primary() -> None:
+    """The other half of the author's sequence: only the stop hands the order to the primary.
+
+    With a 1R target the sell taken at 103 exits at 96.40 on its own bar — a win. Bars 17 and 18
+    then hand the machine every temptation the stopped scenario had: the same reversal, the same
+    pullback through 120. Nothing may be armed and nothing may fill — after a winner the leg is
+    done ("colocou a ordem e ativou o trade, a região fica inválida"; and no order waits behind
+    a winner).
+    """
+    after = [
+        bar(16, open_="88", close="96", high="104", low="87"),  # fills at 103, target at 96.40
+        bar(17, open_="96", close="112", high="113", low="95"),
+        bar(18, open_="112", close="116", high="121", low="111"),  # 120 is reached; no order
+    ]
+    result = run(
+        candles=[*_IMPULSE, *_TWO_ZONE_LEG, *after],
+        timeframe=HOUR,
+        instrument=AAPL,
+        strategy=StructureStrategy(qualifier=ChochQualifier(), allow_secondary=True),
+        broker=BacktestBroker(
+            instrument=AAPL, initial_capital=Decimal(10_000), take_profit_rr=Decimal(1)
+        ),
+        risk=FixedRisk(volume=Decimal(1)),
+    )
+
+    entries = [f for f in result.fills if f.order.intent is SignalKind.ENTRY]
+    assert [(f.time, f.price) for f in entries] == [(_at(16), Decimal("103"))]
+    [trade] = result.trades
+    assert (trade.exit_price, trade.reason) == (Decimal("96.40"), "tp")
+
+
+def test_a_winning_rung_ends_the_ladder() -> None:
+    """A trade that ends on the trader's terms ends the ladder — no order waits behind a winner.
+
+    The event is the machinery's outcome report, deliberately not the zone's marks: both zones
+    are still alive in this context, so nothing but `won` can be doing the work.
+    """
+    primary = _supply("120", "125", 9, primary=True)
+    secondary = _supply("103", "109", 13, primary=False)
+    alive = (TrackedZone(block=primary), TrackedZone(block=secondary))
+    qualifier = ChochQualifier()
+
+    named = qualifier.qualify(_ctx(break_=_CHOCH_DOWN, marked=(primary, secondary), zones=alive))
+    assert named is secondary
+
+    assert qualifier.qualify(_ctx(zones=alive, won=secondary)) is None
+    # and the ladder is over, not deferred: the primary is never offered afterwards either
+    assert qualifier.qualify(_ctx(zones=alive)) is None
+
+
+def test_the_ladder_advances_on_the_stop_not_on_the_zones_marks() -> None:
+    """The stop report alone moves the ladder. Both zones are alive in the context — the stopped
+    rung's region often *is* already dead by the time the stop hits (a trade one width in profit
+    mitigated it the healthy way before reversing), which is exactly why the marks cannot be the
+    signal and the outcome has to be."""
+    primary = _supply("120", "125", 9, primary=True)
+    secondary = _supply("103", "109", 13, primary=False)
+    alive = (TrackedZone(block=primary), TrackedZone(block=secondary))
+    qualifier = ChochQualifier()
+
+    qualifier.qualify(_ctx(break_=_CHOCH_DOWN, marked=(primary, secondary), zones=alive))
+    assert qualifier.qualify(_ctx(zones=alive, stopped=secondary)) is primary
+
+
+def test_only_the_current_rungs_stop_advances_the_ladder() -> None:
+    """A stop reported for some other region leaves the ladder where it is.
+
+    Unreachable while one position is held at a time — the trade that stops can only be the one
+    the current rung opened — so this pins a guard the composite condition hides from coverage,
+    against the phase where several setups (or several instruments) share a strategy and a
+    stop from elsewhere would otherwise skip a rung that never traded.
+    """
+    primary = _supply("120", "125", 9, primary=True)
+    secondary = _supply("103", "109", 13, primary=False)
+    alive = (TrackedZone(block=primary), TrackedZone(block=secondary))
+    qualifier = ChochQualifier()
+
+    qualifier.qualify(_ctx(break_=_CHOCH_DOWN, marked=(primary, secondary), zones=alive))
+    assert qualifier.qualify(_ctx(zones=alive, stopped=primary)) is secondary
+
+
+def test_an_aged_out_rung_passes_to_the_next() -> None:
+    """A rung the tracker dropped is dead of old age: nothing watches it, the machinery would
+    refuse it, and the next zone toward the origin answers instead."""
+    primary = _supply("120", "125", 9, primary=True)
+    secondary = _supply("103", "109", 13, primary=False)
+    qualifier = ChochQualifier()
+
+    qualifier.qualify(
+        _ctx(
+            break_=_CHOCH_DOWN,
+            marked=(primary, secondary),
+            zones=(TrackedZone(block=primary), TrackedZone(block=secondary)),
+        )
+    )
+    named = qualifier.qualify(_ctx(zones=(TrackedZone(block=primary),)))
+    assert named is primary
+
+
+def test_a_rung_that_died_without_a_trade_passes_to_the_next() -> None:
+    """The other way a rung can die: still in the tracker, but no longer usable.
+
+    Not the same case as the aged-out one above, and not reachable through the stop report
+    either — a zone can be spent with no trade ever taken on it. The market gaps open past both
+    the resting order and its stop: the broker discards the order without a fill (ADR-0014) and
+    the same bar's close mitigates the region. No fill means no outcome to report, so the ladder
+    has only the zone's own state to go on.
+
+    Reading it wrong is silent. The qualifier would keep naming a region the machinery refuses
+    on every bar, the ladder would never advance, and the primary — a trade the method takes —
+    simply never happens. Nothing in the run says so; there is one fewer trade than there should
+    be, which is the hardest kind of wrong to notice.
+    """
+    primary = _supply("120", "125", 9, primary=True)
+    secondary = _supply("103", "109", 13, primary=False)
+    qualifier = ChochQualifier()
+
+    qualifier.qualify(
+        _ctx(
+            break_=_CHOCH_DOWN,
+            marked=(primary, secondary),
+            zones=(TrackedZone(block=primary), TrackedZone(block=secondary)),
+        )
+    )
+    spent = (
+        TrackedZone(block=primary),
+        TrackedZone(block=secondary, touched=True, mitigated=True),
+    )
+    assert qualifier.qualify(_ctx(zones=spent)) is primary
+
+
+def test_the_ladder_survives_an_order_the_gap_discarded() -> None:
+    """The same rule end to end, on the market event that produces it.
+
+    The sell rests at 103 with its stop at 109.60. The next bar opens at 112 — above both — so
+    the broker discards the order rather than filling it at a price that was never available
+    (ADR-0014), and that bar's close mitigates the secondary a full width clear. No trade
+    happened on that region, and none ever will; the primary at 120 takes over, and the pullback
+    fills it.
+    """
+    gap = [
+        bar(16, open_="112", close="112", high="113", low="111"),  # gaps past the order and stop
+        bar(17, open_="112", close="116", high="121", low="111"),  # reaches the primary at 120
+    ]
+    result = run(
+        candles=[*_IMPULSE, *_TWO_ZONE_LEG, *gap],
+        timeframe=HOUR,
+        instrument=AAPL,
+        strategy=StructureStrategy(qualifier=ChochQualifier(), allow_secondary=True),
+        broker=BacktestBroker(instrument=AAPL, initial_capital=Decimal(10_000)),
+        risk=FixedRisk(volume=Decimal(1)),
+    )
+
+    entries = [f for f in result.fills if f.order.intent is SignalKind.ENTRY]
+    assert [(f.time, f.price) for f in entries] == [(_at(17), Decimal("120"))]
+
+
+def test_a_new_choch_replaces_the_ladder() -> None:
+    """A contrary change of character is not a special case — it is the setup reapplied. The old
+    ladder is dropped wholesale (even when the new leg marked nothing) and the new leg's zone is
+    simply the next trade, in the other direction."""
+    primary = _supply("120", "125", 9, primary=True)
+    qualifier = ChochQualifier()
+    qualifier.qualify(
+        _ctx(break_=_CHOCH_DOWN, marked=(primary,), zones=(TrackedZone(block=primary),))
+    )
+
+    demand = OrderBlock(
+        kind=ZoneKind.DEMAND,
+        top=Decimal("95"),
+        bottom=Decimal("88"),
+        time=_at(17),
+        confirmed_at=_at(19),
+        break_kind=StructureKind.CHOCH,
+        primary=True,
+    )
+    contrary = StructureBreak(
+        kind=StructureKind.CHOCH,
+        trend=Trend.BULLISH,
+        level=Decimal("125"),
+        time=_at(19),
+        origin=Decimal("87"),
+        origin_time=_at(17),
+    )
+    named = qualifier.qualify(
+        _ctx(
+            break_=contrary,
+            marked=(demand,),
+            zones=(TrackedZone(block=primary), TrackedZone(block=demand)),
+        )
+    )
+    assert named is demand
+
+    # An empty-handed choch also replaces: the old rung must not survive the turn of trend.
+    empty = qualifier.qualify(_ctx(break_=contrary, marked=(), zones=(TrackedZone(block=primary),)))
+    assert empty is None
+
+
+def test_an_outcome_and_a_new_choch_on_one_bar_settle_in_order() -> None:
+    """The outcome belongs to the regime that produced the trade. A win reported on the very bar
+    a contrary choch confirms must not erase the *new* leg's ladder — the old ladder is what the
+    win ends, and the new zone is named as if the bar were clean."""
+    old = _supply("120", "125", 9, primary=True)
+    demand = OrderBlock(
+        kind=ZoneKind.DEMAND,
+        top=Decimal("95"),
+        bottom=Decimal("88"),
+        time=_at(17),
+        confirmed_at=_at(19),
+        break_kind=StructureKind.CHOCH,
+        primary=True,
+    )
+    contrary = StructureBreak(
+        kind=StructureKind.CHOCH,
+        trend=Trend.BULLISH,
+        level=Decimal("125"),
+        time=_at(19),
+        origin=Decimal("87"),
+        origin_time=_at(17),
+    )
+    qualifier = ChochQualifier()
+    qualifier.qualify(_ctx(break_=_CHOCH_DOWN, marked=(old,), zones=(TrackedZone(block=old),)))
+
+    named = qualifier.qualify(
+        _ctx(
+            break_=contrary,
+            marked=(demand,),
+            zones=(TrackedZone(block=old), TrackedZone(block=demand)),
+            won=old,
+        )
+    )
+    assert named is demand

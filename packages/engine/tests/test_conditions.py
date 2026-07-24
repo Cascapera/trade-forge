@@ -13,7 +13,7 @@ import pytest
 
 from tradeforge_engine.domain import Candle, EvalContext, Money
 from tradeforge_engine.errors import EngineError
-from tradeforge_engine.expressions import compile_condition, compile_operand
+from tradeforge_engine.expressions import compile_condition, compile_constant, compile_operand
 from tradeforge_engine.testing import bar
 
 
@@ -57,6 +57,53 @@ def test_operand_lookback_is_the_candle_depth_it_needs() -> None:
     assert compile_operand("price.close").lookback == 0
     assert compile_operand("candle[-3].high").lookback == 3
     assert compile_operand("sma_fast").lookback == 0
+
+
+def test_a_constant_resolves_to_the_same_value_at_every_shift() -> None:
+    """A literal never warms up and never runs out of history: `RSI < 30` needs the 30 to exist
+    on this bar and the previous one, so an edge like `crosses_below 30` has a steady level."""
+    constant = compile_constant(30)
+    assert constant.resolve(_ctx(), 0) == Decimal("30")
+    assert constant.resolve(_ctx(), 1) == Decimal("30")
+    assert constant.lookback == 0
+
+
+def test_a_constant_is_parsed_through_decimal_not_binary_float() -> None:
+    """The threshold typed as 0.1 must be exactly 0.1 in the comparison — `float("0.1")` is
+    0.1000000000000000055..., and a strategy that trips at a boundary would trip wrong."""
+    assert compile_constant(0.1).resolve(_ctx(), 0) == Decimal("0.1")
+
+
+def test_a_comparison_against_a_constant_threshold() -> None:
+    """`rsi < 30`: true when the indicator is below the level, false at or above it."""
+    node = {"op": "lt", "left": {"ref": "rsi"}, "right": {"value": 30}}
+    assert compile_condition(node).evaluate(_ctx(indicators={"rsi": (Decimal("25"),)})) is True
+    assert compile_condition(node).evaluate(_ctx(indicators={"rsi": (Decimal("40"),)})) is False
+
+
+def test_an_edge_operator_crosses_a_constant_threshold() -> None:
+    """`rsi crosses_below 30` — the headline of the literal-operand feature, end to end. True only
+    on the bar the indicator moves from at-or-above 30 to below it, not while it sits below. The
+    constant is steady at both shifts, so it is the indicator's motion the edge measures.
+
+    Indicator history is newest-first: index 0 is this bar, index 1 the previous one.
+    """
+    node = {"op": "crosses_below", "left": {"ref": "rsi"}, "right": {"value": 30}}
+    crossing = _ctx(indicators={"rsi": (Decimal("25"), Decimal("35"))})  # 35 -> 25: pierces 30
+    already_below = _ctx(indicators={"rsi": (Decimal("20"), Decimal("25"))})  # 25 -> 20: both below
+    assert compile_condition(node).evaluate(crossing) is True
+    assert compile_condition(node).evaluate(already_below) is False
+
+
+def test_a_constant_operand_that_is_not_a_number_is_refused() -> None:
+    with pytest.raises(EngineError, match="value must be a number"):
+        compile_constant("30")
+
+
+def test_a_boolean_is_not_a_valid_constant() -> None:
+    """bool is an int subclass, so `True` would otherwise sneak through as 1 — refused."""
+    with pytest.raises(EngineError, match="value must be a number"):
+        compile_constant(True)
 
 
 # --------------------------------------------------------------------------- #
@@ -217,9 +264,14 @@ def test_an_unrecognised_node_is_refused() -> None:
         compile_condition({"maybe": []})
 
 
-def test_a_comparison_operand_that_is_not_a_ref_is_refused() -> None:
-    with pytest.raises(EngineError, match="operand is not a ref"):
-        compile_condition({"op": "gt", "left": {"value": 1}, "right": {"ref": "b"}})
+def test_a_comparison_operand_with_neither_ref_nor_value_is_refused() -> None:
+    with pytest.raises(EngineError, match="needs a 'ref' or a 'value'"):
+        compile_condition({"op": "gt", "left": {"threshold": 1}, "right": {"ref": "b"}})
+
+
+def test_a_comparison_operand_that_is_not_an_object_is_refused() -> None:
+    with pytest.raises(EngineError, match="operand is not an object"):
+        compile_condition({"op": "gt", "left": 30, "right": {"ref": "b"}})
 
 
 def test_a_ref_that_is_not_a_string_is_refused() -> None:

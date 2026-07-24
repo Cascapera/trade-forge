@@ -93,8 +93,124 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
   nível de all/any (o caso das estratégias-demo). A DSL suporta all/any/not aninhados em qualquer
   profundidade; um editor de árvore recursivo (visual, arrastar/soltar) é o design final da Fase 2
   (`sdd.md §3.3.5`). Fazer quando setups compostos exigirem aninhamento profundo.
+- [origem: PR-202] **Plugar AnchoredVWAP na DSL** — a classe de engine existe e conforma ao protocolo
+  `Indicator`, mas NÃO está em `INDICATOR_BUILDERS` nem no `strategy.schema.json`. Hoje só os testes
+  garantem o `ENGINE_CONTEXT` (via `localcontext` manual); em produção, o wiring precisa passar por
+  `run()`. Ao ligar: (a) nó de schema com params próprios (source + volume, sem period); (b) alinhar
+  o enum de `source` — `_price_reader` aceita `close`/`open` além dos 3 pedidos (hlc3/high/low), então
+  o schema deve restringir ou o engine relaxar, senão a validação de 2 camadas diverge; (c) decidir a
+  âncora na DSL (fixa? no último swing? re-ancorável). O `SwingDetector` também não tem exposição DSL.
+- [origem: PR-201] **Indicadores do spec adiados** — o spec da Fase 2 lista RSI, ATR, Bandas de
+  Bollinger, ADX e máx/mín de N períodos. Este slice do PR-201 entregou **RSI + operando literal**
+  (`RSI < 30`); o Guilherme decidiu testar com esses antes de adicionar mais. Adiados para fatias
+  seguintes (ou PR-201b): **MACD** (composto de EMAs, multi-saída — não estava no spec, adição
+  aditiva via ADR-03/ADR-13), **ATR**, **Bollinger**, **ADX**, **máx/mín de N períodos**. ATR/ADX
+  exigem True Range (dependência do candle anterior) + suavização de Wilder — a mesma base do RSI já
+  implementada. Novos operadores do spec (`between`, `rising`, `falling`) também pendentes.
 - [origem: PR-109] **GIF animado da vitrine** — o README embute uma screenshot estática da tela de
   resultados (gerada via `npm run screenshot`, reusa o mock do E2E). O spec pedia um GIF; um GIF do
   fluxo (builder → run → results) precisaria de gravação de tela animada, que não dá pra gerar
   headless. Gravar quando houver ambiente com screen capture (ou usar `playwright` com vídeo do
   contexto e converter para GIF).
+- [origem: PR-202] **`confirmed_at` no `LiquidityPool` para blindar o sweep contra lookahead** — o
+  `SweepDetector` só pode ser varrido por uma barra posterior à poça, mas hoje o backstop compara com
+  `pool.time`, que é o tempo do *swing* (ocorrência), não o da confirmação. Como um swing de força N é
+  confirmado N barras depois, `pool.time` está sempre no passado e o check nunca dispara na prática — a
+  garantia real é o **contrato do chamador** (alimentar a barra em `update`, só então `track` das poças
+  que ela produziu), documentado na docstring de `SweepDetector`. Se o chamador inverter, uma poça pode
+  ser varrida pela barra que a revelou, sem nada falhar alto. Correção definitiva: o `LiquidityDetector`
+  sabe o instante da confirmação (é quando `update` devolve a poça) — carimbar `confirmed_at` no
+  `LiquidityPool` e trocar o backstop por `candle.time > pool.confirmed_at`. Fecha o buraco sem
+  aquecimento e sem depender de ordem de chamada. **Fazer no PR que fizer a fiação** dos detectores
+  (hoje `SweepDetector` e `LiquidityDetector` não têm chamador fora dos testes).
+- [origem: PR-202] **Toque de raspão desarma o flip — CONFIRMAR REGRA COM O GUILHERME antes do setup
+  de flip.** O toque de uma zona é não estrito (`low <= top` na demanda), então uma barra cuja mínima
+  é *exatamente* o topo — que nunca entrou na zona — já conta como toque. Se ela fechar acima, a zona
+  vira `departed` e perde `flippable` para sempre, e o rompimento posterior deixa de ser flip.
+  Verificado: com `low=100.00` numa zona [90,100] o flip some; com `low=100.01` ele existe. Um tick
+  numa barra anterior decide se o setup arma. O código segue a regra ditada ao pé da letra (ele disse
+  "não pode tocar nela, subir, e depois vir flipar"), então não é bug — mas em gráfico real quase toda
+  zona de demanda é raspada e abandonada antes de ser rompida de verdade, e o flip pode quase nunca
+  armar. **Ação:** medir a frequência de `flipped` em dados reais e perguntar a ele se "tocar", para
+  efeito de `departed`, exige penetração real (`low < top`) em vez de encostar. É pré-requisito do
+  setup de flip, não dívida técnica.
+- [origem: PR-202] **Order block — arestas conhecidas do detector, todas de baixo impacto.** (a) Um gap
+  de direção *oposta* entre dois gaps a favor conta como "pausa" no agrupamento de runs, gerando duas
+  zonas onde a regra literal ("uma barra sem gap basta") diria que a barra do meio tem gap; exige
+  `c9.low > c11.high` e `c10.high < c12.low` no mesmo trecho, e o espírito da regra favorece o
+  comportamento atual. (b) Se um run de gaps consecutivos começa antes do `origin_time`, o filtro de
+  perna remove o prefixo e a zona é marcada no primeiro gap *sobrevivente*, não no primeiro do run
+  (verificado que o filtro só remove prefixo, nunca fragmenta o meio). (c) Não há limite de zonas por
+  rompimento: uma perna com N gaps pode devolver ~N/2 zonas num único `update` (pior caso ~250 com
+  `_MAX_LOOKBACK=500`), o que é um contrato surpreendente. (d) A origem de um CHoCH numa barra externa
+  usa o topo anterior, não o desta barra — a janela da perna começa cedo demais, o que é permissivo,
+  não vazante.
+- [origem: PR-203] **`OrderRequest` não valida ordem limite do lado errado** — uma compra limite
+  *acima* do mercado (ou uma venda *abaixo*) é recusada no `Signal`, mas não no `OrderRequest`. Quem
+  submeter direto ao broker a vê preencher na abertura, virando uma ordem a mercado silenciosa. Hoje
+  todo caminho passa pelo `Signal` (o `run()` constrói o `OrderRequest` a partir dele), então a engine
+  está protegida — mas a proteção é geográfica, não estrutural. Fechar quando o broker ganhar um
+  segundo chamador (o `MT5Broker` da Fase 2, ou a maquinaria de entrada se ela submeter direto).
+- [origem: PR-203] **Condução de stop: breakeven no 1º BOS a favor, depois atrás dos topos/fundos
+  válidos** — decisão fechada com o Guilherme em 21/07/2026, deliberadamente FATIADA para depois da
+  maquinaria de entrada. Hoje o stop é fixo: armado no fill dentro do `_Protection` e nunca mais
+  tocado. Mover o stop de uma posição aberta é **peça nova no protocolo `Broker`** (`modify_stop` ou
+  equivalente), logo exige ADR próprio + `engine-guardian`. Parciais entram na mesma fatia. Motivo de
+  adiar: primeiro ver os setups abrindo e fechando operação com stop fixo; gestão de trade depois.
+- [origem: PR-204] **Reconciliação estratégia↔broker em live** — o `Signal` é fire-and-forget: a
+  `StructureStrategy` não tem canal de confirmação do que o broker/loop fez com a intenção. Quatro
+  sub-casos com a mesma causa raiz, para resolver juntos no PR do `MT5Broker` (provavelmente com
+  eventos de ordem no `Context`, na linha do ADR-0015): (a) trade manual no mesmo símbolo faz o
+  fallback de `position` em `_observe_fill` queimar a zona errada e esquecer `_armed`, deixando
+  ordem órfã no book; (b) veto do risk manager ou sizing zero descartam a ordem com `placed=True`
+  já gravado — a estratégia acredita ter ordem no book (fantasma; desde o ADR-0015 a zona não é
+  mais queimada nesse caso, só o fantasma persiste, com cancel espúrio inofensivo ao morrer);
+  (c) descarte do ADR-0014 (barra que atravessa ordem + stop juntos): sem fill, a zona não queima
+  e o nome armado fica fantasma — backtest conservador vs. live, onde daria fill+stop (scratch
+  trade que queimaria a região); (d) nota do `client_id`: o formato `%Y%m%dT%H%M` trunca segundos
+  e é o **contador** que garante unicidade abaixo da resolução de minuto — irrelevante com piso M1
+  do MT5, mas não "simplificar" o contador no futuro. **(e) [PR-205] O executor MT5 precisa mapear
+  exit de stop para `reason == "sl"` literalmente** — `_trade_outcome` classifica o desfecho por
+  essa string, e a escada do choch lê stop como "avança para a próxima zona" e qualquer outro
+  exit como "venceu, encerra a escada". Um rótulo diferente inverte a regra do autor em silêncio.
+  **(f) [PR-205] `won` hoje = qualquer exit que não é `"sl"`.** Só existem `"sl"`/`"tp"`; quando
+  nascer um `exit.condition` de estratégia, perguntar ao Guilherme se saída por condição encerra
+  a escada (tratamento atual) ou a faz avançar.
+- [origem: PR-205] **CHoCH contrário confirmado com posição aberta é perdido pelo qualifier** —
+  `StructureStrategy.on_bar` retorna cedo quando há posição, então o `break_` daquela barra nunca
+  chega ao `qualify` e a escada nova não é instalada; o setup fica em silêncio até o próximo CHoCH.
+  Janela estreita mas real: exige a âncora do CHoCH entre o topo da zona e o topo + buffer (o
+  fechamento confirma a virada sem acionar o stop). Conservador e determinístico — a escada velha
+  se auto-cura (o fechamento contrário fica além do topo de todo degrau da perna, mitigando todos),
+  então nunca há trade errado, só um trade do método que o backtest não toma. Decidir com o
+  Guilherme se um choch perdido deve ser re-qualificado quando a posição fechar.
+- [origem: PR-206] **Fiação da DSL para os setups de estrutura (choch, continuação) + `max_bos`** —
+  hoje `ChochQualifier`/`ContinuationQualifier` e o `StructureStrategy` só existem na engine; o JSON
+  Schema (`packages/schema`) e os tipos TS ainda não têm um nó de estratégia de estrutura, nem os
+  parâmetros `allow_secondary`/`stop_buffer`/`max_bos`. Quando entrar, é mudança **aditiva** (novo
+  membro da união de estratégia) → mantém `schema_version` (ADR-0013). O `max_bos` da continuação é
+  `int | None` (None = ilimitado, 1 = one-shot) — expor como opcional com default null. Fazer no PR
+  que ligar os setups de estrutura à API/builder, não antes (nenhuma tela os usa ainda).
+- [origem: PR-206] **Continuação com posição aberta perde o BOS a favor** — mesmo padrão do CHoCH
+  contrário acima: `on_bar` retorna cedo com posição aberta, então um BOS que confirmaria uma nova
+  perna de continuação enquanto um trade da perna anterior ainda está aberto nunca chega ao
+  `qualify`. Conservador (não instala escada nova cedo demais), mas é um trade do método que o
+  backtest pode não tomar. Mesma decisão pendente do item do CHoCH contrário — resolver os dois
+  juntos se/quando o early-return por posição for revisitado.
+- [origem: PR-204] **Churn de ping-pong entre duas zonas vivas** — com a queima no fill (ADR-0015),
+  um qualifier patológico que alterna os nomes entre duas zonas vivas cancela/rearma a cada barra.
+  Nenhum invariante quebra (uma ordem viva por vez, cancel antes de entry na mesma barra, fill
+  duplo impossível), mas em live é round trip de cancelamento por barra. O freio (histerese ou
+  cooldown por zona) é decisão de método do Guilherme, não da maquinaria — decidir quando um
+  qualifier real exibir o padrão.
+- [origem: PR-204] **`side` do CANCEL sempre resolvível (M19)** — o loop ignora o `side` de um
+  `Signal` de cancel (`broker.cancel(client_id)` não roteia por lado). Mutante equivalente hoje;
+  vira relevante num futuro `MT5Broker` que roteie cancelamentos por lado. Testar quando existir
+  um consumidor que leia o campo.
+- [origem: PR-207] **`stop_loss` do lado errado do nível de repouso é descarte silencioso** — uma
+  compra-stop em 1.10500 com `stop_loss` em 1.10600 (SL *acima* do gatilho, erro de sinal) é aceita
+  pelo `Signal` e depois descartada sem ruído por `_survives_the_gap`, porque o fill nasce já além
+  do próprio stop. A limite tem exatamente o mesmo buraco desde o ADR-0014. A validação de lado
+  `stop_loss` × (`limit_price` | `stop_price`) no `Signal` fecharia os dois de uma vez — mesma
+  família da validação de lado que o `stop_price` já ganhou contra o `reference_price`. Fora do
+  escopo do PR-207 porque muda o contrato da limite também, e isso pede seu aval.

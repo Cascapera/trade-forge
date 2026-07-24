@@ -57,8 +57,11 @@ def _iter_refs(condition: Condition, path: str) -> Iterator[tuple[Ref, str]]:
     unreachable "nothing matched" branch for the coverage report to complain about.
     """
     if isinstance(condition, Comparison):
-        yield condition.left, f"{path}.left"
-        yield condition.right, f"{path}.right"
+        # Only refs need checking against declared indicators; a constant operand references
+        # nothing, so it is skipped rather than mistaken for an undeclared name.
+        for operand, side in ((condition.left, "left"), (condition.right, "right")):
+            if isinstance(operand, Ref):
+                yield operand, f"{path}.{side}"
         return
 
     if isinstance(condition, AllOf):

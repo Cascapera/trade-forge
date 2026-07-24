@@ -148,6 +148,12 @@ class ImmediateFillBroker:
         self.submitted.append(order)
         return OrderResult(order=order, accepted=True)
 
+    def cancel(self, client_id: str) -> bool:  # noqa: ARG002
+        """Nothing ever rests here: everything pending fills at the very next open, so by the
+        time anyone could withdraw an order it has already executed. Always false, which is
+        the same answer the real broker gives for an order it cannot find."""
+        return False
+
     def on_bar(self, candle: Candle) -> Sequence[Fill]:
         # Exits before entries: a reversal on one bar has to close before it opens, or the
         # ledger refuses the second position on a sequence that was merely mis-sorted.
@@ -191,11 +197,13 @@ class ScriptedStrategy:
     script: dict[int, list[Signal]] = field(default_factory=dict)
     seen: list[Candle] = field(default_factory=list)
     positions_seen: list[Side | None] = field(default_factory=list)
+    fills_seen: list[tuple[Fill, ...]] = field(default_factory=list)
 
     def on_bar(self, context: Context) -> Sequence[Signal]:
         index = len(self.seen)
         self.seen.append(context.candle)
         self.positions_seen.append(context.position.side if context.position else None)
+        self.fills_seen.append(context.fills)
         return self.script.get(index, [])
 
 

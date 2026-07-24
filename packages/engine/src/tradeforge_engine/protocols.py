@@ -64,6 +64,25 @@ class Broker(Protocol):
         """Queue an order. Returns whether it was accepted, not whether it executed."""
         ...
 
+    def cancel(self, client_id: str) -> bool:
+        """Withdraw an order still waiting, by the name its strategy gave it. ADR-0014.
+
+        Only a resting order — one with a `limit_price` or a `stop_price`, waiting for the
+        market to reach it — can be withdrawn; a market order queued on the last bar has
+        already executed by the time anyone could ask.
+
+        **Returns false rather than raising when nothing is found.** The order may have
+        filled on this very bar, or been cancelled already, or never have existed. In live
+        that is a race, not a bug: the venue fills while the cancel is in flight, and a
+        broker that raised would turn a normal execution into a dead session.
+
+        The *reason* an order should stop existing is never the broker's to know. A limit
+        order in this system is alive because a zone is alive, and zones are the strategy's
+        vocabulary — the broker holding a rule like "cancel when the region is mitigated"
+        would be the core learning what a region is (AGENTS.md §5.4, in spirit).
+        """
+        ...
+
     def on_bar(self, candle: Candle) -> Sequence[Fill]:
         """A new bar has arrived. Fill what is pending, check stops and targets, and mark
         the account to market at this candle's close.

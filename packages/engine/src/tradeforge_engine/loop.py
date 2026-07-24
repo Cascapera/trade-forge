@@ -24,6 +24,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from decimal import ROUND_HALF_EVEN, localcontext
 from decimal import Context as DecimalContext
+from typing import cast
 
 from tradeforge_engine.domain import (
     ZERO,
@@ -126,10 +127,12 @@ def _run(  # noqa: PLR0913 — see run()
         # 1. The bar arrives. Whatever was decided on an earlier bar executes now, inside
         #    this one, at a price the strategy had not seen when it decided. This is the
         #    ONLY place a fill can be born.
+        born: list[Fill] = []
         for fill in broker.on_bar(candle):
             _reject_lookahead(fill, candle, timeframe)
             _reject_foreign_symbol(fill, instrument)
-            fills.append(fill)
+            born.append(fill)
+        fills.extend(born)
 
         # 2. Only now is the strategy allowed to look at this candle — and at nothing else.
         #    The account is read once: against a live terminal, two reads are two round
@@ -141,17 +144,38 @@ def _run(  # noqa: PLR0913 — see run()
             instrument=instrument,
             account=account,
             position=_open_position(broker, instrument.symbol),
+            # This bar's fills, not the run's: what step 1 just did is part of what the
+            # bar revealed, and it is the only way a strategy learns of a trade that
+            # opened and died inside one bar (ADR-0015).
+            fills=tuple(born),
         )
 
         # 3-4. Intent -> size -> veto -> queue. Never intent -> fill.
         for signal in strategy.on_bar(context):
+            # A cancel is the one intent that never becomes an order — it withdraws one. It
+            # skips sizing and the veto for the same reason an exit skips sizing: there is
+            # nothing to size, and a risk manager that could refuse a cancel would be a risk
+            # manager that keeps an order alive after the strategy disowned it.
+            if signal.kind is SignalKind.CANCEL:
+                # `Signal.__post_init__` has already refused a cancel with no name, so this
+                # is a `str`. Narrowing it again would add a branch no test could enter.
+                broker.cancel(cast(str, signal.client_id))
+                continue
+
             order = _to_order(signal, context, instrument, risk)
             if order is None:
                 continue
             if not risk.allow(order, account):
                 logger.debug("risk manager vetoed %s at %s", order.reason, candle.time)
                 continue
-            broker.submit(order)
+            result = broker.submit(order)
+            # A refusal is the broker declining to take the order at all — a duplicate name, an
+            # order it cannot rest. Silence here would look exactly like a trade that simply
+            # never triggered, which is the one failure the strategy author cannot debug.
+            if not result.accepted:
+                logger.debug(
+                    "broker refused %s at %s: %s", order.reason, candle.time, result.reason
+                )
 
         # 5. The account is worth what it is worth at the close of this bar.
         equity_curve.append(EquityPoint(time=candle.time, equity=account.equity))
@@ -186,6 +210,16 @@ def _to_order(
             logger.debug("exit signal with no open position at %s", context.candle.time)
             return None
 
+        # An exit does not rest at a price: the broker's own protective levels are the only
+        # thing that closes a position at a level, and two paths closing one position is where
+        # the ledger stops adding up (`BacktestBroker._reject_resting`). Said out loud, because
+        # an exit that quietly became a market order is a strategy measuring something else.
+        if signal.limit_price is not None or signal.stop_price is not None:
+            logger.debug(
+                "exit signal at %s carries a resting price; exits fill at the open",
+                context.candle.time,
+            )
+
         return OrderRequest(
             symbol=instrument.symbol,
             side=position.side,
@@ -210,6 +244,9 @@ def _to_order(
         take_profit=signal.take_profit,
         reason=signal.reason,
         context=signal.context,
+        limit_price=signal.limit_price,
+        stop_price=signal.stop_price,
+        client_id=signal.client_id,
     )
 
 

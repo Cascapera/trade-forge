@@ -25,7 +25,7 @@ from tradeforge_engine.loop import run
 from tradeforge_engine.metrics import compute_metrics
 from tradeforge_engine.risk import PercentRiskManager
 from tradeforge_engine.strategy import compile_strategy
-from tradeforge_engine.testing import EURUSD, HOUR, START
+from tradeforge_engine.testing import EURUSD, HOUR, START, bar
 
 _GOLDEN_CSV = Path(__file__).resolve().parent / "golden" / "ma_cross_golden.csv"
 
@@ -250,3 +250,76 @@ def test_reconciliation_holds_over_random_walks(steps: list[int]) -> None:
     open_entry_cost = open_positions[0].entry_costs if open_positions else Decimal(0)
     realised = sum((trade.net_pnl for trade in result.trades), Decimal(0))
     assert realised == result.final_account.balance - Decimal(10_000) + open_entry_cost
+
+
+# --------------------------------------------------------------------------- #
+# RSI + a literal threshold, driven through the whole engine (PR-201)           #
+# --------------------------------------------------------------------------- #
+
+
+def _rsi_oversold_strategy() -> dict[str, object]:
+    """Go long when RSI(2) crosses below 30 — the canonical oversold trigger, and the reason the
+    literal operand had to exist: `30` is a constant, not a reference to anything."""
+    return {
+        "schema_version": "1.0",
+        "name": "RSI oversold",
+        "timeframe": "H1",
+        "indicators": [{"id": "rsi", "type": "RSI", "params": {"period": 2}}],
+        "entry": {
+            "long": {"op": "crosses_below", "left": {"ref": "rsi"}, "right": {"value": 30}},
+            "short": None,
+        },
+        # Stop only — no target — so the entry stays open to the end of this short series and the
+        # test can assert the position the RSI signal opened, not the machinery of an exit.
+        "exit": {
+            "stop_loss": {"type": "candle_extreme", "params": {"lookback": 2, "side": "low"}},
+            "conditions": [],
+        },
+        "risk": {"sizing": {"type": "percent_risk", "params": {"percent": 1.0}}},
+    }
+
+
+def _rsi_candles() -> list[Candle]:
+    """Closes 1.10000, +100, +100, +100, then -300: RSI(2) reads 100 through bar 3 and 25 at bar
+    4. The wide lows on bars 3-4 put the stop far below, so the long that opens stays open."""
+    return [
+        bar(0, open_="1.10000", close="1.10000"),
+        bar(1, open_="1.10000", close="1.10100"),
+        bar(2, open_="1.10100", close="1.10200"),
+        bar(3, open_="1.10200", close="1.10300", high="1.10300", low="1.09000"),
+        bar(4, open_="1.10300", close="1.10000", high="1.10300", low="1.09000"),
+        bar(5, open_="1.10000", close="1.10200", high="1.10200", low="1.10000"),
+        bar(6, open_="1.10200", close="1.10300", high="1.10300", low="1.10200"),
+    ]
+
+
+def test_an_rsi_oversold_entry_runs_through_the_engine() -> None:
+    """RSI(2) hits 25 at bar 4 (avg_gain 0.0005, avg_loss 0.0015, RS 1/3), so `rsi crosses_below
+    30` fires there — bar 3 read 100. The decision acts at bar 5's *open*, 1.10000, never on the
+    signal bar: RSI plus a literal threshold, proven anti-lookahead-clean through the real engine.
+    """
+    broker = BacktestBroker(
+        instrument=EURUSD,
+        initial_capital=Decimal(10_000),
+        cost_model=NoCostModel(),
+        slippage_ticks=Decimal(0),
+    )
+    result = run(
+        candles=_rsi_candles(),
+        timeframe=HOUR,
+        instrument=EURUSD,
+        strategy=compile_strategy(_rsi_oversold_strategy()),
+        broker=broker,
+        risk=PercentRiskManager(percent=Decimal(1)),
+    )
+
+    # The signal opened exactly one long, filled at the bar *after* it — never the signal bar.
+    positions = broker.positions("EURUSD")
+    assert len(positions) == 1
+    assert positions[0].side is Side.LONG
+    assert positions[0].entry_price == Decimal("1.10000")
+    assert len(result.trades) == 0  # still open: nothing closed, so no round-trip yet
+
+    # Reconciliation: nothing closed and no costs, so the balance is exactly where it started.
+    assert positions[0].entry_costs == Decimal(0)
+    assert result.final_account.balance == Decimal(10_000)

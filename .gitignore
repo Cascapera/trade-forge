@@ -37,6 +37,9 @@ data/
 # --- Teaching notes: generated for the author, not part of the public repo ---
 docs/aulas/
 
+# --- The author's own copyrighted books (SMC method source material) — never publish ---
+docs/livros/
+
 # --- Editors / OS ---
 .idea/
 .vscode/

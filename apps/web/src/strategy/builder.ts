@@ -27,10 +27,15 @@ export const OPS = [
 export const SOURCES = ['open', 'high', 'low', 'close'] as const
 export type Source = (typeof SOURCES)[number]
 
-export const INDICATOR_KINDS = ['SMA', 'EMA'] as const
+export const INDICATOR_KINDS = ['SMA', 'EMA', 'RSI'] as const
 export type IndicatorKind = (typeof INDICATOR_KINDS)[number]
 
 export type Combine = 'all' | 'any'
+
+// The right-hand operand is either another reference (`fast`, `price.close`) or a literal number
+// (the `30` in `rsi < 30`). The form keeps `right` a string in both cases and this flag decides
+// how it is folded — a `{ ref }` or a `{ value }` — so RSI thresholds become expressible.
+export type OperandKind = 'ref' | 'value'
 
 export interface IndicatorForm {
   id: string
@@ -43,6 +48,7 @@ export interface ConditionRow {
   left: string
   op: ComparisonOp
   right: string
+  rightKind: OperandKind
 }
 
 export interface SideForm {
@@ -75,7 +81,8 @@ export interface StrategyForm {
 }
 
 function comparison(row: ConditionRow): Comparison {
-  return { op: row.op, left: { ref: row.left }, right: { ref: row.right } }
+  const right = row.rightKind === 'value' ? { value: Number(row.right) } : { ref: row.right }
+  return { op: row.op, left: { ref: row.left }, right }
 }
 
 /** A side's condition, in the DSL's shape: `null` if empty, a bare comparison if there is one
@@ -152,7 +159,7 @@ export function maCrossForm(): StrategyForm {
     long: {
       enabled: true,
       combine: 'all',
-      rows: [{ left: 'fast', op: 'crosses_above', right: 'slow' }],
+      rows: [{ left: 'fast', op: 'crosses_above', right: 'slow', rightKind: 'ref' }],
     },
     short: emptySide(),
     stop: { enabled: true, lookback: 2, side: 'low' },
@@ -160,7 +167,32 @@ export function maCrossForm(): StrategyForm {
     exit: {
       enabled: true,
       combine: 'all',
-      rows: [{ left: 'fast', op: 'crosses_below', right: 'slow' }],
+      rows: [{ left: 'fast', op: 'crosses_below', right: 'slow', rightKind: 'ref' }],
+    },
+    percent: 1,
+  }
+}
+
+/** A worked RSI example: go long when RSI(14) crosses below 30 (oversold) and close when it
+ *  crosses back above 70 (overbought), with a candle-extreme stop and a 2:1 target. The `30` and
+ *  `70` are literal `value` operands — the thresholds the guided builder can now express. */
+export function rsiOversoldForm(): StrategyForm {
+  return {
+    name: 'RSI oversold',
+    timeframe: 'H1',
+    indicators: [{ id: 'rsi', kind: 'RSI', period: 14, source: 'close' }],
+    long: {
+      enabled: true,
+      combine: 'all',
+      rows: [{ left: 'rsi', op: 'crosses_below', right: '30', rightKind: 'value' }],
+    },
+    short: emptySide(),
+    stop: { enabled: true, lookback: 5, side: 'low' },
+    takeProfit: { enabled: true, rr: 2 },
+    exit: {
+      enabled: true,
+      combine: 'all',
+      rows: [{ left: 'rsi', op: 'crosses_above', right: '70', rightKind: 'value' }],
     },
     percent: 1,
   }

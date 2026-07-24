@@ -48,6 +48,32 @@ def test_a_decision_on_one_candle_is_filled_at_the_open_of_the_next() -> None:
     assert fill.price == candles[3].open
 
 
+def test_the_bars_fills_are_shown_to_the_strategy_that_bar() -> None:
+    """A strategy learns its order became a trade from the bar that filled it (ADR-0015).
+
+    The fill is born in step 1 and the strategy runs in step 2 of the same iteration, so the
+    hand-off is bar-N information reaching a bar-N decision — the live terminal's fill
+    notification, replayed. `position` alone cannot carry this: a position opened and stopped
+    out inside one bar is gone before the strategy runs, and a strategy never told about the
+    fill would treat its order as still resting.
+    """
+    candles = rising(6)
+    strategy = ScriptedStrategy(script={2: [entry()]})
+
+    result = run(
+        timeframe=HOUR,
+        candles=candles,
+        instrument=EURUSD,
+        strategy=strategy,
+        broker=ImmediateFillBroker(),
+        risk=FixedRisk(),
+    )
+
+    [fill] = result.fills
+    assert strategy.fills_seen[3] == (fill,)  # shown on the bar the fill was born in
+    assert all(seen == () for index, seen in enumerate(strategy.fills_seen) if index != 3)
+
+
 def test_the_strategy_is_handed_one_candle_and_never_the_series() -> None:
     """Structural, not conventional: there is no future in the object to peek at."""
     candles = rising(4)

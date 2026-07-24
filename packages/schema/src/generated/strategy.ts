@@ -7,7 +7,9 @@
 
 export type Description = string;
 export type Condition = Comparison | AllOf | AnyOf | NotOf;
+export type Operand = Ref | Constant;
 export type Ref1 = string;
+export type Value = number;
 export type ComparisonOp =
   "gt" | "lt" | "gte" | "lte" | "crosses_above" | "crosses_below" | "breaks_above" | "breaks_below";
 /**
@@ -214,17 +216,19 @@ export type Indicators =
       Indicator,
       Indicator
     ];
-export type Indicator = SMA | EMA;
+export type Indicator = SMA | EMA | RSI;
 export type Id = string;
 export type Period = number;
 export type Type2 = "SMA";
 export type Id1 = string;
 export type Type3 = "EMA";
+export type Id2 = string;
+export type Type4 = "RSI";
 export type Name = string;
 export type MaxDailyLossPercent = number;
 export type MaxOpenPositions = number;
 export type Percent = number;
-export type Type4 = "percent_risk";
+export type Type5 = "percent_risk";
 export type SchemaVersion = "1.0";
 export type Timeframe = "M1" | "M5" | "M15" | "M30" | "H1" | "H4" | "D1" | "W1";
 
@@ -256,15 +260,22 @@ export interface Entry {
  * what stops a strategy from re-entering on every bar of a trend it already owns.
  */
 export interface Comparison {
-  left: Ref;
+  left: Operand;
   op: ComparisonOp;
-  right: Ref;
+  right: Operand;
 }
 /**
  * A reference to a value the engine can resolve at evaluation time.
  */
 export interface Ref {
   ref: Ref1;
+}
+/**
+ * A literal number — the fixed side of a threshold like `RSI < 30`. It references nothing,
+ * so the semantic layer skips it; `inf`/`nan` are rejected because no comparison means them.
+ */
+export interface Constant {
+  value: Value;
 }
 /**
  * Logical AND.
@@ -315,17 +326,32 @@ export interface RiskMultipleParams {
 }
 export interface SMA {
   id: Id;
-  params: MovingAverageParams;
+  params: PeriodSourceParams;
   type: Type2;
 }
-export interface MovingAverageParams {
+/**
+ * A window length and which price it reads — shared by every single-period indicator
+ * (SMA, EMA, RSI, and ATR to come). Named for its shape, not for one indicator, because a
+ * period over a price source is exactly what they all take.
+ */
+export interface PeriodSourceParams {
   period: Period;
   source?: "open" | "high" | "low" | "close";
 }
 export interface EMA {
   id: Id1;
-  params: MovingAverageParams;
+  params: PeriodSourceParams;
   type: Type3;
+}
+/**
+ * Relative Strength Index — a bounded 0-100 momentum oscillator (Wilder). Same params as a
+ * moving average; the engine smooths gains and losses with Wilder's method (ADR-13: adding it
+ * is additive, so `schema_version` stays 1.0).
+ */
+export interface RSI {
+  id: Id2;
+  params: PeriodSourceParams;
+  type: Type4;
 }
 export interface Risk {
   max_daily_loss_percent?: MaxDailyLossPercent;
@@ -337,7 +363,7 @@ export interface Risk {
  */
 export interface PercentRiskSizing {
   params: PercentRiskParams;
-  type: Type4;
+  type: Type5;
 }
 export interface PercentRiskParams {
   percent: Percent;

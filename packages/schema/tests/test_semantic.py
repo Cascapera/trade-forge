@@ -36,6 +36,16 @@ def test_the_base_strategy_is_executable() -> None:
     assert validate_semantics(strategy()) == []
 
 
+def test_a_constant_operand_needs_no_indicator_declaration() -> None:
+    """`rsi < 30` compares an indicator against a literal. The constant references nothing, so the
+    semantic layer must not mistake it for an undeclared indicator (and RSI is a valid block)."""
+    model = strategy(
+        indicators=[{"id": "rsi", "type": "RSI", "params": {"period": 14}}],
+        entry={"long": {"op": "lt", "left": {"ref": "rsi"}, "right": {"value": 30}}},
+    )
+    assert validate_semantics(model) == []
+
+
 def test_duplicate_indicator_ids_are_rejected() -> None:
     """Two indicators with one id: every ref to it becomes ambiguous."""
     model = strategy(

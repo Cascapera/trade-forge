@@ -16,7 +16,7 @@
     "screenshot": "playwright test screenshot.spec.ts"
   },
   "dependencies": {
-    "@tanstack/react-query": "^5.101.2",
+    "@tanstack/react-query": "^5.101.4",
     "@tradeforge/schema": "^0.1.0",
     "lightweight-charts": "^5.2.0",
     "react": "^18.3.1",

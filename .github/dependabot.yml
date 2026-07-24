@@ -1,5 +1,14 @@
 version: 2
 
+# **Groups carry minor and patch only.** A grouped bump is meant to be a routine
+# PR: read the title, check CI, merge. A major is the opposite — it is migration
+# work — and grouping one hides it behind a title that says "3 updates". That is
+# not hypothetical: #33 arrived as "bump the js-prod group with 3 updates" and
+# carried React 18 -> 19, failing all 25 web tests on an element-symbol mismatch.
+#
+# Majors still get proposed; dependabot opens them as individual PRs, named after
+# the thing that actually changed. Which is the whole point.
+
 updates:
   # Pinning actions by SHA is only safe if something keeps them fresh. That is
   # this block: it rewrites the pins (and the trailing version comment) for us.
@@ -12,6 +21,7 @@ updates:
     groups:
       actions:
         patterns: ['*']
+        update-types: [minor, patch]
 
   - package-ecosystem: uv
     directory: /
@@ -22,8 +32,10 @@ updates:
     groups:
       python-dev:
         dependency-type: development
+        update-types: [minor, patch]
       python-prod:
         dependency-type: production
+        update-types: [minor, patch]
 
   # Same reasoning as the SHA-pinned actions: we pin image minors (postgres:16.14),
   # so something has to propose the bumps.
@@ -43,5 +55,7 @@ updates:
     groups:
       js-dev:
         dependency-type: development
+        update-types: [minor, patch]
       js-prod:
         dependency-type: production
+        update-types: [minor, patch]

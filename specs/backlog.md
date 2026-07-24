@@ -207,3 +207,10 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
   `Signal` de cancel (`broker.cancel(client_id)` não roteia por lado). Mutante equivalente hoje;
   vira relevante num futuro `MT5Broker` que roteie cancelamentos por lado. Testar quando existir
   um consumidor que leia o campo.
+- [origem: PR-207] **`stop_loss` do lado errado do nível de repouso é descarte silencioso** — uma
+  compra-stop em 1.10500 com `stop_loss` em 1.10600 (SL *acima* do gatilho, erro de sinal) é aceita
+  pelo `Signal` e depois descartada sem ruído por `_survives_the_gap`, porque o fill nasce já além
+  do próprio stop. A limite tem exatamente o mesmo buraco desde o ADR-0014. A validação de lado
+  `stop_loss` × (`limit_price` | `stop_price`) no `Signal` fecharia os dois de uma vez — mesma
+  família da validação de lado que o `stop_price` já ganhou contra o `reference_price`. Fora do
+  escopo do PR-207 porque muda o contrato da limite também, e isso pede seu aval.

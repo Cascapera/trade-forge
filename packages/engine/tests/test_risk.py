@@ -98,6 +98,24 @@ def test_a_limit_order_is_sized_against_its_limit_not_the_close() -> None:
     )
 
 
+def test_a_stop_order_is_sized_against_its_trigger_not_the_close() -> None:
+    """The mirror of the limit case for a breakout (ADR-0016): a buy stop fills at its trigger, so
+    that is the price the stop distance is measured from. Here the close is 1.10000 and the trigger
+    1.10500 with the loss at 1.10000 — 50 pips ($500/lot), so 1% of $10 000 buys 0.20 lots.
+    Measured from the close the distance is zero and there would be no trade at all, which is
+    exactly the silent mis-sizing this guards against."""
+    risk = PercentRiskManager(percent=Decimal(1))
+    signal = Signal(
+        kind=SignalKind.ENTRY,
+        side=Side.LONG,
+        reference_price=Decimal("1.10000"),
+        stop_loss=Decimal("1.10000"),
+        stop_price=Decimal("1.10500"),
+        client_id="zone-1",
+    )
+    assert risk.size(signal, ACCOUNT, EURUSD) == Decimal("0.2")
+
+
 def test_allow_is_the_veto_and_is_open_in_phase_1() -> None:
     risk = PercentRiskManager(percent=Decimal(1))
     order = OrderRequest(

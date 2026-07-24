@@ -215,6 +215,15 @@ class Signal:
     which is a price and not an instant, and filling it at the next open measures a trade the
     method would never have taken."""
 
+    stop_price: Money | None = None
+    """Where a **breakout** order waits, or `None` (ADR-0016). The mirror of `limit_price`.
+
+    A limit rests on the side price has to come *back* to; a stop rests on the side price has to
+    break *through*: a buy-stop above the market, a sell-stop below, filling as price runs into
+    it. It is how the swing setups enter — "buy when price breaks the high of the candle the
+    average turned on". At most one of `limit_price`/`stop_price` is set: an order is one or the
+    other, never both."""
+
     client_id: str | None = None
     """The name this signal gives its order, so a later bar can take it back.
 
@@ -232,6 +241,12 @@ class Signal:
             raise ValueError("a CANCEL names the order it withdraws: client_id is required")
         if self.limit_price is not None and self.limit_price <= ZERO:
             raise ValueError(f"limit price must be positive, got {self.limit_price}")
+        if self.stop_price is not None and self.stop_price <= ZERO:
+            raise ValueError(f"stop price must be positive, got {self.stop_price}")
+        # An order is a limit *or* a stop, never both: the two say opposite things about where it
+        # rests, so a price carrying both meanings is a bug, not a richer order.
+        if self.limit_price is not None and self.stop_price is not None:
+            raise ValueError("an order rests at a limit or a stop, not both")
         # A limit rests on the side price has to come back to: a buy waits *below*, a sell
         # *above*. The wrong side is not an exotic order, it is a sign error — and it does not
         # announce itself, because a buy limit above the market simply fills at the next open
@@ -247,6 +262,21 @@ class Signal:
                 raise ValueError(
                     f"a {self.side.value} limit at {self.limit_price} is on the wrong side of "
                     f"{self.reference_price}: a buy limit rests below the market, a sell above"
+                )
+        # A stop is the mirror: a buy breaks *up* through a level above the market, a sell *down*
+        # through one below. The wrong side is the worse sign error of the two — a buy stop below
+        # the market is already triggered, so it fills at the next open as a silent market order,
+        # sized against a level price never had to break.
+        if self.kind is SignalKind.ENTRY and self.stop_price is not None:
+            wrong_side = (
+                self.stop_price < self.reference_price
+                if self.side is Side.LONG
+                else self.stop_price > self.reference_price
+            )
+            if wrong_side:
+                raise ValueError(
+                    f"a {self.side.value} stop at {self.stop_price} is on the wrong side of "
+                    f"{self.reference_price}: a buy stop rests above the market, a sell below"
                 )
 
 
@@ -280,6 +310,9 @@ class OrderRequest:
     limit_price: Money | None = None
     """The price this order waits at, or `None` for "fill at the next open". See `Signal`."""
 
+    stop_price: Money | None = None
+    """The breakout level this order waits at, or `None`. Mirror of `limit_price` (ADR-0016)."""
+
     client_id: str | None = None
     """The strategy's name for this order, so it can be cancelled later. See `Signal`."""
 
@@ -294,6 +327,10 @@ class OrderRequest:
             raise ValueError("a cancel is not an order: withdraw it through Broker.cancel")
         if self.limit_price is not None and self.limit_price <= ZERO:
             raise ValueError(f"limit price must be positive, got {self.limit_price}")
+        if self.stop_price is not None and self.stop_price <= ZERO:
+            raise ValueError(f"stop price must be positive, got {self.stop_price}")
+        if self.limit_price is not None and self.stop_price is not None:
+            raise ValueError("an order rests at a limit or a stop, not both")
 
 
 @dataclass(frozen=True, slots=True)

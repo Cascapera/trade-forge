@@ -18,11 +18,12 @@ it refuses:
   the target, the tick data to say which came first does not exist — so the backtest assumes
   the **stop** filled first. The optimistic assumption is how a strategy "discovers" an edge
   the market never gave it.
-* **A limit order waits for a price, and only on a later bar.** An order carrying a
-  `limit_price` rests here until a candle's range reaches it (ADR-0014) — the structure
-  setups enter at the edge of a region, which is a price, not an instant. It is the one fill
-  in this engine priced *inside* a bar, which makes it the one place the anti-lookahead rule
-  can be broken quietly; `_fill_resting` restates the rule where it can actually be violated.
+* **A resting order waits for a price, and only on a later bar.** An order carrying a
+  `limit_price` (a pullback, ADR-0014) or a `stop_price` (a breakout, ADR-0016) rests here
+  until a candle's range reaches it — the structure setups enter at the edge of a region and
+  the swing setups on the break of a level, and both are a price, not an instant. It is the
+  one fill in this engine priced *inside* a bar, which makes it the one place the anti-lookahead
+  rule can be broken quietly; `_fill_resting` restates the rule where it can actually be violated.
 
 Phase 1 holds one position at a time. Stops come from the strategy (a level fixed on the
 decision bar, so it cannot see the future); targets are a risk multiple, computed here at the
@@ -75,6 +76,52 @@ def _survives_the_gap(order: OrderRequest, price: Money) -> bool:
     return price > stop if order.side is Side.LONG else price < stop
 
 
+_MAX_ENTRY_SLIP = Decimal("0.5")
+"""How much of its own risk a stop entry may spend before it stops being the trade (ADR-0016).
+
+Half. A buy stop triggered at 1.10500 with its stop at 1.10000 was sized for 500 points of
+risk; filled at 1.10750 it now risks 750 — one and a half times the money the risk manager
+agreed to. Past that the position is not the one the strategy priced, and booking it charges
+the account for a trade nobody sized.
+
+The number is a judgement, not a derivation, which is why it sits here alone with its name on
+it instead of inline in a comparison: change it and every breakout backtest changes with it.
+"""
+
+
+def _survives_the_slip(order: OrderRequest, price: Money) -> bool:
+    """Did this stop entry fill close enough to its trigger to still be the sized trade?
+
+    The mirror of `_survives_the_gap`, for the mirror order — and it exists because that guard
+    is provably a no-op for stops. A limit fills *toward* its own stop, so a gap can carry it
+    past the exit and `_survives_the_gap` catches it. A stop fills *away* from its stop, so it
+    can never cross it, and nothing bounded how far the wrong way it could go:
+
+    * **A gap through the trigger.** The bar opens far above a buy stop and the fill is that
+      open (ADR-0016 says a stop fills at "this price or worse"). Sized for 1R at the trigger,
+      the position can open holding 10R of risk — one overnight gap in an index, and a 1%-risk
+      account books a 10% loss the risk manager never agreed to.
+    * **Eligibility deferred, no gap at all.** A resting order whose bar was taken by another
+      position (step 4 of `on_bar`) waits; by the time the slot frees, price can be far past
+      the trigger, and `max(open, level)` hands it that price.
+
+    Both are the same event told two ways: the level the strategy chose is behind the market
+    now. `_survives_the_gap` drops such an order rather than leaving it resting, and so does
+    this — for the same reason, and at the same place in the fill path.
+
+    An order with no stop was never sized against a distance, so there is nothing to measure
+    it against and it passes.
+    """
+    stop = order.stop_loss
+    trigger = order.stop_price
+    if stop is None or trigger is None:
+        return True
+    risk = abs(trigger - stop)
+    if risk <= ZERO:
+        return True
+    return abs(price - trigger) <= _MAX_ENTRY_SLIP * risk
+
+
 @dataclass(frozen=True, slots=True)
 class _Protection:
     """The open position's protective levels, armed at the fill and cleared at the exit.
@@ -92,16 +139,21 @@ class _Protection:
 
 @dataclass(frozen=True, slots=True)
 class _Resting:
-    """A limit order waiting for the market to come to it, with its level and name pulled out.
+    """A pending order waiting for the market to reach its level, with level and name pulled out.
 
-    Both are stored here instead of being read back off the order for a typing reason that is
-    really a testing reason: `submit` has already proved neither is `None`, so keeping them
-    narrow avoids a second check downstream — and a second check would be a branch no test
-    could ever take, sitting in the middle of the fill path.
+    A **limit** waits for price to come *back* to it; a **stop** waits for price to break
+    *through* it (ADR-0016). `is_stop` is which — it decides both the crossing test and, on a gap,
+    whether the fill is the better price or the worse one.
+
+    Level and name are stored here instead of being read back off the order for a typing reason
+    that is really a testing reason: `submit` has already proved the level is not `None`, so
+    keeping it narrow avoids a second check downstream — a branch no test could take, in the fill
+    path.
     """
 
     order: OrderRequest
-    limit: Money
+    level: Money
+    is_stop: bool
     name: str
 
 
@@ -160,8 +212,10 @@ class BacktestBroker:
     # ----------------------------------------------------------------------- #
 
     def submit(self, order: OrderRequest) -> OrderResult:
-        limit = order.limit_price
-        if limit is None:
+        # A resting order carries a level — a limit or a stop, never both (the domain proved it).
+        # Neither means "at market", filled at the next open.
+        level = order.limit_price if order.limit_price is not None else order.stop_price
+        if level is None:
             self._pending.append(order)
             self.submitted.append(order)
             return OrderResult(order=order, accepted=True)
@@ -172,12 +226,19 @@ class BacktestBroker:
 
         # `_reject_resting` has just proved the name is there; narrowing it again would add a
         # branch no test could enter, in the middle of the path that accepts orders.
-        self._resting.append(_Resting(order=order, limit=limit, name=cast(str, order.client_id)))
+        self._resting.append(
+            _Resting(
+                order=order,
+                level=level,
+                is_stop=order.stop_price is not None,
+                name=cast(str, order.client_id),
+            )
+        )
         self.submitted.append(order)
         return OrderResult(order=order, accepted=True)
 
     def _reject_resting(self, order: OrderRequest) -> str | None:
-        """Why this limit order cannot rest, or `None` if it can.
+        """Why this resting order cannot rest, or `None` if it can.
 
         Both refusals are about a promise the broker would otherwise be unable to keep:
 
@@ -189,7 +250,7 @@ class BacktestBroker:
           answers, and picking either would be the broker guessing.
         """
         if order.intent is not SignalKind.ENTRY:
-            return "only an entry can rest at a limit; a target is the broker's protective exit"
+            return "only an entry can rest at a level; a target is the broker's protective exit"
         if order.client_id is None:
             return "a resting order needs a client_id: nothing else can cancel it later"
         if any(resting.name == order.client_id for resting in self._resting):
@@ -278,9 +339,15 @@ class BacktestBroker:
             resting = self._fill_resting(candle)
             if resting is not None:
                 fills.append(resting)
-                # This position was born *inside* the bar, so its protective levels are read
-                # under different rules — see `_protective_price`.
-                same_bar = self._check_protective(candle, born_this_bar=True)
+                # Born *inside* the bar, its protective levels are read under different rules —
+                # see `_newborn_protective_price`. But a fill *at the open* was not born inside
+                # anything: the bar gapped through the level, the order executed on the first
+                # tick, and the whole bar belongs to the position. Same test as steps 1 and 3,
+                # for the same reason; hard-coding `True` would deny a position the target its
+                # bar demonstrably reached.
+                same_bar = self._check_protective(
+                    candle, born_this_bar=resting.price != candle.open
+                )
                 if same_bar is not None:
                     fills.append(same_bar)
 
@@ -378,6 +445,19 @@ class BacktestBroker:
                     resting.order.stop_loss,
                 )
                 continue
+            if not _survives_the_slip(resting.order, price):
+                # The stop's own version of the same event: the fill is so far past the trigger
+                # that the position would carry risk the manager never sized (ADR-0016). Dropped
+                # on the same terms as the gap above — the level is behind the market, so the
+                # order is gone rather than waiting, and the bar goes on to the next in the queue.
+                self._resting.remove(resting)
+                logger.debug(
+                    "resting order %s dropped: %s is too far past its trigger %s",
+                    resting.name,
+                    price,
+                    resting.order.stop_price,
+                )
+                continue
 
             self._resting.remove(resting)
             order = resting.order
@@ -391,39 +471,55 @@ class BacktestBroker:
         return None
 
     def _resting_price(self, resting: _Resting, candle: Candle) -> Money | None:
-        """The price a resting order fills at on this bar, or `None` if the bar never got there.
+        """The price a resting order fills at on this bar, or `None` if the bar never reached it.
 
-        A buy limit rests *below* the market and fills when the bar trades down to it; a sell
-        limit rests above. On a bar that **opens beyond the level**, the fill is the open, not
-        the limit: a limit order is a promise of "this price or better", and the market opening
-        better than you asked hands you the better one. `min`/`max` says exactly that, and its
-        result is provably inside `[low, high]`, so the loop's range guard never fires.
+        Two mirror-image orders, split by `resting.is_stop`:
 
-        **No slippage.** Adverse slippage would fill this *worse* than the level — the one
-        thing a limit order cannot do. The optimism that remains is the queue: this assumes a
-        one-tick wick through the level filled you, when in a real book you may have been
-        behind everyone else. That is the residual cost of simulating pending orders without
-        tick data (ADR-0014), and it is why the level is a price the strategy chose rather
-        than one the broker invented.
+        * A **limit** rests on the side price has to come *back* to — a buy below, a sell above —
+          and is a promise of "this price or better". On a bar that opens beyond it, the fill is
+          the open: the market opening better than you asked hands you the better price.
+        * A **stop** rests on the side price has to break *through* — a buy above, a sell below —
+          and is a market order triggered at the level, "this price or worse" (ADR-0016). The same
+          `min`/`max` toward the open now hands you the *worse* price on a gap, precisely because
+          the stop rests on the opposite side: a bar that opens past the trigger fills at that
+          open, beyond the level.
+
+        Either way the result is provably inside `[low, high]`, so the loop's range guard never
+        fires.
+
+        **No slippage beyond the gap.** A limit never fills worse than its level; a stop never
+        fills better than its trigger. The residual optimism is the queue — a one-tick wick (limit)
+        or breakout (stop) is assumed to have filled you — the cost of simulating pending orders
+        without tick data (ADR-0014/0016).
         """
-        limit = resting.limit
-        if resting.order.side is Side.LONG:
-            if candle.low > limit:
+        level = resting.level
+        # Which side the order rests on, and so which way the bar must move to reach it. A limit
+        # buy and a stop sell both rest *below*; a limit sell and a stop buy both rest *above*.
+        if resting.is_stop:
+            rests_below = resting.order.side is Side.SHORT
+        else:
+            rests_below = resting.order.side is Side.LONG
+
+        if rests_below:
+            if candle.low > level:
                 return None
-            return min(candle.open, limit)
-        if candle.high < limit:
+            return min(candle.open, level)
+        if candle.high < level:
             return None
-        return max(candle.open, limit)
+        return max(candle.open, level)
 
     def _check_protective(self, candle: Candle, *, born_this_bar: bool = False) -> Fill | None:
         """Has this bar's range touched the open position's stop or target? If both, the stop
         wins — the worst case, because the data to prove otherwise does not exist.
 
-        `born_this_bar` is set only for a position opened by a limit fill — the one entry that
-        does not happen at the open. It changes how the levels are read, and only that. The
-        entry *price* is deliberately not passed: the newborn reading never needs it (the
-        proof is in `_newborn_protective_price`), and a parameter nobody reads is a standing
-        invitation to start reading it.
+        `born_this_bar` is set for a position opened by a resting fill — a limit or a stop —
+        that landed *inside* the bar, the one entry that does not happen at the open. A resting
+        order that filled *at* the open is not one of them: the bar gapped through its level, so
+        it executed on the first tick and the ordinary reading applies (see step 4 of `on_bar`).
+        It changes how the levels are read, and only that. The entry *price* is deliberately not
+        passed: the newborn reading never needs it (the proof is in
+        `_newborn_protective_price`), and a parameter nobody reads is a standing invitation to
+        start reading it.
         """
         position = self._portfolio.position
         protection = self._protection
@@ -495,33 +591,45 @@ class BacktestBroker:
     def _newborn_protective_price(
         self, side: Side, candle: Candle, protection: _Protection
     ) -> tuple[Money | None, str]:
-        """For a position born **inside** this bar, at a limit fill.
+        """For a position born **inside** this bar, at a resting fill — a limit or a stop.
 
         Two things change, and both come from one fact: part of this bar happened before the
-        position existed, and no tick data says which part.
+        position existed, and no tick data says which part. (A resting order that filled *at
+        the open* is not this case at all — it owned the whole bar, and `on_bar` sends it to
+        the ordinary reading.)
 
         **The levels fill exactly, with no gap treatment.** The open is a price from before
-        the entry — it cannot be where this position exited. A buy limit fills on the way
-        down, so it is born below its target and above its stop, and the first touch of
-        either, after the fill, is the level itself.
+        the entry — it cannot be where this position exited. The fill is on the far side of
+        the open from wherever the order rested, so the first touch of either level, after the
+        fill, is the level itself.
 
         **The target must be *provable*, the stop only reachable.** The high of this bar may
         have printed before the entry existed, so "the high reached the target" proves
         nothing. The **close** does: price went from the fill to the close, so a close beyond
-        the target crossed it after the entry, necessarily. The stop needs no such proof — it
-        sits on the far side of the very move that filled the entry, so the bar reaching it is
-        the reading that costs money, and that is the reading this engine takes.
+        the target crossed it after the entry, necessarily. The stop gets no such proof, and
+        the reason differs by order type — worth spelling out, because the asymmetry is the
+        engine's house rule and not a property of the geometry:
+
+        * At a **limit** fill the stop sits on the far side of the very move that filled the
+          entry, so a bar reaching it very likely reached it *after* the fill.
+        * At a **stop** fill (ADR-0016) the entry came on the way *up* through the trigger, so
+          the protective stop below sits behind where price came from: that low may well have
+          printed before the entry existed. The bar is genuinely ambiguous — and an ambiguous
+          bar resolves here the way every ambiguous bar in this engine resolves, against the
+          trade. It is why a breakout can book a loss on a bar that closed above its entry;
+          the alternative is an engine that decides its own doubts in its favour.
 
         The residue — a bar whose high tags the target but whose close falls short — is
         genuinely unknowable and the position simply carries into the next bar, where the
         ordinary reading applies again.
 
-        On the stop, dropping the gap treatment changes nothing, and that is provable rather
-        than hopeful: a long fills at `min(open, limit)`, so `open >= fill`, and
-        `_survives_the_gap` has already established `fill > stop` — therefore
-        `min(open, stop) == stop`. The short side mirrors it. Written plainly here because the
-        two forms are interchangeable *only* under those two guarantees, and reintroducing
-        `min`/`max` would quietly couple this function to them.
+        Dropping the gap treatment on the stop is safe for both, but only the limit side has a
+        price proof (`open >= fill` from `min(open, limit)`, plus `fill > stop` from
+        `_survives_the_gap`, therefore `min(open, stop) == stop`); a stop entry has
+        `open <= fill` instead, so `min(open, stop)` can differ from `stop` and it is the
+        *first* argument above — the open predates the position — that rules the open out.
+        Written plainly here because reintroducing `min`/`max` would quietly reprice an exit
+        at a tick the position was not alive for.
         """
         stop = protection.stop
         target = protection.target

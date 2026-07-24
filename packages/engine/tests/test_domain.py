@@ -106,3 +106,40 @@ def test_a_limit_price_must_be_a_price() -> None:
             limit_price=Decimal("-1.10000"),
             client_id="zone-1",
         )
+
+
+def test_a_stop_price_must_be_a_price() -> None:
+    """The mirror of the limit rule, on either object (ADR-0016)."""
+    with pytest.raises(ValueError, match="stop price must be positive"):
+        Signal(
+            kind=SignalKind.ENTRY,
+            side=Side.LONG,
+            reference_price=Decimal("1.10000"),
+            stop_price=Decimal(0),
+        )
+    with pytest.raises(ValueError, match="stop price must be positive"):
+        OrderRequest(
+            symbol="EURUSD",
+            side=Side.LONG,
+            intent=SignalKind.ENTRY,
+            volume=Decimal(1),
+            decided_at=dt.datetime(2024, 1, 1, tzinfo=dt.UTC),
+            stop_price=Decimal("-1.10000"),
+            client_id="zone-1",
+        )
+
+
+def test_an_order_request_cannot_carry_both_a_limit_and_a_stop() -> None:
+    """The `OrderRequest` guards it too, not just the `Signal`: an order reaching the broker with
+    both levels set would leave `submit` to pick one, and picking is guessing."""
+    with pytest.raises(ValueError, match="limit or a stop"):
+        OrderRequest(
+            symbol="EURUSD",
+            side=Side.LONG,
+            intent=SignalKind.ENTRY,
+            volume=Decimal(1),
+            decided_at=dt.datetime(2024, 1, 1, tzinfo=dt.UTC),
+            limit_price=Decimal("1.09500"),
+            stop_price=Decimal("1.10500"),
+            client_id="zone-1",
+        )

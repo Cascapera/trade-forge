@@ -67,9 +67,9 @@ class Broker(Protocol):
     def cancel(self, client_id: str) -> bool:
         """Withdraw an order still waiting, by the name its strategy gave it. ADR-0014.
 
-        Only a resting order — one with a `limit_price`, waiting for the market to come to
-        it — can be withdrawn; a market order queued on the last bar has already executed by
-        the time anyone could ask.
+        Only a resting order — one with a `limit_price` or a `stop_price`, waiting for the
+        market to reach it — can be withdrawn; a market order queued on the last bar has
+        already executed by the time anyone could ask.
 
         **Returns false rather than raising when nothing is found.** The order may have
         filled on this very bar, or been cancelled already, or never have existed. In live

@@ -11,6 +11,8 @@ import logging
 from decimal import Decimal
 
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 from tradeforge_engine.backtest_broker import BacktestBroker
 from tradeforge_engine.costs import SpreadCostModel
@@ -63,6 +65,30 @@ def _limit(  # noqa: PLR0913 — keyword-only; each names one axis of a resting 
             decided_at=decided_at,
             stop_loss=Decimal(stop) if stop is not None else None,
             limit_price=Decimal(limit),
+            client_id=client_id,
+        )
+    )
+
+
+def _stop(  # noqa: PLR0913 — keyword-only; each names one axis of a resting order
+    broker: BacktestBroker,
+    *,
+    stop_price: str,
+    side: Side = Side.LONG,
+    volume: str = "1",
+    stop: str | None = None,
+    client_id: str = "zone-1",
+    decided_at: dt.datetime = DECIDED,
+) -> OrderResult:
+    return broker.submit(
+        OrderRequest(
+            symbol="EURUSD",
+            side=side,
+            intent=SignalKind.ENTRY,
+            volume=Decimal(volume),
+            decided_at=decided_at,
+            stop_loss=Decimal(stop) if stop is not None else None,
+            stop_price=Decimal(stop_price),
             client_id=client_id,
         )
     )
@@ -1047,3 +1073,434 @@ def test_a_cancel_signal_withdraws_the_order_through_the_loop() -> None:
         risk=FixedRisk(),
     )
     assert result.fills == ()
+
+
+# --------------------------------------------------------------------------- #
+# Stop entry orders: filling on the break of a level (ADR-0016)                 #
+# --------------------------------------------------------------------------- #
+
+
+def test_a_buy_stop_fills_at_its_level_when_the_bar_breaks_up_to_it() -> None:
+    """The golden case, and the reason the feature exists: the swing setups enter on the break of
+    a level. A buy stop rests *above* the market at 1.10500; the bar opens at 1.10000 and runs up
+    to 1.10600, so the order fills at 1.10500 — the mirror of a sell limit, but a long."""
+    broker = _broker()
+    _stop(broker, stop_price="1.10500")
+    [fill] = broker.on_bar(bar(1, open_="1.10000", close="1.10550", high="1.10600", low="1.09900"))
+    assert fill.price == Decimal("1.10500")
+    assert fill.order.side is Side.LONG
+    assert fill.order.client_id == "zone-1"
+
+
+def test_a_sell_stop_fills_at_its_level_when_the_bar_breaks_down_to_it() -> None:
+    broker = _broker()
+    _stop(broker, side=Side.SHORT, stop_price="1.09500")
+    [fill] = broker.on_bar(bar(1, open_="1.10000", close="1.09450", high="1.10100", low="1.09400"))
+    assert fill.price == Decimal("1.09500")
+    assert fill.order.side is Side.SHORT
+
+
+def test_a_bar_that_opens_beyond_the_stop_fills_at_the_open_the_worse_price() -> None:
+    """The decision at the heart of ADR-0016, and the one thing that is *not* a mirror of the
+    limit: a stop is "this price or worse". Price gaps up through a buy stop at 1.10500 and opens
+    at 1.11000 — the fill is the open, 500 points *worse* than the trigger, because a stop is a
+    market order the gap already triggered. The mirrored sell stop, gapped down, fills at its
+    worse open too."""
+    long_broker = _broker()
+    _stop(long_broker, stop_price="1.10500")
+    [long_fill] = long_broker.on_bar(
+        bar(1, open_="1.11000", close="1.11100", high="1.11200", low="1.10950")
+    )
+    assert long_fill.price == Decimal("1.11000")
+
+    short_broker = _broker()
+    _stop(short_broker, side=Side.SHORT, stop_price="1.09500")
+    [short_fill] = short_broker.on_bar(
+        bar(1, open_="1.09000", close="1.08900", high="1.09100", low="1.08800")
+    )
+    assert short_fill.price == Decimal("1.09000")
+
+
+def test_a_bar_that_never_reaches_the_stop_leaves_it_resting() -> None:
+    """The order outlives the bar. A buy stop at 1.10500 with the bar's high only 1.10400 rests;
+    the next bar breaks the level and it fills there."""
+    broker = _broker()
+    _stop(broker, stop_price="1.10500")
+    quiet = bar(1, open_="1.10000", close="1.10200", high="1.10400", low="1.09900")
+    assert broker.on_bar(quiet) == []
+    [fill] = broker.on_bar(bar(2, open_="1.10200", close="1.10600", high="1.10700", low="1.10100"))
+    assert fill.price == Decimal("1.10500")
+
+    # the mirror: a sell stop the bar's low never reaches
+    short_broker = _broker()
+    _stop(short_broker, side=Side.SHORT, stop_price="1.09500")
+    short_quiet = bar(1, open_="1.10000", close="1.09800", high="1.10100", low="1.09600")
+    assert short_broker.on_bar(short_quiet) == []
+
+
+def test_a_resting_stop_cannot_fill_on_the_bar_that_placed_it() -> None:
+    """The anti-lookahead rule where it can actually be broken, for the stop path. The order is
+    decided on the bar at index 1, whose range already breaks the level: no fill. Delete the
+    `decided_at` guard in `_fill_resting` and this fails on the first assertion."""
+    broker = _broker()
+    deciding = bar(1, open_="1.10000", close="1.10550", high="1.10600", low="1.09900")
+    _stop(broker, stop_price="1.10500", decided_at=deciding.time)
+    assert broker.on_bar(deciding) == []
+    # the next bar breaks the same level, and now the order is eligible
+    [fill] = broker.on_bar(bar(2, open_="1.10200", close="1.10600", high="1.10700", low="1.10100"))
+    assert fill.price == Decimal("1.10500")
+
+
+def test_the_stop_level_itself_counts_as_reached() -> None:
+    """The residual optimism ADR-0016 accepts, mirrored from the limit and pinned so it cannot
+    drift: a bar whose high is *exactly* the trigger fills, and one tick short does not."""
+    touching = _broker()
+    _stop(touching, stop_price="1.10500")
+    [fill] = touching.on_bar(
+        bar(1, open_="1.10000", close="1.10400", high="1.10500", low="1.09900")
+    )
+    assert fill.price == Decimal("1.10500")
+
+    missed = _broker()
+    _stop(missed, stop_price="1.10500")
+    assert (
+        missed.on_bar(bar(1, open_="1.10000", close="1.10400", high="1.10499", low="1.09900")) == []
+    )
+
+
+def test_a_stop_entry_can_be_stopped_out_on_its_own_bar() -> None:
+    """A stop entry is born mid-bar like a limit, so the newborn protective reading has to hold
+    for it too. A buy stop at 1.10500 with its loss at 1.10000 fills as the bar breaks up, and
+    the same bar sells off to 1.09900 — the stop closes it, on the bar it opened."""
+    broker = _broker()
+    _stop(broker, stop_price="1.10500", stop="1.10000")
+    fills = broker.on_bar(bar(1, open_="1.10200", close="1.10050", high="1.10600", low="1.09900"))
+    reasons = [fill.order.reason for fill in fills]
+    assert "sl" in reasons
+    [stop_fill] = [fill for fill in fills if fill.order.reason == "sl"]
+    assert stop_fill.price == Decimal("1.10000")
+
+
+def test_a_stop_entry_books_a_loss_on_a_bar_that_closed_above_it() -> None:
+    """The house rule, in the shape that costs a breakout the most — pinned with its whole P&L
+    because it looks wrong until you see why it is not.
+
+    A buy stop at 1.10500 with its loss at 1.10300, on a bar that opens at 1.10200, prints its
+    low at 1.10100, and **closes at 1.10580 — above the entry**. The engine books entry 1.10500,
+    exit 1.10300, -200: a loss on a bar that finished in the trade's favour.
+
+    That low sits *behind* where the break came from, so it may well have printed before the
+    entry existed — the bar is genuinely ambiguous, and no tick data settles it. The engine
+    resolves ambiguity against the trade everywhere else, and does so here too. Read the
+    alternative out loud and it is worse: an engine that decides its own doubts in its favour
+    reports breakout results nobody can trade.
+    """
+    broker = _broker()
+    _stop(broker, stop_price="1.10500", stop="1.10300")
+    fills = broker.on_bar(bar(1, open_="1.10200", close="1.10580", high="1.10600", low="1.10100"))
+    assert [(fill.order.intent, fill.order.reason, fill.price) for fill in fills] == [
+        (SignalKind.EXIT, "sl", Decimal("1.10300")),
+        (SignalKind.ENTRY, "", Decimal("1.10500")),
+    ]
+    [trade] = broker.trades()
+    assert trade.entry_price == Decimal("1.10500")
+    assert trade.exit_price == Decimal("1.10300")
+    assert trade.net_pnl == Decimal(-200)
+
+
+def test_a_stop_that_gapped_to_the_open_owns_its_whole_bar() -> None:
+    """A resting order that filled *at the open* was not born inside anything: the bar gapped
+    through the level and the order executed on the first tick, so the whole bar belongs to the
+    position and the ordinary protective reading applies — the target off the **high**, not the
+    close. Hard-coding the newborn reading here denied it a target its bar demonstrably reached.
+
+    The proof is the market order beside it: same entry price, same bar, same protective levels,
+    so the two must book the same trade. They now do.
+    """
+    gapped = _broker(take_profit_rr=Decimal(2))
+    # trigger 1.10500, loss 1.09500: risk 1000, so the fill may slip 500 and this one slips 300
+    _stop(gapped, stop_price="1.10500", stop="1.09500")
+    breakout = bar(1, open_="1.10800", close="1.13000", high="1.13500", low="1.10700")
+    gapped_fills = gapped.on_bar(breakout)
+
+    at_market = _broker(take_profit_rr=Decimal(2))
+    _entry(at_market, stop="1.09500")
+    market_fills = at_market.on_bar(breakout)
+
+    assert [(fill.order.reason, fill.price) for fill in gapped_fills] == [
+        (fill.order.reason, fill.price) for fill in market_fills
+    ]
+    # the entry is the open, and the target — 2R off the *realised* entry — fills off the high
+    assert [(fill.order.reason, fill.price) for fill in gapped_fills] == [
+        ("tp", Decimal("1.13400")),
+        ("", Decimal("1.10800")),
+    ]
+
+
+def test_a_stop_filled_inside_the_bar_still_reads_its_target_from_the_close() -> None:
+    """The other half of the pair above: this one really was born mid-bar, so the newborn rule
+    holds. Same levels, but the bar opens *below* the trigger and breaks up to it — the high tags
+    the target and the close falls short, and the position carries instead of booking a target
+    the high may have printed before the entry existed."""
+    broker = _broker(take_profit_rr=Decimal(2))
+    _stop(broker, stop_price="1.10500", stop="1.09500")
+    [fill] = broker.on_bar(bar(1, open_="1.10000", close="1.12000", high="1.13500", low="1.09900"))
+    assert fill.price == Decimal("1.10500")
+    assert broker.trades() == ()
+
+
+def test_a_stop_on_the_wrong_side_of_the_market_is_refused() -> None:
+    """A buy stop rests *above* the market and a sell stop *below* — the mirror of the limit, and
+    the worse sign error: a buy stop below the market is already triggered, so it would fill at
+    the next open as a silent market order sized against a level price never had to break."""
+    with pytest.raises(ValueError, match="wrong side"):
+        Signal(
+            kind=SignalKind.ENTRY,
+            side=Side.LONG,
+            reference_price=Decimal("1.10000"),
+            stop_price=Decimal("1.09500"),
+            client_id="zone-1",
+        )
+    with pytest.raises(ValueError, match="wrong side"):
+        Signal(
+            kind=SignalKind.ENTRY,
+            side=Side.SHORT,
+            reference_price=Decimal("1.10000"),
+            stop_price=Decimal("1.10500"),
+            client_id="zone-1",
+        )
+
+
+def test_an_order_cannot_carry_both_a_limit_and_a_stop() -> None:
+    """The two say opposite things about which side the order rests on; a price meaning both is a
+    bug, refused at the boundary rather than resolved by picking one."""
+    with pytest.raises(ValueError, match="limit or a stop"):
+        Signal(
+            kind=SignalKind.ENTRY,
+            side=Side.LONG,
+            reference_price=Decimal("1.10000"),
+            limit_price=Decimal("1.09500"),
+            stop_price=Decimal("1.10500"),
+            client_id="zone-1",
+        )
+
+
+def test_a_stop_entry_survives_the_loops_guards_end_to_end() -> None:
+    """Through the real `run()`, because a stop fill is priced inside a bar and the loop's guards
+    (decided-before, inside-this-bar, inside-the-range) are what make that safe."""
+    strategy = ScriptedStrategy(
+        script={
+            1: [
+                Signal(
+                    kind=SignalKind.ENTRY,
+                    side=Side.LONG,
+                    reference_price=Decimal("1.10000"),
+                    stop_loss=Decimal("1.09500"),
+                    stop_price=Decimal("1.10500"),
+                    client_id="zone-1",
+                )
+            ]
+        }
+    )
+    candles = [
+        bar(0, open_="1.10000", close="1.10000"),
+        bar(1, open_="1.10000", close="1.10000"),
+        # the decision bar is index 1; this one breaks up to the level
+        bar(2, open_="1.10000", close="1.10550", high="1.10600", low="1.09900"),
+    ]
+    result = run(
+        candles=candles,
+        timeframe=HOUR,
+        instrument=EURUSD,
+        strategy=strategy,
+        broker=_broker(),
+        risk=FixedRisk(),
+    )
+    [fill] = result.fills
+    assert fill.time == candles[2].time
+    assert fill.order.decided_at == candles[1].time
+    assert fill.price == Decimal("1.10500")
+
+
+# --------------------------------------------------------------------------- #
+# The slip ceiling: a stop fill too far past its trigger (ADR-0016)            #
+# --------------------------------------------------------------------------- #
+
+
+def test_a_stop_that_gaps_far_past_its_trigger_is_dropped() -> None:
+    """The mirror of `_survives_the_gap`, for the mirror order.
+
+    A buy stop at 1.10500 with its loss at 1.10000 was sized for 500 points of risk. The market
+    gaps and opens at 1.15000: filling there opens a position risking 5000 — **ten times** what
+    the risk manager agreed to, from an order it never got to re-size. One overnight gap in an
+    index would book a 10% loss in an account that promised 1%.
+
+    So the order is dropped, on the same terms as a limit whose gap carried it past its own
+    stop: the level the strategy chose is behind the market, and the trade it priced is gone.
+    """
+    broker = _broker()
+    _stop(broker, stop_price="1.10500", stop="1.10000")
+    assert (
+        broker.on_bar(bar(1, open_="1.15000", close="1.15100", high="1.15200", low="1.14900")) == []
+    )
+    assert broker.resting() == ()  # dropped, not left waiting
+
+
+def test_a_sell_stop_that_gaps_far_past_its_trigger_is_dropped() -> None:
+    broker = _broker()
+    _stop(broker, side=Side.SHORT, stop_price="1.09500", stop="1.10000")
+    assert (
+        broker.on_bar(bar(1, open_="1.05000", close="1.04900", high="1.05100", low="1.04800")) == []
+    )
+    assert broker.resting() == ()
+
+
+def test_a_stop_fills_when_the_gap_stays_inside_the_ceiling() -> None:
+    """The other side of the line, so the guard cannot quietly become "no gap ever fills". The
+    same order gapping to 1.10700 slips 200 points against an allowance of 250 — it fills, at
+    the open, worse than its trigger, exactly as ADR-0016 says."""
+    broker = _broker()
+    _stop(broker, stop_price="1.10500", stop="1.10000")
+    [fill] = broker.on_bar(bar(1, open_="1.10700", close="1.10800", high="1.10900", low="1.10650"))
+    assert fill.price == Decimal("1.10700")
+
+
+def test_a_stop_whose_turn_comes_late_is_dropped_rather_than_filled_at_the_market() -> None:
+    """The same ceiling catching the case with **no gap anywhere** — an engine artefact rather
+    than a market event, and the one a backtest would never suspect.
+
+    A stop order rests while another position holds the slot (step 4 of `on_bar` waits for it).
+    Price breaks the trigger on a bar the order is not eligible for, and by the time the slot
+    frees the market is 1500 points past it. Without the ceiling the order fills *there* — a
+    market entry at a price the strategy never chose, sized against a trigger far behind.
+    """
+    broker = _broker()
+    _entry(broker, stop="1.09000")  # occupies the one position slot
+    _stop(broker, stop_price="1.10500", stop="1.10000", client_id="zone-2")
+
+    broker.on_bar(bar(1, open_="1.10000", close="1.10050", high="1.10100", low="1.09900"))
+    # breaks the trigger, but the slot is taken: nothing fills
+    assert (
+        broker.on_bar(bar(2, open_="1.10100", close="1.10700", high="1.10800", low="1.10050")) == []
+    )
+
+    _exit(broker, side=Side.LONG)
+    fills = broker.on_bar(bar(3, open_="1.12000", close="1.12100", high="1.12200", low="1.11900"))
+    assert [fill.order.intent for fill in fills] == [SignalKind.EXIT]
+    assert broker.resting() == ()
+
+
+def test_a_stop_without_a_loss_has_no_ceiling_to_measure() -> None:
+    """Nothing sized this order against a distance, so there is no risk to blow through: it
+    fills wherever the gap left it. The guard measures a promise; with no stop there is none."""
+    broker = _broker()
+    _stop(broker, stop_price="1.10500")
+    [fill] = broker.on_bar(bar(1, open_="1.15000", close="1.15100", high="1.15200", low="1.14900"))
+    assert fill.price == Decimal("1.15000")
+
+
+# --------------------------------------------------------------------------- #
+# The resting lifecycle, exercised through a stop order                        #
+# --------------------------------------------------------------------------- #
+
+
+def test_a_resting_stop_can_be_cancelled_by_name() -> None:
+    broker = _broker()
+    _stop(broker, stop_price="1.10500", client_id="break-1")
+    assert broker.cancel("break-1") is True
+    assert (
+        broker.on_bar(bar(1, open_="1.10000", close="1.10600", high="1.10700", low="1.09900")) == []
+    )
+
+
+def test_two_stops_cannot_share_a_name() -> None:
+    broker = _broker()
+    _stop(broker, stop_price="1.10500", client_id="break-1")
+    rejected = _stop(broker, stop_price="1.10600", client_id="break-1")
+    assert rejected.accepted is False
+    assert "already resting" in rejected.reason
+
+
+def test_a_stops_name_is_spent_once_it_has_filled() -> None:
+    broker = _broker()
+    _stop(broker, stop_price="1.10500", client_id="break-1")
+    broker.on_bar(bar(1, open_="1.10000", close="1.10600", high="1.10700", low="1.09900"))
+    rejected = _stop(broker, stop_price="1.10500", client_id="break-1")
+    assert rejected.accepted is False
+    assert "already filled" in rejected.reason
+
+
+def test_a_limit_and_a_stop_resting_together_fill_in_arrival_order() -> None:
+    """Both order types share one queue, and one bar can reach both levels. Phase 1 holds one
+    position, so the tie is broken by arrival — the limit was submitted first, so it fills and
+    the stop stays resting, untouched, for a later bar."""
+    broker = _broker()
+    _limit(broker, limit="1.09800", client_id="pullback")
+    _stop(broker, stop_price="1.10500", client_id="breakout")
+    [fill] = broker.on_bar(bar(1, open_="1.10000", close="1.10550", high="1.10600", low="1.09700"))
+    assert fill.order.client_id == "pullback"
+    assert fill.price == Decimal("1.09800")
+    assert [order.client_id for order in broker.resting()] == ["breakout"]
+
+
+@given(
+    prices=st.lists(
+        st.decimals(min_value="1.00000", max_value="1.20000", places=5), min_size=5, max_size=5
+    ),
+    long=st.booleans(),
+)
+def test_a_stop_never_fills_better_than_its_trigger(prices: list[Decimal], long: bool) -> None:
+    """The half of the promise the docstring makes and no example could pin: *no favourable
+    slippage*. A stop is "this price or worse", so however the bar is shaped, a buy stop fills
+    at or above its trigger and a sell stop at or below — and always inside the bar, which is
+    what keeps the loop's range guard from ever firing.
+
+    Property-based because the interesting shapes are the ones nobody thinks to write: the bar
+    that opens exactly on the trigger, the doji, the bar that gaps and reverses.
+    """
+    open_, close, trigger, *rest = prices
+    high = max(open_, close, *rest)
+    low = min(open_, close, *rest)
+    side = Side.LONG if long else Side.SHORT
+
+    broker = _broker()
+    _stop(broker, side=side, stop_price=str(trigger))
+    candle = bar(1, open_=str(open_), close=str(close), high=str(high), low=str(low))
+    fills = broker.on_bar(candle)
+    if not fills:
+        return
+    [fill] = fills
+    assert candle.low <= fill.price <= candle.high
+    assert fill.price >= trigger if long else fill.price <= trigger
+
+
+def test_the_ceiling_is_reached_but_not_crossed_at_exactly_half_the_risk() -> None:
+    """The boundary, pinned on both sides, because a ceiling nobody tested at its own edge is a
+    number that drifts. Trigger 1.10500 with its loss at 1.10000 allows 250 points of slip: a
+    fill at 1.10750 spends exactly half the risk and still trades; one tick further does not."""
+    at_the_line = _broker()
+    _stop(at_the_line, stop_price="1.10500", stop="1.10000")
+    [fill] = at_the_line.on_bar(
+        bar(1, open_="1.10750", close="1.10800", high="1.10900", low="1.10700")
+    )
+    assert fill.price == Decimal("1.10750")
+
+    one_tick_past = _broker()
+    _stop(one_tick_past, stop_price="1.10500", stop="1.10000")
+    assert (
+        one_tick_past.on_bar(
+            bar(1, open_="1.10751", close="1.10800", high="1.10900", low="1.10700")
+        )
+        == []
+    )
+
+
+def test_a_stop_whose_loss_sits_on_its_trigger_has_no_risk_to_measure() -> None:
+    """Zero sized risk means the ceiling has nothing to be a fraction *of* — half of nothing
+    would reject every fill, silently, for an order the strategy did place. The risk manager
+    would have zeroed this lot before it ever reached a broker, but the broker is also driven
+    directly (half this suite does), so the degenerate case answers for itself here."""
+    broker = _broker()
+    _stop(broker, stop_price="1.10500", stop="1.10500")
+    [fill] = broker.on_bar(bar(1, open_="1.10600", close="1.10700", high="1.10800", low="1.10550"))
+    assert fill.price == Decimal("1.10600")

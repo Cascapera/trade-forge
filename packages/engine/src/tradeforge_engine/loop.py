@@ -214,9 +214,9 @@ def _to_order(
         # thing that closes a position at a level, and two paths closing one position is where
         # the ledger stops adding up (`BacktestBroker._reject_resting`). Said out loud, because
         # an exit that quietly became a market order is a strategy measuring something else.
-        if signal.limit_price is not None:
+        if signal.limit_price is not None or signal.stop_price is not None:
             logger.debug(
-                "exit signal at %s carries a limit price; exits fill at the open",
+                "exit signal at %s carries a resting price; exits fill at the open",
                 context.candle.time,
             )
 
@@ -245,6 +245,7 @@ def _to_order(
         reason=signal.reason,
         context=signal.context,
         limit_price=signal.limit_price,
+        stop_price=signal.stop_price,
         client_id=signal.client_id,
     )
 

@@ -209,7 +209,11 @@ jobs:
 
   commitlint:
     name: Conventional commits
-    if: github.event_name == 'pull_request'
+    # Feature PRs only. A release PR (develop -> main) carries commits that were
+    # already linted on their way into develop, and re-linting them lints history
+    # nobody can rewrite: one old violation would fail every release from here on.
+    # `feat: RSI indicator and literal comparison operands (#29)` is that commit.
+    if: github.event_name == 'pull_request' && github.base_ref != 'main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

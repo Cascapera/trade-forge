@@ -204,8 +204,19 @@ jobs:
           uv export --locked --no-emit-workspace --format requirements-txt > requirements.txt
           uvx pip-audit --requirement requirements.txt --strict --progress-spinner off
 
+      # `npm audit` answers "is an installed version vulnerable?". Whether the vulnerable path is
+      # reachable from *our* code is a different question, and only a human who has read the code
+      # can answer it. The gate below keeps failing on everything nobody has answered, and lets
+      # through only advisories with a written, dated argument in the allowlist (ADR-0017).
       - name: Audit JS dependencies (npm audit)
-        run: npm audit --audit-level=high
+        run: |
+          set -uo pipefail
+          # GitHub runs this with `bash -e`, and npm exits non-zero whenever it finds anything —
+          # which is the normal case here. `|| true` hands the verdict to the gate instead, and
+          # costs nothing: a report npm failed to produce is not valid JSON, so the gate exits 2
+          # ("could not run") rather than pretending the tree is clean.
+          npm audit --json > npm-audit.json || true
+          uv run --no-project --python 3.12 scripts/check_js_audit.py < npm-audit.json
 
   commitlint:
     name: Conventional commits

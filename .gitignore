@@ -23,6 +23,8 @@ requirements.txt
 node_modules/
 coverage/
 apps/web/dist/
+# The raw report the `Dependency audit` job pipes into scripts/check_js_audit.py.
+npm-audit.json
 *.tsbuildinfo
 
 # --- Playwright ---

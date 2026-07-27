@@ -101,6 +101,9 @@ select = [
 "**/tests/**" = ["S101", "PLR2004", "ANN201", "ANN401", "ARG001", "ARG002", "S106", "SIM117"]
 # A CLI's stdout *is* its interface; print is the right call there, not logging.
 "**/cli.py" = ["T201"]
+# Same argument for the CI scripts: their output is what a human reads in a failed job log,
+# and a logger configured by nobody would write it to nowhere.
+"scripts/*.py" = ["T201"]
 
 [tool.ruff.lint.flake8-tidy-imports]
 ban-relative-imports = "all"
@@ -109,6 +112,9 @@ ban-relative-imports = "all"
 # Without this, our own packages get sorted in with third-party libraries — the
 # import block stops showing, at a glance, what is ours and what we depend on.
 known-first-party = [
+    # A repo script, not a package (see mypy_path above) — but it is our code, and the import
+    # block should keep saying so at a glance.
+    "check_js_audit",
     "tradeforge_api",
     "tradeforge_collector",
     "tradeforge_db",
@@ -144,8 +150,12 @@ mypy_path = [
     "packages/db/src",
     "packages/engine/src",
     "packages/schema/src",
+    # `scripts/` is not a package and must not become one — the workflow runs those files
+    # directly, with no install step. Telling mypy where they live is what keeps them under
+    # --strict anyway, and mirrors the sys.path insertion in tests/conftest.py.
+    "scripts",
 ]
-files = ["apps/api", "apps/collector", "apps/executor", "packages", "tests"]
+files = ["apps/api", "apps/collector", "apps/executor", "packages", "scripts", "tests"]
 exclude = ["apps/web"]
 
 # Two third-party libraries ship no type information: MetaTrader5 (which has no Linux

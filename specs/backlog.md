@@ -214,3 +214,11 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
   `stop_loss` × (`limit_price` | `stop_price`) no `Signal` fecharia os dois de uma vez — mesma
   família da validação de lado que o `stop_price` já ganhou contra o `reference_price`. Fora do
   escopo do PR-207 porque muda o contrato da limite também, e isso pede seu aval.
+- [origem: PR-208] **Ordem órfã no live quando aparece uma posição estranha** — se uma posição que
+  a estratégia não abriu surgir com uma ordem descansando (trade manual na mesma conta, reconexão
+  do adaptador que replica estado), o fallback de posição do `_observe_fill` derruba o nome e marca
+  a virada como gasta, deixando no broker uma ordem viva que ninguém mais consegue cancelar. Mesma
+  forma que `setups.py` já tem, e **inalcançável no backtest** (só a nossa ordem abre posição), por
+  isso não é bug deste PR. O conserto real é reconciliação no adaptador live — casar ordens e
+  posições por `client_id` na reconexão — e vale resolver junto com o item de reconciliação do MT5
+  (o mesmo em que o executor precisa rotular exit de stop como `"sl"` literalmente).

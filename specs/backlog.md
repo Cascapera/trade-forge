@@ -214,3 +214,20 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
   `stop_loss` × (`limit_price` | `stop_price`) no `Signal` fecharia os dois de uma vez — mesma
   família da validação de lado que o `stop_price` já ganhou contra o `reference_price`. Fora do
   escopo do PR-207 porque muda o contrato da limite também, e isso pede seu aval.
+- [origem: PR-208] **Ordem órfã no live quando aparece uma posição estranha** — se uma posição que
+  a estratégia não abriu surgir com uma ordem descansando (trade manual na mesma conta, reconexão
+  do adaptador que replica estado), o fallback de posição do `_observe_fill` derruba o nome e marca
+  a virada como gasta, deixando no broker uma ordem viva que ninguém mais consegue cancelar. Mesma
+  forma que `setups.py` já tem, e **inalcançável no backtest** (só a nossa ordem abre posição), por
+  isso não é bug deste PR. O conserto real é reconciliação no adaptador live — casar ordens e
+  posições por `client_id` na reconexão — e vale resolver junto com o item de reconciliação do MT5
+  (o mesmo em que o executor precisa rotular exit de stop como `"sl"` literalmente).
+- [origem: PR-208] **`Candle` não valida positividade, e o lado vendido reage diferente do comprado**
+  — `Candle.__post_init__` só checa contenção do corpo e UTC, então um candle de preço não positivo
+  é construível. Com ele, `Mme9BreakoutStrategy._entry_for` diverge por lado: no LONG a guarda de
+  `stop_loss <= ZERO` faz a estratégia **calar** (não arma); no SHORT não há espelho — `stop_price`
+  seria o `low` não positivo e o `Signal.__post_init__` **levanta `ValueError`** em vez de não armar.
+  Preço negativo não é hipótese de laboratório (WTI liquidou a −37,63 em abril/2020). O conserto
+  certo é no `Candle` (validar preço positivo de uma vez, para a engine inteira), não uma guarda a
+  mais no setup — por isso ficou fora do PR-208. Decidir se o modelo aceita preço negativo como
+  dado válido; se aceitar, a guarda do LONG é que está errada.

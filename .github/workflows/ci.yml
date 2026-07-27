@@ -29,7 +29,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
@@ -105,7 +105,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
@@ -189,7 +189,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
@@ -204,8 +204,19 @@ jobs:
           uv export --locked --no-emit-workspace --format requirements-txt > requirements.txt
           uvx pip-audit --requirement requirements.txt --strict --progress-spinner off
 
+      # `npm audit` answers "is an installed version vulnerable?". Whether the vulnerable path is
+      # reachable from *our* code is a different question, and only a human who has read the code
+      # can answer it. The gate below keeps failing on everything nobody has answered, and lets
+      # through only advisories with a written, dated argument in the allowlist (ADR-0017).
       - name: Audit JS dependencies (npm audit)
-        run: npm audit --audit-level=high
+        run: |
+          set -uo pipefail
+          # GitHub runs this with `bash -e`, and npm exits non-zero whenever it finds anything —
+          # which is the normal case here. `|| true` hands the verdict to the gate instead, and
+          # costs nothing: a report npm failed to produce is not valid JSON, so the gate exits 2
+          # ("could not run") rather than pretending the tree is clean.
+          npm audit --json > npm-audit.json || true
+          uv run --no-project --python 3.12 scripts/check_js_audit.py < npm-audit.json
 
   commitlint:
     name: Conventional commits

@@ -209,6 +209,10 @@ markers = [
 branch = true
 relative_files = true
 source = [
+    # A path, not a module name: `scripts/` is not importable as a package (see mypy_path).
+    # It is here because the npm audit gate can silence security alarms, and a mechanism with
+    # that power whose coverage nobody measures is one that quietly stops being covered.
+    "scripts",
     "tradeforge_api",
     "tradeforge_collector",
     "tradeforge_db",

@@ -310,7 +310,7 @@ def test_a_turn_gives_one_trade_and_does_not_rearm_until_a_fresh_cross() -> None
 
 def test_a_short_enters_on_the_break_of_the_reference_low() -> None:
     """The mirror: a bar closes *below* the average, and the order rests at its low waiting for
-    price to break down through it. Bar 3 closes 99 under the MME3 of 100.5; its low 98.7 is the
+    price to break down through it. Bar 3 closes 99 under the MME3 of 100; its low 98.7 is the
     trigger, its high 102.1 the stop. Bar 4 breaks 98.7 and the short fills there."""
     candles = [
         bar(0, open_="100", close="100", high="100.5", low="99.5"),

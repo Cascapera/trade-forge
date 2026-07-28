@@ -129,6 +129,10 @@ class TradeOut(_Out):
     exit_price: Money | None
     exit_reason: str | None
     volume: Money
+    # The stop the trade was sized against, not the one it exited at — see the column comment
+    # in `tradeforge_db.models`. A trailed trade reports `exit_reason='sl'` with an
+    # `exit_price` some distance from this, and a table that renders them side by side without
+    # saying so invites the reader to file a bug against the engine.
     stop_loss: Money | None
     take_profit: Money | None
     gross_pnl: Money | None

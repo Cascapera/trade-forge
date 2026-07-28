@@ -119,6 +119,27 @@ def close_out(side: Side = Side.LONG, *, price: str = "1.10100", reason: str = "
     return Signal(kind=SignalKind.EXIT, side=side, reference_price=Decimal(price), reason=reason)
 
 
+def modify_stop(
+    *,
+    stop: str,
+    side: Side = Side.LONG,
+    price: str = "1.10100",
+    reason: str = "test",
+) -> Signal:
+    """Move the open position's stop to `stop` (ADR-0018).
+
+    `price` is along for the ride: `Signal` requires a `reference_price` and this intent has no
+    use for one — the broker reads the position's own side and level. Same as `CANCEL`.
+    """
+    return Signal(
+        kind=SignalKind.MODIFY_STOP,
+        side=side,
+        reference_price=Decimal(price),
+        stop_loss=Decimal(stop),
+        reason=reason,
+    )
+
+
 class ImmediateFillBroker:
     """Fills whatever is pending at the next bar's open. The honest minimum.
 
@@ -152,6 +173,18 @@ class ImmediateFillBroker:
         """Nothing ever rests here: everything pending fills at the very next open, so by the
         time anyone could withdraw an order it has already executed. Always false, which is
         the same answer the real broker gives for an order it cannot find."""
+        return False
+
+    def modify_stop(
+        self,
+        symbol: str,  # noqa: ARG002
+        stop_loss: Money,  # noqa: ARG002
+        decided_at: dt.datetime,  # noqa: ARG002
+    ) -> bool:
+        """There is no protective stop here to move. This broker fills what is pending at the
+        next open and nothing else — no intrabar stops, no targets — so a position it holds
+        carries no level a modification could reach. Always false, the same answer the real
+        broker gives when there is nothing to protect (ADR-0018)."""
         return False
 
     def on_bar(self, candle: Candle) -> Sequence[Fill]:

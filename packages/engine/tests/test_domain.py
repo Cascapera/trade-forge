@@ -143,3 +143,30 @@ def test_an_order_request_cannot_carry_both_a_limit_and_a_stop() -> None:
             stop_price=Decimal("1.10500"),
             client_id="zone-1",
         )
+
+
+# --------------------------------------------------------------------------- #
+# What a stop modification is allowed to be (ADR-0018)                          #
+# --------------------------------------------------------------------------- #
+
+
+def test_a_stop_modification_must_carry_the_new_level() -> None:
+    """The same shape of refusal as an anonymous cancel, and worse consequences. Reaching the
+    broker with no level, it would have to guess between "leave the stop alone" and "remove the
+    protection" — and one of those answers turns a stopped position into an unstopped one."""
+    with pytest.raises(ValueError, match="stop_loss is required"):
+        Signal(kind=SignalKind.MODIFY_STOP, side=Side.LONG, reference_price=Decimal("1.10000"))
+
+
+def test_a_stop_modification_is_not_an_order() -> None:
+    """It acts on a position that already exists. Built as an `OrderRequest` it would carry a
+    volume nobody asked for and sit in the queue waiting to open a *second* position."""
+    with pytest.raises(ValueError, match="not an order"):
+        OrderRequest(
+            symbol="EURUSD",
+            side=Side.LONG,
+            intent=SignalKind.MODIFY_STOP,
+            volume=Decimal(1),
+            decided_at=dt.datetime(2024, 1, 1, tzinfo=dt.UTC),
+            stop_loss=Decimal("1.09500"),
+        )

@@ -86,16 +86,22 @@ class AssetClass(StrEnum):
 
 
 class SignalKind(StrEnum):
-    """Open a position, close the one that is open, or withdraw an order still waiting.
+    """Open a position, close the open one, withdraw a waiting order, or move a live stop.
 
-    `CANCEL` is the odd one out on purpose: it is the only kind that never becomes an
-    `OrderRequest`. A resting limit order outlives the bar that placed it, so something has
-    to be able to take it back — see `Signal.client_id` and `Broker.cancel` (ADR-0014).
+    `CANCEL` and `MODIFY_STOP` are the odd ones out on purpose: they are the only kinds that
+    never become an `OrderRequest`. Both act on something that already exists rather than
+    asking for something new, so neither carries volume and neither can produce a fill.
+
+    A resting order outlives the bar that placed it, so something has to be able to take it
+    back — see `Signal.client_id` and `Broker.cancel` (ADR-0014). An open position outlives
+    it too, and its stop is the one level a strategy may want to move while the trade runs —
+    see `Broker.modify_stop` (ADR-0018).
     """
 
     ENTRY = "entry"
     EXIT = "exit"
     CANCEL = "cancel"
+    MODIFY_STOP = "modify_stop"
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,6 +245,12 @@ class Signal:
         # bar that could have explained it is gone.
         if self.kind is SignalKind.CANCEL and self.client_id is None:
             raise ValueError("a CANCEL names the order it withdraws: client_id is required")
+        # A stop modification with no level is the same shape of bug as a cancel with no name:
+        # an intent that reaches the broker meaning nothing. Worse here, because the broker
+        # would have to guess between "leave it" and "remove protection", and one of those
+        # answers turns a stopped position into an unstopped one.
+        if self.kind is SignalKind.MODIFY_STOP and self.stop_loss is None:
+            raise ValueError("a MODIFY_STOP carries the new level: stop_loss is required")
         if self.limit_price is not None and self.limit_price <= ZERO:
             raise ValueError(f"limit price must be positive, got {self.limit_price}")
         if self.stop_price is not None and self.stop_price <= ZERO:
@@ -291,9 +303,15 @@ class OrderRequest:
     *inside* a bar rather than at its open.
 
     One subtlety, and PR-105 depends on it: a protective exit (a stop or a target hit
-    intrabar) inherits the `decided_at` of the **entry** that placed it. That is honest —
-    the stop level was decided then — and it is what lets a stop trigger on the very bar
+    intrabar) inherits the `decided_at` of whatever **decided the level it came out at** —
+    for a target, and for a stop that was never moved, the entry that placed it. That is
+    honest, the level was decided then, and it is what lets a stop trigger on the very bar
     the position opened without tripping the lookahead guard.
+
+    A stop that `modify_stop` has since moved carries the instant of the bar that moved it
+    instead (ADR-0018), which is the same honesty applied to a level the entry no longer
+    owns. The two live side by side in `_Protection`, and the exit takes the stamp belonging
+    to the level that was actually hit.
     """
 
     symbol: str
@@ -325,6 +343,11 @@ class OrderRequest:
         # broker fills — which is exactly the queue it is supposed to empty.
         if self.intent is SignalKind.CANCEL:
             raise ValueError("a cancel is not an order: withdraw it through Broker.cancel")
+        # Same argument, same queue: a stop modification acts on a position that already
+        # exists. Built as an order it would carry a volume nobody asked for and sit in the
+        # queue waiting to open a *second* position (ADR-0018).
+        if self.intent is SignalKind.MODIFY_STOP:
+            raise ValueError("a stop modification is not an order: use Broker.modify_stop")
         if self.limit_price is not None and self.limit_price <= ZERO:
             raise ValueError(f"limit price must be positive, got {self.limit_price}")
         if self.stop_price is not None and self.stop_price <= ZERO:
@@ -380,6 +403,33 @@ class Position:
     entry_time: dt.datetime
     entry_costs: Money = ZERO
     stop_loss: Money | None = None
+    """The stop protecting this position **right now** — the level it would exit at today.
+
+    It moves. `Broker.modify_stop` tightens a stop mid-trade (ADR-0018) and this field moves
+    with it, because where a position's stop sits is a fact about the *position*, not about
+    the order that opened it. It is also what a real venue reports: MT5's `POSITION_SL` is
+    the current stop, not the one the entry carried.
+
+    **This is the field a trailing strategy reads** to decide whether a new level tightens.
+    Reading `initial_stop_loss` for that is how a strategy asks the engine to loosen a stop
+    it has already moved — and the engine refuses that with an `EngineError`.
+    """
+    initial_stop_loss: Money | None = None
+    """The stop the position **opened** with, frozen at the fill and never touched again.
+
+    The lot was sized against this distance (`PercentRiskManager`), so it is the money the
+    position stood to lose when it was opened. That makes it the only honest denominator for
+    an R multiple — measuring against a stop that has since been dragged to breakeven would
+    report every trailing win as an infinite one — and it is what `ClosedTrade.stop_loss`
+    records.
+
+    `None` on a position whose entry carried no stop, *including* one that was later given a
+    stop by `modify_stop`: nothing sized that lot against a level, so it has no R.
+
+    Before ADR-0018 a stop could not move, so one field said both of these things at once and
+    was right by accident. The moment it can move they are two different facts. `_Protection`
+    split its decision instant for exactly the same reason, one level down.
+    """
     take_profit: Money | None = None
     context: Mapping[str, Money | None] | None = None
     """The indicator snapshot from the entry that opened this position. See `Signal.context`."""
@@ -427,6 +477,13 @@ class ClosedTrade:
     net_pnl: Money
     reason: str = ""
     stop_loss: Money | None = None
+    """The stop this trade was **sized against** — the position's `initial_stop_loss`.
+
+    Not necessarily the level it exited at. A trade closed by a stop that `modify_stop` had
+    trailed reports `reason='sl'` with an `exit_price` some distance from this number, and
+    that is correct: this is the denominator `r_multiple` divides by, and a record whose
+    risk and whose R came from different stops would contradict itself.
+    """
     take_profit: Money | None = None
     r_multiple: Money | None = None
     """Net result in multiples of the risk taken: `net_pnl / (money risked at the stop)`. The

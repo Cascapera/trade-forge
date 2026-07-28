@@ -33,7 +33,7 @@ fill, because the multiple is measured from an entry price that does not exist u
 import datetime as dt
 import logging
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from typing import cast
 
@@ -51,7 +51,9 @@ from tradeforge_engine.domain import (
     Position,
     Side,
     SignalKind,
+    _require_utc,
 )
+from tradeforge_engine.errors import EngineError
 from tradeforge_engine.portfolio import Portfolio
 from tradeforge_engine.protocols import CostModel
 
@@ -126,15 +128,26 @@ def _survives_the_slip(order: OrderRequest, price: Money) -> bool:
 class _Protection:
     """The open position's protective levels, armed at the fill and cleared at the exit.
 
-    The three travel together — a stop with no decision instant could not build a lookahead-
-    safe exit — so they live in one object that is either wholly present or wholly `None`,
-    which is also what saves the exit path from asserting the decision instant back into
-    existence. `target` alone is optional: a stop without a take-profit is a valid position.
+    They travel together — a level with no decision instant could not build a lookahead-safe
+    exit — so they live in one object that is either wholly present or wholly `None`, which
+    is also what saves the exit path from asserting the decision instant back into existence.
+    `target` alone is optional: a stop without a take-profit is a valid position.
+
+    **Two decision instants, and collapsing them would be a bug.** `decided_at` is the
+    entry's, and it is what the target still answers to: the take-profit was computed at the
+    fill and has not moved since. `stop_decided_at` starts equal to it and is replaced every
+    time `modify_stop` moves the stop (ADR-0018), because from that moment the stop was
+    decided on a *later* bar than the entry — and `loop._reject_lookahead` compares that
+    stamp against the bar it is filling on. One shared field would have to lie about one of
+    the two levels, and the lie that matters is the cheap-looking one: a moved stop wearing
+    the entry's old stamp is a stop the guard will happily let fill inside the bar that
+    decided it.
     """
 
     stop: Money
     decided_at: dt.datetime
     target: Money | None
+    stop_decided_at: dt.datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -276,6 +289,69 @@ class BacktestBroker:
         trades that never happened — a silence, which is the hardest kind of bug to notice.
         """
         return tuple(resting.order for resting in self._resting)
+
+    def modify_stop(self, symbol: str, stop_loss: Money, decided_at: dt.datetime) -> bool:
+        """Move the open position's stop. Tighten only, and stamped with the deciding bar.
+
+        See `Broker.modify_stop` and ADR-0018. Three outcomes, and each says something
+        different:
+
+        * **`False`** — there is no position in `symbol` to protect. A race in live, nothing
+          at all in a backtest, and never an error either way.
+        * **`EngineError`** — the new level would move the stop *away* from price. The lot was
+          sized against the original stop, so this is a request to carry risk nobody
+          authorised, and it is what a sign error in a strategy looks like from here.
+        * **`True`** — the stop is now at `stop_loss`, carrying `decided_at` as its own
+          decision instant. `Position.stop_loss` moves with it, so the strategy reads back the
+          level it will actually exit at; `Position.initial_stop_loss`, the target, and the
+          target's instant are all untouched.
+        """
+        # Every other instant in the engine is validated where it is built (`OrderRequest`
+        # does it in `__post_init__`). This one never becomes an order, so without this line a
+        # naive datetime is accepted here, stored, and raises two bars later from inside the
+        # exit path — a stack trace pointing at the fill instead of at the caller.
+        _require_utc(decided_at, "modify_stop decided_at")
+
+        position = self._portfolio.position
+        if position is None or position.symbol != symbol:
+            return False
+
+        current = self._protection
+        if current is not None:
+            loosening = (
+                stop_loss < current.stop if position.side is Side.LONG else stop_loss > current.stop
+            )
+            if loosening:
+                raise EngineError(
+                    f"a {position.side.value} stop may only tighten: {stop_loss} moves away "
+                    f"from price against the current {current.stop}. The position was sized "
+                    f"against the original stop, so widening it carries risk nobody authorised "
+                    f"(ADR-0018)"
+                )
+            self._protection = replace(current, stop=stop_loss, stop_decided_at=decided_at)
+            # The ledger holds the other copy of this level, and it is the copy the *strategy*
+            # reads back through `Context.position`. Leaving it behind is what turns a moved
+            # stop into two answers to "where is my stop", with the strategy given the stale
+            # one — and then judged against the fresh one by the tightening rule above.
+            self._portfolio.amend_stop(stop_loss)
+            return True
+
+        # An unstopped position — the entry carried no `stop_loss`, so `_arm_protection` left
+        # nothing behind. Arming one now is the only direction this method ever moves risk in,
+        # and refusing it would be the engine declining to make a position safer. No target:
+        # the take-profit is computed from the entry price at the fill, and that moment is gone.
+        #
+        # `decided_at` is dead data on this branch — with `target=None` nothing ever reads it,
+        # because `_check_protective` only consults it for a non-`sl` exit. It is filled in
+        # rather than faked so that the day someone computes a target here, the instant it
+        # would be judged by is already the right one.
+        self._protection = _Protection(
+            stop=stop_loss, decided_at=decided_at, target=None, stop_decided_at=decided_at
+        )
+        # `initial_stop_loss` stays `None`: this position was never sized against a stop, so
+        # it has no R to report. Only the live level exists, and only now.
+        self._portfolio.amend_stop(stop_loss)
+        return True
 
     def on_bar(self, candle: Candle) -> Sequence[Fill]:
         fills: list[Fill] = []
@@ -537,7 +613,12 @@ class BacktestBroker:
             side=position.side,
             intent=SignalKind.EXIT,
             volume=position.volume,
-            decided_at=protection.decided_at,
+            # The stamp of the level that was actually touched. They differ only after a
+            # `modify_stop`, and that is exactly when using the wrong one would hide a
+            # lookahead: a stop moved on this bar's close must not be able to exit inside it,
+            # and `loop._reject_lookahead` can only say so if it is told when the stop was
+            # decided (ADR-0018).
+            decided_at=(protection.stop_decided_at if reason == "sl" else protection.decided_at),
             reason=reason,
         )
         cost = self._cost_model.exit_cost(exit_order, self._instrument, price)
@@ -682,7 +763,12 @@ class BacktestBroker:
             sign = 1 if order.side is Side.LONG else -1
             target = entry_price + sign * self._rr * risk
         self._protection = _Protection(
-            stop=order.stop_loss, decided_at=order.decided_at, target=target
+            stop=order.stop_loss,
+            decided_at=order.decided_at,
+            target=target,
+            # At the fill the two instants are the same fact stated twice: nothing has moved
+            # the stop yet. They diverge the first time `modify_stop` is called.
+            stop_decided_at=order.decided_at,
         )
 
     def _disarm_protection(self) -> None:

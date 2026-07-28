@@ -483,6 +483,10 @@ class Trade(Base):
     exit_price: Mapped[Decimal | None] = mapped_column(PRICE)
     exit_reason: Mapped[ExitReason | None] = mapped_column(_enum(ExitReason, "exit_reason"))
 
+    # The stop the trade was **sized against** — the level it opened with, not the one it
+    # closed at. A strategy that trails its stop (ADR-0018) exits at a level this column never
+    # saw, so `exit_reason = 'sl'` with `exit_price != stop_loss` is correct, not a bug. It is
+    # this number that `r_multiple` divides by, and the two have to come from the same stop.
     stop_loss: Mapped[Decimal | None] = mapped_column(PRICE)
     take_profit: Mapped[Decimal | None] = mapped_column(PRICE)
 

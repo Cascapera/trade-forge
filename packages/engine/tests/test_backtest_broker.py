@@ -20,6 +20,7 @@ from tradeforge_engine.domain import (
     Context,
     OrderRequest,
     OrderResult,
+    Position,
     Side,
     Signal,
     SignalKind,
@@ -1521,6 +1522,22 @@ def test_a_stop_whose_loss_sits_on_its_trigger_has_no_risk_to_measure() -> None:
 BAR_ONE = START + HOUR  # the bar the modifications below are decided on
 
 
+def _the_open_position(broker: BacktestBroker) -> Position:
+    """The one open position, asserted to be exactly one.
+
+    Not `[position] = broker.positions(...)`, tempting as that is: `positions()` returns
+    `(position,)` or `()`, and a static analyser can see the empty branch — it reads the
+    unpack as a mismatched multiple assignment, which is a fair reading of `[x] = ()`.
+
+    The sequence is not defensiveness either. A live MT5 account reports positions this
+    strategy never opened, so `Broker.positions` has to be able to answer with more than one;
+    phase 1 is what holds a single position at a time.
+    """
+    positions = broker.positions("EURUSD")
+    assert len(positions) == 1
+    return positions[0]
+
+
 def _open_a_long(broker: BacktestBroker, *, stop: str | None = "1.09000") -> None:
     """Fill a market long at 1.10000 on bar 1, so bar 2 onwards can test the stop."""
     _entry(broker, side=Side.LONG, stop=stop)
@@ -1833,7 +1850,7 @@ def test_the_position_reports_the_stop_it_would_exit_at_today() -> None:
 
     broker.modify_stop("EURUSD", Decimal("1.09500"), BAR_ONE)
 
-    [position] = broker.positions("EURUSD")
+    position = _the_open_position(broker)
     assert position.stop_loss == Decimal("1.09500")
     assert position.initial_stop_loss == Decimal("1.09000")
 
@@ -1947,7 +1964,7 @@ def test_a_stop_armed_on_an_unstopped_position_leaves_the_trade_without_an_r() -
     _open_a_long(broker, stop=None)
     broker.modify_stop("EURUSD", Decimal("1.09500"), BAR_ONE)
 
-    [position] = broker.positions("EURUSD")
+    position = _the_open_position(broker)
     assert (position.stop_loss, position.initial_stop_loss) == (Decimal("1.09500"), None)
 
     broker.on_bar(bar(2, open_="1.10000", close="1.09400", low="1.09400"))

@@ -17,6 +17,7 @@ backtest. `positions()` takes a symbol because a real MT5 account holds position
 strategy never opened — another EA's, a manual trade, another symbol entirely.
 """
 
+import datetime as dt
 from collections.abc import Sequence
 from typing import Protocol, runtime_checkable
 
@@ -80,6 +81,41 @@ class Broker(Protocol):
         order in this system is alive because a zone is alive, and zones are the strategy's
         vocabulary — the broker holding a rule like "cancel when the region is mitigated"
         would be the core learning what a region is (AGENTS.md §5.4, in spirit).
+        """
+        ...
+
+    def modify_stop(self, symbol: str, stop_loss: Money, decided_at: dt.datetime) -> bool:
+        """Move the protective stop of the open position in `symbol`. ADR-0018.
+
+        The one level a strategy may change while a trade runs. Not the target, not the size,
+        and not a resting order's planned stop — that one is cancelled and re-placed.
+
+        **`decided_at` is the caller's, and the caller is the loop.** It is the opening
+        instant of the bar whose close decided the new level, and it is what keeps the
+        anti-lookahead guard armed on a level that now changes mid-trade: a stop decided on
+        bar N must not be able to exit *inside* bar N. The loop's own ordering already
+        prevents that — `on_bar` runs before the strategy sees the bar — but an honest stamp
+        is what lets `loop._reject_lookahead` **prove** it instead of the ordering merely
+        happening to hold. Inherit the entry's stamp instead and the guard goes quiet on the
+        exact level that stopped being fixed.
+
+        **The stop may only tighten.** A long's new stop must be at or above the current one,
+        a short's at or below; equal is accepted, so a strategy recomputing the same level
+        every bar is not punished for it. Loosening raises: the position was sized against
+        the original stop (`RiskManager`), so moving it away adds risk nobody authorised, and
+        a sign error in a strategy is exactly how that happens.
+
+        **Returns false rather than raising when there is no position to protect.** Same
+        argument as `cancel`: in live the trade may have closed while the instruction was in
+        flight, and that is a race, not a bug. A position holding no protection at all *is*
+        modifiable — arming a stop where there was none only reduces risk.
+
+        **After a `True`, `positions()` must report the new level in `Position.stop_loss`.**
+        An implementation that moves the stop at the venue and keeps handing back the entry's
+        level publishes two answers to "where is my stop" and gives the strategy the stale
+        one — which is then judged against the fresh one by the tightening rule above, so a
+        trailing strategy asking the obvious question gets an `EngineError` it had no way to
+        avoid. `initial_stop_loss` does not move: that is the risk the lot was sized against.
         """
         ...
 

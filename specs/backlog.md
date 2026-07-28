@@ -231,3 +231,8 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
   certo é no `Candle` (validar preço positivo de uma vez, para a engine inteira), não uma guarda a
   mais no setup — por isso ficou fora do PR-208. Decidir se o modelo aceita preço negativo como
   dado válido; se aceitar, a guarda do LONG é que está errada.
+- [origem: PR-210] **`Portfolio.initial_capital` é um acessor morto** — a property existe desde o
+  PR-105 e nenhum chamador a lê (o `compute_metrics` recebe o capital inicial como argumento, não
+  do portfólio). É a única linha do módulo sem cobertura, e por isso a única que faz o `portfolio.py`
+  não fechar 100%. Não foi tocada neste PR porque é anterior a ele e um PR = um escopo: decidir se
+  apaga a property ou se o `RunResult`/métricas passam a lê-la em vez de receber o número por fora.

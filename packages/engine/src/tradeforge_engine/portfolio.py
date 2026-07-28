@@ -18,6 +18,7 @@ the DSL). This class enforces that rather than pretending to support a book it h
 been tested with.
 """
 
+from dataclasses import replace
 from decimal import Decimal
 
 from tradeforge_engine.domain import (
@@ -87,6 +88,20 @@ class Portfolio:
         """
         self._equity = self._balance + self._unrealised(candle.close)
 
+    def amend_stop(self, stop_loss: Money) -> None:
+        """Record that the open position's stop now sits at `stop_loss` (ADR-0018).
+
+        The ledger does not judge the level — whether a move is a tightening is the broker's
+        rule, and it has already been enforced by the time this is called. What the ledger
+        owes is that the position it hands out stops describing a stop that no longer exists.
+
+        `initial_stop_loss` deliberately does not move: it is the risk the lot was sized
+        against, and the denominator of every R multiple this trade will report.
+        """
+        if self._position is None:
+            raise EngineError("cannot move the stop of a position that is not open")
+        self._position = replace(self._position, stop_loss=stop_loss)
+
     # ----------------------------------------------------------------------- #
 
     def _open(self, fill: Fill) -> None:
@@ -117,6 +132,10 @@ class Portfolio:
             entry_time=fill.time,
             entry_costs=fill.costs,
             stop_loss=fill.order.stop_loss,
+            # The same level twice, on purpose: at the fill "where the stop is" and "where
+            # the stop started" are one fact. They separate the first time `modify_stop`
+            # moves one (ADR-0018), and only the left-hand one follows it.
+            initial_stop_loss=fill.order.stop_loss,
             take_profit=fill.order.take_profit,
             context=fill.order.context,
         )
@@ -161,7 +180,11 @@ class Portfolio:
             costs=costs,
             net_pnl=net,
             reason=fill.order.reason,
-            stop_loss=position.stop_loss,
+            # The stop the trade was *sized* against, not the one it died at. It is the level
+            # `r_multiple` divides by, and the record would contradict itself if the two came
+            # from different stops. A trade that exits at a trailed stop therefore reports an
+            # `exit_price` that is not this number — see `ClosedTrade.stop_loss`.
+            stop_loss=position.initial_stop_loss,
             take_profit=position.take_profit,
             r_multiple=self._r_multiple(position, net),
             context=position.context,
@@ -175,10 +198,16 @@ class Portfolio:
         The risk is measured at the *entry* — `|entry - stop| * per-lot value * volume` — which
         is the money the position stood to lose when it was opened. Dividing the net result by
         it turns a dollar figure into a comparable unit: +2R is the same edge on any size.
+
+        Hence `initial_stop_loss` and not `stop_loss`, which a trailing strategy moves. Divide
+        by the *current* stop and a trade whose stop reached breakeven divides by zero risk;
+        one trailed into profit divides by a negative. Neither is a number — and the trailing
+        setups this engine is being built for (the MME9 conduction) would produce them on
+        every winning trade.
         """
-        if position.stop_loss is None:
+        if position.initial_stop_loss is None:
             return None
-        distance = abs(position.entry_price - position.stop_loss)
+        distance = abs(position.entry_price - position.initial_stop_loss)
         risk = self._instrument.money_for(distance, position.volume)
         if risk <= ZERO:
             return None

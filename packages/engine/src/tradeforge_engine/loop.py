@@ -35,6 +35,7 @@ from tradeforge_engine.domain import (
     EquityPoint,
     Fill,
     InstrumentSpec,
+    Money,
     OrderRequest,
     Position,
     Signal,
@@ -160,6 +161,35 @@ def _run(  # noqa: PLR0913 — see run()
                 # `Signal.__post_init__` has already refused a cancel with no name, so this
                 # is a `str`. Narrowing it again would add a branch no test could enter.
                 broker.cancel(cast(str, signal.client_id))
+                continue
+
+            # A stop modification skips sizing and the veto for the same reasons, and adds one
+            # of its own: **the decision instant is stamped here, not by the strategy**. It is
+            # this candle's opening time, so a stop decided on this bar's close cannot exit
+            # inside this bar — `_reject_lookahead` checks it on the way out. The loop already
+            # guarantees that by ordering (`broker.on_bar` ran before the strategy saw the
+            # bar), but ordering is a fact about these lines; the stamp is a fact the engine
+            # can verify. See ADR-0018.
+            if signal.kind is SignalKind.MODIFY_STOP:
+                # `Signal.__post_init__` refuses a MODIFY_STOP with no level, same as a
+                # nameless cancel — so this is a `Money`.
+                moved = broker.modify_stop(
+                    instrument.symbol, cast(Money, signal.stop_loss), candle.time
+                )
+                # Refused. Usually a strategy trailing a stop onto an entry that has not
+                # filled yet; but a broker holding a position it keeps no protective level for
+                # refuses too, and from here the two are the same answer. So the line reports
+                # the refusal and stops there — naming a cause the loop never checked is how a
+                # log turns into a false lead. Silence is not an option either: it looks
+                # exactly like a trailing rule that ran and worked, which is the one difference
+                # the author is trying to see. Same reason `_to_order` logs an exit with no
+                # open position.
+                if not moved:
+                    logger.debug(
+                        "broker refused the stop modification at %s (%s)",
+                        candle.time,
+                        signal.reason,
+                    )
                 continue
 
             order = _to_order(signal, context, instrument, risk)

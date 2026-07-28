@@ -61,6 +61,7 @@ def round_trip(  # noqa: PLR0913 — keyword-only; a round trip simply has this 
     entry_costs: Decimal,
     exit_costs: Decimal,
     index: int,
+    trail_stop_to: Decimal | None = None,
 ) -> None:
     open_order = OrderRequest(
         symbol="EURUSD",
@@ -86,6 +87,8 @@ def round_trip(  # noqa: PLR0913 — keyword-only; a round trip simply has this 
             costs=entry_costs,
         )
     )
+    if trail_stop_to is not None:
+        portfolio.amend_stop(trail_stop_to)
     portfolio.apply(
         Fill(
             order=close_order,
@@ -193,3 +196,47 @@ def test_a_short_through_the_whole_loop_makes_money_when_price_falls() -> None:
     assert trade.side is Side.SHORT
     assert trade.net_pnl > 0
     assert result.final_account.balance > Decimal(10_000)
+
+
+@given(
+    trades=st.lists(
+        st.tuples(sides, volumes, prices, prices, costs, costs, prices),
+        min_size=1,
+        max_size=12,
+    )
+)
+@settings(max_examples=200)
+def test_trailing_the_stop_mid_trade_moves_no_money(
+    trades: list[tuple[Side, Decimal, Decimal, Decimal, Decimal, Decimal, Decimal]],
+) -> None:
+    """The same property, with `amend_stop` called between every entry and its exit (ADR-0018).
+
+    A stop is an *instruction*, not a cash flow: moving one changes where a trade would end, and
+    nothing else. It is the kind of claim that is obviously true until the day the ledger starts
+    deriving a number from the field being moved — and this suite exists precisely because that
+    is how the engine's original accounting bug hid. Any level, on any side, including ones far
+    from the trade's own prices; the reconciliation is not allowed to notice.
+    """
+    initial = Decimal(1_000_000)
+    portfolio = Portfolio(initial_capital=initial, instrument=EURUSD)
+
+    for index, (side, volume, entry_price, exit_price, entry_costs, exit_costs, stop) in enumerate(
+        trades
+    ):
+        round_trip(
+            portfolio,
+            side=side,
+            volume=volume,
+            entry_price=entry_price,
+            exit_price=exit_price,
+            entry_costs=entry_costs,
+            exit_costs=exit_costs,
+            index=index,
+            trail_stop_to=stop,
+        )
+
+    recorded = sum((trade.net_pnl for trade in portfolio.trades), Decimal(0))
+
+    assert recorded == portfolio.account().balance - initial
+    # And the trades still report the entry's stop — which here was never set, so no R at all.
+    assert all(trade.stop_loss is None and trade.r_multiple is None for trade in portfolio.trades)

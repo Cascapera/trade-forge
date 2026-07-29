@@ -17,23 +17,31 @@ price has visited the region and left again": the first return to a zone is the 
 will ever get, and a machine that waits for the second one watches the trade it was built for go
 past.
 
-**What this module does not do.** It never closes a position. The stop and the target are the
-broker's protective exits (`take_profit_rr`), armed at the fill and left alone. Trailing the stop
-— breakeven at the first break in favour, then behind confirmed swings — is a real part of the
-method and is deliberately not here: moving the stop of an open position is a new verb on the
-`Broker` protocol, so it gets its own ADR and its own review.
+**What this module does not do.** It never closes a position. The exits are the broker's — the
+target at a multiple of risk (`take_profit_rr`) and the stop — and the strategy reaches them only
+to *tighten*, never to leave. The trade ends at a level, always.
+
+**The stop is conducted by structure.** The first break of structure in the trade's favour brings
+the stop to the entry price; every break after it brings the stop to that break's `origin` — the
+low the up-move came from, which is the level whose loss would turn the trend (`StructureBreak`).
+So the stop walks up behind the structure it is riding, and sits exactly where being wrong would
+be *proven*, not merely feared. Touching a multiple of the initial risk brings it to the entry
+price too, and the two rules run at once with the tighter one winning (`conduction.py`).
 """
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from typing import Protocol
 
+from tradeforge_engine.conduction import breakeven_candidate, tighten
 from tradeforge_engine.domain import (
     ZERO,
     Candle,
     Context,
     Money,
+    Position,
     Side,
     Signal,
     SignalKind,
@@ -45,6 +53,7 @@ from tradeforge_engine.structure import (
     StructureBreak,
     StructureKind,
     TrackedZone,
+    Trend,
     ZoneKind,
 )
 
@@ -316,14 +325,18 @@ class StructureStrategy:
         name: str = "structure",
         allow_secondary: bool = False,
         stop_buffer: Decimal = DEFAULT_STOP_BUFFER,
+        breakeven_at_r: Decimal | None = Decimal(2),
     ) -> None:
         if stop_buffer < ZERO:
             raise ValueError(f"stop buffer is a fraction of the zone width, got {stop_buffer}")
+        if breakeven_at_r is not None and breakeven_at_r <= ZERO:
+            raise ValueError(f"breakeven R multiple must be positive, got {breakeven_at_r}")
 
         self._qualifier = qualifier
         self._name = name
         self._allow_secondary = allow_secondary
         self._stop_buffer = stop_buffer
+        self._breakeven_at_r = breakeven_at_r
 
         self._structure = MarketStructure()
         self._blocks = OrderBlockDetector()
@@ -336,6 +349,22 @@ class StructureStrategy:
         # what lets the machinery tell the qualifier *how* a trade ended — see
         # `SetupContext.stopped`.
         self._filled: OrderBlock | None = None
+        # Breaks of structure in the open trade's favour. Only the *first* is special (it means
+        # breakeven); after that each one names its own origin, so the count saturates in meaning
+        # and is only ever compared against one.
+        #
+        # It is keyed by the trade it belongs to rather than reset by an event, and that is the
+        # whole point: a counter reset *at the fill* is correct only for as long as every path
+        # that opens a trade goes through `_observe_fill`, and the day one does not, the next
+        # trade's first break silently takes the second break's branch — putting the stop at a
+        # leg origin below the entry, so the trade goes on carrying risk the method says it
+        # already gave up. Keyed this way, a trade that never announced itself still counts from
+        # zero, because it is a different trade.
+        self._breaks_in_favour = 0
+        self._counting_for: datetime | None = None
+        # The bar a fill was observed on. The breakeven rule reads the bar's extremes, and on this
+        # one bar those extremes are not the trade's — see `_conduct`.
+        self._fill_bar: datetime | None = None
 
     def on_bar(self, context: Context) -> tuple[Signal, ...]:
         candle = context.candle
@@ -344,13 +373,20 @@ class StructureStrategy:
 
         self._observe_fill(context)
 
-        if context.position is not None:
-            # It is the broker's stop and target that end a trade — nothing rests and nothing
-            # may be armed while this phase's one position is open. Any name still armed here
-            # never reached the book (`_observe_fill` already forgot a placed one), and holding
-            # it would leave it going stale behind a position it knows nothing about.
+        position = context.position
+        if position is not None:
+            # Nothing rests and nothing may be armed while this phase's one position is open. Any
+            # name still armed here never reached the book (`_observe_fill` already forgot a
+            # placed one), and holding it would leave it going stale behind a position it knows
+            # nothing about.
+            #
+            # What this bar can still owe is a *tightening*. It is the broker's stop and target
+            # that end the trade — the strategy never closes one — but the stop is the strategy's
+            # to move, and the break of structure that moves it arrives on exactly the bars this
+            # branch used to return empty from.
             self._armed = None
-            return ()
+            conducted = self._conduct(position, context, break_)
+            return () if conducted is None else (conducted,)
 
         signals: list[Signal] = []
         stopped, won = self._trade_outcome(context)
@@ -400,6 +436,85 @@ class StructureStrategy:
 
         return tuple(signals)
 
+    def _conduct(
+        self, position: Position, context: Context, break_: StructureBreak | None
+    ) -> Signal | None:
+        """The open trade's stop, moved by whichever rule is tighter — or `None` to leave it.
+
+        Two rules, and **neither of them closes the position**:
+
+        * **The first break of structure in the trade's favour** brings the stop to the entry
+          price. Every break after it brings the stop to that break's `origin`.
+        * **Touching a multiple of the initial risk** brings it to the entry price as well.
+
+        The two run at once and the tighter wins, which no code here decides — `tighten` simply
+        never asks for a level that fails to improve on the one in force (ADR-0018).
+
+        **Why `origin` and not the price that was broken.** `StructureBreak.level` is where the
+        move went *through*; `origin` is where it came *from* — the lowest low of the leg, and
+        the very level the next opposite CHoCH is anchored to. Trailing behind it puts the stop
+        where the trend would be **disproven**, not merely where it looks tired. Behind `level`
+        the stop would sit inside the move it is riding and be taken by any ordinary pullback.
+
+        **Only a BOS counts, read literally from the author's rule** ("breakeven no 1º BOS a
+        favor"). A CHoCH in our favour is arguably the first structural event on our side too,
+        and if it should count this is the line to change — but guessing it would quietly widen
+        a rule that was stated narrowly.
+
+        **The breakeven rule sits out the bar that filled, and this is a correctness fix rather
+        than caution.** It reads the bar's extremes, and a *limit* entry fills in the middle of a
+        bar the trade did not live through: the order rests where price has to come back to, so
+        the excursion in our favour happens **before** the fill. Measured on the ladder golden, a
+        sell filling at 103 sat on a bar whose low was 87 — past its own 2R line of 89.80 — and
+        crediting that print turned a full-R loser into a scratch. No future data is read, which is
+        exactly what makes it dangerous: every backtest gets quietly better and no number looks
+        wrong. The swing family does not need this guard, because a *stop* entry fills going
+        through its level in the direction of travel, so the bar's favourable extreme is
+        necessarily after the fill.
+
+        The structural rule keeps running on that bar: a break of structure is confirmed by the
+        **close**, which is after any fill inside it.
+        """
+        candle = context.candle
+        candidates: list[Money] = []
+
+        if position.entry_time != self._counting_for:
+            self._counting_for, self._breaks_in_favour = position.entry_time, 0
+
+        if candle.time != self._fill_bar:
+            breakeven = breakeven_candidate(
+                position=position,
+                side=position.side,
+                candle=candle,
+                multiple=self._breakeven_at_r,
+            )
+            if breakeven is not None:
+                candidates.append(breakeven)
+
+        if (
+            break_ is not None
+            and break_.kind is StructureKind.BOS
+            and self._favours(break_, position)
+        ):
+            self._breaks_in_favour += 1
+            candidates.append(
+                position.entry_price if self._breaks_in_favour == 1 else break_.origin
+            )
+
+        return tighten(
+            position=position,
+            side=position.side,
+            candle=candle,
+            candidates=candidates,
+            reason=f"trail.{self._name}",
+        )
+
+    @staticmethod
+    def _favours(break_: StructureBreak, position: Position) -> bool:
+        """Does this break push the trend the way the open trade is pointing?"""
+        wanted = Trend.BULLISH if position.side is Side.LONG else Trend.BEARISH
+        return break_.trend is wanted
+
     def _observe_fill(self, context: Context) -> None:
         """Notice the armed order becoming a trade, and spend its zone for good.
 
@@ -424,6 +539,7 @@ class StructureStrategy:
             self._traded.add(armed.block)
             self._filled = armed.block
             self._armed = None
+            self._fill_bar = context.candle.time
 
     def _trade_outcome(self, context: Context) -> tuple[OrderBlock | None, OrderBlock | None]:
         """`(stopped, won)` — the zone whose trade ended on this bar, by how it ended.

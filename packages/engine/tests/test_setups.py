@@ -245,6 +245,8 @@ def _drive(
     candles: list[Candle],
     *,
     position_on: frozenset[int] = frozenset(),
+    held: Position | None = None,
+    held_by_bar: dict[int, Position] | None = None,
 ) -> list[list[Signal]]:
     """Feed candles one at a time and collect the signals each bar produced.
 
@@ -252,13 +254,21 @@ def _drive(
     filled the order — the strategy reads `context.position`, not the fill. Given as a set of bars
     rather than "from here on" because the interesting case is a trade that *ends*: the machinery
     has to still be right on the bars after the stop closed it.
+
+    `held` is for conduction: those scenarios need a fixed entry price and known stops, because
+    what the strategy computes is measured *from* them. Without it the position is a placeholder
+    whose only job is to exist. `held_by_bar` is the same thing per bar, for the scenarios that
+    need **two different trades** — which is the only way to see state leak from one to the next.
     """
+    by_bar = held_by_bar or {}
     out: list[list[Signal]] = []
     with localcontext(ENGINE_CONTEXT):
         for index, candle in enumerate(candles):
             position = None
-            if index in position_on:
-                position = Position(
+            if index in by_bar:
+                position = by_bar[index]
+            elif index in position_on:
+                position = held or Position(
                     symbol=AAPL.symbol,
                     side=Side.LONG,
                     volume=Decimal(1),
@@ -484,15 +494,23 @@ def test_a_live_zone_keeps_its_order_resting() -> None:
 
 
 def test_nothing_is_armed_while_a_position_is_open() -> None:
-    """This phase holds one position at a time, and the trade is the broker's to end.
+    """This phase holds one position at a time, and the trade is the broker's to *end*.
 
     A position open means our order filled. Arming another zone would submit an entry the broker
     refuses, and withdrawing the filled order would be a cancel for something that no longer
     rests — noise either way.
+
+    The stop is the exception, and the only one: the strategy may move it. Bar 9 of this impulse
+    confirms a bullish BOS, which is the open long's first break in favour, so it asks for
+    breakeven — the entry price, 124. What no bar may produce is an entry or a cancel.
     """
     signals = _drive(StructureStrategy(qualifier=_Marked()), _IMPULSE, position_on=frozenset({9}))
 
-    assert all(bar_signals == [] for bar_signals in signals)
+    kinds = {signal.kind for bar_signals in signals for signal in bar_signals}
+    assert kinds <= {SignalKind.MODIFY_STOP}
+    assert [(index, s.stop_loss) for index, b in enumerate(signals) for s in b] == [
+        (9, Decimal("124"))
+    ]
 
 
 def test_an_order_waits_for_price_to_clear_the_zone_before_it_is_placed() -> None:
@@ -1639,3 +1657,265 @@ def test_max_bos_below_one_is_refused() -> None:
     almost always a mistake, so it is refused rather than silently armed to never fire."""
     with pytest.raises(ValueError, match="count of breaks"):
         ContinuationQualifier(max_bos=0)
+
+
+# --------------------------------------------------------------------------- #
+# The conduction: structure moves the stop, and none of it is an exit           #
+# --------------------------------------------------------------------------- #
+
+
+def _held(*, entry: str, stop: str, side: Side = Side.LONG) -> Position:
+    """An open position with known levels, so what the conduction computes can be measured."""
+    return Position(
+        symbol=AAPL.symbol,
+        side=side,
+        volume=Decimal(1),
+        entry_price=Decimal(entry),
+        entry_time=_at(0),
+        stop_loss=Decimal(stop),
+        initial_stop_loss=Decimal(stop),
+    )
+
+
+def _trails(signals: list[list[Signal]]) -> list[list[Decimal | None]]:
+    """The stop levels asked for on each bar. `None` is kept rather than filtered: a
+    `MODIFY_STOP` carrying no level is a bug that must not read as "no signal"."""
+    return [
+        [s.stop_loss for s in per_bar if s.kind is SignalKind.MODIFY_STOP] for per_bar in signals
+    ]
+
+
+# Two more bars of trend after the impulse: a pair of corrections, then a close above the 125 top.
+# `MarketStructure` confirms a second bullish BOS on bar 12, whose origin is bar 11's low of 117.
+_SECOND_LEG = [
+    bar(10, open_="123", close="123", high="124", low="119"),  # correction 1
+    bar(11, open_="121", close="121", high="122", low="117"),  # correction 2 -> armed
+    bar(12, open_="127", close="127", high="128", low="122"),  # close 127 > 125 -> BOS up
+]
+
+
+def test_the_first_break_in_favour_brings_the_stop_to_the_entry_price() -> None:
+    """The author's rule, first half: breakeven at the first break of structure in our favour.
+
+    Bar 9 closes 124 above the 123 top and confirms a bullish BOS — the open long's first break.
+    The stop goes to 100, the entry. The multiple-of-risk rule stays out of it on purpose: risk
+    is 15, so its line is at 130 and bar 9's high of 125 does not reach it. One rule at a time.
+    """
+    signals = _drive(
+        StructureStrategy(qualifier=_Marked()),
+        _IMPULSE,
+        position_on=frozenset({9}),
+        held=_held(entry="100", stop="85"),
+    )
+
+    assert _trails(signals)[9] == [Decimal("100")]
+
+
+def test_every_break_after_the_first_puts_the_stop_at_the_leg_origin() -> None:
+    """The second half, and the reason `origin` is the field that matters.
+
+    Bar 12 confirms a second bullish BOS. Its `level` is 125 — the price the move went *through* —
+    and its `origin` is 117, the low the move came *from*. The stop goes to 117: behind the
+    structure being ridden, at the price whose loss would turn the trend, rather than inside the
+    move where an ordinary pullback would take it out.
+
+    Bars 10 and 11 are the corrections that armed the break, and they ask for nothing. Between
+    breaks the stop does not move — there is no bar-by-bar trailing in this method either.
+    """
+    signals = _drive(
+        StructureStrategy(qualifier=_Marked()),
+        [*_IMPULSE, *_SECOND_LEG],
+        position_on=frozenset({9, 10, 11, 12}),
+        held=_held(entry="100", stop="85"),
+    )
+
+    assert _trails(signals)[9] == [Decimal("100")]
+    assert _trails(signals)[10] == []
+    assert _trails(signals)[11] == []
+    assert _trails(signals)[12] == [Decimal("117")]
+
+
+def test_a_break_against_the_open_trade_moves_nothing() -> None:
+    """Only breaks in the trade's own direction conduct it. Bar 9's BOS is bullish and this
+    position is short, so it is not this trade's news. Its risk line is out of reach too — entry
+    100 against a stop of 115 puts twice the risk at 70, and the bar's low is 120."""
+    signals = _drive(
+        StructureStrategy(qualifier=_Marked()),
+        _IMPULSE,
+        position_on=frozenset({9}),
+        held=_held(entry="100", stop="115", side=Side.SHORT),
+    )
+
+    assert _trails(signals)[9] == []
+
+
+def test_touching_the_multiple_of_risk_brings_the_stop_to_the_entry_price() -> None:
+    """The rule that does not need structure at all, and the exact boundary of its trigger.
+
+    Entry 100 against a stop of 91 risks 9, so twice the risk sits at **118** — bar 8's high,
+    exactly. Reaching the line is reaching it. Bar 8 confirms no break of structure, so the level
+    asked for here can only have come from the risk rule.
+    """
+    signals = _drive(
+        StructureStrategy(qualifier=_Marked()),
+        _IMPULSE,
+        position_on=frozenset({8}),
+        held=_held(entry="100", stop="91"),
+    )
+
+    assert _trails(signals)[8] == [Decimal("100")]
+
+
+def test_switching_breakeven_off_leaves_structure_conducting_alone() -> None:
+    """`None` is a setting, not a missing value: the risk rule is gone and structure is not.
+
+    The same bar 8 that reached twice the risk above now asks for nothing, while bar 9's break
+    still moves the stop. Being able to run the method without the risk rule is what makes "does
+    taking this trade to breakeven early pay for itself" a question a backtest can answer.
+    """
+    signals = _drive(
+        StructureStrategy(qualifier=_Marked(), breakeven_at_r=None),
+        _IMPULSE,
+        position_on=frozenset({8, 9}),
+        held=_held(entry="100", stop="91"),
+    )
+
+    assert _trails(signals)[8] == []
+    assert _trails(signals)[9] == [Decimal("100")]
+
+
+def test_the_bar_that_filled_does_not_credit_its_own_excursion() -> None:
+    """A limit fills in the middle of a bar the trade did not live through, and the favourable
+    extreme of that bar is usually **before** the fill.
+
+    The ladder scenario is the measurement. The sell fills at 103 on bar 16, whose low is 87 —
+    past its own twice-the-risk line of 89.80 (entry 103, stop 109.60). The order rests where
+    price has to come *back* to, so the market fell to 87 while the account was flat and only
+    then rose through 103 to fill. Crediting that print would arm breakeven on the fill bar, and
+    bar 17 would take the trade out at 103 instead of 109.60 — a full-R loser turned into a
+    scratch, in a backtest where no number looks wrong and nothing reads the future.
+
+    So the trade must still lose its full R. A regression test with a price attached.
+    """
+    after = [
+        bar(16, open_="88", close="96", high="104", low="87"),  # fills at 103; its low is pre-fill
+        bar(17, open_="96", close="112", high="113", low="95"),  # takes the untouched stop
+        bar(18, open_="112", close="116", high="121", low="111"),
+    ]
+    result = run(
+        candles=[*_IMPULSE, *_TWO_ZONE_LEG, *after],
+        timeframe=HOUR,
+        instrument=AAPL,
+        strategy=StructureStrategy(qualifier=ChochQualifier(), allow_secondary=True),
+        broker=BacktestBroker(instrument=AAPL, initial_capital=Decimal(10_000)),
+        risk=FixedRisk(volume=Decimal(1)),
+    )
+
+    [first] = result.trades
+    assert (first.entry_price, first.exit_price) == (Decimal("103"), Decimal("109.60"))
+    assert first.r_multiple == Decimal(-1)
+
+
+def test_a_short_is_conducted_by_the_mirror_of_the_same_rules() -> None:
+    """The bearish mirror of the impulse: bar 9 confirms a bearish BOS, and the open short's
+    first break in favour brings its stop to the entry price."""
+    signals = _drive(
+        StructureStrategy(qualifier=_Marked()),
+        _mirror(_IMPULSE),
+        position_on=frozenset({9}),
+        held=_held(entry="100", stop="115", side=Side.SHORT),
+    )
+
+    assert _trails(signals)[9] == [Decimal("100")]
+
+
+def test_the_breakeven_multiple_must_be_positive() -> None:
+    """Zero is refused rather than read as "off" — `None` is how the rule is switched off. A
+    multiple of zero would put the trigger on the entry price itself, arming breakeven on the
+    very bar that opened the trade."""
+    with pytest.raises(ValueError, match="breakeven R multiple"):
+        StructureStrategy(qualifier=_Marked(), breakeven_at_r=Decimal(0))
+
+
+# A third leg after `_SECOND_LEG`, so one instance can see a break of structure, then a *second*
+# trade, then another break. Bar 12's gap over bar 10's high is what makes it a leg with an
+# inefficiency; bar 15 breaks the 131 top it left, and its origin is 123.
+_THIRD_LEG = [
+    bar(13, open_="129", close="129", high="130", low="125"),  # correction 1
+    bar(14, open_="127", close="127", high="128", low="123"),  # correction 2
+    bar(15, open_="133", close="133", high="134", low="132"),  # close 133 > 131 -> BOS up
+]
+
+_GAPPED_SECOND_LEG = [
+    bar(10, open_="123", close="123", high="124", low="119"),  # correction 1
+    bar(11, open_="121", close="121", high="122", low="117"),  # correction 2
+    bar(12, open_="128", close="130", high="131", low="126"),  # gaps over 124 -> BOS up
+]
+
+
+def test_the_count_of_breaks_belongs_to_the_trade_not_to_the_strategy() -> None:
+    """A second trade's first break is *its* first, and it gets breakeven — not the origin.
+
+    Bar 9 breaks structure with one trade open, so that trade has had its first. Bar 15 breaks
+    structure again with a **different** trade open, and it must be read as that trade's first:
+    the stop goes to 100, its entry. A count that survived the change of trade would send bar 15
+    down the second-break branch and put the stop at the leg's origin, **123** — and on a long
+    entered at 100 that is not merely a different number, it is a stop the trade has already
+    passed, so `tighten` accepts it and the position goes on carrying risk the method says was
+    given up two bars ago.
+
+    The two trades are told apart by `entry_time`, which is why this cannot depend on the fill
+    ever having been announced. Twice the risk stays out of it: the stop is 80, so that line sits
+    at 140 and nothing in this stream reaches it.
+    """
+    stream = [*_IMPULSE, *_GAPPED_SECOND_LEG, *_THIRD_LEG]
+    first = _held(entry="100", stop="80")
+    second = Position(
+        symbol=AAPL.symbol,
+        side=Side.LONG,
+        volume=Decimal(1),
+        entry_price=Decimal(100),
+        entry_time=stream[13].time,  # a different trade: same levels, later entry
+        stop_loss=Decimal(80),
+        initial_stop_loss=Decimal(80),
+    )
+    signals = _drive(
+        StructureStrategy(qualifier=_Marked()),
+        stream,
+        held_by_bar={9: first, 13: second, 14: second, 15: second},
+    )
+
+    assert _trails(signals)[9] == [Decimal("100")]  # trade one's first break
+    assert _trails(signals)[13] == []
+    assert _trails(signals)[14] == []
+    assert _trails(signals)[15] == [Decimal("100")]  # trade two's first break, not the origin
+
+
+# The mirrored impulse breaks structure downward on bar 9; price then climbs back through the
+# anchor that break left, which confirms a bullish CHoCH on bar 11 (level 110).
+_CLIMB_BACK = [
+    bar(10, open_="80", close="95", high="98", low="78"),
+    bar(11, open_="95", close="115", high="118", low="94"),
+]
+
+
+def test_a_change_of_character_in_our_favour_is_not_a_break_in_our_favour() -> None:
+    """The author's rule names the **BOS**, and reading it literally is a decision with teeth.
+
+    Bar 11 confirms a bullish CHoCH while a long is open — structurally good news, pointing our
+    way. It moves nothing. A version that counted it would not merely act one event early: it
+    would spend the *first break* slot on the change of character, so the BOS that actually
+    follows would take the second-break branch and hand the stop a leg origin instead of the
+    entry price. Every rung of that trade's stop after it would be one step wrong.
+
+    Twice the risk is out of reach here as well (entry 100 against a stop of 85 puts it at 130,
+    and the bar's high is 118), so silence is the only correct answer.
+    """
+    signals = _drive(
+        StructureStrategy(qualifier=_Marked()),
+        [*_mirror(_IMPULSE), *_CLIMB_BACK],
+        position_on=frozenset({10, 11}),
+        held=_held(entry="100", stop="85"),
+    )
+
+    assert _trails(signals)[11] == []

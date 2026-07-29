@@ -1176,6 +1176,34 @@ def test_a_conducted_level_at_or_below_zero_is_refused_rather_than_sent() -> Non
     assert _trails(signals)[3] == []
 
 
+def test_a_conducted_level_of_exactly_zero_is_refused_too() -> None:
+    """The boundary the test above does not reach, despite its name.
+
+    There a low of 0.01 against a two-tick buffer lands on **-0.01**, which any reading of the
+    guard refuses. Here the low is 0.02 — exactly two ticks — so the level is **0.00**, and only
+    a guard written as "at or below" stays silent. Zero is not a price at which a stop can rest,
+    and a version demanding strictly negative would send it.
+
+    The position carries no stop, and that is what makes the boundary visible at all: against a
+    stop already in force, 0.00 fails the *improvement* test first and the zero guard is never
+    reached. Only a trade with nothing to improve on lets this guard answer for itself.
+    """
+    candles = [
+        bar(0, open_="0.10", close="0.10", high="0.11", low="0.09"),
+        bar(1, open_="0.10", close="0.09", high="0.10", low="0.08"),
+        bar(2, open_="0.09", close="0.08", high="0.09", low="0.07"),
+        bar(3, open_="0.08", close="0.02", high="0.08", low="0.02"),
+    ]
+    signals = _drive(
+        Mme9BreakoutStrategy(period=3, stop_buffer_ticks=2),
+        candles,
+        position_on=frozenset({3}),
+        held=_held(entry="0.10", stop=None),
+    )
+
+    assert _trails(signals)[3] == []
+
+
 def test_a_flat_account_is_never_conducted() -> None:
     """No position, no stop to move — across a scenario that would otherwise fire both rules. A
     `MODIFY_STOP` emitted here is answered `False` by the broker and dropped, so what this guards

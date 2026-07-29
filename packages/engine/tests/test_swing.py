@@ -22,6 +22,7 @@ from tradeforge_engine.domain import (
     Candle,
     Context,
     Fill,
+    Money,
     OrderRequest,
     Position,
     Side,
@@ -89,6 +90,7 @@ def _drive(
     candles: list[Candle],
     *,
     position_on: frozenset[int] = frozenset(),
+    held: Position | None = None,
     fills_on: dict[int, list[Fill]] | None = None,
 ) -> list[list[Signal]]:
     """Feed candles one at a time and collect the signals each bar produced.
@@ -105,7 +107,10 @@ def _drive(
         for index, candle in enumerate(candles):
             position = None
             if index in position_on:
-                position = Position(
+                # `held` is for conduction: those scenarios need a fixed entry price and known
+                # stops, because what the strategy computes is measured *from* them. Without it
+                # the position is a bare placeholder whose only job is to exist.
+                position = held or Position(
                     symbol=AAPL.symbol,
                     side=Side.LONG,
                     volume=Decimal(1),
@@ -175,28 +180,48 @@ def test_nothing_arms_while_the_average_is_warming_up() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_a_long_enters_on_the_break_of_the_reference_high() -> None:
-    """The setup, end to end. Bar 3 closes 101, above the MME3 of 100 — the average turned up, and
-    its own high (101.3) is the trigger, its low (97.9) the stop. Bar 4 breaks 101.3, so the order
-    fills there; bar 7 closes back below and the trade is stopped at 97.9. Entry at the reference
-    high, stop at the reference low — the whole reference bar is the trade."""
+def test_a_long_enters_on_the_break_of_the_reference_high_and_is_conducted_out() -> None:
+    """The setup end to end, entry *and* conduction, on candles worked out by hand.
+
+    Bar 3 closes 101 against a MME3 of 100 — the average turned up — so its own high (101.3) is
+    the trigger and its low (97.9) the stop. Bar 4 breaks 101.3 and fills there: risk 3.4, and
+    the whole reference bar is the trade.
+
+    Then bar 6 closes 102 against a MME3 of 102.625 — back *under* the average. That is not an
+    exit; it drags the stop up to that bar's low, 101.90. Bar 7 collapses to 96.9 and takes it.
+
+    The same candles before the conduction existed produced an exit at 97.9 — a full -1R. They
+    now produce +0.18R. Nothing about the entry changed; the difference is entirely the stop
+    being somewhere else when price came back.
+
+    The 2R rule stays silent here on purpose: breakeven would need 101.3 + 2*3.4 = 108.1 and the
+    high of the whole move is 105.4. One rule at a time is what makes this readable.
+    """
     candles = [
         *_SEED,
         bar(3, open_="98", close="101", high="101.3", low="97.9"),  # cross up; trigger 101.3
         bar(4, open_="101", close="103", high="103.5", low="100.8"),  # breaks 101.3 -> fill
         bar(5, open_="103", close="105", high="105.2", low="102.9"),
-        bar(6, open_="105", close="102", high="105.4", low="101.9"),
-        bar(7, open_="102", close="97", high="102.2", low="96.9"),  # low tags the stop 97.9
+        bar(6, open_="105", close="102", high="105.4", low="101.9"),  # closes under 102.625
+        bar(7, open_="102", close="97", high="102.2", low="96.9"),  # takes the conducted stop
     ]
     result = _run(candles)
     [entry] = _entries(result)
     assert entry.order.side is Side.LONG
     assert entry.price == Decimal("101.3")
     assert entry.order.stop_loss == Decimal("97.9")
-    # the exit is the broker's protective stop at the reference low
+
     [exit_fill] = [f for f in result.fills if f.order.intent is SignalKind.EXIT]
     assert exit_fill.order.reason == "sl"
-    assert exit_fill.price == Decimal("97.9")
+    assert exit_fill.price == Decimal("101.90")  # bar 6's low, not the reference low
+    # The stamp the conducted level carries is bar 6's, not the entry's — the two instants of
+    # ADR-0018 arriving in a real setup. A stop that had kept the entry's stamp would be a stop
+    # the lookahead guard stopped watching the moment it started moving.
+    assert exit_fill.order.decided_at == candles[6].time
+
+    [trade] = result.trades
+    assert trade.net_pnl > ZERO  # a losing trade turned small winner
+    assert trade.stop_loss == Decimal("97.90")  # sized against the entry's stop, as ever
 
 
 def test_the_entry_cannot_fill_on_the_bar_that_armed_it() -> None:
@@ -904,3 +929,419 @@ def test_the_period_must_be_a_real_average() -> None:
 def test_the_stop_buffer_is_a_magnitude() -> None:
     with pytest.raises(ValueError, match="stop buffer"):
         Mme9BreakoutStrategy(stop_buffer_ticks=-1)
+
+
+@pytest.mark.parametrize("multiple", ["0", "-2"])
+def test_the_breakeven_multiple_must_be_positive(multiple: str) -> None:
+    """Zero is refused rather than read as "off", and `None` is the way to say that. A multiple of
+    zero would put the trigger on the entry price itself, so the bar that filled the order would
+    arm breakeven on the trade it just opened — a stop on top of the entry, before the trade has
+    done anything. The two settings look alike and mean opposite things, so only one is spelled."""
+    with pytest.raises(ValueError, match="breakeven R multiple"):
+        Mme9BreakoutStrategy(breakeven_at_r=Decimal(multiple))
+
+
+# --------------------------------------------------------------------------- #
+# The conduction: two events move the stop, and neither of them is an exit      #
+# --------------------------------------------------------------------------- #
+
+
+def _held(
+    *,
+    entry: str,
+    stop: str | None,
+    initial: str | None = None,
+    side: Side = Side.LONG,
+) -> Position:
+    """An open position with known levels, so what the conduction computes can be measured.
+
+    `initial` defaults to `stop`, which is what the ledger writes at the fill. They are handed
+    separately because a conducted trade is precisely one where they have parted company, and
+    the 2R line has to go on being measured from the one that does not move.
+    """
+    frozen = initial if initial is not None else stop
+    return Position(
+        symbol=AAPL.symbol,
+        side=side,
+        volume=Decimal(1),
+        entry_price=Decimal(entry),
+        entry_time=START,
+        stop_loss=Decimal(stop) if stop is not None else None,
+        initial_stop_loss=Decimal(frozen) if frozen is not None else None,
+    )
+
+
+def _trails(signals: list[list[Signal]]) -> list[list[Money | None]]:
+    """The stop levels asked for on each bar. Levels, not signals: every assertion below is about
+    *where* the stop went, and a list of `Signal` reprs makes that unreadable.
+
+    `None` is kept rather than filtered out: a `MODIFY_STOP` carrying no level is a bug this
+    module would otherwise report as "no signal at all", which is the wrong failure to read.
+    """
+    return [
+        [s.stop_loss for s in per_bar if s.kind is SignalKind.MODIFY_STOP] for per_bar in signals
+    ]
+
+
+# The long conduction scenario: the seed, the cross on bar 3, a run up, and a bar that closes
+# back under the average. MME3 from bar 3 on: 100, 101.50, 103.250, 102.6250.
+_CONDUCT = [
+    *_SEED,
+    bar(3, open_="98", close="101", high="101.3", low="97.9"),
+    bar(4, open_="101", close="103", high="103.5", low="100.8"),
+    bar(5, open_="103", close="105", high="105.2", low="102.9"),
+    bar(6, open_="105", close="102", high="105.4", low="101.9"),
+]
+
+
+def test_touching_twice_the_risk_brings_the_stop_to_the_entry_price() -> None:
+    """Entry 100 against a stop of 98 is 1R = 2, so 2R sits at 104. Bar 5's high is 105.2.
+
+    **Touching, not closing** is the author's rule. What pins that reading is bar 4: it closes
+    above the average with the trade in profit and its high is 103.5, just short of the line, and
+    it asks for nothing. The bar whose high first crosses 104 is the one that moves the stop.
+    """
+    signals = _drive(
+        Mme9BreakoutStrategy(period=3),
+        _CONDUCT[:6],
+        position_on=frozenset({4, 5}),
+        held=_held(entry="100", stop="98"),
+    )
+
+    assert _trails(signals)[4] == []
+    assert _trails(signals)[5] == [Decimal("100")]
+
+
+def test_a_bar_closing_back_under_the_average_drags_the_stop_to_its_low() -> None:
+    """The event that reads like an exit and is not one.
+
+    Bar 6 closes 102 against a MME3 of 102.625 — back under the average. The trade does not
+    close: the stop moves to that bar's low, 101.9, and price has to come back and take it. A
+    version that exited here would leave at 102 and would be a different method entirely.
+    """
+    signals = _drive(
+        Mme9BreakoutStrategy(period=3),
+        _CONDUCT,
+        position_on=frozenset({6}),
+        held=_held(entry="100", stop="98"),
+    )
+
+    assert _trails(signals)[6] == [Decimal("101.9")]
+    # And it really is only a stop move: nothing on this bar closes the position.
+    assert [s.kind for s in signals[6]] == [SignalKind.MODIFY_STOP]
+
+
+def test_between_events_the_stop_does_not_move_at_all() -> None:
+    """No bar-by-bar trailing, and that is a rule rather than an omission.
+
+    Bars 3 and 4 both close above the average with the trade running, and a trailing stop of
+    almost any other design would follow them up. This one asks for nothing: 2R is not reached
+    and no bar has closed back across.
+    """
+    signals = _drive(
+        Mme9BreakoutStrategy(period=3),
+        _CONDUCT[:5],
+        position_on=frozenset({3, 4}),
+        held=_held(entry="100", stop="98"),
+    )
+
+    assert _trails(signals)[3] == []
+    assert _trails(signals)[4] == []
+
+
+def test_the_stop_stays_where_it_was_put_when_price_climbs_back_over_the_average() -> None:
+    """The author's rule 4, and the one a reader is most likely to get wrong.
+
+    After bar 6 dragged the stop to 101.9, bar 7 closes 103 against a MME3 of 102.8125 — back
+    *above* the average. The stop does not follow price up and it does not release: it holds at
+    101.9 until another bar closes back under. Bar 7's high is kept at 103.5, under the 104
+    that 2R would need, so only one rule is in play and the silence has one meaning.
+    """
+    candles = [*_CONDUCT, bar(7, open_="102", close="103", high="103.5", low="101.95")]
+    signals = _drive(
+        Mme9BreakoutStrategy(period=3),
+        candles,
+        position_on=frozenset({7}),
+        held=_held(entry="100", stop="101.9", initial="98"),
+    )
+
+    assert _trails(signals)[7] == []
+
+
+def test_the_tighter_rule_wins_and_the_strategy_never_asks_to_loosen() -> None:
+    """The author's own example: entry 100, stop 98, price reaches 2R so the stop goes to 100 —
+    and then a bar closes under the average with a low below that. Moving there would be
+    *releasing* a stop already at 100, so the stop stays.
+
+    Nothing here arbitrates between the two rules. The engine refuses a loosening outright
+    (ADR-0018), so the strategy's only job is not to ask — which it manages by reading
+    `position.stop_loss`, the level really in force, rather than remembering what it last sent.
+    Ask anyway and the run dies on an `EngineError` in the middle of a winning trade.
+    """
+    signals = _drive(
+        Mme9BreakoutStrategy(period=3),
+        _CONDUCT,
+        position_on=frozenset({6}),
+        held=_held(entry="100", stop="102", initial="98"),
+    )
+
+    assert _trails(signals)[6] == []
+
+
+def test_the_conducted_stop_takes_the_same_tick_buffer_as_the_entry() -> None:
+    """One knob for both, because it answers the same objection in both places: a stop sitting
+    exactly on the low is taken out by the noise of the bar that set it. Two ticks of AAPL is
+    0.02, so bar 6's low of 101.9 becomes 101.88."""
+    signals = _drive(
+        Mme9BreakoutStrategy(period=3, stop_buffer_ticks=2),
+        _CONDUCT,
+        position_on=frozenset({6}),
+        held=_held(entry="100", stop="98"),
+    )
+
+    assert _trails(signals)[6] == [Decimal("101.88")]
+
+
+def test_a_short_is_conducted_by_the_mirror_of_the_same_two_events() -> None:
+    """The sell side, where a codebase is usually correct in one direction only.
+
+    A short's average is crossed *upward*: bar 3 closes 101 against a MME3 of 100, which for a
+    short instance is the bar closing back across. The stop goes above that bar's high — 101.3 —
+    tightening against the 102 it was holding.
+    """
+    signals = _drive(
+        Mme9BreakoutStrategy(side=Side.SHORT, period=3),
+        _CONDUCT[:4],
+        position_on=frozenset({3}),
+        held=_held(entry="100", stop="102", side=Side.SHORT),
+    )
+
+    assert _trails(signals)[3] == [Decimal("101.3")]
+
+
+def test_a_short_reaches_breakeven_by_falling_twice_its_risk() -> None:
+    """The 2R mirror: a short entered at 100 against a stop of 102 risks 2, so 2R is 96, and it
+    is the bar's *low* that has to reach it. Bar 2 of the seed closes 98 under a MME3 of 99 — a
+    short's own side — with a low of 97.5, so nothing fires.
+
+    Bar 3 lands its low **exactly** on 96. Reaching the line is reaching it: the comparison is
+    `<=`, and a bar that trades at the level has touched it. A low of 95.9 would fire under
+    either reading and would leave the boundary itself unstated.
+    """
+    candles = [*_SEED, bar(3, open_="98", close="97", high="98.1", low="96")]
+    signals = _drive(
+        Mme9BreakoutStrategy(side=Side.SHORT, period=3),
+        candles,
+        position_on=frozenset({2, 3}),
+        held=_held(entry="100", stop="102", side=Side.SHORT),
+    )
+
+    assert _trails(signals)[2] == []
+    assert _trails(signals)[3] == [Decimal("100")]
+
+
+def test_a_position_with_no_stop_has_no_r_to_reach_but_still_answers_the_average() -> None:
+    """An entry that carried no `stop_loss` leaves `initial_stop_loss` empty, and nothing sized
+    that lot against a level — so there is no risk for 2R to be a multiple of, and breakeven
+    stays quiet however far price runs. The average's rule does not depend on risk and goes on
+    working: bar 6 arms a stop where the position had none at all, which only reduces risk."""
+    signals = _drive(
+        Mme9BreakoutStrategy(period=3),
+        _CONDUCT,
+        position_on=frozenset({5, 6}),
+        held=_held(entry="100", stop=None),
+    )
+
+    assert _trails(signals)[5] == []
+    assert _trails(signals)[6] == [Decimal("101.9")]
+
+
+def test_a_conducted_level_at_or_below_zero_is_refused_rather_than_sent() -> None:
+    """The buffer subtracts from a low that may already be tiny. A stop at or below zero is not a
+    price, and the same guard the entry carries applies here — silence, rather than a signal the
+    engine would have to refuse."""
+    candles = [
+        bar(0, open_="0.10", close="0.10", high="0.11", low="0.09"),
+        bar(1, open_="0.10", close="0.09", high="0.10", low="0.08"),
+        bar(2, open_="0.09", close="0.08", high="0.09", low="0.07"),
+        bar(3, open_="0.08", close="0.02", high="0.08", low="0.01"),
+    ]
+    signals = _drive(
+        Mme9BreakoutStrategy(period=3, stop_buffer_ticks=2),
+        candles,
+        position_on=frozenset({3}),
+        held=_held(entry="0.10", stop="0.05"),
+    )
+
+    assert _trails(signals)[3] == []
+
+
+def test_a_flat_account_is_never_conducted() -> None:
+    """No position, no stop to move — across a scenario that would otherwise fire both rules. A
+    `MODIFY_STOP` emitted here is answered `False` by the broker and dropped, so what this guards
+    against is silent by construction."""
+    signals = _drive(Mme9BreakoutStrategy(period=3), _CONDUCT)
+
+    assert _trails(signals) == [[] for _ in _CONDUCT]
+
+
+def test_a_position_whose_entry_is_its_own_stop_has_no_r_either() -> None:
+    """Risk of zero is not risk of one. The entry price and the initial stop being the same level
+    makes 2R land exactly on the entry, so a bar that merely trades at the entry would "reach"
+    breakeven — a multiple of nothing being satisfied by nothing.
+
+    The guard keeps that arithmetic from running at all, which matters less for the level it
+    would produce (the same one already in force) than for what it says: a position with no risk
+    has no R, exactly as `Portfolio._r_multiple` reports `None` rather than a number. The
+    average's rule is untouched — bar 6 still drags the stop to its low.
+    """
+    signals = _drive(
+        Mme9BreakoutStrategy(period=3),
+        _CONDUCT,
+        position_on=frozenset({5, 6}),
+        held=_held(entry="100", stop="100"),
+    )
+
+    assert _trails(signals)[5] == []
+    assert _trails(signals)[6] == [Decimal("101.9")]
+
+
+def test_the_2r_line_is_measured_from_the_stop_the_lot_was_sized_against() -> None:
+    """The one scenario where `initial_stop_loss` and `stop_loss` can actually disagree about it.
+
+    A trade already conducted once: entered at 100 against an initial stop of 98, and the stop is
+    now at 99. Risk is still 2 — the lot was sized against 98 — so the 2R line is 104 and bar 4's
+    high of 103.5 does not reach it. Measured against the *current* stop instead, risk would read
+    1, the line would have slid down to 102, and this bar would arm breakeven.
+
+    That is the drift the conduction exists to avoid, and it is invisible in every other test
+    here: the two levels either coincide, or sit equidistant from the entry, or the candidate is
+    already the looser one and both readings fall silent. Only a stop conducted to a level that
+    is *not* symmetric with the entry separates them.
+    """
+    signals = _drive(
+        Mme9BreakoutStrategy(period=3),
+        _CONDUCT[:5],
+        position_on=frozenset({4}),
+        held=_held(entry="100", stop="99", initial="98"),
+    )
+
+    assert _trails(signals)[4] == []
+
+
+def test_a_level_already_in_force_is_not_sent_again() -> None:
+    """Reaching 2R a second time restates a stop that is already there, and the strategy says
+    nothing. Not a correctness bug if it did — the broker would answer `True` and the level would
+    not move — but it would rewrite `stop_decided_at` on a bar that decided nothing, and put a
+    signal in the stream for every subsequent bar of a winning trade.
+
+    Bar 5's high clears the 104 line with the stop already at the entry price, which is precisely
+    the level the rule would ask for.
+    """
+    signals = _drive(
+        Mme9BreakoutStrategy(period=3),
+        _CONDUCT[:6],
+        position_on=frozenset({5}),
+        held=_held(entry="100", stop="100", initial="98"),
+    )
+
+    assert _trails(signals)[5] == []
+
+
+# --------------------------------------------------------------------------- #
+# The one number in the conduction, and the race it runs against the target     #
+# --------------------------------------------------------------------------- #
+
+
+def test_the_breakeven_multiple_moves_which_bar_arms_it() -> None:
+    """The same candles, the same trade, a different bar doing the work.
+
+    Entry 100 against a stop of 98 risks 2. At the author's 2x1 the line is 104 and bar 4's high
+    of 103.5 falls short — that is the assertion in `test_touching_twice_the_risk...`. At 1.75 the
+    line is 103.5 and the *same* bar 4 arms breakeven. Nothing else about the setup changed, which
+    is the point of the knob: it is the one part of this conduction a search may vary.
+
+    **1.75 rather than a rounder multiple, because the line then lands on bar 4's high exactly.**
+    That pins the two halves of "touching, not closing" in one assertion: the bar's *close* is
+    103, below the line, so a version reading closes would stay silent here; and reaching the
+    level *is* reaching it, so a version demanding strictly more would stay silent too. Every
+    other bar in this suite clears or misses the line on both readings at once.
+    """
+    bars, held = _CONDUCT[:6], _held(entry="100", stop="98")
+
+    author = _drive(Mme9BreakoutStrategy(period=3), bars, position_on=frozenset({4}), held=held)
+    tighter = _drive(
+        Mme9BreakoutStrategy(period=3, breakeven_at_r=Decimal("1.75")),
+        bars,
+        position_on=frozenset({4}),
+        held=held,
+    )
+
+    assert _trails(author)[4] == []
+    assert _trails(tighter)[4] == [Decimal("100")]
+
+
+def test_switching_breakeven_off_leaves_the_average_conducting_alone() -> None:
+    """`None` is a setting, not a missing value: the 0x0 rule is gone and the other one is not.
+
+    Bars 4 and 5 run well past twice the risk — bar 5's high is 105.2 against a 2R line of 104 —
+    and neither asks for anything. Bar 6 closes back under the average and still drags the stop
+    to its low. Being able to run the setup without breakeven is what makes "does taking this
+    trade to 0x0 pay for itself" a question a backtest can answer instead of an opinion.
+    """
+    signals = _drive(
+        Mme9BreakoutStrategy(period=3, breakeven_at_r=None),
+        _CONDUCT,
+        position_on=frozenset({4, 5, 6}),
+        held=_held(entry="100", stop="98"),
+    )
+
+    assert _trails(signals)[4] == []
+    assert _trails(signals)[5] == []
+    assert _trails(signals)[6] == [Decimal("101.9")]
+
+
+# The race scenario: the cross on bar 3, an entry at 101.3 against a stop of 97.9 (risk 3.4), then
+# a run that touches 2R on bar 5 and 5R on bar 6, and a collapse on bar 7. MME3 from bar 3 on:
+# 100, 103, 107.50, 112.750, 105.875 — every close before bar 7 is above it, so the average never
+# conducts here and breakeven is the only rule that moves the stop.
+_RACE = [
+    *_SEED,
+    bar(3, open_="98", close="101", high="101.3", low="97.9"),
+    bar(4, open_="101", close="106", high="106.5", low="100.9"),
+    bar(5, open_="106", close="112", high="112.5", low="105.5"),
+    bar(6, open_="112", close="118", high="119", low="111.5"),
+    bar(7, open_="118", close="99", high="118.2", low="98"),
+]
+
+
+def test_the_target_and_the_conducted_stop_race_and_the_first_one_wins() -> None:
+    """The author's own configuration, end to end: a target of five times the risk, and a stop
+    the strategy conducts underneath it. Whichever price reaches first ends the trade.
+
+    The target belongs to the *broker* (`take_profit_rr`), which is why the same candles can be
+    run both ways. With it, bar 6 tags 118.30 and the trade closes at +5R. Without it, the trade
+    is still alive when bar 7 collapses — and it leaves at **101.3**, the entry price, because
+    bar 5 touched 2R and moved the stop there. Not 97.90: that trade would have been a full -1R.
+
+    The ledger still reports the initial stop and measures R from it (ADR-0018) — 97.90 on a
+    trade that exited at its entry, scoring exactly 0R. Measuring from the conducted level would
+    divide by a risk of zero.
+    """
+    won_by_target = _run(_RACE, rr="5")
+    won_by_stop = _run(_RACE, rr=None)
+
+    [target] = won_by_target.trades
+    assert (target.exit_price, target.reason) == (Decimal("118.30"), "tp")
+    assert target.exit_time == _RACE[6].time
+    assert target.r_multiple == Decimal(5)
+    assert target.net_pnl == Decimal("4999.8700")
+
+    [stopped] = won_by_stop.trades
+    assert (stopped.exit_price, stopped.reason) == (Decimal("101.3"), "sl")
+    assert stopped.exit_time == _RACE[7].time
+    assert stopped.exit_price == stopped.entry_price  # conducted to breakeven, then taken
+    assert stopped.net_pnl == ZERO
+    # The record keeps the level the lot was sized against, not the one that filled it.
+    assert stopped.stop_loss == Decimal("97.90")
+    assert stopped.r_multiple == ZERO

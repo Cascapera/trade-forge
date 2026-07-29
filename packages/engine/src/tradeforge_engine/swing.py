@@ -25,10 +25,22 @@ setup re-enters every bar of a trend it already owns. The boundary is read on **
 trade or not: a turn that begins while the previous trade is still running is a real turn, and the
 first bar to find the account flat may arm it.
 
-**This module only enters and cancels.** The exit is the broker's: a take-profit at a multiple of
-risk (`take_profit_rr`), or a bare stop when no multiple is set. The author's own exit — ride the
-trade until a bar closes back across the MME9, then trail the stop to that bar's far side — is
-stop conduction, a new verb on the position, and it gets its own ADR and review (the sibling PR).
+**The trade is conducted, and a close back across the average is not an exit.** That reading is
+the obvious one and it is wrong: a bar closing back under the MME9 does not leave the trade, it
+*tightens the stop* to just past that bar's far side. If price never takes that low and climbs
+back over the average, the stop stays exactly where it was put — it does not resume following.
+The other event is touching twice the risk, which brings the stop to the entry price.
+
+Both rules are live from the fill and the tighter one wins, which needs no arbitration: the engine
+refuses to loosen a stop (ADR-0018), so the strategy only ever asks for the tighter level. Between
+events the stop does not move at all — there is no bar-by-bar trailing here.
+
+So the position always ends *at a level*, never at market: whichever comes first, the conducted
+stop or the broker's take-profit (`take_profit_rr`, ADR-0018 is what made the stop side possible).
+The author trades this setup against a target of **five times the risk**, but that number is the
+broker's knob and not the strategy's — the target belongs to the account, the same way it does for
+the structure setups, and hard-coding it here would give every run of this module an opinion the
+engine deliberately keeps outside it.
 """
 
 import logging
@@ -83,6 +95,14 @@ class Mme9BreakoutStrategy:
     gone, and only the strategy can know that, which is why `Broker.cancel` exists. The cancel is
     applied the same bar it is decided, before the next bar can fill (loop step 3), so a withdrawn
     order cannot be taken on a break the setup no longer wanted.
+
+    **`breakeven_at_r` is the only rule here that is a number.** The author trades "2x1" — touch
+    twice the risk and the stop goes to the entry price — and that is the default, but it is the
+    one part of the setup a search can legitimately move, so it is a parameter rather than a
+    constant. `None` switches the rule off entirely, which is not a degenerate setting: taking a
+    winner to breakeven is a known way to turn it into a scratch, and "what would this setup earn
+    without that" has to be askable for the answer to mean anything. The average's rule has no
+    such knob, because it is not a number — it is the event that defines the conduction.
     """
 
     def __init__(
@@ -92,15 +112,19 @@ class Mme9BreakoutStrategy:
         period: int = 9,
         name: str = "mme9",
         stop_buffer_ticks: int = 0,
+        breakeven_at_r: Decimal | None = Decimal(2),
     ) -> None:
         if period < 1:
             raise ValueError(f"MME period must be >= 1, got {period}")
         if stop_buffer_ticks < 0:
             raise ValueError(f"stop buffer is a magnitude in ticks, got {stop_buffer_ticks}")
+        if breakeven_at_r is not None and breakeven_at_r <= ZERO:
+            raise ValueError(f"breakeven R multiple must be positive, got {breakeven_at_r}")
 
         self._side = side
         self._name = name
         self._stop_buffer_ticks = Decimal(stop_buffer_ticks)
+        self._breakeven_at_r = breakeven_at_r
         self._ema = EMA(period=period, source="close")
 
         self._armed: _Armed | None = None
@@ -126,6 +150,12 @@ class Mme9BreakoutStrategy:
         # Which side of the average did this bar close on — the setup's, or against it?
         on_side = candle.close > average if self._side is Side.LONG else candle.close < average
 
+        # The open trade's stop, if either rule tightened it on this bar. Computed before the
+        # branches below because both of them owe it: a bar that closes back across the average
+        # is *itself* one of the two events that move the stop, and it is also the bar that ends
+        # the turn — the same candle doing two unrelated jobs.
+        conducted = self._conduct(context, closed_across=not on_side)
+
         if not on_side:
             # A close back across the average ends the turn — and it ends it whether or not a
             # trade is still open. The average does not know we are positioned: if price closed on
@@ -133,7 +163,7 @@ class Mme9BreakoutStrategy:
             # the first bar to find the account flat is entitled to arm it. Reading this boundary
             # only when flat would swallow every turn that began inside a trade, and swallow it
             # silently — no number comes out wrong, trades simply stop appearing.
-            signals: list[Signal] = []
+            signals: list[Signal] = [] if conducted is None else [conducted]
             if self._armed is not None:
                 signals.append(self._withdraw(self._armed, candle))
                 self._armed = None
@@ -141,10 +171,10 @@ class Mme9BreakoutStrategy:
             return tuple(signals)
 
         if context.position is not None:
-            # The broker's stop and target own an open trade; nothing arms beside it. Nothing is
-            # resting either: `_observe_fill` drops the armed name on any bar that shows a
-            # position, so there is never an order here left to withdraw.
-            return ()
+            # Nothing arms beside an open trade, and nothing is resting either: `_observe_fill`
+            # drops the armed name on any bar that shows a position. What this bar can still owe
+            # is a tightening — the 2R touch does not care which side of the average we closed on.
+            return () if conducted is None else (conducted,)
 
         if self._spent:
             # Still on the setup's side, but this turn already gave its trade. Wait for the cross.
@@ -181,6 +211,96 @@ class Mme9BreakoutStrategy:
             )
         )
         return tuple(signals)
+
+    def _conduct(self, context: Context, *, closed_across: bool) -> Signal | None:
+        """The open trade's stop, moved by whichever rule is tighter — or `None` to leave it.
+
+        Two events, and **neither of them closes the position**:
+
+        * **Touching `breakeven_at_r` times the initial risk** puts the stop at the entry price
+          (the author's own multiple is 2). Touching, not closing: the bar's high reaching the
+          level is the event. Nominal breakeven — with costs, leaving at the entry price is a
+          small loss rather than nothing. `None` means the rule is off and only the average
+          conducts.
+        * **A bar closing back across the average** puts the stop just past that bar's far side.
+          If price never takes that low and climbs back over the average, the stop *stays* — it
+          does not resume following, and it never loosens.
+
+        Between events, nothing. There is no bar-by-bar trailing in this setup.
+
+        **The tighter rule wins, and no code here decides that.** The engine refuses a loosening
+        outright (ADR-0018), so the strategy simply never asks for one — it compares against
+        `position.stop_loss`, the level actually in force, and stays quiet when its candidate is
+        not an improvement. Remembering what it last sent instead would be a second copy of the
+        broker's state, and the day the two disagree the engine raises and the backtest dies.
+
+        **The bar that fills can also conduct**, and that is the rule applied literally rather
+        than an oversight. On a bar whose stop order fills and which then closes back across the
+        average, the low the stop moves to may have printed *before* the fill — so the stop can
+        land at a price the trade never actually carried. No future data is read (the bar is
+        closed, and the level cannot execute until the next one), and refusing to conduct here
+        would mean inventing a rule the author did not state.
+
+        **`initial_stop_loss` is what makes 2R computable at all.** After the first tightening,
+        `stop_loss` is no longer the level the lot was sized against — measure the risk from it
+        and the 2R line drifts closer with every move, arming breakeven earlier and earlier on a
+        trade that never actually reached it.
+        """
+        position = context.position
+        if position is None:
+            return None
+
+        long = self._side is Side.LONG
+        candle = context.candle
+        candidates: list[Money] = []
+
+        # Breakeven. Silent when the rule is off, and silent when the entry carried no stop:
+        # nothing sized that lot against a level, so there is no risk for a multiple to be a
+        # multiple *of*.
+        multiple = self._breakeven_at_r
+        if multiple is not None and position.initial_stop_loss is not None:
+            risk = abs(position.entry_price - position.initial_stop_loss)
+            if risk > ZERO:
+                reach = candle.high if long else candle.low
+                target = (
+                    position.entry_price + multiple * risk
+                    if long
+                    else position.entry_price - multiple * risk
+                )
+                if reach >= target if long else reach <= target:
+                    candidates.append(position.entry_price)
+
+        # The average. The buffer is the entry's own, and deliberately so: a stop sitting exactly
+        # on the low is taken out by the noise of the bar that set it, and on a trade that has
+        # already run in our favour that is a worse way to lose than being wrong.
+        if closed_across:
+            buffer = self._stop_buffer_ticks * context.instrument.tick_size
+            candidates.append(candle.low - buffer if long else candle.high + buffer)
+
+        if not candidates:
+            return None
+
+        level = max(candidates) if long else min(candidates)
+        if level <= ZERO:
+            # A price at or below zero is not a stop. Same guard as `_entry_for`, and reachable
+            # for the same reason: the buffer subtracts from a low that may already be tiny.
+            logger.debug("conducted stop at %s would be <= 0; leaving it", candle.time)
+            return None
+
+        current = position.stop_loss
+        if current is not None and (level <= current if long else level >= current):
+            # Not an improvement. Sending it anyway would be asking the engine to loosen — which
+            # raises — or to restate what is already true, which is noise in the signal stream.
+            return None
+
+        logger.debug("conducting the stop to %s at %s", level, candle.time)
+        return Signal(
+            kind=SignalKind.MODIFY_STOP,
+            side=self._side,
+            reference_price=candle.close,
+            stop_loss=level,
+            reason=f"trail.{self._name}",
+        )
 
     def _observe_fill(self, context: Context) -> None:
         """Notice the armed order becoming a trade, and spend the turn.

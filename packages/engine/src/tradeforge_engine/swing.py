@@ -47,6 +47,7 @@ import logging
 from dataclasses import dataclass
 from decimal import Decimal
 
+from tradeforge_engine.conduction import breakeven_candidate, tighten
 from tradeforge_engine.domain import (
     ZERO,
     Candle,
@@ -250,55 +251,29 @@ class Mme9BreakoutStrategy:
         if position is None:
             return None
 
-        long = self._side is Side.LONG
         candle = context.candle
         candidates: list[Money] = []
 
-        # Breakeven. Silent when the rule is off, and silent when the entry carried no stop:
-        # nothing sized that lot against a level, so there is no risk for a multiple to be a
-        # multiple *of*.
-        multiple = self._breakeven_at_r
-        if multiple is not None and position.initial_stop_loss is not None:
-            risk = abs(position.entry_price - position.initial_stop_loss)
-            if risk > ZERO:
-                reach = candle.high if long else candle.low
-                target = (
-                    position.entry_price + multiple * risk
-                    if long
-                    else position.entry_price - multiple * risk
-                )
-                if reach >= target if long else reach <= target:
-                    candidates.append(position.entry_price)
+        breakeven = breakeven_candidate(
+            position=position, side=self._side, candle=candle, multiple=self._breakeven_at_r
+        )
+        if breakeven is not None:
+            candidates.append(breakeven)
 
         # The average. The buffer is the entry's own, and deliberately so: a stop sitting exactly
         # on the low is taken out by the noise of the bar that set it, and on a trade that has
         # already run in our favour that is a worse way to lose than being wrong.
         if closed_across:
             buffer = self._stop_buffer_ticks * context.instrument.tick_size
-            candidates.append(candle.low - buffer if long else candle.high + buffer)
+            candidates.append(
+                candle.low - buffer if self._side is Side.LONG else candle.high + buffer
+            )
 
-        if not candidates:
-            return None
-
-        level = max(candidates) if long else min(candidates)
-        if level <= ZERO:
-            # A price at or below zero is not a stop. Same guard as `_entry_for`, and reachable
-            # for the same reason: the buffer subtracts from a low that may already be tiny.
-            logger.debug("conducted stop at %s would be <= 0; leaving it", candle.time)
-            return None
-
-        current = position.stop_loss
-        if current is not None and (level <= current if long else level >= current):
-            # Not an improvement. Sending it anyway would be asking the engine to loosen — which
-            # raises — or to restate what is already true, which is noise in the signal stream.
-            return None
-
-        logger.debug("conducting the stop to %s at %s", level, candle.time)
-        return Signal(
-            kind=SignalKind.MODIFY_STOP,
+        return tighten(
+            position=position,
             side=self._side,
-            reference_price=candle.close,
-            stop_loss=level,
+            candle=candle,
+            candidates=candidates,
             reason=f"trail.{self._name}",
         )
 

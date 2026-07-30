@@ -35,7 +35,7 @@ from datetime import datetime
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from typing import Protocol
 
-from tradeforge_engine.conduction import breakeven_candidate, tighten
+from tradeforge_engine.conduction import StructuralTrail, breakeven_candidate, tighten
 from tradeforge_engine.domain import (
     ZERO,
     Candle,
@@ -53,7 +53,6 @@ from tradeforge_engine.structure import (
     StructureBreak,
     StructureKind,
     TrackedZone,
-    Trend,
     ZoneKind,
 )
 
@@ -349,19 +348,10 @@ class StructureStrategy:
         # what lets the machinery tell the qualifier *how* a trade ended — see
         # `SetupContext.stopped`.
         self._filled: OrderBlock | None = None
-        # Breaks of structure in the open trade's favour. Only the *first* is special (it means
-        # breakeven); after that each one names its own origin, so the count saturates in meaning
-        # and is only ever compared against one.
-        #
-        # It is keyed by the trade it belongs to rather than reset by an event, and that is the
-        # whole point: a counter reset *at the fill* is correct only for as long as every path
-        # that opens a trade goes through `_observe_fill`, and the day one does not, the next
-        # trade's first break silently takes the second break's branch — putting the stop at a
-        # leg origin below the entry, so the trade goes on carrying risk the method says it
-        # already gave up. Keyed this way, a trade that never announced itself still counts from
-        # zero, because it is a different trade.
-        self._breaks_in_favour = 0
-        self._counting_for: datetime | None = None
+        # The structural half of the conduction — breakeven on the first break in the trade's
+        # favour, leg origins after it — and the count of breaks that rule needs, keyed to the
+        # trade rather than reset by an event. See `StructuralTrail`.
+        self._trail = StructuralTrail()
         # The bar a fill was observed on. The breakeven rule reads the bar's extremes, and on this
         # one bar those extremes are not the trade's — see `_conduct`.
         self._fill_bar: datetime | None = None
@@ -444,22 +434,13 @@ class StructureStrategy:
         Two rules, and **neither of them closes the position**:
 
         * **The first break of structure in the trade's favour** brings the stop to the entry
-          price. Every break after it brings the stop to that break's `origin`.
+          price. Every break after it brings the stop to that break's `origin`. That rule and its
+          bookkeeping live in `StructuralTrail`, shared with the Ponto Contínuo — which enters
+          nothing like this setup and conducts exactly like it.
         * **Touching a multiple of the initial risk** brings it to the entry price as well.
 
         The two run at once and the tighter wins, which no code here decides — `tighten` simply
         never asks for a level that fails to improve on the one in force (ADR-0018).
-
-        **Why `origin` and not the price that was broken.** `StructureBreak.level` is where the
-        move went *through*; `origin` is where it came *from* — the lowest low of the leg, and
-        the very level the next opposite CHoCH is anchored to. Trailing behind it puts the stop
-        where the trend would be **disproven**, not merely where it looks tired. Behind `level`
-        the stop would sit inside the move it is riding and be taken by any ordinary pullback.
-
-        **Only a BOS counts, read literally from the author's rule** ("breakeven no 1º BOS a
-        favor"). A CHoCH in our favour is arguably the first structural event on our side too,
-        and if it should count this is the line to change — but guessing it would quietly widen
-        a rule that was stated narrowly.
 
         **The breakeven rule sits out the bar that filled, and this is a correctness fix rather
         than caution.** It reads the bar's extremes, and a *limit* entry fills in the middle of a
@@ -478,8 +459,9 @@ class StructureStrategy:
         candle = context.candle
         candidates: list[Money] = []
 
-        if position.entry_time != self._counting_for:
-            self._counting_for, self._breaks_in_favour = position.entry_time, 0
+        structural = self._trail.candidate(position=position, break_=break_)
+        if structural is not None:
+            candidates.append(structural)
 
         if candle.time != self._fill_bar:
             breakeven = breakeven_candidate(
@@ -491,16 +473,6 @@ class StructureStrategy:
             if breakeven is not None:
                 candidates.append(breakeven)
 
-        if (
-            break_ is not None
-            and break_.kind is StructureKind.BOS
-            and self._favours(break_, position)
-        ):
-            self._breaks_in_favour += 1
-            candidates.append(
-                position.entry_price if self._breaks_in_favour == 1 else break_.origin
-            )
-
         return tighten(
             position=position,
             side=position.side,
@@ -508,12 +480,6 @@ class StructureStrategy:
             candidates=candidates,
             reason=f"trail.{self._name}",
         )
-
-    @staticmethod
-    def _favours(break_: StructureBreak, position: Position) -> bool:
-        """Does this break push the trend the way the open trade is pointing?"""
-        wanted = Trend.BULLISH if position.side is Side.LONG else Trend.BEARISH
-        return break_.trend is wanted
 
     def _observe_fill(self, context: Context) -> None:
         """Notice the armed order becoming a trade, and spend its zone for good.

@@ -1,11 +1,18 @@
-"""The swing family: enter on the break of the candle that turned the average.
+"""The swing family: enter on the break of the candle the average has just qualified.
 
 The structure setups (`setups.py`) enter on a **pullback** — price comes back to a zone and a
 limit order fills at its edge. The swing setups (Larry Williams / Stormer — 9.1, 9.2, 9.3, 9.4,
-Ponto Contínuo) enter on the **breakout**, the opposite direction: a bar closes across the MME9,
-and the order rests a tick above that bar waiting for price to break through it. That is a stop
+Ponto Contínuo) enter on the **breakout**, the opposite direction: an average qualifies a bar, and
+the order rests a tick past that bar's edge waiting for price to break through it. That is a stop
 order (ADR-0016), the geometric mirror of the limit — so this is a different machine from the one
 in `setups.py`, and it lives in its own module for exactly that reason.
+
+**Two setups live here and they qualify the bar differently.** For the MME9 breakout the event is a
+bar *closing across* the average. For the Ponto Contínuo it is a bar that *touches* the average and
+closes back on the trend's side, after price has corrected twice — a pullback setup by shape, still
+entered on the breakout of its own high. The shared part is the geometry of the order they leave
+behind, which is `_breakout_entry`, and nothing else: the two hold different state, watch different
+averages, and conduct their trades by different rules.
 
 **"The average turned" is a closed bar, not a slope.** The author's rule, confirmed: a bar that
 closes *above* the MME9 has turned it up; a bar that closes *below* has turned it down. There is
@@ -46,8 +53,9 @@ engine deliberately keeps outside it.
 import logging
 from dataclasses import dataclass
 from decimal import Decimal
+from typing import Final, Literal
 
-from tradeforge_engine.conduction import breakeven_candidate, tighten
+from tradeforge_engine.conduction import StructuralTrail, breakeven_candidate, tighten
 from tradeforge_engine.domain import (
     ZERO,
     Candle,
@@ -58,9 +66,13 @@ from tradeforge_engine.domain import (
     Signal,
     SignalKind,
 )
-from tradeforge_engine.indicators import EMA
+from tradeforge_engine.indicators import EMA, SMA
+from tradeforge_engine.structure import MarketStructure, StructureBreak
 
 logger = logging.getLogger(__name__)
+
+AverageKind = Literal["EMA", "SMA"]
+"""Which mean the Ponto Contínuo measures the pullback against — exponential or arithmetic."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +89,48 @@ class _Armed:
 
     reference: Candle
     client_id: str
+
+
+def _breakout_entry(
+    candle: Candle, instrument: InstrumentSpec, *, side: Side, buffer_ticks: Decimal
+) -> _Breakout | None:
+    """The stop order a reference candle places, or `None` if it would carry no risk.
+
+    The whole bar is the trade: a long breaks the **high** and is protected at the **low**, and the
+    short mirrors it. The buffer, in ticks, pushes the protective stop past the candle's edge — a
+    stop sitting *on* the low is taken out by the noise of the very bar that set it. Zero is the
+    literal rule of both setups here, and the knob exists because a real desk usually wants a tick.
+
+    Shared by the two setups in this module because it is the one thing they agree on. What each
+    does *not* share is which bar gets here: the MME9 sends the bar that closed across the average,
+    the Ponto Contínuo the bar that touched it and closed back. That difference is the method; this
+    function is the plumbing.
+    """
+    if candle.high <= candle.low:
+        logger.debug("reference bar at %s has no range; nothing to arm", candle.time)
+        return None
+
+    buffer = buffer_ticks * instrument.tick_size
+    if side is Side.LONG:
+        stop_loss = candle.low - buffer
+        if stop_loss <= ZERO:
+            logger.debug("reference bar at %s would need a stop <= 0; nothing", candle.time)
+            return None
+        return _Breakout(stop_price=candle.high, stop_loss=stop_loss)
+    return _Breakout(stop_price=candle.low, stop_loss=candle.high + buffer)
+
+
+def _withdraw(armed: _Armed, candle: Candle, *, side: Side, name: str) -> Signal:
+    """Take back a named order. Harmless if it never reached the book — a cancel for an order the
+    broker does not hold is answered `False`, not raised (a live race, not a bug)."""
+    logger.debug("withdrawing %s at %s", armed.client_id, candle.time)
+    return Signal(
+        kind=SignalKind.CANCEL,
+        side=side,
+        reference_price=candle.close,
+        reason=f"cancel.{name}",
+        client_id=armed.client_id,
+    )
 
 
 class Mme9BreakoutStrategy:
@@ -295,35 +349,289 @@ class Mme9BreakoutStrategy:
             self._armed = None
 
     def _entry_for(self, candle: Candle, instrument: InstrumentSpec) -> _Breakout | None:
-        """The stop order this reference candle places, or `None` if it carries no risk.
-
-        A long breaks the **high** and is protected at the **low**; the short mirrors it. The
-        buffer, in ticks, pushes the stop past the candle's edge — a stop *on* the low is taken
-        out by the noise of the very bar that set it. It defaults to zero, which is the author's
-        literal rule (the stop is the reference bar's low), and is offered because a real desk
-        usually wants a tick of room.
-        """
-        if candle.high <= candle.low:
-            logger.debug("reference bar at %s has no range; nothing to arm", candle.time)
-            return None
-
-        buffer = self._stop_buffer_ticks * instrument.tick_size
-        if self._side is Side.LONG:
-            stop_loss = candle.low - buffer
-            if stop_loss <= ZERO:
-                logger.debug("reference bar at %s would need a stop <= 0; nothing", candle.time)
-                return None
-            return _Breakout(stop_price=candle.high, stop_loss=stop_loss)
-        return _Breakout(stop_price=candle.low, stop_loss=candle.high + buffer)
+        return _breakout_entry(
+            candle, instrument, side=self._side, buffer_ticks=self._stop_buffer_ticks
+        )
 
     def _withdraw(self, armed: _Armed, candle: Candle) -> Signal:
-        """Take back a named order. Harmless if it never reached the book — a cancel for an order
-        the broker does not hold is answered `False`, not raised (a live race, not a bug)."""
-        logger.debug("withdrawing %s at %s", armed.client_id, candle.time)
-        return Signal(
-            kind=SignalKind.CANCEL,
-            side=self._side,
-            reference_price=candle.close,
-            reason=f"cancel.{self._name}",
-            client_id=armed.client_id,
+        return _withdraw(armed, candle, side=self._side, name=self._name)
+
+
+_AVERAGES: Final[dict[str, type[EMA] | type[SMA]]] = {"EMA": EMA, "SMA": SMA}
+
+
+class PontoContinuoStrategy:
+    """Ponto Contínuo: buy the bar that came back to the average, touched it, and closed above it.
+
+    The author's rule, dictated and then pinned question by question (`side=LONG` described; the
+    short mirrors every line of it):
+
+    1. **Any bar is a reference.** It is not the signal — it only says whether the bar after it is a
+       *correction*, which means a strictly lower high **and** a strictly lower low.
+    2. **Two consecutive corrections qualify the pullback.** Not one, not none: his choice.
+    3. **The trigger is a bar that touches the average and closes above it.** Touching may pierce —
+       going through the average is still touching. That same bar is the whole setup: the order
+       enters at its **high** and is protected at its **low**, a stop order (ADR-0016).
+    4. **A bar closing below the average cancels the setup** — the resting order *and* the
+       qualification with it, so the next entry needs two fresh corrections.
+    5. **Entries repeat, one trade at a time**, and the setup re-arms once a trade ends — whether it
+       ended at the stop or at the target.
+
+    **The qualification latches, and that is his answer rather than an inference.** Once two
+    corrections have happened the pullback stays qualified: the triggering bar does not itself have
+    to be a correction, and ordinary bars may sit between the correction and the touch. Requiring an
+    unbroken run right up to the trigger would throw away the strongest reversal bars, which
+    routinely print a *higher* high on the day they take the average back. It is also the geometry
+    he already validated once — `MarketStructure` arms a BOS the same way, and says so in the same
+    words ("a bar that is not a correction breaks the streak; arming stands").
+
+    **A close *on* the average is neither event.** Above triggers, below cancels, and equal does
+    neither — the rule is stated with strict words in both directions, so a bar closing exactly on
+    the mean leaves a qualified pullback exactly as it found it. Note this is deliberately *not* how
+    the MME9 breakout reads the same tie, where anything short of a close above ends the turn: there
+    the average's side is the whole signal, here it is only a boundary.
+
+    **Nothing is counted before the average exists.** Corrections during the warmup are real
+    geometry, but the rule that *cancels* a qualification needs a level to compare against — so
+    counting them would let a pullback qualify across a stretch of chart where its own canceller was
+    not running, and be spent by the first touch after the warmup. A qualification never outlives
+    the rule that can kill it.
+
+    **While the order rests, the latest qualifying bar owns it.** A second touch-and-close-above
+    replaces the order on the newer bar, up or down, like the rest of the swing family. In practice
+    this can only move the trigger *down*: a later bar whose high cleared the resting trigger would
+    have filled it on the way through.
+
+    **The trade is conducted structurally, not by the average — his choice, made with the cost of
+    it on the table.** So this setup carries a `MarketStructure` of its own and shares
+    `StructuralTrail` with the SMC setups: breakeven on the first break of structure in the trade's
+    favour, then the stop behind each later break's `origin`, with the 2x1 rule alive alongside and
+    the tighter of them winning. The average that *found* the trade has no say in how it is left.
+
+    **This setup does not need the guard that makes the structure family sit out the bar it filled
+    on.** That guard exists because a *limit* order fills where price came back to, so the bar's
+    favourable excursion can be entirely before the fill. A stop order fills going *through* its
+    level in the direction of travel: the favourable extreme of that bar is necessarily after the
+    fill, so reading it credits nothing the trade did not live through.
+    """
+
+    _MIN_CORRECTION: Final = 2
+
+    def __init__(  # noqa: PLR0913 — keyword-only; each names one knob of the setup
+        self,
+        *,
+        side: Side = Side.LONG,
+        period: int = 20,
+        average: AverageKind = "EMA",
+        name: str = "ponto-continuo",
+        stop_buffer_ticks: int = 0,
+        breakeven_at_r: Decimal | None = Decimal(2),
+    ) -> None:
+        if period < 1:
+            raise ValueError(f"average period must be >= 1, got {period}")
+        if stop_buffer_ticks < 0:
+            raise ValueError(f"stop buffer is a magnitude in ticks, got {stop_buffer_ticks}")
+        if breakeven_at_r is not None and breakeven_at_r <= ZERO:
+            raise ValueError(f"breakeven R multiple must be positive, got {breakeven_at_r}")
+        # `.get` rather than a branch on the literal: the type says only two strings are legal, but
+        # this constructor is what a wiring layer reading JSON will call, and a mistyped kind has to
+        # raise rather than quietly fall through to whichever average the `else` branch held.
+        build = _AVERAGES.get(average)
+        if build is None:
+            raise ValueError(f"unknown average {average!r}; expected one of {sorted(_AVERAGES)}")
+
+        self._side = side
+        self._name = name
+        self._stop_buffer_ticks = Decimal(stop_buffer_ticks)
+        self._breakeven_at_r = breakeven_at_r
+        # Exponential by default — his answer, and the one consistent with the rest of the swing
+        # line, which is MME throughout. The arithmetic mean of the same period is slower, so it
+        # sits further from price and asks for a deeper correction before it is touched.
+        self._average = build(period=period, source="close")
+
+        self._previous: Candle | None = None
+        self._corrections = 0
+        # The latch: two corrections have happened and no close below the average has undone them.
+        self._qualified = False
+        self._armed: _Armed | None = None
+        self._armed_count = 0
+        # Structure, tracked on every bar whether or not a trade is open — a break of structure is
+        # a fact about the chart, and the trail needs the ones that land mid-trade.
+        self._structure = MarketStructure()
+        self._trail = StructuralTrail()
+
+    def on_bar(self, context: Context) -> tuple[Signal, ...]:
+        candle = context.candle
+        self._average.update(candle)
+        average = self._average.value()
+        break_ = self._structure.update(candle)
+        previous, self._previous = self._previous, candle
+
+        self._observe_fill(context)
+
+        conducted = self._conduct(context, break_)
+        signals: list[Signal] = [] if conducted is None else [conducted]
+
+        if average is None:
+            return tuple(signals)
+
+        # The two closes the rule names, tested independently rather than as each other's negation.
+        # They are not complements: a bar closing *on* the average is neither, and reading the
+        # trigger as "did not close below" would silently make the tie an entry.
+        long = self._side is Side.LONG
+        closed_beyond = candle.close > average if long else candle.close < average
+        closed_short_of = candle.close < average if long else candle.close > average
+
+        if closed_short_of:
+            # The setup is over: the order comes back and the qualification goes with it. This bar
+            # becomes the new reference — a reference is any bar, and the count starts after it.
+            if self._armed is not None:
+                signals.append(self._withdraw(self._armed, candle))
+                self._armed = None
+            self._corrections, self._qualified = 0, False
+            return tuple(signals)
+
+        # The qualification as it stood *coming into* this bar is what lets this bar trigger; a
+        # correction this bar happens to be counts toward the next one. That ordering is the BOS's
+        # ("`_up_armed and close > top`" is tested before the correction is counted): the bar that
+        # completes the pullback is part of it, not the reversal out of it.
+        qualified = self._qualified
+        self._track_correction(candle, previous)
+
+        if (
+            context.position is not None
+            or not qualified
+            or not closed_beyond
+            or not self._touches(candle, average)
+        ):
+            return tuple(signals)
+
+        entry = _breakout_entry(
+            candle, context.instrument, side=self._side, buffer_ticks=self._stop_buffer_ticks
         )
+        if entry is None:
+            # A bar with no range is no reference: its high and low are one price, so the trigger
+            # would sit on the stop and the trade would carry no risk. The qualification stands —
+            # this bar failed to be a setup, it did not destroy one.
+            return tuple(signals)
+
+        if self._armed is not None:
+            signals.append(self._withdraw(self._armed, candle))
+        # The counter, not the timestamp, makes the name unique: below M1 two references share a
+        # minute, and a repeated name is one the broker already holds — the second order would be
+        # refused in silence while the strategy believed itself armed.
+        self._armed_count += 1
+        client_id = f"{self._name}-{candle.time:%Y%m%dT%H%M}-{self._armed_count}"
+        self._armed = _Armed(reference=candle, client_id=client_id)
+        signals.append(
+            Signal(
+                kind=SignalKind.ENTRY,
+                side=self._side,
+                reference_price=candle.close,
+                stop_loss=entry.stop_loss,
+                stop_price=entry.stop_price,
+                reason=f"entry.{self._name}",
+                client_id=client_id,
+            )
+        )
+        return tuple(signals)
+
+    def _touches(self, candle: Candle, average: Money) -> bool:
+        """Did this bar reach the average? Piercing it counts — going through is still touching."""
+        return candle.low <= average if self._side is Side.LONG else candle.high >= average
+
+    def _track_correction(self, candle: Candle, previous: Candle | None) -> None:
+        """Fold this bar into the correction count, and qualify the pullback once two have run.
+
+        A correction is a strictly lower high **and** a strictly lower low than the bar before (the
+        mirror for a short). A bar that is not one breaks the streak — but a qualification already
+        earned stands, which is the latch the class docstring argues for.
+        """
+        if previous is None:
+            return
+        corrected = (
+            candle.high < previous.high and candle.low < previous.low
+            if self._side is Side.LONG
+            else candle.high > previous.high and candle.low > previous.low
+        )
+        if not corrected:
+            self._corrections = 0
+            return
+        self._corrections += 1
+        if self._corrections >= self._MIN_CORRECTION:
+            self._qualified = True
+
+    def _conduct(self, context: Context, break_: StructureBreak | None) -> Signal | None:
+        """The open trade's stop, moved by whichever rule is tighter — or `None` to leave it.
+
+        Two rules, neither of which closes the position: the structural trail (breakeven on the
+        first break of structure in the trade's favour, leg origins after it) and touching
+        `breakeven_at_r` times the initial risk. Both live from the fill, and no code here decides
+        which wins — the engine refuses a loosening (ADR-0018), so `tighten` simply never asks for
+        one. Between events the stop does not move; there is no bar-by-bar trailing here.
+        """
+        position = context.position
+        if position is None:
+            return None
+
+        candle = context.candle
+        candidates: list[Money] = []
+
+        breakeven = breakeven_candidate(
+            position=position, side=self._side, candle=candle, multiple=self._breakeven_at_r
+        )
+        if breakeven is not None:
+            candidates.append(breakeven)
+
+        structural = self._trail.candidate(position=position, break_=break_)
+        if structural is not None:
+            candidates.append(structural)
+
+        return tighten(
+            position=position,
+            side=self._side,
+            candle=candle,
+            candidates=candidates,
+            reason=f"trail.{self._name}",
+        )
+
+    def _observe_fill(self, context: Context) -> None:
+        """Notice the armed order becoming a trade, and spend the pullback that found it.
+
+        Two signs, either enough, the pair the whole engine reads (ADR-0015): the bar's own fills
+        carrying the armed name — the only sign that survives a position opening and dying inside
+        one bar — and an open position as the fallback. Forgetting `_armed` is part of it: the order
+        is not resting any more, and keeping the name would cancel an order the trade consumed.
+
+        **The fill spends the qualification**, so the next entry needs two fresh corrections. His
+        rule says entries repeat and re-arm when a trade ends, not that one pullback may be traded
+        twice — and every other setup in this engine spends its trigger at the fill for the same
+        reason (`StructureStrategy`: one trade per zone, ever). Corrections found *while* the trade
+        runs still count, so a pullback that completes mid-trade is a real one, and the first bar to
+        find the account flat may act on it.
+
+        **Zeroing `_corrections` here cannot change any outcome today, and it is kept anyway.** The
+        bar that fills can never be a correction: the order rests at the last qualifying bar's high,
+        and the bar before the fill either *is* that bar or failed to reach it, so the filling bar's
+        high is `>=` the previous bar's — while a correction needs a *strictly* lower one (mirrored
+        for a short, on the lows). The streak rule therefore zeroes the count on this very bar
+        anyway, by a different line, and dropping the assignment leaves a mutant no test can kill.
+
+        That proof covers the `filled` signal. The fallback — `position is not None` — coincides
+        with the fill bar only while **one instance owns the account**, and that is the assumption a
+        two-sided setup breaks first: compose a long and a short of this class over one account (the
+        MME9 docstring already contemplates that composition) and the long sees a position opened by
+        the short, burning its qualification on a bar that is not its own fill and may perfectly
+        well be a correction. This line carries no weight today and will carry it that day, which is
+        why it stays — and why the two flags are reset together rather than one at a time.
+        """
+        armed = self._armed
+        if armed is None:
+            return
+        filled = any(fill.order.client_id == armed.client_id for fill in context.fills)
+        if filled or context.position is not None:
+            self._armed = None
+            self._corrections, self._qualified = 0, False
+
+    def _withdraw(self, armed: _Armed, candle: Candle) -> Signal:
+        return _withdraw(armed, candle, side=self._side, name=self._name)

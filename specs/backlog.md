@@ -236,3 +236,17 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
   do portfólio). É a única linha do módulo sem cobertura, e por isso a única que faz o `portfolio.py`
   não fechar 100%. Não foi tocada neste PR porque é anterior a ele e um PR = um escopo: decidir se
   apaga a property ou se o `RunResult`/métricas passam a lê-la em vez de receber o número por fora.
+- [origem: PR-213] **Nenhum setup da camada swing/SMC é lançável pela DSL** — o
+  `PontoContinuoStrategy` nasceu com o construtor já preparado para vir de JSON (o `average` é
+  validado em runtime com `.get`, não confiando só no `Literal`, exatamente porque quem vai chamar
+  é uma camada de wiring sem tipos), mas esse chamador não existe: `apps/api/.../runner.py:128` só
+  faz `compile_strategy(definition)`, que entende indicador + comparação e mais nada. Vale para o
+  `Mme9BreakoutStrategy` e para o `StructureStrategy` também — tudo que foi construído desde o
+  PR-202 é invisível para a API e para a UI. Fora do escopo aqui porque é um PR de wiring (nó de
+  schema + fábrica + tipos gerados), não de engine, e é o próximo passo combinado.
+- [origem: PR-213] **`_MIN_CORRECTION` é constante de classe, não parâmetro** — o "2 correções" do
+  Ponto Contínuo é regra do autor e deliberadamente não é um botão que uma busca de parâmetros deva
+  girar, ao contrário do `breakeven_at_r`. Fica anotado porque no dia em que virar parâmetro os
+  quatro testes de contagem (consecutividade, estritura das duas comparações, queima no
+  cancelamento) são o que impede a mudança de passar despercebida — e porque a docstring da classe
+  descreve o 2 como escolha dele, o que um leitor pode confundir com configurabilidade.

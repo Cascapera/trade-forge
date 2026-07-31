@@ -1,0 +1,10 @@
+{
+  "schema_version": "1.0",
+  "name": "SMC — continuação, tudo no default",
+  "description": "Exercita o caminho em que o documento omite params inteiro: cada classe da engine aplica o próprio default, e o teste de drift garante que schema e engine concordam sobre quais são.",
+  "timeframe": "M15",
+  "setup": { "type": "structure_continuation" },
+  "risk": {
+    "sizing": { "type": "percent_risk", "params": { "percent": 1 } }
+  }
+}

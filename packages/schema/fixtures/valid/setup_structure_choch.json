@@ -1,0 +1,16 @@
+{
+  "schema_version": "1.0",
+  "name": "SMC — mudança de caráter",
+  "description": "Ordem limite na zona que a mudança de caráter deixou para trás. Sem lado: a estrutura decide.",
+  "timeframe": "M15",
+  "setup": {
+    "type": "structure_choch",
+    "params": { "allow_secondary": false, "stop_buffer": 0.1, "breakeven_at_r": 2 }
+  },
+  "exit": {
+    "take_profit": { "type": "risk_multiple", "params": { "rr": 3 } }
+  },
+  "risk": {
+    "sizing": { "type": "percent_risk", "params": { "percent": 0.5 } }
+  }
+}

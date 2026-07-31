@@ -96,10 +96,25 @@ export function buildCondition(side: SideForm): Condition | null {
   return side.combine === 'all' ? { all: group } : { any: group }
 }
 
+/**
+ * A document that describes its strategy as conditions.
+ *
+ * `entry` and `exit` are optional on `Strategy` because a document may instead *name* a setup —
+ * a state machine the DSL cannot describe, only reference (ADR-0019) — and such a document
+ * carries neither. This builder makes only the condition kind, so it always carries both, and
+ * saying so here is what lets callers read `document.entry.long` without a null check for a
+ * value that is never null. When the builder learns to emit setups, this type is where the
+ * change starts.
+ */
+export type ConditionStrategy = Strategy & {
+  entry: NonNullable<Strategy['entry']>
+  exit: NonNullable<Strategy['exit']>
+}
+
 /** Fold the form into a DSL document. Shape only — the caller validates it (schema in the
  *  browser, semantics at the API) before treating it as runnable. */
-export function buildStrategy(form: StrategyForm): Strategy {
-  const strategy: Strategy = {
+export function buildStrategy(form: StrategyForm): ConditionStrategy {
+  const strategy: ConditionStrategy = {
     schema_version: '1.0',
     name: form.name,
     timeframe: form.timeframe,

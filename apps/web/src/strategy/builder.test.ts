@@ -8,17 +8,26 @@ import {
   emptyForm,
   maCrossForm,
   OPS,
-  pontoContinuoForm,
   rsiOversoldForm,
+  SETUP_LABELS,
+  setupForm,
   setupValues,
+  STRATEGY_CHOICES,
+  strategyChoice,
   TIMEFRAMES,
-  withMode,
   type SideForm,
   type StrategyForm,
 } from './builder'
 
 function side(rows: SideForm['rows'], combine: SideForm['combine'] = 'all'): SideForm {
   return { enabled: true, combine, rows }
+}
+
+/** The Ponto Contínuo with its one unanswered field filled in — what a user has after choosing the
+ *  setup from the picker and saying which way they trade it. */
+function pontoContinuoForm(): StrategyForm {
+  const form = setupForm('ponto_continuo')
+  return { ...form, setup: { ...form.setup, values: { ...form.setup.values, side: 'long' } } }
 }
 
 describe('buildCondition', () => {
@@ -202,37 +211,48 @@ describe('buildSetupStrategy', () => {
   })
 })
 
-describe('switching between the two shapes', () => {
-  it('brings the 5R target along when a setup is chosen', () => {
-    expect(withMode(emptyForm(), 'setup').takeProfit).toEqual({ enabled: true, rr: 5 })
+describe('the strategy picker', () => {
+  it('offers every setup the schema names, plus the worked condition examples', () => {
+    expect(STRATEGY_CHOICES.filter((c) => c.group === 'Setups').map((c) => c.id)).toEqual([
+      ...SETUP_TYPES,
+    ])
+    expect(STRATEGY_CHOICES.filter((c) => c.group === 'Conditions').map((c) => c.id)).toEqual([
+      'ma_cross',
+      'rsi_oversold',
+    ])
   })
 
-  it("overrides the condition half's target rather than inheriting it", () => {
-    // The templates ship a 2R target. Carrying it into a setup would run the setup against a
-    // target its author never chose — a plausible backtest answering the wrong question.
-    const form = { ...maCrossForm(), takeProfit: { enabled: true, rr: 2 } }
-    expect(withMode(form, 'setup').takeProfit).toEqual({ enabled: true, rr: 5 })
-  })
-
-  it('leaves the target alone once already in setup mode', () => {
-    const chosen: StrategyForm = {
-      ...pontoContinuoForm(),
-      takeProfit: { enabled: true, rr: 3 },
+  it('names every setup, so none is offered as a raw schema key', () => {
+    for (const type of SETUP_TYPES) {
+      expect(SETUP_LABELS[type]).toBeTruthy()
+      expect(SETUP_LABELS[type]).not.toBe(type)
     }
-    expect(withMode(chosen, 'setup').takeProfit).toEqual({ enabled: true, rr: 3 })
   })
 
-  it('keeps both halves of the form, so toggling to compare costs nothing', () => {
-    const conditions = maCrossForm()
-    const there = withMode(conditions, 'setup')
-    const back = withMode(there, 'conditions')
-    expect(back.long).toEqual(conditions.long)
-    expect(back.indicators).toEqual(conditions.indicators)
-    expect(there.setup).toEqual(conditions.setup)
+  it('builds a runnable form for every choice, given the one field only a user can answer', () => {
+    for (const choice of STRATEGY_CHOICES) {
+      const form = choice.form()
+      const answered: StrategyForm =
+        'side' in form.setup.values && form.setup.values.side === ''
+          ? { ...form, setup: { ...form.setup, values: { ...form.setup.values, side: 'long' } } }
+          : form
+      expect(validateStrategy(buildStrategy(answered)).valid).toBe(true)
+    }
   })
 
-  it('routes buildStrategy to the shape the mode selects', () => {
-    expect(buildStrategy(maCrossForm())).toHaveProperty('entry')
-    expect(buildStrategy(pontoContinuoForm())).toHaveProperty('setup')
+  it('names an unknown choice as an error rather than silently loading nothing', () => {
+    expect(() => strategyChoice('escada')).toThrow(/no strategy named escada/)
+  })
+
+  it('starts a setup on the 5R target the author trades', () => {
+    expect(setupForm('mme9_breakout').takeProfit).toEqual({ enabled: true, rr: 5 })
+  })
+
+  it('leaves side unanswered, because picking a setup is not picking a direction', () => {
+    // The picker says *which* setup. Pre-filling the direction here would be it quietly answering
+    // the one question the schema deliberately asks.
+    const form = setupForm('ponto_continuo')
+    expect(form.setup.values.side).toBe('')
+    expect(validateStrategy(buildStrategy(form)).valid).toBe(false)
   })
 })

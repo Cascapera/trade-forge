@@ -15,11 +15,14 @@ export function App(): React.JSX.Element {
         <div className="mx-auto flex max-w-5xl items-center gap-6 px-6 py-4">
           <h1 className="text-lg font-bold tracking-tight">TradeForge</h1>
           <nav className="flex gap-4 text-sm">
+            {/* The first route builds a strategy and runs it in one go; the second re-runs the one
+                already saved this session over a different instrument or window, which costs no
+                new version. */}
             <NavLink to="/" end className={navClass}>
-              Strategy
+              New backtest
             </NavLink>
             <NavLink to="/launch" className={navClass}>
-              Backtest
+              Re-run saved
             </NavLink>
           </nav>
         </div>

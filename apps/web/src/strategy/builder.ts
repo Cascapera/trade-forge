@@ -8,7 +8,7 @@
 // hand-written. The runtime option lists below are checked against those types with `satisfies`,
 // so an invalid value (a timeframe the schema does not know) is a compile error.
 
-import { setupSpec, type SetupType } from '@tradeforge/schema'
+import { SETUP_TYPES, setupSpec, type SetupType } from '@tradeforge/schema'
 import type { Comparison, ComparisonOp, Condition, Strategy, Timeframe } from '@tradeforge/schema'
 
 export const TIMEFRAMES = ['M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1', 'W1'] as const satisfies
@@ -217,21 +217,6 @@ export function buildStrategy(form: StrategyForm): Strategy {
 /** The target a setup document starts with: the author trades 5R. */
 export const SETUP_TARGET_RR = 5
 
-/**
- * Switching to a named setup brings that convention's target with it.
- *
- * Entering setup mode always sets the 5R target, rather than keeping whatever the condition half
- * was carrying. The two modes are two different experiments with two different conventions, and
- * the condition templates ship a 2R target — so *inheriting* it would quietly run the setup
- * against a target its author never chose, which is the kind of wrong number that produces a
- * plausible backtest and no complaint. Re-entering setup mode is idempotent, and the condition
- * rows, indicators and stop are never touched, so toggling across to compare and back is free.
- */
-export function withMode(form: StrategyForm, mode: BuilderMode): StrategyForm {
-  if (mode !== 'setup' || form.mode === 'setup') return { ...form, mode }
-  return { ...form, mode, takeProfit: { enabled: true, rr: SETUP_TARGET_RR } }
-}
-
 /** Fold the form into a DSL document that describes its strategy as conditions. */
 export function buildConditionStrategy(form: StrategyForm): ConditionStrategy {
   const strategy: ConditionStrategy = {
@@ -346,20 +331,65 @@ export function rsiOversoldForm(): StrategyForm {
 }
 
 /**
- * A worked setup example: the Ponto Contínuo, long, on its own defaults, with the 5R target.
+ * What each setup is called on screen.
  *
- * `side` is the one field left for the user to answer — the template deliberately fills it, because
- * a *template* is someone stating an intent, which is exactly the thing an empty form must not do
- * on its own. Everything else comes from `setupValues`, so this stays a starting point rather than
- * a second place where the author's numbers are written down.
+ * `Record<SetupType, string>` rather than a lookup with a fallback: a fifth setup added in Python
+ * has to fail to compile here, because the alternative is a picker quietly listing a raw
+ * `structure_choch` among four named ones — or worse, listing nothing for it.
  */
-export function pontoContinuoForm(): StrategyForm {
-  const setup = emptySetup('ponto_continuo')
+export const SETUP_LABELS: Record<SetupType, string> = {
+  mme9_breakout: 'MME9 breakout',
+  ponto_continuo: 'Ponto Contínuo',
+  structure_choch: 'Structure — CHoCH',
+  structure_continuation: 'Structure — Continuation',
+}
+
+/**
+ * A fresh form for a named setup: its own defaults, the author's 5R target, and `side` left blank.
+ *
+ * Picking a setup from the list says *which* setup, not which direction — so the one field with no
+ * default stays unanswered, and the screen keeps saving disabled until it is chosen. Pre-filling it
+ * here would be the picker quietly answering a question the schema deliberately asks.
+ */
+export function setupForm(type: SetupType): StrategyForm {
   return {
     ...emptyForm(),
-    name: 'Ponto Contínuo',
+    name: SETUP_LABELS[type],
     mode: 'setup',
-    setup: { ...setup, values: { ...setup.values, side: 'long' } },
-    takeProfit: { enabled: true, rr: 5 },
+    setup: emptySetup(type),
+    takeProfit: { enabled: true, rr: SETUP_TARGET_RR },
   }
+}
+
+export interface StrategyChoice {
+  id: string
+  label: string
+  /** The heading it sits under: the two shapes a document may take. */
+  group: 'Setups' | 'Conditions'
+  form: () => StrategyForm
+}
+
+/**
+ * Everything the builder can start from, in one list.
+ *
+ * The setups come from the schema, so a new one in Python appears in the picker with no edit here;
+ * the condition entries are worked examples and are written out. Grouping them keeps the two
+ * document shapes visible as the different things they are, while still being one question:
+ * *which strategy* — instead of a mode to pick before the strategies are even visible.
+ */
+export const STRATEGY_CHOICES: readonly StrategyChoice[] = [
+  ...SETUP_TYPES.map((type) => ({
+    id: type,
+    label: SETUP_LABELS[type],
+    group: 'Setups' as const,
+    form: () => setupForm(type),
+  })),
+  { id: 'ma_cross', label: 'Moving-average cross', group: 'Conditions', form: maCrossForm },
+  { id: 'rsi_oversold', label: 'RSI oversold', group: 'Conditions', form: rsiOversoldForm },
+]
+
+export function strategyChoice(id: string): StrategyChoice {
+  const choice = STRATEGY_CHOICES.find((candidate) => candidate.id === id)
+  if (choice === undefined) throw new Error(`no strategy named ${id}`)
+  return choice
 }

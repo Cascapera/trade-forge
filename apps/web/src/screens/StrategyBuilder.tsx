@@ -8,25 +8,29 @@ import {
 import { useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 
-import { useCreateStrategy } from '../api/hooks'
+import { useCreateBacktest, useInstruments, useSaveStrategy } from '../api/hooks'
+import { emptyBacktestForm, toBacktestRequest, whyNotRunnable, type BacktestForm } from '../backtest/settings'
+import { BacktestSettings } from '../components/BacktestSettings'
 import { useSession } from '../store'
 import {
   buildStrategy,
   INDICATOR_KINDS,
-  maCrossForm,
   OPS,
-  pontoContinuoForm,
-  rsiOversoldForm,
   setupValues,
   SOURCES,
+  STRATEGY_CHOICES,
+  strategyChoice,
   TIMEFRAMES,
-  withMode,
   type ConditionRow,
   type IndicatorForm,
   type SetupForm,
   type SideForm,
+  type StrategyChoice,
   type StrategyForm,
 } from '../strategy/builder'
+
+/** The headings the picker groups by, in the order they are offered. */
+const GROUPS: readonly StrategyChoice['group'][] = ['Setups', 'Conditions']
 
 const inputClass =
   'rounded border border-slate-700 bg-slate-900 px-2 py-1 text-sm text-slate-100 focus:border-sky-500 focus:outline-none'
@@ -259,88 +263,79 @@ function SetupFields(props: {
 }
 
 export function StrategyBuilder(): React.JSX.Element {
-  const [form, setForm] = useState<StrategyForm>(maCrossForm)
+  const [choiceId, setChoiceId] = useState(STRATEGY_CHOICES[0]?.id ?? '')
+  const [form, setForm] = useState<StrategyForm>(() => strategyChoice(choiceId).form())
+  const [backtest, setBacktest] = useState<BacktestForm>(emptyBacktestForm)
   const navigate = useNavigate()
-  const setStrategy = useSession((state) => state.setStrategy)
-  const create = useCreateStrategy()
+  const session = useSession()
+  const instruments = useInstruments()
+  const save = useSaveStrategy()
+  const run = useCreateBacktest()
 
   const document = useMemo(() => buildStrategy(form), [form])
   const validation = useMemo(() => validateStrategy(document), [document])
+  const blocked = whyNotRunnable(backtest)
 
   const patch = (update: Partial<StrategyForm>): void => {
     setForm({ ...form, ...update })
   }
 
-  const save = (): void => {
-    create.mutate(document, {
-      onSuccess: (strategy) => {
-        setStrategy(strategy.id, strategy.name)
-        void navigate('/launch')
+  /**
+   * Save, then enqueue, then go and watch it.
+   *
+   * The save is a `PUT` whenever this name has been saved before in this session, because the API
+   * writes version 1 on every `POST` and (name, version) is unique — so re-running after nudging a
+   * parameter is a *new version* of the same strategy, which is what the lineage in the database
+   * was built for. Under a new name it is a `POST` and a new lineage.
+   */
+  const launch = (): void => {
+    const parentId = session.strategyName === form.name ? session.strategyId : null
+    save.mutate(
+      { definition: document, parentId },
+      {
+        onSuccess: (strategy) => {
+          session.setStrategy(strategy.id, strategy.name)
+          run.mutate(toBacktestRequest(backtest, strategy.id, form.timeframe), {
+            onSuccess: (created) => {
+              void navigate(`/results/${created.id}`)
+            },
+          })
+        },
       },
-    })
+    )
   }
 
   return (
     <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <h2 className="text-xl font-semibold">Build a strategy</h2>
-        <div className="flex gap-4">
-          <button
-            type="button"
-            className="text-sm text-slate-400 hover:text-slate-200"
-            onClick={() => {
-              setForm(maCrossForm())
-            }}
-          >
-            Load MA-cross template
-          </button>
-          <button
-            type="button"
-            className="text-sm text-slate-400 hover:text-slate-200"
-            onClick={() => {
-              setForm(rsiOversoldForm())
-            }}
-          >
-            Load RSI template
-          </button>
-          <button
-            type="button"
-            className="text-sm text-slate-400 hover:text-slate-200"
-            onClick={() => {
-              setForm(pontoContinuoForm())
-            }}
-          >
-            Load Ponto Contínuo template
-          </button>
-        </div>
-      </div>
+      <h2 className="text-xl font-semibold">Run a backtest</h2>
 
       <section className={sectionClass}>
-        <h3 className="mb-2 font-medium">How this strategy is described</h3>
-        <div className="flex flex-wrap gap-4">
-          {/* The two shapes a document may take. They are exclusive by rule, not by convenience: a
-              setup owns its own indicators, entry and stop, so a document carrying both would be a
-              second opinion with no arbiter, and the API refuses it. */}
-          {(
-            [
-              ['conditions', 'Conditions on indicators'],
-              ['setup', 'A named setup'],
-            ] as const
-          ).map(([mode, label]) => (
-            <label key={mode} className="flex items-center gap-2 text-sm">
-              <input
-                type="radio"
-                name="builder-mode"
-                aria-label={label}
-                checked={form.mode === mode}
-                onChange={() => {
-                  setForm(withMode(form, mode))
-                }}
-              />
-              {label}
-            </label>
-          ))}
-        </div>
+        <label className="flex flex-col gap-1 text-sm">
+          Strategy
+          <select
+            aria-label="strategy"
+            className={inputClass}
+            value={choiceId}
+            onChange={(event) => {
+              // Choosing a strategy loads its form outright, defaults and all. It replaces what was
+              // there rather than merging: the two document shapes have nothing in common to keep,
+              // and a half-carried-over form is how a run ends up with a parameter nobody chose.
+              const next = event.target.value
+              setChoiceId(next)
+              setForm(strategyChoice(next).form())
+            }}
+          >
+            {GROUPS.map((group) => (
+              <optgroup key={group} label={group}>
+                {STRATEGY_CHOICES.filter((choice) => choice.group === group).map((choice) => (
+                  <option key={choice.id} value={choice.id}>
+                    {choice.label}
+                  </option>
+                ))}
+              </optgroup>
+            ))}
+          </select>
+        </label>
         {form.mode === 'setup' && (
           <div className="mt-4">
             <SetupFields
@@ -536,6 +531,11 @@ export function StrategyBuilder(): React.JSX.Element {
         )}
       </section>
 
+      <section className={sectionClass}>
+        <h3 className="mb-3 font-medium">Where and when</h3>
+        <BacktestSettings form={backtest} instruments={instruments.data} onChange={setBacktest} />
+      </section>
+
       {!validation.valid && (
         <section className="rounded-lg border border-amber-800 bg-amber-950/40 p-4 text-sm">
           <p className="mb-2 font-medium text-amber-300">This strategy is not valid yet:</p>
@@ -549,17 +549,30 @@ export function StrategyBuilder(): React.JSX.Element {
         </section>
       )}
 
-      {create.isError && (
-        <p className="text-sm text-red-400">The API rejected the strategy. Check the fields above.</p>
+      {validation.valid && blocked !== null && (
+        // Why the button is disabled, rather than leaving the user to guess which field is at fault.
+        <p className="text-sm text-amber-300">Before running: {blocked}.</p>
+      )}
+
+      {save.isError && (
+        <p className="text-sm text-red-400">
+          The API rejected the strategy: {save.error.message}. A saved strategy is immutable for its
+          version — if this name already exists from an earlier session, give it a new one.
+        </p>
+      )}
+      {run.isError && (
+        <p className="text-sm text-red-400">
+          The strategy was saved, but the backtest could not be enqueued: {run.error.message}
+        </p>
       )}
 
       <button
         type="button"
-        disabled={!validation.valid || create.isPending}
-        onClick={save}
+        disabled={!validation.valid || blocked !== null || save.isPending || run.isPending}
+        onClick={launch}
         className="rounded bg-sky-600 px-4 py-2 font-medium text-white enabled:hover:bg-sky-500 disabled:opacity-40"
       >
-        {create.isPending ? 'Saving…' : 'Save & configure backtest'}
+        {save.isPending || run.isPending ? 'Starting…' : 'Run backtest'}
       </button>
     </div>
   )

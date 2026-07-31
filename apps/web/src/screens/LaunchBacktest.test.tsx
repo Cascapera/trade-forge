@@ -20,7 +20,7 @@ afterEach(() => {
 describe('LaunchBacktest', () => {
   it('asks the user to build a strategy first when none is selected', () => {
     renderWithProviders(<LaunchBacktest />)
-    expect(screen.getByText(/build and save a strategy first/i)).toBeInTheDocument()
+    expect(screen.getByText(/build and run a strategy first/i)).toBeInTheDocument()
   })
 
   it('enqueues a backtest with a spread cost model', () => {

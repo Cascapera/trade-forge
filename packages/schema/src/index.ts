@@ -1,5 +1,9 @@
 export { validateStrategy } from './validate.js'
 export type { Strategy, ValidationFailure, ValidationResult } from './validate.js'
+// The setups a document may name, with each parameter's kind, bounds and default read out of the
+// JSON Schema — so the builder shows the author's own numbers without keeping a copy of them.
+export { SETUP_TYPES, SETUPS, setupSpec } from './setups.js'
+export type { SetupParam, SetupSpec, SetupType } from './setups.js'
 // The DSL's own sub-types, re-exported from the generated source so a consumer (the web
 // strategy builder) composes a strategy against the same types the schema defines — never a
 // hand-written copy that could drift from the contract.

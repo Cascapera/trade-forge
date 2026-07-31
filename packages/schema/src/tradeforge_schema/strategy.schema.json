@@ -38,6 +38,13 @@
       "title": "AnyOf",
       "type": "object"
     },
+    "AverageKind": {
+      "enum": [
+        "EMA",
+        "SMA"
+      ],
+      "type": "string"
+    },
     "CandleExtremeParams": {
       "additionalProperties": false,
       "properties": {
@@ -154,6 +161,54 @@
       "title": "Constant",
       "type": "object"
     },
+    "ContinuationParams": {
+      "additionalProperties": false,
+      "description": "`max_bos` caps how many breaks after a change of character may still be traded.\n\n`null` is uncapped, which is the default and not a degenerate setting: \"every favourable\nbreak re-arms\" is a real reading of the method, and capping it is the experiment.",
+      "properties": {
+        "allow_secondary": {
+          "default": false,
+          "title": "Allow Secondary",
+          "type": "boolean"
+        },
+        "breakeven_at_r": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "maximum": 100,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": 2.0,
+          "title": "Breakeven At R"
+        },
+        "max_bos": {
+          "anyOf": [
+            {
+              "maximum": 100,
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Bos"
+        },
+        "stop_buffer": {
+          "default": 0.1,
+          "maximum": 10,
+          "minimum": 0,
+          "title": "Stop Buffer",
+          "type": "number"
+        }
+      },
+      "title": "ContinuationParams",
+      "type": "object"
+    },
     "EMA": {
       "additionalProperties": false,
       "properties": {
@@ -267,6 +322,67 @@
         }
       ]
     },
+    "Mme9BreakoutParams": {
+      "additionalProperties": false,
+      "description": "The break of the candle that closed across the MME9 (ADR-0016).",
+      "properties": {
+        "breakeven_at_r": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "maximum": 100,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": 2.0,
+          "title": "Breakeven At R"
+        },
+        "period": {
+          "default": 9,
+          "maximum": 1000,
+          "minimum": 1,
+          "title": "Period",
+          "type": "integer"
+        },
+        "side": {
+          "$ref": "#/$defs/SetupSide"
+        },
+        "stop_buffer_ticks": {
+          "default": 0,
+          "maximum": 10000,
+          "minimum": 0,
+          "title": "Stop Buffer Ticks",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "side"
+      ],
+      "title": "Mme9BreakoutParams",
+      "type": "object"
+    },
+    "Mme9BreakoutSetup": {
+      "additionalProperties": false,
+      "properties": {
+        "params": {
+          "$ref": "#/$defs/Mme9BreakoutParams"
+        },
+        "type": {
+          "const": "mme9_breakout",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "params"
+      ],
+      "title": "Mme9BreakoutSetup",
+      "type": "object"
+    },
     "NotOf": {
       "additionalProperties": false,
       "description": "Logical NOT. Serialised as `not`, which is a Python keyword — hence the alias.",
@@ -346,6 +462,71 @@
         "period"
       ],
       "title": "PeriodSourceParams",
+      "type": "object"
+    },
+    "PontoContinuoParams": {
+      "additionalProperties": false,
+      "description": "Two corrections back to the average, then the bar that touches it and closes back.",
+      "properties": {
+        "average": {
+          "$ref": "#/$defs/AverageKind",
+          "default": "EMA"
+        },
+        "breakeven_at_r": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "maximum": 100,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": 2.0,
+          "title": "Breakeven At R"
+        },
+        "period": {
+          "default": 20,
+          "maximum": 1000,
+          "minimum": 1,
+          "title": "Period",
+          "type": "integer"
+        },
+        "side": {
+          "$ref": "#/$defs/SetupSide"
+        },
+        "stop_buffer_ticks": {
+          "default": 0,
+          "maximum": 10000,
+          "minimum": 0,
+          "title": "Stop Buffer Ticks",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "side"
+      ],
+      "title": "PontoContinuoParams",
+      "type": "object"
+    },
+    "PontoContinuoSetup": {
+      "additionalProperties": false,
+      "properties": {
+        "params": {
+          "$ref": "#/$defs/PontoContinuoParams"
+        },
+        "type": {
+          "const": "ponto_continuo",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "params"
+      ],
+      "title": "PontoContinuoSetup",
       "type": "object"
     },
     "PriceSource": {
@@ -494,6 +675,110 @@
       "title": "SMA",
       "type": "object"
     },
+    "Setup": {
+      "discriminator": {
+        "mapping": {
+          "mme9_breakout": "#/$defs/Mme9BreakoutSetup",
+          "ponto_continuo": "#/$defs/PontoContinuoSetup",
+          "structure_choch": "#/$defs/StructureChochSetup",
+          "structure_continuation": "#/$defs/StructureContinuationSetup"
+        },
+        "propertyName": "type"
+      },
+      "oneOf": [
+        {
+          "$ref": "#/$defs/Mme9BreakoutSetup"
+        },
+        {
+          "$ref": "#/$defs/PontoContinuoSetup"
+        },
+        {
+          "$ref": "#/$defs/StructureChochSetup"
+        },
+        {
+          "$ref": "#/$defs/StructureContinuationSetup"
+        }
+      ]
+    },
+    "SetupSide": {
+      "enum": [
+        "long",
+        "short"
+      ],
+      "type": "string"
+    },
+    "StructureChochSetup": {
+      "additionalProperties": false,
+      "description": "Trade the zone the change of character left behind.",
+      "properties": {
+        "params": {
+          "$ref": "#/$defs/StructureParams"
+        },
+        "type": {
+          "const": "structure_choch",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "title": "StructureChochSetup",
+      "type": "object"
+    },
+    "StructureContinuationSetup": {
+      "additionalProperties": false,
+      "description": "Trade the zone a break in the trend's favour leaves behind, after a change of character.",
+      "properties": {
+        "params": {
+          "$ref": "#/$defs/ContinuationParams"
+        },
+        "type": {
+          "const": "structure_continuation",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "title": "StructureContinuationSetup",
+      "type": "object"
+    },
+    "StructureParams": {
+      "additionalProperties": false,
+      "description": "Shared by every setup that arms a limit order on a zone market structure left behind.\n\nNot directional: which side is traded follows the structure, so there is no `side` here.\n`stop_buffer` is a *fraction of the zone's width*, not ticks — the zone is the unit.",
+      "properties": {
+        "allow_secondary": {
+          "default": false,
+          "title": "Allow Secondary",
+          "type": "boolean"
+        },
+        "breakeven_at_r": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "maximum": 100,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": 2.0,
+          "title": "Breakeven At R"
+        },
+        "stop_buffer": {
+          "default": 0.1,
+          "maximum": 10,
+          "minimum": 0,
+          "title": "Stop Buffer",
+          "type": "number"
+        }
+      },
+      "title": "StructureParams",
+      "type": "object"
+    },
     "Timeframe": {
       "enum": [
         "M1",
@@ -546,6 +831,17 @@
       "title": "Schema Version",
       "type": "string"
     },
+    "setup": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Setup"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
     "timeframe": {
       "$ref": "#/$defs/Timeframe"
     }
@@ -554,8 +850,6 @@
     "schema_version",
     "name",
     "timeframe",
-    "entry",
-    "exit",
     "risk"
   ],
   "title": "Strategy",

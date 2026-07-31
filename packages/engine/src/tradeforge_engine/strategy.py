@@ -42,7 +42,8 @@ from tradeforge_engine.expressions import (
     compile_condition,
 )
 from tradeforge_engine.indicators import build_indicator
-from tradeforge_engine.protocols import Indicator
+from tradeforge_engine.protocols import Indicator, Strategy
+from tradeforge_engine.setup_factory import build_setup
 
 SUPPORTED_SCHEMA_VERSION: Final = "1.0"
 
@@ -203,13 +204,19 @@ def _compile_side(entry: Mapping[str, object], side: str) -> Condition | None:
     return compile_condition(_require_mapping(node, f"entry.{side}"))
 
 
-def compile_strategy(document: Mapping[str, object]) -> CompiledStrategy:
+def compile_strategy(document: Mapping[str, object]) -> Strategy:
     """Compile a validated DSL document into a runnable strategy.
 
     Assumes `document` has already passed the schema package's shape and semantic checks.
     Refuses an unsupported `schema_version` outright, and raises `EngineError` — never a bare
     `KeyError` — on anything structural it cannot interpret, so a malformed document fails
     with a sentence instead of a traceback.
+
+    Returns the `Strategy` *protocol*, not `CompiledStrategy`, because a document has two shapes.
+    One describes its strategy as conditions and compiles into the tree walker below; the other
+    **names** a setup — a state machine no tree can express — and is built by `build_setup`
+    (ADR-0019). Both satisfy the one method the loop calls, which is why this stays a single
+    entry point and no caller grows a branch.
     """
     version = document.get("schema_version")
     if version != SUPPORTED_SCHEMA_VERSION:
@@ -217,6 +224,12 @@ def compile_strategy(document: Mapping[str, object]) -> CompiledStrategy:
             f"strategy schema_version {version!r} is not supported; "
             f"this engine interprets {SUPPORTED_SCHEMA_VERSION!r}"
         )
+
+    setup = document.get("setup")
+    if setup is not None:
+        # The version gate above is deliberately shared: a setup document is a strategy document,
+        # and an engine that refuses to interpret one must refuse to interpret the other.
+        return build_setup(_require_mapping(setup, "setup"))
 
     name = document.get("name")
     if not isinstance(name, str):

@@ -1,0 +1,22 @@
+{
+  "schema_version": "1.0",
+  "name": "Ponto Contínuo — compra",
+  "description": "Duas correções de volta à média de 20; entra no rompimento da barra que a tocou e fechou acima. Alvo de 5R no broker, breakeven no 2x1.",
+  "timeframe": "H1",
+  "setup": {
+    "type": "ponto_continuo",
+    "params": {
+      "side": "long",
+      "period": 20,
+      "average": "EMA",
+      "stop_buffer_ticks": 0,
+      "breakeven_at_r": 2
+    }
+  },
+  "exit": {
+    "take_profit": { "type": "risk_multiple", "params": { "rr": 5 } }
+  },
+  "risk": {
+    "sizing": { "type": "percent_risk", "params": { "percent": 1 } }
+  }
+}

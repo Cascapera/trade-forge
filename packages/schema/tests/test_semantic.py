@@ -145,3 +145,84 @@ def test_generator_writes_the_schema_where_consumers_expect_it(
 ) -> None:
     assert main() == 0
     assert "strategy.schema.json" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------- #
+# Setup documents: the other shape a strategy can have (ADR-0019)               #
+# --------------------------------------------------------------------------- #
+
+
+def setup_strategy(**overrides: object) -> Strategy:
+    """A minimal runnable *setup* document: it names a strategy instead of describing one."""
+    document: dict[str, Any] = {
+        "schema_version": "1.0",
+        "name": "base setup",
+        "timeframe": "H1",
+        "setup": {"type": "ponto_continuo", "params": {"side": "long"}},
+        "risk": {"sizing": {"type": "percent_risk", "params": {"percent": 1.0}}},
+    }
+    document.update(overrides)
+    return Strategy.model_validate(document)
+
+
+def test_a_setup_document_needs_no_entry_conditions() -> None:
+    """The rule that a strategy must trade at least one side does not apply here: the setup *is*
+    the entry, and which side it takes is its own parameter (or, for the structure family, the
+    structure's business). Applying it would reject every setup document there is."""
+    assert validate_semantics(setup_strategy()) == []
+
+
+def test_a_setup_may_name_a_target_without_declaring_a_stop() -> None:
+    """The interaction that is easiest to get wrong. A risk-multiple target needs a risk to
+    multiply, and for a condition strategy that risk comes from `exit.stop_loss` — hence the rule.
+    A setup places its own stop, from the bar it entered on, so the risk exists without the field
+    ever appearing. Enforcing the rule here would reject exactly the documents worth running: the
+    author trades this at five times the risk.
+    """
+    model = setup_strategy(exit={"take_profit": {"type": "risk_multiple", "params": {"rr": 5.0}}})
+
+    assert validate_semantics(model) == []
+
+
+def test_a_setup_cannot_be_combined_with_entry_conditions() -> None:
+    """Refused, not ignored. Both would be an entry decision with no arbiter, and silently
+    dropping the one the user wrote is how a backtest answers a question nobody asked."""
+    model = setup_strategy(
+        entry={"long": {"op": "gt", "left": {"ref": "price.close"}, "right": {"value": 100}}}
+    )
+
+    assert "cannot be combined with entry conditions" in messages(model)
+
+
+def test_a_setup_declares_its_own_indicators() -> None:
+    model = setup_strategy(
+        indicators=[{"id": "sma", "type": "SMA", "params": {"period": 9, "source": "close"}}]
+    )
+
+    assert "a setup declares its own indicators" in messages(model)
+
+
+def test_a_setup_cannot_be_given_a_stop_rule() -> None:
+    model = setup_strategy(
+        exit={"stop_loss": {"type": "candle_extreme", "params": {"lookback": 1, "side": "low"}}}
+    )
+
+    assert "places its own stop" in messages(model)
+
+
+def test_a_setup_cannot_be_given_exit_conditions() -> None:
+    """A setup leaves at a level — its conducted stop or the broker's target — never on a rule
+    evaluated at a close. An exit condition would be a third way out that nothing else knows."""
+    model = setup_strategy(
+        exit={"conditions": [{"op": "lt", "left": {"ref": "price.close"}, "right": {"value": 100}}]}
+    )
+
+    assert "conducts its own exit" in messages(model)
+
+
+def test_a_document_that_is_neither_a_setup_nor_a_strategy_is_refused() -> None:
+    """Dropping `entry` from a document with no `setup` leaves nothing that decides anything. The
+    existing rule catches it, and this pins that making `entry` optional did not open a hole."""
+    model = strategy(entry={})
+
+    assert "at least one side" in messages(model)

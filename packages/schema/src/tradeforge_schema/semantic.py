@@ -91,8 +91,58 @@ def _is_indicator_ref(ref: Ref) -> bool:
     return "." not in ref.ref and "[" not in ref.ref
 
 
+def _validate_setup_document(strategy: Strategy) -> list[SemanticError]:
+    """The rules for a document that *names* a setup rather than describing one.
+
+    A setup is a state machine that owns its own indicators, its own entry trigger and its own
+    protective stop. Anything the condition half of the DSL would contribute is therefore not
+    merely redundant — it is a second opinion with no arbiter, so it is refused rather than
+    ignored. Silently dropping an `entry` the user wrote is how a backtest ends up answering a
+    question nobody asked.
+
+    What a setup document *does* keep is the two numbers that were never the strategy's to begin
+    with: `risk.sizing` (the account's) and `exit.take_profit` (the broker's target, resolved at
+    fill). Note that a target here needs **no** `exit.stop_loss` — the rule below that demands one
+    does not apply, because the setup places the stop itself, from the reference bar. Applying it
+    would reject every setup document that names a target, which is all of the interesting ones.
+    """
+    errors: list[SemanticError] = []
+    if strategy.indicators:
+        errors.append(
+            SemanticError(
+                "indicators",
+                "a setup declares its own indicators; remove these or drop the setup",
+            ),
+        )
+    if strategy.entry.long is not None or strategy.entry.short is not None:
+        errors.append(
+            SemanticError(
+                "entry",
+                "a setup is the entry; it cannot be combined with entry conditions",
+            ),
+        )
+    if strategy.exit.stop_loss is not None:
+        errors.append(
+            SemanticError(
+                "exit.stop_loss",
+                "a setup places its own stop from the bar it entered on",
+            ),
+        )
+    if strategy.exit.conditions:
+        errors.append(
+            SemanticError(
+                "exit.conditions",
+                "a setup conducts its own exit; the position leaves at a level, never on a rule",
+            ),
+        )
+    return errors
+
+
 def validate_semantics(strategy: Strategy) -> list[SemanticError]:
     """Return every reason the strategy cannot run. Empty list means it can."""
+    if strategy.setup is not None:
+        return _validate_setup_document(strategy)
+
     errors: list[SemanticError] = []
 
     declared: set[str] = set()

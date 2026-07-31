@@ -12,6 +12,7 @@ or an indicator type to the DSL and forget to teach the engine, and this test go
 
 import datetime as dt
 import json
+from collections.abc import Callable
 from decimal import Decimal
 from pathlib import Path
 
@@ -21,8 +22,22 @@ from tradeforge_engine.domain import Candle, SignalKind
 from tradeforge_engine.errors import EngineError
 from tradeforge_engine.indicators import SMA
 from tradeforge_engine.loop import run
-from tradeforge_engine.strategy import StopRule, compile_strategy
+from tradeforge_engine.strategy import CompiledStrategy, StopRule, compile_strategy
 from tradeforge_engine.testing import EURUSD, HOUR, START, FixedRisk, ImmediateFillBroker, bar
+
+
+def _compiled(document: dict[str, object]) -> CompiledStrategy:
+    """Compile a *condition* document and narrow to the concrete type.
+
+    `compile_strategy` returns the `Strategy` protocol, because a document may instead name a
+    setup and get a state machine back (ADR-0019). Everything in this module is about the tree
+    walker, and asserting the type once here is also the assertion that a document with no
+    `setup` block still compiles to exactly that.
+    """
+    strategy = compile_strategy(document)
+    assert isinstance(strategy, CompiledStrategy)
+    return strategy
+
 
 _FIXTURES = Path(__file__).resolve().parents[2] / "schema" / "fixtures"
 
@@ -45,6 +60,17 @@ def _crossover_strategy() -> dict[str, object]:
                 {"op": "crosses_below", "left": {"ref": "fast"}, "right": {"ref": "slow"}}
             ]
         },
+        "risk": {"sizing": {"type": "percent_risk", "params": {"percent": 1.0}}},
+    }
+
+
+def _setup_strategy() -> dict[str, object]:
+    """The other document shape: one that *names* a setup instead of describing it (ADR-0019)."""
+    return {
+        "schema_version": "1.0",
+        "name": "the pullback",
+        "timeframe": "H1",
+        "setup": {"type": "ponto_continuo", "params": {"side": "long", "period": 3}},
         "risk": {"sizing": {"type": "percent_risk", "params": {"percent": 1.0}}},
     }
 
@@ -73,7 +99,7 @@ def test_a_compiled_strategy_trades_through_the_real_loop() -> None:
     candles = _series(
         ["1.100", "1.090", "1.080", "1.070", "1.090", "1.110", "1.130", "1.120", "1.090", "1.070"]
     )
-    strategy = compile_strategy(_crossover_strategy())
+    strategy = _compiled(_crossover_strategy())
 
     result = run(
         candles=candles,
@@ -98,7 +124,7 @@ def test_a_compiled_strategy_trades_through_the_real_loop() -> None:
 
 
 def test_the_compiler_reports_the_timeframe_the_loop_needs() -> None:
-    strategy = compile_strategy(_crossover_strategy())
+    strategy = _compiled(_crossover_strategy())
     assert strategy.timeframe == dt.timedelta(hours=1)
     assert strategy.name == "fast crosses slow"
 
@@ -110,7 +136,7 @@ def test_an_entry_only_fires_while_flat_and_an_exit_only_while_in_a_position() -
     candles = _series(
         ["1.100", "1.090", "1.080", "1.070", "1.090", "1.110", "1.130", "1.140", "1.150", "1.160"]
     )
-    strategy = compile_strategy(_crossover_strategy())
+    strategy = _compiled(_crossover_strategy())
     result = run(
         candles=candles,
         timeframe=HOUR,
@@ -131,10 +157,20 @@ def test_an_entry_only_fires_while_flat_and_an_exit_only_while_in_a_position() -
 # --------------------------------------------------------------------------- #
 
 
-def test_an_unsupported_schema_version_is_refused() -> None:
+@pytest.mark.parametrize(
+    "build", [_crossover_strategy, _setup_strategy], ids=["conditions", "setup"]
+)
+def test_an_unsupported_schema_version_is_refused(build: Callable[[], dict[str, object]]) -> None:
     """A saved strategy is immutable for its version; the engine refuses one it was not built
-    to interpret rather than guess and reproduce a different backtest (AGENTS.md §5.5)."""
-    document = _crossover_strategy()
+    to interpret rather than guess and reproduce a different backtest (AGENTS.md §5.5).
+
+    Both document shapes are gated, and this is the assertion that the setup branch sits *after*
+    the gate rather than in front of it. A v2.0 that redefined what `stop_buffer` measures — the
+    field is a fraction of the zone's width, which is peculiar enough to be worth changing — would
+    otherwise be read with this engine's meaning, put every stop somewhere else, and finish `done`
+    with metrics nobody thinks to question.
+    """
+    document = build()
     document["schema_version"] = "2.0"
     with pytest.raises(EngineError, match="schema_version"):
         compile_strategy(document)
@@ -201,7 +237,7 @@ def test_the_history_window_counts_lookback_through_a_not() -> None:
         },
         "short": None,
     }
-    strategy = compile_strategy(document)
+    strategy = _compiled(document)
     assert strategy._candles.maxlen == 6  # 4 (deepest ref, under the not) + 1 + 1
 
 
@@ -252,7 +288,7 @@ def _with_stop(**params: object) -> dict[str, object]:
 
 
 def test_the_stop_is_compiled_and_sizes_the_window() -> None:
-    strategy = compile_strategy(_with_stop(lookback=5, side="low"))
+    strategy = _compiled(_with_stop(lookback=5, side="low"))
     assert strategy._stop_rule == StopRule(lookback=5, side="low")
     assert strategy._candles.maxlen == 7  # max(condition lookback 0, stop 5) + 2
 
@@ -308,7 +344,7 @@ def test_the_history_window_is_sized_to_the_deepest_ref() -> None:
         },
         "short": None,
     }
-    strategy = compile_strategy(document)
+    strategy = _compiled(document)
     assert strategy._candles.maxlen == 5  # 3 (deepest ref) + 1 (current) + 1 (edge shift)
 
 
@@ -323,18 +359,26 @@ def test_the_history_window_is_sized_to_the_deepest_ref() -> None:
     ids=lambda path: path.stem,
 )
 def test_every_valid_schema_fixture_compiles(fixture: Path) -> None:
-    """Each strategy the schema package publishes as valid must compile. This is the seam that
-    keeps the engine and the DSL from drifting without a code dependency between them."""
+    """Each strategy the schema package publishes as valid must compile into something the loop
+    can drive. This is the seam that keeps the engine and the DSL from drifting without a code
+    dependency between them.
+
+    The assertion is `on_bar`, not a concrete type, and that is the whole point since ADR-0019: a
+    valid document compiles either into the tree walker or into a setup's state machine, and what
+    the two owe in common is exactly the one method `run()` calls. Asserting `CompiledStrategy`
+    here would make every setup fixture a failure — which is how this test first told us the
+    fixtures had grown a second shape.
+    """
     document = json.loads(fixture.read_text(encoding="utf-8"))
     strategy = compile_strategy(document)
-    assert strategy.name
+    assert callable(strategy.on_bar)
 
 
 def test_the_canonical_fixture_builds_its_indicators() -> None:
     document = json.loads(
         (_FIXTURES / "valid" / "ma_cross_breakout.json").read_text(encoding="utf-8")
     )
-    strategy = compile_strategy(document)
+    strategy = _compiled(document)
     assert set(strategy._indicators) == {"sma_fast", "sma_slow"}
     assert all(isinstance(indicator, SMA) for indicator in strategy._indicators.values())
     assert strategy.timeframe == dt.timedelta(hours=1)

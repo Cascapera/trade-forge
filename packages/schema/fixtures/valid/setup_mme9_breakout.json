@@ -1,0 +1,13 @@
+{
+  "schema_version": "1.0",
+  "name": "Rompimento da MME9 — venda",
+  "description": "Entra no rompimento da mínima da barra que fechou abaixo da MME9. Sem alvo: o trade acaba no stop conduzido.",
+  "timeframe": "H1",
+  "setup": {
+    "type": "mme9_breakout",
+    "params": { "side": "short", "period": 9, "breakeven_at_r": 2 }
+  },
+  "risk": {
+    "sizing": { "type": "percent_risk", "params": { "percent": 1 } }
+  }
+}

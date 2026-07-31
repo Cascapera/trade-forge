@@ -15,6 +15,7 @@ from tradeforge_api.runner import execute_backtest
 from tradeforge_db.models import Instrument
 from tradeforge_engine import BacktestMetrics as EngineMetrics
 from tradeforge_engine.domain import AssetClass, Candle, ClosedTrade
+from tradeforge_engine.errors import EngineError
 from tradeforge_engine.testing import bar
 
 START = dt.datetime(2024, 1, 1, tzinfo=dt.UTC)
@@ -136,3 +137,137 @@ def test_a_strategy_without_percent_risk_sizing_raises() -> None:
     definition["risk"] = {}
     with pytest.raises(ValueError, match="percent_risk sizing"):
         run_it(definition=definition)
+
+
+# --------------------------------------------------------------------------- #
+# Setup documents: the other shape the runner has to drive (ADR-0019)           #
+# --------------------------------------------------------------------------- #
+
+
+def a_stock() -> Instrument:
+    """A one-cent instrument, because the setup golden below is written in whole dollars."""
+    return Instrument(
+        symbol="AAPL",
+        name="Apple Inc.",
+        asset_class=AssetClass.STOCK,
+        currency_quote="USD",
+        tick_size=Decimal("0.01"),
+        tick_value=Decimal("0.01"),
+        contract_size=Decimal("1"),
+        digits=2,
+    )
+
+
+def pullback_to_the_average() -> list[Candle]:
+    """The Ponto Contínuo golden from the engine's own suite, candle for candle.
+
+    Two corrections (bars 4 and 5) take price back to the average; bar 6 touches it at 111 and
+    closes at 113.5 above it, so the order rests at its high of 114 and bar 7 fills there. The
+    first break of structure takes the stop to breakeven; the second trails it to the leg origin
+    at 116; bar 16 comes back and takes it.
+    """
+    levels = [
+        ("99", "100", "100.5", "98.5"),
+        ("100", "104", "104.5", "100"),
+        ("104", "108", "108.5", "104"),
+        ("110", "114", "115", "110"),
+        ("113.5", "113", "114", "108"),
+        ("113", "112.5", "113.5", "107"),
+        ("112", "113.5", "114", "111"),
+        ("114", "115.5", "116", "113"),
+        ("115.5", "116", "117", "115"),
+        ("116", "115", "116.5", "114.2"),
+        ("115", "116.5", "117.5", "115"),
+        ("117", "118", "118.5", "116.5"),
+        ("118", "119", "119.5", "117.5"),
+        ("119", "118", "119", "116.5"),
+        ("118", "117.5", "118.5", "116"),
+        ("117.5", "120", "121", "117"),
+        ("120", "115.5", "120.5", "115"),
+    ]
+    return [
+        bar(index, open_=open_, close=close, high=high, low=low)
+        for index, (open_, close, high, low) in enumerate(levels)
+    ]
+
+
+def ponto_continuo(**params: object) -> dict[str, object]:
+    """A document that *names* a strategy instead of describing it. Note what is missing:
+    no `indicators`, no `entry`, and no `exit.stop_loss` — the setup owns all three."""
+    return {
+        "schema_version": "1.0",
+        "name": "Ponto Contínuo",
+        "timeframe": "H1",
+        "setup": {"type": "ponto_continuo", "params": {"side": "long", "period": 3, **params}},
+        "exit": {"take_profit": {"type": "risk_multiple", "params": {"rr": 5.0}}},
+        "risk": {"sizing": {"type": "percent_risk", "params": {"percent": 1.0}}},
+    }
+
+
+def test_a_setup_document_reproduces_the_engine_s_own_golden() -> None:
+    """The whole point of this PR, asserted as numbers rather than as "it ran".
+
+    These are the same figures `test_ponto_continuo.py` measures inside the engine — entry at 114,
+    conducted out at 116 for +0.67R — reached here through the API's own path: a stored document,
+    the instrument row, the cost model, the risk manager. If the wiring changed the result, it
+    would change it here.
+
+    `reason == "sl"` on a *winning* trade is not a bug in the ledger. The setup ends at its
+    conducted stop, above the entry price, which is what a stop-out looks like once the trade has
+    been managed. A reader who maps "sl" to "loss" will misread this setup's best trades.
+    """
+    trades, metrics = run_it(
+        definition=ponto_continuo(),
+        instrument=a_stock(),
+        candles=pullback_to_the_average(),
+        initial_capital=Decimal("100000"),
+    )
+
+    (trade,) = trades
+    assert trade.entry_price == Decimal(114)
+    assert trade.exit_price == Decimal(116)
+    assert trade.reason == "sl"
+    assert trade.net_pnl == Decimal("666.66")
+    assert metrics.total_trades == 1
+    assert metrics.long_trades == 1
+
+
+def test_a_setup_document_needs_no_indicators_entry_or_stop_block() -> None:
+    """The runner reads `risk.sizing` and `exit.take_profit` out of the document itself, so a
+    setup document still has to carry those two — they were never the strategy's to begin with.
+    Everything else it omits, and omitting it must not raise."""
+    document = ponto_continuo()
+
+    assert "indicators" not in document
+    assert "entry" not in document
+    assert "stop_loss" not in document["exit"]  # type: ignore[operator]
+
+    trades, _ = run_it(definition=document, instrument=a_stock(), candles=pullback_to_the_average())
+    assert len(trades) == 1
+
+
+def test_switching_the_breakeven_rule_off_reaches_the_setup() -> None:
+    """A parameter that travels from JSON through the factory into the state machine, proved by
+    the trade it changes rather than by reading an attribute back."""
+    with_rule, _ = run_it(
+        definition=ponto_continuo(),
+        instrument=a_stock(),
+        candles=pullback_to_the_average(),
+    )
+    without_rule, _ = run_it(
+        definition=ponto_continuo(breakeven_at_r=None),
+        instrument=a_stock(),
+        candles=pullback_to_the_average(),
+    )
+
+    # Both trade; the conducted stop is what differs, and only structure moves it once the 2x1
+    # rule is gone. Same entry either way.
+    assert with_rule[0].entry_price == without_rule[0].entry_price == Decimal(114)
+
+
+def test_an_unknown_setup_type_fails_loudly_at_compile_time() -> None:
+    document = ponto_continuo()
+    document["setup"] = {"type": "setup_9_4", "params": {}}
+
+    with pytest.raises(EngineError, match="unknown setup type"):
+        run_it(definition=document, instrument=a_stock(), candles=pullback_to_the_average())

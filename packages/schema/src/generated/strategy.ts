@@ -230,6 +230,25 @@ export type MaxOpenPositions = number;
 export type Percent = number;
 export type Type5 = "percent_risk";
 export type SchemaVersion = "1.0";
+export type Setup = Mme9BreakoutSetup | PontoContinuoSetup | StructureChochSetup | StructureContinuationSetup;
+export type BreakevenAtR = number | null;
+export type Period1 = number;
+export type SetupSide = "long" | "short";
+export type StopBufferTicks = number;
+export type Type6 = "mme9_breakout";
+export type BreakevenAtR1 = number | null;
+export type Period2 = number;
+export type StopBufferTicks1 = number;
+export type Type7 = "ponto_continuo";
+export type AllowSecondary = boolean;
+export type BreakevenAtR2 = number | null;
+export type StopBuffer = number;
+export type Type8 = "structure_choch";
+export type AllowSecondary1 = boolean;
+export type BreakevenAtR3 = number | null;
+export type MaxBos = number | null;
+export type StopBuffer1 = number;
+export type Type9 = "structure_continuation";
 export type Timeframe = "M1" | "M5" | "M15" | "M30" | "H1" | "H4" | "D1" | "W1";
 
 /**
@@ -237,12 +256,13 @@ export type Timeframe = "M1" | "M5" | "M15" | "M30" | "H1" | "H4" | "D1" | "W1";
  */
 export interface Strategy {
   description?: Description;
-  entry: Entry;
-  exit: Exit;
+  entry?: Entry;
+  exit?: Exit;
   indicators?: Indicators;
   name: Name;
   risk: Risk;
   schema_version: SchemaVersion;
+  setup?: Setup | null;
   timeframe: Timeframe;
 }
 /**
@@ -367,4 +387,68 @@ export interface PercentRiskSizing {
 }
 export interface PercentRiskParams {
   percent: Percent;
+}
+export interface Mme9BreakoutSetup {
+  params: Mme9BreakoutParams;
+  type: Type6;
+}
+/**
+ * The break of the candle that closed across the MME9 (ADR-0016).
+ */
+export interface Mme9BreakoutParams {
+  breakeven_at_r?: BreakevenAtR;
+  period?: Period1;
+  side: SetupSide;
+  stop_buffer_ticks?: StopBufferTicks;
+}
+export interface PontoContinuoSetup {
+  params: PontoContinuoParams;
+  type: Type7;
+}
+/**
+ * Two corrections back to the average, then the bar that touches it and closes back.
+ */
+export interface PontoContinuoParams {
+  average?: "EMA" | "SMA";
+  breakeven_at_r?: BreakevenAtR1;
+  period?: Period2;
+  side: SetupSide;
+  stop_buffer_ticks?: StopBufferTicks1;
+}
+/**
+ * Trade the zone the change of character left behind.
+ */
+export interface StructureChochSetup {
+  params?: StructureParams;
+  type: Type8;
+}
+/**
+ * Shared by every setup that arms a limit order on a zone market structure left behind.
+ *
+ * Not directional: which side is traded follows the structure, so there is no `side` here.
+ * `stop_buffer` is a *fraction of the zone's width*, not ticks — the zone is the unit.
+ */
+export interface StructureParams {
+  allow_secondary?: AllowSecondary;
+  breakeven_at_r?: BreakevenAtR2;
+  stop_buffer?: StopBuffer;
+}
+/**
+ * Trade the zone a break in the trend's favour leaves behind, after a change of character.
+ */
+export interface StructureContinuationSetup {
+  params?: ContinuationParams;
+  type: Type9;
+}
+/**
+ * `max_bos` caps how many breaks after a change of character may still be traded.
+ *
+ * `null` is uncapped, which is the default and not a degenerate setting: "every favourable
+ * break re-arms" is a real reading of the method, and capping it is the experiment.
+ */
+export interface ContinuationParams {
+  allow_secondary?: AllowSecondary1;
+  breakeven_at_r?: BreakevenAtR3;
+  max_bos?: MaxBos;
+  stop_buffer?: StopBuffer1;
 }

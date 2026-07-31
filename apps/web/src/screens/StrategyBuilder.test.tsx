@@ -91,3 +91,83 @@ describe('StrategyBuilder', () => {
     expect(screen.getByLabelText('timeframe')).toHaveValue('H1')
   })
 })
+
+describe('StrategyBuilder in setup mode', () => {
+  it('swaps the condition half of the form for the setup the document names', () => {
+    renderWithProviders(<StrategyBuilder />)
+    expect(screen.getByLabelText('Long left 0')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByLabelText('A named setup'))
+
+    // A setup owns its own indicators, entry and stop, so none of them may be offered: the API
+    // refuses a document that carries them, and a form that let you fill them in would be
+    // collecting input it then has to throw away.
+    expect(screen.queryByLabelText('Long left 0')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '+ indicator' })).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('Stop at candle extreme')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('Exit conditions')).not.toBeInTheDocument()
+
+    // What it does keep: the account's risk and the broker's target, pre-filled at the 5R the
+    // author trades.
+    expect(screen.getByLabelText('take profit rr')).toHaveValue(5)
+    expect(screen.getByLabelText('percent')).toBeInTheDocument()
+  })
+
+  it("shows each parameter's own default, and leaves side for the user to answer", () => {
+    renderWithProviders(<StrategyBuilder />)
+    fireEvent.click(screen.getByLabelText('A named setup'))
+
+    expect(screen.getByLabelText('setup period')).toHaveValue(20)
+    expect(screen.getByLabelText('setup average')).toHaveValue('EMA')
+    expect(screen.getByLabelText('setup breakeven_at_r')).toHaveValue(2)
+
+    // Unanswered, so the document is invalid and cannot be saved — rather than quietly running long.
+    expect(screen.getByLabelText('setup side')).toHaveValue('')
+    expect(screen.getByRole('button', { name: /save & configure/i })).toBeDisabled()
+
+    fireEvent.change(screen.getByLabelText('setup side'), { target: { value: 'short' } })
+    expect(screen.getByRole('button', { name: /save & configure/i })).toBeEnabled()
+  })
+
+  it('reloads the parameters when a different setup is chosen', () => {
+    renderWithProviders(<StrategyBuilder />)
+    fireEvent.click(screen.getByLabelText('A named setup'))
+    fireEvent.change(screen.getByLabelText('setup type'), {
+      target: { value: 'structure_continuation' },
+    })
+
+    // The structure family is not directional — which way it trades follows the structure it reads.
+    expect(screen.queryByLabelText('setup side')).not.toBeInTheDocument()
+    expect(screen.getByLabelText('setup stop_buffer')).toHaveValue(0.1)
+    expect(screen.getByLabelText('setup allow_secondary')).not.toBeChecked()
+    // `max_bos` defaults to null, which is uncapped, so the box is empty rather than showing a 0.
+    expect(screen.getByLabelText('setup max_bos')).toHaveValue(null)
+    expect(screen.getByRole('button', { name: /save & configure/i })).toBeEnabled()
+  })
+
+  it('keeps a cleared nullable field valid, because empty means off', () => {
+    renderWithProviders(<StrategyBuilder />)
+    fireEvent.click(screen.getByRole('button', { name: /load ponto cont/i }))
+    expect(screen.getByLabelText('setup side')).toHaveValue('long')
+
+    fireEvent.change(screen.getByLabelText('setup breakeven_at_r'), { target: { value: '' } })
+    expect(screen.getByRole('button', { name: /save & configure/i })).toBeEnabled()
+  })
+
+  it('saves a setup document', () => {
+    mutate.mockImplementation(
+      (_document: unknown, options: { onSuccess: (s: { id: string; name: string }) => void }) => {
+        options.onSuccess({ id: 's2', name: 'Ponto Contínuo' })
+      },
+    )
+    renderWithProviders(<StrategyBuilder />)
+    fireEvent.click(screen.getByRole('button', { name: /load ponto cont/i }))
+    fireEvent.click(screen.getByRole('button', { name: /save & configure/i }))
+
+    expect(mutate).toHaveBeenCalledTimes(1)
+    expect(mutate.mock.calls[0]?.[0]).toMatchObject({
+      setup: { type: 'ponto_continuo', params: { side: 'long', period: 20 } },
+    })
+    expect(useSession.getState().strategyId).toBe('s2')
+  })
+})

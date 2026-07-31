@@ -8,6 +8,7 @@
 // hand-written. The runtime option lists below are checked against those types with `satisfies`,
 // so an invalid value (a timeframe the schema does not know) is a compile error.
 
+import { setupSpec, type SetupType } from '@tradeforge/schema'
 import type { Comparison, ComparisonOp, Condition, Strategy, Timeframe } from '@tradeforge/schema'
 
 export const TIMEFRAMES = ['M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1', 'W1'] as const satisfies
@@ -68,9 +69,37 @@ export interface TakeProfitForm {
   rr: number
 }
 
+/**
+ * A document describes its strategy in one of two ways, and the form follows it.
+ *
+ * `conditions` is the tree the builder has always produced. `setup` *names* a state machine the
+ * DSL cannot describe — which order is resting, whether this turn already gave its trade, how many
+ * breaks of structure the position has seen — and the two cannot be combined: the semantic layer
+ * refuses a document carrying both, because a setup owns its own entry and its own stop, and a
+ * second opinion has no arbiter.
+ */
+export type BuilderMode = 'conditions' | 'setup'
+
+/**
+ * The named setup and the values typed into its fields.
+ *
+ * Values are kept as the form holds them — strings, or booleans for flags — rather than parsed,
+ * because an empty box is a meaningful state that a number cannot represent. What it means is
+ * decided per parameter by the schema: an empty *nullable* field is the rule being switched off
+ * (`breakeven_at_r: null` asks what the setup earns without taking winners to breakeven,
+ * `max_bos: null` means uncapped), and any other empty field is simply left out, so the engine
+ * class's own default applies. Neither is the same as sending a zero.
+ */
+export interface SetupForm {
+  type: SetupType
+  values: Record<string, string | boolean>
+}
+
 export interface StrategyForm {
   name: string
   timeframe: Timeframe
+  mode: BuilderMode
+  setup: SetupForm
   indicators: IndicatorForm[]
   long: SideForm
   short: SideForm
@@ -111,9 +140,100 @@ export type ConditionStrategy = Strategy & {
   exit: NonNullable<Strategy['exit']>
 }
 
-/** Fold the form into a DSL document. Shape only — the caller validates it (schema in the
- *  browser, semantics at the API) before treating it as runnable. */
-export function buildStrategy(form: StrategyForm): ConditionStrategy {
+/** A document that names a setup. The counterpart of `ConditionStrategy`. */
+export type SetupStrategy = Strategy & { setup: NonNullable<Strategy['setup']> }
+
+/**
+ * The values a fresh form starts with: every parameter pre-filled with the number the schema
+ * declares, which is the engine class's own default (ADR-0019).
+ *
+ * A parameter with no default starts empty on purpose. `side` is the one that matters: the engine
+ * classes default it to long so a hand-built strategy in a test has somewhere to start, but the
+ * schema makes it required, and a form that pre-selected "long" would turn a forgotten choice into
+ * an entire long-only backtest read as the setup's result.
+ */
+export function setupValues(type: SetupType): Record<string, string | boolean> {
+  const values: Record<string, string | boolean> = {}
+  for (const param of setupSpec(type).params) {
+    values[param.name] = param.kind === 'boolean' ? param.default : (param.default?.toString() ?? '')
+  }
+  return values
+}
+
+/** Fold the typed values back into the document's `params`, per the rules in `SetupForm`. */
+function setupParams(form: SetupForm): Record<string, unknown> {
+  const params: Record<string, unknown> = {}
+  for (const param of setupSpec(form.type).params) {
+    const raw = form.values[param.name]
+    if (param.kind === 'boolean') {
+      params[param.name] = raw === true
+      continue
+    }
+    const text = typeof raw === 'string' ? raw.trim() : ''
+    if (text === '') {
+      if (param.kind !== 'enum' && param.nullable) params[param.name] = null
+      continue
+    }
+    params[param.name] = param.kind === 'enum' ? text : Number(text)
+  }
+  return params
+}
+
+/**
+ * A document that names a setup.
+ *
+ * It carries only what was never the strategy's to decide: the account's risk and the broker's
+ * target. No indicators, no entry conditions, and no stop — the setup declares its own indicators,
+ * *is* the entry, and places its stop from the bar it entered on. The semantic layer refuses a
+ * setup document that carries any of them, so the form does not offer them either.
+ */
+export function buildSetupStrategy(form: StrategyForm): SetupStrategy {
+  return {
+    schema_version: '1.0',
+    name: form.name,
+    timeframe: form.timeframe,
+    setup: {
+      type: form.setup.type,
+      params: setupParams(form.setup),
+    } as SetupStrategy['setup'],
+    exit: {
+      stop_loss: null,
+      take_profit: form.takeProfit.enabled
+        ? { type: 'risk_multiple', params: { rr: form.takeProfit.rr } }
+        : null,
+      conditions: [],
+    },
+    risk: { sizing: { type: 'percent_risk', params: { percent: form.percent } } },
+  }
+}
+
+/** Fold the form into a DSL document, in whichever of the two shapes the mode selects. Shape only
+ *  — the caller validates it (schema in the browser, semantics at the API) before treating it as
+ *  runnable. */
+export function buildStrategy(form: StrategyForm): Strategy {
+  return form.mode === 'setup' ? buildSetupStrategy(form) : buildConditionStrategy(form)
+}
+
+/** The target a setup document starts with: the author trades 5R. */
+export const SETUP_TARGET_RR = 5
+
+/**
+ * Switching to a named setup brings that convention's target with it.
+ *
+ * Entering setup mode always sets the 5R target, rather than keeping whatever the condition half
+ * was carrying. The two modes are two different experiments with two different conventions, and
+ * the condition templates ship a 2R target — so *inheriting* it would quietly run the setup
+ * against a target its author never chose, which is the kind of wrong number that produces a
+ * plausible backtest and no complaint. Re-entering setup mode is idempotent, and the condition
+ * rows, indicators and stop are never touched, so toggling across to compare and back is free.
+ */
+export function withMode(form: StrategyForm, mode: BuilderMode): StrategyForm {
+  if (mode !== 'setup' || form.mode === 'setup') return { ...form, mode }
+  return { ...form, mode, takeProfit: { enabled: true, rr: SETUP_TARGET_RR } }
+}
+
+/** Fold the form into a DSL document that describes its strategy as conditions. */
+export function buildConditionStrategy(form: StrategyForm): ConditionStrategy {
   const strategy: ConditionStrategy = {
     schema_version: '1.0',
     name: form.name,
@@ -146,11 +266,19 @@ function emptySide(): SideForm {
   return { enabled: false, combine: 'all', rows: [] }
 }
 
+/** The setup half of a fresh form. It exists even in condition mode, and vice versa, so toggling
+ *  between the two to compare them never throws away what was typed in the other. */
+export function emptySetup(type: SetupType = 'ponto_continuo'): SetupForm {
+  return { type, values: setupValues(type) }
+}
+
 /** A blank form: no indicators, no conditions, sensible risk. The starting point in the UI. */
 export function emptyForm(): StrategyForm {
   return {
     name: '',
     timeframe: 'H1',
+    mode: 'conditions',
+    setup: emptySetup(),
     indicators: [],
     long: emptySide(),
     short: emptySide(),
@@ -167,6 +295,8 @@ export function maCrossForm(): StrategyForm {
   return {
     name: 'MA cross',
     timeframe: 'H1',
+    mode: 'conditions',
+    setup: emptySetup(),
     indicators: [
       { id: 'fast', kind: 'SMA', period: 9, source: 'close' },
       { id: 'slow', kind: 'SMA', period: 21, source: 'close' },
@@ -195,6 +325,8 @@ export function rsiOversoldForm(): StrategyForm {
   return {
     name: 'RSI oversold',
     timeframe: 'H1',
+    mode: 'conditions',
+    setup: emptySetup(),
     indicators: [{ id: 'rsi', kind: 'RSI', period: 14, source: 'close' }],
     long: {
       enabled: true,
@@ -210,5 +342,24 @@ export function rsiOversoldForm(): StrategyForm {
       rows: [{ left: 'rsi', op: 'crosses_above', right: '70', rightKind: 'value' }],
     },
     percent: 1,
+  }
+}
+
+/**
+ * A worked setup example: the Ponto Contínuo, long, on its own defaults, with the 5R target.
+ *
+ * `side` is the one field left for the user to answer — the template deliberately fills it, because
+ * a *template* is someone stating an intent, which is exactly the thing an empty form must not do
+ * on its own. Everything else comes from `setupValues`, so this stays a starting point rather than
+ * a second place where the author's numbers are written down.
+ */
+export function pontoContinuoForm(): StrategyForm {
+  const setup = emptySetup('ponto_continuo')
+  return {
+    ...emptyForm(),
+    name: 'Ponto Contínuo',
+    mode: 'setup',
+    setup: { ...setup, values: { ...setup.values, side: 'long' } },
+    takeProfit: { enabled: true, rr: 5 },
   }
 }

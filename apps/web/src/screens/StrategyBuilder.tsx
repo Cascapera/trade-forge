@@ -1,4 +1,10 @@
-import { validateStrategy } from '@tradeforge/schema'
+import {
+  SETUPS,
+  setupSpec,
+  validateStrategy,
+  type SetupParam,
+  type SetupType,
+} from '@tradeforge/schema'
 import { useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 
@@ -9,11 +15,15 @@ import {
   INDICATOR_KINDS,
   maCrossForm,
   OPS,
+  pontoContinuoForm,
   rsiOversoldForm,
+  setupValues,
   SOURCES,
   TIMEFRAMES,
+  withMode,
   type ConditionRow,
   type IndicatorForm,
+  type SetupForm,
   type SideForm,
   type StrategyForm,
 } from '../strategy/builder'
@@ -134,6 +144,120 @@ function ConditionRows(props: {
   )
 }
 
+/** What an empty box means for this parameter, said out loud — the distinction is invisible
+ *  otherwise, and it is the difference between two different experiments. */
+function emptyHint(param: SetupParam): string | null {
+  if (param.kind === 'boolean' || !('nullable' in param) || !param.nullable) return null
+  return param.name === 'max_bos' ? 'empty = uncapped' : 'empty = off'
+}
+
+function SetupField(props: {
+  param: SetupParam
+  value: string | boolean | undefined
+  onChange: (next: string | boolean) => void
+}): React.JSX.Element {
+  const { param, value, onChange } = props
+  const hint = emptyHint(param)
+  return (
+    <label className="flex flex-col gap-1 text-sm">
+      <span>
+        {param.name}
+        {param.required && <span className="text-amber-400"> *</span>}
+        {hint !== null && <span className="ml-1 text-xs text-slate-500">({hint})</span>}
+      </span>
+      {param.kind === 'boolean' ? (
+        <input
+          aria-label={`setup ${param.name}`}
+          type="checkbox"
+          className="self-start"
+          checked={value === true}
+          onChange={(event) => {
+            onChange(event.target.checked)
+          }}
+        />
+      ) : param.kind === 'enum' ? (
+        <select
+          aria-label={`setup ${param.name}`}
+          className={inputClass}
+          value={typeof value === 'string' ? value : ''}
+          onChange={(event) => {
+            onChange(event.target.value)
+          }}
+        >
+          {/* A required parameter with no schema default starts unanswered, and the blank option is
+              how it stays that way until the user chooses. Pre-selecting `long` would turn a
+              forgotten choice into a whole long-only backtest read as the setup's result. */}
+          {param.default === null && <option value="">choose…</option>}
+          {param.options.map((option) => (
+            <option key={option} value={option}>
+              {option}
+            </option>
+          ))}
+        </select>
+      ) : (
+        <input
+          aria-label={`setup ${param.name}`}
+          type="number"
+          step={param.kind === 'integer' ? '1' : '0.1'}
+          min={param.min}
+          max={param.max}
+          className={inputClass}
+          value={typeof value === 'string' ? value : ''}
+          onChange={(event) => {
+            onChange(event.target.value)
+          }}
+        />
+      )}
+    </label>
+  )
+}
+
+function SetupFields(props: {
+  setup: SetupForm
+  onChange: (next: SetupForm) => void
+}): React.JSX.Element {
+  const { setup, onChange } = props
+  // Straight off the schema: kind, bounds, nullability and default. A parameter added to the DSL
+  // in Python shows up here once the types are regenerated, with no edit to this file.
+  const spec = setupSpec(setup.type)
+  return (
+    <div className="space-y-3">
+      <label className="flex flex-col gap-1 text-sm">
+        Setup
+        <select
+          aria-label="setup type"
+          className={inputClass}
+          value={setup.type}
+          onChange={(event) => {
+            // A different setup has different parameters, so the values start from its own
+            // defaults rather than carrying over names that mean something else.
+            const type = event.target.value as SetupType
+            onChange({ type, values: setupValues(type) })
+          }}
+        >
+          {SETUPS.map((candidate) => (
+            <option key={candidate.type} value={candidate.type}>
+              {candidate.type}
+            </option>
+          ))}
+        </select>
+      </label>
+      <div className="flex flex-wrap gap-4">
+        {spec.params.map((param) => (
+          <SetupField
+            key={param.name}
+            param={param}
+            value={setup.values[param.name]}
+            onChange={(next) => {
+              onChange({ ...setup, values: { ...setup.values, [param.name]: next } })
+            }}
+          />
+        ))}
+      </div>
+    </div>
+  )
+}
+
 export function StrategyBuilder(): React.JSX.Element {
   const [form, setForm] = useState<StrategyForm>(maCrossForm)
   const navigate = useNavigate()
@@ -179,8 +303,55 @@ export function StrategyBuilder(): React.JSX.Element {
           >
             Load RSI template
           </button>
+          <button
+            type="button"
+            className="text-sm text-slate-400 hover:text-slate-200"
+            onClick={() => {
+              setForm(pontoContinuoForm())
+            }}
+          >
+            Load Ponto Contínuo template
+          </button>
         </div>
       </div>
+
+      <section className={sectionClass}>
+        <h3 className="mb-2 font-medium">How this strategy is described</h3>
+        <div className="flex flex-wrap gap-4">
+          {/* The two shapes a document may take. They are exclusive by rule, not by convenience: a
+              setup owns its own indicators, entry and stop, so a document carrying both would be a
+              second opinion with no arbiter, and the API refuses it. */}
+          {(
+            [
+              ['conditions', 'Conditions on indicators'],
+              ['setup', 'A named setup'],
+            ] as const
+          ).map(([mode, label]) => (
+            <label key={mode} className="flex items-center gap-2 text-sm">
+              <input
+                type="radio"
+                name="builder-mode"
+                aria-label={label}
+                checked={form.mode === mode}
+                onChange={() => {
+                  setForm(withMode(form, mode))
+                }}
+              />
+              {label}
+            </label>
+          ))}
+        </div>
+        {form.mode === 'setup' && (
+          <div className="mt-4">
+            <SetupFields
+              setup={form.setup}
+              onChange={(next) => {
+                patch({ setup: next })
+              }}
+            />
+          </div>
+        )}
+      </section>
 
       <section className={sectionClass}>
         <div className="flex flex-wrap gap-4">
@@ -228,97 +399,107 @@ export function StrategyBuilder(): React.JSX.Element {
         </div>
       </section>
 
-      <section className={sectionClass}>
-        <div className="mb-2 flex items-center justify-between">
-          <h3 className="font-medium">Indicators</h3>
-          <button
-            type="button"
-            className="text-sm text-sky-400 hover:text-sky-300"
-            onClick={() => {
-              patch({
-                indicators: [
-                  ...form.indicators,
-                  { id: '', kind: 'SMA', period: 14, source: 'close' },
-                ],
-              })
-            }}
-          >
-            + indicator
-          </button>
-        </div>
-        <div className="space-y-2">
-          {form.indicators.map((indicator, index) => (
-            <IndicatorRow
-              key={index}
-              indicator={indicator}
-              onChange={(next) => {
+      {form.mode === 'conditions' && (
+        <section className={sectionClass}>
+          <div className="mb-2 flex items-center justify-between">
+            <h3 className="font-medium">Indicators</h3>
+            <button
+              type="button"
+              className="text-sm text-sky-400 hover:text-sky-300"
+              onClick={() => {
                 patch({
-                  indicators: form.indicators.map((item, i) => (i === index ? next : item)),
+                  indicators: [
+                    ...form.indicators,
+                    { id: '', kind: 'SMA', period: 14, source: 'close' },
+                  ],
                 })
               }}
-              onRemove={() => {
-                patch({ indicators: form.indicators.filter((_, i) => i !== index) })
+            >
+              + indicator
+            </button>
+          </div>
+          <div className="space-y-2">
+            {form.indicators.map((indicator, index) => (
+              <IndicatorRow
+                key={index}
+                indicator={indicator}
+                onChange={(next) => {
+                  patch({
+                    indicators: form.indicators.map((item, i) => (i === index ? next : item)),
+                  })
+                }}
+                onRemove={() => {
+                  patch({ indicators: form.indicators.filter((_, i) => i !== index) })
+                }}
+              />
+            ))}
+          </div>
+        </section>
+      )}
+
+      {form.mode === 'conditions' && (
+        <section className={sectionClass}>
+          <h3 className="mb-2 font-medium">Entry</h3>
+          <div className="space-y-4">
+            <ConditionRows
+              label="Long"
+              side={form.long}
+              onChange={(next) => {
+                patch({ long: next })
               }}
             />
-          ))}
-        </div>
-      </section>
-
-      <section className={sectionClass}>
-        <h3 className="mb-2 font-medium">Entry</h3>
-        <div className="space-y-4">
-          <ConditionRows
-            label="Long"
-            side={form.long}
-            onChange={(next) => {
-              patch({ long: next })
-            }}
-          />
-          <ConditionRows
-            label="Short"
-            side={form.short}
-            onChange={(next) => {
-              patch({ short: next })
-            }}
-          />
-        </div>
-      </section>
+            <ConditionRows
+              label="Short"
+              side={form.short}
+              onChange={(next) => {
+                patch({ short: next })
+              }}
+            />
+          </div>
+        </section>
+      )}
 
       <section className={sectionClass}>
         <h3 className="mb-2 font-medium">Exit</h3>
         <div className="mb-3 flex flex-wrap gap-4">
-          <label className="flex items-center gap-2 text-sm">
-            <input
-              type="checkbox"
-              checked={form.stop.enabled}
-              onChange={(event) => {
-                patch({ stop: { ...form.stop, enabled: event.target.checked } })
-              }}
-            />
-            Stop at candle extreme
-          </label>
-          {form.stop.enabled && (
+          {/* A setup places its own stop from the bar it entered on, and the semantic layer
+              refuses a setup document that carries one — so the field is not offered. */}
+          {form.mode === 'conditions' && (
             <>
-              <input
-                aria-label="stop lookback"
-                type="number"
-                className={inputClass}
-                value={form.stop.lookback}
-                onChange={(event) => {
-                  patch({ stop: { ...form.stop, lookback: Number(event.target.value) } })
-                }}
-              />
-              <select
-                aria-label="stop side"
-                className={inputClass}
-                value={form.stop.side}
-                onChange={(event) => {
-                  patch({ stop: { ...form.stop, side: event.target.value as 'low' | 'high' } })
-                }}
-              >
-                <option value="low">low</option>
-                <option value="high">high</option>
-              </select>
+              <label className="flex items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  checked={form.stop.enabled}
+                  onChange={(event) => {
+                    patch({ stop: { ...form.stop, enabled: event.target.checked } })
+                  }}
+                />
+                Stop at candle extreme
+              </label>
+              {form.stop.enabled && (
+                <>
+                  <input
+                    aria-label="stop lookback"
+                    type="number"
+                    className={inputClass}
+                    value={form.stop.lookback}
+                    onChange={(event) => {
+                      patch({ stop: { ...form.stop, lookback: Number(event.target.value) } })
+                    }}
+                  />
+                  <select
+                    aria-label="stop side"
+                    className={inputClass}
+                    value={form.stop.side}
+                    onChange={(event) => {
+                      patch({ stop: { ...form.stop, side: event.target.value as 'low' | 'high' } })
+                    }}
+                  >
+                    <option value="low">low</option>
+                    <option value="high">high</option>
+                  </select>
+                </>
+              )}
             </>
           )}
           <label className="flex items-center gap-2 text-sm">
@@ -344,13 +525,15 @@ export function StrategyBuilder(): React.JSX.Element {
             />
           )}
         </div>
-        <ConditionRows
-          label="Exit conditions"
-          side={form.exit}
-          onChange={(next) => {
-            patch({ exit: next })
-          }}
-        />
+        {form.mode === 'conditions' && (
+          <ConditionRows
+            label="Exit conditions"
+            side={form.exit}
+            onChange={(next) => {
+              patch({ exit: next })
+            }}
+          />
+        )}
       </section>
 
       {!validation.valid && (

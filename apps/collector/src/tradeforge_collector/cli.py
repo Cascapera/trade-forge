@@ -7,6 +7,10 @@
 contributor runs first must work on their machine, on Linux, with no broker account.
 `--source mt5` is the one that needs Windows, a terminal that is open and logged in,
 and a symbol the broker actually offers.
+
+With the market closed, `--source mt5` also needs `--server-offset`: the broker's clock
+is otherwise read from the newest tick, and a shut market freezes that tick. The
+collector refuses rather than guess — see `mt5_source.offset_is_plausible`.
 """
 
 import argparse
@@ -35,6 +39,16 @@ def _date(value: str) -> dt.datetime:
         raise argparse.ArgumentTypeError(f"expected YYYY-MM-DD, got {value!r}") from None
 
 
+def _hours(value: str) -> dt.timedelta:
+    """`+3`, `-5`, `5.5` — hours ahead of UTC. Some timezones are half hours."""
+    try:
+        return dt.timedelta(hours=float(value))
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"expected hours ahead of UTC, like +3 or -5.5, got {value!r}"
+        ) from None
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="tradeforge-collector", description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -57,6 +71,16 @@ def _parser() -> argparse.ArgumentParser:
         help="override the class inferred from the symbol's MT5 path",
     )
     fill.add_argument(
+        "--server-offset",
+        type=_hours,
+        metavar="HOURS",
+        help=(
+            "the broker's clock, in hours ahead of UTC (e.g. +3). Otherwise it is measured "
+            "from the newest tick — which only works while the market is open, because a "
+            "closed market freezes that tick"
+        ),
+    )
+    fill.add_argument(
         "--no-catalogue",
         action="store_true",
         help="write the Parquet but do not touch Postgres",
@@ -74,7 +98,7 @@ def _source(args: argparse.Namespace) -> MarketDataSource:
     from tradeforge_collector.mt5_source import MT5Source  # noqa: PLC0415 — the ADR-02 boundary
 
     asset_class = AssetClass(args.asset_class) if args.asset_class else None
-    return MT5Source(asset_class=asset_class).connect()
+    return MT5Source(asset_class=asset_class, server_offset=args.server_offset).connect()
 
 
 def _backfill(args: argparse.Namespace) -> int:

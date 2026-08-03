@@ -250,3 +250,15 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
   quatro testes de contagem (consecutividade, estritura das duas comparações, queima no
   cancelamento) são o que impede a mudança de passar despercebida — e porque a docstring da classe
   descreve o 2 como escolha dele, o que um leitor pode confundir com configurabilidade.
+- [origem: PR-216] **O detector de gaps não conhece horário de pregão** — ele classifica como
+  "anômalo" tudo que não é fim de semana, então uma ação americana (que negocia ~6,5 h por dia)
+  produz um gap anômalo por madrugada: 499 deles num backfill de 2 anos do AAPL. O relatório vira
+  ruído exatamente onde deveria avisar, e um gap de verdade se esconde no meio. Precisa da sessão
+  do instrumento (o MT5 a expõe em `symbol_info().session_*`). Adiado: escopo do PR-216 é o
+  relógio do servidor, não a classificação de gaps.
+- [origem: PR-216] **Medir o offset com o mercado fechado** — `offset_is_plausible` recusa uma
+  medição impossível (fim de semana, madrugada), mas uma parada mais curta que a faixa de ±14 h
+  passa despercebida: rodar duas horas após o fechamento mede duas horas a mais e parece normal.
+  Separar de verdade exige uma segunda leitura segundos depois, para ver se o tick ainda avança —
+  o que compra certeza com tempo de parede e não-determinismo. Hoje a saída é `--server-offset`.
+  Reabrir se alguém agendar backfill fora do pregão sem poder declarar o offset.

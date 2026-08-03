@@ -5,9 +5,10 @@ import of `MetaTrader5` happens inside `connect()`, at the moment someone actual
 asks for real data. That is what lets CI import the rest of the package, run the whole
 backfill against `SyntheticSource`, and never touch a library it cannot install.
 
-Two things here are *pure functions* on purpose — `asset_class_from_path` and
-`infer_server_offset`. They hold the only two pieces of MT5 behaviour that can be
-gotten wrong silently, so they are lifted out of the I/O and tested directly.
+Three things here are *pure functions* on purpose — `asset_class_from_path`,
+`infer_server_offset` and `offset_is_plausible`. They hold the only pieces of MT5
+behaviour that can be gotten wrong silently, so they are lifted out of the I/O and
+tested directly.
 """
 
 import datetime as dt
@@ -38,6 +39,10 @@ _PATH_TO_ASSET_CLASS: dict[str, AssetClass] = {
 # into a one-hour correction.
 _OFFSET_GRANULARITY = dt.timedelta(minutes=30)
 
+# A clock is a timezone, and the furthest any inhabited place sits from UTC is +14.
+# Beyond this the number being measured is not a clock at all — see `offset_is_plausible`.
+_MAX_PLAUSIBLE_OFFSET = dt.timedelta(hours=14)
+
 
 def asset_class_from_path(path: str) -> AssetClass | None:
     """Read the asset class out of the symbol's tree path. `None` when it cannot tell.
@@ -67,6 +72,29 @@ def infer_server_offset(server_time: dt.datetime, real_now: dt.datetime) -> dt.t
     return units * _OFFSET_GRANULARITY
 
 
+def offset_is_plausible(offset: dt.timedelta) -> bool:
+    """Could this drift be a timezone at all?
+
+    `infer_server_offset` measures the gap between the broker's clock and ours by reading
+    the timestamp of a tick. That reading *is* the server's clock only while the market is
+    open. The moment it closes the last tick stops moving, and the very same subtraction
+    quietly changes meaning: it starts measuring **how long the market has been shut**.
+
+    From a single reading the two are indistinguishable, so this is the line drawn between
+    a number that could be a timezone and one that certainly is not. Every closure long
+    enough to matter falls outside it — a weekend is 48h+, and a stock market's overnight
+    is 17h+.
+
+    What it deliberately does *not* catch: a closure shorter than the band. Run a backfill
+    two hours after the bell and the reading is off by two hours and looks perfectly
+    ordinary. Separating those two cases needs a second reading seconds later, to see
+    whether the tick is still advancing — which buys certainty with wall-clock time and
+    nondeterminism, and this project's second invariant is determinism. `--server-offset`
+    is the answer instead: state the number and nothing has to be inferred.
+    """
+    return abs(offset) <= _MAX_PLAUSIBLE_OFFSET
+
+
 class MT5Source:
     """`MarketDataSource` backed by a running MetaTrader 5 terminal."""
 
@@ -74,10 +102,25 @@ class MT5Source:
         self,
         *,
         asset_class: AssetClass | None = None,
+        server_offset: dt.timedelta | None = None,
         terminal: Any = None,  # noqa: ANN401 — MetaTrader5 ships no type stubs
     ) -> None:
         # An override for symbols whose tree path says nothing useful.
         self._asset_class = asset_class
+
+        # The broker's clock, stated instead of measured. With the market closed there is
+        # nothing to measure from, and a backfill that has to wait for the opening bell to
+        # be correct is not a backfill anyone can schedule.
+        #
+        # A stated offset is checked against the same band as a measured one: `+30` is a
+        # typo whether a human typed it or a frozen tick implied it, and letting it through
+        # here would displace every bar exactly as silently.
+        if server_offset is not None and not offset_is_plausible(server_offset):
+            raise ValueError(
+                f"a server offset of {server_offset / _HOUR:+g} h is not a timezone; "
+                f"brokers sit within {_MAX_PLAUSIBLE_OFFSET / _HOUR:g} h of UTC"
+            )
+        self._stated_offset = server_offset
 
         # The terminal is injectable purely so the conversion logic can be tested. That
         # logic — shifting the broker's clock to UTC, quantising a float to the tick — is
@@ -112,8 +155,17 @@ class MT5Source:
             raise ConnectionError(f"MetaTrader 5 refused the connection: {mt5.last_error()}")
 
         self._mt5 = mt5
-        self._offset = self._measure_offset()
-        logger.info("connected to MetaTrader 5; server clock is UTC%+g h", self._offset / _HOUR)
+        if self._stated_offset is not None:
+            self._offset = self._stated_offset
+            source = "stated"
+        else:
+            self._offset = self._measure_offset()
+            source = "measured"
+        logger.info(
+            "connected to MetaTrader 5; server clock is UTC%+g h (%s)",
+            self._offset / _HOUR,
+            source,
+        )
         return self
 
     def close(self) -> None:
@@ -184,16 +236,40 @@ class MT5Source:
     def _measure_offset(self) -> dt.timedelta:
         mt5 = self._require_connection()
 
-        # Any symbol will do: the tick carries the server's clock, which is what we are
-        # actually asking about.
+        newest = self._newest_tick(mt5)
+        if newest is None:
+            raise LookupError(
+                "no symbol in this terminal has ever ticked, so the server's clock cannot "
+                "be measured; pass --server-offset with the broker's offset from UTC"
+            )
+
+        offset = infer_server_offset(newest, dt.datetime.now(tz=dt.UTC))
+        if not offset_is_plausible(offset):
+            raise LookupError(
+                f"the newest tick in this terminal is {newest:%Y-%m-%d %H:%M} in the "
+                f"server's clock, {offset / _HOUR:+g} h from now — too far to be a "
+                f"timezone. The market is almost certainly closed, which freezes the last "
+                f"tick and makes this measurement the length of the closure instead of "
+                f"the clock. Pass --server-offset (for example --server-offset +3)."
+            )
+        return offset
+
+    def _newest_tick(self, mt5: Any) -> dt.datetime | None:  # noqa: ANN401 — no stubs
+        """The most recent tick anywhere in the terminal, in the server's clock.
+
+        The newest and not merely the first one found: with the market wide open, an
+        illiquid symbol's last tick can be hours old while the terminal itself is
+        perfectly live. Taking the maximum makes the reading as fresh as this terminal is
+        able to be, which is the only part of the staleness problem that measurement can
+        solve on its own.
+        """
+        newest = 0
         for symbol in mt5.symbols_get() or []:
             tick = mt5.symbol_info_tick(symbol.name)
             if tick is not None and tick.time:
-                server_now = dt.datetime.fromtimestamp(int(tick.time), tz=dt.UTC)
-                return infer_server_offset(server_now, dt.datetime.now(tz=dt.UTC))
+                newest = max(newest, int(tick.time))
 
-        logger.warning("no tick available to measure the server clock; assuming UTC")
-        return dt.timedelta()
+        return dt.datetime.fromtimestamp(newest, tz=dt.UTC) if newest else None
 
     def _require_connection(self) -> Any:  # noqa: ANN401 — MetaTrader5 ships no type stubs
         if self._mt5 is None:

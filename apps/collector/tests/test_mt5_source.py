@@ -17,7 +17,12 @@ from typing import Any
 
 import pytest
 
-from tradeforge_collector.mt5_source import MT5Source, asset_class_from_path, infer_server_offset
+from tradeforge_collector.mt5_source import (
+    MT5Source,
+    asset_class_from_path,
+    infer_server_offset,
+    offset_is_plausible,
+)
 from tradeforge_engine.domain import AssetClass
 
 UTC_NOON = dt.datetime(2024, 6, 3, 12, 0, tzinfo=dt.UTC)
@@ -65,10 +70,15 @@ class _FakeTerminal:
     def symbol_info(self, symbol: str) -> _SymbolInfo | None:
         return _SymbolInfo(name=symbol) if symbol == "EURUSD" else None
 
+    def last_tick_age(self, _symbol: str) -> dt.timedelta:
+        """How long ago this symbol last traded. Zero is a live, liquid market."""
+        return dt.timedelta()
+
     def symbol_info_tick(self, symbol: str) -> Any:
         # A tick timestamped in the server's clock — which is the only way to find out
-        # what that clock is.
-        server_now = dt.datetime.now(tz=dt.UTC) + SERVER_OFFSET
+        # what that clock is. Subtracting the age is what lets a subclass go quiet:
+        # a symbol that has not traded, or a market that has closed.
+        server_now = dt.datetime.now(tz=dt.UTC) + SERVER_OFFSET - self.last_tick_age(symbol)
         return type("Tick", (), {"time": int(server_now.timestamp())})()
 
     def copy_rates_range(
@@ -143,6 +153,37 @@ def test_a_server_behind_utc_is_handled_too() -> None:
     assert infer_server_offset(UTC_NOON - dt.timedelta(hours=5), UTC_NOON) == dt.timedelta(hours=-5)
 
 
+@pytest.mark.parametrize(
+    "hours",
+    [0, 3, -5, 5.5, 14, -14],
+    ids=["utc", "ahead", "behind", "half hour", "furthest ahead", "furthest behind"],
+)
+def test_a_real_timezone_is_accepted(hours: float) -> None:
+    assert offset_is_plausible(dt.timedelta(hours=hours))
+
+
+@pytest.mark.parametrize(
+    "hours",
+    [-62, 62, 17.5, -48, 14.5],
+    ids=[
+        "the weekend that displaced a real backfill",
+        "the same, mirrored",
+        "a stock market's overnight",
+        "a weekend",
+        "just past the furthest timezone",
+    ],
+)
+def test_a_closure_is_not_mistaken_for_a_timezone(hours: float) -> None:
+    """The bug this whole change exists to prevent.
+
+    -62h is not a hypothetical: it is what a real backfill measured on a Monday morning,
+    sixteen minutes before the opening bell, with every tick in the terminal frozen at
+    Friday's close. It shifted 3494 bars two and a half days into the future and reported
+    success.
+    """
+    assert not offset_is_plausible(dt.timedelta(hours=hours))
+
+
 # --------------------------------------------------------------------------- #
 # The source, against a fake terminal                                           #
 # --------------------------------------------------------------------------- #
@@ -215,6 +256,22 @@ def test_a_timeframe_the_terminal_does_not_know_is_refused() -> None:
         source.candles("EURUSD", "W1", UTC_NOON, UTC_NOON)
 
 
+def test_a_range_the_terminal_has_no_data_for_is_a_clear_error() -> None:
+    """`None` from MT5 means "I have nothing", and it must not become an empty dataset."""
+
+    class _NoHistory(_FakeTerminal):
+        def copy_rates_range(
+            self, _symbol: str, _timeframe: int, _start: dt.datetime, _end: dt.datetime
+        ) -> list[dict[str, Any]] | None:
+            return None
+
+    with (
+        MT5Source(terminal=_NoHistory()) as source,
+        pytest.raises(LookupError, match="no rates"),
+    ):
+        source.candles("EURUSD", "H1", UTC_NOON, UTC_NOON + dt.timedelta(days=1))
+
+
 def test_a_terminal_that_refuses_the_connection_says_so() -> None:
     class _Refusing(_FakeTerminal):
         def initialize(self) -> bool:
@@ -243,3 +300,92 @@ def test_without_an_override_an_unclassifiable_symbol_stops_the_backfill() -> No
         pytest.raises(LookupError, match="asset-class"),
     ):
         source.instrument("EURUSD")
+
+
+# --------------------------------------------------------------------------- #
+# The server clock, when the market is not cooperating                          #
+# --------------------------------------------------------------------------- #
+
+
+class _ClosedMarket(_FakeTerminal):
+    """Every tick frozen at Friday's close, read on Monday morning."""
+
+    def last_tick_age(self, _symbol: str) -> dt.timedelta:
+        return dt.timedelta(hours=62)
+
+
+def test_a_closed_market_stops_the_backfill_instead_of_displacing_it() -> None:
+    with pytest.raises(LookupError, match="server-offset"):
+        MT5Source(terminal=_ClosedMarket()).connect()
+
+
+def test_the_refusal_names_what_it_saw() -> None:
+    """A user who cannot tell *why* it refused will reach for the flag with a guess."""
+    with pytest.raises(LookupError, match="too far to be a timezone"):
+        MT5Source(terminal=_ClosedMarket()).connect()
+
+
+def test_a_stated_offset_makes_the_measurement_unnecessary() -> None:
+    """The market is shut and the bars still land in the right place."""
+    terminal = _ClosedMarket(rates=[a_rate(server_hour=15)])
+
+    with MT5Source(terminal=terminal, server_offset=SERVER_OFFSET) as source:
+        [candle] = source.candles("EURUSD", "H1", UTC_NOON, UTC_NOON + dt.timedelta(days=1))
+
+    assert candle.time == dt.datetime(2024, 6, 3, 12, tzinfo=dt.UTC)
+
+
+def test_the_clock_is_read_from_the_newest_tick_not_the_first_symbol() -> None:
+    """An illiquid symbol is not evidence that the terminal is asleep.
+
+    The first symbol here last traded nine hours ago — inside the plausible band, so the
+    old first-match code would have accepted it and shifted every bar by nine hours. The
+    market is live; one instrument in it simply is not.
+    """
+
+    class _OneStaleSymbol(_FakeTerminal):
+        def symbols_get(self) -> list[_SymbolInfo]:
+            # The live symbol sits in the *middle* deliberately: with it first, "take the
+            # first tick" would pass this test, and with it last, "take the last one"
+            # would. Only actually taking the maximum survives all three positions.
+            return [
+                _SymbolInfo(name="SLEEPY"),
+                _SymbolInfo(name="EURUSD"),
+                _SymbolInfo(name="DORMANT"),
+            ]
+
+        def last_tick_age(self, symbol: str) -> dt.timedelta:
+            return dt.timedelta() if symbol == "EURUSD" else dt.timedelta(hours=9)
+
+    terminal = _OneStaleSymbol(rates=[a_rate(server_hour=15)])
+
+    with MT5Source(terminal=terminal) as source:
+        [candle] = source.candles("EURUSD", "H1", UTC_NOON, UTC_NOON + dt.timedelta(days=1))
+
+    assert candle.time == dt.datetime(2024, 6, 3, 12, tzinfo=dt.UTC)
+
+
+def test_a_terminal_where_nothing_has_ever_ticked_is_refused() -> None:
+    """Silence is not UTC. The old code logged a warning and assumed zero."""
+
+    class _Mute(_FakeTerminal):
+        def symbol_info_tick(self, symbol: str) -> Any:
+            return None
+
+    with pytest.raises(LookupError, match="has ever ticked"):
+        MT5Source(terminal=_Mute()).connect()
+
+
+def test_a_terminal_with_no_symbols_at_all_is_refused() -> None:
+    class _Empty(_FakeTerminal):
+        def symbols_get(self) -> list[_SymbolInfo]:
+            return []
+
+    with pytest.raises(LookupError, match="server-offset"):
+        MT5Source(terminal=_Empty()).connect()
+
+
+def test_a_stated_offset_that_is_not_a_timezone_is_refused_too() -> None:
+    """`+30` is a typo whether a human typed it or a frozen tick implied it."""
+    with pytest.raises(ValueError, match="is not a timezone"):
+        MT5Source(terminal=_FakeTerminal(), server_offset=dt.timedelta(hours=30))

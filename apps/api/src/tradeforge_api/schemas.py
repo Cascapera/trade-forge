@@ -100,7 +100,12 @@ class MetricsOut(_Out):
 
 
 class BacktestOut(_Out):
-    """A run: its request, its lifecycle status, and its metrics once finished."""
+    """A run: its request, what it actually read, its lifecycle status, and its metrics.
+
+    `date_from`/`date_to` are the *request*; `first_candle`/`last_candle` are the answer.
+    They differ whenever the dataset starts later or ends earlier than what was asked for,
+    and a client that shows only the request is quietly reporting the wrong experiment.
+    """
 
     id: uuid.UUID
     strategy_id: uuid.UUID
@@ -115,6 +120,9 @@ class BacktestOut(_Out):
     created_at: dt.datetime
     started_at: dt.datetime | None
     finished_at: dt.datetime | None
+    candles_seen: int | None = None
+    first_candle: dt.datetime | None = None
+    last_candle: dt.datetime | None = None
     metrics: MetricsOut | None = None
 
 

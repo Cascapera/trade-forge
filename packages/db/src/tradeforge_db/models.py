@@ -341,6 +341,18 @@ class Backtest(Base):
     started_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
 
+    # What the run actually ate, as opposed to what it was asked for. `date_from`/`date_to`
+    # are a *request*; the dataset underneath may start later or end earlier, and then the
+    # run silently covers less ground than its own row claims. Asking for two years and
+    # backtesting five months is not a small discrepancy — it is a different experiment,
+    # and without these columns nothing in the system can tell the two apart afterwards.
+    #
+    # Nullable because a run that failed never got as far as reading a candle, and because
+    # every row that existed before this column did is honestly unknown, not zero.
+    candles_seen: Mapped[int | None] = mapped_column(Integer)
+    first_candle: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    last_candle: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+
     # `passive_deletes=True` pairs with ON DELETE CASCADE: Postgres removes the children
     # in one statement. Without it, SQLAlchemy would load every trade of the run into
     # memory just to issue a DELETE per row — a backtest with 40 000 trades would take
@@ -363,6 +375,14 @@ class Backtest(Base):
         ),
         CheckConstraint(
             "finished_at IS NULL OR finished_at >= started_at", name="finished_after_started"
+        ),
+        # A run that saw candles must say which ones, and a run that saw none must not
+        # claim a range. Half-filled provenance is worse than none: it reads as authoritative.
+        CheckConstraint(
+            "(candles_seen IS NULL AND first_candle IS NULL AND last_candle IS NULL)"
+            " OR (candles_seen > 0 AND first_candle IS NOT NULL AND last_candle IS NOT NULL"
+            " AND last_candle >= first_candle)",
+            name="candle_provenance_complete",
         ),
         # The worker polls for work by status; without this it seq-scans the table.
         Index("ix_backtests_status_created_at", "status", "created_at"),

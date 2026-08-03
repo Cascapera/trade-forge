@@ -2,6 +2,8 @@ import { Link, useParams } from 'react-router-dom'
 
 import { useBacktest, useEquity, useTrades } from '../api/hooks'
 import type { BacktestStatus } from '../api/types'
+import { coverageNotice } from '../backtest/coverage'
+import { count } from '../format'
 import { EquityCurve } from '../components/EquityCurve'
 import { MetricCards } from '../components/MetricCards'
 import { TradesTable } from '../components/TradesTable'
@@ -34,6 +36,7 @@ export function Results(): React.JSX.Element {
   }
 
   const run = backtest.data
+  const coverage = coverageNotice(run)
 
   return (
     <div className="space-y-6">
@@ -41,6 +44,21 @@ export function Results(): React.JSX.Element {
         <h2 className="text-xl font-semibold">Backtest results</h2>
         <StatusBadge status={run.status} />
       </div>
+
+      {coverage !== null && (
+        <p
+          role="status"
+          className="rounded border border-amber-800 bg-amber-950/40 p-4 text-sm text-amber-200"
+        >
+          This run covers{' '}
+          <strong>
+            {coverage.actualFrom} to {coverage.actualTo}
+          </strong>
+          , not the {coverage.requestedFrom} to {coverage.requestedTo} that was requested — the
+          collected data does not reach that far. Every metric below is measured over{' '}
+          {count(coverage.candles)} candles in the shorter period.
+        </p>
+      )}
 
       {(run.status === 'queued' || run.status === 'running') && (
         <p className="text-slate-400">Running the backtest — this page updates itself.</p>

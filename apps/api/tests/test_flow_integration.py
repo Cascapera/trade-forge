@@ -174,6 +174,13 @@ def test_create_enqueue_run_and_read(
         assert finished["metrics"] is not None
         assert finished["metrics"]["total_trades"] >= 1
 
+        # The run says which candles it read, and the row survived the CHECK that keeps the
+        # three provenance columns in step. Both only happen against a real Postgres.
+        series = _candles()
+        assert finished["candles_seen"] == len(series)
+        assert finished["first_candle"] == series[0].time.isoformat().replace("+00:00", "Z")
+        assert finished["last_candle"] == series[-1].time.isoformat().replace("+00:00", "Z")
+
         trades = client.get(f"/backtests/{backtest_id}/trades").json()
         assert trades["total"] == finished["metrics"]["total_trades"]
         assert len(trades["items"]) == trades["total"]
@@ -213,3 +220,61 @@ def test_a_backtest_for_an_unknown_symbol_is_rejected(
         )
         assert response.status_code == 422
         assert "NOPE" in response.json()["detail"]
+
+
+def test_a_timeframe_with_no_collected_candles_fails_instead_of_finishing_empty(
+    session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+) -> None:
+    """The bug this PR exists for, end to end.
+
+    The symbol is catalogued and the strategy is valid — only the *timeframe* has never been
+    collected. This used to finish `done` with every metric at zero, which is indistinguishable
+    on screen from a strategy that found no setups.
+    """
+    seeding = session_factory()
+    _seed_instrument(seeding)
+    seeding.close()
+    write_candles(tmp_path, "EURUSD", "H1", _candles())  # H1 exists; the run will ask for M15
+
+    app = create_app(
+        settings=settings.model_copy(update={"parquet_root": tmp_path}),
+        session_factory=session_factory,
+        arq_pool=_CapturingQueue(),
+    )
+
+    with TestClient(app) as client:
+        strategy_id = client.post("/strategies", json=_strategy()).json()["id"]
+        backtest_id = client.post(
+            "/backtests",
+            json={
+                "strategy_id": strategy_id,
+                "symbol": "EURUSD",
+                "timeframe": "M15",
+                "date_from": START.isoformat(),
+                "date_to": (START + 100 * HOUR).isoformat(),
+                "initial_capital": "10000",
+                "cost_model": {"type": "none"},
+            },
+        ).json()["id"]
+
+        worker_session = session_factory()
+        try:
+            asyncio.run(
+                process_backtest(
+                    session=worker_session,
+                    redis=_RecordingRedis(),  # type: ignore[arg-type]
+                    parquet_root=tmp_path,
+                    backtest_id=uuid.UUID(backtest_id),
+                )
+            )
+        finally:
+            worker_session.close()
+
+        finished = client.get(f"/backtests/{backtest_id}").json()
+
+        assert finished["status"] == "failed"
+        assert "M15" in finished["error"]
+        assert finished["metrics"] is None
+        # Nothing was read, so nothing is claimed. Null is the honest answer, not zero.
+        assert finished["candles_seen"] is None
+        assert finished["first_candle"] is None

@@ -1,9 +1,17 @@
-import { money, percent, ratio, sign, signedMoney } from './format'
+import { count, money, percent, ratio, sign, signedMoney } from './format'
 
 describe('format', () => {
   it('renders money with two decimals and thousands separators', () => {
     expect(money('12345.6')).toBe('12,345.60')
     expect(money('0')).toBe('0.00')
+  })
+
+  it('groups a count with a pinned locale', () => {
+    // Pinned, not the machine's: an unpinned locale renders 3.480 or 3480 depending on the
+    // runner, which is a test that passes here and fails in CI.
+    expect(count(3480)).toBe('3,480')
+    expect(count(0)).toBe('0')
+    expect(count(7)).toBe('7')
   })
 
   it('signs money with an explicit + or minus', () => {

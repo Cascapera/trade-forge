@@ -54,6 +54,9 @@ function backtest(over: Partial<Backtest>): Backtest {
     created_at: '',
     started_at: null,
     finished_at: null,
+    candles_seen: null,
+    first_candle: null,
+    last_candle: null,
     metrics: null,
     ...over,
   }
@@ -107,5 +110,45 @@ describe('Results', () => {
     expect(screen.getByText('+100.00')).toBeInTheDocument()
     expect(screen.getByText('equity chart')).toBeInTheDocument()
     expect(screen.getByText('This run produced no trades.')).toBeInTheDocument()
+  })
+
+  it('warns when the run covered less than was asked for', () => {
+    stubBacktest({
+      isPending: false,
+      isError: false,
+      data: backtest({
+        status: 'done',
+        metrics,
+        date_from: '2024-01-01T00:00:00Z',
+        date_to: '2026-08-03T00:00:00Z',
+        candles_seen: 3480,
+        first_candle: '2024-08-01T13:00:00Z',
+        last_candle: '2026-07-31T19:00:00Z',
+      }),
+    })
+    renderWithProviders(<Results />)
+
+    const notice = screen.getByRole('status')
+    expect(notice).toHaveTextContent('2024-08-01 to 2026-07-31')
+    expect(notice).toHaveTextContent('3,480 candles')
+  })
+
+  it('says nothing about coverage when the run covered the request', () => {
+    stubBacktest({
+      isPending: false,
+      isError: false,
+      data: backtest({
+        status: 'done',
+        metrics,
+        date_from: '2024-09-01T00:00:00Z',
+        date_to: '2024-09-30T00:00:00Z',
+        candles_seen: 500,
+        first_candle: '2024-08-15T00:00:00Z',
+        last_candle: '2024-10-05T00:00:00Z',
+      }),
+    })
+    renderWithProviders(<Results />)
+
+    expect(screen.queryByRole('status')).not.toBeInTheDocument()
   })
 })

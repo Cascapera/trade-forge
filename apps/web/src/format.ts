@@ -11,6 +11,13 @@ export function signedMoney(value: string): string {
   return `${n >= 0 ? '+' : '−'}${money(Math.abs(n).toString())}`
 }
 
+/** A whole count, grouped. The locale is pinned for the same reason `money` pins it: a
+ * rendered string that changes with the machine's locale is a test that passes on one CI
+ * runner and fails on the next. */
+export function count(value: number): string {
+  return value.toLocaleString('en-US')
+}
+
 export function percent(fraction: string | null, digits = 1): string {
   if (fraction === null) return '—'
   return `${(Number(fraction) * 100).toFixed(digits)}%`

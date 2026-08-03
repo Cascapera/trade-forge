@@ -256,6 +256,14 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
   ruído exatamente onde deveria avisar, e um gap de verdade se esconde no meio. Precisa da sessão
   do instrumento (o MT5 a expõe em `symbol_info().session_*`). Adiado: escopo do PR-216 é o
   relógio do servidor, não a classificação de gaps.
+- [origem: PR-217] **As constraints do `rev_0001` estão com prefixo duplicado no banco** — o
+  alembic aplica a convenção de nomes do `base.py` POR CIMA do nome passado, e o `rev_0001`
+  passa o nome já completo. Resultado medido no Postgres: `ck_backtests_ck_backtests_date_range`
+  onde o modelo espera `ck_backtests_date_range` — vale para **todas** as checks das tabelas
+  criadas lá. Consequências: um `--autogenerate` reporta diferença fantasma, e qualquer
+  `op.drop_constraint` futuro que use o nome do modelo falha. Conserto é uma migration que
+  renomeia (`ALTER TABLE ... RENAME CONSTRAINT`), mecânica mas larga. Fora do escopo do PR-217,
+  que só precisava não repetir o erro — a `rev_0002` passa o nome **nu** e sai correta.
 - [origem: PR-216] **Medir o offset com o mercado fechado** — `offset_is_plausible` recusa uma
   medição impossível (fim de semana, madrugada), mas uma parada mais curta que a faixa de ±14 h
   passa despercebida: rodar duas horas após o fechamento mede duas horas a mais e parece normal.

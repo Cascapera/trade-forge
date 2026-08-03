@@ -47,6 +47,11 @@ export const api = {
   listInstruments: (): Promise<Instrument[]> => request('GET', '/instruments'),
   createStrategy: (definition: unknown): Promise<StrategyOut> =>
     request('POST', '/strategies', definition),
+  // Editing is a new version, not an update: the API inserts the next version linked to this
+  // parent. It is what makes iterating on a strategy possible at all — `POST` always writes
+  // version 1, and name+version is unique, so re-saving under the same name can only conflict.
+  updateStrategy: (id: string, definition: unknown): Promise<StrategyOut> =>
+    request('PUT', `/strategies/${id}`, definition),
   createBacktest: (payload: CreateBacktestRequest): Promise<CreatedBacktest> =>
     request('POST', '/backtests', payload),
   getBacktest: (id: string): Promise<Backtest> => request('GET', `/backtests/${id}`),

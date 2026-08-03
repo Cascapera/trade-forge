@@ -35,6 +35,23 @@ export function useCreateStrategy() {
   })
 }
 
+/**
+ * Save a document under a lineage: a new strategy, or the next version of one already saved.
+ *
+ * `POST` always writes version 1, and (name, version) is unique, so saving the same name twice can
+ * only ever conflict. Iterating — nudge the period, run it again — is therefore not a `POST` at
+ * all; it is `PUT` on the previous version, which the API inserts as the next one, linked to its
+ * parent. Choosing between them by *name* is what lets the screen keep one button.
+ */
+export function useSaveStrategy() {
+  return useMutation<StrategyOut, Error, { definition: Strategy; parentId: string | null }>({
+    mutationFn: ({ definition, parentId }) =>
+      parentId === null
+        ? api.createStrategy(definition)
+        : api.updateStrategy(parentId, definition),
+  })
+}
+
 export function useCreateBacktest() {
   return useMutation<CreatedBacktest, Error, CreateBacktestRequest>({
     mutationFn: (payload) => api.createBacktest(payload),

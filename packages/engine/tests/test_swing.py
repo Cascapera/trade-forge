@@ -240,7 +240,13 @@ def test_the_average_trail_spans_exactly_the_snapshot_window() -> None:
     for index, candle in enumerate(fed):
         trail.record(candle, Decimal(index))
 
-    (curve,) = trail.series()
+    # Unpacked in two steps rather than as `(curve,) = trail.series()`. `series()` returns the
+    # empty tuple while the average is warming up, so the one-element unpack is a claim about
+    # *which* branch ran — made silently, by raising ValueError somewhere else. Said out loud
+    # it is one assertion; CodeQL flags the short form for exactly this reason.
+    curves = trail.series()
+    assert len(curves) == 1
+    curve = curves[0]
     assert len(curve.points) == SNAPSHOT_BARS_BEFORE + 1
     # The newest reading is the last one fed, and the oldest is exactly `SNAPSHOT_BARS_BEFORE`
     # bars behind it — the same span the loop's window keeps.

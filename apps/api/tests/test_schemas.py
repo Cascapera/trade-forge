@@ -11,6 +11,7 @@ disagrees in the last place with the trade printed beside it.
 from __future__ import annotations
 
 import datetime as dt
+import json
 from decimal import Decimal
 from typing import Any
 
@@ -69,23 +70,45 @@ def a_trade_payload(*, snapshot: dict[str, Any]) -> dict[str, Any]:
 
 
 @pytest.mark.parametrize("empty", [{}, None])
-def test_a_trade_with_no_recorded_window_serves_a_null_snapshot(empty: Any) -> None:
+def test_a_trade_with_no_recorded_window_reports_no_snapshot(empty: Any) -> None:
     """`{}` is the column's NOT NULL default: it means "no window was recorded", which is what
-    every row written before `rev_0003` says. Validated as an object it would fail on the
-    required fields and the endpoint would 500 on historical backtests instead of serving them
-    without a chart."""
+    every row written before `rev_0003` says. Reported as a false flag, not as an error — the
+    trade is real and its numbers are fine; only the picture is missing."""
     trade = TradeOut.model_validate(a_trade_payload(snapshot=empty))
-    assert trade.snapshot is None
+    assert trade.has_snapshot is False
 
 
-def test_a_recorded_window_survives_with_its_prices_as_strings() -> None:
-    """The exact-decimal discipline, carried to the last hop. A bar that crossed the wire as a
-    JSON number would be an IEEE double, and the chart drawn from it would not line up with the
-    `entry_price` printed beside it."""
+def test_a_trade_with_a_window_advertises_it_without_carrying_it() -> None:
+    """The list says a picture exists; it does not ship one.
+
+    Fifty-odd bars is ~7 kB per trade, and a five-hundred-trade run would assemble megabytes to
+    be almost entirely discarded — a reader opens the two or three entries that look wrong. The
+    body is asserted to contain no bars at all, because a field that quietly came back would
+    restore the cost with nothing failing.
+    """
     trade = TradeOut.model_validate(a_trade_payload(snapshot=a_snapshot_payload()))
-    assert trade.snapshot is not None
+    assert trade.has_snapshot is True
 
-    body = trade.model_dump(mode="json")["snapshot"]
+    body = trade.model_dump(mode="json")
+    assert body["has_snapshot"] is True
+    assert "snapshot" not in body
+    assert "bars" not in json.dumps(body)
+
+
+def test_the_flag_reads_the_column_and_not_a_field_of_its_own_name() -> None:
+    """The alias is the whole mechanism. Without it Pydantic looks for `has_snapshot` on the
+    ORM row, does not find it, and returns the default — every trade reporting no picture,
+    quietly and always, with the endpoint still answering 200."""
+    assert "snapshot" in TradeOut.model_fields["has_snapshot"].validation_alias.choices  # type: ignore[union-attr]
+
+
+def test_a_snapshot_crosses_the_wire_with_its_prices_as_strings() -> None:
+    """The exact-decimal discipline, carried to the last hop. A bar that crossed as a JSON
+    number would be an IEEE double, and the chart drawn from it would not line up with the
+    `entry_price` printed beside it."""
+    snapshot = SnapshotOut.model_validate(a_snapshot_payload())
+
+    body = snapshot.model_dump(mode="json")
     assert [bar["close"] for bar in body["bars"]] == ["1.10000", "1.10100"]
     assert all(isinstance(bar["high"], str) for bar in body["bars"])
 

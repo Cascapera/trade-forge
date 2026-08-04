@@ -284,3 +284,10 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
   DSN recebido, em vez de usar o banco nomeado nele — assim o comando fica idêntico em CI e
   local e a segurança não depende de quem lembrou de exportar a variável certa. Uma recusa
   explícita ("o DSN aponta para um banco com dados; use um banco de teste") é o mínimo.
+  **Paliativo que já funciona** (verificado em 04/08, PR-219): `POSTGRES_DB` existe e é
+  respeitado, então dá para rodar em segurança criando o banco à mão primeiro —
+  `docker compose exec -T postgres psql -U tradeforge -d postgres -c "CREATE DATABASE
+  tradeforge_test OWNER tradeforge;"` e depois `POSTGRES_HOST=localhost POSTGRES_PORT=5433
+  POSTGRES_DB=tradeforge_test uv run pytest -m integration --no-cov`. Passa 36/36 e não toca
+  no banco de desenvolvimento. O item continua aberto porque isso depende de lembrar da
+  variável, que é exatamente o que falhou.

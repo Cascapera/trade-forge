@@ -18,7 +18,14 @@ import uuid
 from decimal import Decimal
 from typing import Annotated, Any
 
-from pydantic import BaseModel, ConfigDict, Field, PlainSerializer, field_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    PlainSerializer,
+    field_validator,
+)
 
 # A Decimal that always serialises to a string. Applied to every monetary/ratio field below.
 Money = Annotated[Decimal, PlainSerializer(str, return_type=str)]
@@ -189,22 +196,35 @@ class TradeOut(_Out):
     net_pnl: Money | None
     r_multiple: Money | None
     context: dict[str, str | None]
-    snapshot: SnapshotOut | None = None
-    """The entry's picture, or `None` for a trade whose run recorded none.
+    has_snapshot: bool = Field(
+        default=False,
+        # Read off the row's `snapshot` column, which holds the window itself. The alias is what
+        # makes this a *projection* of that column rather than a second column nobody writes:
+        # without it Pydantic would look for `has_snapshot` on the row, not find it, and hand
+        # back the default — every trade reporting no picture, quietly and always.
+        validation_alias=AliasChoices("snapshot", "has_snapshot"),
+    )
+    """Whether this trade has an entry picture to fetch, **not** the picture itself.
 
-    `{}` in the column means exactly that — a run from before this existed, or a strategy
-    driven without a window — so it is normalised to `None` here rather than reaching a client
-    as an object with no bars, which a chart would try to draw."""
+    A snapshot is fifty-odd bars — around 7 kB of JSON per trade. Carrying them all in the list
+    makes a five-hundred-trade run a multi-megabyte response assembled to be almost entirely
+    thrown away: a reader opens the two or three entries that look wrong. So the list says only
+    that one exists, and `GET /backtests/{id}/trades/{trade_id}/snapshot` serves it when asked.
 
-    @field_validator("snapshot", mode="before")
+    A flag rather than a nullable object because the client's question here is "is the button
+    live?" — and answering it with an object would put the cost right back."""
+
+    @field_validator("has_snapshot", mode="before")
     @classmethod
-    def _empty_snapshot_is_none(cls, value: object) -> object:
-        """`{}` is the column's NOT NULL default and means "no window was recorded".
+    def _snapshot_column_becomes_a_flag(cls, value: object) -> object:
+        """Reads the `snapshot` JSONB column, which is `{}` when no window was recorded.
 
-        Validated as-is it would fail on every row written before `rev_0003` — the endpoint
-        would 500 on historical backtests rather than serving them without a chart.
+        `{}` is the column's NOT NULL default, so it is what every row written before
+        `rev_0003` says — and it means "nothing recorded", which is a false flag, not a bug.
         """
-        return None if value == {} else value
+        if isinstance(value, bool):
+            return value
+        return bool(value)
 
 
 class TradesPage(BaseModel):

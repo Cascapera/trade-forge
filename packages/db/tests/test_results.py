@@ -21,7 +21,9 @@ from tradeforge_engine.domain import (
     EntrySnapshot,
     EquityPoint,
     Side,
+    SnapshotPoint,
     SnapshotRegion,
+    SnapshotSeries,
 )
 from tradeforge_engine.metrics import BacktestMetrics
 
@@ -74,10 +76,14 @@ def a_candle(index: int, *, close: str) -> Candle:
     )
 
 
-def a_snapshot(*, regions: tuple[SnapshotRegion, ...] = ()) -> EntrySnapshot:
+def a_snapshot(
+    *,
+    regions: tuple[SnapshotRegion, ...] = (),
+    series: tuple[SnapshotSeries, ...] = (),
+) -> EntrySnapshot:
     """Two bars: a decision and the fill that followed it."""
     bars = (a_candle(0, close="1.10000"), a_candle(1, close="1.10100"))
-    return EntrySnapshot(bars=bars, decided_at=bars[0].time, regions=regions)
+    return EntrySnapshot(bars=bars, decided_at=bars[0].time, regions=regions, series=series)
 
 
 def a_metrics(**overrides: object) -> BacktestMetrics:
@@ -211,6 +217,7 @@ def test_the_snapshot_becomes_bars_and_regions_with_string_prices() -> None:
         },
     ]
     assert row.snapshot["regions"] == []
+    assert row.snapshot["series"] == []
 
 
 def test_a_region_keeps_its_own_left_edge_in_time() -> None:
@@ -232,6 +239,45 @@ def test_a_region_keeps_its_own_left_edge_in_time() -> None:
             "top": "1.10200",
             "bottom": "1.10000",
             "from_time": "2023-12-31T19:00:00+00:00",
+        }
+    ]
+
+
+def test_a_series_becomes_time_value_pairs_with_the_value_as_a_string() -> None:
+    """The curve, stored the way it is drawn: one pair per bar, in order.
+
+    Pairs and not objects — a fifty-point curve would repeat two keys fifty times for nothing,
+    and unlike a bar (five fields, read by a human debugging) a point is only ever consumed by
+    the drawing code. The value keeps the exact `Decimal` as a string, like every other price
+    here: a curve rounded to a float would not pass through the level in `context`, and that
+    equality is the only thing making the curve trustworthy.
+    """
+    # Three bars with the decision in the middle, so a two-point curve ends *on* the decision
+    # while the bars still run one further to the fill — the shape every real snapshot has.
+    # The shared `a_snapshot` decides on its first bar, which a two-point curve would overrun,
+    # and `EntrySnapshot` refuses that: an indicator read after the decision is lookahead.
+    bars = (
+        a_candle(0, close="1.10000"),
+        a_candle(1, close="1.10100"),
+        a_candle(2, close="1.10200"),
+    )
+    curve = SnapshotSeries(
+        label="average",
+        points=(
+            SnapshotPoint(time=START, value=Decimal("1.0999999999")),
+            SnapshotPoint(time=START + HOUR, value=Decimal("1.1000000001")),
+        ),
+    )
+    snapshot = EntrySnapshot(bars=bars, decided_at=bars[1].time, series=(curve,))
+    row = map_one(a_trade(snapshot=snapshot))
+
+    assert row.snapshot["series"] == [
+        {
+            "label": "average",
+            "points": [
+                ["2024-01-01T00:00:00+00:00", "1.0999999999"],
+                ["2024-01-01T01:00:00+00:00", "1.1000000001"],
+            ],
         }
     ]
 

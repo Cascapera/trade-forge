@@ -147,6 +147,17 @@ def _snapshot(snapshot: EntrySnapshot | None) -> dict[str, Any]:
             }
             for region in snapshot.regions
         ],
+        # Points as `[time, value]` pairs rather than `{"time": ..., "value": ...}`: a fifty
+        # point curve repeats those two keys fifty times for nothing, and unlike the bars —
+        # which have five fields and are read by a human debugging a chart — a point has two
+        # and is only ever consumed by the drawing code. The order is the same as the tuple.
+        "series": [
+            {
+                "label": series.label,
+                "points": [[point.time.isoformat(), str(point.value)] for point in series.points],
+            }
+            for series in snapshot.series
+        ],
     }
 
 

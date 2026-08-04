@@ -30,7 +30,9 @@ from tradeforge_engine.domain import (
     Side,
     Signal,
     SignalKind,
+    SnapshotPoint,
     SnapshotRegion,
+    SnapshotSeries,
 )
 from tradeforge_engine.loop import SNAPSHOT_BARS_BEFORE, RunResult, run
 from tradeforge_engine.risk import PercentRiskManager
@@ -226,6 +228,66 @@ def test_a_region_starting_on_the_decision_bar_is_allowed() -> None:
         label="zone", top=Decimal(100), bottom=Decimal(90), from_time=bars[1].time
     )
     assert EntrySnapshot(bars=bars, decided_at=bars[1].time, regions=(same,)).regions == (same,)
+
+
+def test_a_series_needs_a_label_and_at_least_one_point() -> None:
+    """An empty series is not a curve with no data — it is a caller that should have sent
+    nothing. Drawn, it is a legend entry pointing at an invisible line."""
+    point = SnapshotPoint(time=START, value=Decimal(100))
+    with pytest.raises(ValueError, match="needs a label"):
+        SnapshotSeries(label="", points=(point,))
+    with pytest.raises(ValueError, match="omit it rather than send it empty"):
+        SnapshotSeries(label="average", points=())
+
+
+def test_series_points_must_ascend_in_time() -> None:
+    """Same rule as the bars, and for the same reason: drawn as-is, a curve that goes backwards
+    folds over itself. Two readings stamped with one time is the other half — a buffer appended
+    twice on one bar, which would draw a vertical jump nothing in the market caused."""
+    first = SnapshotPoint(time=START, value=Decimal(100))
+    second = SnapshotPoint(time=START + HOUR, value=Decimal(101))
+    with pytest.raises(ValueError, match="must ascend in time"):
+        SnapshotSeries(label="average", points=(second, first))
+    with pytest.raises(ValueError, match="must ascend in time"):
+        SnapshotSeries(label="average", points=(first, first))
+
+
+def test_a_series_point_carries_its_own_instant() -> None:
+    """The whole reason a point is a pair rather than a bare number.
+
+    Indexed by position against the bars, a one-bar disagreement between the strategy's buffer
+    and the loop's window draws the entire curve shifted — every point in the wrong place, none
+    of them detectably so. Stamped with a time, the same disagreement is a visible hole.
+    """
+    with pytest.raises(ValueError, match=r"SnapshotPoint\.time"):
+        SnapshotPoint(time=dt.datetime(2024, 1, 1), value=Decimal(100))  # noqa: DTZ001
+
+
+def test_a_series_may_not_reach_past_the_decision() -> None:
+    """The mirror of the region rule, and the guard on the one thing the broker must not do.
+
+    The broker extends the *bars* past the decision, to the bar that filled. Extending a curve
+    alongside them would draw indicator readings the strategy never saw as the justification
+    for what it did — lookahead, one line of code away. Unreachable today, which is exactly
+    why nothing else would notice it becoming reachable.
+    """
+    bars = (_flat(0), _flat(1), _flat(2))
+    reaching = SnapshotSeries(
+        label="average",
+        points=(
+            SnapshotPoint(time=bars[0].time, value=Decimal(100)),
+            SnapshotPoint(time=bars[2].time, value=Decimal(101)),
+        ),
+    )
+    with pytest.raises(ValueError, match="past the decision"):
+        EntrySnapshot(bars=bars, decided_at=bars[1].time, series=(reaching,))
+
+    # Ending *on* the decision is the normal case, and stopping short of it is the norm once
+    # the broker has extended the bars — neither is refused.
+    ending = SnapshotSeries(
+        label="average", points=(SnapshotPoint(time=bars[1].time, value=Decimal(100)),)
+    )
+    assert EntrySnapshot(bars=bars, decided_at=bars[1].time, series=(ending,)).series == (ending,)
 
 
 def test_a_snapshot_has_no_regions_unless_the_strategy_gave_it_any() -> None:

@@ -157,6 +157,22 @@ class SnapshotRegionOut(BaseModel):
     from_time: dt.datetime
 
 
+class SnapshotSeriesOut(BaseModel):
+    """A curve to draw across the bars — an indicator, as the strategy computed it.
+
+    Each point is a `[time, value]` pair. The time is carried per point, not implied by
+    position, so a client joins the curve to the bars on the timestamp: a series that ends
+    before the last bar draws a curve that stops short, rather than one silently stretched.
+
+    Expect exactly that. The curve ends on the decision bar while the bars can run further, to
+    the fill — only the strategy knows the indicator, and it stopped contributing when it
+    decided. A leading gap is the indicator warming up.
+    """
+
+    label: str
+    points: list[tuple[dt.datetime, Money]]
+
+
 class SnapshotOut(BaseModel):
     """What the strategy was looking at when it entered, as recorded by the engine.
 
@@ -172,6 +188,7 @@ class SnapshotOut(BaseModel):
 
     bars: list[SnapshotBarOut]
     regions: list[SnapshotRegionOut] = []
+    series: list[SnapshotSeriesOut] = []
 
 
 class TradeOut(_Out):

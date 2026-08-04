@@ -522,13 +522,18 @@ class BacktestBroker:
             )
             return armed
         since = tuple(bar for bar in self._seen if armed.decided_at < bar.time <= candle.time)
-        # The regions come through untouched. They are the strategy's, describing price bands
-        # that existed before this order was placed, and the broker has no business editing
-        # them — dropping them here would erase the zone from exactly the trades that filled.
+        # Regions and series come through untouched. They are the strategy's — dropping them
+        # here would erase the zone and the average from exactly the trades that filled.
+        #
+        # The series is *not* extended alongside the bars, and cannot be: only the strategy
+        # knows what its average read on the bars this order spent resting, and it stopped
+        # contributing when it emitted the signal. So a curve can stop short of the window's
+        # right edge. That is the arming window's true extent, drawn honestly.
         return EntrySnapshot(
             bars=armed.bars + since,
             decided_at=armed.decided_at,
             regions=armed.regions,
+            series=armed.series,
         )
 
     def _fill_at_open(self, order: OrderRequest, candle: Candle) -> Fill | None:

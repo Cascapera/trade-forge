@@ -79,7 +79,9 @@ export function Results(): React.JSX.Element {
           </section>
           <section>
             <h3 className="mb-2 font-medium">Trades</h3>
-            {trades.data !== undefined && <TradesTable trades={trades.data.items} />}
+            {trades.data !== undefined && (
+              <TradesTable trades={trades.data.items} backtestId={run.id} />
+            )}
           </section>
         </>
       )}

@@ -291,3 +291,13 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
   POSTGRES_DB=tradeforge_test uv run pytest -m integration --no-cov`. Passa 36/36 e não toca
   no banco de desenvolvimento. O item continua aberto porque isso depende de lembrar da
   variável, que é exatamente o que falhou.
+- [origem: PR-220] **Um buraco no meio de uma série de snapshot é acidental, não estrutural** —
+  `_AverageTrail.record` pula leituras `None`, e isso só produz buraco à esquerda (aquecimento)
+  porque `SMA.value()` e `EMA.value()` nunca voltam a `None` depois de aquecer. **`VWAP.value()`
+  devolve `None` quando não houve volume** (`indicators.py`), então no dia em que um trail for
+  construído sobre VWAP uma barra sem negócio no meio da sessão produz exatamente o buraco que o
+  docstring de `SnapshotSeries` chama de "sem causa legítima" — em silêncio, e num indicador
+  intradiário isso é rotina, não exceção. Achado pelo engine-guardian na revisão do PR-220.
+  Conserto quando existir o primeiro trail não-média: ou o ponto passa a admitir valor nulo (e o
+  desenho quebra a linha ali de propósito), ou o trail recusa lacuna interna. Hoje é inalcançável
+  — o único produtor é a média — por isso fica anotado em vez de resolvido.

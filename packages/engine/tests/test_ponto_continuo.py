@@ -331,6 +331,96 @@ def test_the_golden_trade_carries_the_picture_of_its_own_entry() -> None:
     ]
 
 
+def test_the_entry_carries_the_average_as_a_curve_not_a_level() -> None:
+    """The average the whole setup turns on, recorded bar by bar. Measured, not derived.
+
+    A moving average drawn as the single number it held at the decision is a horizontal line,
+    and this setup's entire rule is a *shape*: price runs away, comes back to the line, touches
+    it, and turns. A level cannot show that.
+
+    Four claims, and the third is the one that makes the curve trustworthy:
+
+    1. every point lands on a bar the snapshot carries — the two buffers agree;
+    2. the points ascend and are unique, so the curve is drawn in one direction;
+    3. the value at the decision bar **is** the number `context['average']` reports, so the
+       curve passes through the level the rule was judged against rather than near it;
+    4. the curve stops at the decision. The bars run one further, to the fill, because only the
+       broker knows that bar — the strategy had already stopped contributing.
+
+    The MME3 leaves the first two bars without a point: an average has no value until its
+    period has filled, and the window reaches back before that.
+    """
+    (trade,) = _run(_GOLDEN).trades
+    snapshot = trade.snapshot
+    assert snapshot is not None
+    assert trade.context is not None
+
+    (curve,) = snapshot.series
+    assert curve.label == "average"
+
+    times = [point.time for point in curve.points]
+    assert set(times) <= {candle.time for candle in snapshot.bars}
+    assert times == sorted(set(times))
+
+    # **Every value, not only the one at the decision.** Stamping points with times makes a
+    # shift along *x* impossible, but says nothing about which value got which time: `record()`
+    # called before `update()` would stamp each bar with its neighbour's reading — right shape,
+    # right instants, every value one bar stale, and no hole to give it away.
+    assert [(point.time, point.value) for point in curve.points] == [
+        (_GOLDEN[2].time, Decimal("104")),
+        (_GOLDEN[3].time, Decimal("109.0")),
+        (_GOLDEN[4].time, Decimal("111.00")),
+        (_GOLDEN[5].time, Decimal("111.750")),
+        (_GOLDEN[6].time, Decimal("112.6250")),
+    ]
+
+    at_decision = next(p for p in curve.points if p.time == snapshot.decided_at)
+    assert at_decision.value == trade.context["average"] == Decimal("112.6250")
+
+    assert times[-1] == snapshot.decided_at
+    assert snapshot.filled_at > times[-1]  # the bars go one further than the curve
+
+    # Warmup, at the left and only at the left: two bars of an MME3, then every bar after.
+    assert times == [candle.time for candle in _GOLDEN[2:7]]
+
+
+def test_the_curve_covers_the_bar_that_closed_below_the_average() -> None:
+    """The `record` call sits above every early return, and this is what says so.
+
+    The bar that closes back below the average withdraws the order, resets the correction
+    count and **returns** — it never reaches the bottom of `on_bar`. Move the recording down
+    past that return and the curve loses exactly that bar: a hole in the middle of the chart,
+    on the one bar where price crossed the line, which is the event this whole setup is about.
+    The points that remain still sit on their true instants, so nothing looks misplaced.
+
+    It is also the hole `SnapshotSeries` documents as having no legitimate cause — a leading
+    gap is warmup, a gap in the middle is a bug — and it would ship without a single failure.
+
+    Measured: bar 4 closes 105 against an average of 106.50, then price recovers, two strict
+    corrections run above the line, and bar 9 touches 114 against 116.4844 and closes 118.
+    """
+    stream = [
+        bar(0, open_="100", close="100", high="100.5", low="99.5"),
+        bar(1, open_="100", close="104", high="104.5", low="100"),
+        bar(2, open_="104", close="108", high="108.5", low="104"),
+        bar(3, open_="108", close="112", high="112.5", low="108"),
+        bar(4, open_="112", close="105", high="112.5", low="104"),  # closes below -> early return
+        bar(5, open_="105", close="115", high="116", low="105"),
+        bar(6, open_="115", close="117", high="118", low="114"),  # reference
+        bar(7, open_="117", close="114", high="117.5", low="113"),  # correction 1
+        bar(8, open_="114", close="116", high="117", low="112.5"),  # correction 2 -> qualified
+        bar(9, open_="116", close="118", high="119", low="114"),  # touch + close above -> arms
+    ]
+    signals = [signal for per_bar in _drive(stream) for signal in per_bar]
+    (entry,) = [signal for signal in signals if signal.kind is SignalKind.ENTRY]
+
+    (curve,) = entry.series
+    recorded = {point.time for point in curve.points}
+    assert stream[4].time in recorded, "the bar that returned early is missing from the curve"
+    # And the curve is unbroken from where the average warmed up to the decision.
+    assert recorded == {candle.time for candle in stream[2:10]}
+
+
 def test_the_target_is_not_what_ended_the_golden_trade() -> None:
     """Switching the broker's target off leaves the same trade, which is how we know the conduction
     ended it. At 5R the target sat at 129 and price never saw it."""

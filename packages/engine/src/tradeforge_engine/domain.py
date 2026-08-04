@@ -184,6 +184,67 @@ class Candle:
             )
 
 
+# How many bars before the decision an entry's snapshot carries (`EntrySnapshot`) — enough to
+# read the swing the setup claims to be trading, and no more.
+#
+# It lives here, with the type it describes, rather than with the loop that fills the window:
+# the strategies size their own indicator buffers against it, and a strategy reaching into the
+# event loop for a constant would be the tail wagging the dog.
+SNAPSHOT_BARS_BEFORE = 50
+
+
+@dataclass(frozen=True, slots=True)
+class SnapshotPoint:
+    """One reading of an indicator, stamped with the bar it was read on."""
+
+    time: dt.datetime
+    value: Money
+
+    def __post_init__(self) -> None:
+        _require_utc(self.time, "SnapshotPoint.time")
+
+
+@dataclass(frozen=True, slots=True)
+class SnapshotSeries:
+    """A line to draw across the bars: an indicator, as the strategy actually computed it.
+
+    A moving average is not a level, it is a curve, and drawing it as the single number it held
+    at the decision loses the shape the method is about — where price came back to it, at what
+    angle, how far it had run.
+
+    **Stamped with times, not aligned by position.** The strategy fills this buffer; the loop
+    fills the bar window; they are two buffers and nothing forces them to agree. Indexed by
+    position, a one-bar disagreement draws the whole curve shifted — plausible, silent, and
+    wrong. Indexed by time, the same disagreement is a visible hole, and a reader can see that
+    something is missing rather than believe something that is not there.
+
+    **A leading gap is warmup**, not a fault: an average has no value until its period has
+    filled, and the window can reach back before that. Points simply begin where the indicator
+    did. A gap in the *middle* has no legitimate cause and is worth chasing.
+
+    The series ends on the decision bar, even when the broker later extends the bars to a fill
+    several bars away: only the strategy knows the average, and it stopped contributing when it
+    emitted the signal. So the curve can stop short of the right edge — that is the arming
+    window's extent, drawn honestly.
+    """
+
+    label: str
+    points: tuple[SnapshotPoint, ...]
+
+    def __post_init__(self) -> None:
+        if not self.label:
+            raise ValueError("a series needs a label; an unnamed curve is undrawable")
+        if not self.points:
+            raise ValueError(
+                f"series {self.label} has no points; omit it rather than send it empty"
+            )
+        for earlier, later in zip(self.points, self.points[1:], strict=False):
+            if later.time <= earlier.time:
+                raise ValueError(
+                    f"series {self.label} must ascend in time, got {earlier.time} then {later.time}"
+                )
+
+
 @dataclass(frozen=True, slots=True)
 class SnapshotRegion:
     """A rectangle to draw on the chart: a band of price with a left edge in time.
@@ -275,6 +336,15 @@ class EntrySnapshot:
     a region rather than a level, and where that region begins. Empty for a setup that has none
     — the swing setups enter off an average, which is a line and not a band."""
 
+    series: tuple[SnapshotSeries, ...] = ()
+    """The curves to draw across those bars — the indicators, as the strategy computed them.
+
+    Also the strategy's, and for a stronger reason than the regions: an indicator cannot be
+    recovered from the bars here. A moving average carries the whole run's history in it, so a
+    reader recomputing one from a fifty-bar window would get a different number from a different
+    seed — a curve that looks right and does not pass through the value the entry was judged
+    against. See `SnapshotSeries`."""
+
     def __post_init__(self) -> None:
         # An empty window is not a snapshot, it is a wiring bug that would reach the screen
         # as an empty chart and read as "this trade had no context".
@@ -308,6 +378,16 @@ class EntrySnapshot:
                 raise ValueError(
                     f"region {region.label} starts at {region.from_time}, after the decision "
                     f"at {self.decided_at}: a decision cannot be drawn from a later bar"
+                )
+        # The same rule for the curves, and it is the same rule: an indicator reading stamped
+        # after the decision is a value the strategy had not seen, drawn as justification for
+        # what it did. The broker extends the *bars* past the decision, to the fill, and must
+        # never extend a series alongside them — this is what would catch it trying.
+        for series in self.series:
+            if series.points[-1].time > self.decided_at:
+                raise ValueError(
+                    f"series {series.label} reaches {series.points[-1].time}, past the decision "
+                    f"at {self.decided_at}: an indicator cannot be read from a later bar"
                 )
 
     @property
@@ -347,6 +427,12 @@ class Signal:
     is the training material for the phase-3 analysis ("does this only work when ADX > 25?"),
     and recomputing it afterwards would mean re-running the engine and trusting nothing moved.
     None on an exit, and on any strategy with no indicators."""
+
+    series: tuple[SnapshotSeries, ...] = ()
+    """The indicator curves behind this decision, for the entry's picture.
+
+    The strategy is the only side that can supply them: an indicator carries the whole run's
+    history, so nobody downstream can recover it from the bars. See `SnapshotSeries`."""
 
     regions: tuple[SnapshotRegion, ...] = ()
     """The bands of price this decision was made against, for the entry's picture.

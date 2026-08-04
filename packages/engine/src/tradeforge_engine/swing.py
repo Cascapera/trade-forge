@@ -51,12 +51,14 @@ engine deliberately keeps outside it.
 """
 
 import logging
+from collections import deque
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Final, Literal
 
 from tradeforge_engine.conduction import StructuralTrail, breakeven_candidate, tighten
 from tradeforge_engine.domain import (
+    SNAPSHOT_BARS_BEFORE,
     ZERO,
     Candle,
     Context,
@@ -65,6 +67,8 @@ from tradeforge_engine.domain import (
     Side,
     Signal,
     SignalKind,
+    SnapshotPoint,
+    SnapshotSeries,
 )
 from tradeforge_engine.indicators import EMA, SMA
 from tradeforge_engine.structure import MarketStructure, StructureBreak
@@ -118,6 +122,49 @@ def _breakout_entry(
             return None
         return _Breakout(stop_price=candle.high, stop_loss=stop_loss)
     return _Breakout(stop_price=candle.low, stop_loss=candle.high + buffer)
+
+
+class _AverageTrail:
+    """The last readings of an average, kept so an entry can carry its own curve.
+
+    A moving average is not a level. Recording only the number it held at the decision draws it
+    as a horizontal line, which loses everything the method is about — where price came back to
+    it, at what angle, how far it had run away first.
+
+    **The strategy has to be the one keeping it.** An average carries the whole run's history:
+    an EMA seeded thousands of bars ago is not the EMA of the last fifty, so a reader
+    recomputing one from the snapshot's window would draw a curve that never passes through the
+    value the entry was actually judged against. Plausible, and wrong.
+
+    Bounded to the same span as the snapshot window (`SNAPSHOT_BARS_BEFORE`) — the same argument
+    as the loop's buffer, and the reason the constant lives in `domain` rather than in the loop:
+    a strategy sizing its buffer against the event loop's private constant would be backwards.
+
+    Warming-up bars are skipped rather than recorded as holes. An average has no value until its
+    period has filled, and the window can reach back before that, so the curve simply begins
+    where the indicator did.
+    """
+
+    def __init__(self, label: str = "average") -> None:
+        self._label = label
+        self._points: deque[SnapshotPoint] = deque(maxlen=SNAPSHOT_BARS_BEFORE + 1)
+
+    def record(self, candle: Candle, value: Money | None) -> None:
+        """Fold this bar's reading in. Call on **every** bar, before any early return.
+
+        Called conditionally, the buffer would skip the bars that emitted nothing and the curve
+        would be drawn compressed — the points still landing on their true times, so the shape
+        would be wrong without a single one of them being in the wrong place.
+        """
+        if value is None:
+            return
+        self._points.append(SnapshotPoint(time=candle.time, value=value))
+
+    def series(self) -> tuple[SnapshotSeries, ...]:
+        """The curve as a snapshot series, or nothing at all while the average is warming up."""
+        if not self._points:
+            return ()
+        return (SnapshotSeries(label=self._label, points=tuple(self._points)),)
 
 
 def _withdraw(armed: _Armed, candle: Candle, *, side: Side, name: str) -> Signal:
@@ -181,6 +228,7 @@ class Mme9BreakoutStrategy:
         self._stop_buffer_ticks = Decimal(stop_buffer_ticks)
         self._breakeven_at_r = breakeven_at_r
         self._ema = EMA(period=period, source="close")
+        self._trail_of_the_average = _AverageTrail()
 
         self._armed: _Armed | None = None
         self._armed_count = 0
@@ -195,6 +243,8 @@ class Mme9BreakoutStrategy:
         # cross that starts the next one are both read off a live MME9.
         self._ema.update(candle)
         average = self._ema.value()
+        # Recorded on every bar, before any branch below can return early — see `_AverageTrail`.
+        self._trail_of_the_average.record(candle, average)
 
         self._observe_fill(context)
 
@@ -268,6 +318,10 @@ class Mme9BreakoutStrategy:
                 # downstream would otherwise carry, and without it a chart of this entry shows
                 # a bar breaking out of nothing in particular.
                 context={"average": average},
+                # And the same average as the curve it actually is. The scalar above is what a
+                # later "does this only fire far from the average?" aggregates; this is what
+                # gets drawn. Neither can be derived from the other.
+                series=self._trail_of_the_average.series(),
             )
         )
         return tuple(signals)
@@ -453,6 +507,7 @@ class PontoContinuoStrategy:
         # line, which is MME throughout. The arithmetic mean of the same period is slower, so it
         # sits further from price and asks for a deeper correction before it is touched.
         self._average = build(period=period, source="close")
+        self._trail_of_the_average = _AverageTrail()
 
         self._previous: Candle | None = None
         self._corrections = 0
@@ -469,6 +524,8 @@ class PontoContinuoStrategy:
         candle = context.candle
         self._average.update(candle)
         average = self._average.value()
+        # Recorded on every bar, before any branch below can return early — see `_AverageTrail`.
+        self._trail_of_the_average.record(candle, average)
         break_ = self._structure.update(candle)
         previous, self._previous = self._previous, candle
 
@@ -540,6 +597,10 @@ class PontoContinuoStrategy:
                 # The average this bar touched and closed back above — the pullback's own
                 # definition, and the level a reader needs to see the touch happen.
                 context={"average": average},
+                # And the curve it belongs to. In this setup the shape is the point: the whole
+                # rule is price running away, coming *back* to the line, and turning off it —
+                # which a single horizontal level cannot show.
+                series=self._trail_of_the_average.series(),
             )
         )
         return tuple(signals)

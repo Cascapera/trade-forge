@@ -30,9 +30,9 @@ from tradeforge_engine.domain import (
     SignalKind,
 )
 from tradeforge_engine.indicators import EMA
-from tradeforge_engine.loop import ENGINE_CONTEXT, RunResult, run
+from tradeforge_engine.loop import ENGINE_CONTEXT, SNAPSHOT_BARS_BEFORE, RunResult, run
 from tradeforge_engine.risk import PercentRiskManager
-from tradeforge_engine.swing import Mme9BreakoutStrategy
+from tradeforge_engine.swing import Mme9BreakoutStrategy, _AverageTrail
 from tradeforge_engine.testing import AAPL, HOUR, START, ImmediateFillBroker, bar
 
 _ACCOUNT = ImmediateFillBroker(instrument=AAPL).account()
@@ -222,6 +222,97 @@ def test_a_long_enters_on_the_break_of_the_reference_high_and_is_conducted_out()
     [trade] = result.trades
     assert trade.net_pnl > ZERO  # a losing trade turned small winner
     assert trade.stop_loss == Decimal("97.90")  # sized against the entry's stop, as ever
+
+
+def test_the_average_trail_spans_exactly_the_snapshot_window() -> None:
+    """The curve must reach as far back as the bars it is drawn over — no further, no less.
+
+    Tested here rather than through a run, because every scenario in this suite is a handful of
+    bars long and none of them come near the cap. A trail one bar short would lose the *oldest*
+    point of every real entry: the curve would start one bar inside the chart, which is a
+    difference nobody notices and no golden covers. It is the buffer's own claim, so it is
+    asserted against the buffer.
+
+    `SNAPSHOT_BARS_BEFORE + 1` on both sides: fifty bars before the decision, plus the decision.
+    """
+    trail = _AverageTrail()
+    fed = [bar(i, open_="100", close="100", high="101", low="99") for i in range(200)]
+    for index, candle in enumerate(fed):
+        trail.record(candle, Decimal(index))
+
+    # Unpacked in two steps rather than as `(curve,) = trail.series()`. `series()` returns the
+    # empty tuple while the average is warming up, so the one-element unpack is a claim about
+    # *which* branch ran — made silently, by raising ValueError somewhere else. Said out loud
+    # it is one assertion; CodeQL flags the short form for exactly this reason.
+    curves = trail.series()
+    assert len(curves) == 1
+    curve = curves[0]
+    assert len(curve.points) == SNAPSHOT_BARS_BEFORE + 1
+    # The newest reading is the last one fed, and the oldest is exactly `SNAPSHOT_BARS_BEFORE`
+    # bars behind it — the same span the loop's window keeps.
+    assert curve.points[-1].time == fed[-1].time
+    assert curve.points[0].time == fed[-(SNAPSHOT_BARS_BEFORE + 1)].time
+    assert curve.points[-1].value == Decimal(len(fed) - 1)
+
+
+def test_the_average_trail_offers_no_curve_while_the_average_is_warming_up() -> None:
+    """No points is not an empty curve to draw — it is a series that should not exist yet.
+
+    `SnapshotSeries` refuses to be built empty, so the trail has to answer with nothing at all
+    rather than with a labelled line holding no data."""
+    trail = _AverageTrail()
+    trail.record(bar(0, open_="100", close="100", high="101", low="99"), None)
+    assert trail.series() == ()
+
+
+def test_the_entry_carries_the_average_as_a_curve_across_every_bar_it_saw() -> None:
+    """The MME9's own curve, measured — the mirror of the Ponto Contínuo's, and not redundant.
+
+    Both setups fill their trail through the same helper, but each calls `record` from its own
+    `on_bar`, so "the MME9 emits a curve" is a separate fact from "the Ponto Contínuo does".
+    Without this, dropping `series=` from this setup's `Signal` leaves the whole suite green
+    and the chart silently reverts to the horizontal line this work exists to replace.
+
+    **Every value is asserted, not just the one at the decision.** Stamping points with times
+    makes a shift along *x* impossible — a misplaced point lands off the bars, or leaves a hole.
+    It says nothing about the pairing of value to time: `record()` called before `update()`
+    would stamp each bar with its neighbour's reading, giving a curve of the right shape with
+    every point at the right instant and every value one bar stale. Only reading the whole
+    curve catches that.
+
+    The stream crosses up (arming), closes back *under* the average on bar 4 — the branch that
+    withdraws the order and returns early — recovers, and crosses up again on bar 6. Bar 4 is
+    the point of the scenario: it must be in the curve.
+    """
+    candles = [
+        bar(0, open_="100", close="100", high="100.5", low="99.5"),
+        bar(1, open_="100", close="99", high="100.2", low="98.8"),
+        bar(2, open_="99", close="98", high="99.2", low="97.5"),
+        bar(3, open_="98", close="101", high="101.3", low="97.9"),  # crosses up, arms
+        bar(4, open_="101", close="96.5", high="101.2", low="96"),  # closes back under -> early
+        bar(5, open_="96.5", close="95.5", high="97", low="95"),
+        bar(6, open_="95.5", close="100.5", high="101", low="95.4"),  # crosses up again -> arms
+        bar(7, open_="100.5", close="102.5", high="103", low="100"),  # breaks the trigger
+    ]
+    result = _run(candles)
+    (entry, *_) = _entries(result)
+    snapshot = entry.order.snapshot
+    assert snapshot is not None
+    assert entry.order.context is not None
+
+    (curve,) = snapshot.series
+    assert curve.label == "average"
+    assert [(point.time, point.value) for point in curve.points] == [
+        (candles[2].time, Decimal("99")),
+        (candles[3].time, Decimal("100.0")),
+        (candles[4].time, Decimal("98.25")),  # the bar that returned early, recorded anyway
+        (candles[5].time, Decimal("96.875")),
+        (candles[6].time, Decimal("98.6875")),
+    ]
+    # The curve passes through the level the rule was judged against, rather than near it.
+    assert curve.points[-1].value == entry.order.context["average"] == Decimal("98.6875")
+    # Warmup, and only at the left: an MME3 has no value for its first two bars.
+    assert {point.time for point in curve.points} == {candle.time for candle in candles[2:7]}
 
 
 def test_the_entry_records_the_average_it_closed_across() -> None:

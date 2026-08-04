@@ -28,6 +28,7 @@ from decimal import Context as DecimalContext
 from typing import cast
 
 from tradeforge_engine.domain import (
+    SNAPSHOT_BARS_BEFORE,
     ZERO,
     AccountState,
     Candle,
@@ -62,14 +63,16 @@ logger = logging.getLogger(__name__)
 ENGINE_PRECISION = 28
 ENGINE_CONTEXT = DecimalContext(prec=ENGINE_PRECISION, rounding=ROUND_HALF_EVEN)
 
-# How many bars before the decision an entry's snapshot carries (`EntrySnapshot`) — enough to
-# read the swing the setup claims to be trading, and no more.
+# The window size lives with the type it describes (`domain.SNAPSHOT_BARS_BEFORE`), because the
+# strategies size their own indicator buffers against it and a strategy reaching into the event
+# loop for a constant would be the tail wagging the dog. Re-exported here, where the buffer that
+# uses it is built.
 #
 # A *bounded* window, and that word is the whole design. `run()` takes an `Iterable` precisely
 # so that ten years of M1 never sits in memory at once; a snapshot buffer that grew with the
 # run would give that back, silently, and only on the long backtests where it matters. A
 # `deque` with a `maxlen` cannot: it drops from the left as it fills, at constant cost.
-SNAPSHOT_BARS_BEFORE = 50
+__all__ = ["ENGINE_CONTEXT", "SNAPSHOT_BARS_BEFORE", "RunResult", "run"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -303,6 +306,7 @@ def _to_order(
             bars=tuple(window),
             decided_at=context.candle.time,
             regions=signal.regions,
+            series=signal.series,
         ),
         limit_price=signal.limit_price,
         stop_price=signal.stop_price,

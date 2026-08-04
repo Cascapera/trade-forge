@@ -224,6 +224,29 @@ def test_a_long_enters_on_the_break_of_the_reference_high_and_is_conducted_out()
     assert trade.stop_loss == Decimal("97.90")  # sized against the entry's stop, as ever
 
 
+def test_the_entry_records_the_average_it_closed_across() -> None:
+    """The one level in this decision that no column downstream would otherwise carry.
+
+    The trigger and the stop are on the order; the average is not, and it is the whole reason
+    this bar was a reference. Without it a chart of the entry shows a bar breaking out of
+    nothing in particular — which is indistinguishable from the setup having fired at random.
+
+    Bar 3's MME3 is 100, measured by the same candles as the golden above.
+    """
+    candles = [
+        *_SEED,
+        bar(3, open_="98", close="101", high="101.3", low="97.9"),
+        bar(4, open_="101", close="103", high="103.5", low="100.8"),
+    ]
+    result = _run(candles)
+    [entry] = _entries(result)
+
+    assert entry.order.context == {"average": Decimal("100")}
+    # The bar closed *above* the level recorded, which is what "closed across" means here. A
+    # snapshot whose average sat on the wrong side of the close would be drawing another bar.
+    assert candles[3].close > Decimal("100")
+
+
 def test_the_entry_cannot_fill_on_the_bar_that_armed_it() -> None:
     """Anti-lookahead, where a stop order can actually break it: the order carries the decision
     instant of the bar that placed it, and the fill must land on a *later* bar. Bar 3 arms and its

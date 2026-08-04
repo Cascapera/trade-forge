@@ -7,6 +7,7 @@ table's CHECK constraints — is `test_results_integration.py`.
 """
 
 import datetime as dt
+import json
 import uuid
 from decimal import Decimal
 
@@ -14,7 +15,14 @@ import pytest
 
 from tradeforge_db.models import ExitReason, Trade
 from tradeforge_db.results import to_rows
-from tradeforge_engine.domain import ClosedTrade, EquityPoint, Side
+from tradeforge_engine.domain import (
+    Candle,
+    ClosedTrade,
+    EntrySnapshot,
+    EquityPoint,
+    Side,
+    SnapshotRegion,
+)
 from tradeforge_engine.metrics import BacktestMetrics
 
 START = dt.datetime(2024, 1, 1, tzinfo=dt.UTC)
@@ -32,6 +40,7 @@ def a_trade(  # noqa: PLR0913 — keyword-only; a trade simply has this many fac
     take_profit: str | None = None,
     r_multiple: str | None = None,
     context: dict[str, Decimal | None] | None = None,
+    snapshot: EntrySnapshot | None = None,
 ) -> ClosedTrade:
     net_pnl = Decimal(net)
     return ClosedTrade(
@@ -50,7 +59,25 @@ def a_trade(  # noqa: PLR0913 — keyword-only; a trade simply has this many fac
         take_profit=Decimal(take_profit) if take_profit is not None else None,
         r_multiple=Decimal(r_multiple) if r_multiple is not None else None,
         context=context,
+        snapshot=snapshot,
     )
+
+
+def a_candle(index: int, *, close: str) -> Candle:
+    price = Decimal(close)
+    return Candle(
+        time=START + index * HOUR,
+        open=price,
+        high=price + Decimal("0.00050"),
+        low=price - Decimal("0.00050"),
+        close=price,
+    )
+
+
+def a_snapshot(*, regions: tuple[SnapshotRegion, ...] = ()) -> EntrySnapshot:
+    """Two bars: a decision and the fill that followed it."""
+    bars = (a_candle(0, close="1.10000"), a_candle(1, close="1.10100"))
+    return EntrySnapshot(bars=bars, decided_at=bars[0].time, regions=regions)
 
 
 def a_metrics(**overrides: object) -> BacktestMetrics:
@@ -149,6 +176,7 @@ def test_a_stopless_trade_maps_its_nullable_fields_to_none() -> None:
     assert row.take_profit is None
     assert row.r_multiple is None
     assert row.context == {}
+    assert row.snapshot == {}  # NOT NULL: "nothing was recorded", never a NULL to interpret
 
 
 def test_context_stringifies_decimals_and_keeps_warming_up_nones() -> None:
@@ -156,6 +184,76 @@ def test_context_stringifies_decimals_and_keeps_warming_up_nones() -> None:
     are stored as strings. A `None` (an indicator still warming up) is a fact, not a zero."""
     row = map_one(a_trade(context={"ema": Decimal("1.23456789"), "rsi": None}))
     assert row.context == {"ema": "1.23456789", "rsi": None}
+
+
+def test_the_snapshot_becomes_bars_and_regions_with_string_prices() -> None:
+    """Same precision rule as `context`, applied to a series instead of a map: a JSON number is
+    a float, and a chart drawn from floats disagrees in the last place with the trade printed
+    next to it. Times are ISO with the offset, because a naive one is not an instant."""
+    row = map_one(a_trade(snapshot=a_snapshot()))
+
+    assert row.snapshot["decided_at"] == "2024-01-01T00:00:00+00:00"
+    assert row.snapshot["filled_at"] == "2024-01-01T01:00:00+00:00"
+    assert row.snapshot["bars"] == [
+        {
+            "time": "2024-01-01T00:00:00+00:00",
+            "open": "1.10000",
+            "high": "1.10050",
+            "low": "1.09950",
+            "close": "1.10000",
+        },
+        {
+            "time": "2024-01-01T01:00:00+00:00",
+            "open": "1.10100",
+            "high": "1.10150",
+            "low": "1.10050",
+            "close": "1.10100",
+        },
+    ]
+    assert row.snapshot["regions"] == []
+
+
+def test_a_region_keeps_its_own_left_edge_in_time() -> None:
+    """The rectangle is drawn from the candle that formed the zone, which is older than the
+    entry and often older than the window's first bar. Flattening it to two prices would make
+    the chart guess that edge, and it would guess the window's left edge — a lie about the age
+    of the zone."""
+    zone = SnapshotRegion(
+        label="zone",
+        top=Decimal("1.10200"),
+        bottom=Decimal("1.10000"),
+        from_time=START - 5 * HOUR,
+    )
+    row = map_one(a_trade(snapshot=a_snapshot(regions=(zone,))))
+
+    assert row.snapshot["regions"] == [
+        {
+            "label": "zone",
+            "top": "1.10200",
+            "bottom": "1.10000",
+            "from_time": "2023-12-31T19:00:00+00:00",
+        }
+    ]
+
+
+def test_the_snapshot_is_json_safe_all_the_way_down() -> None:
+    """JSONB takes no `Decimal` and no `datetime`. A value that slipped through as either would
+    only fail at the driver, inside the worker's transaction — after the run had succeeded."""
+    row = map_one(
+        a_trade(
+            snapshot=a_snapshot(
+                regions=(
+                    SnapshotRegion(
+                        label="zone",
+                        top=Decimal("1.10200"),
+                        bottom=Decimal("1.10000"),
+                        from_time=START,
+                    ),
+                )
+            )
+        )
+    )
+    assert json.loads(json.dumps(row.snapshot)) == row.snapshot
 
 
 def test_one_trade_row_is_built_per_closed_trade() -> None:

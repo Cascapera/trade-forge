@@ -519,6 +519,20 @@ class Trade(Base):
         JSONB, nullable=False, server_default=text("'{}'::jsonb")
     )
 
+    # The entry's picture: the bars the strategy had seen when it decided, carried on to the
+    # bar that filled the order, plus the rectangles drawn over them. `context` answers "under
+    # what numbers did this fire?"; this answers "did it fire where the method says?" — and
+    # that one is answered by looking, not by aggregating, which is why it is a time series
+    # and lives in its own column rather than as a key `context` readers must learn to skip.
+    #
+    # Written by the engine at the decision and never recomputed. Rebuilding the window later
+    # from the Parquet would mean charting bars that are not necessarily the ones the strategy
+    # saw — the file gets recollected, extended, corrected — and the chart would disagree with
+    # the trade drawn on it with nothing to show for it. Same argument as `candles_seen`.
+    snapshot: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+    )
+
     backtest: Mapped[Backtest] = relationship(back_populates="trades")
 
     __table_args__ = (

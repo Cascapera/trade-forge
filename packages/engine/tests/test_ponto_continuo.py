@@ -299,6 +299,38 @@ def test_a_long_enters_on_the_touch_that_closed_above_and_is_conducted_out() -> 
     assert trade.stop_loss == Decimal(111)  # the *initial* stop: what the lot was sized against
 
 
+def test_the_golden_trade_carries_the_picture_of_its_own_entry() -> None:
+    """The snapshot on the golden trade, measured by running it.
+
+    Two facts a reader needs and neither of which any other column gives:
+
+    * the **average** the pullback came back to — 112.625, the level bar 6's low of 111 pierced
+      and its close of 113.5 came back above. It is the setup's own definition, and a chart
+      without it shows a bar bouncing off nothing;
+    * the **window** — every bar up to the decision (bar 6), *plus* bar 7, the one the resting
+      stop order filled on. The extension is what separates "it armed in the right place" from
+      "it entered in the right place", and only the second is a claim about the fill.
+
+    Eight bars because the golden stream is short; deep into a real run it saturates at
+    `SNAPSHOT_BARS_BEFORE + 1` before the extension.
+    """
+    (trade,) = _run(_GOLDEN).trades
+    snapshot = trade.snapshot
+    assert snapshot is not None
+
+    assert trade.context == {"average": Decimal("112.6250")}
+    assert _GOLDEN[6].low < Decimal("112.6250") < _GOLDEN[6].close  # touched it, closed above
+
+    assert snapshot.decided_at == _GOLDEN[6].time
+    assert snapshot.filled_at == _GOLDEN[_FILL_BAR].time
+    # The join between the trade row and the chart drawn from it. If these two ever disagree the
+    # entry marker lands on a bar the window does not contain.
+    assert snapshot.filled_at == trade.entry_time
+    assert [candle.time for candle in snapshot.bars] == [
+        candle.time for candle in _GOLDEN[: _FILL_BAR + 1]
+    ]
+
+
 def test_the_target_is_not_what_ended_the_golden_trade() -> None:
     """Switching the broker's target off leaves the same trade, which is how we know the conduction
     ended it. At 5R the target sat at 129 and price never saw it."""

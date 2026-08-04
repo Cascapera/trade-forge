@@ -263,6 +263,11 @@ class Mme9BreakoutStrategy:
                 stop_price=entry.stop_price,
                 reason=f"entry.{self._name}",
                 client_id=client_id,
+                # The level that made this bar a reference. The trigger and the stop are on the
+                # order already; the average is the one number in the decision that no column
+                # downstream would otherwise carry, and without it a chart of this entry shows
+                # a bar breaking out of nothing in particular.
+                context={"average": average},
             )
         )
         return tuple(signals)
@@ -532,6 +537,9 @@ class PontoContinuoStrategy:
                 stop_price=entry.stop_price,
                 reason=f"entry.{self._name}",
                 client_id=client_id,
+                # The average this bar touched and closed back above — the pullback's own
+                # definition, and the level a reader needs to see the touch happen.
+                context={"average": average},
             )
         )
         return tuple(signals)

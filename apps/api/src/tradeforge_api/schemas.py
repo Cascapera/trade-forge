@@ -18,7 +18,7 @@ import uuid
 from decimal import Decimal
 from typing import Annotated, Any
 
-from pydantic import BaseModel, ConfigDict, Field, PlainSerializer
+from pydantic import BaseModel, ConfigDict, Field, PlainSerializer, field_validator
 
 # A Decimal that always serialises to a string. Applied to every monetary/ratio field below.
 Money = Annotated[Decimal, PlainSerializer(str, return_type=str)]
@@ -126,6 +126,47 @@ class BacktestOut(_Out):
     metrics: MetricsOut | None = None
 
 
+class SnapshotBarOut(BaseModel):
+    """One bar of an entry's picture. Prices are strings for the same reason `Money` is."""
+
+    time: dt.datetime
+    open: Money
+    high: Money
+    low: Money
+    close: Money
+
+
+class SnapshotRegionOut(BaseModel):
+    """A rectangle to draw over those bars: a price band with a left edge in time.
+
+    `from_time` is the candle the zone was formed on, which is routinely older than the
+    window's first bar — the client extends the rectangle rightward from wherever that falls,
+    clipping at the chart's edge, and must not shift it to the first bar it can see.
+    """
+
+    label: str
+    top: Money
+    bottom: Money
+    from_time: dt.datetime
+
+
+class SnapshotOut(BaseModel):
+    """What the strategy was looking at when it entered, as recorded by the engine.
+
+    Absent (`None`) on a trade whose run predates the snapshot, which is a different fact from
+    an empty window and is why this is not simply an empty list of bars.
+    """
+
+    decided_at: dt.datetime
+    filled_at: dt.datetime
+    """The bar the order filled on — the window's last. Equal to `decided_at` when the order
+    rested longer than the engine keeps bars for, in which case the window stops at the arming
+    and the entry marker falls outside it. See `EntrySnapshot`."""
+
+    bars: list[SnapshotBarOut]
+    regions: list[SnapshotRegionOut] = []
+
+
 class TradeOut(_Out):
     """One closed round trip, with the indicator snapshot that justified its entry."""
 
@@ -148,6 +189,22 @@ class TradeOut(_Out):
     net_pnl: Money | None
     r_multiple: Money | None
     context: dict[str, str | None]
+    snapshot: SnapshotOut | None = None
+    """The entry's picture, or `None` for a trade whose run recorded none.
+
+    `{}` in the column means exactly that — a run from before this existed, or a strategy
+    driven without a window — so it is normalised to `None` here rather than reaching a client
+    as an object with no bars, which a chart would try to draw."""
+
+    @field_validator("snapshot", mode="before")
+    @classmethod
+    def _empty_snapshot_is_none(cls, value: object) -> object:
+        """`{}` is the column's NOT NULL default and means "no window was recorded".
+
+        Validated as-is it would fail on every row written before `rev_0003` — the endpoint
+        would 500 on historical backtests rather than serving them without a chart.
+        """
+        return None if value == {} else value
 
 
 class TradesPage(BaseModel):

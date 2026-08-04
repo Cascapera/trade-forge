@@ -26,6 +26,7 @@ from tradeforge_engine.domain import (
     AccountState,
     Candle,
     ClosedTrade,
+    EntrySnapshot,
     Fill,
     InstrumentSpec,
     Money,
@@ -71,10 +72,18 @@ class Portfolio:
     def account(self) -> AccountState:
         return AccountState(balance=self._balance, equity=self._equity, currency=self._currency)
 
-    def apply(self, fill: Fill) -> ClosedTrade | None:
-        """Fold one fill into the ledger. Returns the trade, if this fill closed one."""
+    def apply(self, fill: Fill, *, snapshot: EntrySnapshot | None = None) -> ClosedTrade | None:
+        """Fold one fill into the ledger. Returns the trade, if this fill closed one.
+
+        `snapshot` is the window of bars around this entry, and it is passed rather than read
+        off `fill.order` because it is not finished until now: the loop attached the bars up to
+        the decision, and only the caller filling this order knows which bar the waiting ended
+        on (`BacktestBroker._snapshot_through`). Ignored on an exit, which opens no position to
+        hang it from. Defaults to `None` so a ledger driven without one still balances — the
+        snapshot is something to look at, never something the arithmetic reads.
+        """
         if fill.order.intent is SignalKind.ENTRY:
-            self._open(fill)
+            self._open(fill, snapshot)
             return None
 
         return self._close(fill)
@@ -104,7 +113,7 @@ class Portfolio:
 
     # ----------------------------------------------------------------------- #
 
-    def _open(self, fill: Fill) -> None:
+    def _open(self, fill: Fill, snapshot: EntrySnapshot | None = None) -> None:
         if self._position is not None:
             raise EngineError(
                 f"cannot open a {fill.order.side} position while one is already open "
@@ -138,6 +147,7 @@ class Portfolio:
             initial_stop_loss=fill.order.stop_loss,
             take_profit=fill.order.take_profit,
             context=fill.order.context,
+            snapshot=snapshot,
         )
 
     def _close(self, fill: Fill) -> ClosedTrade:
@@ -188,6 +198,7 @@ class Portfolio:
             take_profit=position.take_profit,
             r_multiple=self._r_multiple(position, net),
             context=position.context,
+            snapshot=position.snapshot,
         )
         self._trades.append(trade)
         return trade

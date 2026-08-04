@@ -20,6 +20,7 @@ the check has both a floor and a ceiling — see `_reject_lookahead`.
 
 import datetime as dt
 import logging
+from collections import deque
 from collections.abc import Iterable
 from dataclasses import dataclass
 from decimal import ROUND_HALF_EVEN, localcontext
@@ -32,6 +33,7 @@ from tradeforge_engine.domain import (
     Candle,
     ClosedTrade,
     Context,
+    EntrySnapshot,
     EquityPoint,
     Fill,
     InstrumentSpec,
@@ -59,6 +61,15 @@ logger = logging.getLogger(__name__)
 # tick of 0.003 and that stops being true.
 ENGINE_PRECISION = 28
 ENGINE_CONTEXT = DecimalContext(prec=ENGINE_PRECISION, rounding=ROUND_HALF_EVEN)
+
+# How many bars before the decision an entry's snapshot carries (`EntrySnapshot`) — enough to
+# read the swing the setup claims to be trading, and no more.
+#
+# A *bounded* window, and that word is the whole design. `run()` takes an `Iterable` precisely
+# so that ten years of M1 never sits in memory at once; a snapshot buffer that grew with the
+# run would give that back, silently, and only on the long backtests where it matters. A
+# `deque` with a `maxlen` cannot: it drops from the left as it fills, at constant cost.
+SNAPSHOT_BARS_BEFORE = 50
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,9 +132,19 @@ def _run(  # noqa: PLR0913 — see run()
     equity_curve: list[EquityPoint] = []
     processed = 0
     previous: Candle | None = None
+    # The arming window. Holds the decision bar plus the bars before it, and no more — see
+    # SNAPSHOT_BARS_BEFORE. The loop owns it because the loop is the only component that sees
+    # the stream, in backtest and in live alike, and because it is here that `decided_at` is
+    # stamped: the window and the instant the anti-lookahead guard checks come from one place.
+    window: deque[Candle] = deque(maxlen=SNAPSHOT_BARS_BEFORE + 1)
 
     for candle in candles:
         _reject_out_of_order(previous, candle, timeframe)
+
+        # Before anything else looks at this bar. The strategy is about to be shown it, so it
+        # belongs in any window describing what the strategy had seen — and nothing below can
+        # decide an entry without it being the window's last bar.
+        window.append(candle)
 
         # 1. The bar arrives. Whatever was decided on an earlier bar executes now, inside
         #    this one, at a price the strategy had not seen when it decided. This is the
@@ -192,7 +213,7 @@ def _run(  # noqa: PLR0913 — see run()
                     )
                 continue
 
-            order = _to_order(signal, context, instrument, risk)
+            order = _to_order(signal, context, instrument, risk, window)
             if order is None:
                 continue
             if not risk.allow(order, account):
@@ -227,6 +248,7 @@ def _to_order(
     context: Context,
     instrument: InstrumentSpec,
     risk: RiskManager,
+    window: Iterable[Candle],
 ) -> OrderRequest | None:
     """Turn intent into a sized order, or into nothing.
 
@@ -274,6 +296,14 @@ def _to_order(
         take_profit=signal.take_profit,
         reason=signal.reason,
         context=signal.context,
+        # Entries only. An exit has already returned above, and neither a cancel nor a stop
+        # modification ever becomes an order — so every window built here ends on the bar the
+        # strategy is being shown right now, which is what `decided_at` says one line up.
+        snapshot=EntrySnapshot(
+            bars=tuple(window),
+            decided_at=context.candle.time,
+            regions=signal.regions,
+        ),
         limit_price=signal.limit_price,
         stop_price=signal.stop_price,
         client_id=signal.client_id,

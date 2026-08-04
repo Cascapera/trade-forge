@@ -270,3 +270,17 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
   Separar de verdade exige uma segunda leitura segundos depois, para ver se o tick ainda avança —
   o que compra certeza com tempo de parede e não-determinismo. Hoje a saída é `--server-offset`.
   Reabrir se alguém agendar backfill fora do pregão sem poder declarar o offset.
+- [origem: PR-218] **Os testes de integração apagam o banco para onde apontarem** — a fixture
+  `dsn()` (`packages/db/tests/conftest.py:30`) devolve `PostgresSettings().sqlalchemy_dsn`, ou
+  seja, **o banco que as variáveis de ambiente disserem**, e a fixture `session` faz
+  `TRUNCATE trades, backtest_metrics, backtests, strategies, datasets, instruments RESTART
+  IDENTITY CASCADE` antes de cada teste. No CI isso é inofensivo (o workflow sobe um Postgres
+  descartável como service). Na máquina do dev **não é**: rodar `POSTGRES_HOST=localhost
+  POSTGRES_PORT=5433 uv run pytest -m integration` esvazia o banco de desenvolvimento, e foi
+  exatamente o que aconteceu em 04/08 — os três backtests de 03/08 e os 4 instrumentos semeados
+  se perderam (o Parquet, que é o dado caro, não foi tocado). Nada avisa: o comando é o mesmo
+  que o CI roda e a suíte passa 36/36.
+  Conserto candidato: a fixture criar/derrubar um banco próprio (`tradeforge_test`) a partir do
+  DSN recebido, em vez de usar o banco nomeado nele — assim o comando fica idêntico em CI e
+  local e a segurança não depende de quem lembrou de exportar a variável certa. Uma recusa
+  explícita ("o DSN aponta para um banco com dados; use um banco de teste") é o mínimo.

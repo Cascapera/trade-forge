@@ -32,6 +32,7 @@ fill, because the multiple is measured from an entry price that does not exist u
 
 import datetime as dt
 import logging
+from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from decimal import Decimal
@@ -43,6 +44,7 @@ from tradeforge_engine.domain import (
     AccountState,
     Candle,
     ClosedTrade,
+    EntrySnapshot,
     Fill,
     InstrumentSpec,
     Money,
@@ -58,6 +60,35 @@ from tradeforge_engine.portfolio import Portfolio
 from tradeforge_engine.protocols import CostModel
 
 logger = logging.getLogger(__name__)
+
+# How long an order may rest and still have its snapshot completed to the bar that filled it.
+#
+# The cap is what keeps the window *contiguous* rather than merely bounded. Past it the
+# decision bar has fallen out of `_seen`, and the bars still held no longer adjoin the arming
+# window the loop attached — splicing them would produce a chart with a hole in the middle
+# and nothing on it to show that. So past the cap the snapshot keeps the arming window alone:
+# a short chart, honest about where it stops. A stop order fills in a bar or three and a zone
+# that goes two hundred bars unvisited is one the strategy has long since withdrawn.
+SNAPSHOT_MAX_REST_BARS = 200
+
+
+def _for_the_record(order: OrderRequest) -> OrderRequest:
+    """The order as kept in `submitted`: everything except the bars it was armed with.
+
+    `submitted` is the only list here that grows with the **length of the run** — every other
+    retainer is bounded by open orders or by trades. A strategy that is flat re-arms on most
+    bars (`swing.py` replaces its resting order as the reference moves), so an entry snapshot
+    left attached would pin roughly fifty candles per bar, which pins the whole stream: the
+    exact cost `run()` takes an `Iterable` to avoid, given back through a side door.
+
+    Measured before the strip, on a 3 000-bar run that re-armed every bar: 151 725 candle
+    references held, keeping 100% of the stream alive. Nothing computed a wrong number — the
+    run simply ends in `MemoryError` at a length that used to pass.
+
+    The order that actually fills is untouched; only this inspection copy is stripped, which
+    is why the snapshot still reaches the position, the trade and the database.
+    """
+    return replace(order, snapshot=None) if order.snapshot is not None else order
 
 
 def _survives_the_gap(order: OrderRequest, price: Money) -> bool:
@@ -207,6 +238,12 @@ class BacktestBroker:
         self._slippage_ticks = slippage_ticks
         self._rr = take_profit_rr
 
+        # The bars this broker has processed, most recent last. Its only job is to complete an
+        # entry's snapshot: the loop attaches the bars up to the decision, and what happened
+        # *between* the decision and the fill is knowledge only the broker has — it is the side
+        # that knows when an order stopped resting. Bounded for the reason `loop.window` is.
+        self._seen: deque[Candle] = deque(maxlen=SNAPSHOT_MAX_REST_BARS + 1)
+
         self._pending: list[OrderRequest] = []
         # Limit orders waiting for the market, in submission order — which is what makes the
         # tie deterministic when two of them are reachable on the same bar. Arrival order is
@@ -215,6 +252,9 @@ class BacktestBroker:
         self._resting: list[_Resting] = []
         # Names that have already filled. See `_reject_resting`.
         self._consumed: set[str] = set()
+        # Every order this broker accepted, for inspection. **Without its snapshot** — see
+        # `_for_the_record`. This is the one retainer here that grows with the length of the
+        # run rather than with the number of open orders or trades.
         self.submitted: list[OrderRequest] = []
 
         # The open position's protective levels, or None when flat or holding an unstopped one.
@@ -230,7 +270,7 @@ class BacktestBroker:
         level = order.limit_price if order.limit_price is not None else order.stop_price
         if level is None:
             self._pending.append(order)
-            self.submitted.append(order)
+            self.submitted.append(_for_the_record(order))
             return OrderResult(order=order, accepted=True)
 
         rejection = self._reject_resting(order)
@@ -247,7 +287,7 @@ class BacktestBroker:
                 name=cast(str, order.client_id),
             )
         )
-        self.submitted.append(order)
+        self.submitted.append(_for_the_record(order))
         return OrderResult(order=order, accepted=True)
 
     def _reject_resting(self, order: OrderRequest) -> str | None:
@@ -356,6 +396,11 @@ class BacktestBroker:
     def on_bar(self, candle: Candle) -> Sequence[Fill]:
         fills: list[Fill] = []
 
+        # Recorded before anything can fill inside it. Every fill below lands on *this* bar, and
+        # a snapshot completed to a bar the buffer had not been told about would stop one short
+        # of the fill — the one bar the whole extension exists to show.
+        self._seen.append(candle)
+
         # 1. A position carried in from an earlier bar: its stop/target is live from this
         #    bar's first tick. Checked before anything fills at the open, because a gap
         #    through the stop is the worst case and the worst case goes first.
@@ -448,6 +493,44 @@ class BacktestBroker:
     # Fills                                                                    #
     # ----------------------------------------------------------------------- #
 
+    def _snapshot_through(self, order: OrderRequest, candle: Candle) -> EntrySnapshot | None:
+        """The entry's arming window, carried forward to the bar that filled it.
+
+        The loop's half of the window ends on the decision bar; this adds every bar from there
+        to `candle`, which is the bar the fill is landing on. Together they answer the two
+        questions a human asks of an entry — was it armed in the right place, and did price
+        come to it the way the method says — and the second one cannot be answered by the loop,
+        which does not know that this is the bar the waiting ended.
+
+        No lookahead is possible here: every bar added has already been processed by `on_bar`,
+        and the last of them is the one currently executing. There is no bar in this window the
+        market had not already printed.
+
+        Returns the arming window unchanged when the decision has aged out of `_seen` — see
+        `SNAPSHOT_MAX_REST_BARS`. Membership is the whole test: `_seen` holds an unbroken run of
+        the most recent bars, so if the decision bar is still in it, so is every bar since.
+        """
+        armed = order.snapshot
+        if armed is None:
+            # A hand-built order, which is most of the broker's own tests. Nothing to complete.
+            return None
+        if not any(bar.time == armed.decided_at for bar in self._seen):
+            logger.debug(
+                "order %s rested past the %d-bar snapshot window; keeping the arming window",
+                order.client_id,
+                SNAPSHOT_MAX_REST_BARS,
+            )
+            return armed
+        since = tuple(bar for bar in self._seen if armed.decided_at < bar.time <= candle.time)
+        # The regions come through untouched. They are the strategy's, describing price bands
+        # that existed before this order was placed, and the broker has no business editing
+        # them — dropping them here would erase the zone from exactly the trades that filled.
+        return EntrySnapshot(
+            bars=armed.bars + since,
+            decided_at=armed.decided_at,
+            regions=armed.regions,
+        )
+
     def _fill_at_open(self, order: OrderRequest, candle: Candle) -> Fill | None:
         if order.intent is SignalKind.EXIT:
             return self._fill_exit_at_open(order, candle)
@@ -461,7 +544,7 @@ class BacktestBroker:
         price = self._entry_price(order.side, candle)
         cost = self._cost_model.entry_cost(order, self._instrument, price)
         fill = Fill(order=order, time=candle.time, price=price, volume=order.volume, costs=cost)
-        self._portfolio.apply(fill)
+        self._portfolio.apply(fill, snapshot=self._snapshot_through(order, candle))
         self._arm_protection(order, price)
         return fill
 
@@ -540,7 +623,7 @@ class BacktestBroker:
             self._consumed.add(resting.name)
             cost = self._cost_model.entry_cost(order, self._instrument, price)
             fill = Fill(order=order, time=candle.time, price=price, volume=order.volume, costs=cost)
-            self._portfolio.apply(fill)
+            self._portfolio.apply(fill, snapshot=self._snapshot_through(order, candle))
             self._arm_protection(order, price)
             return fill
 

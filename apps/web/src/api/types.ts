@@ -89,6 +89,58 @@ export interface Trade {
   net_pnl: string | null
   r_multiple: string | null
   context: Record<string, string | null>
+  /**
+   * Whether this trade has an entry picture to fetch — not the picture itself.
+   *
+   * A snapshot is fifty-odd bars, and a reader opens the two or three entries that look wrong,
+   * not all of them. So the list says only that one exists and `getTradeSnapshot` fetches it
+   * when asked. `false` on a run older than the feature.
+   */
+  has_snapshot: boolean
+}
+
+/** One bar of an entry's picture. Prices are strings for the same reason every price here is. */
+export interface SnapshotBar {
+  time: string
+  open: string
+  high: string
+  low: string
+  close: string
+}
+
+/**
+ * A rectangle to draw over the bars: a band of price with a left edge in time.
+ *
+ * `from_time` is the candle that *formed* the zone and is routinely older than the window's
+ * first bar. Clamp the drawing at the chart's left edge; never move `from_time` to the first
+ * visible bar, which would redraw the zone as younger than it is.
+ */
+export interface SnapshotRegion {
+  label: string
+  top: string
+  bottom: string
+  from_time: string
+}
+
+/**
+ * A curve to draw across the bars — an indicator, as the strategy computed it.
+ *
+ * Each point is `[time, value]`. Join to the bars **on the timestamp**, never by position: the
+ * curve legitimately ends before the last bar (it stops at the decision, while the bars run on
+ * to the fill) and legitimately starts after the first (the indicator was warming up).
+ */
+export interface SnapshotSeries {
+  label: string
+  points: [string, string][]
+}
+
+export interface Snapshot {
+  decided_at: string
+  /** The bar the order filled on — the window's last. Equal to `decided_at` on a long rest. */
+  filled_at: string
+  bars: SnapshotBar[]
+  regions: SnapshotRegion[]
+  series: SnapshotSeries[]
 }
 
 export interface TradesPage {

@@ -8,6 +8,7 @@ import type {
   CreatedBacktest,
   EquityPoint,
   Instrument,
+  Snapshot,
   StrategyOut,
   TradesPage,
 } from './types'
@@ -58,4 +59,8 @@ export const api = {
   getTrades: (id: string, limit = 100, offset = 0): Promise<TradesPage> =>
     request('GET', `/backtests/${id}/trades?limit=${String(limit)}&offset=${String(offset)}`),
   getEquity: (id: string): Promise<EquityPoint[]> => request('GET', `/backtests/${id}/equity`),
+  // One snapshot at a time. The list deliberately does not carry them — fifty bars per trade
+  // would be megabytes assembled to be thrown away — so this is the only way to get one.
+  getTradeSnapshot: (id: string, tradeId: number): Promise<Snapshot> =>
+    request('GET', `/backtests/${id}/trades/${String(tradeId)}/snapshot`),
 }

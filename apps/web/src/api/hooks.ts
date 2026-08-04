@@ -14,6 +14,7 @@ import type {
   CreatedBacktest,
   EquityPoint,
   Instrument,
+  Snapshot,
   StrategyOut,
   TradesPage,
 } from './types'
@@ -80,5 +81,26 @@ export function useEquity(id: string | undefined, enabled: boolean) {
   return useQuery<EquityPoint[]>({
     queryKey: ['equity', id],
     queryFn: id !== undefined && enabled ? () => api.getEquity(id) : skipToken,
+  })
+}
+
+/**
+ * The entry picture for one trade, fetched only once someone opens it.
+ *
+ * `tradeId === null` means nothing is open, and `skipToken` keeps the query from running at all —
+ * which is the whole point. Loading every snapshot with the trades list would assemble megabytes
+ * a reader never looks at; the two or three entries that look wrong are the ones that get opened.
+ *
+ * Cached per trade, so re-opening one costs nothing and closing does not throw the bars away.
+ */
+export function useTradeSnapshot(backtestId: string | undefined, tradeId: number | null) {
+  return useQuery<Snapshot>({
+    queryKey: ['snapshot', backtestId, tradeId],
+    queryFn:
+      backtestId !== undefined && tradeId !== null
+        ? () => api.getTradeSnapshot(backtestId, tradeId)
+        : skipToken,
+    // A recorded window never changes: it was frozen with the trade. Nothing to refetch.
+    staleTime: Infinity,
   })
 }

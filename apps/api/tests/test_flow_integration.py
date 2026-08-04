@@ -111,6 +111,49 @@ def _strategy() -> dict[str, Any]:
     }
 
 
+def _assert_the_snapshot_is_advertised_then_served(
+    client: TestClient, backtest_id: str, strategy_id: str, first: dict[str, Any]
+) -> None:
+    """The list says a picture exists; a second call fetches it.
+
+    Split out of the flow test because it is a claim of its own — that the cost of the window
+    is not paid by every reader of the trades table — and because the flow test is already at
+    the statement limit. It runs inside that test rather than beside it: a finished run over a
+    real Postgres is expensive to build, and this needs one.
+    """
+    # Asserted on the serialised body, not on the model: what this buys is bytes on the wire,
+    # so a field that quietly came back would restore the cost with nothing failing.
+    assert first["has_snapshot"] is True
+    assert "snapshot" not in first
+    assert "bars" not in client.get(f"/backtests/{backtest_id}/trades").text
+
+    served = client.get(f"/backtests/{backtest_id}/trades/{first['id']}/snapshot")
+    assert served.status_code == 200, served.text
+    window = served.json()
+    assert len(window["bars"]) >= 2
+    assert isinstance(window["bars"][0]["close"], str)  # exact decimals, never JSON floats
+    # The window ends on the bar that filled: that equality is what pins a chart to its row.
+    assert window["filled_at"] == first["entry_time"]
+    assert any(bar["time"] == window["decided_at"] for bar in window["bars"])
+
+    # Trade ids are globally unique, so the backtest in the path is not needed to *find* the
+    # row — it is there so a wrong run is a 404 instead of another run's chart.
+    other = client.post(
+        "/backtests",
+        json={
+            "strategy_id": strategy_id,
+            "symbol": "EURUSD",
+            "timeframe": "H1",
+            "date_from": START.isoformat(),
+            "date_to": (START + 100 * HOUR).isoformat(),
+            "initial_capital": "10000",
+            "cost_model": {"type": "none"},
+        },
+    ).json()["id"]
+    assert client.get(f"/backtests/{other}/trades/{first['id']}/snapshot").status_code == 404
+    assert client.get(f"/backtests/{backtest_id}/trades/999999999/snapshot").status_code == 404
+
+
 def test_create_enqueue_run_and_read(
     session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
 ) -> None:
@@ -187,6 +230,8 @@ def test_create_enqueue_run_and_read(
         first = trades["items"][0]
         assert first["direction"] in {"long", "short"}
         assert isinstance(first["net_pnl"], str)  # money is a string on the wire, never a float
+
+        _assert_the_snapshot_is_advertised_then_served(client, backtest_id, strategy_id, first)
 
         equity = client.get(f"/backtests/{backtest_id}/equity").json()
         assert len(equity) >= 1

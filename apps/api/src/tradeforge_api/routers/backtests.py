@@ -20,6 +20,7 @@ from tradeforge_api.schemas import (
     CreateBacktestRequest,
     CreatedBacktest,
     EquityPointOut,
+    SnapshotOut,
     TradeOut,
     TradesPage,
 )
@@ -134,6 +135,40 @@ def list_trades(
         offset=offset,
         items=[TradeOut.model_validate(row) for row in rows],
     )
+
+
+@router.get(
+    "/backtests/{backtest_id}/trades/{trade_id}/snapshot",
+    response_model=SnapshotOut,
+    responses=_NOT_FOUND,
+)
+def get_trade_snapshot(
+    backtest_id: uuid.UUID, trade_id: int, session: SessionDep
+) -> dict[str, Any]:
+    """The bars the strategy was looking at when it entered this trade.
+
+    Served one at a time on purpose. The window is fifty-odd bars, and a reader opens the two
+    or three entries that look wrong out of a run of hundreds — see `TradeOut.has_snapshot`.
+
+    Scoped by backtest rather than looked up by trade id alone. Trade ids are globally unique,
+    so the join is not needed to *find* the row; it is here so that a wrong backtest in the URL
+    is a 404 instead of quietly serving a chart belonging to a different run.
+    """
+    _load(session, backtest_id)
+    trade = session.scalar(
+        select(Trade).where(Trade.id == trade_id, Trade.backtest_id == backtest_id)
+    )
+    if trade is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="trade not found")
+    # `{}` is the column's NOT NULL default: a run older than `rev_0003`, or a strategy driven
+    # without a window. Distinguished from a missing trade, because the two are different
+    # questions and a client that conflated them would show "not found" for a real trade.
+    if not trade.snapshot:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="this trade recorded no entry snapshot",
+        )
+    return trade.snapshot
 
 
 @router.get(

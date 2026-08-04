@@ -22,9 +22,10 @@ from __future__ import annotations
 import uuid
 from collections.abc import Mapping, Sequence
 from decimal import Decimal
+from typing import Any
 
 from tradeforge_db.models import BacktestMetrics, ExitReason, Trade
-from tradeforge_engine.domain import ClosedTrade, EquityPoint
+from tradeforge_engine.domain import ClosedTrade, EntrySnapshot, EquityPoint
 from tradeforge_engine.metrics import BacktestMetrics as RunMetrics
 
 # Every `ClosedTrade` carries the reason of its *exit* fill, and the engine emits exactly
@@ -80,6 +81,7 @@ def _trade_row(trade: ClosedTrade, backtest_id: uuid.UUID, instrument_id: uuid.U
         net_pnl=trade.net_pnl,
         r_multiple=trade.r_multiple,
         context=_context(trade.context),
+        snapshot=_snapshot(trade.snapshot),
     )
 
 
@@ -104,6 +106,48 @@ def _context(context: Mapping[str, Decimal | None] | None) -> dict[str, str | No
     if context is None:
         return {}
     return {name: (str(value) if value is not None else None) for name, value in context.items()}
+
+
+def _snapshot(snapshot: EntrySnapshot | None) -> dict[str, Any]:
+    """The entry's picture as JSONB: the bars around it, and the rectangles drawn over them.
+
+    A nested object where `context` is a flat map, because this is a time series and that is a
+    set of named scalars — see the `snapshot` column on `Trade`. Prices are stringified for the
+    same reason as everywhere else here: a JSON number is a float, and a chart drawn from floats
+    would disagree in the last place with the trade printed beside it.
+
+    `filled_at` is written out even though it is the last bar's time. It is what the chart marks
+    the entry on, and a reader of this column should not have to know that the list is ordered
+    to find it. It cannot drift — the engine derives it from the same tuple.
+
+    A trade whose engine recorded no window becomes `{}`, the column's NOT NULL default, which
+    is the same answer `_context` gives and means "nothing was recorded", not "an empty chart".
+    """
+    if snapshot is None:
+        return {}
+    return {
+        "decided_at": snapshot.decided_at.isoformat(),
+        "filled_at": snapshot.filled_at.isoformat(),
+        "bars": [
+            {
+                "time": bar.time.isoformat(),
+                "open": str(bar.open),
+                "high": str(bar.high),
+                "low": str(bar.low),
+                "close": str(bar.close),
+            }
+            for bar in snapshot.bars
+        ],
+        "regions": [
+            {
+                "label": region.label,
+                "top": str(region.top),
+                "bottom": str(region.bottom),
+                "from_time": region.from_time.isoformat(),
+            }
+            for region in snapshot.regions
+        ],
+    }
 
 
 def _metrics_row(metrics: RunMetrics, backtest_id: uuid.UUID) -> BacktestMetrics:

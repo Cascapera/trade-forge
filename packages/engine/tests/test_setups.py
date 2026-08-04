@@ -305,6 +305,65 @@ def test_the_authors_geometry_a_demand_zone_is_bought_at_its_top() -> None:
     assert signal.client_id is not None  # it has to be nameable to be withdrawable
 
 
+def test_the_entry_records_the_region_it_is_waiting_at() -> None:
+    """This setup enters *at the edge of a zone*, not at a price the decision bar names.
+
+    So the two edges are the entry's justification, and neither survives anywhere else: the
+    order carries the near edge as its limit and a stop derived from the far one, which is not
+    the same as knowing where the region was. A chart missing them shows an order resting in
+    mid-air.
+
+    The author's own zone: demand [90, 100], bought at its top.
+    """
+    strategy = StructureStrategy(qualifier=_Marked(), name="test")
+    [signal] = _drive(strategy, _IMPULSE)[9]
+
+    assert signal.context == {"zone_top": Decimal("100"), "zone_bottom": Decimal("90")}
+    # The limit rests on the near edge — the side price has to come back to. Asserted against
+    # the recorded edge rather than the literal, so a zone that moved would move both.
+    assert signal.limit_price == signal.context["zone_top"]
+
+
+def test_the_region_is_a_rectangle_starting_on_the_candle_before_the_gap() -> None:
+    """The author draws a zone the way he trades it: a rectangle over the marking candle's
+    range, from that candle, extended right until price comes back into it.
+
+    So the region needs a **left edge in time**, and it has to be `OrderBlock.time` — the candle
+    before the gap — rather than `confirmed_at`, the later bar whose break revealed the zone.
+    Starting the rectangle at the confirmation would draw the zone as younger than it is and
+    hide the impulse that made it, which is the part that says the zone is worth anything.
+
+    Measured on the author's impulse: candle 3 runs 90 to 100, candle 4 opens at a low of 103 —
+    the gap — so candle 3 is the marking candle and the rectangle is [90, 100] from candle 3.
+    """
+    strategy = StructureStrategy(qualifier=_Marked(), name="test")
+    [signal] = _drive(strategy, _IMPULSE)[9]
+
+    (region,) = signal.regions
+    assert region.label == "zone"
+    assert (region.top, region.bottom) == (Decimal("100"), Decimal("90"))
+    assert region.from_time == _IMPULSE[3].time
+
+    # The two facts that make candle 3 the marking candle, asserted rather than asserted-about:
+    # the rectangle is that candle's own range, and the candle after it gaps clear of its high.
+    assert (region.top, region.bottom) == (_IMPULSE[3].high, _IMPULSE[3].low)
+    assert _IMPULSE[4].low > _IMPULSE[3].high
+
+    # The rectangle and the scalars describe one zone. They are written a line apart from the
+    # same block, and this is what would catch them drifting.
+    assert signal.context == {"zone_top": region.top, "zone_bottom": region.bottom}
+
+
+def test_the_recorded_region_mirrors_for_a_supply_zone() -> None:
+    """Reflected about 200: supply [100, 110], sold at its bottom. `top` stays the higher price
+    — it names the edge, not the entry side — so a short's limit sits at `zone_bottom`."""
+    strategy = StructureStrategy(qualifier=_Marked(), name="test")
+    [signal] = _drive(strategy, _mirror(_IMPULSE))[9]
+
+    assert signal.context == {"zone_top": Decimal("110"), "zone_bottom": Decimal("100")}
+    assert signal.limit_price == signal.context["zone_bottom"]
+
+
 def test_the_geometry_mirrors_for_a_supply_zone() -> None:
     """The same impulse reflected about 200: supply [100, 110], sold at 100 with the stop at 111.
 

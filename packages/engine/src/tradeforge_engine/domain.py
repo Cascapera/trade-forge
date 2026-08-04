@@ -185,6 +185,141 @@ class Candle:
 
 
 @dataclass(frozen=True, slots=True)
+class SnapshotRegion:
+    """A rectangle to draw on the chart: a band of price with a left edge in time.
+
+    A zone is not a pair of numbers. It is drawn from the candle that formed it, across the
+    price range it covers, extended rightward until price comes back into it — which is how a
+    reader sees *when* it was filled rather than merely that it was. Two scalars cannot say
+    where the rectangle starts, so a chart drawn from them has to guess, and it guesses the
+    left edge of the window, which is a lie about the age of the zone.
+
+    `from_time` is the bar the region is drawn on — for an order block, the candle before the
+    gap, which is `OrderBlock.time` and not `confirmed_at`. The two differ on purpose: the zone
+    belongs to the past, and nothing knew it was a zone until the break revealed it.
+
+    **It routinely falls before the snapshot's first bar.** A zone marked by a long impulse leg
+    can be older than the window that carries it, and that is not an error to correct: the
+    rectangle really does start there. A client draws from wherever `from_time` lands, clamping
+    to the left edge of the chart — never *moving* it to the first visible bar, which would
+    redraw the zone as younger than it is and lose the one thing the rectangle is for.
+
+    No right edge. Where a region *stops* is a fact about what price did afterwards, and the
+    snapshot is sealed at the fill — so the chart extends it to its own edge and lets the bars
+    show the rest.
+    """
+
+    label: str
+    top: Money
+    bottom: Money
+    from_time: dt.datetime
+
+    def __post_init__(self) -> None:
+        _require_utc(self.from_time, "SnapshotRegion.from_time")
+        if not self.label:
+            raise ValueError("a region needs a label; an unnamed rectangle is undrawable")
+        # Inverted edges would render as a rectangle of negative height — which most chart
+        # libraries silently normalise, leaving a zone that looks right and is upside down.
+        if self.top < self.bottom:
+            raise ValueError(f"region {self.label}: top {self.top} is below bottom {self.bottom}")
+
+
+@dataclass(frozen=True, slots=True)
+class EntrySnapshot:
+    """The bars the strategy had seen when it decided to enter — the picture, not the numbers.
+
+    Its whole job is to let a human look at a trade afterwards and answer "did this enter
+    where the method says it should?". The levels that justified the entry are already
+    recorded, in `Signal.context`; what no column carries is the *shape* price had at that
+    moment, and no amount of scalars substitutes for seeing it.
+
+    **Captured when the decision is made, never rebuilt afterwards.** Reconstructing the
+    window later — from the Parquet, in the API — is the same class of mistake as computing
+    an indicator after the fact: the bars on disk tomorrow are not necessarily the bars the
+    strategy was looking at (the file gets recollected, extended, corrected), and the
+    difference would show up as a chart that quietly disagrees with the trade drawn on it.
+    Freezing it with the trade is the same argument as `Backtest.candles_seen`, one level down.
+
+    The window answers **two** questions, and they are not the same one:
+
+    * *Was it armed in the right place?* — the bars up to and including the decision bar,
+      attached by the loop. `decided_at` is the last of them.
+    * *Did it enter in the right place?* — the bars from the decision through the one that
+      filled, attached by the broker, which is the only component that knows when a resting
+      order stopped resting. `filled_at` is the last of them.
+
+    The two coincide for an order that never rested. They separate for a stop or a limit,
+    which can wait bars before price comes to it — and what price did while it waited is
+    precisely how you tell a trigger that was reached from one that was run over by a gap.
+
+    **The window is contiguous.** Every bar between the first and the last is present, with
+    no holes: a chart with a bar silently missing is worse than a short chart, because
+    nothing on it looks wrong. An order that rests longer than the broker keeps bars for
+    therefore reports the arming window alone rather than a spliced one.
+    """
+
+    bars: tuple[Candle, ...]
+
+    decided_at: dt.datetime
+    """The opening instant of the bar the strategy decided on.
+
+    Stored rather than derived, because once the broker extends the window past the fill the
+    decision bar is no longer at either end of it — it is somewhere in the middle, and only
+    this field says where. It is the same instant as `OrderRequest.decided_at`, which is what
+    the anti-lookahead guard is written against."""
+
+    regions: tuple[SnapshotRegion, ...] = ()
+    """The rectangles to draw over those bars — the zones the entry was waiting at.
+
+    Contributed by the **strategy**, unlike the bars: only it knows that a stretch of price is
+    a region rather than a level, and where that region begins. Empty for a setup that has none
+    — the swing setups enter off an average, which is a line and not a band."""
+
+    def __post_init__(self) -> None:
+        # An empty window is not a snapshot, it is a wiring bug that would reach the screen
+        # as an empty chart and read as "this trade had no context".
+        if not self.bars:
+            raise ValueError("an entry snapshot needs at least the decision bar")
+        _require_utc(self.decided_at, "EntrySnapshot.decided_at")
+        # Out-of-order bars would be drawn as a chart folding back on itself. The loop
+        # already refuses an out-of-order *stream* (`_reject_out_of_order`); this refuses an
+        # out-of-order *window*, which is what a buffer filled from the wrong end produces.
+        for earlier, later in zip(self.bars, self.bars[1:], strict=False):
+            if later.time <= earlier.time:
+                raise ValueError(
+                    f"snapshot bars must ascend in time, got {earlier.time} then {later.time}"
+                )
+        # The decision bar has to be *in* the picture. Extending the window is a splice, and a
+        # splice that lost the bar it was anchored to is one whose two halves may not adjoin —
+        # the exact failure the contiguity rule above cannot see, because both halves ascend.
+        if not any(bar.time == self.decided_at for bar in self.bars):
+            raise ValueError(
+                f"the decision bar {self.decided_at} is not in the snapshot window "
+                f"[{self.bars[0].time} .. {self.bars[-1].time}]"
+            )
+        # A region drawn from a bar the strategy had not reached yet is a rectangle justifying
+        # a decision with something that had not happened — lookahead, expressed as a drawing.
+        # No producer can do this today (the only one passes `OrderBlock.time`, always past),
+        # which is precisely why it is worth pinning: the next one has no market event to warn
+        # it. Regions may start *before* the window and usually do; they may not start after
+        # the decision.
+        for region in self.regions:
+            if region.from_time > self.decided_at:
+                raise ValueError(
+                    f"region {region.label} starts at {region.from_time}, after the decision "
+                    f"at {self.decided_at}: a decision cannot be drawn from a later bar"
+                )
+
+    @property
+    def filled_at(self) -> dt.datetime:
+        """The opening instant of the window's last bar.
+
+        The bar the order filled on once the broker has extended the window, and the decision
+        bar until then — an order that never filled has no trade and no row to reach."""
+        return self.bars[-1].time
+
+
+@dataclass(frozen=True, slots=True)
 class Signal:
     """A strategy's *intent*, before anyone decides how big it should be.
 
@@ -212,6 +347,15 @@ class Signal:
     is the training material for the phase-3 analysis ("does this only work when ADX > 25?"),
     and recomputing it afterwards would mean re-running the engine and trusting nothing moved.
     None on an exit, and on any strategy with no indicators."""
+
+    regions: tuple[SnapshotRegion, ...] = ()
+    """The bands of price this decision was made against, for the entry's picture.
+
+    Separate from `context` because they are a different kind of fact: `context` is named
+    scalars, exact and aggregatable, and it is what a later "does this only work when the zone
+    is narrow?" reads. A region is a rectangle with a left edge in time, which is not a scalar
+    and would have to be flattened into three keys nobody could reassemble. The engine carries
+    both, and neither pretends to be the other. See `SnapshotRegion`."""
 
     limit_price: Money | None = None
     """Where the order should wait, or `None` to take the next open at market (ADR-0014).
@@ -325,6 +469,14 @@ class OrderRequest:
     context: Mapping[str, Money | None] | None = None
     """The indicator snapshot from the signal that produced this order. See `Signal.context`."""
 
+    snapshot: EntrySnapshot | None = None
+    """The bars the strategy had seen when it decided this. See `EntrySnapshot`.
+
+    Attached by the **loop**, not by the strategy: the window is a fact about the stream, and
+    the loop is the only component that sees the stream — in backtest and in live alike. A
+    strategy keeping its own buffer would be four copies of one deque, each free to disagree
+    about which bars it saw."""
+
     limit_price: Money | None = None
     """The price this order waits at, or `None` for "fill at the next open". See `Signal`."""
 
@@ -434,6 +586,12 @@ class Position:
     context: Mapping[str, Money | None] | None = None
     """The indicator snapshot from the entry that opened this position. See `Signal.context`."""
 
+    snapshot: EntrySnapshot | None = None
+    """The bars around the entry, arming window included. See `EntrySnapshot`.
+
+    Carried on the position for the same reason `context` is: nothing else survives from the
+    fill to the close, and the `ClosedTrade` is built at the close."""
+
 
 @dataclass(frozen=True, slots=True)
 class AccountState:
@@ -492,6 +650,9 @@ class ClosedTrade:
     risk against."""
     context: Mapping[str, Money | None] | None = None
     """The indicator snapshot from the entry. See `Signal.context`."""
+
+    snapshot: EntrySnapshot | None = None
+    """The bars around the entry, arming window included. See `EntrySnapshot`."""
 
 
 @dataclass(frozen=True, slots=True)

@@ -45,6 +45,7 @@ from tradeforge_engine.domain import (
     Side,
     Signal,
     SignalKind,
+    SnapshotRegion,
 )
 from tradeforge_engine.structure import (
     MarketStructure,
@@ -421,6 +422,27 @@ class StructureStrategy:
                         reason=f"entry.{self._name}",
                         limit_price=entry.limit_price,
                         client_id=self._armed.client_id,
+                        # The region the order is waiting at, twice over and on purpose. The
+                        # scalars are what a later "does this only work on narrow zones?"
+                        # aggregates; the rectangle is what gets drawn — and it needs a left
+                        # edge in time, which a scalar cannot carry. Both are read off the same
+                        # block one line apart, so they cannot drift.
+                        context={
+                            "zone_top": self._armed.block.top,
+                            "zone_bottom": self._armed.block.bottom,
+                        },
+                        regions=(
+                            SnapshotRegion(
+                                label="zone",
+                                top=self._armed.block.top,
+                                bottom=self._armed.block.bottom,
+                                # The bar the zone is *drawn on* — the candle before the gap —
+                                # not `confirmed_at`, the later bar whose break revealed it. A
+                                # rectangle starting at the confirmation would show the zone
+                                # as younger than it is, and hide the impulse that made it.
+                                from_time=self._armed.block.time,
+                            ),
+                        ),
                     )
                 )
 

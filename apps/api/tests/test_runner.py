@@ -11,7 +11,7 @@ from decimal import Decimal
 
 import pytest
 
-from tradeforge_api.runner import execute_backtest
+from tradeforge_api.runner import CandleWindow, execute_backtest
 from tradeforge_db.models import Instrument
 from tradeforge_engine import BacktestMetrics as EngineMetrics
 from tradeforge_engine.domain import AssetClass, Candle, ClosedTrade
@@ -82,7 +82,7 @@ def ma_cross() -> dict[str, object]:
     }
 
 
-def run_it(**overrides: object) -> tuple[list[ClosedTrade], EngineMetrics]:
+def run_it(**overrides: object) -> tuple[list[ClosedTrade], EngineMetrics, CandleWindow]:
     kwargs: dict[str, object] = {
         "definition": ma_cross(),
         "instrument": an_instrument(),
@@ -99,7 +99,7 @@ def run_it(**overrides: object) -> tuple[list[ClosedTrade], EngineMetrics]:
 
 
 def test_a_crossover_series_produces_a_trade_and_coherent_metrics() -> None:
-    trades, metrics = run_it()
+    trades, metrics, _ = run_it()
     assert metrics.total_trades == len(trades)
     assert metrics.total_trades >= 1
     # Reconciliation is the engine's own invariant; here we only assert the metrics summarise the
@@ -107,18 +107,58 @@ def test_a_crossover_series_produces_a_trade_and_coherent_metrics() -> None:
     assert metrics.long_trades + metrics.short_trades == metrics.total_trades
 
 
-def test_the_window_excludes_candles_outside_the_dates() -> None:
-    """A date range that ends before the series starts yields no candles — a valid, empty run."""
-    trades, metrics = run_it(date_from=START - 10 * HOUR, date_to=START - 5 * HOUR)
+def test_a_window_containing_no_candles_is_refused() -> None:
+    """This reverses an earlier decision, deliberately.
+
+    A range outside the series used to be "a valid, empty run": `done`, every metric zero.
+    But that is byte for byte what a run whose strategy found no setups looks like, and the
+    two need opposite responses — collect the data, versus nothing to do. A screen full of
+    zeroes cannot say which, so the run refuses instead and names the coverage it does have.
+    """
+    with pytest.raises(LookupError, match="contains none of it"):
+        run_it(date_from=START - 10 * HOUR, date_to=START - 5 * HOUR)
+
+
+def test_the_refusal_names_the_coverage_that_does_exist() -> None:
+    """ "No data" is a dead end; "I have January to March" is the next command to type."""
+    with pytest.raises(LookupError, match="2024-01-01"):
+        run_it(date_from=START - 10 * HOUR, date_to=START - 5 * HOUR)
+
+
+def test_a_symbol_with_nothing_collected_is_a_different_message() -> None:
+    """Empty dataset and empty window are different faults with different fixes."""
+    with pytest.raises(LookupError, match="no candles have been collected"):
+        run_it(candles=[])
+
+
+def test_a_window_full_of_candles_that_produces_no_trades_still_succeeds() -> None:
+    """The line is drawn at candles, not at trades.
+
+    A strategy that legitimately finds nothing is an answer, and must not be reported as a
+    failure — otherwise "my filter is too strict" becomes indistinguishable from an outage.
+    """
+    flat = [bar(index, open_="1.10000", close="1.10000") for index in range(10)]
+
+    trades, metrics, window = run_it(candles=flat, date_to=START + 9 * HOUR)
+
     assert trades == []
     assert metrics.total_trades == 0
+    assert window.candles == 10
+
+
+def test_the_run_reports_the_window_it_actually_read() -> None:
+    """Asking for more than the dataset holds must not be recorded as if it had it."""
+    _, _, window = run_it(date_from=START - 50 * HOUR, date_to=START + 500 * HOUR)
+
+    series = dip_then_rally()
+    assert window == CandleWindow(len(series), series[0].time, series[-1].time)
 
 
 def test_a_spread_cost_model_eats_into_the_result() -> None:
     """The same run with a spread nets less than costless — proof the cost model is wired, not
     ignored."""
-    _, costless = run_it(cost_model={"type": "none"})
-    _, spread = run_it(cost_model={"type": "spread", "spread_points": 20})
+    _, costless, _ = run_it(cost_model={"type": "none"})
+    _, spread, _ = run_it(cost_model={"type": "spread", "spread_points": 20})
     assert spread.net_profit < costless.net_profit
 
 
@@ -216,7 +256,7 @@ def test_a_setup_document_reproduces_the_engine_s_own_golden() -> None:
     conducted stop, above the entry price, which is what a stop-out looks like once the trade has
     been managed. A reader who maps "sl" to "loss" will misread this setup's best trades.
     """
-    trades, metrics = run_it(
+    trades, metrics, _ = run_it(
         definition=ponto_continuo(),
         instrument=a_stock(),
         candles=pullback_to_the_average(),
@@ -242,19 +282,21 @@ def test_a_setup_document_needs_no_indicators_entry_or_stop_block() -> None:
     assert "entry" not in document
     assert "stop_loss" not in document["exit"]  # type: ignore[operator]
 
-    trades, _ = run_it(definition=document, instrument=a_stock(), candles=pullback_to_the_average())
+    trades, _, _ = run_it(
+        definition=document, instrument=a_stock(), candles=pullback_to_the_average()
+    )
     assert len(trades) == 1
 
 
 def test_switching_the_breakeven_rule_off_reaches_the_setup() -> None:
     """A parameter that travels from JSON through the factory into the state machine, proved by
     the trade it changes rather than by reading an attribute back."""
-    with_rule, _ = run_it(
+    with_rule, _, _ = run_it(
         definition=ponto_continuo(),
         instrument=a_stock(),
         candles=pullback_to_the_average(),
     )
-    without_rule, _ = run_it(
+    without_rule, _, _ = run_it(
         definition=ponto_continuo(breakeven_at_r=None),
         instrument=a_stock(),
         candles=pullback_to_the_average(),

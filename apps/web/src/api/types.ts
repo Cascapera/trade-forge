@@ -64,6 +64,12 @@ export interface Backtest {
   created_at: string
   started_at: string | null
   finished_at: string | null
+  // What the run actually read. `date_from`/`date_to` above are only the request: the dataset
+  // underneath may start later or end earlier. Null on runs that failed, and on rows written
+  // before the API recorded this — null means unknown, never zero.
+  candles_seen: number | null
+  first_candle: string | null
+  last_candle: string | null
   metrics: Metrics | null
 }
 

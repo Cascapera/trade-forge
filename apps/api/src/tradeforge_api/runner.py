@@ -18,7 +18,7 @@ from __future__ import annotations
 import datetime as dt
 from collections.abc import Mapping, Sequence
 from decimal import Decimal
-from typing import Any
+from typing import Any, NamedTuple
 
 from tradeforge_collector import step
 from tradeforge_db.models import Instrument
@@ -92,12 +92,57 @@ def _risk_percent(definition: Mapping[str, Any]) -> Decimal:
     return _decimal(percent)
 
 
-def _within(
-    candles: Sequence[Candle], date_from: dt.datetime, date_to: dt.datetime
+def _candles_to_run(
+    candles: Sequence[Candle],
+    symbol: str,
+    timeframe: str,
+    date_from: dt.datetime,
+    date_to: dt.datetime,
 ) -> list[Candle]:
-    """Clip to the requested window. Reading the whole (symbol, timeframe) and filtering here is
-    fine for phase 1; partition pruning by year is a later optimisation, not a correctness need."""
-    return [candle for candle in candles if date_from <= candle.time <= date_to]
+    """Clip to the requested window — and refuse to run over nothing.
+
+    Reading the whole (symbol, timeframe) and filtering here is fine for phase 1; partition
+    pruning by year is a later optimisation, not a correctness need.
+
+    The refusal is the point. A run with no candles used to finish as `done` with every metric
+    at zero, which reads exactly like a run whose strategy found no setups. Those two need
+    opposite responses — collect the data, versus nothing to do — and a screen full of zeroes
+    cannot say which you are looking at.
+
+    Note the line is drawn at *candles*, not at trades. A window full of candles that produces
+    no trades is a real answer and still succeeds; conflating the two would turn "my filter is
+    too strict" into an error message.
+    """
+    if not candles:
+        raise LookupError(
+            f"no candles have been collected for {symbol} {timeframe}; "
+            f"run the collector backfill for it before backtesting"
+        )
+
+    windowed = [candle for candle in candles if date_from <= candle.time <= date_to]
+    if not windowed:
+        raise LookupError(
+            f"{symbol} {timeframe} covers {candles[0].time:%Y-%m-%d} to "
+            f"{candles[-1].time:%Y-%m-%d}, and the requested window "
+            f"{date_from:%Y-%m-%d} to {date_to:%Y-%m-%d} contains none of it"
+        )
+    return windowed
+
+
+class CandleWindow(NamedTuple):
+    """What a run actually read, as opposed to what it asked for.
+
+    Returned alongside the result so the run can be *recorded* honestly. A request is not
+    evidence: asking for 2024-01-01 onwards when the dataset opens in August produces a
+    perfectly ordinary-looking result covering five months, and without this nothing
+    downstream can tell that from the two years the row claims.
+    """
+
+    # Not `count`: a NamedTuple inherits `tuple.count`, and a field of that name would shadow
+    # the method — mypy rejects it outright rather than let the two quietly disagree.
+    candles: int
+    first: dt.datetime
+    last: dt.datetime
 
 
 def execute_backtest(  # noqa: PLR0913 — keyword-only; each names one axis of a backtest run
@@ -111,8 +156,14 @@ def execute_backtest(  # noqa: PLR0913 — keyword-only; each names one axis of 
     cost_model: Mapping[str, Any],
     slippage_ticks: Decimal,
     candles: Sequence[Candle],
-) -> tuple[list[ClosedTrade], EngineMetrics]:
-    """Run the strategy over the windowed candles and fold the result into the §5 metrics."""
+) -> tuple[list[ClosedTrade], EngineMetrics, CandleWindow]:
+    """Run the strategy over the windowed candles and fold the result into the §5 metrics.
+
+    Returns the window it actually read along with the result, so the caller can record what
+    the run saw rather than what it was asked for.
+    """
+    windowed = _candles_to_run(candles, instrument.symbol, timeframe, date_from, date_to)
+
     spec = _instrument_spec(instrument)
     broker = BacktestBroker(
         instrument=spec,
@@ -122,7 +173,7 @@ def execute_backtest(  # noqa: PLR0913 — keyword-only; each names one axis of 
         take_profit_rr=_take_profit_rr(definition),
     )
     result = run(
-        candles=_within(candles, date_from, date_to),
+        candles=windowed,
         timeframe=step(timeframe),
         instrument=spec,
         strategy=compile_strategy(definition),
@@ -134,7 +185,8 @@ def execute_backtest(  # noqa: PLR0913 — keyword-only; each names one axis of 
         equity_curve=result.equity_curve,
         initial_capital=initial_capital,
     )
-    return list(result.trades), metrics
+    window = CandleWindow(len(windowed), windowed[0].time, windowed[-1].time)
+    return list(result.trades), metrics, window
 
 
-__all__ = ["ENGINE_VERSION", "execute_backtest"]
+__all__ = ["ENGINE_VERSION", "CandleWindow", "execute_backtest"]

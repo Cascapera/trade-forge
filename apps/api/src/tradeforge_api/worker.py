@@ -70,7 +70,7 @@ async def process_backtest(
             raise ValueError("backtest references a missing strategy or instrument")
 
         candles = read_candles(parquet_root, instrument.symbol, backtest.timeframe)
-        trades, metrics = execute_backtest(
+        trades, metrics, window = execute_backtest(
             definition=strategy.definition,
             instrument=instrument,
             timeframe=backtest.timeframe,
@@ -90,6 +90,11 @@ async def process_backtest(
         )
         session.add(metrics_row)
         session.add_all(trade_rows)
+        # Recorded on the run, not derived later: the Parquet underneath can be re-collected
+        # or extended, and then "what this run read" stops being answerable from the dataset.
+        backtest.candles_seen = window.candles
+        backtest.first_candle = window.first
+        backtest.last_candle = window.last
         backtest.status = BacktestStatus.DONE
         backtest.finished_at = _now()
         session.commit()

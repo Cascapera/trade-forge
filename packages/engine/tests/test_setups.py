@@ -81,7 +81,7 @@ _IMPULSE = [
     bar(5, open_="108", close="108", high="110", low="102"),  # gap A: 100 < 102
     bar(6, open_="113", close="113", high="115", low="107"),  # gap B
     bar(7, open_="112", close="112", high="117", low="110"),  # pause
-    bar(8, open_="116", close="116", high="118", low="112"),  # pause
+    bar(8, open_="116", close="118", high="119", low="112"),  # pause; closes clear of 117
     bar(9, open_="124", close="124", high="125", low="120"),  # gap C, and close 124 > 123 -> BOS
 ]
 

@@ -45,6 +45,10 @@ def _break(
         trend=trend,
         level=Decimal(level),
         time=START,
+        # Unread by the conduction, which cares only about the level and the origin. Set to
+        # the same instant rather than an invented earlier one: a number nothing reads that
+        # looks measured is worse than one that plainly is not.
+        level_time=START,
         origin=Decimal(origin),
         origin_time=START,
     )

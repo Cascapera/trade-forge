@@ -173,6 +173,24 @@ class SnapshotSeriesOut(BaseModel):
     points: list[tuple[dt.datetime, Money]]
 
 
+class SnapshotLevelOut(BaseModel):
+    """A horizontal segment: the structure a break of structure broke.
+
+    Bounded at **both** ends, unlike a region. A zone is still in force after the entry and so
+    extends rightward; a level is over the moment it is crossed, and `to_time` is that bar. The
+    segment's length is how long the structure held, which is what says whether the break meant
+    anything — so a client draws it between the two instants and does not extend it.
+
+    `label` is `choch` or `bos`, and the difference matters: one turns the trend and the other
+    continues it.
+    """
+
+    label: str
+    price: Money
+    from_time: dt.datetime
+    to_time: dt.datetime
+
+
 class SnapshotOut(BaseModel):
     """What the strategy was looking at when it entered, as recorded by the engine.
 
@@ -189,6 +207,7 @@ class SnapshotOut(BaseModel):
     bars: list[SnapshotBarOut]
     regions: list[SnapshotRegionOut] = []
     series: list[SnapshotSeriesOut] = []
+    levels: list[SnapshotLevelOut] = []
 
 
 class TradeOut(_Out):

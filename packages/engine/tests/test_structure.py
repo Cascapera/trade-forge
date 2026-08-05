@@ -329,26 +329,36 @@ def _breaks(candles: list[Candle]) -> list[tuple[int, StructureBreak]]:
     return found
 
 
-def _bos(trend: Trend, level: str, at: int, *, origin: str, origin_at: int) -> StructureBreak:
+def _bos(  # noqa: PLR0913 — keyword-only; a break simply has this many facts
+    trend: Trend, level: str, at: int, *, level_at: int, origin: str, origin_at: int
+) -> StructureBreak:
     """A bullish/bearish BOS confirmed on bar `at`, whose impulse started at `origin` on
-    `origin_at` — the extreme the move came from, which is also the next opposite CHoCH anchor."""
+    `origin_at` — the extreme the move came from, which is also the next opposite CHoCH anchor.
+
+    `level_at` is the bar that *set* the broken level, and is required rather than defaulted: a
+    default would let a new golden be written without stating it, and quietly assert whatever
+    that default happened to be against whatever the engine produced."""
     return StructureBreak(
         kind=StructureKind.BOS,
         trend=trend,
         level=Decimal(level),
         time=_at(at),
+        level_time=_at(level_at),
         origin=Decimal(origin),
         origin_time=_at(origin_at),
     )
 
 
-def _choch(trend: Trend, level: str, at: int, *, origin: str, origin_at: int) -> StructureBreak:
+def _choch(  # noqa: PLR0913 — see _bos
+    trend: Trend, level: str, at: int, *, level_at: int, origin: str, origin_at: int
+) -> StructureBreak:
     """A CHoCH confirmed on bar `at`; `origin` is the extreme the reversing move began from."""
     return StructureBreak(
         kind=StructureKind.CHOCH,
         trend=trend,
         level=Decimal(level),
         time=_at(at),
+        level_time=_at(level_at),
         origin=Decimal(origin),
         origin_time=_at(origin_at),
     )
@@ -374,8 +384,8 @@ def test_structure_matches_the_hand_worked_example() -> None:
     bounce), then a bearish CHoCH on bar 8 (close 95 below 96 — the lowest low the up-move
     defended). Exactly the two events the method's author marked."""
     assert _breaks(_STRUCTURE_GOLDEN) == [
-        (5, _bos(Trend.BULLISH, "105", 5, origin="96", origin_at=3)),
-        (8, _choch(Trend.BEARISH, "96", 8, origin="107", origin_at=5)),
+        (5, _bos(Trend.BULLISH, "105", 5, level_at=1, origin="96", origin_at=3)),
+        (8, _choch(Trend.BEARISH, "96", 8, level_at=3, origin="107", origin_at=5)),
     ]
 
 
@@ -404,8 +414,8 @@ def test_the_bearish_mirror_bootstraps_down_then_chochs_up() -> None:
         bar(8, open_="104", close="104", high="105", low="100"),  # close 104 > 103 -> CHoCH up
     ]
     assert _breaks(mirror) == [
-        (5, _bos(Trend.BEARISH, "90", 5, origin="103", origin_at=3)),
-        (8, _choch(Trend.BULLISH, "103", 8, origin="88", origin_at=5)),
+        (5, _bos(Trend.BEARISH, "90", 5, level_at=1, origin="103", origin_at=3)),
+        (8, _choch(Trend.BULLISH, "103", 8, level_at=3, origin="88", origin_at=5)),
     ]
 
 
@@ -452,7 +462,7 @@ def test_a_non_correction_bar_becomes_the_next_correction_reference() -> None:
         bar(5, open_="106", close="106", high="107", low="103"),  # close 106 > 105 -> BOS
     ]
     assert _breaks(candles) == [
-        (5, _bos(Trend.BULLISH, "105", 5, origin="99", origin_at=1)),
+        (5, _bos(Trend.BULLISH, "105", 5, level_at=1, origin="99", origin_at=1)),
     ]
 
 
@@ -490,9 +500,9 @@ def test_a_second_bos_raises_the_choch_anchor() -> None:
         ),  # close 98 < 99 -> CHoCH at the new anchor
     ]
     assert _breaks(candles) == [
-        (5, _bos(Trend.BULLISH, "105", 5, origin="96", origin_at=3)),
-        (8, _bos(Trend.BULLISH, "107", 8, origin="99", origin_at=7)),
-        (10, _choch(Trend.BEARISH, "99", 10, origin="109", origin_at=8)),
+        (5, _bos(Trend.BULLISH, "105", 5, level_at=1, origin="96", origin_at=3)),
+        (8, _bos(Trend.BULLISH, "107", 8, level_at=5, origin="99", origin_at=7)),
+        (10, _choch(Trend.BEARISH, "99", 10, level_at=7, origin="109", origin_at=8)),
     ]
 
 
@@ -506,7 +516,7 @@ def test_a_choch_can_flip_back() -> None:
     ]
     assert _breaks(extended)[-1] == (
         10,
-        _choch(Trend.BULLISH, "107", 10, origin="93", origin_at=9),
+        _choch(Trend.BULLISH, "107", 10, level_at=5, origin="93", origin_at=9),
     )
 
 

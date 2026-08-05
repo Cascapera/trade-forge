@@ -246,6 +246,38 @@ class SnapshotSeries:
 
 
 @dataclass(frozen=True, slots=True)
+class SnapshotLevel:
+    """A horizontal segment: one price, bounded at both ends in time.
+
+    Where a region is a band that stays live and a series is a curve that moves, this is a level
+    that *held and then broke* — the structure a break of structure broke. Drawn from the bar
+    that set it to the bar that crossed it, its length is how long the structure stood, which is
+    the difference between a break that means something and one that does not.
+
+    Bounded at both ends, unlike `SnapshotRegion`, and that is the distinction: a zone is still
+    in force after the entry, so it extends rightward; a broken level is over the moment it is
+    crossed, and drawing it onward would show a structure still standing that is not.
+    """
+
+    label: str
+    price: Money
+    from_time: dt.datetime
+    to_time: dt.datetime
+
+    def __post_init__(self) -> None:
+        _require_utc(self.from_time, "SnapshotLevel.from_time")
+        _require_utc(self.to_time, "SnapshotLevel.to_time")
+        if not self.label:
+            raise ValueError("a level needs a label; an unnamed line is undrawable")
+        # A level set after it was broken is not a level, it is a swapped pair — and it would
+        # render as a segment of negative width, which most chart code silently normalises.
+        if self.to_time < self.from_time:
+            raise ValueError(
+                f"level {self.label} is set at {self.from_time}, after it broke at {self.to_time}"
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class SnapshotRegion:
     """A rectangle to draw on the chart: a band of price with a left edge in time.
 
@@ -335,6 +367,13 @@ class EntrySnapshot:
     Contributed by the **strategy**, unlike the bars: only it knows that a stretch of price is
     a region rather than a level, and where that region begins. Empty for a setup that has none
     — the swing setups enter off an average, which is a line and not a band."""
+
+    levels: tuple[SnapshotLevel, ...] = ()
+    """The horizontal segments to draw — the structure this entry was built on.
+
+    A zone is only worth entering because a break of structure revealed it, and that break is
+    otherwise invisible in the record: the bars show price crossing a price, with nothing saying
+    which price mattered or how long it had held. See `SnapshotLevel`."""
 
     series: tuple[SnapshotSeries, ...] = ()
     """The curves to draw across those bars — the indicators, as the strategy computed them.
@@ -427,6 +466,12 @@ class Signal:
     is the training material for the phase-3 analysis ("does this only work when ADX > 25?"),
     and recomputing it afterwards would mean re-running the engine and trusting nothing moved.
     None on an exit, and on any strategy with no indicators."""
+
+    levels: tuple[SnapshotLevel, ...] = ()
+    """The structural levels behind this decision, for the entry's picture.
+
+    The strategy's, like the regions: only it knows which of the prices on the chart was the one
+    that had to break. See `SnapshotLevel`."""
 
     series: tuple[SnapshotSeries, ...] = ()
     """The indicator curves behind this decision, for the entry's picture.

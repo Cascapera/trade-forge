@@ -196,6 +196,16 @@ class StructureBreak:
     trend: Trend
     level: Money
     time: datetime
+    level_time: datetime
+    """The bar that *set* the level this break crossed — where the structure was last defended.
+
+    Distinct from `time`, which is the bar that crossed it, and the two together are what make a
+    break legible on a chart: a horizontal line from `level_time` to `time` is the structure that
+    held, drawn for exactly as long as it held. Without this, the level can only be drawn as a
+    line of arbitrary length, and how long the structure stood — the thing that says whether a
+    break means anything — is not recoverable from the record.
+    """
+
     origin: Money
     origin_time: datetime
 
@@ -203,103 +213,268 @@ class StructureBreak:
 class MarketStructure:
     """Tracks trend through breaks of structure (BOS) and changes of character (CHoCH).
 
-    The method (its author's, pinned by a hand-worked golden):
+    **A transcription of the author's own Profit indicator**, which he has traded from for
+    years. That provenance is the design: this is not a reading of what SMC "should" mean, it
+    is the machine whose marks he recognises, ported so that a backtest disagrees with his
+    screen about nothing. Where the two could differ, the indicator wins.
 
-    * A **BOS** continues the trend. Going up: after the top, two *consecutive* correction bars —
-      each a strictly lower high **and** lower low than the bar before, the first measured against
-      the top candle — arm it; then a candle **closing** above the top confirms it. Other bars may
-      sit between the correction and the close. Every BOS re-anchors the CHoCH level to the lowest
-      low of its move (top through break), and lifts the top to the breaking bar.
-    * A **CHoCH** turns the trend, and needs no correction: a candle simply **closes** beyond the
-      anchor — the lowest low that the last up-move defended (going down), or the highest high the
-      last down-move defended (going up). It flips the bias and points the next CHoCH at the high
-      or low of the move that just reversed.
-    * **Bootstrap.** With no trend yet, the first BOS in either direction — two correction bars and
-      a close through — sets the initial bias; from there the sequence runs.
+    Its state is four running extremes and two armed levels, and the whole method falls out of
+    when each is reset:
 
-    Only Decimal highs, lows and closes are compared, so it is exact and context-independent, and
-    every break is confirmed on a *closed* candle, so a rule acting on one acts on the next open.
+    * **`_low_down` / `_high_down`** — the extremes tracked while the bias is down;
+      **`_low_up` / `_high_up`** — the same going up. All four move on every bar, and only a
+      break resets them.
+    * **A BOS is armed by a two-bar counter-move and confirmed by a close.** Going up: two
+      consecutive bars each making a lower high **and** a lower low arm it at `_high_up`, the
+      highest high so far; a candle **closing above** that level confirms. Going down mirrors
+      it. Only the first counter-move arms — a second one while a level is already armed is
+      ignored, so the level waits for its close rather than being dragged along by the
+      pullback.
+    * **Confirming a BOS plants the anchor the opposite CHoCH will need**, and *that* is the
+      rule this class exists to get right: a bullish BOS sets the bearish CHoCH anchor to
+      `_lowest_since_armed` — **the lowest low between the bar that armed the BOS and the bar
+      that confirmed it**. Not the lowest low of the whole leg, and not the lowest low since
+      the last high: only the stretch the pullback and its resolution occupy.
+    * **A CHoCH needs no counter-move.** A close through the anchor turns the bias, and plants
+      the opposite anchor from whichever level is standing — the armed BOS if there is one, the
+      running extreme if there is not.
+
+    **One deliberate departure from the Pascal.** There, an unset level is the number zero, so
+    the first close of a series is "above" the bullish anchor and fires a CHoCH at 0.00, and
+    the next bar fires its mirror. On a chart those two marks are harmless paint. In an engine
+    they are two orders on a level that is not a price, so an anchor that has never been planted
+    is `None` here and breaks nothing until it exists. Everything else is literal.
     """
-
-    _MIN_CORRECTION: Final = 2
 
     def __init__(self) -> None:
         self._trend: Trend | None = None
         self._previous: Candle | None = None
-        # Up-leg tracking (toward a bullish BOS): top, the lowest low since it, correction count.
-        # Each extreme carries the bar it happened on, so a break can report where its impulse
-        # started — the window an order block has to be found in.
-        self._up_top: Money | None = None
-        self._up_top_time: datetime | None = None
-        self._up_low: Money | None = None
-        self._up_low_time: datetime | None = None
-        self._up_corr = 0
-        self._up_armed = False
-        # Down-leg tracking (toward a bearish BOS).
-        self._dn_bottom: Money | None = None
-        self._dn_bottom_time: datetime | None = None
-        self._dn_high: Money | None = None
-        self._dn_high_time: datetime | None = None
-        self._dn_corr = 0
-        self._dn_armed = False
-        # CHoCH anchors: the level a *closing* candle must cross to turn the trend. After a break
-        # the anchor facing back the way it came *is* that break's origin.
-        self._choch_down: Money | None = None  # break below -> bearish CHoCH (while bullish)
+        self._before_previous: Candle | None = None
+
+        # The four running extremes. `_down` are read while the bias is bearish, `_up` while it
+        # is bullish; both pairs advance on every bar regardless, exactly as the indicator does.
+        self._low_down: Money | None = None
+        self._low_down_time: datetime | None = None
+        self._high_down: Money | None = None
+        self._low_up: Money | None = None
+        self._low_up_time: datetime | None = None
+        self._high_up: Money | None = None
+        self._high_up_time: datetime | None = None
+
+        # The armed levels: the price a close has to pass for a BOS to confirm. `None` means
+        # nothing is armed — the Pascal writes 0 and 999999 for these, which are sentinels and
+        # not prices.
+        self._armed_low: Money | None = None
+        self._armed_low_time: datetime | None = None
+        self._armed_high: Money | None = None
+        self._armed_high_time: datetime | None = None
+
+        # The CHoCH anchors, each planted by the BOS that confirmed in the opposite direction.
+        self._choch_down: Money | None = None
         self._choch_down_time: datetime | None = None
-        self._choch_up: Money | None = None  # break above -> bullish CHoCH (while bearish)
+        self._choch_up: Money | None = None
         self._choch_up_time: datetime | None = None
 
+        # The extremes accumulated **only while a BOS is armed** — the heart of the method.
+        # While nothing is armed they simply follow the current bar, so that the moment one
+        # arms they start from the bar beside it; once armed they only extend.
+        self._lowest_since_armed: Money | None = None
+        self._lowest_since_armed_time: datetime | None = None
+        self._highest_since_armed: Money | None = None
+        self._highest_since_armed_time: datetime | None = None
+
     def update(self, candle: Candle) -> StructureBreak | None:
-        """Fold in one closed candle; return the structure break it confirms, or `None`."""
-        previous = self._previous
-        self._previous = candle
+        """Fold in one closed candle; return the break it confirmed, or `None`.
 
-        # Reversal first: a CHoCH takes precedence over a continuation on the same bar.
-        if (
-            self._trend is Trend.BULLISH
-            and self._choch_down is not None
-            and candle.close < self._choch_down
-        ):
-            level = self._choch_down
-            self._flip_to_bearish(candle)
-            return self._break(StructureKind.CHOCH, Trend.BEARISH, level, candle)
-        if (
-            self._trend is Trend.BEARISH
-            and self._choch_up is not None
-            and candle.close > self._choch_up
-        ):
-            level = self._choch_up
-            self._flip_to_bullish(candle)
-            return self._break(StructureKind.CHOCH, Trend.BULLISH, level, candle)
-
-        # Continuation / bootstrap: a BOS in whichever direction the trend allows (either, if none).
-        if self._trend in (Trend.BULLISH, None):
-            broken = self._update_up_leg(candle, previous)
-            if broken is not None:
-                self._on_bullish_bos(candle)
-                return self._break(StructureKind.BOS, Trend.BULLISH, broken, candle)
-        if self._trend in (Trend.BEARISH, None):
-            broken = self._update_down_leg(candle, previous)
-            if broken is not None:
-                self._on_bearish_bos(candle)
-                return self._break(StructureKind.BOS, Trend.BEARISH, broken, candle)
-        return None
-
-    def _break(
-        self, kind: StructureKind, trend: Trend, level: Money, candle: Candle
-    ) -> StructureBreak:
-        """Build the break, reading its origin from the anchor the handler just planted.
-
-        Call this *after* the state handler has run: settling the new trend is what records where
-        the impulse came from, as the anchor an opposite CHoCH would now have to cross. A bullish
-        break leaves `_choch_down` on the low it rose from; a bearish one leaves `_choch_up` on the
-        high it fell from.
+        At most one break per bar. The Pascal can emit a BOS and a CHoCH on the same candle —
+        the BOS plants the opposite anchor, and the very same close can already be through it —
+        but a bar that both continues and reverses the trend is not something a strategy can
+        act on twice, and the second mark is the one that decides the bias. So the reversal is
+        reported and the continuation is folded into the state, which is what the next bar sees.
         """
-        if trend is Trend.BULLISH:
-            origin, origin_time = self._choch_down, self._choch_down_time
-        else:
-            origin, origin_time = self._choch_up, self._choch_up_time
-        # Both are planted by the handler that just ran; narrowing here is for the type checker.
+        previous, before = self._previous, self._before_previous
+        self._before_previous, self._previous = previous, candle
+
+        self._advance_extremes(candle)
+        if previous is None or before is None:
+            # The counter-move rule reads three bars. Nothing can be armed before there are.
+            return None
+
+        rising = (
+            candle.high > previous.high
+            and candle.low > previous.low
+            and previous.high > before.high
+            and previous.low > before.low
+        )
+        falling = (
+            candle.high < previous.high
+            and candle.low < previous.low
+            and previous.high < before.high
+            and previous.low < before.low
+        )
+
+        if self._trend is Trend.BULLISH:
+            return self._on_bullish_bar(candle, rising=rising, falling=falling)
+        return self._on_bearish_bar(candle, rising=rising, falling=falling)
+
+    # ----------------------------------------------------------------------- #
+
+    def _advance_extremes(self, candle: Candle) -> None:
+        """The four running extremes, moved on every bar before anything is decided."""
+        if self._low_down is None or candle.low < self._low_down:
+            self._low_down, self._low_down_time = candle.low, candle.time
+        if self._high_down is None or candle.high > self._high_down:
+            self._high_down = candle.high
+        if self._low_up is None or candle.low < self._low_up:
+            self._low_up, self._low_up_time = candle.low, candle.time
+        if self._high_up is None or candle.high > self._high_up:
+            self._high_up, self._high_up_time = candle.high, candle.time
+
+    def _on_bullish_bar(
+        self, candle: Candle, *, rising: bool, falling: bool
+    ) -> StructureBreak | None:
+        """The `DIR = 1` branch, in its original order."""
+        if rising:
+            # Housekeeping for the other direction: the pullback that would arm a bearish BOS.
+            self._armed_low, self._armed_low_time = self._low_down, self._low_down_time
+            self._high_down = candle.high
+
+        if falling and self._armed_high is None:
+            # The counter-move arms the BOS at the highest high reached so far. Only the first
+            # one: a second pullback while a level waits does not move it.
+            self._armed_high, self._armed_high_time = self._high_up, self._high_up_time
+            self._low_up, self._low_up_time = candle.low, candle.time
+
+        confirmed: StructureBreak | None = None
+        if self._armed_high is not None and candle.close > self._armed_high:
+            confirmed = self._emit(
+                StructureKind.BOS,
+                Trend.BULLISH,
+                self._armed_high,
+                self._armed_high_time,
+                candle,
+                anchor=(self._lowest_since_armed, self._lowest_since_armed_time),
+            )
+            self._armed_high = self._armed_high_time = None
+            # The rule this class exists for: the bearish CHoCH now sits on the lowest low
+            # between the arming and this close.
+            self._choch_down = self._lowest_since_armed
+            self._choch_down_time = self._lowest_since_armed_time
+
+        self._track_lowest(candle, armed=self._armed_high is not None)
+
+        if self._choch_down is not None and candle.close < self._choch_down:
+            reversal = self._emit(
+                StructureKind.CHOCH,
+                Trend.BEARISH,
+                self._choch_down,
+                self._choch_down_time,
+                candle,
+                anchor=(
+                    (self._high_up, self._high_up_time)
+                    if self._armed_high is None
+                    else (self._armed_high, self._armed_high_time)
+                ),
+            )
+            self._choch_up = reversal.origin
+            self._choch_up_time = reversal.origin_time
+            self._low_down, self._low_down_time = candle.low, candle.time
+            self._armed_low = self._armed_low_time = None
+            self._trend = Trend.BEARISH
+            return reversal
+        return confirmed
+
+    def _on_bearish_bar(
+        self, candle: Candle, *, rising: bool, falling: bool
+    ) -> StructureBreak | None:
+        """The `DIR = -1` branch — the mirror, and also where a fresh series starts."""
+        if rising and self._armed_low is None:
+            self._armed_low, self._armed_low_time = self._low_down, self._low_down_time
+            self._high_down = candle.high
+
+        if falling:
+            self._armed_high, self._armed_high_time = self._high_up, self._high_up_time
+            self._low_up, self._low_up_time = candle.low, candle.time
+
+        confirmed: StructureBreak | None = None
+        if self._armed_low is not None and candle.close < self._armed_low:
+            confirmed = self._emit(
+                StructureKind.BOS,
+                Trend.BEARISH,
+                self._armed_low,
+                self._armed_low_time,
+                candle,
+                anchor=(self._highest_since_armed, self._highest_since_armed_time),
+            )
+            self._armed_low = self._armed_low_time = None
+            self._choch_up = self._highest_since_armed
+            self._choch_up_time = self._highest_since_armed_time
+
+        self._track_highest(candle, armed=self._armed_low is not None)
+
+        if self._choch_up is not None and candle.close > self._choch_up:
+            reversal = self._emit(
+                StructureKind.CHOCH,
+                Trend.BULLISH,
+                self._choch_up,
+                self._choch_up_time,
+                candle,
+                anchor=(
+                    (self._low_down, self._low_down_time)
+                    if self._armed_low is None
+                    else (self._armed_low, self._armed_low_time)
+                ),
+            )
+            self._choch_down = reversal.origin
+            self._choch_down_time = reversal.origin_time
+            self._high_up, self._high_up_time = candle.high, candle.time
+            self._armed_high = self._armed_high_time = None
+            self._trend = Trend.BULLISH
+            return reversal
+        return confirmed
+
+    def _track_lowest(self, candle: Candle, *, armed: bool) -> None:
+        """Follow the current low while nothing is armed; extend it while something is.
+
+        Called **after** the arm and confirm checks, exactly where the Pascal calls it. That
+        ordering is the whole reason the anchor covers the pullback: on the bar that arms, this
+        has already been following the bar beside it, so the window opens there rather than at
+        the arming bar itself.
+        """
+        if not armed or self._lowest_since_armed is None or candle.low < self._lowest_since_armed:
+            self._lowest_since_armed, self._lowest_since_armed_time = candle.low, candle.time
+
+    def _track_highest(self, candle: Candle, *, armed: bool) -> None:
+        """The mirror of `_track_lowest`."""
+        if (
+            not armed
+            or self._highest_since_armed is None
+            or candle.high > self._highest_since_armed
+        ):
+            self._highest_since_armed, self._highest_since_armed_time = candle.high, candle.time
+
+    def _emit(  # noqa: PLR0913 — one axis each; a break is this many facts
+        self,
+        kind: StructureKind,
+        trend: Trend,
+        level: Money | None,
+        level_time: datetime | None,
+        candle: Candle,
+        *,
+        anchor: tuple[Money | None, datetime | None],
+    ) -> StructureBreak:
+        """Build the break. `anchor` is the extreme the move came from — its `origin`.
+
+        The origin is where the impulse started, which is both the stretch an order block must
+        be found in and the level the opposite CHoCH will be anchored to. Those are the same
+        price for the same reason: the move begins where the structure it broke was last
+        defended.
+        """
+        origin, origin_time = anchor
+        # Every one of these is planted in the same statement as its price; the narrowing is
+        # for the type checker, not for a case that can happen.
+        assert level is not None  # noqa: S101
+        assert level_time is not None  # noqa: S101
         assert origin is not None  # noqa: S101
         assert origin_time is not None  # noqa: S101
         return StructureBreak(
@@ -307,126 +482,15 @@ class MarketStructure:
             trend=trend,
             level=level,
             time=candle.time,
+            level_time=level_time,
             origin=origin,
             origin_time=origin_time,
         )
 
     @property
     def trend(self) -> Trend | None:
-        """The current structural bias, or `None` before the first BOS bootstraps it."""
+        """The bias in force, or `None` before the first break settles one."""
         return self._trend
-
-    # -- up leg (bullish BOS) -------------------------------------------------- #
-
-    def _update_up_leg(self, candle: Candle, previous: Candle | None) -> Money | None:
-        """Advance the up-leg; return the broken top level if a bullish BOS confirms, else None."""
-        if self._up_top is None or self._up_low is None:
-            self._restart_up_leg(candle)
-            return None
-        if self._up_armed and candle.close > self._up_top:
-            self._lower_up_low(candle)  # the break bar closes the move
-            return self._up_top
-        if candle.high > self._up_top:  # a new high lifts the top and restarts the correction
-            self._restart_up_leg(candle)
-            return None
-        self._lower_up_low(candle)
-        if previous is not None and candle.high < previous.high and candle.low < previous.low:
-            self._up_corr += 1
-            if self._up_corr >= self._MIN_CORRECTION:
-                self._up_armed = True
-        else:
-            self._up_corr = 0  # a bar that is not a correction breaks the streak; arming stands
-        return None
-
-    def _restart_up_leg(self, candle: Candle) -> None:
-        """Start the up-leg over from `candle`: it is both the new top and the new low."""
-        self._up_top, self._up_low, self._up_corr, self._up_armed = (
-            candle.high,
-            candle.low,
-            0,
-            False,
-        )
-        self._up_top_time = self._up_low_time = candle.time
-
-    def _lower_up_low(self, candle: Candle) -> None:
-        """Drop the up-leg's low to this candle if it went lower. Ties keep the earlier bar — the
-        move began the first time price reached that level, not the last."""
-        if self._up_low is None or candle.low < self._up_low:
-            self._up_low, self._up_low_time = candle.low, candle.time
-
-    def _on_bullish_bos(self, candle: Candle) -> None:
-        self._trend = Trend.BULLISH
-        # The low the up-move defended is both the next CHoCH anchor and this break's origin.
-        self._choch_down, self._choch_down_time = self._up_low, self._up_low_time
-        self._choch_up = self._choch_up_time = None
-        self._restart_up_leg(candle)
-        self._reset_down_leg()
-
-    def _flip_to_bullish(self, candle: Candle) -> None:
-        self._trend = Trend.BULLISH
-        self._choch_down, self._choch_down_time = self._dn_bottom, self._dn_bottom_time
-        self._choch_up = self._choch_up_time = None
-        self._restart_up_leg(candle)
-        self._reset_down_leg()
-
-    def _reset_up_leg(self) -> None:
-        self._up_top, self._up_low, self._up_corr, self._up_armed = None, None, 0, False
-        self._up_top_time = self._up_low_time = None
-
-    # -- down leg (bearish BOS) ------------------------------------------------ #
-
-    def _update_down_leg(self, candle: Candle, previous: Candle | None) -> Money | None:
-        if self._dn_bottom is None or self._dn_high is None:
-            self._restart_down_leg(candle)
-            return None
-        if self._dn_armed and candle.close < self._dn_bottom:
-            self._raise_dn_high(candle)
-            return self._dn_bottom
-        if candle.low < self._dn_bottom:
-            self._restart_down_leg(candle)
-            return None
-        self._raise_dn_high(candle)
-        if previous is not None and candle.high > previous.high and candle.low > previous.low:
-            self._dn_corr += 1
-            if self._dn_corr >= self._MIN_CORRECTION:
-                self._dn_armed = True
-        else:
-            self._dn_corr = 0
-        return None
-
-    def _restart_down_leg(self, candle: Candle) -> None:
-        """Start the down-leg over from `candle`: it is both the new bottom and the new high."""
-        self._dn_bottom, self._dn_high, self._dn_corr, self._dn_armed = (
-            candle.low,
-            candle.high,
-            0,
-            False,
-        )
-        self._dn_bottom_time = self._dn_high_time = candle.time
-
-    def _raise_dn_high(self, candle: Candle) -> None:
-        """Lift the down-leg's high to this candle if it went higher; ties keep the earlier bar."""
-        if self._dn_high is None or candle.high > self._dn_high:
-            self._dn_high, self._dn_high_time = candle.high, candle.time
-
-    def _on_bearish_bos(self, candle: Candle) -> None:
-        self._trend = Trend.BEARISH
-        # The high the down-move defended is both the next CHoCH anchor and this break's origin.
-        self._choch_up, self._choch_up_time = self._dn_high, self._dn_high_time
-        self._choch_down = self._choch_down_time = None
-        self._restart_down_leg(candle)
-        self._reset_up_leg()
-
-    def _flip_to_bearish(self, candle: Candle) -> None:
-        self._trend = Trend.BEARISH
-        self._choch_up, self._choch_up_time = self._up_top, self._up_top_time
-        self._choch_down = self._choch_down_time = None
-        self._restart_down_leg(candle)
-        self._reset_up_leg()
-
-    def _reset_down_leg(self) -> None:
-        self._dn_bottom, self._dn_high, self._dn_corr, self._dn_armed = None, None, 0, False
-        self._dn_bottom_time = self._dn_high_time = None
 
 
 class LiquiditySide(StrEnum):

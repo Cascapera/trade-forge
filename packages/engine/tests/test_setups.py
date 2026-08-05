@@ -354,6 +354,52 @@ def test_the_region_is_a_rectangle_starting_on_the_candle_before_the_gap() -> No
     assert signal.context == {"zone_top": region.top, "zone_bottom": region.bottom}
 
 
+def test_the_entry_records_the_structure_that_broke() -> None:
+    """The event that made the zone worth entering, drawn as the line the author draws by hand.
+
+    A zone on its own justifies nothing: it is a stretch of price like any other until a break
+    of structure reveals it. Without the broken level in the record, a chart of this entry shows
+    price crossing a price, with nothing saying which price mattered — and a reader trying to
+    judge whether the entry was right is looking at the wrong half of the setup.
+
+    The segment is bounded at **both** ends, unlike the zone rectangle: a zone is still in force
+    after the entry so it runs rightward, but a level is over the moment it is crossed, and
+    drawing it onward would show a structure still standing that is not.
+
+    Measured on the author's impulse: the level is 123, the high of bar 0, and bar 9 closes 124
+    through it. Nine bars is how long that structure held.
+    """
+    strategy = StructureStrategy(qualifier=_Marked(), name="test")
+    [signal] = _drive(strategy, _IMPULSE)[9]
+
+    (level,) = signal.levels
+    assert level.label == "bos"
+    assert level.price == Decimal("123")
+    assert (level.from_time, level.to_time) == (_IMPULSE[0].time, _IMPULSE[9].time)
+
+    # The two facts that make this the broken level, asserted rather than asserted-about: the
+    # price is bar 0's high, and bar 9 is the bar whose *close* went through it.
+    assert level.price == _IMPULSE[0].high
+    assert _IMPULSE[9].close > level.price
+
+
+def test_the_structural_level_ends_where_it_broke_not_at_the_entry() -> None:
+    """The right edge is the break, and the entry can be much later.
+
+    Conflating the two would draw every structure as having held right up to the trade, which is
+    the opposite of what a reader is checking: how long ago the break was is exactly the thing
+    that says whether this entry is still trading that break or a stale memory of one.
+    """
+    strategy = StructureStrategy(qualifier=_Marked(), name="test")
+    [signal] = _drive(strategy, _IMPULSE)[9]
+
+    (level,) = signal.levels
+    # The signal is emitted on bar 9, which is also the break here — so the claim is made
+    # against the region instead, whose own left edge is bar 3, well after the level was set.
+    (region,) = signal.regions
+    assert level.from_time < region.from_time <= level.to_time
+
+
 def test_the_recorded_region_mirrors_for_a_supply_zone() -> None:
     """Reflected about 200: supply [100, 110], sold at its bottom. `top` stays the higher price
     — it names the edge, not the entry side — so a short's limit sits at `zone_bottom`."""
@@ -1017,6 +1063,9 @@ _CHOCH_DOWN = StructureBreak(
     trend=Trend.BEARISH,
     level=Decimal("90"),
     time=_at(15),
+    # The qualifier never reads this; the bar the broken low came from is bar 9, the same
+    # place the impulse started, which is what an anchor and an origin coinciding looks like.
+    level_time=_at(9),
     origin=Decimal("125"),
     origin_time=_at(9),
 )
@@ -1340,6 +1389,7 @@ def test_a_new_choch_replaces_the_ladder() -> None:
         trend=Trend.BULLISH,
         level=Decimal("125"),
         time=_at(19),
+        level_time=_at(9),
         origin=Decimal("87"),
         origin_time=_at(17),
     )
@@ -1376,6 +1426,7 @@ def test_an_outcome_and_a_new_choch_on_one_bar_settle_in_order() -> None:
         trend=Trend.BULLISH,
         level=Decimal("125"),
         time=_at(19),
+        level_time=_at(9),
         origin=Decimal("87"),
         origin_time=_at(17),
     )
@@ -1416,6 +1467,7 @@ _BOS_DOWN = StructureBreak(
     trend=Trend.BEARISH,
     level=Decimal("87"),
     time=_at(17),
+    level_time=_at(15),
     origin=Decimal("100"),
     origin_time=_at(15),
 )

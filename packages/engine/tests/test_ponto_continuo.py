@@ -12,6 +12,7 @@ average is a 3 rather than the author's 20 so the warmup stays readable, and bec
 moves far enough per bar to put a touch and a close on opposite sides of the line.
 """
 
+import datetime as dt
 from decimal import Decimal, localcontext
 
 import pytest
@@ -31,12 +32,30 @@ from tradeforge_engine.domain import (
     Signal,
     SignalKind,
 )
+from tradeforge_engine.indicators import EMA
 from tradeforge_engine.loop import ENGINE_CONTEXT, RunResult, run
 from tradeforge_engine.risk import PercentRiskManager
 from tradeforge_engine.swing import AverageKind, PontoContinuoStrategy
-from tradeforge_engine.testing import AAPL, HOUR, START, ImmediateFillBroker, bar
+from tradeforge_engine.testing import (
+    AAPL,
+    BULLISH_START_EMA3,
+    HOUR,
+    START,
+    ImmediateFillBroker,
+    bar,
+)
 
 _ACCOUNT = ImmediateFillBroker(instrument=AAPL).account()
+
+
+def _index_of(candle: Candle) -> int:
+    """The bar number `bar()` stamped into this candle — negative for anything before bar 0."""
+    return round((candle.time - START) / HOUR)
+
+
+def _time(index: int) -> dt.datetime:
+    """The instant `bar(index)` carries, for reading expectations by bar number."""
+    return START + index * HOUR
 
 
 # --------------------------------------------------------------------------- #
@@ -101,7 +120,10 @@ def _drive(  # noqa: PLR0913 — keyword-only; each names one axis of a driven r
     )
     out: list[list[Signal]] = []
     with localcontext(ENGINE_CONTEXT):
-        for index, candle in enumerate(candles):
+        for candle in candles:
+            # By bar number, not by position: a stream carrying `_BULLISH_WARM` in front of it has
+            # eight bars before bar 0, and every scenario here names its bars by their own numbers.
+            index = _index_of(candle)
             position = None
             if index in position_on:
                 position = held or Position(
@@ -111,19 +133,21 @@ def _drive(  # noqa: PLR0913 — keyword-only; each names one axis of a driven r
                     entry_price=candle.open,
                     entry_time=candle.time,
                 )
-            out.append(
-                list(
-                    strategy.on_bar(
-                        Context(
-                            candle=candle,
-                            instrument=AAPL,
-                            account=_ACCOUNT,
-                            position=position,
-                            fills=tuple(fills_on.get(index, ())),
-                        )
+            emitted = list(
+                strategy.on_bar(
+                    Context(
+                        candle=candle,
+                        instrument=AAPL,
+                        account=_ACCOUNT,
+                        position=position,
+                        fills=tuple(fills_on.get(index, ())),
                     )
                 )
             )
+            if index >= 0:
+                # The warm-up's own bars are dropped, so the returned list is indexed by bar
+                # number and every `_arms`/`_trails`/`_cancels` reading below still lines up.
+                out.append(emitted)
     return out
 
 
@@ -210,8 +234,18 @@ _WARM = [
 # the average at 111 and closes at 113.5 above it, so it is the setup — while making a *higher*
 # high than bar 5, which is the whole point of the latch. The order rests at 114 and bar 7 takes it.
 #
-# Structure, from the strategy's own detector: bullish BOS on bar 7 (level 115, origin 107), a
-# second on bar 15 (level 119.5, origin 116), and a bearish CHoCH on bar 16 (level 116).
+# Structure, from the strategy's own detector — re-measured against the transcribed
+# `MarketStructure` and unchanged by it: bullish BOS on bar 7 (level 115, origin 107), a second on
+# bar 15 (level 119.5, origin 116), and a bearish CHoCH on bar 16 (level 116).
+#
+# Annotation, but not unguarded, and it is worth knowing where each part is held: the bar-7 break
+# is what `test_the_first_break_of_structure_takes_the_trade_to_breakeven` reads, the bar-15
+# origin of 116 is asserted outright by `test_a_later_break_trails_the_stop_to_its_leg_origin`,
+# and bar 16 by `test_a_change_of_character_against_the_trade_conducts_nothing`. The levels
+# themselves (115, 119.5) are the only figures here that no assertion names — they are reference
+# for a reader following the stream by hand, and they will not fail loudly if they drift. Note
+# also that this whole reading requires `_GOLDEN_STREAM`, not `_GOLDEN`: on its own the stream
+# rises from bar 0 and confirms nothing at all.
 _GOLDEN = [
     *_WARM,
     bar(3, open_="110", close="114", high="115", low="110"),  # reference
@@ -232,6 +266,58 @@ _GOLDEN = [
 
 _FILL_BAR = 7
 _HELD_IN_GOLDEN = frozenset(range(_FILL_BAR, len(_GOLDEN)))
+
+# The structure warm-up. This setup is conducted structurally, so it carries a `MarketStructure`
+# of its own — and that machine starts at the indicator's `DIR = -1`. A stream that rises from bar
+# 0 confirms no break at all, so the golden above would enter correctly and then never be
+# conducted: the trade would simply run off the end of the data.
+#
+# `BULLISH_START_EMA3` is the variant re-closed so that a three-period average cannot tell it is
+# there — which is what lets every number this file documents stay the number it always was. The
+# reasoning lives on the constant; `test_the_structure_warm_up_leaves_the_average_alone` below is
+# what actually holds it.
+_BULLISH_WARM = BULLISH_START_EMA3
+
+# What actually gets fed to the engine. `_GOLDEN` itself stays bar-0-based so that every
+# `_GOLDEN[6]`, `_GOLDEN[16]` and `_GOLDEN[2:7]` below still names the bar it always named.
+_GOLDEN_STREAM = [*_BULLISH_WARM, *_GOLDEN]
+
+
+def test_the_structure_warm_up_leaves_the_average_alone() -> None:
+    """The warm-up's whole licence: it buys a trend for the structure detector and pays nothing.
+
+    Every average in this file's goldens — 104, 109, 111, 111.75, 112.625 and the rest — was
+    measured on the stream without it. If prefixing moved them, this suite would be asserting the
+    warm-up's arithmetic rather than the author's setup, and the readable numbers the short period
+    exists to give would be gone.
+
+    So the two curves are compared point for point. Nothing here derives the average: both sides
+    are read out of the same indicator the strategy uses.
+
+    One thing the warm-up *does* change, and it is the reason this is not a plain equality: the
+    average finishes warming up during it. The unprefixed stream has no reading at all on bars 0
+    and 1 — an MME3 needs three closes — while the prefixed one is already running by then. That
+    is a curve reaching further left, not a curve at different heights, and the distinction is the
+    whole claim: on every bar both can speak, they say the same thing to the last digit.
+    """
+
+    def curve(candles: list[Candle]) -> dict[int, Money]:
+        average = EMA(period=3)
+        with localcontext(ENGINE_CONTEXT):
+            readings = {}
+            for candle in candles:
+                average.update(candle)
+                value = average.value()
+                if value is not None:
+                    readings[_index_of(candle)] = value
+            return readings
+
+    warmed, plain = curve(_GOLDEN_STREAM), curve(_GOLDEN)
+
+    assert plain.keys() == set(range(2, len(_GOLDEN)))  # the MME3's own warmup, and nothing else
+    assert all(warmed[at] == value for at, value in plain.items())
+    # And the only bars they disagree about are ones the plain stream never had a value for.
+    assert warmed.keys() - plain.keys() == set(range(-6, 2))
 
 
 # --------------------------------------------------------------------------- #
@@ -284,7 +370,7 @@ def test_a_long_enters_on_the_touch_that_closed_above_and_is_conducted_out() -> 
     not an anomaly to be smoothed over — it is what conducting a trade looks like in the ledger, and
     a reader of `reason == "sl"` who assumes a loss will misread this setup's every winning trade.
     """
-    result = _run(_GOLDEN)
+    result = _run(_GOLDEN_STREAM)
 
     (entry,) = _entries(result)
     assert entry.price == Decimal(114)
@@ -311,10 +397,12 @@ def test_the_golden_trade_carries_the_picture_of_its_own_entry() -> None:
       stop order filled on. The extension is what separates "it armed in the right place" from
       "it entered in the right place", and only the second is a claim about the fill.
 
-    Eight bars because the golden stream is short; deep into a real run it saturates at
-    `SNAPSHOT_BARS_BEFORE + 1` before the extension.
+    Sixteen bars because the stream is short and the window takes all of it, `_BULLISH_WARM`
+    included; deep into a real run it saturates at `SNAPSHOT_BARS_BEFORE + 1` before the
+    extension. The count is incidental — what is asserted is that the window runs from the start
+    of the data to the fill and stops there.
     """
-    (trade,) = _run(_GOLDEN).trades
+    (trade,) = _run(_GOLDEN_STREAM).trades
     snapshot = trade.snapshot
     assert snapshot is not None
 
@@ -327,7 +415,7 @@ def test_the_golden_trade_carries_the_picture_of_its_own_entry() -> None:
     # entry marker lands on a bar the window does not contain.
     assert snapshot.filled_at == trade.entry_time
     assert [candle.time for candle in snapshot.bars] == [
-        candle.time for candle in _GOLDEN[: _FILL_BAR + 1]
+        candle.time for candle in _GOLDEN_STREAM[: len(_BULLISH_WARM) + _FILL_BAR + 1]
     ]
 
 
@@ -348,9 +436,12 @@ def test_the_entry_carries_the_average_as_a_curve_not_a_level() -> None:
        broker knows that bar — the strategy had already stopped contributing.
 
     The MME3 leaves the first two bars without a point: an average has no value until its
-    period has filled, and the window reaches back before that.
+    period has filled, and the window reaches back before that. Those are now the first two bars
+    of `_BULLISH_WARM`, which is the same statement about a longer stream — and from bar 2 on,
+    every value below is the one the unprefixed golden always recorded
+    (`test_the_structure_warm_up_leaves_the_average_alone` is what holds that).
     """
-    (trade,) = _run(_GOLDEN).trades
+    (trade,) = _run(_GOLDEN_STREAM).trades
     snapshot = trade.snapshot
     assert snapshot is not None
     assert trade.context is not None
@@ -367,11 +458,19 @@ def test_the_entry_carries_the_average_as_a_curve_not_a_level() -> None:
     # called before `update()` would stamp each bar with its neighbour's reading — right shape,
     # right instants, every value one bar stale, and no hole to give it away.
     assert [(point.time, point.value) for point in curve.points] == [
-        (_GOLDEN[2].time, Decimal("104")),
-        (_GOLDEN[3].time, Decimal("109.0")),
-        (_GOLDEN[4].time, Decimal("111.00")),
-        (_GOLDEN[5].time, Decimal("111.750")),
-        (_GOLDEN[6].time, Decimal("112.6250")),
+        (_time(-6), Decimal("90")),  # the MME3's own warmup ends here
+        (_time(-5), Decimal("90")),
+        (_time(-4), Decimal("90.5")),
+        (_time(-3), Decimal("90.25")),
+        (_time(-2), Decimal("89")),
+        (_time(-1), Decimal("92")),  # the value the golden's whole chain hangs from
+        (_time(0), Decimal("96")),
+        (_time(1), Decimal("100")),
+        (_time(2), Decimal("104")),  # and from here on, the author's own numbers
+        (_time(3), Decimal("109")),
+        (_time(4), Decimal("111")),
+        (_time(5), Decimal("111.75")),
+        (_time(6), Decimal("112.625")),
     ]
 
     at_decision = next(p for p in curve.points if p.time == snapshot.decided_at)
@@ -380,8 +479,9 @@ def test_the_entry_carries_the_average_as_a_curve_not_a_level() -> None:
     assert times[-1] == snapshot.decided_at
     assert snapshot.filled_at > times[-1]  # the bars go one further than the curve
 
-    # Warmup, at the left and only at the left: two bars of an MME3, then every bar after.
-    assert times == [candle.time for candle in _GOLDEN[2:7]]
+    # Warmup, at the left and only at the left: two bars of an MME3, then every bar after, up to
+    # the decision. Read off the stream that was actually run, so the hole cannot hide anywhere.
+    assert times == [candle.time for candle in _GOLDEN_STREAM[2 : len(_BULLISH_WARM) + 7]]
 
 
 def test_the_curve_covers_the_bar_that_closed_below_the_average() -> None:
@@ -424,8 +524,8 @@ def test_the_curve_covers_the_bar_that_closed_below_the_average() -> None:
 def test_the_target_is_not_what_ended_the_golden_trade() -> None:
     """Switching the broker's target off leaves the same trade, which is how we know the conduction
     ended it. At 5R the target sat at 129 and price never saw it."""
-    with_target = _run(_GOLDEN, rr="5").trades
-    without_target = _run(_GOLDEN, rr=None).trades
+    with_target = _run(_GOLDEN_STREAM, rr="5").trades
+    without_target = _run(_GOLDEN_STREAM, rr=None).trades
     assert [(t.exit_price, t.exit_time, t.reason) for t in with_target] == [
         (t.exit_price, t.exit_time, t.reason) for t in without_target
     ]
@@ -440,7 +540,7 @@ def test_the_entry_cannot_fill_on_the_bar_that_armed_it() -> None:
     an entry at 06:00. The engine raises `LookaheadError` rather than allow it, and the fill lands
     on bar 7 — which this asserts by time, not by price, because the price is the same either way.
     """
-    (entry,) = _entries(_run(_GOLDEN))
+    (entry,) = _entries(_run(_GOLDEN_STREAM))
     assert entry.time == _GOLDEN[7].time
     assert entry.time > _GOLDEN[6].time
 
@@ -906,7 +1006,7 @@ def test_the_first_break_of_structure_takes_the_trade_to_breakeven() -> None:
     the broken level, and not to the leg origin. Only the *first* break means breakeven."""
     trails = _trails(
         _drive(
-            _GOLDEN,
+            _GOLDEN_STREAM,
             position_on=_HELD_IN_GOLDEN,
             held=_held(entry="114", stop="111", at=7),
             breakeven_at_r=None,
@@ -923,7 +1023,7 @@ def test_a_later_break_trails_the_stop_to_its_leg_origin() -> None:
     """
     trails = _trails(
         _drive(
-            _GOLDEN,
+            _GOLDEN_STREAM,
             position_on=_HELD_IN_GOLDEN,
             held=_held(entry="114", stop="111", at=7),
             breakeven_at_r=None,
@@ -942,7 +1042,7 @@ def test_a_break_whose_origin_would_loosen_the_stop_is_not_sent() -> None:
     """
     trails = _trails(
         _drive(
-            _GOLDEN,
+            _GOLDEN_STREAM,
             position_on=_HELD_IN_GOLDEN,
             held=_held(entry="114", stop="114", initial="111", at=7),
         )
@@ -957,7 +1057,7 @@ def test_a_change_of_character_against_the_trade_conducts_nothing() -> None:
     favour, so it names no level — with the 2x1 rule switched off, bar 16 is silent."""
     trails = _trails(
         _drive(
-            _GOLDEN,
+            _GOLDEN_STREAM,
             position_on=_HELD_IN_GOLDEN,
             held=_held(entry="114", stop="111", at=7),
             breakeven_at_r=None,
@@ -976,7 +1076,7 @@ def test_the_two_by_one_rule_lives_alongside_the_structural_trail() -> None:
     """
     with_2x1 = _trails(
         _drive(
-            _GOLDEN,
+            _GOLDEN_STREAM,
             position_on=_HELD_IN_GOLDEN,
             held=_held(entry="114", stop="111", at=7),
             breakeven_at_r=Decimal(2),
@@ -984,7 +1084,7 @@ def test_the_two_by_one_rule_lives_alongside_the_structural_trail() -> None:
     )
     without = _trails(
         _drive(
-            _GOLDEN,
+            _GOLDEN_STREAM,
             position_on=_HELD_IN_GOLDEN,
             held=_held(entry="114", stop="111", at=7),
             breakeven_at_r=None,
@@ -1022,7 +1122,7 @@ def test_the_conduction_reads_the_bar_that_filled() -> None:
     """
     trails = _trails(
         _drive(
-            _GOLDEN,
+            _GOLDEN_STREAM,
             position_on=_HELD_IN_GOLDEN,
             held=_held(entry="114", stop="111", at=7),
             breakeven_at_r=None,
@@ -1032,7 +1132,7 @@ def test_the_conduction_reads_the_bar_that_filled() -> None:
 
 
 def test_nothing_is_conducted_while_the_account_is_flat() -> None:
-    assert [t for t in _trails(_drive(_GOLDEN)) if t] == []
+    assert [t for t in _trails(_drive(_GOLDEN_STREAM)) if t] == []
 
 
 @pytest.mark.parametrize("average", ["EMA", "SMA"])
@@ -1222,7 +1322,7 @@ def _random_candles(draw: st.DrawFn) -> list[Candle]:
 
 
 def test_the_same_candles_always_produce_the_same_run() -> None:
-    first, second = _run(_GOLDEN), _run(_GOLDEN)
+    first, second = _run(_GOLDEN_STREAM), _run(_GOLDEN_STREAM)
     assert [(f.time, f.price, f.volume) for f in first.fills] == [
         (f.time, f.price, f.volume) for f in second.fills
     ]

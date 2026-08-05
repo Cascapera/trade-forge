@@ -82,6 +82,77 @@ def bar(
     )
 
 
+BULLISH_START = [
+    bar(-8, open_="92", close="91", high="92", low="90"),
+    bar(-7, open_="91", close="90", high="91", low="89"),  # falling
+    bar(-6, open_="90", close="89", high="90", low="88"),  # falling -> bottom 88
+    bar(-5, open_="89", close="90", high="91", low="89"),  # up 1
+    bar(-4, open_="90", close="91", high="92", low="90"),  # up 2 -> arms the bottom at 88
+    bar(-3, open_="91", close="90", high="91", low="89"),
+    bar(-2, open_="90", close="87", high="90", low="86"),  # close 87 < 88 -> bearish BOS
+    bar(-1, open_="88", close="93", high="94", low="88"),  # close 93 > 92 -> bullish CHoCH
+]
+"""The toll a rising scenario has to pay before `MarketStructure` can read it at all.
+
+`MarketStructure` is a transcription of the author's indicator, and it starts where the indicator
+starts, at `DIR = -1`. So the only event a fresh machine can possibly report is a *bearish* BOS,
+and a scenario that rises from bar 0 never leaves the starting gate — it confirms nothing, marks
+no zone, and offers a setup nothing to qualify. That is not a bug to work around: an uptrend's
+structure is only meaningful once there is an uptrend, and the machine insists on being shown one.
+
+These eight bars are the shortest honest route into one: a bearish BOS on bar -2 (close 87 through
+the armed bottom of 88), then a bullish CHoCH on bar -1 (close 93 through the 92 the down-move
+came from). `test_the_bullish_start_is_a_bearish_bos_then_a_bullish_choch` pins exactly that, so
+this is a stated fact and not hidden state.
+
+Two properties make it safe to prepend to a scenario, and both are load-bearing:
+
+* **The bars carry negative numbers.** `bar()` stamps `START + index * HOUR`, so these sit in the
+  hour before bar 0 and every scenario keeps its own numbering. No golden had to be re-measured to
+  accommodate the prefix, which is the whole reason it is shaped this way — a prefix that shifted
+  the bars would mean rewriting the expectations, and a rewritten expectation proves nothing.
+* **Nothing it leaves behind can decide a scenario's events.** Two residues could: the bearish
+  CHoCH anchor at 86 and the running high at 94. The anchor is either out of reach or replaced by
+  the scenario's own first break long before anything gets near it. The running high cannot be
+  armed at all, and that one is structural rather than a matter of levels: arming reads `falling`,
+  which requires `previous.high < before.high` — for bar 0 that is bar -1's 94 against bar -2's
+  90, which is false. There is no path by which this prefix arms a bullish BOS of its own.
+
+Lives here rather than in a test file because two suites need it, and by this module's own rule a
+helper that two suites copy is a helper that drifts into two versions.
+"""
+
+BULLISH_START_EMA3 = [
+    *BULLISH_START[:6],
+    bar(-2, open_="90", close="87.75", high="90", low="86"),  # close below 88 -> bearish BOS
+    bar(-1, open_="88", close="95", high="96", low="88"),  # close above 92 -> bullish CHoCH
+]
+"""`BULLISH_START`, re-closed so that it is invisible to a three-period moving average.
+
+Same eight bars, same two events, same levels — only the last two closes differ. They have to,
+because a scenario judged against an average cannot afford a prefix that moves it, and every
+golden of the Ponto Contínuo documents its average bar by bar.
+
+The arithmetic that makes one variant enough: `EMA` seeds with the simple mean of the first
+`period` closes and is a first-order recurrence thereafter, so the whole of a prefixed stream's
+average chain depends on a **single** quantity — the value the average holds on bar -1. Left at
+exactly 92 there, the ordinary updates on bars 0, 1 and 2 of a stream closing 100, 104, 108
+reproduce 96, 100 and 104 — and 104 is precisely the seed that stream started from unprefixed. Bar
+2 onward is then identical to the last digit. Closing bar -2 at 87.75 and bar -1 at 95 is what
+lands it there, and both still do their structural job: 87.75 is under the armed bottom of 88, and
+95 is over the 92 the down-move came from.
+
+⚠️ **Tuned to a period of 3 and to a stream opening at those closes.** It is not a general-purpose
+"average-safe" prefix, and under any other period it moves the average like the plain one does.
+`test_the_structure_warm_up_leaves_the_average_alone` asserts the result rather than trusting the
+arithmetic above, and is the thing to re-run if either ever changes.
+
+One difference it does not hide: the average finishes **warming up** during the prefix, so a
+prefixed stream has readings on bars 0 and 1 that the unprefixed one had none for. That is a curve
+reaching further left, not a curve at different heights.
+"""
+
+
 def rising(count: int, *, start: str = "1.10000", step: str = "0.00100") -> list[Candle]:
     """A market that only goes up. Boring on purpose — the loop is what is under test."""
     price = Decimal(start)

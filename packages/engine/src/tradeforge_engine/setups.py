@@ -619,12 +619,23 @@ class StructureStrategy:
         past the far edge by a fraction of the zone's own width — the region is where price is
         expected to turn, and a stop level *on* the edge is taken out by the turn itself.
 
+        **Price is always clear of the region here, and that is now an invariant rather than a
+        case to handle.** This used to wait: with price inside the region a buy limit would rest
+        *above* the market, which `Signal` refuses as the sign error it usually is (ADR-0014), so
+        the order was held back until a bar closed clear. Under his mitigation rule that state
+        cannot arrive. For a demand region, price being inside means `close < top`, which implies
+        `low <= top` — and `low <= top` is precisely what retires the region. `on_bar` settles
+        that first: `_blocks.update` marks the region on the bar price reached it, the standing
+        order is withdrawn immediately after, and `_may_arm` refuses a region that no longer
+        stands. A region that reaches this method is one price has not touched.
+
+        Verified as well as argued: instrumented over the same 3480 real AAPL H1 candles, across
+        choch and continuation with secondaries on and off, the branch was reached zero times. It
+        is gone rather than kept as a guard, so that if the invariant is ever broken `Signal`
+        raises where this would have returned a silent `None`.
+
         Two bars where nothing is placed, both returning `None` rather than raising:
 
-        * **Price is not clear of the zone yet.** A buy limit has to rest *below* the market; with
-          price still inside the region, the level is above it, and `Signal` refuses that as the
-          sign error it usually is (ADR-0014). Nothing is lost by waiting — the zone stays armed
-          and the order goes out on the first bar that closes clear of it.
         * **The zone has no width.** Its two edges are one price, so the stop would land on the
           entry and the trade would carry no risk at all — which is not a free trade, it is a
           division by zero in position sizing.
@@ -639,13 +650,10 @@ class StructureStrategy:
             logger.debug("zone at %s has no width; nothing to arm", block.time)
             return None
 
-        close = context.candle.close
         tick = context.instrument.tick_size
         buffer = size * self._stop_buffer
 
         if block.kind is ZoneKind.DEMAND:
-            if close < block.top:
-                return None
             # Rounded *away* from the entry, so the stop never ends up nearer the zone than the
             # buffer says. Rounding to nearest would sometimes shave it back onto the edge, which
             # is the one place the buffer exists to keep it off.
@@ -655,8 +663,6 @@ class StructureStrategy:
                 return None
             return ZoneEntry(side=Side.LONG, limit_price=block.top, stop_loss=stop)
 
-        if close > block.bottom:
-            return None
         return ZoneEntry(
             side=Side.SHORT,
             limit_price=block.bottom,

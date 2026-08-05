@@ -553,7 +553,14 @@ def test_a_newly_qualified_zone_withdraws_the_order_resting_on_the_old_one() -> 
 
 
 def test_naming_the_same_zone_again_does_not_churn_the_order() -> None:
-    """A qualifier that keeps pointing at the zone it already qualified is not a new setup.
+    """The repeat guard, and now the only test of it.
+
+    A sibling used to cover the other window — a zone qualified but whose order had not reached
+    the book yet, because price was still inside the region. His mitigation rule removed that
+    window (see `test_a_region_price_is_inside_is_already_gone`), so this is where the guard is
+    held.
+
+    A qualifier that keeps pointing at the zone it already qualified is not a new setup.
 
     Acting on the repeat would withdraw a resting order and put an identical one back a bar later,
     every bar — and the fill would land on whichever bar the qualifier last repeated itself
@@ -574,32 +581,6 @@ def test_naming_the_same_zone_again_does_not_churn_the_order() -> None:
     assert signals[9][0].kind is SignalKind.ENTRY
     # and the three bars of the qualifier saying the same thing again produce nothing at all
     assert (signals[10], signals[11], signals[12]) == ([], [], [])
-
-
-def test_repeating_a_zone_armed_but_not_yet_placed_emits_nothing() -> None:
-    """The repeat guard in the window before the order reaches the book.
-
-    An unfilled zone is never in `_traded` — only a fill puts it there — so the armed-zone guard
-    is what refuses a qualifier repeating itself, in both windows. This test pins the earlier
-    one: between qualifying a zone and placing its order there is a real gap — price is still
-    inside the region, so no order can rest there yet. A qualifier repeating itself there would
-    withdraw an order that was never placed and re-arm under a fresh name, every bar, until
-    price finally cleared the zone.
-
-    Bars 10 and 11 both close inside [90, 100] with the setup naming the zone on each; bar 12
-    closes clear and the order finally goes out — once, at the level it always would have.
-    """
-    inside = [
-        bar(10, open_="124", close="96", high="125", low="95"),  # qualified here, inside the zone
-        bar(11, open_="96", close="97", high="98", low="95"),  # still inside: the repeat
-        bar(12, open_="97", close="103", high="104", low="96"),  # clear of it at last
-    ]
-    signals = _drive_from_bullish(
-        StructureStrategy(qualifier=_StickyFrom(at=10)), [*_IMPULSE, *inside]
-    )
-
-    assert (signals[10], signals[11]) == ([], [])  # nothing while price is inside the zone
-    assert [s.kind for s in signals[12]] == [SignalKind.ENTRY]  # and exactly one order after
 
 
 # --------------------------------------------------------------------------- #
@@ -661,48 +642,37 @@ def test_nothing_is_armed_while_a_position_is_open() -> None:
     ]
 
 
-def test_an_order_waits_for_price_to_clear_the_zone_before_it_is_placed() -> None:
-    """A buy limit has to rest below the market. While price is still inside the region the level
-    is above it, and `Signal` refuses that as the sign error it usually is (ADR-0014).
+def test_a_region_price_is_inside_is_already_gone() -> None:
+    """The invariant that replaced the wait, asserted on the shape that used to exercise it.
 
-    Nothing is lost by waiting: the zone stays armed and the order goes out on the first bar that
-    closes clear of it. Here the setup qualifies on bar 10, which closes at 96 — inside [90, 100]
-    — and the entry appears on bar 11, at the same level it always would have rested at.
+    The machinery used to hold an order back while price sat inside the region: a buy limit rests
+    *below* the market, so with price inside, the level is above it and `Signal` refuses that as a
+    sign error (ADR-0014). Two tests asserted that wait, and a third asserted the repeat that
+    happened while it lasted.
+
+    His mitigation rule removes the state they described. Price being inside a demand region means
+    `close < top`, which forces `low <= top` — and `low <= top` is exactly what retires it. So by
+    the time anything could ask for an order, the region has been marked and its order withdrawn.
+
+    Bar 10 closes at 96, inside [90, 100]. Under the old rule the setup qualified there and the
+    entry appeared on bar 11 at 100. Now bar 10 takes the region instead, and bar 11 has nothing
+    left to place — which is the correct reading of his method: price came back to the region and
+    the region is where it was traded, once.
     """
     inside = [
-        bar(10, open_="124", close="96", high="125", low="95"),  # closes inside the zone
-        bar(11, open_="96", close="101", high="102", low="95"),  # closes clear of it again
+        bar(10, open_="124", close="96", high="125", low="95"),  # reaches into the region
+        bar(11, open_="96", close="101", high="102", low="95"),  # too late; it is spent
     ]
-    signals = _drive_from_bullish(
-        StructureStrategy(qualifier=_OnBar(at=10), name="test"), [*_IMPULSE, *inside]
-    )
+    strategy = StructureStrategy(qualifier=_OnBar(at=10), name="test")
+    signals = _drive_from_bullish(strategy, [*_IMPULSE, *inside])
 
-    assert signals[9] == []  # the qualifier said nothing on the bar that marked the zone
-    assert signals[10] == []  # qualified, but price is inside it — no order can rest there yet
-    [signal] = signals[11]
-    assert signal.kind is SignalKind.ENTRY
-    assert (signal.limit_price, signal.stop_loss) == (Decimal("100"), Decimal("89"))
+    assert signals[11] == []
+    (region,) = [z for z in strategy._blocks.zones if z.block.time == _at(3)]
+    assert region.mitigated
+    assert not region.usable
 
-
-def test_the_wait_mirrors_for_a_sell_limit() -> None:
-    """The short side of the same rule, and it is not symmetric by accident: a sell limit rests
-    *above* the market, so what defers it is price still being **below** the zone's bottom edge.
-
-    The mirrored scenario reflects to supply [100, 110]. Bar 10 closes at 104, inside it, so no
-    order can rest there yet; bar 11 closes at 99, clear below, and the order goes out at 100.
-    """
-    inside = [
-        bar(10, open_="124", close="96", high="125", low="95"),
-        bar(11, open_="96", close="101", high="102", low="95"),
-    ]
-    signals = _drive(
-        StructureStrategy(qualifier=_OnBar(at=10), name="test"), _mirror([*_IMPULSE, *inside])
-    )
-
-    assert signals[10] == []
-    [signal] = signals[11]
-    assert signal.side is Side.SHORT
-    assert (signal.limit_price, signal.stop_loss) == (Decimal("100"), Decimal("111"))
+    # And no order was ever placed on it — not withdrawn later, never sent.
+    assert not [s for per_bar in signals for s in per_bar if s.kind is SignalKind.ENTRY]
 
 
 def test_a_zone_the_tracker_no_longer_holds_is_never_armed() -> None:
@@ -783,7 +753,13 @@ def test_a_zone_that_gave_a_trade_is_never_armed_again() -> None:
 
     assert signals[9][0].kind is SignalKind.ENTRY  # armed once, on the qualifying bar
     assert (signals[11], signals[12]) == ([], [])  # and never again, though the zone still stands
-    assert strategy._blocks.zones[0].usable  # the zone really did survive the trade
+    # The fill *is* the mitigation now: price reaching the near edge is both the entry and what
+    # retires the region, so the two reasons to refuse it have become the same event. `_traded`
+    # is kept as defence in depth rather than removed — re-arming a spent region is the failure
+    # this guard exists to make impossible, and it costs a set lookup.
+    (region,) = [z for z in strategy._blocks.zones if z.block.time == _at(3)]
+    assert not region.usable
+    assert region.block in strategy._traded
 
 
 def test_a_trade_that_opened_and_died_inside_one_bar_still_spends_its_zone() -> None:
@@ -832,7 +808,11 @@ def test_a_trade_that_opened_and_died_inside_one_bar_still_spends_its_zone() -> 
         after = strategy.on_bar(Context(candle=named_again, instrument=AAPL, account=_ACCOUNT))
 
     assert (during, after) == ((), ())  # no re-arm, and no cancel for the consumed order
-    assert strategy._blocks.zones[0].usable  # refused as traded, not as dead
+    # Spent and recorded: under his rule the fill retires the region, so "refused as traded" and
+    # "refused as dead" now name one event. See the note in the sibling test above.
+    (region,) = [z for z in strategy._blocks.zones if z.block.time == _at(3)]
+    assert not region.usable
+    assert region.block in strategy._traded
 
 
 def test_an_invisible_fill_does_not_leave_a_phantom_armed_order() -> None:
@@ -1568,13 +1548,18 @@ def test_continuation_arms_the_bos_zone_after_a_change_of_character() -> None:
     assert armed.side is Side.LONG
     assert (armed.limit_price, armed.stop_loss) == (Decimal("100"), Decimal("89"))
 
-    [dropped] = signals[13]
+    # The order comes back on bar 11, and under his rule for a different reason than it used to:
+    # bar 11 dips to 98, through the region's top of 100, so price *took* the region — this is
+    # where a broker would have filled the order. The turn on bar 13 then has nothing left to
+    # drop. That the turn drops a ladder still standing is its own scenario,
+    # `test_a_turn_drops_the_standing_continuation_ladder`, where price stays clear of the region.
+    [dropped] = signals[11]
     assert dropped.kind is SignalKind.CANCEL
     assert dropped.client_id == armed.client_id  # the very order bar 9 placed
 
-    # Nothing between the turn and the break that confirms it — the choch's own region is not
-    # continuation's to trade.
-    assert all(bar_signals == [] for bar_signals in signals[14:17])
+    # And nothing from there to the break that confirms the new trend: the choch's own region is
+    # not continuation's to trade.
+    assert all(bar_signals == [] for bar_signals in signals[12:17])
 
     [signal] = signals[17]
     assert signal.kind is SignalKind.ENTRY

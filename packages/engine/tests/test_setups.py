@@ -1387,7 +1387,7 @@ def test_a_rung_that_died_without_a_trade_passes_to_the_next() -> None:
     )
     spent = (
         TrackedZone(block=primary),
-        TrackedZone(block=secondary, touched=True, mitigated=True),
+        TrackedZone(block=secondary, mitigated=True),
     )
     assert qualifier.qualify(_ctx(zones=spent)) is primary
 

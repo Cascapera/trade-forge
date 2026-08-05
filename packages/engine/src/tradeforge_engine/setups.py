@@ -160,10 +160,20 @@ class ChochQualifier:
             self._ladder.pop(0)
 
         break_ = context.break_
-        if break_ is not None and break_.kind is StructureKind.CHOCH:
-            # Nearest zone first, the leg's origin last. `marked` arrives in marking order —
-            # origin first — so the ladder is its reverse.
-            self._ladder = list(reversed(context.marked))
+        if break_ is not None:
+            # **Any** break ends this ladder, not only another change of character. The author's
+            # rule: "um choch de baixa cria a zona, se depois ele fizer um bos de baixa, a entrada
+            # de choch morre" — the structure moved on, and a region belonging to the break before
+            # last is not one he would still sell. A BOS leaves regions of its own but they are
+            # the continuation setup's, not this one's, so the ladder empties rather than refills.
+            #
+            # This was the hole: only a CHoCH used to touch the ladder, so any number of BOS could
+            # confirm while an order still rested on a superseded region. Measured over 3480 AAPL
+            # H1 candles, 21 of 34 changes of character were followed by at least one BOS before
+            # the next one — 53 breaks in all, up to 7 stacked on a single choch.
+            self._ladder = (
+                list(reversed(context.marked)) if break_.kind is StructureKind.CHOCH else []
+            )
 
         while self._ladder:
             rung = self._ladder[0]

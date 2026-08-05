@@ -12,6 +12,7 @@ import {
   candles,
   curveRuns,
   makeScale,
+  levelSegments,
   markers,
   priceBand,
   priceLabels,
@@ -31,6 +32,9 @@ const LEVEL = { entry: '#5F8AD2', stop: '#CE5F94', average: '#BC8620' } as const
 const DASH = { entry: '0', stop: '4 3', average: '5 3' } as const
 // The candle body's fill for an up bar: the page behind it, so the outline reads as hollow.
 const SURFACE = '#020617'
+// The broken structure gets its own hue, distinct from the three trade levels: it is not a
+// price the order relates to, it is the event that justified the order existing.
+const LEVEL_STRUCTURE = '#C9A227'
 
 interface Props {
   snapshot: Snapshot
@@ -59,6 +63,7 @@ export function TradeSnapshot({
   const shapes = candles(snapshot, scale)
   const runs = curveRuns(snapshot, scale)
   const zones = regions(snapshot, scale)
+  const segments = levelSegments(snapshot, scale)
   const labels = priceLabels(
     { entry, stop, average, hasCurve: snapshot.series.length > 0 },
     scale,
@@ -145,6 +150,34 @@ export function TradeSnapshot({
           </g>
         )
       })}
+
+      {/* The structure that broke: a segment from the bar that set the level to the bar that
+          crossed it. Not extended — a broken level stops being structure the moment it gives
+          way, and drawing it onward would show one still standing. */}
+      {segments.map((segment, index) => (
+        <g key={`level-${segment.label}-${String(index)}`}>
+          <line
+            x1={segment.x1}
+            y1={segment.y}
+            x2={segment.x2}
+            y2={segment.y}
+            stroke={LEVEL_STRUCTURE}
+            strokeWidth="2"
+            strokeDasharray="7 4"
+            opacity="0.95"
+          />
+          <text
+            x={Math.min(segment.x1 + 4, scale.plotRight - 30)}
+            y={segment.y - 5}
+            fontSize="9.5"
+            fill={LEVEL_STRUCTURE}
+            opacity="0.95"
+          >
+            {segment.label.toUpperCase()}
+            {segment.clamped ? ' ←' : ''} {money(String(segment.price))}
+          </text>
+        </g>
+      ))}
 
       {/* The indicator curves, joined to the bars on time. A break is left as a break. */}
       {runs.map((run, index) => (

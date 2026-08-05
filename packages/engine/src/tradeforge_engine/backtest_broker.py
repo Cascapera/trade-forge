@@ -534,6 +534,7 @@ class BacktestBroker:
             decided_at=armed.decided_at,
             regions=armed.regions,
             series=armed.series,
+            levels=armed.levels,
         )
 
     def _fill_at_open(self, order: OrderRequest, candle: Candle) -> Fill | None:

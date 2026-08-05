@@ -158,6 +158,17 @@ def _snapshot(snapshot: EntrySnapshot | None) -> dict[str, Any]:
             }
             for series in snapshot.series
         ],
+        # Bounded at both ends, unlike a region: a broken level stops being structure the moment
+        # it is crossed, and `to_time` is where. See `SnapshotLevel`.
+        "levels": [
+            {
+                "label": level.label,
+                "price": str(level.price),
+                "from_time": level.from_time.isoformat(),
+                "to_time": level.to_time.isoformat(),
+            }
+            for level in snapshot.levels
+        ],
     }
 
 

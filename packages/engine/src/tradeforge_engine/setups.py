@@ -45,6 +45,7 @@ from tradeforge_engine.domain import (
     Side,
     Signal,
     SignalKind,
+    SnapshotLevel,
     SnapshotRegion,
 )
 from tradeforge_engine.structure import (
@@ -284,6 +285,14 @@ class _Armed:
     block: OrderBlock
     client_id: str
     placed: bool
+    confirmed_by: StructureBreak | None = None
+    """The break that revealed this zone, kept for the entry's picture.
+
+    Kept here rather than looked up later because it cannot be looked up later: the qualifier
+    names a zone on the bar the break confirms, and the order may not be placeable for many bars
+    after that — by which time `MarketStructure` has moved on and the level this trade was built
+    on is gone from every object still in scope. The zone remembers what revealed it, or nothing
+    downstream can say why the zone was worth entering."""
 
 
 class StructureStrategy:
@@ -407,6 +416,7 @@ class StructureStrategy:
                 block=chosen,
                 client_id=f"{chosen.kind.value}-{chosen.time:%Y%m%dT%H%M}-{self._armed_count}",
                 placed=False,
+                confirmed_by=break_,
             )
 
         if self._armed is not None and not self._armed.placed:
@@ -443,6 +453,11 @@ class StructureStrategy:
                                 from_time=self._armed.block.time,
                             ),
                         ),
+                        # The structure that broke, drawn from the bar that set it to the bar
+                        # that crossed it. It is the event that made the zone worth anything,
+                        # and it is otherwise absent from the record: the bars would show price
+                        # crossing a price, with nothing saying which price mattered.
+                        levels=_structure_levels(self._armed.confirmed_by),
                     )
                 )
 
@@ -666,6 +681,29 @@ class StructureStrategy:
             reason=f"cancel.{self._name}",
             client_id=armed.client_id,
         )
+
+
+def _structure_levels(break_: StructureBreak | None) -> tuple[SnapshotLevel, ...]:
+    """The broken structure as a drawable segment, or nothing when there is none to draw.
+
+    Labelled by kind — `choch` or `bos` — because the two mean opposite things about trend and a
+    reader deciding whether an entry was justified is asking which one this was. The price is
+    the level that was crossed: on a bearish break the low that gave way, on a bullish one the
+    high, which is exactly the line the author draws by hand.
+
+    `None` on a zone armed with no break in hand. That is a qualifier's prerogative — one may
+    name a zone from the tracker on a quiet bar — and a missing line is the honest picture of it.
+    """
+    if break_ is None:
+        return ()
+    return (
+        SnapshotLevel(
+            label=break_.kind.value,
+            price=break_.level,
+            from_time=break_.level_time,
+            to_time=break_.time,
+        ),
+    )
 
 
 def _to_tick(price: Money, tick: Money, rounding: str) -> Money:

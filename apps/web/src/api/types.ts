@@ -134,6 +134,22 @@ export interface SnapshotSeries {
   points: [string, string][]
 }
 
+/**
+ * A horizontal segment: the structure a break of structure broke.
+ *
+ * Bounded at **both** ends, unlike a region. A zone stays in force after the entry and extends
+ * rightward; a level is over the moment it is crossed. Its length is how long the structure
+ * held — draw it between the two instants and do not extend it.
+ *
+ * `label` is `choch` or `bos`: one turns the trend, the other continues it.
+ */
+export interface SnapshotLevel {
+  label: string
+  price: string
+  from_time: string
+  to_time: string
+}
+
 export interface Snapshot {
   decided_at: string
   /** The bar the order filled on — the window's last. Equal to `decided_at` on a long rest. */
@@ -141,6 +157,7 @@ export interface Snapshot {
   bars: SnapshotBar[]
   regions: SnapshotRegion[]
   series: SnapshotSeries[]
+  levels: SnapshotLevel[]
 }
 
 export interface TradesPage {

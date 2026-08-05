@@ -307,6 +307,7 @@ def _to_order(
             decided_at=context.candle.time,
             regions=signal.regions,
             series=signal.series,
+            levels=signal.levels,
         ),
         limit_price=signal.limit_price,
         stop_price=signal.stop_price,

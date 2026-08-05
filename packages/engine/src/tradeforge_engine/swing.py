@@ -441,8 +441,11 @@ class PontoContinuoStrategy:
     to be a correction, and ordinary bars may sit between the correction and the touch. Requiring an
     unbroken run right up to the trigger would throw away the strongest reversal bars, which
     routinely print a *higher* high on the day they take the average back. It is also the geometry
-    he already validated once — `MarketStructure` arms a BOS the same way, and says so in the same
-    words ("a bar that is not a correction breaks the streak; arming stands").
+    he already validated once: `MarketStructure` — now a transcription of his own indicator —
+    arms a BOS on the same two-bar counter-move and then lets it stand, so that a bar which is not
+    a correction cannot disarm what is already armed. The worked example in `test_structure.py`
+    is where that is pinned: two corrections arm the top, an ordinary bounce follows, and the bar
+    after it breaks anyway.
 
     **A close *on* the average is neither event.** Above triggers, below cancels, and equal does
     neither — the rule is stated with strict words in both directions, so a bar closing exactly on

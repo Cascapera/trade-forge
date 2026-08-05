@@ -38,7 +38,7 @@ from tradeforge_engine.structure import (
     ZoneKind,
     _WedgeTracker,
 )
-from tradeforge_engine.testing import HOUR, START, bar
+from tradeforge_engine.testing import BULLISH_START, HOUR, START, bar
 
 
 def _run(detector: SwingDetector, candles: list[Candle]) -> list[tuple[int, Swing]]:
@@ -319,43 +319,122 @@ def test_the_detector_reports_exactly_the_strict_three_candle_gaps(
 # --------------------------------------------------------------------------- #
 
 
+def _index_of(candle: Candle) -> int:
+    """The bar number `bar()` stamped into this candle — negative for anything before bar 0.
+
+    Read from the candle rather than from `enumerate`, so that a scenario prefixed with the
+    bootstrap below still reports its own bars by their own numbers.
+    """
+    return round((candle.time - START) / HOUR)
+
+
 def _breaks(candles: list[Candle]) -> list[tuple[int, StructureBreak]]:
     structure = MarketStructure()
     found: list[tuple[int, StructureBreak]] = []
-    for index, candle in enumerate(candles):
+    for candle in candles:
         event = structure.update(candle)
         if event is not None:
-            found.append((index, event))
+            found.append((_index_of(candle), event))
     return found
 
 
-def _bos(trend: Trend, level: str, at: int, *, origin: str, origin_at: int) -> StructureBreak:
+def _bos(  # noqa: PLR0913 — keyword-only; a break simply has this many facts
+    trend: Trend, level: str, at: int, *, level_at: int, origin: str, origin_at: int
+) -> StructureBreak:
     """A bullish/bearish BOS confirmed on bar `at`, whose impulse started at `origin` on
-    `origin_at` — the extreme the move came from, which is also the next opposite CHoCH anchor."""
+    `origin_at` — the extreme the move came from, which is also the next opposite CHoCH anchor.
+
+    `level_at` is the bar that *set* the broken level, and is required rather than defaulted: a
+    default would let a new golden be written without stating it, and quietly assert whatever
+    that default happened to be against whatever the engine produced."""
     return StructureBreak(
         kind=StructureKind.BOS,
         trend=trend,
         level=Decimal(level),
         time=_at(at),
+        level_time=_at(level_at),
         origin=Decimal(origin),
         origin_time=_at(origin_at),
     )
 
 
-def _choch(trend: Trend, level: str, at: int, *, origin: str, origin_at: int) -> StructureBreak:
+def _choch(  # noqa: PLR0913 — see _bos
+    trend: Trend, level: str, at: int, *, level_at: int, origin: str, origin_at: int
+) -> StructureBreak:
     """A CHoCH confirmed on bar `at`; `origin` is the extreme the reversing move began from."""
     return StructureBreak(
         kind=StructureKind.CHOCH,
         trend=trend,
         level=Decimal(level),
         time=_at(at),
+        level_time=_at(level_at),
         origin=Decimal(origin),
         origin_time=_at(origin_at),
     )
 
 
-# The author's hand-worked example: a bullish BOS bootstraps the trend, then a bearish CHoCH turns
-# it. high, low, close per bar (open = close for simplicity).
+def _breaks_from_bullish(candles: list[Candle]) -> list[tuple[int, StructureBreak]]:
+    """`_breaks`, on a machine already in an uptrend, reporting only what `candles` produced.
+
+    The prefix's own two events are dropped rather than repeated in every golden that uses it:
+    they are not what those scenarios are about, and the test above pins them once.
+    """
+    return [(index, event) for index, event in _breaks([*BULLISH_START, *candles]) if index >= 0]
+
+
+def test_the_bullish_start_is_a_bearish_bos_then_a_bullish_choch() -> None:
+    """What the shared prefix does, stated once so the scenarios using it need not restate it.
+
+    It is also the shape of every fresh series, which is worth pinning for its own sake: the
+    machine begins at the indicator's `DIR = -1`, so the first thing it can mark is a bearish BOS,
+    and it takes a change of character to turn the bias up.
+    """
+    assert _breaks(BULLISH_START) == [
+        (-2, _bos(Trend.BEARISH, "88", -2, level_at=-6, origin="92", origin_at=-4)),
+        (-1, _choch(Trend.BULLISH, "92", -1, level_at=-4, origin="86", origin_at=-2)),
+    ]
+
+
+def test_the_bullish_start_hands_over_a_state_that_can_decide_nothing() -> None:
+    """The prefix's licence, asserted instead of asserted-in-a-docstring.
+
+    Every scenario in this file reads as a statement about its own bars, and that is only true if
+    what the prefix leaves behind cannot produce an event of its own. Three residues could, and
+    each is closed differently:
+
+    * **`_armed_high` is `None`.** The CHoCH cleared it, so no bullish break is half-way armed.
+    * **The bearish anchor is 86**, beneath every scenario here — and where a scenario does dig
+      that deep, its own first break has replanted the anchor long before it gets there.
+    * **The running high is 94**, and this one is closed structurally rather than by level:
+      arming reads `falling`, which needs `previous.high < before.high`. For bar 0 of any
+      scenario that is bar -1's 94 against bar -2's 90, which is false. There is no sequence of
+      scenario bars that arms a bullish BOS at 94 — not "it is out of reach", but "that path does
+      not exist".
+
+    Reaching into the private state is the point: these are exactly the values no public result
+    exposes, and a change to the prefix that moved them would otherwise be found as an unrelated
+    golden failing somewhere else entirely.
+
+    ⚠️ **The last assertion is a hand-copy of a rule that lives elsewhere.** It restates, over two
+    literals, the second clause of `falling` in `MarketStructure.update` — and it is the *only*
+    thing tying the two together. It can therefore never fail because of a change to the engine:
+    if `falling` is ever given a different criterion, this line goes on passing while defending a
+    property it no longer establishes. It is a statement about the fixture, not a guard on the
+    code, and it has to be re-read by hand if that comparison moves.
+    """
+    structure = MarketStructure()
+    for candle in BULLISH_START:
+        structure.update(candle)
+
+    assert structure._armed_high is None
+    assert structure._choch_down == Decimal("86")
+    assert structure._high_up == Decimal("94")
+    # See the warning above: this mirrors `falling`'s `previous.high < before.high` by hand.
+    assert not BULLISH_START[-1].high < BULLISH_START[-2].high
+
+
+# The author's hand-worked example, unchanged: a bullish BOS on bar 5, then a bearish CHoCH on bar
+# 8 that turns it. high, low, close per bar (open = close for simplicity).
 _STRUCTURE_GOLDEN = [
     bar(0, open_="99", close="99", high="100", low="95"),
     bar(1, open_="104", close="104", high="105", low="99"),  # top = 105
@@ -372,19 +451,39 @@ _STRUCTURE_GOLDEN = [
 def test_structure_matches_the_hand_worked_example() -> None:
     """A bullish BOS on bar 5 (close 106 above the 105 top, after two correction bars and a
     bounce), then a bearish CHoCH on bar 8 (close 95 below 96 — the lowest low the up-move
-    defended). Exactly the two events the method's author marked."""
-    assert _breaks(_STRUCTURE_GOLDEN) == [
-        (5, _bos(Trend.BULLISH, "105", 5, origin="96", origin_at=3)),
-        (8, _choch(Trend.BEARISH, "96", 8, origin="107", origin_at=5)),
+    defended). Exactly the two events the method's author marked.
+
+    Worth saying plainly, because it is the load-bearing fact of the transcription: these are the
+    numbers this golden has always asserted. Porting the indicator did not move a single one of
+    them. What the port changed is that the machine now has to be *in* an uptrend to read an
+    uptrend's structure, which is what `BULLISH_START` supplies.
+    """
+    assert _breaks_from_bullish(_STRUCTURE_GOLDEN) == [
+        (5, _bos(Trend.BULLISH, "105", 5, level_at=1, origin="96", origin_at=3)),
+        (8, _choch(Trend.BEARISH, "96", 8, level_at=3, origin="107", origin_at=5)),
     ]
 
 
-def test_trend_is_none_until_the_first_bos() -> None:
+def test_trend_is_none_until_the_first_choch() -> None:
+    """A bias has to be *earned*, and only a change of character earns one.
+
+    The indicator's `DIR` starts at -1, so a fresh series already leans bearish — but nothing has
+    happened yet to say so, and the bearish BOS on bar -2 merely confirms what was assumed.
+    Reporting `BEARISH` there would dress an untested default up as a reading of the market, and
+    a strategy gating on `trend is not None` would act on it. The bias becomes a fact on bar -1,
+    where the CHoCH turns it.
+    """
     structure = MarketStructure()
-    for candle in _STRUCTURE_GOLDEN[:5]:
+    for candle in BULLISH_START[:-1]:  # everything up to and including the bearish BOS
         structure.update(candle)
         assert structure.trend is None
-    structure.update(_STRUCTURE_GOLDEN[5])
+    structure.update(BULLISH_START[-1])
+    assert structure.trend is Trend.BULLISH
+
+    # And a BOS in the trend's own direction leaves it alone: the golden's bullish BOS on bar 5
+    # continues the bias the CHoCH settled rather than re-deciding it.
+    for candle in _STRUCTURE_GOLDEN[:6]:
+        structure.update(candle)
     assert structure.trend is Trend.BULLISH
 
 
@@ -404,26 +503,35 @@ def test_the_bearish_mirror_bootstraps_down_then_chochs_up() -> None:
         bar(8, open_="104", close="104", high="105", low="100"),  # close 104 > 103 -> CHoCH up
     ]
     assert _breaks(mirror) == [
-        (5, _bos(Trend.BEARISH, "90", 5, origin="103", origin_at=3)),
-        (8, _choch(Trend.BULLISH, "103", 8, origin="88", origin_at=5)),
+        (5, _bos(Trend.BEARISH, "90", 5, level_at=1, origin="103", origin_at=3)),
+        (8, _choch(Trend.BULLISH, "103", 8, level_at=3, origin="88", origin_at=5)),
     ]
 
 
 def test_one_correction_bar_does_not_arm_a_bos() -> None:
     """Two consecutive correction bars are required. With only one, the top is unarmed and a close
-    above it is not a break of structure."""
+    above it is not a break of structure.
+
+    The bullish start is what gives this test teeth. Run on a fresh machine it would also report
+    nothing — but for the wrong reason, because a machine at `DIR = -1` can mark no bullish break
+    whatever these bars do. Then the assertion would hold with the arming rule deleted outright.
+    """
     candles = [
         bar(0, open_="99", close="99", high="100", low="95"),
         bar(1, open_="104", close="104", high="105", low="99"),  # top 105
         bar(2, open_="99", close="99", high="103", low="98"),  # a single correction bar
         bar(3, open_="106", close="106", high="107", low="102"),  # closes above 105 but unarmed
     ]
-    assert _breaks(candles) == []
+    assert _breaks_from_bullish(candles) == []
 
 
 def test_a_wick_through_the_top_without_a_close_is_no_bos() -> None:
     """The break is by close, not by pierce: a bar whose high tags the top but whose close stays
-    below it does not confirm a BOS (here it simply lifts the top)."""
+    below it does not confirm a BOS (here it simply lifts the top).
+
+    On the bullish start, so that the silence means the *close* rule held — see the note on
+    `test_one_correction_bar_does_not_arm_a_bos`.
+    """
     candles = [
         bar(0, open_="99", close="99", high="100", low="95"),
         bar(1, open_="104", close="104", high="105", low="99"),  # top 105
@@ -431,14 +539,24 @@ def test_a_wick_through_the_top_without_a_close_is_no_bos() -> None:
         bar(3, open_="97", close="97", high="101", low="96"),  # correction 2 -> armed
         bar(4, open_="103", close="104", high="107", low="100"),  # high 107 > 105, close 104 < 105
     ]
-    assert _breaks(candles) == []
+    assert _breaks_from_bullish(candles) == []
 
 
 def test_a_non_correction_bar_becomes_the_next_correction_reference() -> None:
     """The author's rule, pinned: after the top, a bar that is not a correction becomes the
     reference, and correction is measured against it, and so on. Bar 2 has a higher low than the
     105 top (not a correction), so it is the reference; bars 3 and 4 step down from it and arm the
-    top — a BOS — even though neither dipped below the top's own low of 99."""
+    top — a BOS — even though neither dipped below the top's own low of 99.
+
+    The origin is the one number in this file the transcription moved, and moving it is the point
+    of the whole port. It is now **99.2 on bar 4** — the deepest the pullback itself went — where
+    the rule this replaced said 99 on bar 1, the low of the bar that made the high. Bar 1's low was
+    never part of the counter-move the break resolved; it belongs to the leg before it. And the
+    origin is load-bearing twice over: it is the anchor the next opposite CHoCH will sit on, and
+    the start of the stretch an order block is hunted in. Taking it from a bar the pullback never
+    visited is exactly the error he found by drawing on the chart — the level lands too low, and
+    the zone and the entry follow it down.
+    """
     candles = [
         bar(0, open_="99", close="99", high="100", low="95"),
         bar(1, open_="104", close="104", high="105", low="99"),  # top 105, low 99
@@ -451,13 +569,56 @@ def test_a_non_correction_bar_becomes_the_next_correction_reference() -> None:
         ),  # steps down from bar 3 -> corr 2
         bar(5, open_="106", close="106", high="107", low="103"),  # close 106 > 105 -> BOS
     ]
-    assert _breaks(candles) == [
-        (5, _bos(Trend.BULLISH, "105", 5, origin="99", origin_at=1)),
+    assert _breaks_from_bullish(candles) == [
+        (5, _bos(Trend.BULLISH, "105", 5, level_at=1, origin="99.2", origin_at=4)),
+    ]
+
+
+def test_the_anchor_stops_at_the_bar_before_the_one_that_confirmed() -> None:
+    """The anchor is the lowest low *up to* the confirming bar, never including it.
+
+    This is the discriminating case for the rule the whole port exists to get right, and no other
+    scenario in this file reaches it. `_lowest_since_armed` is advanced **after** the break is
+    emitted, while `_low_up` has already absorbed the current bar in `_advance_extremes` — so the
+    two agree on every ordinary pullback and part company on exactly one shape: a bar that both
+    digs deeper than anything before it *and* closes through the armed top. A V: news knocks price
+    to 90, buyers take it back, and it closes at 106 above the 105 top.
+
+    Reading the confirming bar's own low would be a small, plausible transcription slip — `Fundo_
+    Sobe` is a real variable in the Pascal and sits one line away — and it damages two things at
+    once, because `origin` is used for two:
+
+    * it is the start of the impulse leg the `OrderBlockDetector` hunts gaps in. Moved to 90 on
+      bar 4, the leg collapses to the breaking bar alone and the zone the setup would have bought
+      is never marked at all;
+    * it is the anchor the next bearish CHoCH sits on. Moved to 90, bar 5's close of 94 — the real
+      change of character — passes unnoticed, and the reversal is recognised six points late.
+
+    So both halves are asserted: where the anchor is, and that it is the level a later close is
+    actually judged against.
+    """
+    candles = [
+        bar(0, open_="99", close="99", high="100", low="95"),
+        bar(1, open_="104", close="104", high="105", low="99"),  # top 105
+        bar(2, open_="102", close="99", high="103", low="98"),  # correction 1
+        bar(3, open_="99", close="97", high="101", low="96"),  # correction 2 -> arms 105, low 96
+        bar(4, open_="97", close="106", high="107", low="90"),  # the V: digs to 90, closes 106
+        bar(5, open_="106", close="94", high="106", low="93"),  # 94 is under 96 but over 90
+    ]
+    assert _breaks_from_bullish(candles) == [
+        # 96 on bar 3 — the pullback's own low — and not 90 on bar 4, the breaking bar's.
+        (4, _bos(Trend.BULLISH, "105", 4, level_at=1, origin="96", origin_at=3)),
+        # And 96 is what bar 5 is judged against. Anchored at 90 this bar would be silent.
+        (5, _choch(Trend.BEARISH, "96", 5, level_at=3, origin="107", origin_at=4)),
     ]
 
 
 def test_a_close_exactly_at_the_top_is_not_a_break() -> None:
-    """Strict inequality for structure too: a close landing exactly on the top does not confirm."""
+    """Strict inequality for structure too: a close landing exactly on the top does not confirm.
+
+    On the bullish start, so that the silence means the *strictness* held — see the note on
+    `test_one_correction_bar_does_not_arm_a_bos`.
+    """
     candles = [
         bar(0, open_="99", close="99", high="100", low="95"),
         bar(1, open_="104", close="104", high="105", low="99"),  # top 105
@@ -465,7 +626,7 @@ def test_a_close_exactly_at_the_top_is_not_a_break() -> None:
         bar(3, open_="97", close="97", high="101", low="96"),  # correction 2 -> armed
         bar(4, open_="104", close="105", high="105", low="100"),  # close 105 == top, not above
     ]
-    assert _breaks(candles) == []
+    assert _breaks_from_bullish(candles) == []
 
 
 def test_a_second_bos_raises_the_choch_anchor() -> None:
@@ -489,10 +650,68 @@ def test_a_second_bos_raises_the_choch_anchor() -> None:
             10, open_="98", close="98", high="103", low="97"
         ),  # close 98 < 99 -> CHoCH at the new anchor
     ]
-    assert _breaks(candles) == [
-        (5, _bos(Trend.BULLISH, "105", 5, origin="96", origin_at=3)),
-        (8, _bos(Trend.BULLISH, "107", 8, origin="99", origin_at=7)),
-        (10, _choch(Trend.BEARISH, "99", 10, origin="109", origin_at=8)),
+    assert _breaks_from_bullish(candles) == [
+        (5, _bos(Trend.BULLISH, "105", 5, level_at=1, origin="96", origin_at=3)),
+        (8, _bos(Trend.BULLISH, "107", 8, level_at=5, origin="99", origin_at=7)),
+        (10, _choch(Trend.BEARISH, "99", 10, level_at=7, origin="109", origin_at=8)),
+    ]
+
+
+def test_a_close_exactly_on_the_bottom_is_not_a_bearish_break() -> None:
+    """The mirror of `test_a_close_exactly_at_the_top_is_not_a_break`, and it needs no prefix.
+
+    A fresh machine already sits at the indicator's `DIR = -1`, so this is the one direction that
+    reads straight from bar 0 — which is also why it went untested: nothing about the scenario
+    looked broken, and the sell side simply had no strictness case of its own.
+
+    A close landing exactly on the armed bottom is the everyday shape at a round number, which is
+    precisely where the stops that would be swept are stacked. Accepting it opens a short, marks
+    supply zones and plants a bullish anchor on a leg that never happened.
+    """
+    candles = [
+        bar(0, open_="101", close="101", high="105", low="100"),
+        bar(1, open_="100", close="96", high="101", low="95"),  # bottom 95
+        bar(2, open_="97", close="102", high="103", low="97"),  # up-correction 1
+        bar(3, open_="102", close="104", high="105", low="99"),  # up-correction 2 -> arms 95
+        bar(4, open_="98", close="95", high="98", low="94"),  # close 95 == bottom, not below
+    ]
+    assert _breaks(candles) == []
+
+
+def test_a_close_exactly_on_a_choch_anchor_does_not_turn_the_bias() -> None:
+    """Strictness on the anchors too, in both directions — the two comparisons that decide a
+    *reversal*, and therefore the two whose failure costs most.
+
+    A CHoCH is the only event that changes the bias, so a comparison one tick too generous here
+    does not merely add a mark: it hands the next stretch of chart to the wrong trend, and every
+    setup gated on `trend` follows it. Both are checked against a golden that is one bar short of
+    the real thing, so the anchor is genuinely planted and genuinely tested.
+    """
+    # Bullish BOS on bar 5 plants the bearish anchor at 96; bar 8 lands exactly on it.
+    on_the_down_anchor = [
+        *_STRUCTURE_GOLDEN[:6],
+        bar(6, open_="101", close="101", high="105", low="100"),
+        bar(7, open_="99", close="99", high="103", low="98"),
+        bar(8, open_="97", close="96", high="100", low="94"),  # close 96 == anchor, not below
+    ]
+    assert _breaks_from_bullish(on_the_down_anchor) == [
+        (5, _bos(Trend.BULLISH, "105", 5, level_at=1, origin="96", origin_at=3))
+    ]
+
+    # The mirror, on a fresh machine: a bearish BOS plants the bullish anchor at 103.
+    on_the_up_anchor = [
+        bar(0, open_="96", close="96", high="100", low="95"),
+        bar(1, open_="91", close="91", high="99", low="90"),  # bottom 90
+        bar(2, open_="100", close="100", high="101", low="92"),  # up-correction 1
+        bar(3, open_="102", close="102", high="103", low="94"),  # up-correction 2 -> armed
+        bar(4, open_="95", close="95", high="100", low="93"),
+        bar(5, open_="89", close="89", high="97", low="88"),  # BOS down -> anchor 103
+        bar(6, open_="94", close="94", high="95", low="92"),
+        bar(7, open_="98", close="98", high="99", low="95"),
+        bar(8, open_="100", close="103", high="104", low="100"),  # close 103 == anchor, not above
+    ]
+    assert _breaks(on_the_up_anchor) == [
+        (5, _bos(Trend.BEARISH, "90", 5, level_at=1, origin="103", origin_at=3))
     ]
 
 
@@ -504,9 +723,9 @@ def test_a_choch_can_flip_back() -> None:
         bar(9, open_="96", close="96", high="99", low="93"),  # bearish leg makes a new low
         bar(10, open_="108", close="108", high="109", low="100"),  # close 108 > 107 -> CHoCH up
     ]
-    assert _breaks(extended)[-1] == (
+    assert _breaks_from_bullish(extended)[-1] == (
         10,
-        _choch(Trend.BULLISH, "107", 10, origin="93", origin_at=9),
+        _choch(Trend.BULLISH, "107", 10, level_at=5, origin="93", origin_at=9),
     )
 
 
@@ -1505,10 +1724,34 @@ def _zones(candles: list[Candle]) -> list[tuple[int, OrderBlock]]:
     """Drive structure and order blocks together the way a strategy would, one bar at a time."""
     structure, blocks = MarketStructure(), OrderBlockDetector()
     found: list[tuple[int, OrderBlock]] = []
-    for index, candle in enumerate(candles):
+    for candle in candles:
         break_ = structure.update(candle)
-        found.extend((index, zone) for zone in blocks.update(candle, break_))
+        found.extend((_index_of(candle), zone) for zone in blocks.update(candle, break_))
     return found
+
+
+def _zones_from_bullish(candles: list[Candle]) -> list[tuple[int, OrderBlock]]:
+    """`_zones`, on a machine already in an uptrend. See `BULLISH_START`.
+
+    The prefix marks no zone of its own — its bars overlap throughout, so they leave no gap for
+    one to be marked from — and the step up into bar 0 falls outside every break's impulse leg,
+    so it marks nothing either. `test_the_bullish_start_marks_no_zone_of_its_own` pins both.
+    """
+    return [(index, zone) for index, zone in _zones([*BULLISH_START, *candles]) if index >= 0]
+
+
+def test_the_bullish_start_marks_no_zone_of_its_own() -> None:
+    """The prefix must be inert for order blocks, or `_zones_from_bullish` would hide a real one.
+
+    Two ways it could contaminate a scenario, and both are checked. Its own bars could leave a gap
+    and mark a zone — they do not, they overlap throughout. And the step up from bar -1 into bar 0
+    is a gap by construction, so it could be picked up by the scenario's own break; it is not,
+    because it sits before that break's origin and the detector only hunts inside the impulse leg.
+    Were either to happen, the filter in `_zones_from_bullish` would quietly drop the first and
+    the second would show up as a zone nobody put there.
+    """
+    assert _zones(BULLISH_START) == []
+    assert [index for index, _ in _zones([*BULLISH_START, *_OB_IMPULSE])] == [9, 9]
 
 
 def test_order_block_golden_one_impulse_two_gap_events_two_zones() -> None:
@@ -1519,7 +1762,7 @@ def test_order_block_golden_one_impulse_two_gap_events_two_zones() -> None:
     is the first event; the secondary is the one after the pause. Gaps A and B are adjacent bars,
     one continuous push, so they share a zone: without that rule this leg would mark three.
     """
-    zones = _zones(_OB_IMPULSE)
+    zones = _zones_from_bullish(_OB_IMPULSE)
 
     assert [(index, z.time, z.top, z.bottom, z.primary) for index, z in zones] == [
         (9, _at(3), Decimal("100"), Decimal("98"), True),  # from gap A, marked on bar 3
@@ -1536,7 +1779,7 @@ def test_a_zone_belongs_to_its_own_bar_but_is_only_known_at_the_break() -> None:
     make it one. A backtest that marked it on bar 3 would be trading on information the market had
     not yet produced.
     """
-    index, zone = _zones(_OB_IMPULSE)[0]
+    index, zone = _zones_from_bullish(_OB_IMPULSE)[0]
     assert zone.time == _at(3)
     assert zone.confirmed_at == _at(9)
     assert index == 9
@@ -1564,7 +1807,7 @@ def test_the_gap_candles_wick_extends_the_demand_zone_down() -> None:
         bar(6, open_="108", close="108", high="110", low="102"),  # gap: 100 < 102
         *_OB_IMPULSE[7:],
     ]
-    _, primary = _zones(candles)[0]
+    _, primary = _zones_from_bullish(candles)[0]
 
     assert primary.time == _at(4)
     assert primary.top == Decimal("100")  # still the marking candle's high
@@ -1583,7 +1826,7 @@ def test_adjacent_gaps_are_one_event_and_mark_from_the_first() -> None:
         bar(8, open_="116", close="116", high="118", low="116"),  # gaps: 115 < 116
         bar(9, open_="124", close="124", high="125", low="118"),  # gaps: 117 < 118, and BOS
     ]
-    zones = _zones(candles)
+    zones = _zones_from_bullish(candles)
 
     assert [(z.time, z.primary) for _, z in zones] == [(_at(3), True)]
 
@@ -1591,8 +1834,14 @@ def test_adjacent_gaps_are_one_event_and_mark_from_the_first() -> None:
 def test_a_gap_outside_the_impulse_leg_marks_nothing() -> None:
     """Only the leg that broke structure leaves a footprint worth trading.
 
-    The gap here forms during the correction, before the impulse's origin, so it is not the move
-    that broke anything. The impulse itself gaps too, and only that one marks a zone.
+    The out-of-leg gap is the climb out of `BULLISH_START` and into bar 0 — a real bullish gap,
+    of the same kind the break wants, sitting on bars 0 and 1 and therefore *before* the impulse's
+    origin on bar 3. It is not the move that broke anything, so it marks nothing, and the two zones
+    reported are the impulse's own.
+
+    The exact list is asserted rather than `all(time >= origin)`: that weaker form is satisfied by
+    marking no zones at all, which is precisely what this scenario did before it was given a trend
+    to break.
     """
     candles = [
         bar(0, open_="122", close="122", high="123", low="120"),
@@ -1606,10 +1855,9 @@ def test_a_gap_outside_the_impulse_leg_marks_nothing() -> None:
         bar(8, open_="116", close="116", high="118", low="112"),
         bar(9, open_="124", close="124", high="125", low="120"),  # BOS
     ]
-    zones = _zones(candles)
+    zones = _zones_from_bullish(candles)
 
-    # Every zone reported sits at or after the break's own origin bar, never before it.
-    assert all(z.time >= _at(3) for _, z in zones)
+    assert [z.time for _, z in zones] == [_at(3), _at(7)]
 
 
 def test_a_bearish_break_marks_supply_from_bearish_gaps_only() -> None:
@@ -1644,6 +1892,10 @@ def test_an_impulse_without_a_gap_marks_no_zone() -> None:
 
     The author's fallback for this case — mark the candle of the swing that began the move — is a
     separate rule, deliberately not folded into the inefficiency marking.
+
+    On the bullish start, so that the break on bar 4 genuinely happens and is genuinely empty
+    handed. Without it nothing breaks at all, and "no zone" would be true of a scenario in which
+    nothing was ever looked for.
     """
     candles = [
         bar(0, open_="99", close="99", high="100", low="95"),
@@ -1652,7 +1904,8 @@ def test_an_impulse_without_a_gap_marks_no_zone() -> None:
         bar(3, open_="97", close="97", high="101", low="96"),  # correction 2 -> armed
         bar(4, open_="106", close="106", high="107", low="100"),  # breaks, but overlaps throughout
     ]
-    assert _zones(candles) == []
+    assert _breaks_from_bullish(candles) != []  # the break happened...
+    assert _zones_from_bullish(candles) == []  # ...and left no footprint
 
 
 # --- Zone lifecycle -----------------------------------------------------------------------------
@@ -1849,7 +2102,7 @@ def test_a_zone_is_born_clean_and_not_touched_by_the_bar_that_revealed_it() -> N
     """
     reveal = bar(9, open_="124", close="124", high="125", low="99")
     structure, blocks = MarketStructure(), OrderBlockDetector()
-    for candle in [*_OB_IMPULSE[:9], reveal]:
+    for candle in [*BULLISH_START, *_OB_IMPULSE[:9], reveal]:
         blocks.update(candle, structure.update(candle))
 
     (zone,) = blocks.zones
@@ -1966,7 +2219,7 @@ def test_a_choch_marks_its_zone_and_says_so() -> None:
         bar(6, open_="105", close="99", high="105", low="98"),  # falling
         bar(7, open_="99", close="94", high="99", low="93"),  # closes 94 < 96 -> CHoCH down
     ]
-    zones = _zones(candles)
+    zones = _zones_from_bullish(candles)
 
     assert [(z.kind, z.break_kind) for _, z in zones] == [(ZoneKind.SUPPLY, StructureKind.CHOCH)]
 

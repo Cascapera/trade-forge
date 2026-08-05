@@ -57,6 +57,7 @@ const snapshot: Snapshot = {
   ],
   regions: [],
   series: [],
+  levels: [],
 }
 
 describe('TradesTable', () => {

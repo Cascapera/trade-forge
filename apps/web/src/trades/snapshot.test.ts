@@ -12,6 +12,7 @@ import {
   VIEW,
   candles,
   curveRuns,
+  levelSegments,
   makeScale,
   markers,
   priceBand,
@@ -39,6 +40,7 @@ function aSnapshot(overrides: Partial<Snapshot> = {}): Snapshot {
     ],
     regions: [],
     series: [],
+    levels: [],
     ...overrides,
   }
 }
@@ -184,6 +186,66 @@ describe('regions, degenerate inputs', () => {
     const [zone] = regions(snapshot, scaleFor(snapshot))
     expect(zone!.x).toBe(0)
     expect(Number.isFinite(zone!.width)).toBe(true)
+  })
+})
+
+describe('levelSegments', () => {
+  const level = (from: number, to: number, price = '105') => ({
+    label: 'choch',
+    price,
+    from_time: `2024-01-01T${String(from).padStart(2, '0')}:00:00Z`,
+    to_time: `2024-01-01T${String(to).padStart(2, '0')}:00:00Z`,
+  })
+
+  it('spans from the bar that set the level to the bar that broke it', () => {
+    // Both ends, unlike a zone. A broken level stops being structure the moment it gives way;
+    // extending it rightward would draw a structure still standing that is not.
+    const snapshot = aSnapshot({ levels: [level(1, 3)] })
+    const scale = scaleFor(snapshot)
+    const [segment] = levelSegments(snapshot, scale)
+
+    expect(segment!.x1).toBeCloseTo(scale.x(1))
+    expect(segment!.x2).toBeCloseTo(scale.x(3))
+    expect(segment!.clamped).toBe(false)
+    expect(segment!.y).toBeCloseTo(scale.y(105))
+  })
+
+  it('clamps a level older than the window and says it was cut', () => {
+    // A structure that held two hundred bars is exactly the kind worth breaking, so its left end
+    // routinely falls outside. The length *is* the information, so a cut has to be visible —
+    // otherwise a long structure reads as a short one.
+    const snapshot = aSnapshot({ levels: [level(0, 3)] })
+    const older = aSnapshot({
+      levels: [{ ...level(0, 3), from_time: '2023-06-01T00:00:00Z' }],
+    })
+    expect(levelSegments(snapshot, scaleFor(snapshot))[0]!.clamped).toBe(false)
+
+    const [cut] = levelSegments(older, scaleFor(older))
+    expect(cut!.clamped).toBe(true)
+    expect(cut!.x1).toBe(0)
+  })
+
+  it('clamps a break that happened after the window too', () => {
+    const snapshot = aSnapshot({
+      levels: [{ ...level(1, 3), to_time: '2099-01-01T00:00:00Z' }],
+    })
+    const scale = scaleFor(snapshot)
+    const [segment] = levelSegments(snapshot, scale)
+    expect(segment!.clamped).toBe(true)
+    expect(segment!.x2).toBeCloseTo(scale.plotRight)
+  })
+
+  it('draws nothing when the window has no bars', () => {
+    const empty = aSnapshot({ bars: [], levels: [level(1, 3)] })
+    expect(levelSegments(empty, makeScale(0, { low: 100, high: 110 }))).toEqual([])
+  })
+
+  it('is inside the price band even when the level sits outside the bars', () => {
+    // A structure broken far from where price is now would otherwise be drawn off-canvas —
+    // and a line you cannot see is indistinguishable from one that was never recorded.
+    const snapshot = aSnapshot({ levels: [level(1, 3, '150')] })
+    const band = priceBand(snapshot, [])
+    expect(band.high).toBeGreaterThan(150)
   })
 })
 

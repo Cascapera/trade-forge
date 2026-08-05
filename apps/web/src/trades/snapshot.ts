@@ -72,6 +72,18 @@ export interface PriceLabel {
   text: string
 }
 
+export interface LevelSegment {
+  label: string
+  price: number
+  y: number
+  /** Left end. Clamped to the chart edge when the level was set before the window. */
+  x1: number
+  /** Right end: the bar that broke it. Clamped to the right edge if that is past the window. */
+  x2: number
+  /** True when either end was clamped — the segment is longer than it can be drawn. */
+  clamped: boolean
+}
+
 export interface Marker {
   kind: 'decision' | 'fill'
   index: number
@@ -96,6 +108,9 @@ export function priceBand(snapshot: Snapshot, levels: number[]): { low: number; 
   }
   for (const region of snapshot.regions) {
     values.push(toNumber(region.bottom), toNumber(region.top))
+  }
+  for (const level of snapshot.levels) {
+    values.push(toNumber(level.price))
   }
   for (const series of snapshot.series) {
     for (const [, value] of series.points) values.push(toNumber(value))
@@ -199,6 +214,37 @@ export function regions(snapshot: Snapshot, scale: Scale): RegionShape[] {
       width: scale.plotRight - left,
       height: Math.max(1, scale.y(toNumber(region.bottom)) - top),
       clipped,
+    }
+  })
+}
+
+/**
+ * The broken structural levels, as segments bounded at both ends.
+ *
+ * A level routinely predates the window — a structure that held for two hundred bars is exactly
+ * the kind worth breaking — so the left end is clamped to the chart edge. The right end is the
+ * bar that broke it, which for a zone entered long after the break also falls outside, on the
+ * other side. `clamped` says a segment ran past what can be drawn, so the caller can mark it
+ * rather than let a cut line read as a short one: the length **is** the information here.
+ */
+export function levelSegments(snapshot: Snapshot, scale: Scale): LevelSegment[] {
+  const first = snapshot.bars[0]
+  const last = snapshot.bars[snapshot.bars.length - 1]
+  if (first === undefined || last === undefined) return []
+  const at = (time: string): number | null => {
+    const index = snapshot.bars.findIndex((candle) => candle.time === time)
+    return index < 0 ? null : scale.x(index)
+  }
+  return snapshot.levels.map((level) => {
+    const start = at(level.from_time)
+    const end = at(level.to_time)
+    return {
+      label: level.label,
+      price: toNumber(level.price),
+      y: scale.y(toNumber(level.price)),
+      x1: start ?? 0,
+      x2: end ?? scale.plotRight,
+      clamped: start === null || end === null,
     }
   })
 }

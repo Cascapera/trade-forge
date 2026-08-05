@@ -16,7 +16,7 @@ from tradeforge_db.models import Instrument
 from tradeforge_engine import BacktestMetrics as EngineMetrics
 from tradeforge_engine.domain import AssetClass, Candle, ClosedTrade
 from tradeforge_engine.errors import EngineError
-from tradeforge_engine.testing import bar
+from tradeforge_engine.testing import BULLISH_START_EMA3, bar
 
 START = dt.datetime(2024, 1, 1, tzinfo=dt.UTC)
 HOUR = dt.timedelta(hours=1)
@@ -198,6 +198,17 @@ def a_stock() -> Instrument:
     )
 
 
+# How far behind bar 0 the golden reaches, and therefore where its window has to start.
+#
+# `run_it` defaults `date_from` to `START`, which is bar 0 — and the window added in PR-217 is a
+# real filter, not a label: left at the default it would drop every warm-up bar, the setup would
+# enter at 114 and never be conducted, and the trade these tests assert on would not exist.
+#
+# Derived from the warm-up rather than written as a number, so that a ninth bar cannot shift the
+# whole numbering in silence and surface as an unrelated golden failing.
+_GOLDEN_FROM = START - len(BULLISH_START_EMA3) * HOUR
+
+
 def pullback_to_the_average() -> list[Candle]:
     """The Ponto Contínuo golden from the engine's own suite, candle for candle.
 
@@ -205,6 +216,13 @@ def pullback_to_the_average() -> list[Candle]:
     closes at 113.5 above it, so the order rests at its high of 114 and bar 7 fills there. The
     first break of structure takes the stop to breakeven; the second trails it to the leg origin
     at 116; bar 16 comes back and takes it.
+
+    The structure warm-up in front is `BULLISH_START_EMA3`, the shared one, taken as candles
+    rather than re-typed as levels: this file is the third place those eight bars would otherwise
+    have been written out, and two of them are enough to drift. The setup is conducted
+    structurally and `MarketStructure` begins at the indicator's `DIR = -1`, so without an uptrend
+    to break this stream would enter at 114 exactly as it does and then never be conducted — the
+    trade the assertions below are about would not exist.
     """
     levels = [
         ("99", "100", "100.5", "98.5"),
@@ -226,8 +244,11 @@ def pullback_to_the_average() -> list[Candle]:
         ("120", "115.5", "120.5", "115"),
     ]
     return [
-        bar(index, open_=open_, close=close, high=high, low=low)
-        for index, (open_, close, high, low) in enumerate(levels)
+        *BULLISH_START_EMA3,
+        *(
+            bar(index, open_=open_, close=close, high=high, low=low)
+            for index, (open_, close, high, low) in enumerate(levels)
+        ),
     ]
 
 
@@ -260,6 +281,7 @@ def test_a_setup_document_reproduces_the_engine_s_own_golden() -> None:
         definition=ponto_continuo(),
         instrument=a_stock(),
         candles=pullback_to_the_average(),
+        date_from=_GOLDEN_FROM,
         initial_capital=Decimal("100000"),
     )
 
@@ -283,7 +305,10 @@ def test_a_setup_document_needs_no_indicators_entry_or_stop_block() -> None:
     assert "stop_loss" not in document["exit"]  # type: ignore[operator]
 
     trades, _, _ = run_it(
-        definition=document, instrument=a_stock(), candles=pullback_to_the_average()
+        definition=document,
+        instrument=a_stock(),
+        candles=pullback_to_the_average(),
+        date_from=_GOLDEN_FROM,
     )
     assert len(trades) == 1
 
@@ -295,11 +320,13 @@ def test_switching_the_breakeven_rule_off_reaches_the_setup() -> None:
         definition=ponto_continuo(),
         instrument=a_stock(),
         candles=pullback_to_the_average(),
+        date_from=_GOLDEN_FROM,
     )
     without_rule, _, _ = run_it(
         definition=ponto_continuo(breakeven_at_r=None),
         instrument=a_stock(),
         candles=pullback_to_the_average(),
+        date_from=_GOLDEN_FROM,
     )
 
     # Both trade; the conducted stop is what differs, and only structure moves it once the 2x1
@@ -312,4 +339,9 @@ def test_an_unknown_setup_type_fails_loudly_at_compile_time() -> None:
     document["setup"] = {"type": "setup_9_4", "params": {}}
 
     with pytest.raises(EngineError, match="unknown setup type"):
-        run_it(definition=document, instrument=a_stock(), candles=pullback_to_the_average())
+        run_it(
+            definition=document,
+            instrument=a_stock(),
+            candles=pullback_to_the_average(),
+            date_from=_GOLDEN_FROM,
+        )

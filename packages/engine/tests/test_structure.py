@@ -283,9 +283,14 @@ def test_the_detector_reports_exactly_the_strict_three_candle_gaps(
     bars: list[tuple[int, int]],
 ) -> None:
     """The full biconditional. A reported gap is a strict inefficiency between the first and third
-    candle of its window, zoned exactly by their wicks and timed to the third bar (soundness); and
-    where it reports nothing, neither inequality held (completeness) — so a flipped bound, a
-    non-strict compare, or a stray filter on the middle candle would fail one half or the other."""
+    candle of its window **whose middle candle closed clear of it**, zoned exactly by their wicks
+    and timed to the third bar (soundness); and where it reports nothing, one of those did not
+    hold (completeness) — so a flipped bound or a non-strict compare fails one half or the other.
+
+    The middle candle's close is part of the rule, not a stray filter: it is his indicator's
+    `close[1] > high[2]`, and an earlier version of this property asserted its *absence*. These
+    fixtures set open == close == low, so for a bullish gap the test reads as the middle bar's low
+    clearing the first bar's high."""
     candles = [
         bar(index, open_=str(low), close=str(low), high=str(low + span), low=str(low))
         for index, (low, span) in enumerate(bars)
@@ -297,15 +302,17 @@ def test_the_detector_reports_exactly_the_strict_three_candle_gaps(
             assert gap is None  # no full window yet
             continue
         first, third = candles[index - 2], candle
+        middle = candles[index - 1]
         if gap is None:
-            # completeness: a silent bar must hide no gap.
-            assert not first.high < third.low
-            assert not first.low > third.high
+            # completeness: a silent bar must hide no gap the author would have marked.
+            assert not (first.high < third.low and middle.close > first.high)
+            assert not (first.low > third.high and middle.close < first.low)
             continue
         assert gap.time == third.time
         assert gap.top > gap.bottom
         if gap.kind is FVGKind.BULLISH:
             assert first.high < third.low
+            assert middle.close > first.high  # the author's own condition
             assert gap.bottom == first.high
             assert gap.top == third.low
         else:
@@ -1715,7 +1722,7 @@ _OB_IMPULSE = [
     bar(5, open_="108", close="108", high="110", low="102"),  # gap A
     bar(6, open_="113", close="113", high="115", low="107"),  # gap B
     bar(7, open_="112", close="112", high="117", low="110"),  # pause
-    bar(8, open_="116", close="116", high="118", low="112"),  # pause
+    bar(8, open_="116", close="118", high="119", low="112"),  # pause; closes clear of 117
     bar(9, open_="124", close="124", high="125", low="120"),  # gap C, and close 124 > 123 -> BOS
 ]
 
@@ -1824,7 +1831,7 @@ def test_a_gap_outside_the_impulse_leg_marks_nothing() -> None:
         bar(5, open_="108", close="108", high="110", low="102"),  # the impulse's own gap
         bar(6, open_="113", close="113", high="115", low="107"),
         bar(7, open_="112", close="112", high="117", low="110"),
-        bar(8, open_="116", close="116", high="118", low="112"),
+        bar(8, open_="116", close="118", high="119", low="112"),
         bar(9, open_="124", close="124", high="125", low="120"),  # BOS
     ]
     zones = _zones_from_bullish(candles)
@@ -1848,7 +1855,7 @@ def test_a_bearish_break_marks_supply_from_bearish_gaps_only() -> None:
         bar(5, open_="112", close="112", high="118", low="110"),  # bearish gap: 120 > 118
         bar(6, open_="107", close="107", high="113", low="105"),  # adjacent gap, same event
         bar(7, open_="108", close="108", high="110", low="103"),  # pause
-        bar(8, open_="104", close="104", high="108", low="102"),  # pause
+        bar(8, open_="104", close="102", high="108", low="101"),  # pause; closes under 103
         bar(9, open_="96", close="96", high="100", low="95"),  # gap + close 96 < 97 -> bearish BOS
     ]
     zones = _zones(candles)
@@ -1937,32 +1944,37 @@ def test_a_zone_is_not_spent_by_a_move_it_never_touched() -> None:
     assert tracked.usable
 
 
-def test_a_zone_is_born_clean_and_not_touched_by_the_bar_that_revealed_it() -> None:
-    """The breaking bar must not count against the zone it just revealed.
+def test_a_region_cannot_be_taken_by_the_bar_that_created_it() -> None:
+    """The gap's own geometry rules that out, so nothing in the code has to.
 
-    The bar here is an outside bar: it closes at 124 to confirm the BOS, but its low of 99 reaches
-    down into the primary zone [98, 100] and its high of 125 is more than a full width clear of it.
-    If zones were marked before being advanced, this one would be born already touched *and*
-    already mitigated — dead on arrival, on information nobody had until this very bar closed.
+    This replaces a test for a rule that no longer exists. The detector used to hold a region
+    "clean" at birth on purpose — the leg that revealed it was never replayed against it — because
+    replaying it marked almost every region spent immediately. That was a workaround for a
+    mitigation rule the engine had invented; his is narrower and needs no help.
 
-    The low of 99 also leaves the leg's origin at 98 on bar 3, so the zone itself is unchanged;
-    only the order of the two halves of `update` decides the outcome. Reverse them and this fails.
+    On the bar a gap completes, his condition already puts price clear of the region: a bullish gap
+    requires `low > high[2]`, and the region's top *is* `high[2]`, so the touch test `low <= top`
+    is false there by construction. The impulse bar between them is never tested at all, because
+    the region does not exist until the gap closes.
 
-    Reaching down to 99 does cost the leg its second gap — 117 is no longer below the breaking
-    bar's low — so this leg marks the primary zone alone, which is the one the case needs.
+    Asserted on the two bars that could do it — the gap bar and the impulse before it — rather
+    than on the flag alone, so this fails if the region ever starts being followed too early.
     """
-    reveal = bar(9, open_="124", close="124", high="125", low="99")
-    structure, blocks = MarketStructure(), OrderBlockDetector()
-    for candle in [*BULLISH_START, *_OB_IMPULSE[:9], reveal]:
-        blocks.update(candle, structure.update(candle))
+    detector = OrderBlockDetector()
+    for candle in [*BULLISH_START, *_OB_IMPULSE[:6]]:
+        detector.update(candle, None)
 
-    (zone,) = blocks.zones
-    assert (zone.block.time, zone.block.top, zone.block.bottom) == (
-        _at(3),
-        Decimal("100"),
-        Decimal("98"),
-    )
-    assert (zone.mitigated, zone.usable) == (False, True)
+    # By its marking bar: other regions are alive here, including one the prefix left. That they
+    # coexist is the point — regions are followed from their own gaps, independently.
+    marking = _OB_IMPULSE[3]
+    region = next(r for r in detector._regions if r.marking.time == marking.time)
+    assert (region.top, region.bottom) == (marking.high, marking.low)
+    assert not region.mitigated  # nothing so far has been able to take it
+
+    # And neither of the two bars that made it could have: the impulse is never tested, and the
+    # gap bar is clear of the region by the gap condition itself.
+    assert not region.touched_by(_OB_IMPULSE[4])
+    assert not region.touched_by(_OB_IMPULSE[5])
 
 
 def test_a_choch_marks_its_zone_and_says_so() -> None:

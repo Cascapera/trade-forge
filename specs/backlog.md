@@ -332,3 +332,36 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
   4. Timeframe **não** é trabalho: a cadeia inteira já é agnóstica (a DSL é dona da lista dos 8,
      a tela renderiza `TIMEFRAMES`, o collector mapeia por `getattr(mt5, f"TIMEFRAME_{tf}")` e a
      constraint do banco aceita os 8). Hoje só existe H1 em disco porque só H1 foi coletado.
+- [origem: PR-223 / coleta 06/08] **As barras D1 chegam carimbadas um dia adiantado** — medido em
+  06/08/2026 no backfill de AAPL D1: **499 de 499** barras batem, candle a candle, com o pregão do
+  **dia seguinte** em UTC. A barra rotulada `2024-08-01 21:00Z` contém o pregão de 02/08.
+  Não é bug do collector: o servidor do broker é **UTC+3**, o dia dele abre à meia-noite do
+  servidor, e `--server-offset +3` converte isso corretamente para 21:00Z do dia anterior. O
+  carimbo é o instante de **abertura** da barra, que é a mesma convenção do H1 (13:00Z abre o
+  pregão das 13:30). Só que no D1 o instante de abertura cai na **data anterior** em UTC.
+  Consequências, em ordem de gravidade:
+  1. ⚠️ **Lookahead latente em multi-timeframe.** Uma barra D1 carimbada em 21:00Z do dia X resume
+     o pregão de X+1. Num backtest que misturasse D1 com H1/M15 ela seria consumida **antes** das
+     barras intradiárias que ela sumariza — lookahead puro, e do tipo que melhora o resultado em
+     silêncio. Hoje é inalcançável (um backtest roda **um** timeframe), por isso fica anotado em
+     vez de resolvido; vira bloqueante no dia em que multi-timeframe existir.
+  2. **A data reportada dos trades sai um dia errada** num backtest D1: um trade "de 01/08" na
+     tela aconteceu de fato em 02/08.
+  3. **A janela do backtest desloca.** `_candles_to_run` filtra por `date_from <= time <= date_to`,
+     então pedir `date_from=2024-08-01` inclui uma barra que é o pregão de 02/08 e exclui a de
+     01/08 (carimbada em 2024-07-31 21:00Z).
+  Conserto candidato: normalizar o carimbo do D1 (e de qualquer timeframe >= D1) para a **data da
+  sessão** que a barra representa, em vez do instante de abertura no servidor. Precisa da sessão
+  do instrumento, que é a mesma dependência do item dos gaps anômalos acima — os dois se resolvem
+  juntos. Intraday (M5/M15/H1/H4) **não** tem o problema: conferidos contra o H1, batem exatamente
+  (2948, 2970 e 996 comparações, zero divergências) e nunca cruzam a fronteira do dia.
+- [origem: coleta 06/08] **O MT5 recusa `copy_rates_range` acima de ~11 mil barras** — medido com
+  AAPL M5: 2 anos (~42 mil) e o ano de 2025 inteiro (~19 mil) devolvem `(-2, 'Terminal: Invalid
+  params')`, enquanto 3 meses (4.799), 2024 parcial (7.993) e 2026 parcial (11.161) passam. O erro
+  **não distingue** "timeframe indisponível" de "pedi demais", e a mensagem que o collector propaga
+  também não. Paliativo usado: coletar **por ano-calendário**, porque `write_candles` usa
+  `existing_data_behavior="delete_matching"` e substitui exatamente as partições de ano da rodada
+  — fatiar *dentro* de um ano apagaria o pedaço anterior. Para 2025 foi preciso buscar duas metades
+  em diretórios temporários e gravar o ano numa única chamada. Conserto candidato: o collector
+  fatiar sozinho quando o intervalo pedido exceder o limite, acumulando antes de escrever; e a
+  mensagem de erro sugerir a janela menor em vez de só repassar o código do terminal.

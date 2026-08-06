@@ -113,6 +113,41 @@ estava morta havia sete dias. A ordem preencheu em 28/08 e tomou **−1,73R**.
 que teve mais tempo para ser consumida. Oferecer só a primária significa oferecer preferencialmente
 a mais gasta. Não foi azar deste caso; era o desenho.
 
+## A prova: 574 de 574 regiões idênticas
+
+Medido em 06/08/2026 sobre os mesmos 3480 candles de AAPL H1, portando o Pine abaixo
+**literalmente** para Python (mesmos nomes de variável, mesma ordem de operações) e dirigindo o
+`OrderBlockDetector` de verdade ao lado dele. É o análogo dos 88/88 da estrutura.
+
+O detector foi alimentado com `break_=None` em toda barra, de propósito: a regra 4 é dele e
+**não está no indicador**, que desenha regiões sem olhar estrutura. O que se compara aqui é a
+camada que os dois compartilham — qual barra marca a região, com que bordas, e em que barra o
+preço a toma.
+
+| | |
+|---|---|
+| regiões marcadas — indicador | **574** |
+| regiões marcadas — engine | **574** |
+| marcadas só pelo indicador | **0** |
+| marcadas só pela engine | **0** |
+| barra de nascimento divergente | **0** |
+| barra de mitigação divergente | 9 — todas explicadas abaixo |
+
+**As 9 são o teto de 500 barras da engine, e são invisíveis para a estratégia.** O
+`_MAX_LOOKBACK` para de seguir uma região que passa de 500 barras sem ser tocada; o indicador
+segue para sempre. São regiões que o preço só voltou a tocar mais de 500 barras depois do gap.
+
+Nenhuma delas poderia ter sido oferecida a um setup: a engine só oferece regiões dentro da perna
+de impulso (`origin_time → barra do rompimento`), e nos mesmos 3480 candles a **perna mais longa
+dos 88 rompimentos tem 287 barras** — pouco mais da metade da janela. O teto não alcança nada que
+um rompimento reporte.
+
+⚠️ **Armadilha do script de equivalência**, para quem repetir a medição: não indexar as regiões
+vivas por `id()`. Um `_Region` descartado é liberado e o CPython entrega o mesmo endereço para o
+próximo, o que funde regiões distintas em silêncio — na primeira rodada isso reportou **98**
+regiões em vez de 574, e o veredito parecia divergência de regra. A chave estável é
+`(barra do gap, direção)`.
+
 ## Uma diferença de escopo, deliberada
 
 O indicador marca uma região em **todo** gap, sem olhar estrutura. A engine só oferece as regiões
@@ -277,7 +312,7 @@ alertcondition(novoBaixa, "Novo OB de baixa", "SMC: novo Order Block de baixa em
 | `gapAlta` / `gapBaixa` | `FVGDetector.update` |
 | `criar()` → `t = high[2]`, `f = low[2]` | `_zone()` → `top`, `bottom` |
 | `bar_index - 2` (x da caixa) | `OrderBlock.time` — a barra que marca |
-| `obAtivoAlta` / `obAtivoBaixa` (trava) | `_runs()` — gaps em barras consecutivas são um evento só |
+| `obAtivoAlta` / `obAtivoBaixa` (trava) | `OrderBlockDetector._gapping` — um latch por direção, gaps em barras consecutivas são um evento só |
 | `processar()` → `low <= topo` / `high >= fundo` | `TrackedZone.mitigated` |
 | `ob.mitigado` | `not TrackedZone.usable` |
 | caixa parando de estender | a região deixa de ser oferecida ao setup |

@@ -36,6 +36,7 @@ from tradeforge_engine.structure import (
     TrackedZone,
     Trend,
     ZoneKind,
+    _Region,
     _WedgeTracker,
 )
 from tradeforge_engine.testing import BULLISH_START, HOUR, START, bar
@@ -317,6 +318,7 @@ def test_the_detector_reports_exactly_the_strict_three_candle_gaps(
             assert gap.top == third.low
         else:
             assert first.low > third.high
+            assert middle.close < first.low  # his condition, on the side that had none
             assert gap.top == first.low
             assert gap.bottom == third.high
 
@@ -1889,9 +1891,18 @@ def test_an_impulse_without_a_gap_marks_no_zone() -> None:
 
 # --- Zone lifecycle -----------------------------------------------------------------------------
 #
-# The author's own worked example, kept literal: a demand zone from 90 to 100, so ten points wide.
-# Price arrives from 105, dips to 98 (a touch), and the zone is spent only once price is driven a
-# full width clear of it — past 100 + 10 = 110.
+# His whole rule, and it is one line of his indicator:
+#
+#     ob.bull ? low <= ob.topo : high >= ob.fundo
+#
+# The near edge is the side price must come back to — a demand zone's top, a supply zone's bottom —
+# and the first wick that reaches it takes the region. By wick, not by close; once, not by degree.
+#
+# The zones below are ten points wide so that "reached the near edge" and "reached the far one" are
+# ten points apart: a mutant that reads the wrong edge has to change an answer, not a rounding.
+# Every rule here is asserted on **both** sides and with the boundary sampled from both directions,
+# because an earlier version of this file asserted only that untouched zones stay alive — which any
+# definition of the edge satisfies, including a reversed one.
 
 
 def _demand_90_100() -> OrderBlock:
@@ -1928,20 +1939,104 @@ def _live(block: OrderBlock, candles: list[Candle]) -> TrackedZone:
 
 
 def test_a_zone_is_not_spent_by_a_move_it_never_touched() -> None:
-    """Both halves are required: price must reach the zone before running away can spend it.
+    """Distance is not mitigation. Only coming back is.
 
-    A rally straight past 110 that never came down to 100 says nothing about the orders resting at
-    90 — they are still there, untouched, and the zone is still live.
+    A rally away from a demand zone says nothing about the orders resting inside it — they are
+    still there, untouched, and the zone is still live however far price runs. This used to be
+    false: the engine had invented a second death, `driven_off`, where a close a full zone-width
+    clear counted as the region having done its job. That is not in his indicator and is gone.
     """
     tracked = _live(
         _demand_90_100(),
         [
-            bar(0, open_="105", close="112", high="115", low="104"),  # clears 110 without touching
+            bar(0, open_="105", close="112", high="115", low="104"),  # a full width clear of 100
             bar(1, open_="112", close="118", high="120", low="111"),
         ],
     )
     assert not tracked.mitigated
     assert tracked.usable
+
+
+def test_a_demand_zone_is_spent_by_the_first_wick_that_reaches_its_top() -> None:
+    """The near edge of a demand zone is its **top**, and touching it is enough.
+
+    100 exactly, by wick, on a bar that closes well above — no close inside, no penetration, no
+    second visit. That is where the buy limit rests, so that is where the orders in the region are
+    taken. Sampled from both sides of the boundary because both mutants are one character wide: a
+    zone that only died at its *bottom* would keep offering a level the market has already worked,
+    and `low < top` instead of `low <= top` would miss the exact touch that fills the order.
+    """
+    grazed = _live(_demand_90_100(), [bar(0, open_="105", close="104", high="106", low="100.01")])
+    assert grazed.usable  # a hair above the edge: the limit at 100 would not have filled
+
+    touched = _live(_demand_90_100(), [bar(0, open_="105", close="104", high="106", low="100")])
+    assert touched.mitigated
+    assert not touched.usable
+
+    # And permanent: leaving and coming back does not revive it.
+    assert not _live(
+        _demand_90_100(),
+        [
+            bar(0, open_="105", close="104", high="106", low="100"),
+            bar(1, open_="104", close="118", high="120", low="103"),
+        ],
+    ).usable
+
+
+def test_a_supply_zone_is_spent_by_the_first_wick_that_reaches_its_bottom() -> None:
+    """The same rule mirrored, and it is the half that had no test at all.
+
+    A supply zone is sold at its **bottom**, so its near edge is the one underneath it and price
+    reaches it from below. Both comparisons in `_advance` are separate lines of code; the demand
+    one was covered three times over and this one zero times, which let the sell side read the far
+    edge — an order left resting at a level price had already traded through.
+    """
+    grazed = _live(_supply_100_110(), [bar(0, open_="95", close="96", high="99.99", low="94")])
+    assert grazed.usable  # a hair below the edge: the limit at 100 would not have filled
+
+    touched = _live(_supply_100_110(), [bar(0, open_="95", close="96", high="100", low="94")])
+    assert touched.mitigated
+    assert not touched.usable
+
+    assert not _live(
+        _supply_100_110(),
+        [
+            bar(0, open_="95", close="96", high="100", low="94"),
+            bar(1, open_="96", close="82", high="97", low="80"),
+        ],
+    ).usable
+
+
+def _followed(kind: FVGKind, marking: Candle) -> _Region:
+    """A region under observation, built by hand to isolate the touch rule from detection."""
+    return _Region(index=0, kind=kind, marking=marking)
+
+
+def test_a_followed_region_dies_at_its_entry_edge_on_either_side() -> None:
+    """`_Region.touched_by` is the same rule as `_advance`, on the *other* half of the lifetime.
+
+    A region has two lives: it is **followed** from the bar its gap completes, by anyone or no
+    one, and it is **offered** when a break reveals it. `touched_by` governs the first and
+    `_advance` the second, and they are separate code — a region can therefore be taken long
+    before any setup hears about it. That is the whole point of the rule, and it is what the
+    detector used to get wrong: 49% of regions were already spent when they were first offered.
+
+    Asserted positively here because the only test that used to reach this method asserted the
+    *negative* twice — that two named bars could not take a region — which is satisfied by every
+    definition of the entry edge, including one with the sides swapped. A test that only watches
+    a machine stay silent proves nothing until the machine has been given a reason to speak.
+    """
+    marking = bar(0, open_="95", close="99", high="100", low="90")  # the region is [90, 100]
+
+    demand = _followed(FVGKind.BULLISH, marking)
+    assert not demand.touched_by(bar(1, open_="105", close="104", high="106", low="100.01"))
+    assert demand.touched_by(bar(2, open_="105", close="104", high="106", low="100"))
+    assert demand.near_edge == Decimal("100")
+
+    supply = _followed(FVGKind.BEARISH, marking)
+    assert not supply.touched_by(bar(1, open_="85", close="86", high="89.99", low="84"))
+    assert supply.touched_by(bar(2, open_="85", close="86", high="90", low="84"))
+    assert supply.near_edge == Decimal("90")
 
 
 def test_a_region_cannot_be_taken_by_the_bar_that_created_it() -> None:
@@ -1975,6 +2070,69 @@ def test_a_region_cannot_be_taken_by_the_bar_that_created_it() -> None:
     # gap bar is clear of the region by the gap condition itself.
     assert not region.touched_by(_OB_IMPULSE[4])
     assert not region.touched_by(_OB_IMPULSE[5])
+
+
+def _visited(dip_low: str) -> list[Candle]:
+    """One impulse leg, twice: the only difference is how deep bar 6 pulls back.
+
+    The region is marked on bar 3 at [98, 100] and born on bar 5, when its gap completes. Bar 6
+    is the pullback — a low of 101 leaves it alone, a low of 100 touches its top exactly — and
+    bar 6 is *also* the marking candle of a second gap, so whichever way it goes it leaves a
+    region of its own behind. Bar 9 closes through 123 and breaks structure over both.
+    """
+    return [
+        bar(0, open_="122", close="122", high="123", low="120"),  # top 123
+        bar(1, open_="119", close="119", high="122", low="118"),  # correction 1
+        bar(2, open_="117", close="117", high="121", low="116"),  # correction 2 -> armed
+        bar(3, open_="99", close="99", high="100", low="98"),  # marks the region [98, 100]
+        bar(4, open_="104", close="104", high="105", low="103"),
+        bar(5, open_="108", close="108", high="110", low="102"),  # gap: 100 < 102, close[1] = 104
+        bar(6, open_="106", close="106", high="107", low=dip_low),  # the visit, or the near miss
+        bar(7, open_="110", close="110", high="112", low="106"),
+        bar(8, open_="116", close="116", high="118", low="112"),
+        bar(9, open_="124", close="124", high="125", low="120"),  # close 124 > 123 -> BOS
+    ]
+
+
+def test_a_region_taken_before_the_break_is_never_offered() -> None:
+    """The rule this whole change exists for: a break reveals only what is still standing.
+
+    A region is born at its gap and price starts working it immediately, but nothing *asks* about
+    it until a break comes along — a median of 16 bars later, 282 at the worst. The engine used to
+    create the region at the break and so knew nothing of those bars, which meant **49% of the
+    regions it offered were already spent**. Measured, and it is the bug behind the worked example
+    in `docs/referencia/indicador-regioes-order-block.md`: a primary marked on 14/08, first touched
+    four hours later, offered fresh to a CHoCH on 21/08 and filled on 28/08 for -1.73R.
+
+    Two scenarios that differ by one point of one low, so the machine has every chance to speak:
+
+    * bar 6 bottoms at 101 — the region survives and is offered as the primary;
+    * bar 6 bottoms at 100 — its top exactly — and it is **gone**, with the region bar 6 marked on
+      its way through promoted to primary in its place.
+
+    The promotion is what makes this sharp. A regression does not merely add a zone back to the
+    list, it changes which region the setup is handed first, and `allow_secondary: false` means
+    the primary is the only one most runs ever see.
+
+    Pinned as well: the break reports the **same** `origin_time` in both, so the vanishing cannot
+    be the impulse leg having moved out from under the region. Only mitigation is left.
+    """
+    survived = _zones_from_bullish(_visited("101"))
+    assert [(z.bottom, z.top, z.primary) for _, z in survived] == [
+        (Decimal("98"), Decimal("100"), True),
+        (Decimal("101"), Decimal("107"), False),
+    ]
+
+    taken = _zones_from_bullish(_visited("100"))
+    assert [(z.bottom, z.top, z.primary) for _, z in taken] == [
+        (Decimal("100"), Decimal("107"), True),  # the survivor of bar 6, promoted
+    ]
+
+    origins = [
+        events[-1][1].origin_time
+        for events in (_breaks_from_bullish(_visited(low)) for low in ("101", "100"))
+    ]
+    assert origins[0] == origins[1] == _at(3)  # the leg is identical; only the touch differs
 
 
 def test_a_choch_marks_its_zone_and_says_so() -> None:

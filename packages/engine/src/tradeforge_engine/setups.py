@@ -315,18 +315,32 @@ class StructureStrategy:
     honest answer would be *arrival order in a list*. One order is auditable.
 
     **The order's life is the zone's life.** There is no separate expiry. While the zone still
-    stands the order waits; the bar the zone is spent — closed through, or driven a full width
-    clear of, or simply aged out of the tracker — the order is withdrawn. Only the strategy can
-    know that, which is why `Broker.cancel` exists and why the broker is never told about zones
+    stands the order waits; the bar the zone is spent — the first wick back to its entry edge, or
+    simply aged out of the tracker — the order is withdrawn. Only the strategy can know that,
+    which is why `Broker.cancel` exists and why the broker is never told about zones
     (`AGENTS.md §5.4`).
 
-    **One trade per zone, ever.** A region whose order filled is finished here, whether the
-    stop, the target, or the same bar ended the trade. Without this the machine martingales: a
-    zone survives being traded — a wick down through a demand zone only marks it *flipped*, and
-    mitigation wants a close beyond it — so a stateful qualifier still pointing at the region
-    re-arms it the bar after the stop, and buys the same level into the same downtrend until the
-    zone finally breaks. The backtest then reports a setup that averages down, and the equity
-    curve blames the setup rather than this class.
+    **One trade per zone, ever.** A region whose order filled is finished here, whether the stop,
+    the target, or the same bar ended the trade. Without this the machine martingales: a stateful
+    qualifier still pointing at the region re-arms it the bar after the stop and buys the same
+    level into the same downtrend until the zone finally breaks. The backtest then reports a setup
+    that averages down, and the equity curve blames the setup rather than this class.
+
+    **That guard is currently redundant, and is kept anyway — read this before deleting it.**
+    Under his mitigation rule the entry edge *is* where the order rests, so any fill is a touch of
+    the edge on that same bar, and `_blocks.update` runs at the top of `on_bar` — before the fill
+    is observed and before anything may be armed. The region is therefore already dead when
+    `_may_arm` asks, and `_still_standing` refuses it without `_traded` ever being consulted.
+    Verified by mutation: deleting the `_traded` check breaks no test, and there is no path where
+    only it catches. Two reasons it stays. It states a **different** invariant — one trade per
+    region, independent of how regions die — and the rule it currently duplicates is exactly the
+    one that just changed under it; and it fails safe, refusing a trade, where the branch this PR
+    *did* remove (`_entry_for`'s wait) failed silent, returning `None` and hiding the breakage.
+
+    An earlier version of this paragraph justified the guard with "a zone survives being traded —
+    a wick down only marks it flipped, and mitigation wants a close beyond it". Both halves
+    described machinery this PR deleted. Wrong documentation on a correctness path becomes wrong
+    code again, so it is recorded here rather than quietly corrected.
 
     The line is drawn at the **fill**, deliberately — the author's rule: placing the order and
     *activating the trade* is what spends a region. A zone whose order was withdrawn untouched,
@@ -595,9 +609,12 @@ class StructureStrategy:
         * **A zone that no longer stands** — mitigated, or dropped by the tracker. Checking this
           only at the top of the bar would be a bar too late: the broker fills before the strategy
           runs (`loop.py`), so an order armed on a dead zone fills before its cancel is ever sent.
-        * **A zone that has already given its trade.** See the class docstring: without it the
-          machine re-buys a level it was just stopped out of. Only a *fill* puts a zone in
-          `_traded` — an order withdrawn untouched leaves its region free to be named again.
+        * **A zone that has already given its trade.** Only a *fill* puts a zone in `_traded` —
+          an order withdrawn untouched leaves its region free to be named again. Under his
+          mitigation rule this check is currently unreachable, because the fill and the touch that
+          retires the region are the same event and the region is dead by the time this runs; it
+          is kept deliberately, and the class docstring says why. Do not delete it on the strength
+          of a green suite alone.
         """
         if self._armed is not None and block == self._armed.block:
             return False

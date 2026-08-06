@@ -834,11 +834,16 @@ def test_a_fill_spends_the_region_it_traded_and_no_other() -> None:
     Two honest notes on what this does *not* own, so nobody has to rediscover them. The bar-12
     silence is the sibling's claim, not this one: under his mitigation rule an unobserved fill
     leaves `_armed` on a region the same bar just retired, so the phantom withdrawal fires on bar
-    12 there too. And every mutant this kills — the fill forgetting to clear `_armed`, forgetting
-    `_traded`, or spending the whole tracker — is also killed by some sibling; measured, and the
-    file's coverage of `setups.py` is unchanged without it. It is kept because it is the only
-    scenario in this file whose *subject* is a fill's blast radius, and the only one that reaches
-    it through a hand-delivered `Context.fills` (ADR-0015) rather than through a broker.
+    12 there too. And the mutants this kills — the fill forgetting to clear `_armed`, forgetting
+    to record `_traded`, spending the whole tracker — each die in some sibling as well; measured,
+    and the file's coverage of `setups.py` is unchanged without it. It is kept because it is the
+    only scenario here whose *subject* is a fill's blast radius, and the only one that reaches it
+    through a hand-delivered `Context.fills` (ADR-0015) rather than through a broker.
+
+    What no test in this file kills is the `_traded` **guard** in `_may_arm` — deleting it leaves
+    the suite green. That is not an oversight to fix here; the guard is unreachable by
+    construction under his mitigation rule and is kept on purpose. `StructureStrategy`'s docstring
+    carries the argument and the measurement.
     """
     strategy = StructureStrategy(
         qualifier=_Script(picks={9: 1, 13: 0, 14: 1}), allow_secondary=True
@@ -1450,6 +1455,41 @@ def test_a_new_choch_replaces_the_ladder() -> None:
     # An empty-handed choch also replaces: the old rung must not survive the turn of trend.
     empty = qualifier.qualify(_ctx(break_=contrary, marked=(), zones=(TrackedZone(block=primary),)))
     assert empty is None
+
+
+def test_a_bos_in_the_same_direction_also_empties_the_ladder() -> None:
+    """His rule 4, and the half that used to leak. Stated by him on 05/08/2026:
+
+        "um choch de baixa cria a zona, se depois ele fizer um bos de baixa, a entrada de choch
+        morre. mesma coisa um bos de baixa, se ele faz um segundo bos a entrada do 1 morreu e só
+        pode entrar pelo segundo. e assim vai"
+
+    Only the regions of the **most recent** break are live. The continuation setup always worked
+    this way — a new BOS replaces its whole ladder — but this qualifier only ever reacted to
+    another CHoCH, so any number of BOS could confirm while an order still rested on a region the
+    structure had left behind. Measured over 3480 AAPL H1 candles: 21 of 34 changes of character
+    were followed by at least one BOS before the next one, 53 breaks in all, up to 7 stacked on a
+    single choch.
+
+    The region here is handed back **alive and present** in `context.zones`, which is the whole
+    difference between this test and a vacuous one. The ladder walk already skips a rung it
+    cannot find or that is no longer usable, so a scenario that withheld the zone would return
+    `None` whether the ladder was emptied or not — right answer, wrong reason, and the rule would
+    still be deletable. Here the only thing that can silence the qualifier is the BOS itself.
+
+    A BOS leaves regions of its own, but they belong to the continuation setup, not to this one.
+    That is why the ladder empties rather than refills.
+    """
+    primary = _supply("120", "125", 9, primary=True)
+    alive = (TrackedZone(block=primary),)
+    qualifier = ChochQualifier()
+    assert qualifier.qualify(_ctx(break_=_CHOCH_DOWN, marked=(primary,), zones=alive)) is primary
+
+    # The structure moves on in the same direction. Nothing happened to the region itself.
+    assert alive[0].usable
+    assert qualifier.qualify(_ctx(break_=_BOS_DOWN, marked=(), zones=alive)) is None
+    # And it stays dead to this setup on later bars, not just on the bar the BOS confirmed.
+    assert qualifier.qualify(_ctx(zones=alive)) is None
 
 
 def test_an_outcome_and_a_new_choch_on_one_bar_settle_in_order() -> None:

@@ -301,3 +301,34 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
   Conserto quando existir o primeiro trail não-média: ou o ponto passa a admitir valor nulo (e o
   desenho quebra a linha ali de propósito), ou o trail recusa lacuna interna. Hoje é inalcançável
   — o único produtor é a média — por isso fica anotado em vez de resolvido.
+- [origem: PR-223] **"Uma região é oferecida no máximo uma vez" não tem prova** — na varredura que
+  o rompimento faz, `structure.py:1186` guarda `r.index > self._index`. Trocado por `>=`, a suíte
+  inteira passa. O efeito da mutação é real: uma região nascida na *própria* barra do rompimento
+  sobrevive à limpeza e, se for do mesmo lado, pode ser oferecida de novo num rompimento posterior
+  com outro `confirmed_at` — dois `TrackedZone` para o mesmo gap, e um deles com a idade errada.
+  Fora do escopo do PR-223 porque o comportamento é **idêntico ao da base** (`g.time >
+  break_.time` também esvaziava tudo); o PR não mexeu nessa linha. Achado pelo engine-guardian.
+- [origem: PR-223] **Coletar dados pela tela, com busca de ticker no MT5** — pedido dele em
+  06/08/2026: escolher ativo e timeframe no front e o sistema coleta, mais um campo de busca que,
+  ao digitar o ticker, pergunta ao MT5 se aquele símbolo existe. Motivação real: ele troca de
+  corretora/mercado dentro do MT5, então a lista de símbolos disponíveis **muda**, e hoje a única
+  porta é a CLI do collector.
+  ⚠️ **A restrição que decide a forma:** `AGENTS.md §5.4` / ADR-02 — nada fora de `apps/collector`
+  e `apps/executor` importa a lib `MetaTrader5` — e o MT5 só roda no **host Windows**, enquanto a
+  API e o worker rodam **em container**. A API não pode falar com o MT5, nem hoje nem depois.
+  Desenho candidato, que reusa o encanamento que já existe em vez de inventar transporte:
+  1. **Um segundo worker arq, rodando no host** (fora do docker, ao lado do terminal MT5),
+     consumindo uma fila `collect` do mesmo Redis. A API só enfileira; o host coleta, escreve o
+     Parquet e cataloga. A tela acompanha por polling, exatamente como já faz com backtests.
+     O preço: ele precisa manter esse processo no ar, como já mantém o terminal aberto.
+  2. **Busca de símbolo não pode ser round-trip por tecla.** O mesmo worker publica um *snapshot*
+     do catálogo do broker (`mt5.symbols_get()` — 9550 símbolos na conta dele) para o Postgres, e
+     a API serve a busca daí: instantânea, e continua funcionando com o terminal fechado. Um botão
+     "sincronizar símbolos" cobre a troca de corretora, que é o caso que ele descreveu.
+  3. ⚠️ **Bloqueio conhecido, e ele já anunciou que vai cair nele:** `mt5_source.py` chama
+     `mt5.initialize()` **sem argumento**, então com dois terminais instalados não há como
+     escolher qual. Precisa de `--terminal-path` → `initialize(path=...)` antes de "trocar de
+     corretora" virar operação de tela.
+  4. Timeframe **não** é trabalho: a cadeia inteira já é agnóstica (a DSL é dona da lista dos 8,
+     a tela renderiza `TIMEFRAMES`, o collector mapeia por `getattr(mt5, f"TIMEFRAME_{tf}")` e a
+     constraint do banco aceita os 8). Hoje só existe H1 em disco porque só H1 foi coletado.

@@ -138,6 +138,17 @@ class FVGDetector:
     its right — it is defined by the three that end on the current one — so it confirms with no
     lag and no lookahead: a rule acting on it acts on the next open. Only Decimal highs and lows
     are compared, so it is exact and context-independent.
+
+    **The middle candle must also close beyond the gap's origin**, and that is the author's rule
+    rather than the textbook one — his indicator is in `docs/referencia/indicador-regioes-order-
+    block.md`, and where the two disagree it wins. The geometric test alone admits a shape he does
+    not trade: three bars that leave an untraded band while the middle one closes back *inside*
+    it, which is a hole price is still arguing over rather than one it left behind. Requiring the
+    close makes the middle bar commit to the direction that made the hole.
+
+    Measured over 3480 real AAPL H1 candles: the geometric test alone reports 482 bullish and 388
+    bearish gaps, his rule 428 and 347 — so 95 of them, better than one in six, were shapes the
+    engine marked and he does not.
     """
 
     def __init__(self) -> None:
@@ -149,13 +160,14 @@ class FVGDetector:
         if len(self._window) < 3:  # noqa: PLR2004 — a gap is a three-candle pattern
             return None
 
-        first, _middle, third = self._window
-        if first.high < third.low:
-            # Bullish: an untraded band from the first high up to the third low.
+        first, middle, third = self._window
+        if first.high < third.low and middle.close > first.high:
+            # Bullish: an untraded band from the first high up to the third low, left by a middle
+            # bar that closed clear of it.
             return FairValueGap(
                 kind=FVGKind.BULLISH, top=third.low, bottom=first.high, time=third.time
             )
-        if first.low > third.high:
+        if first.low > third.high and middle.close < first.low:
             # Bearish: an untraded band from the third high up to the first low.
             return FairValueGap(
                 kind=FVGKind.BEARISH, top=first.low, bottom=third.high, time=third.time
@@ -991,10 +1003,13 @@ class OrderBlock:
     the last opposite candle before the break, and says to pick one and stay with it. This is the
     one.)
 
-    `top` and `bottom` bound the zone. For demand the base is the marking candle's own range,
-    extended *down* to the gap candle's low whenever that low ran deeper — the wick is part of
-    where they worked, and dropping it would put the zone above where price actually turned.
-    Supply mirrors it upward.
+    `top` and `bottom` bound the zone, and they are the marking candle's **own high and low** —
+    nothing added, nothing extended. His indicator draws exactly `[low[2], high[2]]`.
+
+    An earlier version of this widened the zone to swallow the gap candle's wick wherever that ran
+    past the marking candle, on the reasoning that the wick was part of where the size was worked.
+    That was not his rule, and it was not harmless: the edge is where the order rests, so a
+    widened zone is an order at a price he would not have used. It moved 22% of zones.
 
     `time` is the bar the zone is drawn on; `confirmed_at` is the bar whose close broke structure
     and revealed it. Both matter and they differ: the zone belongs to the past, but nothing could
@@ -1017,59 +1032,66 @@ class OrderBlock:
 
 @dataclass(slots=True)
 class TrackedZone:
-    """An order block and what price has since done to it.
+    """An order block and the one thing that can happen to it.
 
-    Two marks, both permanent once set, and they answer different questions.
+    `mitigated` says the region is spent: **price came back and touched its entry edge**, by wick,
+    once. The near edge is the top of a demand zone and the bottom of a supply zone — the side
+    price has to return to in order to trade there — so the first touch is the moment the orders
+    resting in the region are taken. There is nothing to add after that; a region is offered once.
 
-    `mitigated` says the zone is spent **for its own side**. It happens either the healthy way —
-    price came back, touched it, and then *closed* a full zone-width clear of it, so the orders
-    resting there have been filled and the move they fund is already underway — or the failed way:
-    price closed straight through, so whatever was defending the level is gone.
+    That is his indicator's rule verbatim (`docs/referencia/indicador-regioes-order-block.md`):
 
-    A touch is a wick; everything that *decides* is a close. That split is what lets a zone survive
-    a news spike: a bar can trade far outside it and still end up inside, and the market has not
-    left. It also removes the intrabar guess — a single bar whose wick both reaches the zone and
-    runs a width past it says nothing about which came first, so nothing is inferred from it.
+        ob.bull ? low <= ob.topo : high >= ob.fundo
 
-    `flipped` says price went *through* the zone, by wick or by close. A demand zone that price
-    traded down through has trapped every buyer who took it, and on the way back those buyers sell
-    to get out flat. That is the raw material of the flip setup: a zone marked flipped is where a
-    trade *against* the prevailing trend becomes reasonable. A wick through is enough to mark it
-    and leaves the zone still usable; a close through marks it **and** mitigates it.
+    An earlier version of this carried three more marks — `touched`, `departed`, `flipped` — and a
+    second way to die, `driven_off`, where a close a full zone-width clear counted as the region
+    having done its job. None of that is his method. The extra marks existed to feed a *flip*
+    setup, trading the region price had traded through against whoever was trapped in it; asked
+    directly, he said a dead region does not serve a flip, and the setup had never been built.
     """
 
     block: OrderBlock
-    touched: bool = False
-    departed: bool = False
-    flipped: bool = False
     mitigated: bool = False
 
     @property
     def usable(self) -> bool:
-        """Whether the zone still stands for the side it was marked on."""
+        """Whether the region still stands — nothing has come back to take it."""
         return not self.mitigated
 
-    @property
-    def flippable(self) -> bool:
-        """Whether breaking this zone would still count as a flip.
 
-        A flip has to be *abrupt* — one move that arrives and takes the zone out. Price that came
-        in, backed away, and only later returned to break it is a different story: the zone was
-        already being negotiated, so breaking it traps nobody the way a single decisive drive
-        does. A zone price has left after touching, or that is already mitigated, is past that.
-        """
-        return not self.departed and not self.mitigated
+@dataclass(slots=True)
+class _Region:
+    """A gap's region, followed from the bar the gap completed.
 
+    This is the piece that has to exist *before* a break reveals anything. A region is born the
+    moment its gap completes, and price starts working it from that bar — so by the time a break
+    makes it interesting, it may already be gone. Waiting for the break to start watching is what
+    made the engine offer regions the market had spent days earlier.
+    """
 
-@dataclass(frozen=True, slots=True)
-class _GapEvent:
-    """One confirmed gap, kept with the two candles a zone would be marked from."""
-
-    index: int  # bar index of the gap's third candle — adjacency is what groups a run
+    index: int  # bar index of the gap's third candle
     kind: FVGKind
-    time: datetime
-    first: Candle  # c1 — the candle the zone is drawn on
-    second: Candle  # c2 — the impulse candle whose wick may extend the zone
+    marking: Candle  # c1 — the candle the region is drawn on; its range *is* the region
+    mitigated: bool = False
+
+    @property
+    def top(self) -> Money:
+        return self.marking.high
+
+    @property
+    def bottom(self) -> Money:
+        return self.marking.low
+
+    @property
+    def near_edge(self) -> Money:
+        """The side price must come back to: a demand region's top, a supply region's bottom."""
+        return self.top if self.kind is FVGKind.BULLISH else self.bottom
+
+    def touched_by(self, candle: Candle) -> bool:
+        """His rule, on one candle: the first wick to reach the entry edge takes the region."""
+        if self.kind is FVGKind.BULLISH:
+            return candle.low <= self.near_edge
+        return candle.high >= self.near_edge
 
 
 class OrderBlockDetector:
@@ -1080,90 +1102,92 @@ class OrderBlockDetector:
     bar, the stretch the break itself reports — for gaps pointing the same way as the break, and
     returns the zones they mark, primary first.
 
-    Three rules, all the author's:
+    Four rules, all the author's, and his indicator is the reference for the first three:
+    `docs/referencia/indicador-regioes-order-block.md`.
 
-    * **The gap must be in the impulse leg.** A gap left somewhere else is not the footprint of the
-      move that broke structure, so it marks nothing here.
-    * **The zone is the candle before the gap**, widened by the gap candle's wick when that wick
-      ran past it.
-    * **Consecutive gaps are one event.** Price gapping on bar after bar is one continuous push;
-      it takes a pause — a bar that completes no gap — before a fresh gap starts a second zone.
-      Without this an impulsive leg would mark a zone on nearly every bar of itself.
+    * **The region is born at the gap, not at the break.** It is the marking candle's own range,
+      and it starts being worked the moment the gap completes. This is the rule the detector used
+      to get wrong, and it was not a detail: a break confirms a median of 16 bars after the gap
+      (282 at the worst), so a region could be traded away for a week before anything asked about
+      it. Offered fresh at the break, it was an order at a level the market had already taken.
+    * **A region dies at the first touch of its entry edge**, by wick — see `TrackedZone`.
+    * **Consecutive gaps make one region.** While the gap condition holds bar after bar it is one
+      continuous push, and only the first bar of the run marks anything. His indicator latches on
+      exactly this, per direction, and so does this.
+    * **Only regions inside the impulse leg are offered.** A gap left elsewhere is not the
+      footprint of the move that broke structure. The leg is `origin_time` to the breaking bar,
+      which the break reports itself.
 
-    Nothing is reported until a break confirms on a closed candle, so a zone is only ever known
-    from `confirmed_at` onward, and a strategy acting on it acts at the next open.
-
-    Every zone it marks is then kept and followed — see `zones` and `TrackedZone` — because a zone
-    that has been used up, or traded through, is not thereby uninteresting: the flip setup trades
-    exactly those.
-
-    **A zone is born clean.** The impulse leg that revealed it is not replayed against it, and the
-    breaking bar does not touch it either. That is deliberate twice over. Nobody could know the
-    zone existed until the break confirmed, so counting the leg against it would be acting on
-    hindsight; and the leg *is* price leaving the zone — by the gap's own construction the impulse
-    candle overlaps the marking candle, so replaying it would mark almost every zone touched, and
-    often mitigated, at birth.
+    So a region has two lives. It is *followed* from its gap, by anyone or no one; it is *offered*
+    when a break reveals it, and only if it is still standing then. Nothing is reported before the
+    break, so a strategy still only ever acts from `confirmed_at` onward and acts at the next open.
     """
 
     # A leg longer than this is not an impulse any more; the cap also bounds memory when a long
     # stretch of chart passes with no break at all.
     _MAX_LOOKBACK: Final = 500
-    # Zones outlive their usefulness but stay readable for the flip setup; keep the recent ones.
+    # Offered regions stay readable to strategies for a while after they die; keep the recent ones.
     _MAX_ZONES: Final = 200
 
     def __init__(self) -> None:
         self._fvgs = FVGDetector()
         self._window: deque[Candle] = deque(maxlen=3)
-        self._gaps: list[_GapEvent] = []
+        self._regions: list[_Region] = []
         self._zones: list[TrackedZone] = []
         self._index = -1
+        # The author's latch, one per direction: a run of gapping bars marks one region, not one
+        # per bar. Cleared by any bar that completes no gap that way.
+        self._gapping: dict[FVGKind, bool] = {FVGKind.BULLISH: False, FVGKind.BEARISH: False}
 
     @property
     def zones(self) -> tuple[TrackedZone, ...]:
-        """Every zone marked so far, oldest first, each with what price has done to it since."""
+        """Every region offered so far, oldest first, each with whether price has taken it."""
         return tuple(self._zones)
 
     def update(self, candle: Candle, break_: StructureBreak | None) -> tuple[OrderBlock, ...]:
-        """Fold in one closed candle and the break it confirmed (if any); return the zones marked.
+        """Fold in one closed candle and the break it confirmed (if any); return the zones offered.
 
         Pass the `StructureBreak` that `MarketStructure.update` returned for *this* candle, or
-        `None`. Returns the zones the break reveals, primary first, and `()` on every other bar.
+        `None`. Returns the regions the break reveals, primary first, and `()` on every other bar.
         """
         self._index += 1
         self._window.append(candle)
-        # Advance the zones already on the book *before* marking new ones: a zone cannot be
-        # touched or broken by the very bar whose close first revealed it.
+        # Everything already being followed advances *before* this bar can mark anything new. A
+        # region cannot be taken by the bar that created it — his gap condition puts price clear
+        # of the region on that bar, so the first touch can only come later.
         for tracked in self._zones:
             self._advance(tracked, candle)
+        for region in self._regions:
+            region.mitigated = region.mitigated or region.touched_by(candle)
 
         gap = self._fvgs.update(candle)
-        if gap is not None and len(self._window) == self._window.maxlen:
-            first, second, _third = self._window
-            self._gaps.append(
-                _GapEvent(
-                    index=self._index, kind=gap.kind, time=gap.time, first=first, second=second
-                )
-            )
-        self._gaps = [g for g in self._gaps if self._index - g.index <= self._MAX_LOOKBACK]
+        for kind in self._gapping:
+            self._gapping[kind] = self._gapping[kind] and gap is not None and gap.kind is kind
+        if gap is not None and not self._gapping[gap.kind]:
+            if len(self._window) == self._window.maxlen:
+                marking, _impulse, _third = self._window
+                self._regions.append(_Region(index=self._index, kind=gap.kind, marking=marking))
+            self._gapping[gap.kind] = True
+        self._regions = [r for r in self._regions if self._index - r.index <= self._MAX_LOOKBACK]
 
         if break_ is None:
             return ()
 
         wanted = FVGKind.BULLISH if break_.trend is Trend.BULLISH else FVGKind.BEARISH
         in_leg = [
-            gap_event
-            for gap_event in self._gaps
-            if gap_event.kind is wanted
-            and gap_event.first.time >= break_.origin_time
-            and gap_event.time <= break_.time
+            region
+            for region in self._regions
+            if region.kind is wanted
+            and not region.mitigated
+            and region.marking.time >= break_.origin_time
         ]
-        # Every gap up to this break belongs to the leg that just ended: a new leg starts at the
-        # breaking bar, so none of these can qualify again.
-        self._gaps = [g for g in self._gaps if g.time > break_.time]
+        # Every region up to this break belonged to the leg that just ended, taken or not: a new
+        # leg starts at the breaking bar, so none of them can be offered again.
+        self._regions = [r for r in self._regions if r.index > self._index]
 
         marked = tuple(
-            self._zone(run[0], break_, primary=position == 0)
-            for position, run in enumerate(self._runs(in_leg))
+            self._zone(region, break_, primary=position == 0)
+            for position, region in enumerate(in_leg)
         )
         self._zones.extend(TrackedZone(block=block) for block in marked)
         if len(self._zones) > self._MAX_ZONES:
@@ -1172,90 +1196,28 @@ class OrderBlockDetector:
 
     @staticmethod
     def _advance(tracked: TrackedZone, candle: Candle) -> None:
-        """Fold one candle into a zone's state. Every mark is permanent once set."""
+        """Fold one candle into an offered region: the first touch of its entry edge takes it.
+
+        The whole rule, and permanent once set. What was here before — a flip mark, a departure
+        mark, and a second death by being driven a full width clear — was the engine's invention
+        and is documented as such on `TrackedZone`.
+        """
         block = tracked.block
-        size = block.top - block.bottom
-        demand = block.kind is ZoneKind.DEMAND
-
-        # Read before this bar changes anything. A bar that closes clean through both flips the
-        # zone and spends it, so the flip has to be judged on the history *behind* the bar — if
-        # this bar's own mitigation counted first, it would veto its own flip.
-        was_flippable = tracked.flippable
-
-        # Closing beyond the far side always spends the zone, whatever else is true of it. A level
-        # the market has closed through is gone: whether it was flippable, already departed, or
-        # untouched makes no difference to that.
-        through = candle.close < block.bottom if demand else candle.close > block.top
-        tracked.mitigated = tracked.mitigated or through
-
-        # The flip mark is the narrow one: only a still-flippable zone can be flipped, and the
-        # pierce is by wick — the drive has to arrive and take the zone out in one go.
-        pierced = candle.low < block.bottom if demand else candle.high > block.top
-        if was_flippable and pierced:
-            tracked.flipped = True
-
-        # Reaching the zone at all counts as a touch — by wick, like everything else here.
-        reached = candle.low <= block.top if demand else candle.high >= block.bottom
-        tracked.touched = tracked.touched or reached
-        # Leaving it is judged on the *close*, not the wick — the same line this module draws
-        # everywhere else. News can spike price far out of a zone and drag it straight back inside
-        # within one bar; that spike is not the market backing away from the level. Only a bar
-        # that ends up beyond the near edge has actually left. So a bar closing lower inside the
-        # zone, then one that pokes up but closes down and carries on through, is still one drive.
-        #
-        # `touched` is updated first on purpose: a single bar that dips into the zone and closes
-        # clear of it has touched and left, exactly as two bars doing the same would. Reading the
-        # old value here would make the flip mark depend on whether the move happened to land in
-        # one candle or two — the same strategy would flip on M5 and not on M15.
-        # Set *after* the flip mark above, and that ordering is semantic, not cosmetic: a bar that
-        # arrives, takes the zone out and closes clear must not use its own departure to veto its
-        # own flip. Same principle as reading `was_flippable` at the top. Moving this block up
-        # would silently break it.
-        cleared = candle.close > block.top if demand else candle.close < block.bottom
-        if tracked.touched and cleared:
-            tracked.departed = True
-
-        # Spent the healthy way: touched, then driven off by a full zone-width. The zone did its
-        # job, and the orders that were resting in it are now in the market.
-        #
-        # Measured on the close, like every other decision in this module. A news wick can throw
-        # price a long way past a zone and bring it back inside the same bar; treating that spike
-        # as the zone having worked would kill a level the market never actually left — and with
-        # it any flip that level still had in it, since a mitigated zone can no longer flip.
-        if not tracked.touched:
-            return
-        driven_off = (
-            candle.close > block.top + size if demand else candle.close < block.bottom - size
-        )
-        tracked.mitigated = tracked.mitigated or driven_off
-
-    @staticmethod
-    def _runs(gaps: list[_GapEvent]) -> list[list[_GapEvent]]:
-        """Split gaps into runs of consecutive bars. A break in the indices is the pause that
-        separates one gap event from the next."""
-        runs: list[list[_GapEvent]] = []
-        for gap in gaps:
-            if runs and gap.index == runs[-1][-1].index + 1:
-                runs[-1].append(gap)
-            else:
-                runs.append([gap])
-        return runs
-
-    @staticmethod
-    def _zone(gap: _GapEvent, break_: StructureBreak, *, primary: bool) -> OrderBlock:
-        """Mark the zone on the candle before `gap`, extended by the gap candle's wick."""
-        marking, impulse = gap.first, gap.second
-        if gap.kind is FVGKind.BULLISH:
-            kind = ZoneKind.DEMAND
-            top, bottom = marking.high, min(marking.low, impulse.low)
+        if block.kind is ZoneKind.DEMAND:
+            reached = candle.low <= block.top
         else:
-            kind = ZoneKind.SUPPLY
-            top, bottom = max(marking.high, impulse.high), marking.low
+            reached = candle.high >= block.bottom
+        tracked.mitigated = tracked.mitigated or reached
+
+    @staticmethod
+    def _zone(region: _Region, break_: StructureBreak, *, primary: bool) -> OrderBlock:
+        """Offer a region that is still standing — its marking candle's range, edge to edge."""
+        kind = ZoneKind.DEMAND if region.kind is FVGKind.BULLISH else ZoneKind.SUPPLY
         return OrderBlock(
             kind=kind,
-            top=top,
-            bottom=bottom,
-            time=marking.time,
+            top=region.top,
+            bottom=region.bottom,
+            time=region.marking.time,
             confirmed_at=break_.time,
             break_kind=break_.kind,
             primary=primary,

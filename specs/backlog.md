@@ -365,3 +365,21 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
   em diretórios temporários e gravar o ano numa única chamada. Conserto candidato: o collector
   fatiar sozinho quando o intervalo pedido exceder o limite, acumulando antes de escrever; e a
   mensagem de erro sugerir a janela menor em vez de só repassar o código do terminal.
+- [origem: coleta 06/08] **Backfill em pedaços deixa o catálogo descrevendo só o último pedaço** —
+  `record_dataset` (`packages/db/.../instruments.py`) faz upsert com
+  `index_elements=[Dataset.instrument_id, Dataset.timeframe]`, então cada rodada **substitui** a
+  linha em vez de estender a cobertura. Como o limite de ~11 mil barras do MT5 (item acima) obriga
+  a coletar por ano, a linha final descreve apenas o último ano coletado. Medido em 06/08, disco
+  contra catálogo: EURUSD e GBPUSD H1 têm **9804** candles desde 01/01/2025 no Parquet e o catálogo
+  diz **3605** desde 01/01/2026; AAPL M5 tem **38 391** desde 01/08/2024 e o catálogo diz
+  **11 161** desde 02/01/2026. Escrever pelo `write_candles` direto (como foi preciso fazer para
+  fundir as metades de 2025) não cataloga nada.
+  Não bloqueia nada hoje: o backtest lê o Parquet do disco e **nada** na API ou na web consulta
+  `datasets` — o próprio `config.py` diz que "the `datasets` row only proves coverage, the bytes
+  live on disk". Mas é exatamente a tabela cujo propósito é provar cobertura, e ela está afirmando
+  menos do que existe. Conserto candidato: o upsert unir a faixa (`least(date_from)`,
+  `greatest(date_to)`) e recontar do Parquet em vez de confiar no que a rodada trouxe — recontar é
+  o único jeito de a linha ficar verdadeira depois de uma escrita que não passou pelo CLI.
+  ⚠️ **AAPL H1 não está no catálogo** por outro motivo, já registrado: foi coletado em 03/08 e o
+  banco foi truncado em 04/08 pelos testes de integração; os instrumentos foram resemeados, os
+  datasets não.

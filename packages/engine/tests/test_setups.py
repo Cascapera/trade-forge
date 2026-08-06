@@ -815,40 +815,43 @@ def test_a_trade_that_opened_and_died_inside_one_bar_still_spends_its_zone() -> 
     assert region.block in strategy._traded
 
 
-def test_an_invisible_fill_does_not_leave_a_phantom_armed_order() -> None:
-    """The discriminator for the fill observation itself, on a *different* zone qualifying next.
+def test_a_fill_spends_the_region_it_traded_and_no_other() -> None:
+    """A trade retires **its own** region. Every other region the impulse left stays tradeable.
 
-    The sibling test above re-names the traded zone, and that cannot tell the observation apart
-    from its absence: an unobserved fill leaves `_armed` pointing at the zone with `placed=True`,
-    and the repeat guard refuses the re-arm with the same silence `_traded` would — right answer,
-    wrong reason. The difference only shows when another zone qualifies after the invisible fill:
+    The two siblings above both end in silence, so neither can tell "the fill spent one region"
+    apart from "the fill ended the machine". Nor is the difference academic: the impulse leaves a
+    primary and a secondary, and a rule that let one trade retire the pair would quietly halve the
+    regions the method offers — the same class of loss as the mitigation bug this PR fixed, and
+    just as invisible in the totals.
 
-    * observed (correct): the armed name was forgotten with the fill, so zone B arms with
-      **exactly one ENTRY and no CANCEL** — nothing rests to withdraw;
-    * unobserved: the phantom is withdrawn first (a cancel for an order the trade consumed), and
-      worse, the traded zone A never entered `_traded` — so when the setup names A again, it
-      re-arms and the martingale is back through the supersession door.
+    Geometry, and it is the reverse of what this scenario used to do. The traded region has to be
+    the **upper** one, because a fill is a touch of the near edge and price cannot reach a lower
+    region's edge without first passing through a higher one's. So the secondary at [110, 117] is
+    the one bought — limit 117, stop 109.3, a tenth of the zone's own width under the floor — and
+    the flash bar's low of 109 takes entry and stop together without ever reaching 100. The
+    primary [90, 100] is left untouched, alive, and free to arm on the next bar that names it.
 
-    Geometry, chosen so zone A is still alive to answer step (b): the marking candle is dug to 80,
-    making A [80, 100] — twenty wide, so mitigation needs a close at 120 and the closes here stay
-    under it — and zone B is the same impulse's secondary at [110, 117], reachable while A lives.
-    The stop sits at 78, so the one-bar round trip needs a low of 77: a flash-crash bar, which is
-    what it takes for entry and stop to die together while both regions survive on the close.
+    Two honest notes on what this does *not* own, so nobody has to rediscover them. The bar-12
+    silence is the sibling's claim, not this one: under his mitigation rule an unobserved fill
+    leaves `_armed` on a region the same bar just retired, so the phantom withdrawal fires on bar
+    12 there too. And every mutant this kills — the fill forgetting to clear `_armed`, forgetting
+    `_traded`, or spending the whole tracker — is also killed by some sibling; measured, and the
+    file's coverage of `setups.py` is unchanged without it. It is kept because it is the only
+    scenario in this file whose *subject* is a fill's blast radius, and the only one that reaches
+    it through a hand-delivered `Context.fills` (ADR-0015) rather than through a broker.
     """
-    candles = [*_IMPULSE]
-    candles[3] = bar(3, open_="99", close="99", high="100", low="80")  # zone A becomes [80, 100]
     strategy = StructureStrategy(
-        qualifier=_Script(picks={9: 0, 13: 1, 14: 0}), allow_secondary=True
+        qualifier=_Script(picks={9: 1, 13: 0, 14: 1}), allow_secondary=True
     )
-    descent = [
-        bar(10, open_="124", close="118", high="125", low="116"),
-        bar(11, open_="118", close="112", high="119", low="111"),
+    descent = [  # down off the break, but clear of 117: the secondary must survive to be filled
+        bar(10, open_="124", close="120", high="125", low="119"),
+        bar(11, open_="120", close="119", high="121", low="118"),
     ]
-    signals = _drive_from_bullish(strategy, [*candles, *descent])
+    signals = _drive_from_bullish(strategy, [*_IMPULSE, *descent])
     [entry] = signals[9]
-    assert (entry.limit_price, entry.stop_loss) == (Decimal("100"), Decimal("78"))
+    assert (entry.limit_price, entry.stop_loss) == (Decimal("117"), Decimal("109.3"))
 
-    wick_out = bar(12, open_="112", close="112", high="113", low="77")  # fills 100, stops 78
+    wick_out = bar(12, open_="118", close="118", high="119", low="109")  # fills 117, stops 109.3
     fill = Fill(
         order=OrderRequest(
             symbol=AAPL.symbol,
@@ -861,7 +864,7 @@ def test_an_invisible_fill_does_not_leave_a_phantom_armed_order() -> None:
             client_id=entry.client_id,
         ),
         time=_at(12),
-        price=Decimal("100"),
+        price=Decimal("117"),
         volume=Decimal(1),
         costs=Decimal(0),
     )
@@ -869,17 +872,26 @@ def test_an_invisible_fill_does_not_leave_a_phantom_armed_order() -> None:
         during = strategy.on_bar(
             Context(candle=wick_out, instrument=AAPL, account=_ACCOUNT, fills=(fill,))
         )
-        b_bar = bar(13, open_="112", close="118", high="119", low="111")  # zone B is named
-        b_signals = strategy.on_bar(Context(candle=b_bar, instrument=AAPL, account=_ACCOUNT))
-        a_again = bar(14, open_="118", close="119", high="120", low="117")  # zone A named again
-        a_signals = strategy.on_bar(Context(candle=a_again, instrument=AAPL, account=_ACCOUNT))
+        primary_bar = bar(13, open_="118", close="119", high="120", low="117")  # names [90, 100]
+        primary_signals = strategy.on_bar(
+            Context(candle=primary_bar, instrument=AAPL, account=_ACCOUNT)
+        )
+        traded_again = bar(14, open_="119", close="120", high="121", low="118")  # names the spent
+        again_signals = strategy.on_bar(
+            Context(candle=traded_again, instrument=AAPL, account=_ACCOUNT)
+        )
 
-    assert during == ()
-    [b_entry] = b_signals  # exactly one signal: no cancel for the consumed phantom
-    assert b_entry.kind is SignalKind.ENTRY
-    assert b_entry.limit_price == Decimal("117")  # the secondary zone's top
-    assert a_signals == ()  # the traded zone is spent; zone B's order stays where it is
-    assert strategy._blocks.zones[0].usable  # and A was refused as traded, not as dead
+    assert during == ()  # nothing to withdraw: the fill took the name with it
+    [primary_entry] = primary_signals  # exactly one signal, and no cancel in front of it
+    assert primary_entry.kind is SignalKind.ENTRY
+    assert primary_entry.limit_price == Decimal("100")  # the primary region, untouched and alive
+    assert again_signals == ()  # the traded region is spent; the new order stays where it is
+
+    primary, secondary = strategy._blocks.zones
+    assert primary.usable  # untouched by the trade that happened above it
+    assert primary.block not in strategy._traded
+    assert not secondary.usable  # the fill was the touch of its edge
+    assert secondary.block in strategy._traded
 
 
 def test_a_zone_withdrawn_unfilled_may_be_offered_again() -> None:

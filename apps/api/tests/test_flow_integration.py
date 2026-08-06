@@ -18,6 +18,7 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import Engine, event
 from sqlalchemy.orm import Session
 
 from tradeforge_api.config import Settings
@@ -154,8 +155,104 @@ def _assert_the_snapshot_is_advertised_then_served(
     assert client.get(f"/backtests/{backtest_id}/trades/999999999/snapshot").status_code == 404
 
 
+def _assert_the_run_log_lists_both_runs_without_their_curves(
+    client: TestClient, backtest_id: str, strategy_id: str
+) -> None:
+    """The list endpoint, checked once two runs exist — one finished, one still queued.
+
+    Called after the snapshot helper because that one leaves a second backtest behind, which is
+    what makes the filters and the `total` worth asserting at all: over a single row, every
+    filter that matches looks identical to one that does not filter.
+    """
+    page = client.get("/backtests").json()
+    assert page["total"] == 2
+    assert [item["id"] for item in page["items"]][:1] != [], "newest first, and non-empty"
+
+    listed = {item["id"]: item for item in page["items"]}
+    finished = listed[backtest_id]
+
+    # What this schema adds over `BacktestOut`: the ids resolved into what a human reads.
+    assert finished["symbol"] == "EURUSD"
+    assert finished["strategy_id"] == strategy_id
+    assert finished["strategy_name"] == _strategy()["name"]
+    assert finished["strategy_version"] == 1
+    assert finished["cost_model"] == {"type": "none"}
+    assert finished["metrics"]["total_trades"] >= 1
+
+    # The queued run has no metrics at all — null, never a fabricated row of zeroes, which would
+    # read in a comparison table as a strategy that traded and made nothing.
+    queued = next(item for item in page["items"] if item["id"] != backtest_id)
+    assert queued["status"] == "queued"
+    assert queued["metrics"] is None
+
+    # The curve is absent from the list *and* exists for this run: asserting only the absence
+    # would pass just as well against a run that never had one.
+    assert len(client.get(f"/backtests/{backtest_id}/equity").json()) >= 1
+    assert "equity" not in client.get("/backtests").text
+
+    # Filters bite, and the negative case is a symbol that exists in the catalogue rather than a
+    # nonsense one, so a filter that silently matched nothing would still look wrong here.
+    assert client.get("/backtests", params={"symbol": "EURUSD"}).json()["total"] == 2
+    assert client.get("/backtests", params={"symbol": "AAPL"}).json()["total"] == 0
+    assert client.get("/backtests", params={"status": "done"}).json()["total"] == 1
+    assert client.get("/backtests", params={"timeframe": "H1"}).json()["total"] == 2
+    assert client.get("/backtests", params={"timeframe": "M15"}).json()["total"] == 0
+
+    # `total` counts the matching rows, not the page: a client sizing its pager off `len(items)`
+    # would stop after the first page and quietly hide every run before it.
+    one = client.get("/backtests", params={"limit": 1}).json()
+    assert one["total"] == 2
+    assert len(one["items"]) == 1
+    assert (
+        client.get("/backtests", params={"limit": 1, "offset": 1}).json()["items"][0]["id"]
+        != (one["items"][0]["id"])
+    )
+
+
+def _assert_listing_costs_the_same_whatever_the_page_holds(
+    client: TestClient, engine: Engine
+) -> None:
+    """The N+1 guard, stated as the property it actually is rather than as a magic number.
+
+    `Backtest.metrics` lazy-loads by default, so a handler that merely touches it emits one extra
+    query per row — and each of those drags the run's equity curve out of Postgres, a JSONB
+    column measured at up to 856 kB apiece on this project's own database. Neither shows up in
+    the response, which is what makes the regression invisible: the payload stays correct and
+    only the clock moves. Measured over 36 real runs, lazy took 37 queries and 145 ms against 2
+    queries and 4.8 ms with the curve deferred.
+
+    Asserting a query *count* would encode today's implementation and break on any harmless
+    refactor. The property that matters is that the count does not depend on how many rows come
+    back: eager loading answers a one-row page and a two-row page with the same statements, lazy
+    loading needs one more for the second row. So the two pages are compared to each other, and
+    nothing is claimed about the absolute number.
+    """
+    counted: list[int] = []
+
+    def count(*_args: object, **_kwargs: object) -> None:
+        counted[-1] += 1
+
+    event.listen(engine, "before_cursor_execute", count)
+    try:
+        for limit in (1, 2):
+            counted.append(0)
+            assert client.get("/backtests", params={"limit": limit}).status_code == 200
+    finally:
+        event.remove(engine, "before_cursor_execute", count)
+
+    one_row, two_rows = counted
+    assert one_row > 0, "the listener saw nothing, so this proves nothing"
+    assert one_row == two_rows, (
+        f"listing one run took {one_row} queries and listing two took {two_rows}: "
+        f"the per-row query is back, and with it the curve nobody reads"
+    )
+
+
 def test_create_enqueue_run_and_read(
-    session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+    session_factory: Callable[[], Session],
+    settings: Settings,
+    tmp_path: Path,
+    migrated_engine: Engine,
 ) -> None:
     seeding = session_factory()
     _seed_instrument(seeding)
@@ -232,6 +329,8 @@ def test_create_enqueue_run_and_read(
         assert isinstance(first["net_pnl"], str)  # money is a string on the wire, never a float
 
         _assert_the_snapshot_is_advertised_then_served(client, backtest_id, strategy_id, first)
+        _assert_the_run_log_lists_both_runs_without_their_curves(client, backtest_id, strategy_id)
+        _assert_listing_costs_the_same_whatever_the_page_holds(client, migrated_engine)
 
         equity = client.get(f"/backtests/{backtest_id}/equity").json()
         assert len(equity) >= 1

@@ -133,6 +133,51 @@ class BacktestOut(_Out):
     metrics: MetricsOut | None = None
 
 
+class BacktestListItem(_Out):
+    """One row of the run log: enough to compare runs without opening any of them.
+
+    Deliberately *not* `BacktestOut`. Two differences, both of them the point of this schema.
+
+    It resolves the foreign keys the detail view leaves as ids. A list of runs is read by a human
+    deciding which experiment to look at, and `instrument_id` answers nothing — the symbol, the
+    strategy's name and its version are what tell one row from another. Resolving them here costs
+    two joins on the server and saves the client a lookup per row.
+
+    It carries `cost_model` because a run's costs are part of what it *is*, not a detail of how it
+    was launched. The same strategy over the same window with a wider spread is a different
+    experiment (ADR-07), and a comparison table that hides that invites reading two incomparable
+    rows as a like-for-like result.
+
+    What it does not carry is the equity curve, which lives on `MetricsOut`'s sibling and is
+    fetched per run from `/backtests/{id}/equity`. See `list_backtests` for what that costs.
+    """
+
+    id: uuid.UUID
+    strategy_id: uuid.UUID
+    strategy_name: str
+    strategy_version: int
+    symbol: str
+    timeframe: str
+    date_from: dt.datetime
+    date_to: dt.datetime
+    initial_capital: Money
+    cost_model: dict[str, Any]
+    status: str
+    error: str | None
+    created_at: dt.datetime
+    finished_at: dt.datetime | None
+    metrics: MetricsOut | None = None
+
+
+class BacktestsPage(BaseModel):
+    """A page of runs. `total` lets a client size the pager without walking every page."""
+
+    total: int
+    limit: int
+    offset: int
+    items: list[BacktestListItem]
+
+
 class SnapshotBarOut(BaseModel):
     """One bar of an entry's picture. Prices are strings for the same reason `Money` is."""
 

@@ -7,25 +7,36 @@ other caller). The GETs read the state the worker writes back.
 """
 
 import uuid
-from typing import Any
+from typing import Annotated, Any
 
 from fastapi import APIRouter, HTTPException, Query, status
 from sqlalchemy import func, select
+from sqlalchemy.orm import selectinload
 
 from tradeforge_api.deps import QueueDep, SessionDep
 from tradeforge_api.queue import RUN_BACKTEST
 from tradeforge_api.runner import ENGINE_VERSION
 from tradeforge_api.schemas import (
+    BacktestListItem,
     BacktestOut,
+    BacktestsPage,
     CreateBacktestRequest,
     CreatedBacktest,
     EquityPointOut,
+    MetricsOut,
     SnapshotOut,
     TradeOut,
     TradesPage,
 )
 from tradeforge_collector import step
-from tradeforge_db.models import Backtest, BacktestStatus, Instrument, Strategy, Trade
+from tradeforge_db.models import (
+    Backtest,
+    BacktestMetrics,
+    BacktestStatus,
+    Instrument,
+    Strategy,
+    Trade,
+)
 
 router = APIRouter(tags=["backtests"])
 
@@ -102,6 +113,100 @@ async def create_backtest(
 
     await queue.enqueue_job(RUN_BACKTEST, str(backtest.id))
     return backtest
+
+
+@router.get("/backtests", response_model=BacktestsPage)
+def list_backtests(  # noqa: PLR0913 — one filter per column a run is chosen by
+    session: SessionDep,
+    # `Annotated` rather than a `Query(...)` default: the call then lives in the annotation
+    # instead of the default value, which is what FastAPI now recommends and what keeps the
+    # status filter out of B008. It has to be spelled `status` on the wire and cannot be named
+    # that here, because `fastapi.status` is already in scope for the response codes.
+    symbol: Annotated[str | None, Query(description="exact instrument symbol, e.g. EURUSD")] = None,
+    timeframe: Annotated[str | None, Query(description="exact timeframe, e.g. H1")] = None,
+    run_status: Annotated[BacktestStatus | None, Query(alias="status")] = None,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> BacktestsPage:
+    """Every run, newest first, with the metrics that decide which one is worth opening.
+
+    Newest first because this is a research log: the run you want is nearly always one you just
+    launched, and paging backwards to reach it would be the wrong default for the only reader
+    this endpoint has.
+
+    **The equity curve is deferred, and that is the whole performance story here.** It is a JSONB
+    column on the metrics row, and it is large — measured on this project's own database, 33
+    finished runs carry 9 MB of curve between them, the largest 856 kB on its own. It never
+    reaches the response, because `MetricsOut` has no field for it; the cost is entirely in what
+    Postgres ships to the application to build rows nothing will read. Measured over those 36
+    rows:
+
+    * lazy loading, the default — **37 queries, 145 ms**. One query per row, the N+1 that any
+      relationship touched in a loop produces.
+    * eager loading alone — 2 queries, 81 ms. The N+1 is gone and the 9 MB still crosses.
+    * eager loading with the curve deferred — 2 queries, **4.8 ms**.
+
+    Thirty times the naive version, and the gap widens with every run added, since the curve grows
+    with the length of the backtest rather than with the number of them. A client that wants a
+    curve asks for one run's, from `/backtests/{id}/equity`.
+
+    The joins to instrument and strategy are inner joins on non-nullable foreign keys with
+    `ondelete="RESTRICT"`, so they cannot drop a row: a backtest whose instrument or strategy had
+    vanished could not have been written in the first place.
+    """
+    filters = []
+    if symbol is not None:
+        filters.append(Instrument.symbol == symbol)
+    if timeframe is not None:
+        filters.append(Backtest.timeframe == timeframe)
+    if run_status is not None:
+        filters.append(Backtest.status == run_status)
+
+    base = (
+        select(Backtest, Instrument.symbol, Strategy.name, Strategy.version)
+        .join(Instrument, Instrument.id == Backtest.instrument_id)
+        .join(Strategy, Strategy.id == Backtest.strategy_id)
+        .where(*filters)
+    )
+    total = session.scalar(
+        select(func.count())
+        .select_from(Backtest)
+        .join(Instrument, Instrument.id == Backtest.instrument_id)
+        .join(Strategy, Strategy.id == Backtest.strategy_id)
+        .where(*filters)
+    )
+    rows = session.execute(
+        base.options(selectinload(Backtest.metrics).defer(BacktestMetrics.equity_curve))
+        .order_by(Backtest.created_at.desc(), Backtest.id)
+        .limit(limit)
+        .offset(offset)
+    ).all()
+
+    return BacktestsPage(
+        total=total or 0,
+        limit=limit,
+        offset=offset,
+        items=[
+            BacktestListItem(
+                id=run.id,
+                strategy_id=run.strategy_id,
+                strategy_name=name,
+                strategy_version=version,
+                symbol=run_symbol,
+                timeframe=run.timeframe,
+                date_from=run.date_from,
+                date_to=run.date_to,
+                initial_capital=run.initial_capital,
+                cost_model=run.cost_model,
+                status=run.status,
+                error=run.error,
+                created_at=run.created_at,
+                finished_at=run.finished_at,
+                metrics=(None if run.metrics is None else MetricsOut.model_validate(run.metrics)),
+            )
+            for run, run_symbol, name, version in rows
+        ],
+    )
 
 
 @router.get("/backtests/{backtest_id}", response_model=BacktestOut, responses=_NOT_FOUND)

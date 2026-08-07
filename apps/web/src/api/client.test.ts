@@ -63,6 +63,39 @@ describe('api client', () => {
     await expect(api.getEquity('x')).resolves.toBeNull()
   })
 
+  it('leaves an unset filter out of the run-log URL entirely', async () => {
+    // Not a cosmetic detail. `?symbol=` asks the API for runs whose symbol is the empty string and
+    // matches nothing, so the screen's "All" — which is an empty string — has to *disappear*, not
+    // be sent along. An empty filter and an absent one are different requests.
+    const fetchMock = mockFetch(200, { total: 0, items: [] })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await api.listBacktests({})
+    expect(fetchMock).toHaveBeenLastCalledWith('/api/backtests', expect.anything())
+
+    await api.listBacktests({ symbol: '', timeframe: 'H1' })
+    expect(fetchMock).toHaveBeenLastCalledWith('/api/backtests?timeframe=H1', expect.anything())
+  })
+
+  it('sends every run-log filter that was set', async () => {
+    const fetchMock = mockFetch(200, { total: 0, items: [] })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await api.listBacktests({ symbol: 'EURUSD', timeframe: 'M15', status: 'done', limit: 20 })
+
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      '/api/backtests?symbol=EURUSD&timeframe=M15&status=done&limit=20',
+      expect.anything(),
+    )
+  })
+
+  it('takes no filters at all', async () => {
+    const fetchMock = mockFetch(200, { total: 0, items: [] })
+    vi.stubGlobal('fetch', fetchMock)
+    await api.listBacktests()
+    expect(fetchMock).toHaveBeenLastCalledWith('/api/backtests', expect.anything())
+  })
+
   it('reaches the trades and backtest-creation endpoints', async () => {
     const fetchMock = mockFetch(200, { total: 0, items: [] })
     vi.stubGlobal('fetch', fetchMock)

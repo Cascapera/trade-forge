@@ -73,6 +73,52 @@ export interface Backtest {
   metrics: Metrics | null
 }
 
+/**
+ * One row of the run log. Deliberately not `Backtest`, and the differences are the point.
+ *
+ * It resolves what the detail shape leaves as foreign keys — `symbol`, `strategy_name`,
+ * `strategy_version` — because a list is read by a human choosing where to look, and an
+ * `instrument_id` answers nothing. And it carries `cost_model`, because under ADR-07 the same
+ * strategy over the same window with a wider spread is a *different experiment*: a table that
+ * hid that would invite reading two incomparable rows as like for like.
+ *
+ * What it does not carry is the equity curve. That is fetched per run, only for the runs
+ * someone selected — see `useEquityCurves`.
+ */
+export interface BacktestListItem {
+  id: string
+  strategy_id: string
+  strategy_name: string
+  strategy_version: number
+  symbol: string
+  timeframe: string
+  date_from: string
+  date_to: string
+  initial_capital: string
+  cost_model: Record<string, unknown>
+  status: BacktestStatus
+  error: string | null
+  created_at: string
+  finished_at: string | null
+  metrics: Metrics | null
+}
+
+export interface BacktestsPage {
+  total: number
+  limit: number
+  offset: number
+  items: BacktestListItem[]
+}
+
+/** The run log's filters. Every field absent means "no filter", which is the default view. */
+export interface BacktestFilters {
+  symbol?: string
+  timeframe?: string
+  status?: BacktestStatus
+  limit?: number
+  offset?: number
+}
+
 export interface Trade {
   id: number
   direction: 'long' | 'short'

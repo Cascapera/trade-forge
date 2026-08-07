@@ -2,6 +2,7 @@ import { NavLink, Navigate, Route, Routes } from 'react-router-dom'
 
 import { LaunchBacktest } from './screens/LaunchBacktest'
 import { Results } from './screens/Results'
+import { RunLog } from './screens/RunLog'
 import { StrategyBuilder } from './screens/StrategyBuilder'
 
 function navClass({ isActive }: { isActive: boolean }): string {
@@ -17,12 +18,16 @@ export function App(): React.JSX.Element {
           <nav className="flex gap-4 text-sm">
             {/* The first route builds a strategy and runs it in one go; the second re-runs the one
                 already saved this session over a different instrument or window, which costs no
-                new version. */}
+                new version. The third looks back at everything already run — the only one that
+                reads across runs rather than into one. */}
             <NavLink to="/" end className={navClass}>
               New backtest
             </NavLink>
             <NavLink to="/launch" className={navClass}>
               Re-run saved
+            </NavLink>
+            <NavLink to="/runs" className={navClass}>
+              Run log
             </NavLink>
           </nav>
         </div>
@@ -31,6 +36,7 @@ export function App(): React.JSX.Element {
         <Routes>
           <Route path="/" element={<StrategyBuilder />} />
           <Route path="/launch" element={<LaunchBacktest />} />
+          <Route path="/runs" element={<RunLog />} />
           <Route path="/results/:id" element={<Results />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>

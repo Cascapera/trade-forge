@@ -283,6 +283,45 @@ def test_a_symbol_the_terminal_cannot_price_reports_unknown_not_free() -> None:
         assert source.spread_points("EURUSD") is None
 
 
+class _MarketShut(_FakeTerminal):
+    """The exchange closed 47 minutes ago and the last quote is the widened closing print."""
+
+    def last_tick_age(self, _symbol: str) -> dt.timedelta:
+        return dt.timedelta(minutes=47)
+
+    def symbol_info(self, symbol: str) -> _SymbolInfo | None:
+        # What this broker actually reported for AAPL after the close: eleven times the
+        # spread the same terminal quoted during the session.
+        return _SymbolInfo(name=symbol, spread=110) if symbol == "EURUSD" else None
+
+
+def test_a_spread_read_after_the_close_is_not_catalogued() -> None:
+    """The bug this guard was written from, reproduced.
+
+    Catalogued 11 ticks for AAPL 47 minutes after the US close, against the 1 tick the same
+    terminal quoted during the session — brokers widen at the close, and `symbol_info.spread`
+    keeps reporting the widened number for as long as the market stays shut. Stored, it would
+    have charged eleven times the real cost under a column that reads as a measurement.
+    """
+    with MT5Source(terminal=_MarketShut(), server_offset=SERVER_OFFSET) as source:
+        assert source.spread_points("EURUSD") is None
+
+
+def test_a_live_quote_is_catalogued_even_though_the_symbol_is_quiet() -> None:
+    """The other half: a gap of a couple of minutes is a thin market, not a shut one.
+
+    Refusing those would trade a wrong number for a missing one on every illiquid symbol,
+    which is why the threshold is minutes rather than seconds.
+    """
+
+    class _Quiet(_FakeTerminal):
+        def last_tick_age(self, _symbol: str) -> dt.timedelta:
+            return dt.timedelta(minutes=2)
+
+    with MT5Source(terminal=_Quiet(), server_offset=SERVER_OFFSET) as source:
+        assert source.spread_points("EURUSD") == Decimal("12")
+
+
 def test_asking_the_spread_of_an_unknown_symbol_is_the_same_clear_error() -> None:
     with MT5Source(terminal=_FakeTerminal()) as source, pytest.raises(LookupError, match="EURJPY"):
         source.spread_points("EURJPY")

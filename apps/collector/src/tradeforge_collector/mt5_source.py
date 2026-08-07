@@ -238,6 +238,27 @@ class MT5Source:
             )
             return None
 
+        age = self._quote_age(mt5, symbol)
+        if age is not None and age > _STALE_QUOTE:
+            # Measured the hard way: catalogued 11 ticks for AAPL 47 minutes after the US
+            # close, against the 1 tick the same terminal quoted during the session. Brokers
+            # widen at the close, and `symbol_info.spread` keeps reporting that widened
+            # number for as long as the market stays shut. Storing it would have charged
+            # eleven times the real cost, under a column that reads as a measurement.
+            #
+            # `None` and not the number: unmeasured is the truthful answer, and the screen
+            # already has words for it. A spread that looks measured is worse than one that
+            # admits it is missing.
+            logger.warning(
+                "%s: last quote is %.0f min old — the market is shut and %s points is the "
+                "widened closing spread, not the session's. Not catalogued; re-run while "
+                "the market is open.",
+                symbol,
+                age.total_seconds() / 60,
+                info.spread,
+            )
+            return None
+
         ticks = Decimal(int(info.spread)) * point / tick_size
         logger.info(
             "%s: spread %s points of %s = %s ticks of %s (%s)",
@@ -246,9 +267,29 @@ class MT5Source:
             point,
             ticks,
             tick_size,
-            "fixed" if not info.spread_float else "floating",
+            "floating" if info.spread_float else "fixed",
         )
         return ticks
+
+    def _quote_age(self, mt5: Any, symbol: str) -> dt.timedelta | None:  # noqa: ANN401 — no stubs
+        """How long ago this symbol last quoted, in real time, or `None` if it never has.
+
+        ⚠️ Only as good as `self._offset`. A tick carries the *server's* clock, so turning it
+        into an age means undoing that offset — and when the offset was measured rather than
+        stated, the very closure this is trying to detect is what corrupted it. Measured on
+        this project's own terminal: 47 minutes after the close, the offset came out as +2 h
+        instead of the true +3, which makes a 47-minute-old quote look one minute old.
+
+        So this catches the case where the operator passed `--server-offset`, and cannot save
+        the case where it had to guess. That is a real limit, not an oversight: the guard is
+        worth having for the runs that state the offset, and `offset_is_plausible` already
+        refuses the grosser version of the same problem.
+        """
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is None or not tick.time:
+            return None
+        quoted_at = dt.datetime.fromtimestamp(int(tick.time), tz=dt.UTC) - self._offset
+        return dt.datetime.now(tz=dt.UTC) - quoted_at
 
     def candles(
         self, symbol: str, timeframe: str, start: dt.datetime, end: dt.datetime
@@ -336,6 +377,12 @@ class MT5Source:
 
 
 _HOUR = dt.timedelta(hours=1)
+
+# How old a quote may be before its spread stops describing the session. Generous on purpose:
+# a thinly traded symbol can go minutes without a print while the market is wide open, and
+# refusing those would trade a wrong number for a missing one. What this is aimed at is the
+# closed market, where the gap is tens of minutes and the quote is the widened closing print.
+_STALE_QUOTE = dt.timedelta(minutes=5)
 
 
 def _naive(moment: dt.datetime) -> dt.datetime:

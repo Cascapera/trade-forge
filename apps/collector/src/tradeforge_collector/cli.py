@@ -25,6 +25,7 @@ from tradeforge_collector.gaps import format_report
 from tradeforge_collector.source import MarketDataSource
 from tradeforge_collector.synthetic import SyntheticSource
 from tradeforge_collector.timeframes import TIMEFRAME_STEP
+from tradeforge_db.instruments import CatalogueEntry, upsert_instruments
 from tradeforge_db.session import create_db_engine, create_session_factory, session_scope
 from tradeforge_engine.domain import AssetClass
 
@@ -86,7 +87,54 @@ def _parser() -> argparse.ArgumentParser:
         help="write the Parquet but do not touch Postgres",
     )
 
+    # Re-reading a contract specification used to mean re-running a backfill, which downloads
+    # thousands of candles to refresh a handful of fields. Broker specs change on their own
+    # schedule — a spread is re-quoted far more often than history is re-downloaded — so
+    # refreshing them deserves a command that does not touch Parquet at all.
+    catalogue = commands.add_parser(
+        "catalogue",
+        help="refresh contract specs (including the spread) without downloading candles",
+    )
+    catalogue.add_argument("symbols", nargs="+", metavar="SYMBOL")
+    catalogue.add_argument(
+        "--source",
+        choices=("mock", "mt5"),
+        default="mt5",
+        help="mt5: a real terminal (default, since specs are what a terminal knows)",
+    )
+    catalogue.add_argument(
+        "--asset-class",
+        choices=[member.value for member in AssetClass],
+        help="override the class inferred from the symbol's MT5 path",
+    )
+    catalogue.add_argument(
+        "--server-offset",
+        type=_hours,
+        metavar="HOURS",
+        help="unused for specs, accepted so the flags match backfill's",
+    )
+
     return parser
+
+
+def _catalogue_command(args: argparse.Namespace) -> int:
+    """Upsert contract specs for the named symbols. No Parquet, no candles."""
+    source = _source(args)
+    engine = create_db_engine()
+    try:
+        with session_scope(create_session_factory(engine)) as session:
+            for symbol in args.symbols:
+                spec = source.instrument(symbol)
+                spread = source.spread_points(symbol)
+                upsert_instruments(session, (CatalogueEntry(spec, spread),))
+                # Printed as the pair it is: the number and its unit. A spread means nothing
+                # without the tick it is counted in, and "12" alone has burned this project
+                # once already on the difference between MT5 points and engine ticks.
+                shown = "unknown" if spread is None else f"{spread.normalize()} ticks"
+                print(f"{spec.symbol}: tick {spec.tick_size.normalize()}, spread {shown}")
+    finally:
+        engine.dispose()
+    return 0
 
 
 def _source(args: argparse.Namespace) -> MarketDataSource:
@@ -144,9 +192,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     args = _parser().parse_args(argv)
     try:
-        return _backfill(args)
+        return _catalogue_command(args) if args.command == "catalogue" else _backfill(args)
     except (LookupError, ValueError, ConnectionError) as error:
-        # These are the ways a backfill legitimately fails: a symbol the broker does not
+        # These are the ways either command legitimately fails: a symbol the broker does not
         # offer, a range with no data, a terminal that is not running. A stack trace
         # would say nothing a user can act on.
         print(f"error: {error}", file=sys.stderr)

@@ -19,6 +19,15 @@ export interface Instrument {
   tick_value: string
   contract_size: string
   digits: number
+  /**
+   * The broker's quoted spread in ticks, for pre-filling a run's cost model.
+   *
+   * `null` means nobody has measured this symbol — a seeded row, or one catalogued before
+   * the collector recorded it. Not zero, which would be the claim that this instrument is
+   * free to trade, and the screen has to be able to tell the two apart: it charges nothing
+   * for an unmeasured instrument, but says so rather than implying the number is a result.
+   */
+  default_spread_points: string | null
 }
 
 export interface StrategyOut {

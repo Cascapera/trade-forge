@@ -17,6 +17,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError, ProgrammingError
 from sqlalchemy.orm import Session
 
+from tradeforge_db.instruments import CatalogueEntry, upsert_instruments
 from tradeforge_db.models import (
     Backtest,
     BacktestMetrics,
@@ -27,7 +28,7 @@ from tradeforge_db.models import (
     Strategy,
     Trade,
 )
-from tradeforge_db.seeds import seed_instruments
+from tradeforge_db.seeds import INSTRUMENT_SEEDS, seed_instruments
 from tradeforge_engine.domain import AssetClass, Side
 
 pytestmark = pytest.mark.integration
@@ -413,3 +414,78 @@ def test_seeding_twice_leaves_one_copy_of_each_instrument(session: Session) -> N
 
     assert len(symbols) == len(set(symbols))
     assert ("EURUSD",) in symbols
+
+
+# --------------------------------------------------------------------------- #
+# The instrument's default spread                                               #
+# --------------------------------------------------------------------------- #
+
+
+def test_a_catalogued_spread_is_stored_and_re_reading_it_updates_in_place(
+    session: Session,
+) -> None:
+    """The upsert converges, which is what makes re-running `catalogue` safe.
+
+    A broker re-quotes a spread far more often than history is re-downloaded, so this path
+    runs repeatedly against a symbol that already exists. It has to land on the new number,
+    not fail on the conflict and not leave the stale one behind.
+    """
+    spec = INSTRUMENT_SEEDS[0]
+
+    upsert_instruments(session, (CatalogueEntry(spec, Decimal("12")),))
+    session.commit()
+    assert session.query(Instrument.default_spread_points).scalar() == Decimal("12")
+
+    upsert_instruments(session, (CatalogueEntry(spec, Decimal("16")),))
+    session.commit()
+    assert session.query(Instrument.default_spread_points).scalar() == Decimal("16")
+
+
+def test_a_source_with_nothing_to_say_writes_null_rather_than_zero(session: Session) -> None:
+    """Unknown and free are different claims, and the column has to keep them apart.
+
+    Zero here would tell the screen this instrument costs nothing to trade — a statement
+    about a market that no seeded row is entitled to make. NULL says nobody measured it,
+    which is what lets the screen fall back to charging nothing *and say why*.
+    """
+    upsert_instruments(session, (INSTRUMENT_SEEDS[0],))
+    session.commit()
+
+    stored = session.query(Instrument.default_spread_points).scalar()
+    assert stored is None
+    assert stored != Decimal("0")
+
+
+def test_a_measured_spread_survives_a_later_backfill_that_knows_nothing(
+    session: Session,
+) -> None:
+    """⚠️ It does not — and this test exists to make that visible rather than surprising.
+
+    `default_spread_points` is in the updatable set, so a catalogue run from a source that
+    cannot quote a spread overwrites a measured one with NULL. That is the correct reading
+    of an upsert whose whole job is to converge on what the source currently says: a broker
+    that stopped quoting a spread has genuinely stopped, and silently keeping yesterday's
+    number would be the catalogue asserting something nobody told it.
+    """
+    spec = INSTRUMENT_SEEDS[0]
+    upsert_instruments(session, (CatalogueEntry(spec, Decimal("12")),))
+    session.commit()
+
+    upsert_instruments(session, (spec,))
+    session.commit()
+
+    assert session.query(Instrument.default_spread_points).scalar() is None
+
+
+def test_a_zero_spread_is_allowed_but_a_negative_one_is_refused(session: Session) -> None:
+    """Zero is a real quote on some instruments; negative would pay you for trading."""
+    spec = INSTRUMENT_SEEDS[0]
+
+    upsert_instruments(session, (CatalogueEntry(spec, Decimal("0")),))
+    session.commit()
+    assert session.query(Instrument.default_spread_points).scalar() == Decimal("0")
+
+    # The upsert issues the INSERT itself, so the constraint bites on this call rather than
+    # on a later commit — which is the point of asserting on it directly.
+    with pytest.raises(IntegrityError, match="default_spread_points"):
+        upsert_instruments(session, (CatalogueEntry(spec, Decimal("-1")),))

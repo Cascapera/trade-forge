@@ -20,6 +20,7 @@ collector found convenient is a candle the engine would have to translate foreve
 """
 
 import datetime as dt
+from decimal import Decimal
 from typing import Protocol
 
 from tradeforge_engine.domain import Candle, InstrumentSpec
@@ -32,6 +33,30 @@ class MarketDataSource(Protocol):
 
     def instrument(self, symbol: str) -> InstrumentSpec:
         """The contract specification: tick size, tick value, digits, currencies."""
+        ...
+
+    def spread_points(self, symbol: str) -> Decimal | None:
+        """The broker's quoted spread in **ticks**, or `None` if this source cannot say.
+
+        Deliberately not part of `InstrumentSpec`. That type is the engine's, and the engine
+        prices a move without ever consulting a spread — costs reach a run as a plugged-in
+        `CostModel` (ADR-07). This is catalogue data used to *pre-fill* that choice, so it
+        travels beside the spec rather than inside it.
+
+        In ticks, not in whatever unit the venue quotes. MT5 counts spreads in `point`, which
+        is not the same quantity as `trade_tick_size` by definition, and the engine's
+        `SpreadCostModel` counts ticks. Converting at the edge means no reader downstream has
+        to know which unit it is holding.
+
+        `None`, never zero, when unknown: zero is the claim that this instrument is free to
+        trade, and a source that simply has no idea must not make it.
+
+        Declared with no body even though every source but one answers `None`. A default here
+        would not have saved anyone the line: conformance to a `Protocol` is *structural*, so
+        a class satisfies it by having the method, and inheriting a default requires actually
+        subclassing — which nothing here does, on purpose. Writing `return None` above would
+        therefore have failed exactly the same way while looking like it worked.
+        """
         ...
 
     def candles(

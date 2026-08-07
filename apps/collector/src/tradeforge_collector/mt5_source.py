@@ -201,6 +201,55 @@ class MT5Source:
             digits=digits,
         )
 
+    def spread_points(self, symbol: str) -> Decimal | None:
+        """The broker's quoted spread, converted from MT5 `point` into engine ticks.
+
+        MT5 reports `symbol_info.spread` as a count of `point`, and `point` is not the same
+        quantity as `trade_tick_size`. On this project's own broker they happen to coincide —
+        AAPL quotes both at 0.01, the forex pairs both at 0.00001 — and code written on that
+        coincidence would be a silent factor-of-ten wherever a venue sets a tick to several
+        points. So the conversion is explicit: `spread · point / tick_size` is the distance in
+        ticks, whatever the two are.
+
+        ⚠️ **This is the spread *now*.** On a fixed-spread instrument (`spread_float` false,
+        which is how this broker quotes AAPL) that is the whole story. On a floating one it is
+        one reading of a number that widens at rollover and around news, so what lands in the
+        catalogue is a representative default a human can override — never a guarantee, and
+        never something to reconcile a live fill against.
+
+        `None` rather than an exception when the terminal has nothing: a symbol that has not
+        been selected into Market Watch answers with zeroes, and a backfill should catalogue
+        the instrument regardless rather than fail over a field nothing is blocked on.
+        """
+        mt5 = self._require_connection()
+
+        info = mt5.symbol_info(symbol)
+        if info is None:
+            raise LookupError(f"symbol {symbol!r} is not available in this terminal")
+
+        point = Decimal(str(info.point))
+        tick_size = Decimal(str(info.trade_tick_size))
+        if point <= 0 or tick_size <= 0:
+            logger.warning(
+                "%s: broker reports point=%s tick_size=%s; cannot express a spread in ticks",
+                symbol,
+                point,
+                tick_size,
+            )
+            return None
+
+        ticks = Decimal(int(info.spread)) * point / tick_size
+        logger.info(
+            "%s: spread %s points of %s = %s ticks of %s (%s)",
+            symbol,
+            info.spread,
+            point,
+            ticks,
+            tick_size,
+            "fixed" if not info.spread_float else "floating",
+        )
+        return ticks
+
     def candles(
         self, symbol: str, timeframe: str, start: dt.datetime, end: dt.datetime
     ) -> list[Candle]:

@@ -1,5 +1,5 @@
 import type { Instrument } from '../api/types'
-import type { BacktestForm } from '../backtest/settings'
+import { costlessReason, withInstrumentCosts, type BacktestForm } from '../backtest/settings'
 
 const inputClass =
   'rounded border border-slate-700 bg-slate-900 px-2 py-1 text-sm text-slate-100 focus:border-sky-500 focus:outline-none'
@@ -21,6 +21,8 @@ export function BacktestSettings(props: {
   const patch = (update: Partial<BacktestForm>): void => {
     onChange({ ...form, ...update })
   }
+  const chosen = instruments?.find((instrument) => instrument.symbol === form.symbol)
+  const costless = costlessReason(form, chosen)
   return (
     <div className="grid grid-cols-2 gap-4 sm:grid-cols-3">
       <label className="flex flex-col gap-1 text-sm">
@@ -30,7 +32,13 @@ export function BacktestSettings(props: {
           className={inputClass}
           value={form.symbol}
           onChange={(event) => {
-            patch({ symbol: event.target.value })
+            // Choosing an instrument chooses its costs too. The spread is a property of the
+            // symbol, not of the run, so leaving the previous instrument's number behind — or
+            // leaving `none` behind, which is what produced this project's costless history —
+            // would be the form quietly keeping an answer to a question that just changed.
+            const symbol = event.target.value
+            const next = instruments?.find((instrument) => instrument.symbol === symbol)
+            onChange(withInstrumentCosts({ ...form, symbol }, next))
           }}
         >
           {/* Blank until the instruments arrive, so the field never shows a symbol that is really
@@ -96,7 +104,7 @@ export function BacktestSettings(props: {
       </label>
       {form.cost === 'spread' && (
         <label className="flex flex-col gap-1 text-sm">
-          Spread (points)
+          Spread (ticks)
           <input
             aria-label="spread points"
             type="number"
@@ -106,7 +114,21 @@ export function BacktestSettings(props: {
               patch({ spreadPoints: event.target.value })
             }}
           />
+          {chosen?.default_spread_points != null && (
+            <span className="text-xs text-slate-400">
+              {chosen.symbol} quotes {String(Number(chosen.default_spread_points))}
+            </span>
+          )}
         </label>
+      )}
+      {costless !== null && (
+        <p
+          role="status"
+          className="col-span-full rounded border border-amber-800 bg-amber-950/40 p-3 text-xs text-amber-200"
+        >
+          This run charges no spread and no commission — {costless}. Its curve is an upper
+          bound, not a P&amp;L, and it is not comparable with a run that paid costs.
+        </p>
       )}
     </div>
   )

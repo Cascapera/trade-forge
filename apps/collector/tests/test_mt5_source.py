@@ -44,6 +44,12 @@ class _SymbolInfo:
     trade_tick_value: float = 1.0
     trade_contract_size: float = 100000.0
     digits: int = 5
+    # MT5 counts a spread in `point`, which is a *different field* from `trade_tick_size`.
+    # They coincide on this project's own broker, which is exactly why the default here keeps
+    # them equal — and why the tests below deliberately pull them apart.
+    point: float = 1e-05
+    spread: int = 12
+    spread_float: bool = True
 
 
 class _FakeTerminal:
@@ -231,6 +237,55 @@ def test_the_contract_specification_is_read_from_the_terminal() -> None:
 def test_an_unknown_symbol_is_a_clear_error() -> None:
     with MT5Source(terminal=_FakeTerminal()) as source, pytest.raises(LookupError, match="EURJPY"):
         source.instrument("EURJPY")
+
+
+class _PointIsTenTicks(_FakeTerminal):
+    """A venue where one `point` is ten ticks — the case the coincidence hides."""
+
+    def symbol_info(self, symbol: str) -> _SymbolInfo | None:
+        if symbol != "EURUSD":
+            return None
+        return _SymbolInfo(name=symbol, point=1e-04, trade_tick_size=1e-05, spread=12)
+
+
+class _NoPoint(_FakeTerminal):
+    """A symbol the terminal has not selected into Market Watch: zeroes all the way down."""
+
+    def symbol_info(self, symbol: str) -> _SymbolInfo | None:
+        if symbol != "EURUSD":
+            return None
+        return _SymbolInfo(name=symbol, point=0.0, trade_tick_size=0.0)
+
+
+def test_the_spread_is_read_in_ticks_not_in_the_brokers_points() -> None:
+    # The default fake keeps point and tick equal, which is what this project's own broker
+    # does — so here the two units agree and 12 points is 12 ticks.
+    with MT5Source(terminal=_FakeTerminal()) as source:
+        assert source.spread_points("EURUSD") == Decimal("12")
+
+
+def test_a_point_worth_several_ticks_is_converted_rather_than_copied() -> None:
+    """The assertion the happy path cannot make, because there the two units coincide.
+
+    `spread` counts `point`; `SpreadCostModel` counts ticks. Copying the number across
+    would be right on every symbol this project has today and wrong by a factor of ten on
+    the first venue that sets a tick to a fraction of a point — a silent factor, since a
+    cost model does not know what it should have charged.
+    """
+    with MT5Source(terminal=_PointIsTenTicks()) as source:
+        assert source.spread_points("EURUSD") == Decimal("120")
+
+
+def test_a_symbol_the_terminal_cannot_price_reports_unknown_not_free() -> None:
+    # Zero would say "this instrument costs nothing to trade", which is a claim. None says
+    # nobody measured it, and the screen is built to tell the reader which one it has.
+    with MT5Source(terminal=_NoPoint()) as source:
+        assert source.spread_points("EURUSD") is None
+
+
+def test_asking_the_spread_of_an_unknown_symbol_is_the_same_clear_error() -> None:
+    with MT5Source(terminal=_FakeTerminal()) as source, pytest.raises(LookupError, match="EURJPY"):
+        source.spread_points("EURJPY")
 
 
 def test_using_the_source_before_connecting_is_refused() -> None:

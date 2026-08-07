@@ -1,6 +1,8 @@
 """`tradeforge-collector`, driven from the command line — mock source, no database."""
 
 import datetime as dt
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -8,6 +10,7 @@ import pytest
 # Importable on Linux: `mt5_source` defers its `MetaTrader5` import until `connect()`.
 from tradeforge_collector import cli, mt5_source
 from tradeforge_collector.storage import read_candles
+from tradeforge_db.instruments import CatalogueEntry
 
 
 def test_a_backfill_runs_end_to_end_and_prints_a_gap_report(
@@ -123,3 +126,96 @@ def test_a_failed_backfill_reports_the_reason_and_exits_non_zero(
 
     assert exit_code == 1
     assert "no synthetic instrument" in capsys.readouterr().err
+
+
+class _RecordingSession:
+    """Stands in for a real session: the upserts are asserted, not the SQL."""
+
+
+def _stub_database(monkeypatch: pytest.MonkeyPatch) -> list[tuple[CatalogueEntry, ...]]:
+    """Replace the Postgres wiring, keeping the command's own logic under test.
+
+    The upsert itself is proven against a real database in
+    `packages/db/tests/test_constraints_integration.py`; what is worth testing *here* is
+    the wiring — which symbols get read, what is built from them, and what the operator is
+    told. Driving that through Docker would test SQLAlchemy twice and this command once.
+    """
+    written: list[tuple[CatalogueEntry, ...]] = []
+
+    def record(_session: object, entries: tuple[CatalogueEntry, ...]) -> None:
+        written.append(entries)
+
+    monkeypatch.setattr(cli, "create_db_engine", _StubEngine)
+    monkeypatch.setattr(cli, "create_session_factory", lambda _engine: None)
+    monkeypatch.setattr(cli, "session_scope", lambda _factory: _session_scope())
+    monkeypatch.setattr(cli, "upsert_instruments", record)
+    return written
+
+
+class _StubEngine:
+    def dispose(self) -> None:
+        """The command disposes the engine in a `finally`; this records that it can."""
+
+
+@contextmanager
+def _session_scope() -> Iterator[_RecordingSession]:
+    yield _RecordingSession()
+
+
+def test_the_catalogue_command_refreshes_specs_without_touching_parquet(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The whole reason the command exists: specs move without history moving.
+
+    A spread is re-quoted far more often than two years of candles change, and refreshing
+    it used to mean re-running a backfill. Nothing is written to `tmp_path` here, and that
+    empty directory is the assertion.
+    """
+    written = _stub_database(monkeypatch)
+
+    exit_code = cli.main(["catalogue", "EURUSD", "--source", "mock"])
+
+    assert exit_code == 0
+    assert list(tmp_path.iterdir()) == []
+    assert len(written) == 1
+    entry = written[0][0]
+    assert entry.spec.symbol == "EURUSD"
+
+
+def test_the_catalogue_command_reports_unknown_rather_than_a_free_instrument(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The mock source has no broker behind it, so it quotes nothing — and says so.
+
+    Printing `0` here would read as "this instrument is free to trade", which is a claim
+    about a market that a made-up source is in no position to make.
+    """
+    written = _stub_database(monkeypatch)
+
+    cli.main(["catalogue", "EURUSD", "--source", "mock"])
+
+    assert written[0][0].default_spread_points is None
+    output = capsys.readouterr().out
+    assert "spread unknown" in output
+    assert "spread 0" not in output
+
+
+def test_the_catalogue_command_takes_several_symbols_in_one_go(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    written = _stub_database(monkeypatch)
+
+    cli.main(["catalogue", "EURUSD", "AAPL", "--source", "mock"])
+
+    assert [entries[0].spec.symbol for entries in written] == ["EURUSD", "AAPL"]
+
+
+def test_the_catalogue_command_names_a_symbol_the_source_does_not_have(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _stub_database(monkeypatch)
+
+    exit_code = cli.main(["catalogue", "NOPE", "--source", "mock"])
+
+    assert exit_code == 1
+    assert "NOPE" in capsys.readouterr().err

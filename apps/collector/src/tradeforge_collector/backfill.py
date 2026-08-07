@@ -12,6 +12,7 @@ the world looks the same as after running it once.
 import datetime as dt
 import logging
 from dataclasses import dataclass
+from decimal import Decimal
 from itertools import pairwise
 from pathlib import Path
 
@@ -22,7 +23,7 @@ from tradeforge_collector.gaps import Gap, find_gaps
 from tradeforge_collector.source import MarketDataSource
 from tradeforge_collector.storage import write_candles
 from tradeforge_collector.timeframes import step
-from tradeforge_db.instruments import upsert_dataset, upsert_instruments
+from tradeforge_db.instruments import CatalogueEntry, upsert_dataset, upsert_instruments
 from tradeforge_db.models import Instrument
 from tradeforge_engine.domain import Candle, InstrumentSpec
 
@@ -40,6 +41,10 @@ class BackfillReport:
     date_to: dt.datetime
     parquet_path: str
     gaps: list[Gap]
+    # In ticks, and `None` when the source could not say — never zero, which would claim the
+    # instrument is free to trade. Beside the spec rather than inside it, because the engine
+    # prices a move without consulting a spread: costs are plugged into a run (ADR-07).
+    spread_points: Decimal | None = None
 
 
 def backfill(  # noqa: PLR0913 — all keyword-only, and each one names a real axis of the job
@@ -80,6 +85,7 @@ def backfill(  # noqa: PLR0913 — all keyword-only, and each one names a real a
         date_to=candles[-1].time,
         parquet_path=parquet_path,
         gaps=gaps,
+        spread_points=source.spread_points(symbol),
     )
 
     if session is not None:
@@ -91,7 +97,7 @@ def backfill(  # noqa: PLR0913 — all keyword-only, and each one names a real a
 
 def _catalogue(session: Session, report: BackfillReport) -> None:
     """Record the instrument and the coverage. Both upserts — see `tradeforge_db`."""
-    upsert_instruments(session, (report.instrument,))
+    upsert_instruments(session, (CatalogueEntry(report.instrument, report.spread_points),))
 
     instrument_id = session.execute(
         select(Instrument.id).where(Instrument.symbol == report.instrument.symbol)

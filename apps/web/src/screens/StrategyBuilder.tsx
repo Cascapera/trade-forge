@@ -264,7 +264,10 @@ function SetupFields(props: {
 
 export function StrategyBuilder(): React.JSX.Element {
   const [choiceId, setChoiceId] = useState(STRATEGY_CHOICES[0]?.id ?? '')
-  const [form, setForm] = useState<StrategyForm>(() => strategyChoice(choiceId).form())
+  // The clock enters here and nowhere deeper. Every form factory takes the instant as an argument,
+  // so the name a run is saved under is decided at the moment the strategy is *picked* — see
+  // `runName` for why that timing is what keeps versioning working.
+  const [form, setForm] = useState<StrategyForm>(() => strategyChoice(choiceId).form(new Date()))
   const [backtest, setBacktest] = useState<BacktestForm>(emptyBacktestForm)
   const navigate = useNavigate()
   const session = useSession()
@@ -320,9 +323,11 @@ export function StrategyBuilder(): React.JSX.Element {
               // Choosing a strategy loads its form outright, defaults and all. It replaces what was
               // there rather than merging: the two document shapes have nothing in common to keep,
               // and a half-carried-over form is how a run ends up with a parameter nobody chose.
+              // That includes the name, which is re-stamped here — picking a strategy is the act
+              // that starts a new lineage, so it is the act that mints a new name.
               const next = event.target.value
               setChoiceId(next)
-              setForm(strategyChoice(next).form())
+              setForm(strategyChoice(next).form(new Date()))
             }}
           >
             {GROUPS.map((group) => (
@@ -557,7 +562,8 @@ export function StrategyBuilder(): React.JSX.Element {
       {save.isError && (
         <p className="text-sm text-red-400">
           The API rejected the strategy: {save.error.message}. A saved strategy is immutable for its
-          version — if this name already exists from an earlier session, give it a new one.
+          version, and the name is what identifies the lineage — pick the strategy again to stamp a
+          fresh name, or edit the name field by hand.
         </p>
       )}
       {run.isError && (

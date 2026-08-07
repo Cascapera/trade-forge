@@ -20,5 +20,20 @@
   "devDependencies": {
     "@commitlint/cli": "^21.2.1",
     "@commitlint/config-conventional": "^21.2.0"
+  },
+  "overridesComment": [
+    "Transitive pins held ahead of what our direct dependencies ask for. Every key under",
+    "`overrides` is read by npm as a package name, so this note lives outside it.",
+    "Each entry is an advisory whose fix exists but is out of reach: npm will not raise a",
+    "transitive dependency on its own, so `npm audit fix` reports nothing to do while the",
+    "audit job keeps failing. Prefer an entry here over one in .github/audit-allowlist.json",
+    "whenever a real patch exists — an allowlist entry argues a vulnerability away, this one",
+    "closes it. Drop an entry once every dependent asks for the fixed version by itself.",
+    "js-yaml: GHSA-5p4m-2wfm-xmqj, quadratic CPU on !!omap. Reached only through",
+    "@commitlint/cli and json-schema-to-typescript, both dev-only and build-time. 4.3.1 is",
+    "the patch on the 4.x line (npm tag v4-legacy); both dependents ask for ^4."
+  ],
+  "overrides": {
+    "js-yaml": "^4.3.1"
   }
 }

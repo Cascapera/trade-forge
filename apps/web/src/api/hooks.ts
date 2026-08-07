@@ -3,13 +3,15 @@
 // a backtest is asynchronous, so the query *polls* until the run reaches a terminal status, then
 // stops on its own. That is the whole point of the 202-plus-poll contract the API exposes.
 
-import { skipToken, useMutation, useQuery } from '@tanstack/react-query'
+import { skipToken, useMutation, useQueries, useQuery } from '@tanstack/react-query'
 import type { Strategy } from '@tradeforge/schema'
 
 import { api } from './client'
 import type {
   Backtest,
+  BacktestFilters,
   BacktestStatus,
+  BacktestsPage,
   CreateBacktestRequest,
   CreatedBacktest,
   EquityPoint,
@@ -67,6 +69,54 @@ export function useBacktest(id: string | undefined) {
     queryFn: id === undefined ? skipToken : () => api.getBacktest(id),
     // Keep polling while the run is queued or running; stop the moment it is done or failed.
     refetchInterval: (query) => (isTerminal(query.state.data?.status) ? false : POLL_MS),
+  })
+}
+
+/**
+ * The run log: every backtest, newest first, under the current filters.
+ *
+ * The filters are part of the query key, so switching from EURUSD to AAPL is a different cached
+ * entry rather than a refetch that blanks the table. `placeholderData` keeps the previous page on
+ * screen while the next one loads, which is what stops the layout jumping on every keystroke.
+ */
+export function useBacktests(filters: BacktestFilters) {
+  return useQuery<BacktestsPage>({
+    queryKey: ['backtests', filters],
+    queryFn: () => api.listBacktests(filters),
+    placeholderData: (previous) => previous,
+  })
+}
+
+/**
+ * The equity curves of the selected runs, fetched in parallel — one query per run, not one
+ * request for all of them.
+ *
+ * `useQueries` rather than a loop of `useQuery` because the number of selected runs changes as
+ * the user ticks boxes, and hooks cannot be called conditionally. It also gives each curve its
+ * own cache entry keyed by run id, which is what makes unticking and re-ticking a run free.
+ *
+ * `staleTime: Infinity` because a finished run's curve is frozen: the backtest wrote it once and
+ * nothing can change it. Re-polling it would be pure waste — the largest of these is 856 kB.
+ */
+export function useEquityCurves(ids: readonly string[]) {
+  return useQueries({
+    queries: ids.map((id) => ({
+      queryKey: ['equity', id],
+      queryFn: () => api.getEquity(id),
+      staleTime: Infinity,
+    })),
+    combine: (results) => ({
+      curves: new Map(
+        results.flatMap((result, index) => {
+          const id = ids[index]
+          return result.data !== undefined && id !== undefined
+            ? ([[id, result.data]] as [string, EquityPoint[]][])
+            : []
+        }),
+      ),
+      isPending: results.some((result) => result.isPending),
+      isError: results.some((result) => result.isError),
+    }),
   })
 }
 

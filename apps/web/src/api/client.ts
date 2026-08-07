@@ -4,6 +4,8 @@
 
 import type {
   Backtest,
+  BacktestFilters,
+  BacktestsPage,
   CreateBacktestRequest,
   CreatedBacktest,
   EquityPoint,
@@ -44,8 +46,26 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   return payload as T
 }
 
+/**
+ * A query string from the fields that are actually set.
+ *
+ * An absent filter and an empty one are different requests: `?symbol=` asks the API for runs whose
+ * symbol is the empty string, which matches nothing, while omitting it asks for every symbol. The
+ * run log's "All" option produces `undefined`, so it has to disappear from the URL entirely.
+ */
+function query(params: Record<string, string | number | undefined>): string {
+  const search = new URLSearchParams()
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== '') search.set(key, String(value))
+  }
+  const text = search.toString()
+  return text ? `?${text}` : ''
+}
+
 export const api = {
   listInstruments: (): Promise<Instrument[]> => request('GET', '/instruments'),
+  listBacktests: (filters: BacktestFilters = {}): Promise<BacktestsPage> =>
+    request('GET', `/backtests${query({ ...filters })}`),
   createStrategy: (definition: unknown): Promise<StrategyOut> =>
     request('POST', '/strategies', definition),
   // Editing is a new version, not an update: the API inserts the next version linked to this

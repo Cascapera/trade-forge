@@ -11,6 +11,8 @@
 import { SETUP_TYPES, setupSpec, type SetupType } from '@tradeforge/schema'
 import type { Comparison, ComparisonOp, Condition, Strategy, Timeframe } from '@tradeforge/schema'
 
+import { runName } from './naming'
+
 export const TIMEFRAMES = ['M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1', 'W1'] as const satisfies
   readonly Timeframe[]
 
@@ -276,9 +278,9 @@ export function emptyForm(): StrategyForm {
 
 /** A worked example the UI offers as a starting template: a two-SMA crossover, long only, with
  *  a candle-extreme stop and a 2:1 target. */
-export function maCrossForm(): StrategyForm {
+export function maCrossForm(now: Date): StrategyForm {
   return {
-    name: 'MA cross',
+    name: runName('ma_cross', now),
     timeframe: 'H1',
     mode: 'conditions',
     setup: emptySetup(),
@@ -306,9 +308,9 @@ export function maCrossForm(): StrategyForm {
 /** A worked RSI example: go long when RSI(14) crosses below 30 (oversold) and close when it
  *  crosses back above 70 (overbought), with a candle-extreme stop and a 2:1 target. The `30` and
  *  `70` are literal `value` operands — the thresholds the guided builder can now express. */
-export function rsiOversoldForm(): StrategyForm {
+export function rsiOversoldForm(now: Date): StrategyForm {
   return {
-    name: 'RSI oversold',
+    name: runName('rsi_oversold', now),
     timeframe: 'H1',
     mode: 'conditions',
     setup: emptySetup(),
@@ -351,10 +353,10 @@ export const SETUP_LABELS: Record<SetupType, string> = {
  * default stays unanswered, and the screen keeps saving disabled until it is chosen. Pre-filling it
  * here would be the picker quietly answering a question the schema deliberately asks.
  */
-export function setupForm(type: SetupType): StrategyForm {
+export function setupForm(type: SetupType, now: Date): StrategyForm {
   return {
     ...emptyForm(),
-    name: SETUP_LABELS[type],
+    name: runName(type, now),
     mode: 'setup',
     setup: emptySetup(type),
     takeProfit: { enabled: true, rr: SETUP_TARGET_RR },
@@ -366,7 +368,14 @@ export interface StrategyChoice {
   label: string
   /** The heading it sits under: the two shapes a document may take. */
   group: 'Setups' | 'Conditions'
-  form: () => StrategyForm
+  /**
+   * A fresh form for this choice, stamped with the instant it was picked.
+   *
+   * The clock is a parameter and not a `new Date()` inside, for the usual reason: a function that
+   * reads the wall clock cannot be tested for what it produces, only that it produced something.
+   * The screen passes the real one; tests pass a fixed instant and assert the exact name.
+   */
+  form: (now: Date) => StrategyForm
 }
 
 /**
@@ -382,7 +391,7 @@ export const STRATEGY_CHOICES: readonly StrategyChoice[] = [
     id: type,
     label: SETUP_LABELS[type],
     group: 'Setups' as const,
-    form: () => setupForm(type),
+    form: (now: Date) => setupForm(type, now),
   })),
   { id: 'ma_cross', label: 'Moving-average cross', group: 'Conditions', form: maCrossForm },
   { id: 'rsi_oversold', label: 'RSI oversold', group: 'Conditions', form: rsiOversoldForm },

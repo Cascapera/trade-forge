@@ -23,10 +23,15 @@ function side(rows: SideForm['rows'], combine: SideForm['combine'] = 'all'): Sid
   return { enabled: true, combine, rows }
 }
 
+/** The instant every form in this file is "picked" at. Fixed, because a form factory that read the
+ *  wall clock could only be tested for having produced something. Naming is proven in
+ *  `naming.test.ts`; here the clock just has to be a value. */
+const PICKED_AT = new Date(2026, 7, 7, 15, 12, 30)
+
 /** The Ponto Contínuo with its one unanswered field filled in — what a user has after choosing the
  *  setup from the picker and saying which way they trade it. */
 function pontoContinuoForm(): StrategyForm {
-  const form = setupForm('ponto_continuo')
+  const form = setupForm('ponto_continuo', PICKED_AT)
   return { ...form, setup: { ...form.setup, values: { ...form.setup.values, side: 'long' } } }
 }
 
@@ -73,14 +78,14 @@ describe('buildCondition', () => {
 
 describe('buildStrategy', () => {
   it('produces a valid MA-cross document from the template', () => {
-    const result = validateStrategy(buildStrategy(maCrossForm()))
+    const result = validateStrategy(buildStrategy(maCrossForm(PICKED_AT)))
     expect(result.valid).toBe(true)
   })
 
   it('produces a valid RSI document with literal thresholds from the template', () => {
     // The narrowed builder, so `entry` reads without a null check: `buildStrategy` returns the
     // union of both document shapes now, and only this one always carries entry conditions.
-    const document = buildConditionStrategy(rsiOversoldForm())
+    const document = buildConditionStrategy(rsiOversoldForm(PICKED_AT))
     expect(validateStrategy(document).valid).toBe(true)
     expect(document.entry.long).toEqual({
       op: 'crosses_below',
@@ -107,7 +112,7 @@ describe('buildStrategy', () => {
     expect(without.exit.stop_loss).toBeNull()
     expect(without.exit.take_profit).toBeNull()
 
-    const form = maCrossForm()
+    const form = maCrossForm(PICKED_AT)
     const withExit = buildConditionStrategy(form)
     expect(withExit.exit.stop_loss).toEqual({
       type: 'candle_extreme',
@@ -231,7 +236,7 @@ describe('the strategy picker', () => {
 
   it('builds a runnable form for every choice, given the one field only a user can answer', () => {
     for (const choice of STRATEGY_CHOICES) {
-      const form = choice.form()
+      const form = choice.form(PICKED_AT)
       const answered: StrategyForm =
         'side' in form.setup.values && form.setup.values.side === ''
           ? { ...form, setup: { ...form.setup, values: { ...form.setup.values, side: 'long' } } }
@@ -245,13 +250,13 @@ describe('the strategy picker', () => {
   })
 
   it('starts a setup on the 5R target the author trades', () => {
-    expect(setupForm('mme9_breakout').takeProfit).toEqual({ enabled: true, rr: 5 })
+    expect(setupForm('mme9_breakout', PICKED_AT).takeProfit).toEqual({ enabled: true, rr: 5 })
   })
 
   it('leaves side unanswered, because picking a setup is not picking a direction', () => {
     // The picker says *which* setup. Pre-filling the direction here would be it quietly answering
     // the one question the schema deliberately asks.
-    const form = setupForm('ponto_continuo')
+    const form = setupForm('ponto_continuo', PICKED_AT)
     expect(form.setup.values.side).toBe('')
     expect(validateStrategy(buildStrategy(form)).valid).toBe(false)
   })

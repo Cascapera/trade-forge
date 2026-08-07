@@ -35,7 +35,18 @@ function succeed(strategyId = 's1', backtestId = 'b1'): void {
   })
 }
 
+// The screen reads the wall clock to stamp a run's name, so the clock is pinned. Built from local
+// components, which makes the rendered digits the same on a machine in São Paulo and on a CI runner
+// in UTC — see `naming.ts` for why the stamp is local time in the first place.
+const PICKED_AT = new Date(2026, 7, 7, 15, 12, 30)
+
+beforeEach(() => {
+  vi.useFakeTimers({ shouldAdvanceTime: true })
+  vi.setSystemTime(PICKED_AT)
+})
+
 afterEach(() => {
+  vi.useRealTimers()
   vi.clearAllMocks()
   useSession.getState().clear()
 })
@@ -70,9 +81,44 @@ describe('the strategy picker', () => {
 
     expect(screen.getByLabelText('setup period')).toHaveValue(20)
     expect(screen.getByLabelText('setup average')).toHaveValue('EMA')
-    expect(screen.getByLabelText('name')).toHaveValue('Ponto Contínuo')
+    // The name is stamped, not typed: the abbreviation of the setup and the instant it was picked.
+    expect(screen.getByLabelText('name')).toHaveValue('PCONT-20260807-151230')
     // The author's target, on every setup.
     expect(screen.getByLabelText('take profit rr')).toHaveValue(5)
+  })
+
+  it('stamps a fresh name every time a strategy is picked', () => {
+    // Picking a strategy is the act that starts a new lineage, so it is the act that mints a new
+    // name. Two picks a minute apart must not collide — that collision is the 409 this replaces.
+    renderWithProviders(<StrategyBuilder />)
+
+    fireEvent.change(screen.getByLabelText('strategy'), { target: { value: 'structure_choch' } })
+    expect(screen.getByLabelText('name')).toHaveValue('SCHOCH-20260807-151230')
+
+    vi.setSystemTime(new Date(2026, 7, 7, 15, 13, 45))
+    fireEvent.change(screen.getByLabelText('strategy'), { target: { value: 'structure_choch' } })
+    expect(screen.getByLabelText('name')).toHaveValue('SCHOCH-20260807-151345')
+  })
+
+  it('keeps the stamped name while a parameter is nudged', () => {
+    // The other half of the design, and the reason the clock is read on *pick* rather than on
+    // launch: editing a parameter and running again is the same lineage's next version, so the
+    // name has to hold still. A name re-stamped per launch would make every run a new lineage.
+    renderWithProviders(<StrategyBuilder />)
+    fireEvent.change(screen.getByLabelText('strategy'), { target: { value: 'ponto_continuo' } })
+
+    vi.setSystemTime(new Date(2026, 7, 7, 16, 0, 0))
+    fireEvent.change(screen.getByLabelText('setup period'), { target: { value: '30' } })
+
+    expect(screen.getByLabelText('setup period')).toHaveValue(30)
+    expect(screen.getByLabelText('name')).toHaveValue('PCONT-20260807-151230')
+  })
+
+  it('still lets the name be typed over', () => {
+    // Generated, not imposed. Labelling a run "the wide-stop test" stays possible.
+    renderWithProviders(<StrategyBuilder />)
+    fireEvent.change(screen.getByLabelText('name'), { target: { value: 'teste do stop largo' } })
+    expect(screen.getByLabelText('name')).toHaveValue('teste do stop largo')
   })
 
   it('swaps the whole form when a condition strategy is chosen', () => {

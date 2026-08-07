@@ -219,3 +219,31 @@ def test_the_catalogue_command_names_a_symbol_the_source_does_not_have(
 
     assert exit_code == 1
     assert "NOPE" in capsys.readouterr().err
+
+
+def test_the_catalogue_command_demands_the_offset_against_a_real_terminal(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The loop the guard cannot close on its own.
+
+    `spread_points` dates the last quote by undoing the server's clock offset, and a measured
+    offset is wrong exactly when the market is shut — which is the case the guard exists for.
+    Demanding the offset up front is the one cheap way out; without this the command would
+    accept a guess and wave a stale spread through.
+    """
+    _stub_database(monkeypatch)
+
+    exit_code = cli.main(["catalogue", "AAPL", "--source", "mt5"])
+
+    assert exit_code == 1
+    assert "--server-offset" in capsys.readouterr().err
+
+
+def test_the_catalogue_command_does_not_demand_an_offset_from_the_mock_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """There is no terminal clock to undo, and no spread to date, behind a made-up source."""
+    written = _stub_database(monkeypatch)
+
+    assert cli.main(["catalogue", "EURUSD", "--source", "mock"]) == 0
+    assert len(written) == 1

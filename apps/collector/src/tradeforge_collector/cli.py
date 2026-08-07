@@ -111,14 +111,38 @@ def _parser() -> argparse.ArgumentParser:
         "--server-offset",
         type=_hours,
         metavar="HOURS",
-        help="unused for specs, accepted so the flags match backfill's",
+        help=(
+            "the broker's clock, in hours ahead of UTC (e.g. +3). REQUIRED with --source mt5: "
+            "the spread guard dates the last quote by undoing this offset, and a closed "
+            "market is exactly what corrupts the measured one"
+        ),
     )
 
     return parser
 
 
 def _catalogue_command(args: argparse.Namespace) -> int:
-    """Upsert contract specs for the named symbols. No Parquet, no candles."""
+    """Upsert contract specs for the named symbols. No Parquet, no candles.
+
+    `--server-offset` is mandatory against a real terminal, and the reason is circular in a
+    way worth stating. The spread guard refuses a quote older than a few minutes, and it dates
+    the quote by undoing the server's clock offset. When that offset is *measured* rather than
+    stated, it comes from the newest tick — so a closed market, the very thing the guard
+    exists to detect, is what makes the offset wrong. Measured on this project's terminal: 47
+    minutes after the US close the offset read +2 h against the true +3, which makes a
+    47-minute-old quote look one minute old and waves the stale spread straight through.
+
+    Demanding the offset up front costs one flag and closes the loop. The backfill does not
+    demand it because there `offset_is_plausible` can still refuse the gross case; here the
+    dangerous case is a short closure, which is precisely the size that slips under it.
+    """
+    if args.source == "mt5" and args.server_offset is None:
+        raise ValueError(
+            "catalogue needs --server-offset with --source mt5 (for example --server-offset "
+            "+3): the spread guard dates the last quote with it, and a measured offset is "
+            "wrong exactly when the market is shut, which is when the guard has to bite"
+        )
+
     source = _source(args)
     engine = create_db_engine()
     try:

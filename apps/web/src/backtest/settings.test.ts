@@ -161,3 +161,23 @@ describe('costlessReason', () => {
     expect(chosen).not.toBe(unmeasured)
   })
 })
+
+describe('a legitimately zero spread', () => {
+  it('is charged as zero rather than falling back to no cost model', () => {
+    // The database CHECK admits zero on purpose — a broker genuinely can quote it. A
+    // truthiness test (`!spread`) would pass every other test in this file and silently
+    // turn that real quote into `none`, which is a different `cost_model` on the wire and
+    // a different row in the run log's comparison.
+    const next = withInstrumentCosts(form(), instrument({ default_spread_points: '0.0000000000' }))
+
+    expect(next.cost).toBe('spread')
+    expect(next.spreadPoints).toBe('0')
+  })
+
+  it('does not trip the costless warning, because it is a measurement', () => {
+    // Zero measured and zero by omission look identical on the tape and mean opposite
+    // things. The run charging a measured zero is complete; the warning is for the other one.
+    const measured = form({ cost: 'spread', spreadPoints: '0' })
+    expect(costlessReason(measured, instrument({ default_spread_points: '0' }))).toBeNull()
+  })
+})

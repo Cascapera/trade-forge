@@ -47,6 +47,16 @@ _NOT_FOUND: _Responses = {status.HTTP_404_NOT_FOUND: {"description": "not found"
 # FastAPI answers an unparseable JSON body with 400, before validation ever runs.
 _BAD_BODY: _Responses = {status.HTTP_400_BAD_REQUEST: {"description": "malformed request body"}}
 
+# The largest `offset` the database can be asked for. Postgres renders OFFSET as a bigint, so a
+# larger number is not a big page — it is a `NumericValueOutOfRange` raised inside the driver,
+# which surfaces as a 500 on input a client fully controls. Bounding it here turns that into the
+# 422 it always was: a request outside what the parameter can mean.
+#
+# The bound is the type's own limit rather than a guess at a sensible page depth. Every value it
+# admits is genuinely valid SQL that returns an empty page, so nothing legitimate is refused, and
+# there is no invented business number to be wrong about later.
+_MAX_OFFSET = 9_223_372_036_854_775_807  # 2**63 - 1, Postgres bigint
+
 
 def _load(session: SessionDep, backtest_id: uuid.UUID) -> Backtest:
     backtest = session.get(Backtest, backtest_id)
@@ -126,7 +136,7 @@ def list_backtests(  # noqa: PLR0913 — one filter per column a run is chosen b
     timeframe: Annotated[str | None, Query(description="exact timeframe, e.g. H1")] = None,
     run_status: Annotated[BacktestStatus | None, Query(alias="status")] = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
-    offset: Annotated[int, Query(ge=0)] = 0,
+    offset: Annotated[int, Query(ge=0, le=_MAX_OFFSET)] = 0,
 ) -> BacktestsPage:
     """Every run, newest first, with the metrics that decide which one is worth opening.
 
@@ -220,7 +230,7 @@ def list_trades(
     backtest_id: uuid.UUID,
     session: SessionDep,
     limit: int = Query(100, ge=1, le=1000),
-    offset: int = Query(0, ge=0),
+    offset: int = Query(0, ge=0, le=_MAX_OFFSET),
 ) -> TradesPage:
     """Trades in entry order, paginated. `total` is returned so a client can size its pager."""
     _load(session, backtest_id)

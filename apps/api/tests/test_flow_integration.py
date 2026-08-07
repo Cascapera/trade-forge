@@ -208,6 +208,26 @@ def _assert_the_run_log_lists_both_runs_without_their_curves(
         != (one["items"][0]["id"])
     )
 
+    # An offset past what Postgres can render as a bigint is refused by validation, not handed to
+    # the driver. Unbounded, it reached the database and came back as `NumericValueOutOfRange` —
+    # a 500 on input a client fully controls, which is what schemathesis caught. The two assertions
+    # are a pair on purpose: the first pins the rejection, the second pins that the bound is the
+    # type's limit and not something narrower, so a legitimate deep page still answers 200.
+    beyond = 2**63
+    assert client.get("/backtests", params={"offset": beyond}).status_code == 422
+    assert client.get("/backtests", params={"offset": beyond - 1}).status_code == 200
+
+    # The same hole existed on the trades listing since long before this endpoint, and the fuzzer
+    # simply happened to draw `/backtests` first. Fixing one and leaving the other would have left
+    # the identical 500 one URL away.
+    assert (
+        client.get(f"/backtests/{backtest_id}/trades", params={"offset": beyond}).status_code == 422
+    )
+    assert (
+        client.get(f"/backtests/{backtest_id}/trades", params={"offset": beyond - 1}).status_code
+        == 200
+    )
+
 
 def _assert_listing_costs_the_same_whatever_the_page_holds(
     client: TestClient, engine: Engine

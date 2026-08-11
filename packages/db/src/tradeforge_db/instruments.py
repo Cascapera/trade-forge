@@ -16,6 +16,7 @@ import datetime as dt
 from dataclasses import asdict, dataclass
 from decimal import Decimal
 
+from sqlalchemy import func
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
@@ -92,7 +93,25 @@ def upsert_instruments(
     statement = insert(Instrument).values(rows)
     statement = statement.on_conflict_do_update(
         index_elements=[Instrument.symbol],
-        set_={column: statement.excluded[column] for column in _INSTRUMENT_UPDATABLE},
+        set_={
+            **{column: statement.excluded[column] for column in _INSTRUMENT_UPDATABLE},
+            # Stamped here rather than left to the column's `onupdate`, which does not fire:
+            # that hook belongs to the ORM's UPDATE, and this is a Core ON CONFLICT whose SET
+            # clause is used exactly as written. Absent from it, the stamp keeps the value the
+            # row was first inserted with — so the catalogue would carry a fresh spread under
+            # a stale date, which reads as a measurement and is not one.
+            #
+            # `func.now()` and not the process clock: the writer here is the collector on a
+            # Windows host and the row lives in a container, two clocks that need not agree.
+            # `models._created_at` states the rule — the database's clock is the shared one.
+            # (The sibling `upsert_dataset` stamps `collected_at` from Python; same defect,
+            # smaller blast radius, noted in `specs/backlog.md`.)
+            #
+            # Postgres evaluates `now()` at transaction start, so every symbol in one
+            # `catalogue` call shares a stamp. That is the honest reading: they were read
+            # from the terminal in one pass.
+            "updated_at": func.now(),
+        },
     )
     session.execute(statement)
     return len(rows)

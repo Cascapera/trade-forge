@@ -17,7 +17,7 @@ from dataclasses import asdict, dataclass
 from decimal import Decimal
 
 from sqlalchemy import func
-from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.dialects.postgresql import Insert, insert
 from sqlalchemy.orm import Session
 
 from tradeforge_db.models import Dataset, Instrument
@@ -66,16 +66,37 @@ _INSTRUMENT_UPDATABLE = (
 
 
 def upsert_instruments(
-    session: Session, entries: tuple[CatalogueEntry | InstrumentSpec, ...]
+    session: Session,
+    entries: tuple[CatalogueEntry | InstrumentSpec, ...],
+    *,
+    overwrite: bool = True,
 ) -> int:
-    """Insert the instruments, updating any symbol that already exists.
+    """Insert the instruments. Returns how many rows the database actually wrote.
 
-    Idempotent: running it twice leaves the same rows. Returns how many were written.
+    Idempotent either way: running it twice leaves the same rows.
 
     A bare `InstrumentSpec` is accepted as well as a `CatalogueEntry`, and means "this source
     has nothing to say about the spread" — which writes NULL rather than zero. The seeds are
     the reason: they are hand-written example instruments with no broker behind them, and
     claiming a spread of zero for them would be inventing a measurement.
+
+    `overwrite` is what separates the two callers, and it exists because collapsing them cost
+    real data. The collector states the broker's truth and must win over whatever is there.
+    The seeds only guarantee the example symbols exist so a fresh machine has something to
+    run — but they went through the identical upsert, so `docker compose up` (which runs the
+    seed step every time) rewrote all ten updatable columns with placeholders.
+
+    That was invisible until PR-226 added `default_spread_points`, because the placeholder
+    specs were chosen to match what MT5 reports: rewriting `tick_size` with the same
+    `tick_size` changes nothing observable. The spread is the first column where the seeds
+    have nothing and the collector has something, so it is the first place the overwrite
+    could be seen — measured on 11-08-2026, a catalogued EURUSD 8 / GBPUSD 9 was back to
+    NULL within minutes, wiped by a stack restart.
+
+    ⚠️ The cost of `overwrite=False`: a corrected placeholder never reaches a database that
+    already has the row. Accepted, and the alternative is worse — a seed silently outranking
+    a measurement is how the data was lost in the first place, and the broker is the
+    authority on every one of these columns anyway.
     """
     if not entries:
         return 0
@@ -91,6 +112,10 @@ def upsert_instruments(
     ]
 
     statement = insert(Instrument).values(rows)
+    if not overwrite:
+        statement = statement.on_conflict_do_nothing(index_elements=[Instrument.symbol])
+        return _written(session, statement)
+
     statement = statement.on_conflict_do_update(
         index_elements=[Instrument.symbol],
         set_={
@@ -113,8 +138,19 @@ def upsert_instruments(
             "updated_at": func.now(),
         },
     )
-    session.execute(statement)
-    return len(rows)
+    return _written(session, statement)
+
+
+def _written(session: Session, statement: Insert) -> int:
+    """Run the upsert and count the rows the database actually wrote.
+
+    `len(rows)` would be the count of rows *offered*, which under `DO UPDATE` happens to be
+    the same number and under `DO NOTHING` is not: re-seeding a populated catalogue writes
+    nothing and would still have reported four. `tradeforge-db seed` prints this straight to
+    the migrate log, so the wrong number is not an internal detail — it is the line an
+    operator reads to find out what a deploy did.
+    """
+    return len(session.execute(statement.returning(Instrument.symbol)).all())
 
 
 def upsert_dataset(  # noqa: PLR0913 — keyword-only; these are simply the columns of the row

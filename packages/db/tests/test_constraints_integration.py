@@ -9,6 +9,7 @@ Run locally with:  docker compose up -d  &&  uv run pytest -m integration
 
 import datetime as dt
 import uuid
+from dataclasses import replace
 from decimal import Decimal
 from typing import Any
 
@@ -414,6 +415,89 @@ def test_seeding_twice_leaves_one_copy_of_each_instrument(session: Session) -> N
 
     assert len(symbols) == len(set(symbols))
     assert ("EURUSD",) in symbols
+
+
+def test_seeding_does_not_overwrite_a_catalogued_spread(session: Session) -> None:
+    """The regression, and it is a report from production rather than a hypothetical.
+
+    On 11-08-2026 the forex spreads were catalogued from a live terminal — EURUSD 8 ticks,
+    GBPUSD 9 — and were NULL again minutes later. `docker compose up` runs the seed step on
+    every start, the seeds went through the same upsert as the collector, and
+    `default_spread_points` sits in `_INSTRUMENT_UPDATABLE`: the placeholder's silence was
+    written straight over the measurement.
+
+    A measured spread must outlive a stack restart, or the column is decorative.
+    """
+    spec = INSTRUMENT_SEEDS[0]
+    upsert_instruments(session, (CatalogueEntry(spec, Decimal("8")),))
+    session.commit()
+
+    seed_instruments(session)
+    session.commit()
+
+    # Filtered, not `.scalar()`: seeding leaves four rows, and the bare scalar would read
+    # whichever the database happened to return first — a NULL from one of the other three
+    # would fail this test for the wrong reason, and an ordering fluke could pass it.
+    stored = session.query(Instrument.default_spread_points).filter_by(symbol=spec.symbol)
+    assert stored.scalar() == Decimal("8")
+
+
+def test_seeding_does_not_overwrite_the_brokers_contract_specs(session: Session) -> None:
+    """Not just the spread — the seeds had authority over all ten updatable columns.
+
+    This is the half that was invisible, and worth a test precisely because nothing broke.
+    The placeholders were written to match what MT5 reports for these four symbols, so
+    rewriting `contract_size` with an identical `contract_size` changed nothing anyone could
+    observe. The bug was always there; the spread was merely the first column where the two
+    sources disagreed.
+
+    So the catalogued value here is deliberately *different* from the seed's. A broker that
+    resizes a contract, or any symbol whose placeholder was a guess, is this test.
+    """
+    seed = INSTRUMENT_SEEDS[0]
+    from_broker = replace(seed, contract_size=Decimal("50000"), name="EURUSD as MT5 spells it")
+    upsert_instruments(session, (CatalogueEntry(from_broker, Decimal("8")),))
+    session.commit()
+
+    seed_instruments(session)
+    session.commit()
+
+    row = session.query(Instrument).filter_by(symbol=seed.symbol).one()
+    assert row.contract_size == Decimal("50000"), "the seed's placeholder reclaimed the row"
+    assert row.name == "EURUSD as MT5 spells it"
+
+
+def test_seeding_still_inserts_a_symbol_the_catalogue_lacks(session: Session) -> None:
+    """Not overwriting must not become not writing — a fresh clone still needs its examples.
+
+    The failure this guards against is a one-character one: `on_conflict_do_nothing` without
+    `index_elements` swallows *every* conflict, and a seed run against an empty table would
+    still work, so the suite would stay green while a real box got nothing.
+    """
+    assert session.query(Instrument).count() == 0
+
+    written = seed_instruments(session)
+    session.commit()
+
+    assert written == len(INSTRUMENT_SEEDS)
+    assert session.query(Instrument).count() == len(INSTRUMENT_SEEDS)
+
+
+def test_re_seeding_a_populated_catalogue_reports_nothing_written(session: Session) -> None:
+    """The count has to be rows written, not rows offered.
+
+    `tradeforge-db seed` prints this number to the migrate log — the line an operator reads
+    to learn what a deploy did. Returning `len(entries)` was harmless while every row was
+    genuinely written; under DO NOTHING it would announce "seeded 4 instruments" having
+    touched none, which is the same species of defect as a fresh spread under a stale date.
+    """
+    assert seed_instruments(session) == len(INSTRUMENT_SEEDS)
+    session.commit()
+
+    assert seed_instruments(session) == 0
+    session.commit()
+
+    assert session.query(Instrument).count() == len(INSTRUMENT_SEEDS)
 
 
 # --------------------------------------------------------------------------- #

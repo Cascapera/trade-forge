@@ -62,6 +62,12 @@ class InstrumentOut(_Out):
     tick_value: Money
     contract_size: Money
     digits: int
+    # The broker's quoted spread in ticks, for a client to pre-fill a run's cost model with.
+    # Null means nobody has measured this symbol — a seeded row, or one catalogued before the
+    # collector recorded it — and a client must say so rather than charging zero, which is a
+    # claim that trading it is free. The engine never reads this: costs reach a run as a
+    # plugged-in `CostModel` (ADR-07), and this only decides what the screen offers first.
+    default_spread_points: Money | None = None
 
 
 class CreateBacktestRequest(BaseModel):

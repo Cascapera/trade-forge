@@ -13,13 +13,39 @@ the path production uses.
 """
 
 import datetime as dt
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
+from decimal import Decimal
 
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
 from tradeforge_db.models import Dataset, Instrument
 from tradeforge_engine.domain import InstrumentSpec
+
+
+@dataclass(frozen=True, slots=True)
+class CatalogueEntry:
+    """An `InstrumentSpec` plus what the catalogue knows and the engine deliberately does not.
+
+    The split is the point. `InstrumentSpec` is the engine's type — "a symbol and the numbers
+    that turn a price move into money" — and the engine's pricing genuinely does not need a
+    spread: under ADR-07 costs are plugged into a run as a `CostModel`, never read off the
+    instrument. Adding `default_spread_points` to that dataclass would have been one line
+    fewer here and an open invitation for a later change to have the engine read it directly,
+    which is precisely the coupling ADR-07 exists to prevent.
+
+    So the field lives on the catalogue's own type instead. The database stores it because it
+    is broker-quoted data like `tick_value`; the screen reads it to pre-fill a cost model; the
+    engine never sees it.
+
+    `default_spread_points` is in **ticks**, already converted from whatever unit the source
+    quoted it in, and `None` means nobody has measured this symbol — never zero, which would
+    claim the instrument is free to trade.
+    """
+
+    spec: InstrumentSpec
+    default_spread_points: Decimal | None = None
+
 
 # Everything except the natural key. Re-running a backfill after a broker changes a
 # contract size must update the row, not silently keep the stale number that every
@@ -34,18 +60,34 @@ _INSTRUMENT_UPDATABLE = (
     "tick_value",
     "contract_size",
     "digits",
+    "default_spread_points",
 )
 
 
-def upsert_instruments(session: Session, specs: tuple[InstrumentSpec, ...]) -> int:
+def upsert_instruments(
+    session: Session, entries: tuple[CatalogueEntry | InstrumentSpec, ...]
+) -> int:
     """Insert the instruments, updating any symbol that already exists.
 
     Idempotent: running it twice leaves the same rows. Returns how many were written.
+
+    A bare `InstrumentSpec` is accepted as well as a `CatalogueEntry`, and means "this source
+    has nothing to say about the spread" — which writes NULL rather than zero. The seeds are
+    the reason: they are hand-written example instruments with no broker behind them, and
+    claiming a spread of zero for them would be inventing a measurement.
     """
-    if not specs:
+    if not entries:
         return 0
 
-    rows = [asdict(spec) for spec in specs]
+    rows = [
+        {
+            **asdict(entry.spec if isinstance(entry, CatalogueEntry) else entry),
+            "default_spread_points": (
+                entry.default_spread_points if isinstance(entry, CatalogueEntry) else None
+            ),
+        }
+        for entry in entries
+    ]
 
     statement = insert(Instrument).values(rows)
     statement = statement.on_conflict_do_update(

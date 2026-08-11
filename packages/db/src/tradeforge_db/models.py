@@ -162,6 +162,22 @@ class Instrument(Base):
     contract_size: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
     digits: Mapped[int] = mapped_column(SmallInteger, nullable=False)
 
+    # The broker's quoted spread, in ticks, as a *default* for a run's cost model — not a
+    # number the engine ever reads. Costs are plugged in per backtest (ADR-07), and this is
+    # only what the screen offers before anyone overrides it. Kept here, with the other
+    # broker-quoted specs, because that is what it is: `symbol_info` said so.
+    #
+    # Nullable, and the distinction is load-bearing. NULL means *nobody has measured this
+    # symbol's spread* — a row seeded by hand, or catalogued before this column existed.
+    # Zero would mean "this instrument is free to trade", which is a claim, and the wrong
+    # one. The screen falls back to charging nothing only when it can say why.
+    #
+    # Stored in ticks rather than in MT5 "points" because the engine's `SpreadCostModel`
+    # counts ticks, and the two are not the same quantity by definition — see the collector,
+    # which converts and refuses when a broker's point and tick disagree in a way it cannot
+    # reconcile. Storing the raw MT5 number would leave that conversion to every reader.
+    default_spread_points: Mapped[Decimal | None] = mapped_column(PRICE)
+
     created_at: Mapped[dt.datetime] = _created_at()
     updated_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True),
@@ -186,6 +202,13 @@ class Instrument(Base):
         CheckConstraint("tick_value > 0", name="tick_value_positive"),
         CheckConstraint("contract_size > 0", name="contract_size_positive"),
         CheckConstraint("digits BETWEEN 0 AND 10", name="digits_range"),
+        # Unlike the three above, zero is *allowed*: a broker genuinely can quote a
+        # zero spread on some instruments. Negative is not — a spread is a magnitude,
+        # and a negative one would credit the account for trading.
+        CheckConstraint(
+            "default_spread_points IS NULL OR default_spread_points >= 0",
+            name="default_spread_points_non_negative",
+        ),
     )
 
 

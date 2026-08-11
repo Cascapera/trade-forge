@@ -31,9 +31,13 @@
     "closes it. Drop an entry once every dependent asks for the fixed version by itself.",
     "js-yaml: GHSA-5p4m-2wfm-xmqj, quadratic CPU on !!omap. Reached only through",
     "@commitlint/cli and json-schema-to-typescript, both dev-only and build-time. 4.3.1 is",
-    "the patch on the 4.x line (npm tag v4-legacy); both dependents ask for ^4."
+    "the patch on the 4.x line (npm tag v4-legacy); both dependents ask for ^4.",
+    "nanoid: GHSA-2v37-7h3g-55p8, custom generators loop forever at size zero. Reached only",
+    "through vite -> postcss, dev-only and build-time. 3.3.18 is the patch on the 3.x line",
+    "(npm tag legacy), same bin and engines as 3.3.16."
   ],
   "overrides": {
-    "js-yaml": "^4.3.1"
+    "js-yaml": "^4.3.1",
+    "nanoid": "^3.3.18"
   }
 }

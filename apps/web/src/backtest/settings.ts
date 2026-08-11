@@ -7,7 +7,7 @@
 // screen that asked for it twice could run an H1 strategy over M5 candles and report the result
 // without a word. It is passed in by whoever owns the strategy.
 
-import type { CreateBacktestRequest } from '../api/types'
+import type { CreateBacktestRequest, Instrument } from '../api/types'
 
 export type CostKind = 'none' | 'spread'
 
@@ -26,7 +26,11 @@ export function toIso(date: string): string {
   return `${date}T00:00:00Z`
 }
 
-/** A year of H1 on a round balance — a window the collector actually has data for. */
+/** A year of H1 on a round balance — a window the collector actually has data for.
+ *
+ *  The cost starts at `none` because no instrument is chosen yet, and there is nothing
+ *  honest to charge for a symbol nobody named. `withInstrumentCosts` fills it in the moment
+ *  one is picked. */
 export function emptyBacktestForm(): BacktestForm {
   return {
     symbol: '',
@@ -34,8 +38,49 @@ export function emptyBacktestForm(): BacktestForm {
     dateTo: '2024-12-31',
     capital: '10000',
     cost: 'none',
-    spreadPoints: '10',
+    spreadPoints: '',
   }
+}
+
+/**
+ * Why this run charges nothing, when it charges nothing — or `null` when it does charge.
+ *
+ * A costless run is not wrong, it is *incomplete*, and the difference between "you turned
+ * costs off" and "nobody ever measured this symbol" is the difference between a choice and a
+ * gap. Measured on this project's own trades, a 12-tick spread against EURUSD H1's median
+ * stop of 0.00116 is 10% of one R paid on every round trip; on AAPL H1 the same arithmetic
+ * is 0.55%. A screen that stayed quiet about which case it was in would let the first one
+ * pass for a result.
+ */
+export function costlessReason(form: BacktestForm, instrument: Instrument | undefined): string | null {
+  if (form.cost !== 'none') return null
+  if (form.symbol === '') return null
+  if (instrument?.default_spread_points == null) {
+    return 'no spread has been catalogued for this instrument, so this run charges nothing'
+  }
+  return 'costs are switched off for this run, so the result is an upper bound'
+}
+
+/**
+ * The form with this instrument's own costs filled in — called when a symbol is chosen.
+ *
+ * Switched **on**, not merely pre-filled. The default that produced this project's first
+ * thirty-six runs was `none`, and every one of them reported a result nobody had to opt into
+ * believing; the forex ones are overstated by 5–10% of R per trade as a result. Defaulting to
+ * the measured number makes the honest run the one that happens by not thinking about it, and
+ * the field stays editable for when someone means to think about it.
+ *
+ * An instrument with no catalogued spread falls back to `none` — never to zero dressed up as
+ * a measurement — and `costlessReason` is what tells the reader which of the two they have.
+ */
+export function withInstrumentCosts(form: BacktestForm, instrument: Instrument | undefined): BacktestForm {
+  const spread = instrument?.default_spread_points
+  if (spread === undefined || spread === null) {
+    return { ...form, cost: 'none', spreadPoints: '' }
+  }
+  // Trailing zeros come off a Decimal column as `12.0000000000`; the field is read by a
+  // person, and `12` is the same number.
+  return { ...form, cost: 'spread', spreadPoints: String(Number(spread)) }
 }
 
 export function costModel(form: BacktestForm): CreateBacktestRequest['cost_model'] {

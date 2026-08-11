@@ -1,11 +1,31 @@
+import type { Instrument } from '../api/types'
 import {
   costModel,
+  costlessReason,
   emptyBacktestForm,
   toBacktestRequest,
   toIso,
   whyNotRunnable,
+  withInstrumentCosts,
   type BacktestForm,
 } from './settings'
+
+function instrument(patch: Partial<Instrument> = {}): Instrument {
+  return {
+    id: 'i1',
+    symbol: 'AAPL',
+    name: 'Apple Inc.',
+    asset_class: 'stock',
+    currency_quote: 'USD',
+    currency_base: null,
+    tick_size: '0.01',
+    tick_value: '0.01',
+    contract_size: '1',
+    digits: 2,
+    default_spread_points: '1.0000000000',
+    ...patch,
+  }
+}
 
 function form(patch: Partial<BacktestForm> = {}): BacktestForm {
   return { ...emptyBacktestForm(), symbol: 'AAPL', ...patch }
@@ -74,5 +94,90 @@ describe('why a run cannot start', () => {
 
   it('ignores the spread when costs are off', () => {
     expect(whyNotRunnable(form({ cost: 'none', spreadPoints: '-5' }))).toBeNull()
+  })
+})
+
+describe('costs that come from the instrument', () => {
+  it('switches costs on with the number the catalogue measured', () => {
+    // Switched *on*, not merely pre-filled. The default that produced this project's first
+    // thirty-six runs was `none`, and the forex ones are overstated by 5–10% of R per trade
+    // as a result. The honest run has to be the one that happens without thinking about it.
+    const next = withInstrumentCosts(form({ cost: 'none' }), instrument())
+
+    expect(next.cost).toBe('spread')
+    expect(next.spreadPoints).toBe('1')
+  })
+
+  it('strips the decimal tail a numeric column comes back with', () => {
+    // `12.0000000000` and `12` are the same number, and only one of them is readable in a
+    // field a person edits.
+    const next = withInstrumentCosts(form(), instrument({ default_spread_points: '12.0000000000' }))
+    expect(next.spreadPoints).toBe('12')
+  })
+
+  it('falls back to charging nothing when nobody has measured the instrument', () => {
+    // Never to zero dressed up as a measurement: a spread of 0 would say the instrument is
+    // free to trade, which is a claim. `none` plus a stated reason is the honest pair.
+    const next = withInstrumentCosts(form(), instrument({ default_spread_points: null }))
+
+    expect(next.cost).toBe('none')
+    expect(next.spreadPoints).toBe('')
+  })
+
+  it('falls back the same way when the instrument is not loaded yet', () => {
+    const next = withInstrumentCosts(form(), undefined)
+    expect(next.cost).toBe('none')
+  })
+
+  it('replaces the previous instrument’s spread rather than keeping it', () => {
+    // The spread belongs to the symbol, not to the run. Carrying EURUSD's 12 over to AAPL
+    // would charge twelve times the real cost with nothing on screen saying so.
+    const eurusd = form({ cost: 'spread', spreadPoints: '12' })
+    const next = withInstrumentCosts({ ...eurusd, symbol: 'AAPL' }, instrument())
+
+    expect(next.spreadPoints).toBe('1')
+  })
+})
+
+describe('costlessReason', () => {
+  it('says nothing while a run does charge costs', () => {
+    expect(costlessReason(form({ cost: 'spread', spreadPoints: '12' }), instrument())).toBeNull()
+  })
+
+  it('says nothing before an instrument is chosen', () => {
+    // There is no honest thing to charge for a symbol nobody named, and a warning here would
+    // fire on every fresh form — which is how a warning stops being read.
+    expect(costlessReason(form({ symbol: '', cost: 'none' }), undefined)).toBeNull()
+  })
+
+  it('distinguishes a deliberate choice from a gap in the catalogue', () => {
+    // The two costless runs are not the same thing: one is "you turned costs off", the other
+    // is "nobody ever measured this symbol". Collapsing them would hide which one you have.
+    const chosen = costlessReason(form({ cost: 'none' }), instrument())
+    const unmeasured = costlessReason(form({ cost: 'none' }), instrument({ default_spread_points: null }))
+
+    expect(chosen).toMatch(/switched off/)
+    expect(unmeasured).toMatch(/no spread has been catalogued/)
+    expect(chosen).not.toBe(unmeasured)
+  })
+})
+
+describe('a legitimately zero spread', () => {
+  it('is charged as zero rather than falling back to no cost model', () => {
+    // The database CHECK admits zero on purpose — a broker genuinely can quote it. A
+    // truthiness test (`!spread`) would pass every other test in this file and silently
+    // turn that real quote into `none`, which is a different `cost_model` on the wire and
+    // a different row in the run log's comparison.
+    const next = withInstrumentCosts(form(), instrument({ default_spread_points: '0.0000000000' }))
+
+    expect(next.cost).toBe('spread')
+    expect(next.spreadPoints).toBe('0')
+  })
+
+  it('does not trip the costless warning, because it is a measurement', () => {
+    // Zero measured and zero by omission look identical on the tape and mean opposite
+    // things. The run charging a measured zero is complete; the warning is for the other one.
+    const measured = form({ cost: 'spread', spreadPoints: '0' })
+    expect(costlessReason(measured, instrument({ default_spread_points: '0' }))).toBeNull()
   })
 })

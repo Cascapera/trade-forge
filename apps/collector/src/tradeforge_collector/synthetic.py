@@ -85,6 +85,18 @@ class SyntheticSource:
             known = ", ".join(SYNTHETIC_INSTRUMENTS)
             raise ValueError(f"no synthetic instrument {symbol!r}; known: {known}") from None
 
+    def spread_points(self, symbol: str) -> Decimal | None:
+        """Always unknown — there is no broker here to quote one.
+
+        `None` and not zero, and the difference is the whole point of the field being
+        nullable. Zero would say "this instrument is free to trade", which is a claim about a
+        market; a made-up source is in no position to make it, and a run pre-filled from it
+        would report a costless result that looked measured. Unknown is the truth, and the
+        screen is built to say so rather than to charge nothing quietly.
+        """
+        self.instrument(symbol)  # raises on an unknown symbol, like every other method here
+        return None
+
     def candles(
         self, symbol: str, timeframe: str, start: dt.datetime, end: dt.datetime
     ) -> list[Candle]:

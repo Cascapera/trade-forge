@@ -489,3 +489,37 @@ def test_a_zero_spread_is_allowed_but_a_negative_one_is_refused(session: Session
     # on a later commit — which is the point of asserting on it directly.
     with pytest.raises(IntegrityError, match="default_spread_points"):
         upsert_instruments(session, (CatalogueEntry(spec, Decimal("-1")),))
+
+
+def test_re_cataloguing_a_symbol_moves_its_updated_at(session: Session) -> None:
+    """A floating spread means nothing without the instant it was read at.
+
+    `Instrument.updated_at` declares `onupdate=func.now()`, but that is an ORM hook and this
+    write is a Core `INSERT ... ON CONFLICT DO UPDATE`: the SET clause is used exactly as
+    written, so a column absent from it simply keeps its old value. The stamp therefore has
+    to be set here, next to the columns it dates.
+
+    Measured on the real catalogue before the fix: re-reading GBPUSD's spread stored the new
+    number under a timestamp a week old. Both halves of the row were true on their own and
+    the pair was a lie — which is worse than a missing value, because it reads as a
+    measurement. See the sibling `upsert_dataset`, which has always stamped `collected_at`.
+
+    ⚠️ Asserting merely that `updated_at` is *recent* would pass without the fix — the row
+    is created moments earlier by `server_default`. Only comparing the stamp across two
+    committed upserts can tell a column that tracks its row from one that never moves.
+    """
+    spec = INSTRUMENT_SEEDS[0]
+
+    upsert_instruments(session, (CatalogueEntry(spec, Decimal("8")),))
+    session.commit()
+    first = session.query(Instrument.updated_at).scalar()
+
+    # Separate transactions, deliberately: `now()` in Postgres is the *transaction's* start
+    # time, so two upserts sharing one would share a stamp however correct the code was.
+    upsert_instruments(session, (CatalogueEntry(spec, Decimal("9")),))
+    session.commit()
+    second = session.query(Instrument.updated_at).scalar()
+
+    assert first is not None
+    assert second is not None
+    assert second > first, f"updated_at did not move: {first} -> {second}"

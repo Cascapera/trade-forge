@@ -383,3 +383,18 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
   ⚠️ **AAPL H1 não está no catálogo** por outro motivo, já registrado: foi coletado em 03/08 e o
   banco foi truncado em 04/08 pelos testes de integração; os instrumentos foram resemeados, os
   datasets não.
+- [origem: PR-226+ / 11-08-2026] **`upsert_dataset` carimba `collected_at` pelo relógio do
+  processo, não pelo do banco** — `instruments.py` monta o `set_` do `ON CONFLICT` com
+  `dt.datetime.now(tz=dt.UTC)`. Está correto no essencial (ao contrário do `updated_at` dos
+  instrumentos, que não se movia e foi corrigido em `fix/instruments-updated-at`): a coluna
+  **avança** a cada upsert. O que diverge é a fonte do tempo. `models._created_at` declara a
+  regra do projeto — *"server_default, not a Python default: the database's clock is the one
+  clock every writer shares, whatever timezone the machine that inserted thinks it is in"* — e
+  esse caminho é exatamente o que a regra descreve: quem escreve é o collector no **host
+  Windows** e a linha vive no **container**, dois relógios que não têm obrigação de concordar.
+  Consequência real, embora pequena: `datasets.collected_at` e `instruments.updated_at` passam a
+  ser medidos por relógios diferentes, então ordenar ou comparar as duas colunas entre si pode
+  inverter eventos próximos. Não bloqueia nada — nada na API nem na web lê `datasets`
+  (ver o item da cobertura acima). Conserto: trocar por `func.now()`, uma linha, junto do
+  primeiro trabalho que já for tocar `upsert_dataset` — provavelmente o item da cobertura, que
+  vai reescrever esse `set_` de qualquer forma.

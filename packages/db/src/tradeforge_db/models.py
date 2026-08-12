@@ -321,6 +321,58 @@ class Strategy(Base):
 # --------------------------------------------------------------------------- #
 
 
+class Basket(Base):
+    """One strategy launched over several symbols at once, to ask whether it travels.
+
+    A strategy that works on exactly one instrument is a strategy fitted to that
+    instrument's history. This table exists so that suspicion has an experiment: same
+    strategy, same window, same capital, N markets, results side by side.
+
+    **It groups runs; it is not a run.** Each symbol executes as its own `Backtest`,
+    untouched — the engine holds one instrument and one position per run by construction
+    (`loop._reject_foreign_symbol`, `Portfolio._open`), and a basket deliberately does not
+    challenge that. A shared-capital portfolio, where positions compete for one account,
+    is a different product answering a different question, and it would need the engine
+    rewritten at its most invariant-heavy point.
+
+    ⚠️ **Consequence worth stating where the data lives:** every run starts with the full
+    `initial_capital`, so the runs of a basket cannot be added up. Four runs of $10 000 are
+    neither a $10 000 account nor a $40 000 one. What a basket reports is *dispersion*
+    across markets, never a combined account curve — see `routers/baskets`.
+
+    No `cost_model` column, and the absence is the design. Each run is charged that
+    instrument's own measured spread (PR-226), so the basket has no single cost to store;
+    the concrete model lands on each `Backtest` row, which is what keeps each one
+    independently reproducible.
+    """
+
+    __tablename__ = "baskets"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+
+    strategy_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("strategies.id", ondelete="RESTRICT"), nullable=False
+    )
+    timeframe: Mapped[str] = mapped_column(TIMEFRAME, nullable=False)
+
+    date_from: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    date_to: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    initial_capital: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+
+    created_at: Mapped[dt.datetime] = _created_at()
+
+    # `passive_deletes="all"`: the FK is ON DELETE SET NULL, and Postgres is the one that
+    # should apply it. Left to itself SQLAlchemy would load every run to NULL its column
+    # one by one — and, worse, would do so even when the database's rule says otherwise.
+    backtests: Mapped[list[Backtest]] = relationship(back_populates="basket", passive_deletes="all")
+
+    __table_args__ = (
+        _timeframe_check(),
+        CheckConstraint("date_to >= date_from", name="date_range"),
+        CheckConstraint("initial_capital > 0", name="initial_capital_positive"),
+    )
+
+
 class Backtest(Base):
     """One run of one strategy version over one instrument and period.
 
@@ -341,6 +393,18 @@ class Backtest(Base):
     instrument_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("instruments.id", ondelete="RESTRICT"), nullable=False
     )
+
+    # Nullable, and it stays nullable: a run launched on its own belongs to no basket, which
+    # is the truth for every row made before baskets existed and for every single-symbol run
+    # made after. Not a gap waiting to be backfilled.
+    #
+    # SET NULL, not CASCADE. Deleting the grouping must not delete the measurements — "I no
+    # longer care about this comparison" is not "destroy four backtests and their trades".
+    basket_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("baskets.id", ondelete="SET NULL"), index=True
+    )
+    basket: Mapped[Basket | None] = relationship(back_populates="backtests")
+
     timeframe: Mapped[str] = mapped_column(TIMEFRAME, nullable=False)
 
     date_from: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)

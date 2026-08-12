@@ -20,7 +20,7 @@ from tradeforge_api.config import Settings
 from tradeforge_api.deps import SettingsDep
 from tradeforge_api.health import check_postgres, check_redis
 from tradeforge_api.queue import JobQueue, redis_settings
-from tradeforge_api.routers import backtests, instruments, strategies
+from tradeforge_api.routers import backtests, baskets, instruments, strategies
 from tradeforge_db.session import create_db_engine, create_session_factory
 
 
@@ -66,6 +66,7 @@ def create_app(
     app.include_router(instruments.router)
     app.include_router(strategies.router)
     app.include_router(backtests.router)
+    app.include_router(baskets.router)
     app.include_router(ws.router)
 
     @app.get("/health", tags=["health"])

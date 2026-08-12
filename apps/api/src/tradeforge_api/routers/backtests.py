@@ -58,6 +58,34 @@ _BAD_BODY: _Responses = {status.HTTP_400_BAD_REQUEST: {"description": "malformed
 _MAX_OFFSET = 9_223_372_036_854_775_807  # 2**63 - 1, Postgres bigint
 
 
+def list_item(
+    run: Backtest, symbol: str, strategy_name: str, strategy_version: int
+) -> BacktestListItem:
+    """Build one run-log row from a run and the three fields its foreign keys resolve to.
+
+    Shared with `/baskets/{id}`, which reports the same rows for the runs it groups. A basket
+    read that assembled its own would drift from this one the first time a column is added —
+    and the two views would then disagree about what a run *is* while both looking right.
+    """
+    return BacktestListItem(
+        id=run.id,
+        strategy_id=run.strategy_id,
+        strategy_name=strategy_name,
+        strategy_version=strategy_version,
+        symbol=symbol,
+        timeframe=run.timeframe,
+        date_from=run.date_from,
+        date_to=run.date_to,
+        initial_capital=run.initial_capital,
+        cost_model=run.cost_model,
+        status=run.status,
+        error=run.error,
+        created_at=run.created_at,
+        finished_at=run.finished_at,
+        metrics=(None if run.metrics is None else MetricsOut.model_validate(run.metrics)),
+    )
+
+
 def _load(session: SessionDep, backtest_id: uuid.UUID) -> Backtest:
     backtest = session.get(Backtest, backtest_id)
     if backtest is None:
@@ -197,24 +225,7 @@ def list_backtests(  # noqa: PLR0913 — one filter per column a run is chosen b
         limit=limit,
         offset=offset,
         items=[
-            BacktestListItem(
-                id=run.id,
-                strategy_id=run.strategy_id,
-                strategy_name=name,
-                strategy_version=version,
-                symbol=run_symbol,
-                timeframe=run.timeframe,
-                date_from=run.date_from,
-                date_to=run.date_to,
-                initial_capital=run.initial_capital,
-                cost_model=run.cost_model,
-                status=run.status,
-                error=run.error,
-                created_at=run.created_at,
-                finished_at=run.finished_at,
-                metrics=(None if run.metrics is None else MetricsOut.model_validate(run.metrics)),
-            )
-            for run, run_symbol, name, version in rows
+            list_item(run, run_symbol, name, version) for run, run_symbol, name, version in rows
         ],
     )
 

@@ -241,3 +241,88 @@ export interface CreateBacktestRequest {
   initial_capital: string
   cost_model: Record<string, unknown>
 }
+
+// --------------------------------------------------------------------------- //
+// Baskets — one strategy across several markets                                 //
+// --------------------------------------------------------------------------- //
+
+/**
+ * Launch one strategy over several symbols, one run each.
+ *
+ * ⚠️ **No `cost_model`, and that absence is the contract.** Each run is charged the spread
+ * measured for *its own* instrument, resolved by the server. A single figure across a basket
+ * would be meaningless: 8 ticks of EURUSD and 4 of AAPL are not only different numbers, they
+ * are counted in tick sizes that differ by a factor of a thousand. The screen's job is to
+ * *show* what each symbol will be charged before the launch, not to choose it.
+ */
+export interface CreateBasketRequest {
+  strategy_id: string
+  symbols: string[]
+  timeframe: string
+  date_from: string
+  date_to: string
+  initial_capital: string
+}
+
+/** One symbol's place in the basket: which run it became, and what it is being charged. */
+export interface BasketRunOut {
+  backtest_id: string
+  symbol: string
+  status: BacktestStatus
+  cost_model: Record<string, unknown>
+  /** `null` means nobody measured this symbol, so the run is uncosted. Never zero. */
+  default_spread_points: string | null
+}
+
+export interface CreatedBasket {
+  id: string
+  runs: BasketRunOut[]
+}
+
+/**
+ * What a basket says once its runs finish — **dispersion, never a combined account.**
+ *
+ * There is no summed equity curve in this shape, and its absence is deliberate. Every run in a
+ * basket starts with the whole `initial_capital`, so four runs of $10 000 are neither a $10 000
+ * account nor a $40 000 one. Adding the curves would draw a line that looks like a portfolio and
+ * is not one — the same failure as the forward-fill the run comparator refuses.
+ *
+ * The median rather than the mean, and the extremes by name: a strategy returning 30% on one
+ * symbol and −25% on another has an average near zero and a story the average destroys.
+ *
+ * `null` for every statistic until at least one run finishes. Undefined, not zero — a basket
+ * whose runs are still queued has not returned 0%.
+ */
+export interface BasketAggregate {
+  runs_total: number
+  runs_finished: number
+  runs_failed: number
+  runs_profitable: number
+  best_symbol: string | null
+  best_return: string | null
+  worst_symbol: string | null
+  worst_return: string | null
+  median_return: string | null
+}
+
+/**
+ * A basket read back: how it was launched, every run in it, and how far apart they landed.
+ *
+ * `runs` is `BacktestListItem[]` — the same row the run log renders, from the same builder on the
+ * server. That is why this screen reuses `RunTable` and `ComparisonChart` unchanged: a basket
+ * assembling its own idea of a run would drift from the log's the first time a column is added,
+ * and the two views would then disagree about what a run *is* while both looking right.
+ */
+export interface BasketOut {
+  id: string
+  strategy_id: string
+  strategy_name: string
+  strategy_version: number
+  timeframe: string
+  date_from: string
+  date_to: string
+  initial_capital: string
+  created_at: string
+  aggregate: BasketAggregate
+  runs: BacktestListItem[]
+}

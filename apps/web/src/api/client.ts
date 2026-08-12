@@ -6,8 +6,11 @@ import type {
   Backtest,
   BacktestFilters,
   BacktestsPage,
+  BasketOut,
   CreateBacktestRequest,
+  CreateBasketRequest,
   CreatedBacktest,
+  CreatedBasket,
   EquityPoint,
   Instrument,
   Snapshot,
@@ -83,4 +86,10 @@ export const api = {
   // would be megabytes assembled to be thrown away — so this is the only way to get one.
   getTradeSnapshot: (id: string, tradeId: number): Promise<Snapshot> =>
     request('GET', `/backtests/${id}/trades/${String(tradeId)}/snapshot`),
+  // One POST enqueues every run in the basket, or none of them: an unknown symbol is refused
+  // whole rather than leaving half a comparison behind. The 422's `detail` names every bad
+  // symbol at once, which is why `ApiError` carries it.
+  createBasket: (payload: CreateBasketRequest): Promise<CreatedBasket> =>
+    request('POST', '/baskets', payload),
+  getBasket: (id: string): Promise<BasketOut> => request('GET', `/baskets/${id}`),
 }

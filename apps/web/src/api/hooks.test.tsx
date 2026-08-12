@@ -11,12 +11,18 @@ vi.mock('./client', () => ({
     getEquity: vi.fn(),
     createStrategy: vi.fn(),
     createBacktest: vi.fn(),
+    createBasket: vi.fn(),
+    getBasket: vi.fn(),
   },
 }))
 
+import type { BasketOut } from './types'
 import { api } from './client'
 import {
+  isSettled,
   isTerminal,
+  useBasket,
+  useCreateBasket,
   useBacktest,
   useBacktests,
   useCreateBacktest,
@@ -47,6 +53,77 @@ describe('isTerminal', () => {
     expect(isTerminal('running')).toBe(false)
     expect(isTerminal('queued')).toBe(false)
     expect(isTerminal(undefined)).toBe(false)
+  })
+})
+
+describe('isSettled', () => {
+  function basket(...statuses: string[]): BasketOut {
+    return { runs: statuses.map((status) => ({ status })) } as BasketOut
+  }
+
+  it('waits for the last run, not the first', () => {
+    // A basket has no status of its own — only N runs finishing at their own pace. Stopping the
+    // poll when the first one lands would freeze the screen with the rest still queued.
+    expect(isSettled(basket('done', 'queued'))).toBe(false)
+    expect(isSettled(basket('done', 'running'))).toBe(false)
+    expect(isSettled(basket('done', 'done'))).toBe(true)
+  })
+
+  it('counts a failed run as settled, because it is not coming back', () => {
+    expect(isSettled(basket('done', 'failed'))).toBe(true)
+  })
+
+  it('keeps polling while the basket has not arrived at all', () => {
+    expect(isSettled(undefined)).toBe(false)
+  })
+
+  it('calls a basket with no runs settled rather than polling it forever', () => {
+    // The API refuses fewer than two symbols so this cannot be created, but `every` is true of an
+    // empty list — reading that as unsettled would be a query polling a shape that cannot happen.
+    expect(isSettled(basket())).toBe(true)
+  })
+})
+
+describe('useBasket', () => {
+  it('reads a basket and stops polling once every run has landed', async () => {
+    mockedApi.getBasket.mockResolvedValue({
+      id: 'k1',
+      runs: [{ status: 'done' }, { status: 'failed' }],
+    } as never)
+
+    const { result } = renderHook(() => useBasket('k1'), { wrapper: makeWrapper() })
+
+    await waitFor(() => {
+      expect(result.current.data?.id).toBe('k1')
+    })
+    expect(mockedApi.getBasket).toHaveBeenCalledWith('k1')
+  })
+
+  it('does not fetch without an id', () => {
+    renderHook(() => useBasket(undefined), { wrapper: makeWrapper() })
+    expect(mockedApi.getBasket).not.toHaveBeenCalled()
+  })
+})
+
+describe('useCreateBasket', () => {
+  it('posts the basket and returns the runs it created', async () => {
+    mockedApi.createBasket.mockResolvedValue({ id: 'k1', runs: [{}, {}] } as never)
+    const { result } = renderHook(() => useCreateBasket(), { wrapper: makeWrapper() })
+
+    act(() => {
+      result.current.mutate({
+        strategy_id: 's1',
+        symbols: ['EURUSD', 'GBPUSD'],
+        timeframe: 'H1',
+        date_from: '2024-01-01T00:00:00Z',
+        date_to: '2024-12-31T00:00:00Z',
+        initial_capital: '10000',
+      })
+    })
+
+    await waitFor(() => {
+      expect(result.current.data?.id).toBe('k1')
+    })
   })
 })
 

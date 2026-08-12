@@ -12,8 +12,11 @@ import type {
   BacktestFilters,
   BacktestStatus,
   BacktestsPage,
+  BasketOut,
   CreateBacktestRequest,
+  CreateBasketRequest,
   CreatedBacktest,
+  CreatedBasket,
   EquityPoint,
   Instrument,
   Snapshot,
@@ -143,6 +146,42 @@ export function useEquity(id: string | undefined, enabled: boolean) {
  *
  * Cached per trade, so re-opening one costs nothing and closing does not throw the bars away.
  */
+export function useCreateBasket() {
+  return useMutation<CreatedBasket, Error, CreateBasketRequest>({
+    mutationFn: (payload) => api.createBasket(payload),
+  })
+}
+
+/**
+ * Is every run in this basket over? — the basket's own version of `isTerminal`.
+ *
+ * A basket is not "done" the way a run is; it has no status of its own, only N runs that finish
+ * at their own pace. So the poll stops when the **last** one lands, not the first.
+ *
+ * ⚠️ A basket with no runs counts as settled. It cannot be created — the API refuses fewer than
+ * two symbols — but reading it as unsettled would leave `every` returning `true` for an empty
+ * list to fight a poll that never stops, and a query that polls forever over a shape that
+ * cannot happen is worse than one that quietly agrees there is nothing to wait for.
+ */
+export function isSettled(basket: BasketOut | undefined): boolean {
+  return basket?.runs.every((run) => isTerminal(run.status)) ?? false
+}
+
+/**
+ * One basket, polled until every run in it has landed.
+ *
+ * Same 202-plus-poll contract the single run uses, one level up. The interval is deliberately
+ * the same: a basket is N runs on the same worker pool, so it settles on the timescale of the
+ * slowest of them, and asking more often would only add requests to the thing being waited on.
+ */
+export function useBasket(id: string | undefined) {
+  return useQuery<BasketOut>({
+    queryKey: ['basket', id],
+    queryFn: id === undefined ? skipToken : () => api.getBasket(id),
+    refetchInterval: (query) => (isSettled(query.state.data) ? false : POLL_MS),
+  })
+}
+
 export function useTradeSnapshot(backtestId: string | undefined, tradeId: number | null) {
   return useQuery<Snapshot>({
     queryKey: ['snapshot', backtestId, tradeId],

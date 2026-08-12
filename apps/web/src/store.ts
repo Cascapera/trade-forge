@@ -8,16 +8,32 @@ interface SessionState {
   strategyId: string | null
   strategyName: string | null
   setStrategy: (id: string, name: string) => void
+  /**
+   * The basket launched most recently, so the nav can offer a way back to it.
+   *
+   * Here rather than in React Query because it is not server state: it is *which* basket this
+   * person is currently looking at, which the server has no opinion about. There is no
+   * `GET /baskets` listing, so without this thread a basket would be reachable only by pasting
+   * its URL back — the same thread `strategyId` already provides for the launch screen.
+   */
+  basketId: string | null
+  basketLabel: string | null
+  setBasket: (id: string, label: string) => void
   clear: () => void
 }
 
 export const useSession = create<SessionState>((set) => ({
   strategyId: null,
   strategyName: null,
+  basketId: null,
+  basketLabel: null,
   setStrategy: (id, name) => {
     set({ strategyId: id, strategyName: name })
   },
+  setBasket: (id, label) => {
+    set({ basketId: id, basketLabel: label })
+  },
   clear: () => {
-    set({ strategyId: null, strategyName: null })
+    set({ strategyId: null, strategyName: null, basketId: null, basketLabel: null })
   },
 }))

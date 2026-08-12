@@ -30,6 +30,7 @@ EXPECTED_TABLES = {
     "instruments",
     "datasets",
     "strategies",
+    "baskets",
     "backtests",
     "backtest_metrics",
     "trades",

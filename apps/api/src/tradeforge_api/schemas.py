@@ -333,3 +333,123 @@ class CreatedBacktest(_Out):
 
     id: uuid.UUID
     status: str
+
+
+# --------------------------------------------------------------------------- #
+# Baskets — one strategy across several markets                                 #
+# --------------------------------------------------------------------------- #
+
+# A basket of one is a backtest, and the endpoint that already does that is better at it.
+_MIN_SYMBOLS = 2
+
+# A ceiling, because every list a client controls needs one for the same reason every numeric
+# query parameter does: without it a single POST enqueues as many jobs as the caller likes.
+# Twenty is well past what a human reads off one screen and far short of what hurts the queue.
+_MAX_SYMBOLS = 20
+
+
+class CreateBasketRequest(BaseModel):
+    """Launch one strategy over several symbols, one run each.
+
+    ⚠️ **No `cost_model`, and that is the design.** Each run is charged the spread measured
+    for *its own* instrument (PR-226), resolved by the server at launch. A single figure
+    across a basket would be meaningless: 8 ticks of EURUSD and 4 of AAPL are not only
+    different numbers, they are counted in tick sizes that differ by a factor of a thousand.
+    A symbol with no measured spread runs uncosted, and the response says which ones did.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    strategy_id: uuid.UUID
+    symbols: list[str] = Field(min_length=_MIN_SYMBOLS, max_length=_MAX_SYMBOLS)
+    timeframe: str
+    date_from: dt.datetime
+    date_to: dt.datetime
+    initial_capital: Decimal = Field(gt=0)
+
+    @field_validator("symbols")
+    @classmethod
+    def _distinct(cls, symbols: list[str]) -> list[str]:
+        """The same symbol twice is a duplicated experiment wearing a comparison's clothes.
+
+        Rejected rather than de-duplicated: silently returning three runs for four requested
+        symbols would leave the caller's own list disagreeing with the basket, and a client
+        that sent a duplicate by accident learns nothing from being quietly corrected.
+        """
+        duplicated = sorted({s for s in symbols if symbols.count(s) > 1})
+        if duplicated:
+            raise ValueError(f"symbols must be distinct; repeated: {', '.join(duplicated)}")
+        return symbols
+
+
+class BasketRunOut(_Out):
+    """One symbol's place in the basket: which run it became, and what it is being charged."""
+
+    backtest_id: uuid.UUID
+    symbol: str
+    status: str
+    cost_model: dict[str, Any]
+    # Null means the catalogue has no measured spread for this symbol, so the run is
+    # uncosted — surfaced per row rather than as a basket-wide footnote, because it is
+    # true of some symbols and not others and the reader has to know which.
+    default_spread_points: Money | None
+
+
+class CreatedBasket(_Out):
+    """The 202 body: the basket exists and its runs are queued, one per symbol."""
+
+    id: uuid.UUID
+    runs: list[BasketRunOut]
+
+
+class BasketAggregate(BaseModel):
+    """What a basket says once its runs finish — **dispersion, never a combined account.**
+
+    ⚠️ There is no summed equity curve here, and its absence is the most important decision
+    in this schema. Every run in a basket starts with the whole `initial_capital`, so four
+    runs of $10 000 are neither a $10 000 account nor a $40 000 one. Adding the curves would
+    draw a line that looks like a portfolio and is not one — the same failure as the
+    forward-fill rejected in the run comparator, where a fabricated shape is indistinguishable
+    on screen from a measured one.
+
+    What a basket is *for* is the spread of outcomes across markets. A strategy returning 30%
+    on one symbol and -25% on another has a mean near zero and a story the mean destroys, so
+    the extremes are reported by name and the median is reported instead of the average:
+    one spectacular market cannot drag the middle.
+
+    Returns are fractions of `initial_capital`, which the basket fixes for every run — so
+    unlike the general run comparator, these percentages are comparable by construction.
+
+    `null` for every statistic until at least one run finishes. Undefined, not zero: a basket
+    whose runs are still queued has not returned 0%.
+    """
+
+    runs_total: int
+    runs_finished: int
+    runs_failed: int
+
+    # Among the finished runs only. A queued run is not an unprofitable one.
+    runs_profitable: int
+
+    best_symbol: str | None
+    best_return: Money | None
+    worst_symbol: str | None
+    worst_return: Money | None
+    median_return: Money | None
+
+
+class BasketOut(_Out):
+    """A basket read back: how it was launched, every run in it, and the dispersion."""
+
+    id: uuid.UUID
+    strategy_id: uuid.UUID
+    strategy_name: str
+    strategy_version: int
+    timeframe: str
+    date_from: dt.datetime
+    date_to: dt.datetime
+    initial_capital: Money
+    created_at: dt.datetime
+
+    aggregate: BasketAggregate
+    runs: list[BacktestListItem]

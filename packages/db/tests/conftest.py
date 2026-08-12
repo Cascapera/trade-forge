@@ -20,6 +20,7 @@ TABLES_CHILD_FIRST = (
     "trades",
     "backtest_metrics",
     "backtests",
+    "baskets",
     "strategies",
     "datasets",
     "instruments",

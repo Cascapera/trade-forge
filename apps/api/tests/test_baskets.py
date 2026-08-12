@@ -84,8 +84,14 @@ def test_an_odd_count_takes_the_middle_value_itself() -> None:
 
 
 def test_an_even_count_averages_the_two_middle_values() -> None:
-    """Chosen so the answer is a value no single run has: an off-by-one picks 1% or 3%."""
-    runs = [_run("A", "-500"), _run("B", "100"), _run("C", "300"), _run("D", "900")]
+    """Chosen so the answer is a value no single run has: an off-by-one picks 1% or 3%.
+
+    The outlier is there on purpose. With a fourth run at +9% the median is 2% and so is the
+    mean of all four — the even branch is precisely where the two statistics are hardest to
+    tell apart, and a test whose numbers make them coincide cannot report that the whole
+    function was replaced by an average. At +49% the mean is 12% and this test says so.
+    """
+    runs = [_run("A", "-500"), _run("B", "100"), _run("C", "300"), _run("D", "4900")]
 
     assert _aggregate(runs, CAPITAL).median_return == Decimal("0.02")
 

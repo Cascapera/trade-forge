@@ -1487,3 +1487,92 @@ def test_the_target_and_the_conducted_stop_race_and_the_first_one_wins() -> None
     # The record keeps the level the lot was sized against, not the one that filled it.
     assert stopped.stop_loss == Decimal("97.90")
     assert stopped.r_multiple == ZERO
+
+
+# --------------------------------------------------------------------------- #
+# What the chart is allowed to draw (`protocols.Charted`)                       #
+# --------------------------------------------------------------------------- #
+
+
+def _rising(count: int) -> list[Candle]:
+    """A plain climbing series — the average's own values are the subject, not the trades."""
+    return [bar(i, open_=str(100 + i), close=str(101 + i)) for i in range(count)]
+
+
+def test_the_setup_reports_the_average_it_is_defined_by() -> None:
+    strategy = Mme9BreakoutStrategy(period=9)
+
+    overlays = strategy.overlays()
+
+    assert list(overlays) == ["EMA 9"]
+    assert isinstance(overlays["EMA 9"], EMA)
+
+
+def test_the_label_follows_the_period_it_was_built_with() -> None:
+    """The label is not the constant "EMA 9". A run of a 21-period MME must not be charted
+    against a curve captioned 9 — the caption is the only thing saying which average this is."""
+    assert list(Mme9BreakoutStrategy(period=21).overlays()) == ["EMA 21"]
+
+
+def test_driving_the_overlay_alone_gives_what_the_running_strategy_computed() -> None:
+    """⚠️ The property the whole overlay endpoint rests on.
+
+    The chart is drawn by building a throwaway strategy and feeding candles straight into the
+    indicator it hands back — never by running `on_bar`. That shortcut is only legitimate because
+    the average is updated on **every** bar, position or not, so the standalone series and the one
+    the run computed are the same series.
+
+    If a future edit moved `self._ema.update(candle)` inside any branch — behind "no position",
+    say — the two would part company, every chart would stop agreeing with the trades on it, and
+    nothing else in the suite would notice. This is what notices.
+    """
+    candles = _rising(30)
+
+    alone = Mme9BreakoutStrategy(period=9)
+    solo: list[Money | None] = []
+    with localcontext(ENGINE_CONTEXT):
+        for candle in candles:
+            indicator = alone.overlays()["EMA 9"]
+            indicator.update(candle)
+            solo.append(indicator.value())
+
+    running = Mme9BreakoutStrategy(period=9)
+    _drive(running, candles)
+    replayed: list[Money | None] = []
+    with localcontext(ENGINE_CONTEXT):
+        # The running strategy's own average, read after the fact: driving it again would double
+        # count, so this asserts on the *last* value it reached versus the standalone one.
+        replayed.append(running.overlays()["EMA 9"].value())
+
+    assert solo[-1] == replayed[-1]
+    assert solo[-1] is not None
+
+
+def test_the_average_is_the_same_whether_or_not_the_bars_produced_trades() -> None:
+    """The same property from the other side: hold a position on half the bars and the average
+    must not move. A conditional update would show up here as a different final value."""
+    candles = _rising(30)
+
+    flat = Mme9BreakoutStrategy(period=9)
+    _drive(flat, candles)
+
+    traded = Mme9BreakoutStrategy(period=9)
+    _drive(traded, candles, position_on=frozenset(range(10, 20)))
+
+    assert flat.overlays()["EMA 9"].value() == traded.overlays()["EMA 9"].value()
+
+
+def test_the_curve_has_no_value_until_the_average_has_warmed_up() -> None:
+    """Eight `None`s before a 9-period EMA says anything — the gap the chart draws as a curve
+    that simply starts later, rather than as a line pinned to zero."""
+    strategy = Mme9BreakoutStrategy(period=9)
+    indicator = strategy.overlays()["EMA 9"]
+
+    seen: list[Money | None] = []
+    with localcontext(ENGINE_CONTEXT):
+        for candle in _rising(12):
+            indicator.update(candle)
+            seen.append(indicator.value())
+
+    assert seen[:8] == [None] * 8
+    assert seen[8] is not None

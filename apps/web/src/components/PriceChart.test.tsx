@@ -6,7 +6,7 @@ import type { Candle, Trade } from '../api/types'
 // and the test asserts what this component is responsible for: the bars reaching the series, the
 // second encoding on the candles, markers going through the plugin rather than a rebuild, and the
 // chosen trade moving the view.
-const { createChart, setData, setMarkers, setVisibleRange, fitContent, remove, options } =
+const { createChart, setData, setMarkers, setVisibleRange, fitContent, remove, options, kinds } =
   vi.hoisted(() => {
     const setData = vi.fn()
     const setMarkers = vi.fn()
@@ -14,7 +14,9 @@ const { createChart, setData, setMarkers, setVisibleRange, fitContent, remove, o
     const fitContent = vi.fn()
     const remove = vi.fn()
     const options: Record<string, unknown>[] = []
-    const addSeries = vi.fn((_kind: string, given: Record<string, unknown>) => {
+    const kinds: string[] = []
+    const addSeries = vi.fn((kind: string, given: Record<string, unknown>) => {
+      kinds.push(kind)
       options.push(given)
       return { setData }
     })
@@ -23,13 +25,14 @@ const { createChart, setData, setMarkers, setVisibleRange, fitContent, remove, o
       timeScale: () => ({ fitContent, setVisibleRange }),
       remove,
     }))
-    return { createChart, setData, setMarkers, setVisibleRange, fitContent, remove, options }
+    return { createChart, setData, setMarkers, setVisibleRange, fitContent, remove, options, kinds }
   })
 
 vi.mock('lightweight-charts', () => ({
   createChart,
   createSeriesMarkers: () => ({ setMarkers }),
   CandlestickSeries: 'CandlestickSeries',
+  LineSeries: 'LineSeries',
   ColorType: { Solid: 'solid' },
 }))
 
@@ -88,6 +91,7 @@ afterEach(() => {
   cleanup()
   vi.clearAllMocks()
   options.length = 0
+  kinds.length = 0
 })
 
 describe('PriceChart', () => {
@@ -190,5 +194,45 @@ describe('PriceChart', () => {
     draw().unmount()
 
     expect(remove).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('PriceChart — the curves the strategy was reading', () => {
+  const ema = {
+    label: 'EMA 9',
+    points: [
+      ['2024-08-01T15:00:00Z', '226.10'],
+      ['2024-08-01T16:00:00Z', '226.40'],
+    ] as [string, string][],
+  }
+
+  it('draws a line per curve, on top of the candles', () => {
+    draw({ overlays: [ema] })
+
+    expect(kinds).toEqual(['CandlestickSeries', 'LineSeries'])
+  })
+
+  it('names every curve in the legend, because colour alone may not identify it', () => {
+    draw({ overlays: [ema] })
+
+    expect(screen.getByText('EMA 9')).toBeInTheDocument()
+  })
+
+  it('draws only the candles when the strategy reads no curves', () => {
+    // A structure setup. The chart must be an ordinary chart, not an error state.
+    draw({ overlays: [] })
+
+    expect(kinds).toEqual(['CandlestickSeries'])
+  })
+
+  it('sends the curve its own points rather than padding it to the bars', () => {
+    // The curve is two points long against six candles: the warm-up gap survives to the library,
+    // which is what lets it be drawn starting where the indicator started.
+    draw({ overlays: [ema] })
+
+    expect(setData).toHaveBeenLastCalledWith([
+      { time: 1722524400, value: 226.1 },
+      { time: 1722528000, value: 226.4 },
+    ])
   })
 })

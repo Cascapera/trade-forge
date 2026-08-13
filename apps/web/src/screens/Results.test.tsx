@@ -8,6 +8,7 @@ vi.mock('../api/hooks', () => ({
   useTrades: vi.fn(),
   useEquity: vi.fn(),
   useCandles: vi.fn(),
+  useOverlays: vi.fn(),
   useTradeSnapshot: vi.fn(),
 }))
 
@@ -19,13 +20,14 @@ vi.mock('../components/PriceChart', () => ({
   ),
 }))
 
-import { useBacktest, useCandles, useEquity, useTrades } from '../api/hooks'
+import { useBacktest, useCandles, useEquity, useOverlays, useTrades } from '../api/hooks'
 import { Results } from './Results'
 
 const mockedBacktest = vi.mocked(useBacktest)
 const mockedTrades = vi.mocked(useTrades)
 const mockedEquity = vi.mocked(useEquity)
 const mockedCandles = vi.mocked(useCandles)
+const mockedOverlays = vi.mocked(useOverlays)
 
 const metrics: Metrics = {
   net_profit: '100',
@@ -113,6 +115,7 @@ beforeEach(() => {
   mockedTrades.mockReturnValue({ data: { total: 0, limit: 100, offset: 0, items: [] } } as never)
   mockedEquity.mockReturnValue({ data: [] } as never)
   mockedCandles.mockReturnValue({ data: candles(), isPending: false, isError: false } as never)
+  mockedOverlays.mockReturnValue({ data: { symbol: 'AAPL', timeframe: 'H1', series: [] } } as never)
 })
 
 afterEach(() => {

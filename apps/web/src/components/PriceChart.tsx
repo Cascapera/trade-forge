@@ -1,6 +1,7 @@
 import {
   CandlestickSeries,
   ColorType,
+  LineSeries,
   createChart,
   createSeriesMarkers,
   type IChartApi,
@@ -11,8 +12,8 @@ import {
 } from 'lightweight-charts'
 import { useEffect, useMemo, useRef } from 'react'
 
-import type { Candle, Trade } from '../api/types'
-import { toBars, toMarkers, visibleRangeFor } from '../backtest/price'
+import type { Candle, OverlaySeries, Trade } from '../api/types'
+import { toBars, toCurves, toMarkers, visibleRangeFor } from '../backtest/price'
 
 // The price a run was executed over, with its trades marked on it.
 //
@@ -34,11 +35,19 @@ const GRID = '#1e293b'
 const AXIS = '#334155'
 const INK = '#94a3b8'
 
+// A module constant, and the test `sets the markers through the plugin` is what caught its
+// absence: `overlays = []` written in the destructuring builds a *fresh* array on every render,
+// so the curves recompute, the effect's dependency changes, and the chart is torn down and
+// rebuilt — discarding whatever the reader had zoomed to, on every click.
+const NO_OVERLAYS: readonly OverlaySeries[] = []
+
 interface Props {
   candles: readonly Candle[]
   trades: readonly Trade[]
   /** The trade the reader picked in the table, or `null`. Drives both the labels and the view. */
   selectedTradeId: number | null
+  /** What the strategy was reading. Empty is ordinary — a structure setup draws zones, not lines. */
+  overlays?: readonly OverlaySeries[]
   symbol: string
   timeframe: string
 }
@@ -49,6 +58,7 @@ export function PriceChart({
   selectedTradeId,
   symbol,
   timeframe,
+  overlays = NO_OVERLAYS,
 }: Props): React.JSX.Element {
   const container = useRef<HTMLDivElement>(null)
   const chartRef = useRef<IChartApi | null>(null)
@@ -59,6 +69,7 @@ export function PriceChart({
 
   const bars = useMemo(() => toBars(candles), [candles])
   const marks = useMemo(() => toMarkers(trades, selectedTradeId), [trades, selectedTradeId])
+  const curves = useMemo(() => toCurves(overlays), [overlays])
 
   // The chart itself, rebuilt only when the bars change — which for a finished run is once.
   // Keeping it out of the marker and selection effects is what lets a reader click through
@@ -92,6 +103,20 @@ export function PriceChart({
     })
     drawn.setData(bars.map((bar) => ({ ...bar, time: bar.time as UTCTimestamp })))
 
+    // The curves the strategy was reading. Each carries its own timestamps and is set as its own
+    // series, so a curve that starts late (an average warming up) simply begins where it begins —
+    // joining by position would slide every point one warm-up period to the left, and the shape
+    // would still look like a moving average.
+    for (const curve of curves) {
+      const line = chart.addSeries(LineSeries, {
+        color: curve.color,
+        lineWidth: 2,
+        lastValueVisible: false,
+        priceLineVisible: false,
+      })
+      line.setData(curve.points.map((p) => ({ time: p.time as UTCTimestamp, value: p.value })))
+    }
+
     chartRef.current = chart
     plugin.current = createSeriesMarkers(drawn)
     chart.timeScale().fitContent()
@@ -101,7 +126,7 @@ export function PriceChart({
       plugin.current = null
       chart.remove()
     }
-  }, [bars])
+  }, [bars, curves])
 
   // Markers are set through the plugin rather than by rebuilding the chart: selecting a trade
   // changes every marker's text, and rebuilding for that would reset the reader's view.
@@ -151,6 +176,19 @@ export function PriceChart({
         className="rounded-lg border border-slate-800 bg-slate-900/40 p-2"
       />
       <ul className="flex flex-wrap gap-x-5 gap-y-2 text-xs text-slate-300">
+        {/* The curves first, each directly named. A legend is not optional here: the line hues are
+            only legal alongside a label, and "which average is this" is the question the caption
+            answers. Text stays in ink; the swatch beside it carries the colour. */}
+        {curves.map((curve) => (
+          <li key={curve.label} className="flex items-center gap-2">
+            <span
+              aria-hidden
+              className="h-0.5 w-4 shrink-0 rounded-full"
+              style={{ backgroundColor: curve.color }}
+            />
+            {curve.label}
+          </li>
+        ))}
         <li className="flex items-center gap-2">
           <span aria-hidden style={{ color: '#5F8AD2' }}>
             ▲▼

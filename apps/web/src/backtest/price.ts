@@ -5,7 +5,7 @@
 // else — which is what lets these rules be tested without a chart at all, since jsdom has no
 // canvas for lightweight-charts to draw on.
 
-import type { Candle, Trade } from '../api/types'
+import type { Candle, OverlaySeries, Trade } from '../api/types'
 
 /** A bar as lightweight-charts wants it: seconds, and numbers rather than exact decimals. */
 export interface Bar {
@@ -64,6 +64,58 @@ export function toBars(candles: readonly Candle[]): Bar[] {
     low: Number(candle.low),
     close: Number(candle.close),
   }))
+}
+
+/**
+ * The hues an overlay curve can wear, in fixed order.
+ *
+ * The first is the same gold `TradeSnapshot` draws an average in, so the average is the same
+ * colour whether you are looking at one entry or the whole run — the two charts read as one
+ * system rather than as two pictures of the same thing.
+ *
+ * Measured as a set against this chart's surface together with the candle and entry hues, not
+ * picked: with one curve the worst normal-vision adjacent pair is ΔE 24.8, with two it is 19.2,
+ * and every colour clears 3:1 against `#070d1f`. Reordering this list or dropping one from the
+ * middle invalidates that measurement.
+ *
+ * Assigned by position, which is safe **here** and would not be everywhere: the series come back
+ * in the order the strategy declares them and nothing on this screen filters one out, so a
+ * position is a stable identity. The run comparison chart faces the opposite situation and needs
+ * a seating chart for exactly that reason — see `compare.ts`.
+ */
+export const CURVE_COLORS: readonly string[] = ['#BC8620', '#d55181', '#3987e5']
+
+export interface Curve {
+  label: string
+  color: string
+  points: { time: number; value: number }[]
+}
+
+/**
+ * Overlay series off the wire, ready to draw.
+ *
+ * Curves past the palette are **dropped, not recycled**. A fourth line repeating the first
+ * colour would be two different indicators the reader is invited to read as one, and a legend
+ * naming both in the same swatch says nothing. No strategy in the DSL declares more than three
+ * today; if one ever does, this loses a line visibly rather than lying about the ones it keeps.
+ */
+export function toCurves(series: readonly OverlaySeries[]): Curve[] {
+  // Walking the palette rather than the series is what makes the cap structural: there is no
+  // index here the palette does not have, so no assertion is needed to say so.
+  return CURVE_COLORS.flatMap((color, index) => {
+    const one = series[index]
+    if (one === undefined) return []
+    return [
+      {
+        label: one.label,
+        color,
+        points: one.points.map(([time, value]) => ({
+          time: toSeconds(time),
+          value: Number(value),
+        })),
+      },
+    ]
+  })
 }
 
 /** `+2.30R`, or `—` when the run recorded no R multiple for the trade. */

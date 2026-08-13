@@ -52,6 +52,7 @@ engine deliberately keeps outside it.
 
 import logging
 from collections import deque
+from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Final, Literal
@@ -71,6 +72,7 @@ from tradeforge_engine.domain import (
     SnapshotSeries,
 )
 from tradeforge_engine.indicators import EMA, SMA
+from tradeforge_engine.protocols import Indicator
 from tradeforge_engine.structure import MarketStructure, StructureBreak
 
 logger = logging.getLogger(__name__)
@@ -228,6 +230,9 @@ class Mme9BreakoutStrategy:
         self._stop_buffer_ticks = Decimal(stop_buffer_ticks)
         self._breakeven_at_r = breakeven_at_r
         self._ema = EMA(period=period, source="close")
+        # Kept for the chart's label. The indicator does not expose its own period, and a label
+        # rebuilt from the setup's JSON elsewhere would be a second place holding this number.
+        self._period = period
         self._trail_of_the_average = _AverageTrail()
 
         self._armed: _Armed | None = None
@@ -236,6 +241,10 @@ class Mme9BreakoutStrategy:
         # the average and crosses again. Set when a fill is observed, cleared by the first bar
         # that closes on the wrong side of the average — which is exactly a turn ending.
         self._spent = False
+
+    def overlays(self) -> Mapping[str, Indicator]:
+        """The average this setup is defined by — see `protocols.Charted`."""
+        return {f"EMA {self._period}": self._ema}
 
     def on_bar(self, context: Context) -> tuple[Signal, ...]:
         candle = context.candle
@@ -510,6 +519,10 @@ class PontoContinuoStrategy:
         # line, which is MME throughout. The arithmetic mean of the same period is slower, so it
         # sits further from price and asks for a deeper correction before it is touched.
         self._average = build(period=period, source="close")
+        # Both kept for the chart's label: unlike the MME9 setup, which average this one uses is
+        # itself a parameter, so the label has to say *which* as well as how long.
+        self._period = period
+        self._average_kind = average
         self._trail_of_the_average = _AverageTrail()
 
         self._previous: Candle | None = None
@@ -522,6 +535,10 @@ class PontoContinuoStrategy:
         # a fact about the chart, and the trail needs the ones that land mid-trade.
         self._structure = MarketStructure()
         self._trail = StructuralTrail()
+
+    def overlays(self) -> Mapping[str, Indicator]:
+        """The average the corrections are counted against — see `protocols.Charted`."""
+        return {f"{self._average_kind} {self._period}": self._average}
 
     def on_bar(self, context: Context) -> tuple[Signal, ...]:
         candle = context.candle

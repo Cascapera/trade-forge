@@ -1353,3 +1353,37 @@ def test_no_order_is_armed_on_a_bar_that_shows_a_position(
     every_bar = frozenset(range(len(candles)))
     side = Side.LONG if long else Side.SHORT
     assert _arms(_drive(candles, side=side, position_on=every_bar)) == []
+
+
+def test_the_overlay_names_which_average_as_well_as_how_long() -> None:
+    """Unlike the MME9 setup, *which* mean this one uses is a parameter — so the caption has to
+    carry it. Two runs of period 20, one exponential and one arithmetic, are different
+    experiments, and a chart captioning both "20" could not tell a reader which it drew."""
+    assert list(PontoContinuoStrategy(period=20, average="EMA").overlays()) == ["EMA 20"]
+    assert list(PontoContinuoStrategy(period=20, average="SMA").overlays()) == ["SMA 20"]
+
+
+def test_the_arithmetic_and_exponential_overlays_are_genuinely_different_curves() -> None:
+    """The label is not cosmetic. If `average` were ignored and both built an EMA, the captions
+    would still differ while the curves agreed — so the values are what this asserts.
+
+    ⚠️ **The series has to bend.** The first attempt walked a straight ramp, and on a straight
+    ramp the two averages are *equal*: both settle exactly one half-period of slope behind price,
+    so the scenario written to separate them could not. Twenty flat bars and then a sharp climb is
+    the shape where they part — the exponential is already chasing the move while the arithmetic
+    still carries ten of the old bars in its window.
+    """
+    flat = [bar(i, open_="100", close="100") for i in range(20)]
+    climb = [bar(20 + i, open_=str(100 + 5 * i), close=str(105 + 5 * i)) for i in range(10)]
+
+    with localcontext(ENGINE_CONTEXT):
+        exponential = PontoContinuoStrategy(period=20, average="EMA").overlays()["EMA 20"]
+        arithmetic = PontoContinuoStrategy(period=20, average="SMA").overlays()["SMA 20"]
+        for candle in [*flat, *climb]:
+            exponential.update(candle)
+            arithmetic.update(candle)
+        faster, slower = exponential.value(), arithmetic.value()
+
+    assert faster is not None
+    assert slower is not None
+    assert faster > slower

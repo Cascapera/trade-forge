@@ -14,6 +14,7 @@ import type {
   CreatedBasket,
   EquityPoint,
   Instrument,
+  OverlaysResponse,
   Snapshot,
   StrategyOut,
   TradesPage,
@@ -88,6 +89,11 @@ export const api = {
   // did not execute over. A client that assembled the window itself could get it subtly wrong,
   // and a chart disagreeing with the trades drawn on it says nothing about the disagreement.
   getCandles: (id: string): Promise<CandlesResponse> => request('GET', `/backtests/${id}/candles`),
+  // Recomputed per request rather than stored: an indicator series is derivable from the candles
+  // and the parameters, and the engine is deterministic, so what comes back is what the run
+  // computed. Separate from `getCandles` because a strategy can legitimately have no curves.
+  getOverlays: (id: string): Promise<OverlaysResponse> =>
+    request('GET', `/backtests/${id}/overlays`),
   // One snapshot at a time. The list deliberately does not carry them — fifty bars per trade
   // would be megabytes assembled to be thrown away — so this is the only way to get one.
   getTradeSnapshot: (id: string, tradeId: number): Promise<Snapshot> =>

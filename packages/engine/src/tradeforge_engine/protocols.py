@@ -18,7 +18,7 @@ strategy never opened — another EA's, a manual trade, another symbol entirely.
 """
 
 import datetime as dt
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Protocol, runtime_checkable
 
 from tradeforge_engine.domain import (
@@ -189,6 +189,39 @@ class Indicator(Protocol):
 
     def value(self) -> Money | None:
         """The current value, or `None` while still warming up."""
+        ...
+
+
+@runtime_checkable
+class Charted(Protocol):
+    """A strategy that can say which curves it was reading, for something to draw them.
+
+    **Optional, and the engine never calls it.** Nothing in the event loop asks a strategy for
+    this; a strategy that does not implement it simply charts as bars and trades. The protocol
+    exists so a *reader* — the API serving a price chart — can ask a question the loop has no
+    reason to ask.
+
+    **The values are not persisted, and that is deliberate.** An indicator series is derivable
+    from the candles and the parameters, and this project's rule is that derivable data is
+    recomputed rather than stored: the equity curve of a single run already reaches 856 kB, and
+    a series per indicator per run would grow the same way for something a chart reads once.
+
+    **It returns the strategy's own indicators, not a description of them.** A description
+    ("EMA, period 9, on close") would have to be turned back into an indicator by whoever drew
+    it, and that reconstruction is a second place where "which average does this setup use"
+    lives. The day a setup changed its average, the description path would keep drawing the old
+    one — correct-looking, and wrong. Handing back the object removes the second place entirely.
+
+    ⚠️ **The objects are live and mutable.** A caller that drives them with `update` advances
+    the very indicators the strategy would read, so this must be asked of a strategy built for
+    charting and used for nothing else — never of one that is executing a backtest. Driving
+    them is exact for the setups here because each updates its average on **every** bar,
+    position or not (see `Mme9BreakoutStrategy.on_bar`), so the standalone series and the one
+    the run computed cannot differ.
+    """
+
+    def overlays(self) -> Mapping[str, Indicator]:
+        """Label to indicator, in drawing order. Empty is a valid answer."""
         ...
 
 

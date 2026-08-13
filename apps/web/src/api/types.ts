@@ -242,6 +242,32 @@ export interface CandlesResponse {
   candles: Candle[]
 }
 
+/**
+ * A curve to draw across the run's bars — an indicator, as the strategy computed it.
+ *
+ * Each point is `[time, value]`. Join to the candles **on the timestamp**, never by index: the
+ * series is shorter than the bars whenever the indicator was warming up, so an index join draws
+ * every point one period to the left of where it belongs — and the shape still looks right.
+ */
+export interface OverlaySeries {
+  label: string
+  points: [string, string][]
+}
+
+/** Every curve the run's strategy was reading. Empty for a setup whose overlay is zones. */
+export interface OverlaysResponse {
+  symbol: string
+  timeframe: string
+  /**
+   * The same provenance pair the candles carry, and the curve needs it *more* than they do: the
+   * bars are read back, while the curve is recomputed over them, so one extra bar inside the
+   * window does not add a point at the end — it reseeds the average and moves the whole line.
+   */
+  candles_seen: number
+  count: number
+  series: OverlaySeries[]
+}
+
 export interface TradesPage {
   total: number
   limit: number

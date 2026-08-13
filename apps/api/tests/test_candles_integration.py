@@ -12,7 +12,7 @@ import asyncio
 import datetime as dt
 import uuid
 from collections.abc import Callable
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +26,8 @@ from tradeforge_api.worker import process_backtest
 from tradeforge_collector import write_candles
 from tradeforge_db.models import Backtest, BacktestStatus, Instrument
 from tradeforge_engine.domain import AssetClass, Candle
+from tradeforge_engine.indicators import EMA
+from tradeforge_engine.loop import ENGINE_CONTEXT
 from tradeforge_engine.testing import bar
 
 pytestmark = pytest.mark.integration
@@ -322,3 +324,258 @@ def test_an_unknown_backtest_is_a_404(
 
     assert response.status_code == 404
     assert response.json()["detail"] == "backtest not found"
+
+
+# --------------------------------------------------------------------------- #
+# `/overlays` — the curves the strategy was reading                             #
+# --------------------------------------------------------------------------- #
+
+
+def _setup_strategy() -> dict[str, Any]:
+    """A `setup` document, which is what every strategy in this project's database actually is.
+
+    Worth its own fixture beside the DSL one above: the two reach `overlays` by different paths,
+    and the setup path is the one that would have been missed entirely by an implementation that
+    read `definition["indicators"]` — a setup document has no such block.
+    """
+    return {
+        "schema_version": "1.0",
+        "name": "MME9 for the price chart",
+        "timeframe": "H1",
+        "setup": {"type": "mme9_breakout", "params": {"side": "long", "period": 3}},
+        "risk": {"sizing": {"type": "percent_risk", "params": {"percent": 1.0}}},
+    }
+
+
+def _launch_with(client: TestClient, document: dict[str, Any]) -> str:
+    created = client.post("/strategies", json=document)
+    assert created.status_code == 201, created.text
+    enqueued = client.post(
+        "/backtests",
+        json={
+            "strategy_id": created.json()["id"],
+            "symbol": "EURUSD",
+            "timeframe": "H1",
+            "date_from": START.isoformat(),
+            "date_to": (START + 100 * HOUR).isoformat(),
+            "initial_capital": "10000",
+            "cost_model": {"type": "none"},
+        },
+    )
+    assert enqueued.status_code == 202, enqueued.text
+    return str(enqueued.json()["id"])
+
+
+def test_a_setup_reports_the_average_it_trades_even_with_no_indicators_block(
+    session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+) -> None:
+    """⚠️ The test that would have caught the obvious wrong implementation.
+
+    A `setup` document has no `indicators` key at all — the average lives inside the setup's own
+    params. Every strategy in this project's database is one of these, so an overlay built by
+    reading `definition["indicators"]` would have returned an empty list for all of them: a
+    feature that ships, draws nothing, and raises no error anywhere.
+    """
+    seeding = session_factory()
+    _seed_instrument(seeding)
+    seeding.close()
+    write_candles(tmp_path, "EURUSD", "H1", _candles())
+
+    with TestClient(_app(settings, session_factory, tmp_path)) as client:
+        backtest_id = _launch_with(client, _setup_strategy())
+        _run(session_factory, tmp_path, backtest_id)
+        body = client.get(f"/backtests/{backtest_id}/overlays").json()
+
+    assert [series["label"] for series in body["series"]] == ["EMA 3"]
+    assert body["symbol"] == "EURUSD"
+
+
+def test_the_curve_starts_where_the_indicator_did_not_where_the_bars_do(
+    session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+) -> None:
+    """Warm-up bars are absent rather than null, so the series is shorter than the candles.
+
+    Which is exactly why the points carry their own timestamps: a client joining curve to bars by
+    *index* would draw every point one warm-up period to the left of where it belongs, and the
+    shape would still look like a moving average.
+    """
+    seeding = session_factory()
+    _seed_instrument(seeding)
+    seeding.close()
+    bars = _candles()
+    write_candles(tmp_path, "EURUSD", "H1", bars)
+
+    with TestClient(_app(settings, session_factory, tmp_path)) as client:
+        backtest_id = _launch_with(client, _setup_strategy())
+        _run(session_factory, tmp_path, backtest_id)
+        overlays = client.get(f"/backtests/{backtest_id}/overlays").json()
+        candles = client.get(f"/backtests/{backtest_id}/candles").json()
+
+    [series] = overlays["series"]
+    # A 3-period average: two bars of warm-up, so two fewer points than there are candles.
+    assert len(series["points"]) == candles["count"] - 2
+    assert _moment(series["points"][0][0]) > _moment(candles["candles"][0]["time"])
+    # And it ends on the same bar the candles do — a curve stopping short would read as the
+    # strategy having gone blind for the last stretch of the run.
+    assert _moment(series["points"][-1][0]) == _moment(candles["candles"][-1]["time"])
+
+
+def test_a_dsl_strategy_is_charted_under_the_ids_its_own_rules_refer_to(
+    session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+) -> None:
+    """The other path. Labels are the document's ids (`fast`, `slow`), not prettified names —
+    those ids are what the conditions say, so the curve can be read against the rule."""
+    seeding = session_factory()
+    _seed_instrument(seeding)
+    seeding.close()
+    write_candles(tmp_path, "EURUSD", "H1", _candles())
+
+    with TestClient(_app(settings, session_factory, tmp_path)) as client:
+        backtest_id = _launch(client)
+        _run(session_factory, tmp_path, backtest_id)
+        body = client.get(f"/backtests/{backtest_id}/overlays").json()
+
+    assert sorted(series["label"] for series in body["series"]) == ["fast", "slow"]
+
+
+def test_prices_on_the_curve_are_strings_like_every_other_price(
+    session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+) -> None:
+    seeding = session_factory()
+    _seed_instrument(seeding)
+    seeding.close()
+    write_candles(tmp_path, "EURUSD", "H1", _candles())
+
+    with TestClient(_app(settings, session_factory, tmp_path)) as client:
+        backtest_id = _launch_with(client, _setup_strategy())
+        _run(session_factory, tmp_path, backtest_id)
+        body = client.get(f"/backtests/{backtest_id}/overlays").json()
+
+    _, value = body["series"][0]["points"][0]
+    assert isinstance(value, str)
+    assert Decimal(value) > 0
+
+
+def test_a_run_with_no_provenance_has_no_curves_either(
+    session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+) -> None:
+    """The same guard as `/candles`, and it has to be the same guard: a curve served for a window
+    the candles endpoint refuses would be drawn against bars nothing agreed on."""
+    seeding = session_factory()
+    _seed_instrument(seeding)
+    seeding.close()
+    write_candles(tmp_path, "EURUSD", "H1", _candles())
+
+    with TestClient(_app(settings, session_factory, tmp_path)) as client:
+        backtest_id = _launch_with(client, _setup_strategy())
+        session = session_factory()
+        try:
+            run = session.get(Backtest, uuid.UUID(backtest_id))
+            assert run is not None
+            run.status = BacktestStatus.FAILED
+            run.error = "never read a candle"
+            session.commit()
+        finally:
+            session.close()
+
+        response = client.get(f"/backtests/{backtest_id}/overlays")
+
+    assert response.status_code == 404
+    assert "did not record" in response.json()["detail"]
+
+
+def test_every_value_on_the_curve_is_the_average_over_the_window_the_run_read(
+    session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+) -> None:
+    """⚠️ The only test here that looks at the *numbers*.
+
+    Every other one checks the shape of the response — the label, the length, the timestamps at
+    the ends. A curve that was the right length, spanned the right period, and was made of
+    different numbers would pass all of them.
+
+    The expectation is built by driving the same indicator over the same bars under the engine's
+    own decimal context. That deliberately shares the EMA implementation — this is not trying to
+    re-derive an exponential average, which the engine's golden tests already pin — but it does
+    not share the window, the seeding, the alignment or the context, and those are exactly what
+    an endpoint recomputing a series can get wrong while still returning something plausible.
+
+    **What it does not prove**, and the stronger anchor for it: a run *persists* the average it
+    judged each entry against, into that trade's snapshot. Comparing the served curve to those
+    recorded values would close the loop against numbers written during the run rather than
+    beside it. It is not done here because this fixture produces no filled trade — on a series
+    that climbs steadily the MME9 re-arms on every bar and the resting order is never taken — and
+    inventing one is its own scenario. Noted in `specs/backlog.md`.
+    """
+    seeding = session_factory()
+    _seed_instrument(seeding)
+    seeding.close()
+    bars = _candles()
+    write_candles(tmp_path, "EURUSD", "H1", bars)
+
+    with TestClient(_app(settings, session_factory, tmp_path)) as client:
+        backtest_id = _launch_with(client, _setup_strategy())
+        _run(session_factory, tmp_path, backtest_id)
+        body = client.get(f"/backtests/{backtest_id}/overlays").json()
+
+    expected: list[tuple[dt.datetime, Decimal]] = []
+    with localcontext(ENGINE_CONTEXT):
+        indicator = EMA(period=3, source="close")
+        for candle in bars:
+            indicator.update(candle)
+            value = indicator.value()
+            if value is not None:
+                expected.append((candle.time, value))
+
+    [curve] = body["series"]
+    served = [(_moment(when), Decimal(value)) for when, value in curve["points"]]
+
+    assert served == expected
+    # And the provenance travels with it, for the same reason it travels with the candles: one
+    # extra bar inside the window does not add a point at the end, it reseeds the average and
+    # moves the whole line.
+    assert body["candles_seen"] == len(bars)
+    assert body["count"] == len(bars)
+
+
+def test_the_two_provenance_numbers_are_reported_when_they_disagree(
+    session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+) -> None:
+    """A bar appearing *inside* the window after the run, which is the case the pair exists for.
+
+    Both endpoints carry `candles_seen` (what the run recorded eating) and `count` (what is on
+    disk for that window now), and until this test the only scenario exercised had them equal —
+    so `count=read.seen` would have been indistinguishable from the truth. A field added to make
+    a disagreement visible has to be seen disagreeing.
+
+    A bar appearing in the middle is worse than one appended to the end, and that is why the hole
+    is in the middle: an extra bar at the end would add a point to the curve, while an extra bar
+    in the middle **reseeds the average and moves every point after it**. The candles endpoint
+    would look almost right; the overlay would be a different line under the same trades.
+
+    ⚠️ The second write passes all twelve bars. `write_candles` replaces whole year partitions,
+    so writing only the missing hour would delete the other eleven.
+    """
+    seeding = session_factory()
+    _seed_instrument(seeding)
+    seeding.close()
+    complete = [bar(i, open_=_LEVELS[i], close=_LEVELS[i + 1]) for i in range(len(_LEVELS) - 1)]
+    # The same series with its sixth hour missing — the shape a gap in collection leaves behind.
+    with_a_hole = [candle for index, candle in enumerate(complete) if index != 5]
+    write_candles(tmp_path, "EURUSD", "H1", with_a_hole)
+
+    with TestClient(_app(settings, session_factory, tmp_path)) as client:
+        backtest_id = _launch_with(client, _setup_strategy())
+        _run(session_factory, tmp_path, backtest_id)
+
+        # The gap is filled in afterwards, the way a re-collection would fill it.
+        write_candles(tmp_path, "EURUSD", "H1", complete)
+
+        candles = client.get(f"/backtests/{backtest_id}/candles").json()
+        overlays = client.get(f"/backtests/{backtest_id}/overlays").json()
+
+    assert candles["candles_seen"] == len(with_a_hole)
+    assert candles["count"] == len(complete)
+    assert candles["candles_seen"] != candles["count"]
+    # And the overlay reports the same disagreement, over the same window.
+    assert overlays["candles_seen"] == candles["candles_seen"]
+    assert overlays["count"] == candles["count"]

@@ -141,6 +141,16 @@ class CompiledStrategy:
             indicator_id: deque(maxlen=2) for indicator_id in self._indicators
         }
 
+    def overlays(self) -> Mapping[str, Indicator]:
+        """Every indicator the document declared, under its own id — see `protocols.Charted`.
+
+        Its own id and not a prettier label: in the DSL the id is what the conditions refer to
+        (`{"ref": "sma_fast"}`), so a chart labelled that way can be read straight against the
+        rules that produced the trades. A generated name like "SMA 20" would be tidier and would
+        break the only join a reader has between the curve and the rule.
+        """
+        return dict(self._indicators)
+
     def on_bar(self, context: Context) -> Sequence[Signal]:
         candle = context.candle
         self._candles.appendleft(candle)

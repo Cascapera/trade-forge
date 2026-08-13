@@ -367,6 +367,43 @@ class CandlesOut(BaseModel):
     candles: list[CandleOut]
 
 
+class OverlaySeriesOut(BaseModel):
+    """A curve to draw across the run's bars — an indicator, as the strategy computed it.
+
+    Each point is a `[time, value]` pair, and the time is carried per point rather than implied
+    by position. A client joins the curve to the candles **on the timestamp**: the series is
+    shorter than the bars whenever the indicator was still warming up, and a curve joined by
+    index would then be drawn one period to the left of where it belongs — every point wrong,
+    and the shape still perfectly plausible.
+
+    Warm-up bars are absent rather than null. The curve begins where the indicator did.
+    """
+
+    label: str
+    points: list[tuple[dt.datetime, Money]]
+
+
+class OverlaysOut(BaseModel):
+    """Every curve the run's strategy was reading, over the window the run read.
+
+    `series` is empty for a strategy that declares none — the structure setups, whose overlay is
+    a set of zones rather than a line. Empty is an answer, not a failure.
+    """
+
+    symbol: str
+    timeframe: str
+
+    #: The same provenance pair `/candles` carries, and the curve needs it *more* than the bars
+    #: do. The bars are read back; the curve is **recomputed over them**, so one extra bar inside
+    #: the window does not add a point at the end — it reseeds the average and moves the whole
+    #: line. A client that could not see the two disagree would redraw a different curve under
+    #: the same trades and have nothing to notice it by.
+    candles_seen: int
+    count: int
+
+    series: list[OverlaySeriesOut]
+
+
 class CreatedBacktest(_Out):
     """The 202 body: the run exists and is queued; poll `id` or subscribe to its WebSocket."""
 

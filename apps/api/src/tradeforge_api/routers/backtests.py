@@ -6,13 +6,17 @@ worker (a ten-year backtest in the request path would block the event loop and s
 other caller). The GETs read the state the worker writes back.
 """
 
+import datetime as dt
 import uuid
+from dataclasses import dataclass
+from decimal import Decimal, localcontext
 from typing import Annotated, Any
 
 from fastapi import APIRouter, HTTPException, Query, status
 from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
 
+from tradeforge_api.config import Settings
 from tradeforge_api.deps import QueueDep, SessionDep, SettingsDep
 from tradeforge_api.queue import RUN_BACKTEST
 from tradeforge_api.runner import ENGINE_VERSION
@@ -26,6 +30,8 @@ from tradeforge_api.schemas import (
     CreatedBacktest,
     EquityPointOut,
     MetricsOut,
+    OverlaySeriesOut,
+    OverlaysOut,
     SnapshotOut,
     TradeOut,
     TradesPage,
@@ -39,6 +45,10 @@ from tradeforge_db.models import (
     Strategy,
     Trade,
 )
+from tradeforge_engine.domain import Candle
+from tradeforge_engine.loop import ENGINE_CONTEXT
+from tradeforge_engine.protocols import Charted
+from tradeforge_engine.strategy import compile_strategy
 
 router = APIRouter(tags=["backtests"])
 
@@ -113,6 +123,68 @@ def _load(session: SessionDep, backtest_id: uuid.UUID) -> Backtest:
     if backtest is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="backtest not found")
     return backtest
+
+
+@dataclass(frozen=True, slots=True)
+class _Window:
+    """A run's bars plus everything the two chart endpoints need to describe them."""
+
+    backtest: Backtest
+    instrument: Instrument
+    strategy: Strategy
+    seen: int
+    first: dt.datetime
+    last: dt.datetime
+    candles: list[Candle]
+
+
+def _read_the_window(session: SessionDep, settings: Settings, backtest: Backtest) -> _Window:
+    """Load exactly the bars a finished run read, or refuse.
+
+    Shared by `/candles` and `/overlays` because the two must never disagree about which bars
+    the run saw — a curve computed over a different window than the candles under it would be
+    drawn point by point against the wrong bars, and would still look like a curve.
+    """
+    first, last = backtest.first_candle, backtest.last_candle
+    seen = backtest.candles_seen
+    # The three are written together and constrained together (`candles_provenance` on the
+    # table), so this is one condition, not three. Narrowing all three keeps the types honest.
+    if seen is None or first is None or last is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="this run did not record which candles it read",
+        )
+    # Checked before touching the disk: `candles_seen` already answers "how big is this",
+    # so an oversized run costs a row read rather than a scan that ends in a refusal.
+    if seen > _MAX_CANDLES:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=(
+                f"this run read {seen} candles, over the {_MAX_CANDLES} this endpoint serves"
+                " in one response"
+            ),
+        )
+
+    instrument = session.get(Instrument, backtest.instrument_id)
+    strategy = session.get(Strategy, backtest.strategy_id)
+    if instrument is None or strategy is None:  # pragma: no cover — RESTRICT makes this unreachable
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="run references nothing")
+
+    return _Window(
+        backtest=backtest,
+        instrument=instrument,
+        strategy=strategy,
+        seen=seen,
+        first=first,
+        last=last,
+        candles=read_candles(
+            settings.parquet_root,
+            instrument.symbol,
+            backtest.timeframe,
+            start=first,
+            end=last,
+        ),
+    )
 
 
 @router.post(
@@ -361,44 +433,74 @@ def get_candles(backtest_id: uuid.UUID, session: SessionDep, settings: SettingsD
     back to the requested dates there would produce exactly the quiet disagreement this
     endpoint is shaped to prevent.
     """
-    backtest = _load(session, backtest_id)
-    first, last = backtest.first_candle, backtest.last_candle
-    seen = backtest.candles_seen
-    # The three are written together and constrained together (`candles_provenance` on the
-    # table), so this is one condition, not three. Narrowing all three keeps the types honest.
-    if seen is None or first is None or last is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="this run did not record which candles it read",
-        )
-    # Checked before touching the disk: `candles_seen` already answers "how big is this",
-    # so an oversized run costs a row read rather than a scan that ends in a refusal.
-    if seen > _MAX_CANDLES:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail=(
-                f"this run read {seen} candles, over the {_MAX_CANDLES} this endpoint serves"
-                " in one response"
-            ),
-        )
-
-    instrument = session.get(Instrument, backtest.instrument_id)
-    if instrument is None:  # pragma: no cover — RESTRICT on the FK makes this unreachable
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="instrument not found")
-
-    candles = read_candles(
-        settings.parquet_root,
-        instrument.symbol,
-        backtest.timeframe,
-        start=first,
-        end=last,
-    )
+    read = _read_the_window(session, settings, _load(session, backtest_id))
     return CandlesOut(
-        timeframe=backtest.timeframe,
-        symbol=instrument.symbol,
-        candles_seen=seen,
-        first_candle=first,
-        last_candle=last,
-        count=len(candles),
-        candles=[CandleOut.model_validate(candle) for candle in candles],
+        timeframe=read.backtest.timeframe,
+        symbol=read.instrument.symbol,
+        candles_seen=read.seen,
+        first_candle=read.first,
+        last_candle=read.last,
+        count=len(read.candles),
+        candles=[CandleOut.model_validate(candle) for candle in read.candles],
+    )
+
+
+@router.get(
+    "/backtests/{backtest_id}/overlays",
+    response_model=OverlaysOut,
+    responses={**_NOT_FOUND, **_TOO_MANY_CANDLES},
+)
+def get_overlays(backtest_id: uuid.UUID, session: SessionDep, settings: SettingsDep) -> OverlaysOut:
+    """The curves the strategy was reading, bar by bar, over the window the run read.
+
+    **Recomputed, not stored.** An indicator series is derivable from the candles and the
+    parameters, and this project stores measurements rather than derivations — one run's equity
+    curve already reaches 856 kB, and a series per indicator per run would grow the same way for
+    something a chart reads once. The engine is deterministic, so recomputing returns what the
+    run computed rather than something like it.
+
+    **The strategy is asked what it was looking at; nothing here reads the document.** Reading
+    `definition["indicators"]` was the obvious route and it is wrong twice over. It finds nothing
+    at all for a `setup` strategy — every strategy in this project's own database is one, and the
+    average they trade lives inside the setup, not in that block. And where it does find
+    something, it puts "which average does this setup use" in a second place: the day a setup
+    changed its average, a chart rebuilt from the document would keep drawing the old one,
+    correct-looking and wrong. `Charted.overlays` hands back the strategy's own indicators, so
+    there is no second place to disagree.
+
+    A strategy that implements nothing charts as bars and trades, with an empty `series`.
+    """
+    read = _read_the_window(session, settings, _load(session, backtest_id))
+    strategy = compile_strategy(read.strategy.definition)
+    # Built for this request and used for nothing else. `overlays` hands back live, mutable
+    # indicators (see `protocols.Charted`), so driving them advances the very state a running
+    # strategy would read — safe here only because this instance never executes anything.
+    overlays = strategy.overlays() if isinstance(strategy, Charted) else {}
+
+    points: dict[str, list[tuple[dt.datetime, Decimal]]] = {label: [] for label in overlays}
+    # ⚠️ Under the engine's own decimal context, not the request thread's. Today the two agree
+    # byte for byte — CPython's default is `prec=28`/`ROUND_HALF_EVEN`, which is what
+    # `ENGINE_CONTEXT` asks for — so this changes no number that exists now. It is here because
+    # that agreement is a coincidence and not a guarantee: `getcontext()` is global and mutable
+    # by anything in the process, and `ENGINE_CONTEXT` exists precisely to stop a run's
+    # arithmetic depending on who touched it last. Measured at `prec=10` the curve comes back
+    # `1.114858523` against the run's `1.114858524264470690451361286` — a chart disagreeing with
+    # the trades on it in the ninth decimal, which no reader would ever see.
+    with localcontext(ENGINE_CONTEXT):
+        for candle in read.candles:
+            for label, indicator in overlays.items():
+                indicator.update(candle)
+                value = indicator.value()
+                # Warm-up bars are left out rather than sent as nulls, matching the entry
+                # snapshot's own series: the curve simply begins where the indicator did. A null
+                # per bar would have every client decide again what a hole means.
+                if value is not None:
+                    points[label].append((candle.time, value))
+
+    return OverlaysOut(
+        symbol=read.instrument.symbol,
+        timeframe=read.backtest.timeframe,
+        candles_seen=read.seen,
+        count=len(read.candles),
+        series=[OverlaySeriesOut(label=label, points=found) for label, found in points.items()],
     )

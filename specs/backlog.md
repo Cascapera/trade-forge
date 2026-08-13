@@ -415,3 +415,14 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
   está imediatamente acima de `useCreateBasket`, não de `useTradeSnapshot`. Documentação
   apontando para a função errada, sem efeito em runtime. Mover junto do próximo trabalho que já
   for tocar o arquivo.
+- [origem: PR-229] **Ancorar a curva do `/overlays` na trilha que a corrida persistiu** — hoje o
+  teste de valor do endpoint constrói a expectativa dirigindo o mesmo indicador sobre as mesmas
+  barras. Isso pega janela errada, contexto decimal errado, semente e alinhamento errados, mas
+  compartilha a implementação da EMA. A âncora **forte** já existe no banco e não precisa ser
+  inventada: uma corrida grava a média que julgou cada entrada dentro do `snapshot` daquele trade
+  (`_AverageTrail`), *durante* a corrida. Comparar o ponto servido no instante do snapshot com o
+  valor gravado ali fecha o laço contra números escritos pela corrida, não ao lado dela. Adiado
+  porque a fixture de integração não produz trade preenchido: numa série que sobe de forma
+  monotônica o MME9 rearma a cada barra e a ordem em repouso nunca é tomada — construir o cenário
+  que preenche é trabalho próprio. Fazer junto do PR que desenhar as regiões (ele vai precisar de
+  uma fixture que negocia de qualquer jeito).

@@ -1,5 +1,5 @@
-import type { Candle, Trade } from '../api/types'
-import { toBars, toMarkers, toSeconds, visibleRangeFor } from './price'
+import type { Candle, OverlaySeries, Trade } from '../api/types'
+import { CURVE_COLORS, toBars, toCurves, toMarkers, toSeconds, visibleRangeFor } from './price'
 
 function candle(over: Partial<Candle>): Candle {
   return {
@@ -241,5 +241,64 @@ describe('visibleRangeFor', () => {
       from: toSeconds('2024-08-01T13:00:00Z'),
       to: toSeconds('2024-08-01T16:00:00Z'),
     })
+  })
+})
+
+describe('toCurves', () => {
+  function series(over: Partial<OverlaySeries> = {}): OverlaySeries {
+    return {
+      label: 'EMA 9',
+      points: [
+        ['2024-08-01T14:00:00Z', '226.2700000000'],
+        ['2024-08-01T15:00:00Z', '226.9800000000'],
+      ],
+      ...over,
+    }
+  }
+
+  it('turns the wire pairs into seconds and numbers', () => {
+    const [curve] = toCurves([series()])
+
+    expect(curve?.label).toBe('EMA 9')
+    expect(curve?.points).toEqual([
+      { time: toSeconds('2024-08-01T14:00:00Z'), value: 226.27 },
+      { time: toSeconds('2024-08-01T15:00:00Z'), value: 226.98 },
+    ])
+  })
+
+  it('gives each curve its own colour, in the order the palette was measured in', () => {
+    const curves = toCurves([series({ label: 'fast' }), series({ label: 'slow' })])
+
+    expect(curves.map((c) => c.color)).toEqual([CURVE_COLORS[0], CURVE_COLORS[1]])
+  })
+
+  it('drops curves past the palette instead of recycling a colour', () => {
+    // Recycling would put two different indicators in one swatch, and a legend naming both
+    // against the same colour tells the reader nothing. Losing a line is visible; two lines
+    // claiming to be the same one is not.
+    const many = Array.from({ length: CURVE_COLORS.length + 2 }, (_, i) =>
+      series({ label: `ind ${String(i)}` }),
+    )
+
+    const curves = toCurves(many)
+
+    expect(curves).toHaveLength(CURVE_COLORS.length)
+    expect(new Set(curves.map((c) => c.color)).size).toBe(CURVE_COLORS.length)
+  })
+
+  it('is empty for a strategy that reads no curves at all', () => {
+    // The structure setups. Empty is an ordinary answer, not a failure.
+    expect(toCurves([])).toEqual([])
+  })
+
+  it('keeps a curve that starts after the first bar starting where it does', () => {
+    // The warm-up gap. Nothing here pads the head of the series to the length of the candles —
+    // the timestamps are carried per point precisely so the chart joins on time, not on index.
+    const late = series({ points: [['2024-08-01T18:00:00Z', '227.00']] })
+
+    const [curve] = toCurves([late])
+
+    expect(curve?.points).toHaveLength(1)
+    expect(curve?.points[0]?.time).toBe(toSeconds('2024-08-01T18:00:00Z'))
   })
 })

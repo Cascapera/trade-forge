@@ -1,8 +1,8 @@
 import { useMemo, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 
-import { useBacktest, useCandles, useEquity, useTrades } from '../api/hooks'
-import type { BacktestStatus } from '../api/types'
+import { useBacktest, useCandles, useEquity, useOverlays, useTrades } from '../api/hooks'
+import type { BacktestStatus, OverlaySeries } from '../api/types'
 import { coverageNotice } from '../backtest/coverage'
 import { count } from '../format'
 import { EquityCurve } from '../components/EquityCurve'
@@ -25,6 +25,10 @@ function StatusBadge({ status }: { status: BacktestStatus }): React.JSX.Element 
 
 type Tab = 'results' | 'price'
 
+// A module constant, not `[]` inline: a fresh array each render would recompute every curve
+// and rebuild the chart, throwing away the zoom the reader had set.
+const EMPTY_SERIES: OverlaySeries[] = []
+
 const TABS: { id: Tab; label: string }[] = [
   { id: 'results', label: 'Results' },
   { id: 'price', label: 'Price' },
@@ -46,6 +50,9 @@ export function Results(): React.JSX.Element {
   // for — thousands of bars against a handful of metrics — and a reader who never leaves the
   // results tab should not pay for it.
   const candles = useCandles(id, done && tab === 'price')
+  // Fetched on the same condition, and separately: a strategy may legitimately have no curves,
+  // and a failure to compute them must not take the price chart down with it.
+  const overlays = useOverlays(id, done && tab === 'price')
 
   // Held stable across renders. `?? []` inline would hand the chart a new array every time the
   // page re-rendered for any reason, and the chart would recompute and re-set every marker for
@@ -174,6 +181,7 @@ export function Results(): React.JSX.Element {
                     candles={price.candles}
                     trades={tradeItems}
                     selectedTradeId={locatedTrade}
+                    overlays={overlays.data?.series ?? EMPTY_SERIES}
                     symbol={price.symbol}
                     timeframe={price.timeframe}
                   />

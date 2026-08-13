@@ -1353,3 +1353,85 @@ def test_no_order_is_armed_on_a_bar_that_shows_a_position(
     every_bar = frozenset(range(len(candles)))
     side = Side.LONG if long else Side.SHORT
     assert _arms(_drive(candles, side=side, position_on=every_bar)) == []
+
+
+def test_the_overlay_names_which_average_as_well_as_how_long() -> None:
+    """Unlike the MME9 setup, *which* mean this one uses is a parameter — so the caption has to
+    carry it. Two runs of period 20, one exponential and one arithmetic, are different
+    experiments, and a chart captioning both "20" could not tell a reader which it drew."""
+    assert list(PontoContinuoStrategy(period=20, average="EMA").overlays()) == ["EMA 20"]
+    # ⚠️ 50, not 20. Twenty is the constructor's own default, so a label hard-coded to it would
+    # have agreed with every assertion above — the fixture would not separate "the period
+    # arrived" from "the caption was stamped". The engine guardian killed the first version of
+    # this test with exactly that mutant.
+    assert list(PontoContinuoStrategy(period=50, average="SMA").overlays()) == ["SMA 50"]
+
+
+def test_the_arithmetic_and_exponential_overlays_are_genuinely_different_curves() -> None:
+    """The label is not cosmetic. If `average` were ignored and both built an EMA, the captions
+    would still differ while the curves agreed — so the values are what this asserts.
+
+    ⚠️ **The series has to bend.** The first attempt walked a straight ramp, and on a straight
+    ramp the two averages are *equal*: both settle exactly one half-period of slope behind price,
+    so the scenario written to separate them could not. Twenty flat bars and then a sharp climb is
+    the shape where they part — the exponential is already chasing the move while the arithmetic
+    still carries ten of the old bars in its window.
+    """
+    flat = [bar(i, open_="100", close="100") for i in range(20)]
+    climb = [bar(20 + i, open_=str(100 + 5 * i), close=str(105 + 5 * i)) for i in range(10)]
+
+    with localcontext(ENGINE_CONTEXT):
+        exponential = PontoContinuoStrategy(period=20, average="EMA").overlays()["EMA 20"]
+        arithmetic = PontoContinuoStrategy(period=20, average="SMA").overlays()["SMA 20"]
+        for candle in [*flat, *climb]:
+            exponential.update(candle)
+            arithmetic.update(candle)
+        faster, slower = exponential.value(), arithmetic.value()
+
+    assert faster is not None
+    assert slower is not None
+    assert faster > slower
+
+
+def test_the_average_is_the_same_whether_or_not_the_bars_produced_trades() -> None:
+    """The property the overlay endpoint rests on, for the setup whose average is a *parameter*.
+
+    The chart drives the indicator this strategy hands back without ever running `on_bar`. That
+    is exact only while the average is updated on **every** bar, position or not. Move the update
+    behind a `context.position is None` guard and the two part company: the run conducts against
+    a frozen line while the chart draws a moving one, every number on screen stays plausible, and
+    nothing else in the suite notices.
+
+    ⚠️ This test exists because the guardian ran that mutant here and it **survived** — the MME9
+    had its pair written and this one did not, and it is the setup whose average varies most.
+    """
+    rising = [bar(i, open_=str(100 + i), close=str(101 + i)) for i in range(30)]
+
+    def walk(*, positioned: bool) -> Money | None:
+        """Drive one strategy by hand and read the average it reached.
+
+        Not `_drive`, which builds its own strategy and hands back only the signals — this needs
+        the instance afterwards. Positioned on the middle third, which is where a guard on
+        `context.position` would take hold.
+        """
+        strategy = PontoContinuoStrategy(period=9, average="EMA")
+        with localcontext(ENGINE_CONTEXT):
+            for index, candle in enumerate(rising):
+                position = None
+                if positioned and 10 <= index < 20:
+                    position = Position(
+                        symbol=AAPL.symbol,
+                        side=Side.LONG,
+                        volume=Decimal(1),
+                        entry_price=candle.open,
+                        entry_time=candle.time,
+                    )
+                strategy.on_bar(
+                    Context(candle=candle, instrument=AAPL, account=_ACCOUNT, position=position)
+                )
+            return strategy.overlays()["EMA 9"].value()
+
+    flat = walk(positioned=False)
+
+    assert flat is not None
+    assert flat == walk(positioned=True)

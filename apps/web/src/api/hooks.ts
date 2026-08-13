@@ -20,6 +20,7 @@ import type {
   CreatedBasket,
   EquityPoint,
   Instrument,
+  OverlaysResponse,
   Snapshot,
   StrategyOut,
   TradesPage,
@@ -151,6 +152,21 @@ export function useEquity(id: string | undefined, enabled: boolean) {
  * another candle. Re-fetching on every window focus would re-download thousands of bars to
  * receive the same ones back.
  */
+/**
+ * The curves the strategy was reading, on the same terms as the candles.
+ *
+ * A query of its own rather than a field on the candles response: a strategy may have no curves
+ * at all (the structure setups draw zones, not lines), and folding an optional thing into a
+ * required one would make every caller check the same emptiness twice.
+ */
+export function useOverlays(id: string | undefined, enabled: boolean) {
+  return useQuery<OverlaysResponse>({
+    queryKey: ['overlays', id],
+    queryFn: id !== undefined && enabled ? () => api.getOverlays(id) : skipToken,
+    staleTime: Infinity,
+  })
+}
+
 export function useCandles(id: string | undefined, enabled: boolean) {
   return useQuery<CandlesResponse>({
     queryKey: ['candles', id],

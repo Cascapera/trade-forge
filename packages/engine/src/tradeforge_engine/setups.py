@@ -30,6 +30,7 @@ price too, and the two rules run at once with the tighter one winning (`conducti
 """
 
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
@@ -47,6 +48,7 @@ from tradeforge_engine.domain import (
     SignalKind,
     SnapshotLevel,
     SnapshotRegion,
+    ZoneMark,
 )
 from tradeforge_engine.structure import (
     MarketStructure,
@@ -389,6 +391,27 @@ class StructureStrategy:
         # The bar a fill was observed on. The breakeven rule reads the bar's extremes, and on this
         # one bar those extremes are not the trade's — see `_conduct`.
         self._fill_bar: datetime | None = None
+
+    def zones(self) -> Sequence[ZoneMark]:
+        """Every region the detector has marked, as records — see `protocols.Zoned`.
+
+        Translated here rather than handed over: `TrackedZone` is the detector's live
+        bookkeeping, and a reader holding it could advance the very machinery it is describing.
+        `mitigated_at` is `None` while a region still stands, which is what tells a chart to
+        extend the rectangle to its own edge instead of closing it somewhere arbitrary.
+        """
+        return tuple(
+            ZoneMark(
+                kind=str(tracked.block.kind),
+                top=tracked.block.top,
+                bottom=tracked.block.bottom,
+                from_time=tracked.block.time,
+                confirmed_at=tracked.block.confirmed_at,
+                mitigated_at=tracked.mitigated_at,
+                primary=tracked.block.primary,
+            )
+            for tracked in self._blocks.zones
+        )
 
     def on_bar(self, context: Context) -> tuple[Signal, ...]:
         candle = context.candle

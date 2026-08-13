@@ -2172,3 +2172,53 @@ def _grid_candle(index: int, prices: tuple[str, str, str, str]) -> Candle:
         high=max(values),
         low=min(values),
     )
+
+
+def test_the_stamp_is_the_bar_that_took_the_zone_not_the_last_one_to_visit() -> None:
+    """⚠️ The whole subtlety of carrying a time alongside the boolean.
+
+    `mitigated` is folded forward with `or`, so once true it stays true through every later bar —
+    including the many that also reach the edge, because price ranges around a level it has just
+    worked. A stamp written on the same terms ("if it is reached, record this bar") would keep
+    moving to the most recent visit.
+
+    Nothing about the run's decisions would change: `usable` only reads the boolean. What changes
+    is the picture. The chart draws a region from the bar that marked it to the bar that took it,
+    so the rectangle's length is *how long the region stood* — and a stamp that crept forward
+    would draw a zone as having survived until the last time price happened to be there, which
+    across a range is many bars past the touch that actually killed it. A longer rectangle is not
+    an obviously wrong one.
+
+    Three visits here, and only the first may be recorded.
+    """
+    tracked = _live(
+        _demand_90_100(),
+        [
+            bar(0, open_="105", close="104", high="106", low="100"),  # takes it, at the edge
+            bar(1, open_="104", close="103", high="105", low="98"),  # deep inside, later
+            bar(2, open_="103", close="106", high="107", low="95"),  # deeper still, later again
+        ],
+    )
+
+    assert tracked.mitigated
+    assert tracked.mitigated_at == _at(0)
+
+
+def test_a_zone_nothing_came_back_to_carries_no_time_at_all() -> None:
+    """`None` is "still standing", not "unknown" — and it is what tells a chart to extend the
+    rectangle to its own right edge rather than closing it at some invented bar."""
+    tracked = _live(_demand_90_100(), [bar(0, open_="105", close="112", high="115", low="104")])
+
+    assert not tracked.mitigated
+    assert tracked.mitigated_at is None
+
+
+def test_the_stamp_and_the_flag_are_set_by_the_same_bar() -> None:
+    """They are two readings of one event, and a scenario where they disagree is a bug in one of
+    them. Sampled on the exact boundary, where a `<` against a `<=` would separate the pair."""
+    grazed = _live(_demand_90_100(), [bar(0, open_="105", close="104", high="106", low="100.01")])
+    assert (grazed.mitigated, grazed.mitigated_at) == (False, None)
+
+    touched = _live(_demand_90_100(), [bar(0, open_="105", close="104", high="106", low="100")])
+    assert touched.mitigated
+    assert touched.mitigated_at == _at(0)

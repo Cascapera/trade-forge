@@ -1053,6 +1053,20 @@ class TrackedZone:
     block: OrderBlock
     mitigated: bool = False
 
+    mitigated_at: datetime | None = None
+    """The bar that took it — the **first** touch, never a later one.
+
+    Carried for the chart, which draws a region from the bar that marked it to the bar that
+    took it, so the rectangle's length is how long it stood. Nothing in the engine's decisions
+    reads this: `usable` is the whole rule, and it only ever asks the boolean.
+
+    ⚠️ First, and that is the entire subtlety of stamping it. `mitigated` is folded forward with
+    `or`, so it stays true through every later bar that also reaches the edge — and a stamp
+    written on the same terms would keep moving to the most recent one. The region would then be
+    drawn as having survived until the last time price happened to be there, which in a range is
+    hundreds of bars past the touch that actually killed it.
+    """
+
     @property
     def usable(self) -> bool:
         """Whether the region still stands — nothing has come back to take it."""
@@ -1207,6 +1221,10 @@ class OrderBlockDetector:
             reached = candle.low <= block.top
         else:
             reached = candle.high >= block.bottom
+        # The stamp goes on the transition, not on the condition. Writing it whenever `reached`
+        # is true would keep overwriting it with every later visit — see `TrackedZone`.
+        if reached and not tracked.mitigated:
+            tracked.mitigated_at = candle.time
         tracked.mitigated = tracked.mitigated or reached
 
     @staticmethod

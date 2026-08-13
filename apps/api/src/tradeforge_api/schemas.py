@@ -383,6 +383,30 @@ class OverlaySeriesOut(BaseModel):
     points: list[tuple[dt.datetime, Money]]
 
 
+class ZoneOut(BaseModel):
+    """One region over the whole run, with both ends of its life.
+
+    Three instants, none interchangeable. `from_time` is where the rectangle begins — the candle
+    before the gap, routinely far older than the break that revealed it. `confirmed_at` is when a
+    strategy could first act on it; on this project's own data the gap between the two runs to a
+    median of twenty bars, so collapsing them would redraw most regions as much younger than they
+    are. `mitigated_at` is the bar whose wick took the region, and `null` means it was still
+    standing when the run ended — a chart extends that one to its own right edge rather than
+    closing it somewhere invented.
+    """
+
+    kind: str
+    """`demand` or `supply`."""
+
+    top: Money
+    bottom: Money
+    from_time: dt.datetime
+    confirmed_at: dt.datetime
+    mitigated_at: dt.datetime | None
+    primary: bool
+    """First gap event of the impulse; the rest are secondary and need `allow_secondary`."""
+
+
 class OverlaysOut(BaseModel):
     """Every curve the run's strategy was reading, over the window the run read.
 
@@ -402,6 +426,11 @@ class OverlaysOut(BaseModel):
     count: int
 
     series: list[OverlaySeriesOut]
+
+    #: The regions the run's strategy marked. Empty for the swing setups, which read a curve and
+    #: mark no zones — the two halves of a chart's overlay are independent, and a strategy having
+    #: one says nothing about whether it has the other.
+    zones: list[ZoneOut] = []
 
 
 class CreatedBacktest(_Out):

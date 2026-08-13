@@ -35,6 +35,7 @@ from tradeforge_engine.domain import (
     Position,
     Signal,
     Volume,
+    ZoneMark,
 )
 
 
@@ -222,6 +223,27 @@ class Charted(Protocol):
 
     def overlays(self) -> Mapping[str, Indicator]:
         """Label to indicator, in drawing order. Empty is a valid answer."""
+        ...
+
+
+@runtime_checkable
+class Zoned(Protocol):
+    """A strategy that marks regions on the chart, for something to draw them.
+
+    The rectangle half of `Charted`, and a separate protocol rather than another method on it
+    because the two are genuinely independent: the swing setups read a curve and mark no zones,
+    the structure setups mark zones and read no curve. One protocol with two methods would make
+    every implementer answer a question it has no opinion on.
+
+    **Immutable records, unlike `Charted`.** That asymmetry is deliberate. An indicator has to be
+    handed over live, because the only faithful way to get its series is to drive it. A region is
+    already history by the time anyone asks: the detector has been folding candles into it all
+    run, and what is left is a fact, not a machine. Handing back `TrackedZone` would give a
+    reader the detector's own mutable bookkeeping — advancing what it means to describe.
+    """
+
+    def zones(self) -> Sequence[ZoneMark]:
+        """Every region marked so far, oldest first. Empty is a valid answer."""
         ...
 
 

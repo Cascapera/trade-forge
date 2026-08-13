@@ -19,7 +19,7 @@ from sqlalchemy.orm import selectinload
 from tradeforge_api.config import Settings
 from tradeforge_api.deps import QueueDep, SessionDep, SettingsDep
 from tradeforge_api.queue import RUN_BACKTEST
-from tradeforge_api.runner import ENGINE_VERSION
+from tradeforge_api.runner import ENGINE_VERSION, instrument_spec
 from tradeforge_api.schemas import (
     BacktestListItem,
     BacktestOut,
@@ -35,6 +35,7 @@ from tradeforge_api.schemas import (
     SnapshotOut,
     TradeOut,
     TradesPage,
+    ZoneOut,
 )
 from tradeforge_collector import read_candles, step
 from tradeforge_db.models import (
@@ -45,9 +46,13 @@ from tradeforge_db.models import (
     Strategy,
     Trade,
 )
-from tradeforge_engine.domain import Candle
+from tradeforge_engine.domain import AccountState, Candle, Context
 from tradeforge_engine.loop import ENGINE_CONTEXT
-from tradeforge_engine.protocols import Charted
+
+# Aliased: `Strategy` in this module is already the ORM row. Two very different
+# things with one name is how a signature ends up quietly accepting the wrong one.
+from tradeforge_engine.protocols import Charted, Zoned
+from tradeforge_engine.protocols import Strategy as EngineStrategy
 from tradeforge_engine.strategy import compile_strategy
 
 router = APIRouter(tags=["backtests"])
@@ -445,6 +450,54 @@ def get_candles(backtest_id: uuid.UUID, session: SessionDep, settings: SettingsD
     )
 
 
+def _zones_of(strategy: EngineStrategy, read: _Window) -> list[ZoneOut]:
+    """Replay the run's bars through the strategy and collect the regions it marked.
+
+    **This one has to run `on_bar`, unlike the curves.** An indicator can be driven on its own
+    because it folds a candle and nothing else; a region is marked by a detector that needs the
+    structure break the *same* bar produced, and the strategy is what wires those two together.
+    Driving the detector directly from here would put that wiring in a second place — the exact
+    duplication `Charted` exists to avoid.
+
+    Replaying with a flat account is faithful for the same reason the standalone average is: the
+    structure and the detector are advanced on the **first two lines** of `on_bar`, before any
+    branch that reads a position. What a position changes is which zone gets an order, and no
+    order is placed here — the signals are discarded and the broker never exists.
+
+    The account is a plausible stand-in rather than the run's real equity, and it cannot matter:
+    nothing on the marking path reads it. Sizing does, and sizing is the risk manager's, which
+    is not in this loop at all.
+    """
+    # Two views of one object, and they are kept apart on purpose: `Zoned` declares only
+    # `zones()`, so narrowing to it would take `on_bar` away — and this is the one reader that
+    # needs both. The protocol stays minimal rather than growing a method it does not mean.
+    marking = strategy if isinstance(strategy, Zoned) else None
+    if marking is None:
+        return []
+
+    spec = instrument_spec(read.instrument)
+    account = AccountState(
+        equity=read.backtest.initial_capital,
+        balance=read.backtest.initial_capital,
+        currency=read.instrument.currency_quote,
+    )
+    with localcontext(ENGINE_CONTEXT):
+        for candle in read.candles:
+            strategy.on_bar(Context(candle=candle, instrument=spec, account=account))
+        return [
+            ZoneOut(
+                kind=zone.kind,
+                top=zone.top,
+                bottom=zone.bottom,
+                from_time=zone.from_time,
+                confirmed_at=zone.confirmed_at,
+                mitigated_at=zone.mitigated_at,
+                primary=zone.primary,
+            )
+            for zone in marking.zones()
+        ]
+
+
 @router.get(
     "/backtests/{backtest_id}/overlays",
     response_model=OverlaysOut,
@@ -503,4 +556,5 @@ def get_overlays(backtest_id: uuid.UUID, session: SessionDep, settings: Settings
         candles_seen=read.seen,
         count=len(read.candles),
         series=[OverlaySeriesOut(label=label, points=found) for label, found in points.items()],
+        zones=_zones_of(strategy, read),
     )

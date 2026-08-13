@@ -45,7 +45,7 @@ def _decimal(value: object) -> Decimal:
     return Decimal(str(value))
 
 
-def _instrument_spec(instrument: Instrument) -> InstrumentSpec:
+def instrument_spec(instrument: Instrument) -> InstrumentSpec:
     """The engine's value object, projected from the database row. The `asset_class` enum is
     the very same `tradeforge_engine.domain.AssetClass` the ORM column stores — no translation."""
     return InstrumentSpec(
@@ -164,7 +164,7 @@ def execute_backtest(  # noqa: PLR0913 — keyword-only; each names one axis of 
     """
     windowed = _candles_to_run(candles, instrument.symbol, timeframe, date_from, date_to)
 
-    spec = _instrument_spec(instrument)
+    spec = instrument_spec(instrument)
     broker = BacktestBroker(
         instrument=spec,
         initial_capital=initial_capital,
@@ -189,4 +189,4 @@ def execute_backtest(  # noqa: PLR0913 — keyword-only; each names one axis of 
     return list(result.trades), metrics, window
 
 
-__all__ = ["ENGINE_VERSION", "CandleWindow", "execute_backtest"]
+__all__ = ["ENGINE_VERSION", "CandleWindow", "execute_backtest", "instrument_spec"]

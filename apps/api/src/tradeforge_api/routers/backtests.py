@@ -13,13 +13,15 @@ from fastapi import APIRouter, HTTPException, Query, status
 from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
 
-from tradeforge_api.deps import QueueDep, SessionDep
+from tradeforge_api.deps import QueueDep, SessionDep, SettingsDep
 from tradeforge_api.queue import RUN_BACKTEST
 from tradeforge_api.runner import ENGINE_VERSION
 from tradeforge_api.schemas import (
     BacktestListItem,
     BacktestOut,
     BacktestsPage,
+    CandleOut,
+    CandlesOut,
     CreateBacktestRequest,
     CreatedBacktest,
     EquityPointOut,
@@ -28,7 +30,7 @@ from tradeforge_api.schemas import (
     TradeOut,
     TradesPage,
 )
-from tradeforge_collector import step
+from tradeforge_collector import read_candles, step
 from tradeforge_db.models import (
     Backtest,
     BacktestMetrics,
@@ -56,6 +58,26 @@ _BAD_BODY: _Responses = {status.HTTP_400_BAD_REQUEST: {"description": "malformed
 # admits is genuinely valid SQL that returns an empty page, so nothing legitimate is refused, and
 # there is no invented business number to be wrong about later.
 _MAX_OFFSET = 9_223_372_036_854_775_807  # 2**63 - 1, Postgres bigint
+
+# How many bars `/candles` will put in one response.
+#
+# A cap and not a reduction, which is the decision worth recording. The tempting alternative
+# is to decimate — serve every tenth bar of an oversized run — and it is wrong in a way that
+# looks right on screen. A candle is not a sample of a price; it is the *summary of an
+# interval*. Dropping nine of ten throws away highs and lows, and the high thrown away may be
+# precisely the one that hit a stop. The chart would be smooth, plausible, and would no longer
+# contain the bar that explains the trade beside it.
+#
+# The correct reduction is aggregation — first open, highest high, lowest low, last close —
+# which preserves the extremes but is a real rule with real edges (what a partial bucket at
+# the end of the window means) and deserves its own tests. It is not built here because there
+# is nothing to build it for yet: the largest dataset this project holds is 38 986 M15 bars,
+# and the longest run ever executed read 12 883. Everything collected fits whole, so nothing
+# is reduced, and the day an M1 series is collected the aggregating slice has a caller.
+_MAX_CANDLES = 50_000
+_TOO_MANY_CANDLES: _Responses = {
+    status.HTTP_422_UNPROCESSABLE_CONTENT: {"description": "run too long to chart in one response"}
+}
 
 
 def list_item(
@@ -310,3 +332,73 @@ def get_equity(backtest_id: uuid.UUID, session: SessionDep) -> list[EquityPointO
             status_code=status.HTTP_404_NOT_FOUND, detail="backtest has no results yet"
         )
     return [EquityPointOut.model_validate(point) for point in backtest.metrics.equity_curve]
+
+
+@router.get(
+    "/backtests/{backtest_id}/candles",
+    response_model=CandlesOut,
+    responses={**_NOT_FOUND, **_TOO_MANY_CANDLES},
+)
+def get_candles(backtest_id: uuid.UUID, session: SessionDep, settings: SettingsDep) -> CandlesOut:
+    """The price the run was executed over, for charting the trades against it.
+
+    **Hung off the run, not off the instrument.** The obvious alternative was a general
+    `/instruments/{symbol}/candles?timeframe&from&to`, and it is a superset of this — but it
+    would make the *client* assemble the window, out of a symbol, a timeframe and two
+    timestamps it holds separately. A client that assembles it slightly wrong gets a chart
+    that disagrees with the trades drawn on it, and nothing about the picture would say so.
+    Here the window is not a parameter at all: it is the provenance the run recorded, so the
+    chart cannot be asked for a period the run did not execute over. The general endpoint can
+    exist the day a second caller needs one.
+
+    **The window comes from `first_candle`/`last_candle`, never from `date_from`/`date_to`.**
+    Those are a *request*; the run may well have covered less (see the columns' own comment in
+    `tradeforge_db.models`). Charting the requested period would draw bars beside trades that
+    were never given the chance to happen on them.
+
+    A run that recorded no provenance is refused rather than approximated. That is every
+    `failed` run — it never reached a candle — and any row written before `rev_0002`. Falling
+    back to the requested dates there would produce exactly the quiet disagreement this
+    endpoint is shaped to prevent.
+    """
+    backtest = _load(session, backtest_id)
+    first, last = backtest.first_candle, backtest.last_candle
+    seen = backtest.candles_seen
+    # The three are written together and constrained together (`candles_provenance` on the
+    # table), so this is one condition, not three. Narrowing all three keeps the types honest.
+    if seen is None or first is None or last is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="this run did not record which candles it read",
+        )
+    # Checked before touching the disk: `candles_seen` already answers "how big is this",
+    # so an oversized run costs a row read rather than a scan that ends in a refusal.
+    if seen > _MAX_CANDLES:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=(
+                f"this run read {seen} candles, over the {_MAX_CANDLES} this endpoint serves"
+                " in one response"
+            ),
+        )
+
+    instrument = session.get(Instrument, backtest.instrument_id)
+    if instrument is None:  # pragma: no cover — RESTRICT on the FK makes this unreachable
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="instrument not found")
+
+    candles = read_candles(
+        settings.parquet_root,
+        instrument.symbol,
+        backtest.timeframe,
+        start=first,
+        end=last,
+    )
+    return CandlesOut(
+        timeframe=backtest.timeframe,
+        symbol=instrument.symbol,
+        candles_seen=seen,
+        first_candle=first,
+        last_candle=last,
+        count=len(candles),
+        candles=[CandleOut.model_validate(candle) for candle in candles],
+    )

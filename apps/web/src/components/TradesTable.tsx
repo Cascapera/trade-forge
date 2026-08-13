@@ -60,9 +60,18 @@ function SnapshotRow({
 export function TradesTable({
   trades,
   backtestId,
+  onLocate,
 }: {
   trades: Trade[]
   backtestId: string
+  /**
+   * Take the reader to this trade on the run's price chart.
+   *
+   * Optional, and absent is the honest default: the run log renders this same table for runs
+   * whose candles it never fetched, and a button that navigates nowhere is worse than no button.
+   * The results screen passes it because it owns both the chart and the tab holding it.
+   */
+  onLocate?: (tradeId: number) => void
 }): React.JSX.Element {
   // One open at a time. Several charts at once turns a table you scan into a page you scroll,
   // and the question being asked here is about one entry.
@@ -101,7 +110,36 @@ export function TradesTable({
                     {trade.net_pnl === null ? '—' : signedMoney(trade.net_pnl)}
                   </td>
                   <Cell>{trade.r_multiple === null ? '—' : `${ratio(trade.r_multiple)}R`}</Cell>
-                  <td className="px-3 py-2 text-right">
+                  <td className="px-3 py-2 text-right whitespace-nowrap">
+                    {/* ⚠️ Every accessible name here names *this* trade. A research run enters the
+                        same strategy on the same instrument dozens of times, so "Show on the price
+                        chart" repeated down the column would be several controls sharing one name
+                        — which a screen reader cannot tell apart, and which is a defect in the
+                        page rather than an inconvenience in a test. */}
+                    {onLocate && (
+                      <button
+                        type="button"
+                        aria-label={`Show the ${trade.direction} entered at ${trade.entry_time} on the price chart`}
+                        onClick={() => {
+                          onLocate(trade.id)
+                        }}
+                        className="mr-1 rounded border border-slate-700 px-2 py-1 text-slate-300 hover:border-slate-500 hover:text-slate-100 focus-visible:outline-2 focus-visible:outline-sky-400"
+                      >
+                        <svg
+                          viewBox="0 0 16 16"
+                          className="h-4 w-4"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="1.5"
+                          aria-hidden="true"
+                        >
+                          {/* A target: "take me to this one", not "show me a chart" — the row
+                              already has a button for the second thing. */}
+                          <circle cx="8" cy="8" r="4.5" />
+                          <path d="M8 1v2M8 13v2M1 8h2M13 8h2" strokeLinecap="round" />
+                        </svg>
+                      </button>
+                    )}
                     {/* The button is the affordance. Making the whole row clickable would mean a
                         row that responds to a click without looking like it does — guesswork.
                         Absent, not disabled, when there is no window: a control that can never

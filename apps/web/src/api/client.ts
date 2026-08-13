@@ -7,6 +7,7 @@ import type {
   BacktestFilters,
   BacktestsPage,
   BasketOut,
+  CandlesResponse,
   CreateBacktestRequest,
   CreateBasketRequest,
   CreatedBacktest,
@@ -82,6 +83,11 @@ export const api = {
   getTrades: (id: string, limit = 100, offset = 0): Promise<TradesPage> =>
     request('GET', `/backtests/${id}/trades?limit=${String(limit)}&offset=${String(offset)}`),
   getEquity: (id: string): Promise<EquityPoint[]> => request('GET', `/backtests/${id}/equity`),
+  // No window parameters, and that is the endpoint's design rather than an omission: the run
+  // already recorded which candles it read, so the chart cannot be asked for a period the run
+  // did not execute over. A client that assembled the window itself could get it subtly wrong,
+  // and a chart disagreeing with the trades drawn on it says nothing about the disagreement.
+  getCandles: (id: string): Promise<CandlesResponse> => request('GET', `/backtests/${id}/candles`),
   // One snapshot at a time. The list deliberately does not carry them — fifty bars per trade
   // would be megabytes assembled to be thrown away — so this is the only way to get one.
   getTradeSnapshot: (id: string, tradeId: number): Promise<Snapshot> =>

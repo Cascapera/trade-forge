@@ -328,6 +328,45 @@ class EquityPointOut(_Out):
     equity: Money
 
 
+class CandleOut(_Out):
+    """One bar of the price chart. Prices are strings for the same reason `Money` is.
+
+    No volume. It is on the row in Parquet and deliberately left off the wire: a run of
+    thirteen thousand bars pays for every field it carries, and nothing on this chart reads
+    volume yet. Adding it later is additive; sending it now is bytes spent on nothing.
+    """
+
+    time: dt.datetime
+    open: Money
+    high: Money
+    low: Money
+    close: Money
+
+
+class CandlesOut(BaseModel):
+    """The bars a finished run read, with the provenance to check them against.
+
+    The three provenance fields are not decoration. Parquet underneath a run can be
+    re-collected or extended after the fact, so "what this run read" and "what the dataset
+    holds today" are two different questions — and the second is the only one this endpoint
+    can answer by reading. Carrying `candles_seen` alongside `count` lets a client see the
+    two disagree instead of drawing a chart that quietly covers a different period than the
+    trades on it.
+    """
+
+    timeframe: str
+    symbol: str
+
+    #: What the run recorded eating, copied from the `backtests` row.
+    candles_seen: int
+    first_candle: dt.datetime
+    last_candle: dt.datetime
+
+    #: What was actually found on disk just now, for that same window.
+    count: int
+    candles: list[CandleOut]
+
+
 class CreatedBacktest(_Out):
     """The 202 body: the run exists and is queued; poll `id` or subscribe to its WebSocket."""
 

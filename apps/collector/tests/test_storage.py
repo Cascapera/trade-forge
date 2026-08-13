@@ -118,6 +118,73 @@ def test_reading_a_symbol_that_was_never_collected_is_empty_not_an_error(tmp_pat
     assert read_candles(tmp_path, "NOPE", "H1") == []
 
 
+# --------------------------------------------------------------------------- #
+# Reading a window                                                              #
+# --------------------------------------------------------------------------- #
+
+# Five consecutive daily bars, so a window can be stated as "the middle three" and the two it
+# must exclude sit on either side of it.
+_DAYS = [dt.datetime(2024, 6, day, 9, tzinfo=dt.UTC) for day in range(1, 6)]
+
+
+def _five_days(root: Path) -> None:
+    write_candles(root, "EURUSD", "D1", [a_candle(day) for day in _DAYS])
+
+
+def test_a_window_keeps_both_of_its_edges(tmp_path: Path) -> None:
+    """Inclusive at both ends, and the `end` edge is the one that matters.
+
+    A run records `last_candle` as the final bar it *ate*. Read that window with an exclusive
+    upper bound and the chart loses exactly that bar — the one the last trade may have closed
+    on. The failure is a single missing candle at the right-hand edge of a chart, which is
+    invisible unless a test states the boundary outright.
+    """
+    _five_days(tmp_path)
+
+    window = read_candles(tmp_path, "EURUSD", "D1", start=_DAYS[1], end=_DAYS[3])
+
+    assert [candle.time for candle in window] == [_DAYS[1], _DAYS[2], _DAYS[3]]
+
+
+def test_each_bound_stands_on_its_own(tmp_path: Path) -> None:
+    """`start` alone is an open-ended tail, `end` alone an open-ended head."""
+    _five_days(tmp_path)
+
+    assert [c.time for c in read_candles(tmp_path, "EURUSD", "D1", start=_DAYS[3])] == _DAYS[3:]
+    assert [c.time for c in read_candles(tmp_path, "EURUSD", "D1", end=_DAYS[1])] == _DAYS[:2]
+
+
+def test_no_window_still_reads_everything(tmp_path: Path) -> None:
+    """The window is optional, and every caller that predates it must be unaffected."""
+    _five_days(tmp_path)
+
+    assert len(read_candles(tmp_path, "EURUSD", "D1")) == len(_DAYS)
+
+
+def test_a_window_that_spans_years_keeps_both_of_them(tmp_path: Path) -> None:
+    """The filter must prune partitions, not drop them.
+
+    Years are directories, and the bounds are pushed down into Arrow to skip the ones outside
+    the window. A predicate that interacted badly with the partition keys could return only the
+    year the boundary happens to name — a chart missing half its history, still plausible.
+    """
+    december = dt.datetime(2023, 12, 31, 9, tzinfo=dt.UTC)
+    january = dt.datetime(2024, 1, 1, 9, tzinfo=dt.UTC)
+    write_candles(tmp_path, "EURUSD", "D1", [a_candle(december), a_candle(january)])
+
+    window = read_candles(tmp_path, "EURUSD", "D1", start=december, end=january)
+
+    assert [candle.time for candle in window] == [december, january]
+
+
+def test_a_window_with_nothing_in_it_is_empty_not_an_error(tmp_path: Path) -> None:
+    _five_days(tmp_path)
+
+    assert (
+        read_candles(tmp_path, "EURUSD", "D1", start=dt.datetime(2030, 1, 1, tzinfo=dt.UTC)) == []
+    )
+
+
 def test_writing_nothing_is_an_error_not_a_silent_no_op(tmp_path: Path) -> None:
     """An empty backfill means something went wrong upstream. It must not look like success."""
     with pytest.raises(ValueError, match="no candles"):

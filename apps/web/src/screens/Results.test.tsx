@@ -1,23 +1,31 @@
-import { screen } from '@testing-library/react'
+import { fireEvent, screen } from '@testing-library/react'
 
-import type { Backtest, Metrics } from '../api/types'
+import type { Backtest, CandlesResponse, Metrics, Trade } from '../api/types'
 import { renderWithProviders } from '../test-utils'
 
 vi.mock('../api/hooks', () => ({
   useBacktest: vi.fn(),
   useTrades: vi.fn(),
   useEquity: vi.fn(),
+  useCandles: vi.fn(),
+  useTradeSnapshot: vi.fn(),
 }))
 
-// The chart draws to a canvas jsdom lacks; stub it out — its own test covers the wiring.
+// Both charts draw to a canvas jsdom lacks; stub them out — each has its own test.
 vi.mock('../components/EquityCurve', () => ({ EquityCurve: () => <div>equity chart</div> }))
+vi.mock('../components/PriceChart', () => ({
+  PriceChart: ({ selectedTradeId }: { selectedTradeId: number | null }) => (
+    <div>price chart, showing trade {selectedTradeId ?? 'none'}</div>
+  ),
+}))
 
-import { useBacktest, useEquity, useTrades } from '../api/hooks'
+import { useBacktest, useCandles, useEquity, useTrades } from '../api/hooks'
 import { Results } from './Results'
 
 const mockedBacktest = vi.mocked(useBacktest)
 const mockedTrades = vi.mocked(useTrades)
 const mockedEquity = vi.mocked(useEquity)
+const mockedCandles = vi.mocked(useCandles)
 
 const metrics: Metrics = {
   net_profit: '100',
@@ -66,9 +74,45 @@ function stubBacktest(value: unknown): void {
   mockedBacktest.mockReturnValue(value as ReturnType<typeof useBacktest>)
 }
 
+function trade(over: Partial<Trade>): Trade {
+  return {
+    id: 1,
+    direction: 'long',
+    entry_time: '2024-08-01T14:00:00Z',
+    entry_price: '226.50',
+    exit_time: '2024-08-01T17:00:00Z',
+    exit_price: '228.00',
+    exit_reason: 'take_profit',
+    volume: '10',
+    stop_loss: '225.00',
+    take_profit: '229.50',
+    gross_pnl: '15.00',
+    costs: '0',
+    net_pnl: '15.00',
+    r_multiple: '2.00',
+    context: {},
+    has_snapshot: false,
+    ...over,
+  }
+}
+
+function candles(over: Partial<CandlesResponse> = {}): CandlesResponse {
+  return {
+    timeframe: 'H1',
+    symbol: 'AAPL',
+    candles_seen: 3,
+    first_candle: '2024-08-01T13:00:00Z',
+    last_candle: '2024-08-01T15:00:00Z',
+    count: 3,
+    candles: [],
+    ...over,
+  }
+}
+
 beforeEach(() => {
   mockedTrades.mockReturnValue({ data: { total: 0, limit: 100, offset: 0, items: [] } } as never)
   mockedEquity.mockReturnValue({ data: [] } as never)
+  mockedCandles.mockReturnValue({ data: candles(), isPending: false, isError: false } as never)
 })
 
 afterEach(() => {
@@ -150,5 +194,94 @@ describe('Results', () => {
     renderWithProviders(<Results />)
 
     expect(screen.queryByRole('status')).not.toBeInTheDocument()
+  })
+})
+
+describe('Results — the price tab', () => {
+  function done(): void {
+    stubBacktest({ isPending: false, isError: false, data: backtest({ status: 'done', metrics }) })
+  }
+
+  it('opens on the results tab, not on the price one', () => {
+    done()
+    renderWithProviders(<Results />)
+
+    expect(screen.getByRole('tab', { name: 'Results' })).toHaveAttribute('aria-selected', 'true')
+    expect(screen.getByRole('tab', { name: 'Price' })).toHaveAttribute('aria-selected', 'false')
+    expect(screen.queryByText(/price chart/)).not.toBeInTheDocument()
+  })
+
+  it('does not fetch the candles until the price tab is open', () => {
+    // The point of the `enabled` flag, and it is worth a test of its own: this is the largest
+    // payload the page can ask for — thousands of bars against a handful of metrics — and a
+    // reader who never leaves the results tab must not pay for it. A hook wired without the
+    // condition would still render correctly, and the cost would be invisible on screen.
+    done()
+    renderWithProviders(<Results />)
+
+    expect(mockedCandles).toHaveBeenLastCalledWith(undefined, false)
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Price' }))
+
+    expect(mockedCandles).toHaveBeenLastCalledWith(undefined, true)
+  })
+
+  it('takes the reader to the price chart, on the trade they picked', () => {
+    done()
+    mockedTrades.mockReturnValue({
+      data: { total: 1, limit: 100, offset: 0, items: [trade({ id: 42 })] },
+    } as never)
+    renderWithProviders(<Results />)
+
+    fireEvent.click(screen.getByRole('button', { name: /on the price chart/i }))
+
+    expect(screen.getByRole('tab', { name: 'Price' })).toHaveAttribute('aria-selected', 'true')
+    // Both halves matter: switching tabs without carrying the choice would land the reader on a
+    // chart of the whole run with nothing to say which trade they had asked about.
+    expect(screen.getByText('price chart, showing trade 42')).toBeInTheDocument()
+  })
+
+  it('says so when the dataset no longer matches what the run read', () => {
+    // A re-collected dataset can hold a different number of bars for the same window. The chart
+    // would still draw, and it would be a chart of bars the trades were not decided on.
+    done()
+    mockedCandles.mockReturnValue({
+      data: candles({ candles_seen: 3480, count: 3200 }),
+      isPending: false,
+      isError: false,
+    } as never)
+    renderWithProviders(<Results />)
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Price' }))
+
+    const notice = screen.getByRole('status')
+    expect(notice).toHaveTextContent('3,480')
+    expect(notice).toHaveTextContent('3,200')
+  })
+
+  it('says nothing when the dataset still matches', () => {
+    done()
+    renderWithProviders(<Results />)
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Price' }))
+
+    expect(screen.queryByRole('status')).not.toBeInTheDocument()
+    expect(screen.getByText(/price chart/)).toBeInTheDocument()
+  })
+
+  it('surfaces a failure to load the price instead of an empty chart', () => {
+    done()
+    mockedCandles.mockReturnValue({
+      data: undefined,
+      isPending: false,
+      isError: true,
+      error: new Error('this run did not record which candles it read'),
+    } as never)
+    renderWithProviders(<Results />)
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Price' }))
+
+    expect(screen.getByText(/did not record which candles/i)).toBeInTheDocument()
+    expect(screen.queryByText(/price chart/)).not.toBeInTheDocument()
   })
 })

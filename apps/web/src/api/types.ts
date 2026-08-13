@@ -215,6 +215,33 @@ export interface Snapshot {
   levels: SnapshotLevel[]
 }
 
+/** One bar of the price chart. Prices are strings for the same reason every price here is. */
+export interface Candle {
+  time: string
+  open: string
+  high: string
+  low: string
+  close: string
+}
+
+/**
+ * The bars a run read, with the provenance to check them against.
+ *
+ * `candles_seen` is what the run *recorded* eating; `count` is what was found on disk just now.
+ * They are two different questions — Parquet underneath a run can be re-collected or extended
+ * afterwards — and they are both carried so a client can see them disagree instead of drawing a
+ * chart that quietly covers a different period than the trades plotted on it.
+ */
+export interface CandlesResponse {
+  timeframe: string
+  symbol: string
+  candles_seen: number
+  first_candle: string
+  last_candle: string
+  count: number
+  candles: Candle[]
+}
+
 export interface TradesPage {
   total: number
   limit: number

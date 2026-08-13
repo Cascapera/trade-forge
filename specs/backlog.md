@@ -84,11 +84,6 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
   worker durante o `run` (CPU-bound) e as queries. Aceitável na Fase 1 (um job por vez, processo
   dedicado), mas ao escalar concorrência do worker, mover o trabalho pesado para um executor de threads
   ou usar sessão async. Anotar como dívida de escala, não de correção.
-- [origem: PR-108] **Gráfico de candles com entradas/saídas** — a tela de resultados entrega cards +
-  curva de capital + tabela de trades, mas NÃO o gráfico de candles com marcadores de entrada/saída
-  (lightweight-charts). Falta o dado: OHLCV mora em Parquet (ADR-05), não no Postgres, e não há endpoint
-  que o sirva. Fatia seguinte: `GET /instruments/{symbol}/candles?tf&from&to` na API (lê via
-  `read_candles`, pagina/decima) + a série de candlestick na UI com os trades plotados. Escopo próprio.
 - [origem: PR-108] **Builder recursivo de condições** — o form guiado do PR-108 cobre comparações e UM
   nível de all/any (o caso das estratégias-demo). A DSL suporta all/any/not aninhados em qualquer
   profundidade; um editor de árvore recursivo (visual, arrastar/soltar) é o design final da Fase 2
@@ -398,3 +393,25 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
   (ver o item da cobertura acima). Conserto: trocar por `func.now()`, uma linha, junto do
   primeiro trabalho que já for tocar `upsert_dataset` — provavelmente o item da cobertura, que
   vai reescrever esse `set_` de qualquer forma.
+- [origem: PR-228] **Agregar candles quando uma corrida passa do teto do gráfico** — o
+  `GET /backtests/{id}/candles` recusa (422) uma corrida que leu mais de 50 000 barras, em vez de
+  reduzir. Recusar é deliberado: **decimar está errado** — um candle não é uma amostra de preço, é
+  o resumo de um intervalo, e jogar fora nove de cada dez apaga máximas e mínimas, inclusive a
+  máxima que estopou o trade. O gráfico ficaria liso, plausível e sem a barra que explica o trade
+  ao lado. A redução correta é **agregar** (primeiro open, maior high, menor low, último close),
+  que preserva os extremos — mas é uma regra com borda de verdade (o que fazer com o balde
+  incompleto no fim da janela) e merece testes próprios. Adiado por não ter caso de uso: o maior
+  dataset do projeto tem 38 986 barras (EURUSD M15) e a corrida mais longa já executada leu
+  12 883, então hoje **tudo cabe inteiro** e nada é reduzido. Fazer quando houver M1 coletado.
+- [origem: PR-228] **Endpoint genérico de candles por instrumento** — hoje as barras só são
+  servidas presas a uma corrida (`/backtests/{id}/candles`), de propósito: a janela é a
+  procedência que a corrida gravou, então o gráfico não pode ser pedido para um período que ela
+  não executou. Um `GET /instruments/{symbol}/candles?timeframe&from&to` é o superconjunto e vai
+  fazer falta na hora de **pré-visualizar o dado antes de lançar** e na tela de coleta (item do
+  PR-223). Fazer quando existir esse segundo consumidor — não antes, porque um endpoint com
+  janela livre convida a tela de resultado a montar a janela sozinha e a errá-la em silêncio.
+- [origem: PR-228] **Docstring órfã em `apps/web/src/api/hooks.ts`** — o bloco que descreve o
+  snapshot por trade ("The entry picture for one trade, fetched only once someone opens it")
+  está imediatamente acima de `useCreateBasket`, não de `useTradeSnapshot`. Documentação
+  apontando para a função errada, sem efeito em runtime. Mover junto do próximo trabalho que já
+  for tocar o arquivo.

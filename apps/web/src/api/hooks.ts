@@ -13,6 +13,7 @@ import type {
   BacktestStatus,
   BacktestsPage,
   BasketOut,
+  CandlesResponse,
   CreateBacktestRequest,
   CreateBasketRequest,
   CreatedBacktest,
@@ -134,6 +135,27 @@ export function useEquity(id: string | undefined, enabled: boolean) {
   return useQuery<EquityPoint[]>({
     queryKey: ['equity', id],
     queryFn: id !== undefined && enabled ? () => api.getEquity(id) : skipToken,
+  })
+}
+
+/**
+ * The price the run was executed over, fetched only when someone opens the chart.
+ *
+ * `enabled` carries two conditions from the caller: the run has finished, and the price tab is
+ * the one on screen. Both matter — this is the largest payload the results page can ask for
+ * (thousands of bars, against a handful of metrics), and fetching it for a reader who never
+ * leaves the metrics tab would be the page's whole cost, spent on nothing.
+ *
+ * `staleTime: Infinity` because the answer genuinely cannot change while the page is open: the
+ * window is bounded by the provenance a *finished* run recorded, and a finished run never eats
+ * another candle. Re-fetching on every window focus would re-download thousands of bars to
+ * receive the same ones back.
+ */
+export function useCandles(id: string | undefined, enabled: boolean) {
+  return useQuery<CandlesResponse>({
+    queryKey: ['candles', id],
+    queryFn: id !== undefined && enabled ? () => api.getCandles(id) : skipToken,
+    staleTime: Infinity,
   })
 }
 

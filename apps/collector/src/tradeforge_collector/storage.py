@@ -109,18 +109,42 @@ def write_candles(root: Path, symbol: str, timeframe: str, candles: list[Candle]
     return dataset_path(root, symbol, timeframe)
 
 
-def read_candles(root: Path, symbol: str, timeframe: str) -> list[Candle]:
+def read_candles(
+    root: Path,
+    symbol: str,
+    timeframe: str,
+    *,
+    start: dt.datetime | None = None,
+    end: dt.datetime | None = None,
+) -> list[Candle]:
     """Read a symbol's bars back, in order.
 
     Sorted explicitly: a dataset is a set of files, and the order they are listed in is
     the filesystem's business, not ours. Candles that arrive out of order would make the
     engine's notion of "the previous bar" a lie.
+
+    `start` and `end` bound the read and are **inclusive on both ends**. Inclusive because
+    the caller that uses them holds a window as *the first bar and the last bar* — the
+    provenance a finished run records — and a half-open `end` would silently drop the very
+    bar the run finished on.
+
+    The bounds are pushed into Arrow rather than applied to the result, which is the point
+    of the layout described at the top of this file: the year directories outside the window
+    are never opened, and the rows inside the boundary files are never decoded into Python
+    objects. Filtering afterwards would build every `Candle` first and throw most away.
     """
     directory = Path(dataset_path(root, symbol, timeframe))
     if not directory.exists():
         return []
 
-    table = ds.dataset(directory, format="parquet", partitioning="hive").to_table()
+    window = None
+    if start is not None:
+        window = ds.field("time") >= start
+    if end is not None:
+        upper = ds.field("time") <= end
+        window = upper if window is None else window & upper
+
+    table = ds.dataset(directory, format="parquet", partitioning="hive").to_table(filter=window)
     table = table.sort_by("time")
 
     rows = table.to_pylist()

@@ -535,3 +535,47 @@ def test_every_value_on_the_curve_is_the_average_over_the_window_the_run_read(
     # moves the whole line.
     assert body["candles_seen"] == len(bars)
     assert body["count"] == len(bars)
+
+
+def test_the_two_provenance_numbers_are_reported_when_they_disagree(
+    session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+) -> None:
+    """A bar appearing *inside* the window after the run, which is the case the pair exists for.
+
+    Both endpoints carry `candles_seen` (what the run recorded eating) and `count` (what is on
+    disk for that window now), and until this test the only scenario exercised had them equal —
+    so `count=read.seen` would have been indistinguishable from the truth. A field added to make
+    a disagreement visible has to be seen disagreeing.
+
+    A bar appearing in the middle is worse than one appended to the end, and that is why the hole
+    is in the middle: an extra bar at the end would add a point to the curve, while an extra bar
+    in the middle **reseeds the average and moves every point after it**. The candles endpoint
+    would look almost right; the overlay would be a different line under the same trades.
+
+    ⚠️ The second write passes all twelve bars. `write_candles` replaces whole year partitions,
+    so writing only the missing hour would delete the other eleven.
+    """
+    seeding = session_factory()
+    _seed_instrument(seeding)
+    seeding.close()
+    complete = [bar(i, open_=_LEVELS[i], close=_LEVELS[i + 1]) for i in range(len(_LEVELS) - 1)]
+    # The same series with its sixth hour missing — the shape a gap in collection leaves behind.
+    with_a_hole = [candle for index, candle in enumerate(complete) if index != 5]
+    write_candles(tmp_path, "EURUSD", "H1", with_a_hole)
+
+    with TestClient(_app(settings, session_factory, tmp_path)) as client:
+        backtest_id = _launch_with(client, _setup_strategy())
+        _run(session_factory, tmp_path, backtest_id)
+
+        # The gap is filled in afterwards, the way a re-collection would fill it.
+        write_candles(tmp_path, "EURUSD", "H1", complete)
+
+        candles = client.get(f"/backtests/{backtest_id}/candles").json()
+        overlays = client.get(f"/backtests/{backtest_id}/overlays").json()
+
+    assert candles["candles_seen"] == len(with_a_hole)
+    assert candles["count"] == len(complete)
+    assert candles["candles_seen"] != candles["count"]
+    # And the overlay reports the same disagreement, over the same window.
+    assert overlays["candles_seen"] == candles["candles_seen"]
+    assert overlays["count"] == candles["count"]

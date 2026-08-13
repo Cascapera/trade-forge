@@ -9,7 +9,7 @@ other caller). The GETs read the state the worker writes back.
 import datetime as dt
 import uuid
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from typing import Annotated, Any
 
 from fastapi import APIRouter, HTTPException, Query, status
@@ -46,6 +46,7 @@ from tradeforge_db.models import (
     Trade,
 )
 from tradeforge_engine.domain import Candle
+from tradeforge_engine.loop import ENGINE_CONTEXT
 from tradeforge_engine.protocols import Charted
 from tradeforge_engine.strategy import compile_strategy
 
@@ -477,18 +478,29 @@ def get_overlays(backtest_id: uuid.UUID, session: SessionDep, settings: Settings
     overlays = strategy.overlays() if isinstance(strategy, Charted) else {}
 
     points: dict[str, list[tuple[dt.datetime, Decimal]]] = {label: [] for label in overlays}
-    for candle in read.candles:
-        for label, indicator in overlays.items():
-            indicator.update(candle)
-            value = indicator.value()
-            # Warm-up bars are left out rather than sent as nulls, matching the entry snapshot's
-            # own series: the curve simply begins where the indicator did. A null per bar would
-            # have every client decide again what a hole means.
-            if value is not None:
-                points[label].append((candle.time, value))
+    # ⚠️ Under the engine's own decimal context, not the request thread's. Today the two agree
+    # byte for byte — CPython's default is `prec=28`/`ROUND_HALF_EVEN`, which is what
+    # `ENGINE_CONTEXT` asks for — so this changes no number that exists now. It is here because
+    # that agreement is a coincidence and not a guarantee: `getcontext()` is global and mutable
+    # by anything in the process, and `ENGINE_CONTEXT` exists precisely to stop a run's
+    # arithmetic depending on who touched it last. Measured at `prec=10` the curve comes back
+    # `1.114858523` against the run's `1.114858524264470690451361286` — a chart disagreeing with
+    # the trades on it in the ninth decimal, which no reader would ever see.
+    with localcontext(ENGINE_CONTEXT):
+        for candle in read.candles:
+            for label, indicator in overlays.items():
+                indicator.update(candle)
+                value = indicator.value()
+                # Warm-up bars are left out rather than sent as nulls, matching the entry
+                # snapshot's own series: the curve simply begins where the indicator did. A null
+                # per bar would have every client decide again what a hole means.
+                if value is not None:
+                    points[label].append((candle.time, value))
 
     return OverlaysOut(
         symbol=read.instrument.symbol,
         timeframe=read.backtest.timeframe,
+        candles_seen=read.seen,
+        count=len(read.candles),
         series=[OverlaySeriesOut(label=label, points=found) for label, found in points.items()],
     )

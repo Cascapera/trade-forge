@@ -392,6 +392,15 @@ class OverlaysOut(BaseModel):
 
     symbol: str
     timeframe: str
+
+    #: The same provenance pair `/candles` carries, and the curve needs it *more* than the bars
+    #: do. The bars are read back; the curve is **recomputed over them**, so one extra bar inside
+    #: the window does not add a point at the end — it reseeds the average and moves the whole
+    #: line. A client that could not see the two disagree would redraw a different curve under
+    #: the same trades and have nothing to notice it by.
+    candles_seen: int
+    count: int
+
     series: list[OverlaySeriesOut]
 
 

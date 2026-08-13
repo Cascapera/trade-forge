@@ -258,6 +258,13 @@ export interface OverlaySeries {
 export interface OverlaysResponse {
   symbol: string
   timeframe: string
+  /**
+   * The same provenance pair the candles carry, and the curve needs it *more* than they do: the
+   * bars are read back, while the curve is recomputed over them, so one extra bar inside the
+   * window does not add a point at the end — it reseeds the average and moves the whole line.
+   */
+  candles_seen: number
+  count: number
   series: OverlaySeries[]
 }
 

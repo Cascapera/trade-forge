@@ -12,7 +12,7 @@ import asyncio
 import datetime as dt
 import uuid
 from collections.abc import Callable
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +26,8 @@ from tradeforge_api.worker import process_backtest
 from tradeforge_collector import write_candles
 from tradeforge_db.models import Backtest, BacktestStatus, Instrument
 from tradeforge_engine.domain import AssetClass, Candle
+from tradeforge_engine.indicators import EMA
+from tradeforge_engine.loop import ENGINE_CONTEXT
 from tradeforge_engine.testing import bar
 
 pytestmark = pytest.mark.integration
@@ -480,3 +482,56 @@ def test_a_run_with_no_provenance_has_no_curves_either(
 
     assert response.status_code == 404
     assert "did not record" in response.json()["detail"]
+
+
+def test_every_value_on_the_curve_is_the_average_over_the_window_the_run_read(
+    session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+) -> None:
+    """⚠️ The only test here that looks at the *numbers*.
+
+    Every other one checks the shape of the response — the label, the length, the timestamps at
+    the ends. A curve that was the right length, spanned the right period, and was made of
+    different numbers would pass all of them.
+
+    The expectation is built by driving the same indicator over the same bars under the engine's
+    own decimal context. That deliberately shares the EMA implementation — this is not trying to
+    re-derive an exponential average, which the engine's golden tests already pin — but it does
+    not share the window, the seeding, the alignment or the context, and those are exactly what
+    an endpoint recomputing a series can get wrong while still returning something plausible.
+
+    **What it does not prove**, and the stronger anchor for it: a run *persists* the average it
+    judged each entry against, into that trade's snapshot. Comparing the served curve to those
+    recorded values would close the loop against numbers written during the run rather than
+    beside it. It is not done here because this fixture produces no filled trade — on a series
+    that climbs steadily the MME9 re-arms on every bar and the resting order is never taken — and
+    inventing one is its own scenario. Noted in `specs/backlog.md`.
+    """
+    seeding = session_factory()
+    _seed_instrument(seeding)
+    seeding.close()
+    bars = _candles()
+    write_candles(tmp_path, "EURUSD", "H1", bars)
+
+    with TestClient(_app(settings, session_factory, tmp_path)) as client:
+        backtest_id = _launch_with(client, _setup_strategy())
+        _run(session_factory, tmp_path, backtest_id)
+        body = client.get(f"/backtests/{backtest_id}/overlays").json()
+
+    expected: list[tuple[dt.datetime, Decimal]] = []
+    with localcontext(ENGINE_CONTEXT):
+        indicator = EMA(period=3, source="close")
+        for candle in bars:
+            indicator.update(candle)
+            value = indicator.value()
+            if value is not None:
+                expected.append((candle.time, value))
+
+    [curve] = body["series"]
+    served = [(_moment(when), Decimal(value)) for when, value in curve["points"]]
+
+    assert served == expected
+    # And the provenance travels with it, for the same reason it travels with the candles: one
+    # extra bar inside the window does not add a point at the end, it reseeds the average and
+    # moves the whole line.
+    assert body["candles_seen"] == len(bars)
+    assert body["count"] == len(bars)

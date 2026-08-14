@@ -116,13 +116,16 @@ describe('LaunchStudy', () => {
     ).toBeInTheDocument()
   })
 
-  it('reports the size of the grid as it is typed, and multiplies rather than adds', () => {
+  it('reports the size of the grid as it is typed, and multiplies rather than adds', async () => {
     // ⚠️ The reason this number is on screen at all. Three by four is twelve backtests, not
     // seven, and the moment someone needs to know that is *while* adding the second axis — not
     // after launching a study four times the size they meant.
     renderWithProviders(<LaunchStudy />)
+    // The parameter dropdown exists only once the strategy list has arrived — it is built from
+    // the chosen strategy's setup, so waiting for the option is waiting for that query.
+    await screen.findByRole('option', { name: /MME9/ })
 
-    fireEvent.change(screen.getByLabelText('Parameter 1 path'), {
+    fireEvent.change(screen.getByLabelText('Parameter 1'), {
       target: { value: 'setup.params.period' },
     })
     fireEvent.change(screen.getByLabelText('Parameter 1 values'), {
@@ -131,8 +134,12 @@ describe('LaunchStudy', () => {
     expect(screen.getByRole('status')).toHaveTextContent('3 combinations, so 3 backtests.')
 
     fireEvent.click(screen.getByRole('button', { name: 'Add a parameter' }))
-    fireEvent.change(screen.getByLabelText('Parameter 2 path'), {
-      target: { value: 'setup.params.rr' },
+    // ⚠️ A parameter this setup **really has**. It used to say `setup.params.rr`, which
+    // `mme9_breakout` does not have — harmless while the field was free text, and a silent
+    // no-op now that it is a dropdown of the setup's own parameters. The old test was asserting
+    // a grid that could never have been launched.
+    fireEvent.change(screen.getByLabelText('Parameter 2'), {
+      target: { value: 'setup.params.breakeven_at_r' },
     })
     fireEvent.change(screen.getByLabelText('Parameter 2 values'), {
       target: { value: '1, 2, 3, 4' },
@@ -156,6 +163,11 @@ describe('LaunchStudy', () => {
     // option is a no-op that leaves the field empty and says nothing. Waiting for the option is
     // waiting for the instruments query.
     await screen.findByRole('option', { name: 'AAPL' })
+    // ⚠️ **Each** query needs its own wait. The parameter dropdown is built from the chosen
+    // strategy's setup, so it fills from the *strategies* request — waiting for the market's
+    // option says nothing about it, and setting a parameter before it arrives is the same
+    // silent no-op one field over.
+    await screen.findByRole('option', { name: 'period' })
     fireEvent.change(screen.getByLabelText('Market'), {
       target: { value: 'AAPL' },
     })
@@ -165,8 +177,8 @@ describe('LaunchStudy', () => {
     fireEvent.change(screen.getByLabelText('To'), {
       target: { value: '2025-01-01' },
     })
-    fireEvent.change(screen.getByLabelText('Parameter 1 path'), {
-      target: { value: 'a' },
+    fireEvent.change(screen.getByLabelText('Parameter 1'), {
+      target: { value: 'setup.params.period' },
     })
     fireEvent.change(screen.getByLabelText('Parameter 1 values'), {
       target: {
@@ -174,8 +186,8 @@ describe('LaunchStudy', () => {
       },
     })
     fireEvent.click(screen.getByRole('button', { name: 'Add a parameter' }))
-    fireEvent.change(screen.getByLabelText('Parameter 2 path'), {
-      target: { value: 'b' },
+    fireEvent.change(screen.getByLabelText('Parameter 2'), {
+      target: { value: 'setup.params.breakeven_at_r' },
     })
     fireEvent.change(screen.getByLabelText('Parameter 2 values'), {
       target: {
@@ -198,6 +210,11 @@ describe('LaunchStudy', () => {
     // option is a no-op that leaves the field empty and says nothing. Waiting for the option is
     // waiting for the instruments query.
     await screen.findByRole('option', { name: 'AAPL' })
+    // ⚠️ **Each** query needs its own wait. The parameter dropdown is built from the chosen
+    // strategy's setup, so it fills from the *strategies* request — waiting for the market's
+    // option says nothing about it, and setting a parameter before it arrives is the same
+    // silent no-op one field over.
+    await screen.findByRole('option', { name: 'period' })
     fireEvent.change(screen.getByLabelText('Market'), {
       target: { value: 'AAPL' },
     })
@@ -207,14 +224,14 @@ describe('LaunchStudy', () => {
     fireEvent.change(screen.getByLabelText('To'), {
       target: { value: '2025-01-01' },
     })
-    fireEvent.change(screen.getByLabelText('Parameter 1 path'), {
+    fireEvent.change(screen.getByLabelText('Parameter 1'), {
       target: { value: 'setup.params.period' },
     })
     fireEvent.change(screen.getByLabelText('Parameter 1 values'), {
       target: { value: '5, 9' },
     })
     fireEvent.click(screen.getByRole('button', { name: 'Add a parameter' }))
-    fireEvent.change(screen.getByLabelText('Parameter 2 path'), {
+    fireEvent.change(screen.getByLabelText('Parameter 2'), {
       target: { value: 'setup.params.side' },
     })
     fireEvent.change(screen.getByLabelText('Parameter 2 values'), {
@@ -254,11 +271,16 @@ describe('LaunchStudy', () => {
 
     return (async () => {
       await screen.findByRole('option', { name: 'AAPL' })
+      // ⚠️ **Each** query needs its own wait. The parameter dropdown is built from the chosen
+      // strategy's setup, so it fills from the *strategies* request — waiting for the market's
+      // option says nothing about it, and setting a parameter before it arrives is the same
+      // silent no-op one field over.
+      await screen.findByRole('option', { name: 'period' })
       fireEvent.change(screen.getByLabelText('Market'), { target: { value: 'AAPL' } })
       fireEvent.change(screen.getByLabelText('From'), { target: { value: '2024-01-01' } })
       fireEvent.change(screen.getByLabelText('To'), { target: { value: '2025-01-01' } })
       fireEvent.change(screen.getByLabelText(/Spread \(ticks\)/), { target: { value: '8' } })
-      fireEvent.change(screen.getByLabelText('Parameter 1 path'), {
+      fireEvent.change(screen.getByLabelText('Parameter 1'), {
         target: { value: 'setup.params.period' },
       })
       fireEvent.change(screen.getByLabelText('Parameter 1 values'), { target: { value: '5, 9' } })
@@ -282,10 +304,15 @@ describe('LaunchStudy', () => {
     renderWithProviders(<LaunchStudy />)
 
     await screen.findByRole('option', { name: 'AAPL' })
+    // ⚠️ **Each** query needs its own wait. The parameter dropdown is built from the chosen
+    // strategy's setup, so it fills from the *strategies* request — waiting for the market's
+    // option says nothing about it, and setting a parameter before it arrives is the same
+    // silent no-op one field over.
+    await screen.findByRole('option', { name: 'period' })
     fireEvent.change(screen.getByLabelText('Market'), { target: { value: 'AAPL' } })
     fireEvent.change(screen.getByLabelText('From'), { target: { value: '2024-01-01' } })
     fireEvent.change(screen.getByLabelText('To'), { target: { value: '2025-01-01' } })
-    fireEvent.change(screen.getByLabelText('Parameter 1 path'), {
+    fireEvent.change(screen.getByLabelText('Parameter 1'), {
       target: { value: 'setup.params.period' },
     })
     fireEvent.change(screen.getByLabelText('Parameter 1 values'), { target: { value: '5, 9' } })

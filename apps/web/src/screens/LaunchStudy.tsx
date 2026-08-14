@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 
-import { useCreateStudy, useInstruments } from '../api/hooks'
+import { useCreateStudy, useInstruments, useStrategies } from '../api/hooks'
 import { StrategyPicker } from '../components/StrategyPicker'
 import { useSession } from '../store'
 import { TIMEFRAMES } from '../strategy/builder'
@@ -41,10 +41,15 @@ export function LaunchStudy(): React.JSX.Element {
   const navigate = useNavigate()
 
   const [form, setForm] = useState<StudyForm>(emptyStudyForm)
-  // The chosen strategy's setup, which is what says *which* parameters can be varied. Held here
-  // rather than looked up again: the picker already had the row in its hand.
-  const [setup, setSetup] = useState<string | null>(null)
-  const options = axesFor(setup)
+  // ⚠️ **Derived from the list, never held as state.** It was state, set only inside the
+  // picker's `onChange` — so a screen opened with a strategy *already* chosen (from the
+  // builder, or from an earlier visit in this session) showed it selected while knowing
+  // nothing about its setup, and fell back to the free-text field. The selection and what is
+  // known about it cannot disagree if only one of them exists. The query is React Query's, so
+  // this shares the picker's single request rather than making a second one.
+  const strategies = useStrategies({ limit: 200 })
+  const chosen = strategies.data?.items.find((item) => item.id === strategyId)
+  const options = axesFor(chosen?.setup ?? null)
 
 
   const blocked = strategyId === null ? 'Choose a strategy.' : whyNotLaunchable(form)
@@ -89,9 +94,8 @@ export function LaunchStudy(): React.JSX.Element {
               something since the last reload — with forty-five strategies in the database. */}
           <StrategyPicker
             value={strategyId ?? ''}
-            onChange={(chosen) => {
-              setStrategy(chosen.id, chosen.name)
-              setSetup(chosen.setup)
+            onChange={(picked) => {
+              setStrategy(picked.id, picked.name)
               // The axes belong to the setup that was just replaced, so keeping them would leave
               // paths pointing at a document that no longer has them — refused by the server,
               // but only after the reader had filled in values for nothing.

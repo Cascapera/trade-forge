@@ -54,12 +54,24 @@ function hintFor(param: SetupParam): string {
   if (param.kind === 'boolean') {
     return 'true, false — separated by commas'
   }
-  const bounds =
-    param.min !== undefined && param.max !== undefined
-      ? ` between ${String(param.min)} and ${String(param.max)}`
-      : ''
+  // ⚠️ An exclusive bound is said as an exclusive bound. Folding `> 0` into "between 0 and 100"
+  // is how this hint told a reader that zero was legal on `breakeven_at_r`, which the API
+  // refuses — and the study came back 422 for doing what the screen had suggested.
+  const lower =
+    param.min === undefined
+      ? null
+      : param.minExclusive === true
+        ? `greater than ${String(param.min)}`
+        : `at least ${String(param.min)}`
+  const upper =
+    param.max === undefined
+      ? null
+      : param.maxExclusive === true
+        ? `below ${String(param.max)}`
+        : `at most ${String(param.max)}`
+  const bounds = [lower, upper].filter((part) => part !== null).join(' and ')
   const whole = param.kind === 'integer' ? 'whole numbers' : 'numbers'
-  return `${whole}${bounds}, separated by commas`
+  return `${whole}${bounds === '' ? '' : ` ${bounds}`}, separated by commas`
 }
 
 /**
@@ -89,8 +101,12 @@ function exampleFor(param: SetupParam): string {
   )
   const within = candidates.filter(
     (value) =>
-      (param.min === undefined || value >= param.min) &&
-      (param.max === undefined || value <= param.max),
+      // The same exclusivity the hint now states. Suggesting the bound itself would offer a
+      // value the API refuses, which is worse than offering none.
+      (param.min === undefined ||
+        (param.minExclusive === true ? value > param.min : value >= param.min)) &&
+      (param.max === undefined ||
+        (param.maxExclusive === true ? value < param.max : value <= param.max)),
   )
   // Distinct and in order. A repeated value is two identical backtests, which the server
   // refuses — an example must not be the thing the form is there to prevent.

@@ -6,6 +6,7 @@
 // five runs, it multiplies by five. People consistently underestimate that, and a form that
 // only reports it after the fact reports it too late.
 
+import { ApiError } from '../api/client'
 import type { CreateStudyRequest } from '../api/types'
 
 /** Values a grid may try. Anything the DSL accepts for a parameter — a number, a flag, a name. */
@@ -150,4 +151,57 @@ export function toStudyRequest(form: StudyForm, strategyId: string): CreateStudy
 export function studyLabel(form: StudyForm): string {
   const axes = Object.keys(axesOf(form)).map((path) => path.split('.').at(-1) ?? path)
   return `${form.symbol} ${form.timeframe} · ${axes.join(', ')}`
+}
+
+/**
+ * What to tell the reader when the server refuses a study.
+ *
+ * ⚠️ **The screen showed `"API error 422"`, which is the one thing that cannot be acted on.**
+ * `ApiError.message` is built from the status alone; the reason lives in `detail`, and the
+ * server's reasons are specific by design — *"`setup.params.periodd`: this strategy has nothing
+ * at `setup.params.periodd`"*, *"this grid expands to 900 combinations, over the 500 a study
+ * will run"*. Replacing those with a house apology throws away the only part that says what to
+ * change.
+ *
+ * Two shapes arrive here, because two different validators refuse. A grid that cannot be applied
+ * gives a **sentence**; a grid whose *values* produce an unrunnable strategy gives the DSL
+ * validator's own body — `{message, errors}` — where `errors` is a list of pydantic failures
+ * naming the field and what it wanted. Both are read: the second one is the case where the path
+ * is fine and the number is not, which is the more confusing of the two to meet blind.
+ */
+export function launchFailure(error: unknown): string {
+  const detail = error instanceof ApiError ? error.detail : null
+  if (typeof detail === 'string') return detail
+
+  if (detail !== null && typeof detail === 'object' && 'message' in detail) {
+    const body = detail as { message?: unknown; errors?: unknown }
+    const message = typeof body.message === 'string' ? body.message : 'The study was refused'
+    const first: unknown = Array.isArray(body.errors) ? body.errors[0] : undefined
+    const because = reasonOf(first)
+    return because === null ? message : `${message}: ${because}`
+  }
+
+  // Not an `ApiError` at all — the network died, or the response was not JSON. Its own message
+  // is the only thing that knows what happened ("Failed to fetch"), and swallowing it for a
+  // house sentence would leave a reader retrying a form that was never the problem.
+  if (error instanceof Error && error.message !== '') return error.message
+
+  return 'The study was refused. Check the parameters and their values.'
+}
+
+/**
+ * One pydantic failure as a sentence: which field, and what it wanted.
+ *
+ * Only the first, deliberately. A grid of fifty points that names one illegal value produces one
+ * failure repeated fifty times, and listing them all would bury the sentence under its own
+ * echoes.
+ */
+function reasonOf(failure: unknown): string | null {
+  if (failure === null || typeof failure !== 'object') return null
+  const { loc, msg } = failure as { loc?: unknown; msg?: unknown }
+  if (typeof msg !== 'string') return null
+  // The last segment is the field; the ones before it are the union branch pydantic took, which
+  // names an internal model and would only puzzle a reader.
+  const field: unknown = Array.isArray(loc) ? loc.at(-1) : undefined
+  return typeof field === 'string' ? `${field} ${msg.toLowerCase()}` : msg
 }

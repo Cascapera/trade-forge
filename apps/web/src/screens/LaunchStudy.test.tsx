@@ -1,7 +1,7 @@
 import { fireEvent, screen, waitFor, within } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { api } from '../api/client'
+import { ApiError, api } from '../api/client'
 import { useSession } from '../store'
 import { renderWithProviders } from '../test-utils'
 
@@ -272,8 +272,13 @@ describe('LaunchStudy', () => {
     })()
   })
 
-  it('reports a refusal from the server instead of failing silently', async () => {
-    createStudy.mockRejectedValue(new Error('this grid expands to 900 combinations'))
+  it('reports the server own words, not the status code it came with', async () => {
+    // ⚠️ `ApiError.message` is built from the status alone — "API error 422" — and that is what
+    // the screen used to show. Reported from the screen exactly like that, with the reason the
+    // server had actually sent sitting unread in `detail`.
+    createStudy.mockRejectedValue(
+      new ApiError(422, 'this grid expands to 900 combinations, over the 500 a study will run'),
+    )
     renderWithProviders(<LaunchStudy />)
 
     await screen.findByRole('option', { name: 'AAPL' })
@@ -319,7 +324,7 @@ describe('LaunchStudy', () => {
     // The sentence comes from the schema's own minimum and maximum, so it tightens on its own
     // the day a bound does.
     expect(
-      screen.getByText('whole numbers between 1 and 1000, separated by commas'),
+      screen.getByText('whole numbers at least 1 and at most 1000, separated by commas'),
     ).toBeInTheDocument()
   })
 

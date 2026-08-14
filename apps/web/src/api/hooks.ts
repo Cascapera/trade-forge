@@ -24,6 +24,8 @@ import type {
   Instrument,
   OverlaysResponse,
   Snapshot,
+  StrategiesPage,
+  StrategyFilters,
   StrategyOut,
   StudyOut,
   TradesPage,
@@ -52,19 +54,48 @@ export function useCreateStrategy() {
 }
 
 /**
+ * Every strategy lineage, for a picker to choose from.
+ *
+ * One row per lineage rather than per version, and a grid's own points are left out by the
+ * server — a hundred-point study writes a hundred strategies nobody picks by hand.
+ */
+export function useStrategies(filters: StrategyFilters = {}) {
+  return useQuery<StrategiesPage>({
+    queryKey: ['strategies', filters],
+    queryFn: () => api.listStrategies(filters),
+  })
+}
+
+/**
  * Save a document under a lineage: a new strategy, or the next version of one already saved.
  *
  * `POST` always writes version 1, and (name, version) is unique, so saving the same name twice can
  * only ever conflict. Iterating — nudge the period, run it again — is therefore not a `POST` at
  * all; it is `PUT` on the previous version, which the API inserts as the next one, linked to its
  * parent. Choosing between them by *name* is what lets the screen keep one button.
+ *
+ * ⚠️ **The name is looked up on the server, and that is the fix for the 409.** This used to
+ * decide from the id the screen had created in *this browser session*, so a strategy saved from
+ * any other tab, or before a reload, was invisible to it — and saving under that name was a
+ * `POST` that collided. What a name means is a fact about the database, never about what a tab
+ * remembers.
+ *
+ * `include_generated` on the lookup, because a name is taken in the database whether or not a
+ * picker chooses to show it. Hidden is not free, and conflating the two would put the 409 back
+ * for exactly the names a study had generated.
  */
 export function useSaveStrategy() {
-  return useMutation<StrategyOut, Error, { definition: Strategy; parentId: string | null }>({
-    mutationFn: ({ definition, parentId }) =>
-      parentId === null
+  return useMutation<StrategyOut, Error, { definition: Strategy }>({
+    mutationFn: async ({ definition }) => {
+      const taken = await api.listStrategies({
+        name: definition.name,
+        include_generated: true,
+      })
+      const existing = taken.items[0]
+      return existing === undefined
         ? api.createStrategy(definition)
-        : api.updateStrategy(parentId, definition),
+        : api.updateStrategy(existing.id, definition)
+    },
   })
 }
 

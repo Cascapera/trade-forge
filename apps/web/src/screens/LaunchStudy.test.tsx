@@ -14,6 +14,7 @@ vi.mock('../api/client', async () => {
     api: {
       ...actual.api,
       listInstruments: vi.fn(),
+      listStrategies: vi.fn(),
       createStudy: vi.fn(),
     },
   }
@@ -21,6 +22,7 @@ vi.mock('../api/client', async () => {
 
 const listInstruments = vi.mocked(api.listInstruments)
 const createStudy = vi.mocked(api.createStudy)
+const listStrategies = vi.mocked(api.listStrategies)
 
 function instrument(symbol: string) {
   return {
@@ -41,16 +43,77 @@ function instrument(symbol: string) {
 beforeEach(() => {
   vi.clearAllMocks()
   listInstruments.mockResolvedValue([instrument('AAPL')])
+  listStrategies.mockResolvedValue({
+    total: 1,
+    limit: 200,
+    offset: 0,
+    items: [
+      {
+        id: 'strategy-1',
+        name: 'MME9',
+        version: 1,
+        schema_version: '1.0',
+        setup: 'mme9_breakout',
+        runs: 3,
+        created_at: '2024-01-01T00:00:00Z',
+      },
+    ],
+  })
   useSession.setState({ strategyId: 'strategy-1', strategyName: 'MME9' })
 })
 
 describe('LaunchStudy', () => {
-  it('asks for a strategy first, because a study varies one that already exists', () => {
+  it('offers the strategies that exist rather than demanding one built just now', async () => {
+    // ⚠️ This screen used to *refuse to open* unless a strategy had been created since the last
+    // reload, because there was no way to ask the server what existed — for a database holding
+    // forty-five of them. The picker is what `GET /strategies` was missing for.
     useSession.setState({ strategyId: null, strategyName: null })
 
     renderWithProviders(<LaunchStudy />)
 
-    expect(screen.getByText(/Build and run a strategy first/)).toBeInTheDocument()
+    expect(await screen.findByRole('option', { name: /MME9 · mme9_breakout/ })).toBeInTheDocument()
+    expect(screen.queryByText(/Build and run a strategy first/)).not.toBeInTheDocument()
+  })
+
+  it('will not launch until a strategy is chosen, and says so', async () => {
+    useSession.setState({ strategyId: null, strategyName: null })
+
+    renderWithProviders(<LaunchStudy />)
+    await screen.findByRole('option', { name: /MME9/ })
+    fireEvent.change(screen.getByLabelText('Parameter 1 path'), {
+      target: { value: 'setup.params.period' },
+    })
+    fireEvent.change(screen.getByLabelText('Parameter 1 values'), { target: { value: '5, 9' } })
+
+    expect(screen.getByText('Choose a strategy.')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Run the study' })).toBeDisabled()
+  })
+
+  it('shows what each strategy actually runs, because a name can lie', async () => {
+    // Not hypothetical: this project's database holds `Structure — CHoCH 56454`, which runs
+    // `mme9_breakout`. A name is typed by a person; a setup is executed by the engine.
+    listStrategies.mockResolvedValue({
+      total: 1,
+      limit: 200,
+      offset: 0,
+      items: [
+        {
+          id: 'liar',
+          name: 'Structure - CHoCH 56454',
+          version: 1,
+          schema_version: '1.0',
+          setup: 'mme9_breakout',
+          runs: 1,
+          created_at: '2024-01-01T00:00:00Z',
+        },
+      ],
+    })
+
+    renderWithProviders(<LaunchStudy />)
+
+    expect(
+      await screen.findByRole('option', { name: /Structure - CHoCH 56454 · mme9_breakout/ }),
+    ).toBeInTheDocument()
   })
 
   it('reports the size of the grid as it is typed, and multiplies rather than adds', () => {

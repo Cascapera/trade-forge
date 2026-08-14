@@ -18,6 +18,8 @@ import type {
   Instrument,
   OverlaysResponse,
   Snapshot,
+  StrategiesPage,
+  StrategyFilters,
   StrategyOut,
   StudyOut,
   TradesPage,
@@ -110,4 +112,8 @@ export const api = {
   createStudy: (payload: CreateStudyRequest): Promise<CreatedStudy> =>
     request('POST', '/studies', payload),
   getStudy: (id: string): Promise<StudyOut> => request('GET', `/studies/${id}`),
+  // The same `query` helper the run log's filters use: an absent filter and an empty one are
+  // different requests, and that distinction is already written down once.
+  listStrategies: (filters: StrategyFilters = {}): Promise<StrategiesPage> =>
+    request('GET', `/strategies${query({ ...filters, include_generated: filters.include_generated === true ? 'true' : undefined })}`),
 }

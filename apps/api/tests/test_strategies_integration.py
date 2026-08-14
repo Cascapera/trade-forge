@@ -265,3 +265,59 @@ def test_the_page_reports_a_total_that_survives_paging(
     assert page["limit"] == 2
     assert page["offset"] == 2
     assert len(page["items"]) == 2
+
+
+def test_an_exact_name_can_be_asked_about_separately_from_a_search(
+    session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+) -> None:
+    """⚠️ The builder's question is "is *this* name taken", which a substring cannot answer.
+
+    Three names where one contains another: searching `MME9` finds all three, and only the
+    exact lookup answers the question the builder is actually asking. Without this the screen
+    would have to filter in the client and hope the match landed on the first page — the same
+    shape of guess that produces the 409 this endpoint exists to remove.
+
+    ⚠️ The exact lookup also has to see a **grid's own points**, which the default listing
+    hides. A name colliding with one of those collides just as hard in the database, and a
+    builder told the name was free would meet the 409 it was trying to avoid.
+    """
+    with TestClient(_app(settings, session_factory, tmp_path)) as client:
+        _create(client, "MME9")
+        _create(client, "MME9 breakout")
+        _create(client, "MME9 breakout H4")
+
+        search = client.get("/strategies", params={"q": "MME9"}).json()
+        exact = client.get("/strategies", params={"name": "MME9 breakout"}).json()
+        free = client.get("/strategies", params={"name": "Never used"}).json()
+
+    assert search["total"] == 3
+    assert [item["name"] for item in exact["items"]] == ["MME9 breakout"]
+    assert free["total"] == 0
+
+
+def test_the_exact_lookup_finds_a_name_a_grid_generated(
+    session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+) -> None:
+    """A point's name is taken in the database whether or not a picker chooses to show it.
+
+    So the exact lookup asks with `include_generated`, and this pins that: hidden from the list
+    is not the same as free to reuse, and conflating them puts the 409 back.
+    """
+    seeding = session_factory()
+    _seed_instrument(seeding)
+    seeding.close()
+
+    with TestClient(_app(settings, session_factory, tmp_path)) as client:
+        base = _create(client, "MME9 base")
+        _launch_study(client, base)
+
+        hidden = client.get("/strategies", params={"name": "MME9 base [period=5]"}).json()
+        shown = client.get(
+            "/strategies",
+            params={"name": "MME9 base [period=5]", "include_generated": True},
+        ).json()
+
+    # Hidden by default, exactly as the picker wants…
+    assert hidden["total"] == 0
+    # …and findable when asked, which is what keeps a name from being offered twice.
+    assert [item["name"] for item in shown["items"]] == ["MME9 base [period=5]"]

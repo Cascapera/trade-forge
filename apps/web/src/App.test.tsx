@@ -22,9 +22,17 @@ describe('App', () => {
 
   it('routes to the basket launcher', () => {
     renderWithProviders(<App />, '/basket')
-    // No strategy in the session yet, so the screen asks for one — which is enough to prove the
-    // route resolves to it rather than falling through to the catch-all redirect.
-    expect(screen.getByText(/build and run a strategy first/i)).toBeInTheDocument()
+    // Its own heading, which is enough to prove the route resolves to this screen rather than
+    // falling through to the catch-all redirect. It used to assert the "build a strategy first"
+    // message, and that stopped being a fact about the route when the screen learned to offer
+    // the strategies that already exist.
+    expect(screen.getByRole('heading', { name: /Basket of/ })).toBeInTheDocument()
+  })
+
+  it('routes to the study launcher', () => {
+    renderWithProviders(<App />, '/study')
+
+    expect(screen.getByRole('heading', { name: 'Parameter study' })).toBeInTheDocument()
   })
 
   it('offers no link back to a basket until one has been launched', () => {

@@ -91,9 +91,12 @@ _MAX_OFFSET = 9_223_372_036_854_775_807
 
 
 @router.get("/strategies", response_model=StrategiesPage)
-def list_strategies(
+def list_strategies(  # noqa: PLR0913 — one query parameter per question a picker asks
     session: SessionDep,
     q: Annotated[str | None, Query(description="case-insensitive substring of the name")] = None,
+    name: Annotated[
+        str | None, Query(description="exact name, for asking whether one is taken")
+    ] = None,
     include_generated: Annotated[bool, Query(description="include a grid's own points")] = False,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     offset: Annotated[int, Query(ge=0, le=_MAX_OFFSET)] = 0,
@@ -138,6 +141,12 @@ def list_strategies(
         newest = newest.where(Strategy.id.not_in(generated))
     if q is not None and q.strip() != "":
         newest = newest.where(Strategy.name.ilike(f"%{q.strip()}%"))
+    # ⚠️ Exact, and separate from `q` rather than a mode of it. The builder's question is "is
+    # this name taken?", and answering it with a substring search means filtering in the client
+    # and hoping the match landed on the first page — which is the same shape of guess that
+    # produces the 409 this endpoint exists to remove.
+    if name is not None:
+        newest = newest.where(Strategy.name == name)
 
     lineages = newest.subquery()
     rows = session.execute(

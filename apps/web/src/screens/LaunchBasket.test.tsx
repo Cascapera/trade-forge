@@ -22,6 +22,9 @@ vi.mock('../api/hooks', () => ({
     ],
   }),
   useCreateBasket: () => ({ mutate, isPending: false, ...state }),
+  // The strategy picker asks the server what exists. Empty here: these tests are about the
+  // basket's own rules, and the picker has its own test.
+  useStrategies: () => ({ data: { total: 0, limit: 200, offset: 0, items: [] }, isPending: false }),
 }))
 
 import { LaunchBasket } from './LaunchBasket'
@@ -41,9 +44,15 @@ afterEach(() => {
 })
 
 describe('LaunchBasket', () => {
-  it('asks the user to build a strategy first when none is selected', () => {
+  it('says a strategy has to be chosen rather than refusing to open at all', () => {
+    // ⚠️ This screen used to render nothing but "build and run a strategy first" whenever the
+    // store was empty — which a reload made true, for a database holding forty-five strategies.
+    // Now the form is there and one field is missing, which is an ordinary thing for a form.
     renderWithProviders(<LaunchBasket />)
-    expect(screen.getByText(/build and run a strategy first/i)).toBeInTheDocument()
+
+    expect(screen.getByText(/Before running: choose a strategy/)).toBeInTheDocument()
+    expect(screen.getByLabelText(/Strategy/)).toBeInTheDocument()
+    expect(screen.queryByText(/build and run a strategy first/i)).not.toBeInTheDocument()
   })
 
   it('refuses a basket of one market, saying why rather than disabling in silence', () => {

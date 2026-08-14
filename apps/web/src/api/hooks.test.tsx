@@ -13,6 +13,8 @@ vi.mock('./client', () => ({
     createBacktest: vi.fn(),
     createBasket: vi.fn(),
     getBasket: vi.fn(),
+    listStrategies: vi.fn(),
+    updateStrategy: vi.fn(),
   },
 }))
 
@@ -27,6 +29,7 @@ import {
   useBacktests,
   useCreateBacktest,
   useCreateStrategy,
+  useSaveStrategy,
   useEquity,
   useEquityCurves,
   useInstruments,
@@ -301,6 +304,87 @@ describe('mutations', () => {
     })
     await waitFor(() => {
       expect(backtest.result.current.data).toEqual({ id: 'b1', status: 'queued' })
+    })
+  })
+})
+
+// --------------------------------------------------------------------------- #
+// `useSaveStrategy` — the 409's actual cause, and its fix                       #
+// --------------------------------------------------------------------------- #
+
+function page(items: { id: string; name: string }[]) {
+  return {
+    total: items.length,
+    limit: 50,
+    offset: 0,
+    items: items.map((item) => ({
+      ...item,
+      version: 1,
+      schema_version: '1.0',
+      setup: 'mme9_breakout',
+      runs: 0,
+      created_at: '2024-01-01T00:00:00Z',
+    })),
+  }
+}
+
+const document = { schema_version: '1.0', name: 'MME9' } as unknown as Parameters<
+  ReturnType<typeof useSaveStrategy>['mutate']
+>[0]['definition']
+
+describe('useSaveStrategy', () => {
+  it('creates a lineage when the name is free', async () => {
+    vi.mocked(api.listStrategies).mockResolvedValue(page([]))
+    vi.mocked(api.createStrategy).mockResolvedValue({ id: 'new' } as never)
+
+    const { result } = renderHook(() => useSaveStrategy(), { wrapper: makeWrapper() })
+    act(() => {
+      result.current.mutate({ definition: document })
+    })
+
+    await waitFor(() => {
+      expect(api.createStrategy).toHaveBeenCalledWith(document)
+    })
+    expect(api.updateStrategy).not.toHaveBeenCalled()
+  })
+
+  it('adds a version when the name is taken, whoever took it', async () => {
+    // ⚠️ **This is the 409.** The old rule compared the typed name against the one *this tab*
+    // had created, so a strategy saved in another tab — or before a reload — was invisible, and
+    // saving under its name was a `POST` onto a name that already had a version 1. Nothing
+    // about this test involves the session store, because nothing about the decision does any
+    // more.
+    vi.mocked(api.listStrategies).mockResolvedValue(page([{ id: 'from-another-tab', name: 'MME9' }]))
+    vi.mocked(api.updateStrategy).mockResolvedValue({ id: 'v2' } as never)
+
+    const { result } = renderHook(() => useSaveStrategy(), { wrapper: makeWrapper() })
+    act(() => {
+      result.current.mutate({ definition: document })
+    })
+
+    await waitFor(() => {
+      expect(api.updateStrategy).toHaveBeenCalledWith('from-another-tab', document)
+    })
+    expect(api.createStrategy).not.toHaveBeenCalled()
+  })
+
+  it('asks about generated names too, because hidden is not free', async () => {
+    // A grid's points are left out of the picker, but their names are taken in the database
+    // just as hard. A lookup that inherited the picker's default would report a name as free
+    // and put the 409 straight back for exactly those names.
+    vi.mocked(api.listStrategies).mockResolvedValue(page([]))
+    vi.mocked(api.createStrategy).mockResolvedValue({ id: 'new' } as never)
+
+    const { result } = renderHook(() => useSaveStrategy(), { wrapper: makeWrapper() })
+    act(() => {
+      result.current.mutate({ definition: document })
+    })
+
+    await waitFor(() => {
+      expect(api.listStrategies).toHaveBeenCalledWith({
+        name: 'MME9',
+        include_generated: true,
+      })
     })
   })
 })

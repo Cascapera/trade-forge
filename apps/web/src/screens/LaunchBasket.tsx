@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { Link, useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router-dom'
 
 import { useCreateBasket, useInstruments } from '../api/hooks'
 import {
@@ -12,6 +12,7 @@ import {
   whyNotLaunchable,
   type BasketForm,
 } from '../basket/settings'
+import { StrategyPicker } from '../components/StrategyPicker'
 import { SymbolPicker } from '../components/SymbolPicker'
 import { useSession } from '../store'
 import { TIMEFRAMES } from '../strategy/builder'
@@ -36,6 +37,7 @@ export function LaunchBasket(): React.JSX.Element {
   const strategyId = useSession((state) => state.strategyId)
   const strategyName = useSession((state) => state.strategyName)
   const setBasket = useSession((state) => state.setBasket)
+  const setStrategy = useSession((state) => state.setStrategy)
   const instruments = useInstruments()
   const create = useCreateBasket()
   const navigate = useNavigate()
@@ -43,22 +45,14 @@ export function LaunchBasket(): React.JSX.Element {
   const [form, setForm] = useState<BasketForm>(emptyBasketForm)
   const [timeframe, setTimeframe] = useState('H1')
 
-  if (strategyId === null || strategyName === null) {
-    return (
-      <p className="text-sm text-slate-300">
-        Build and run a strategy first.{' '}
-        <Link to="/" className="text-sky-400 hover:text-sky-300">
-          Go to the builder
-        </Link>
-        .
-      </p>
-    )
-  }
-
-  const blocked = whyNotLaunchable(form)
+  // ⚠️ This screen used to refuse to open unless a strategy had been created since the last
+  // reload, because there was no way to ask the server what existed — for a database holding
+  // forty-five of them. The picker is what `GET /strategies` was missing for.
+  const blocked = strategyId === null ? 'choose a strategy' : whyNotLaunchable(form)
   const uncosted = uncostedAmong(form.symbols, instruments.data)
 
   const launch = (): void => {
+    if (strategyId === null || strategyName === null) return
     create.mutate(toBasketRequest(form, strategyId, timeframe), {
       onSuccess: (created) => {
         setBasket(created.id, basketLabel(strategyName, created.runs.length))
@@ -71,12 +65,19 @@ export function LaunchBasket(): React.JSX.Element {
     <div className="space-y-6">
       <div>
         <h2 className="text-xl font-semibold">
-          Basket of <span className="text-sky-400">{strategyName}</span>
+          Basket of <span className="text-sky-400">{strategyName ?? 'a strategy'}</span>
         </h2>
         <p className="text-sm text-slate-400">
           One strategy, several markets, one run each — to see whether it travels.
         </p>
       </div>
+
+      <StrategyPicker
+        value={strategyId ?? ''}
+        onChange={(id, name) => {
+          setStrategy(id, name)
+        }}
+      />
 
       <div className="space-y-4 rounded-lg border border-slate-800 bg-slate-900/40 p-4">
         <SymbolPicker

@@ -1,7 +1,8 @@
 import { useState } from 'react'
-import { Link, useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router-dom'
 
 import { useCreateStudy, useInstruments } from '../api/hooks'
+import { StrategyPicker } from '../components/StrategyPicker'
 import { useSession } from '../store'
 import { TIMEFRAMES } from '../strategy/builder'
 import {
@@ -31,27 +32,16 @@ const inputClass =
  */
 export function LaunchStudy(): React.JSX.Element {
   const strategyId = useSession((state) => state.strategyId)
-  const strategyName = useSession((state) => state.strategyName)
   const setStudy = useSession((state) => state.setStudy)
+  const setStrategy = useSession((state) => state.setStrategy)
   const instruments = useInstruments()
   const create = useCreateStudy()
   const navigate = useNavigate()
 
   const [form, setForm] = useState<StudyForm>(emptyStudyForm)
 
-  if (strategyId === null || strategyName === null) {
-    return (
-      <p className="text-sm text-slate-300">
-        Build and run a strategy first.{' '}
-        <Link to="/" className="text-sky-400 hover:text-sky-300">
-          Go to the builder
-        </Link>
-        .
-      </p>
-    )
-  }
 
-  const blocked = whyNotLaunchable(form)
+  const blocked = strategyId === null ? 'Choose a strategy.' : whyNotLaunchable(form)
   const total = combinationCount(form)
 
   const set = (patch: Partial<StudyForm>) => {
@@ -69,8 +59,8 @@ export function LaunchStudy(): React.JSX.Element {
       <header>
         <h2 className="text-lg font-semibold text-slate-100">Parameter study</h2>
         <p className="mt-1 text-sm text-slate-400">
-          Run <span className="text-slate-200">{strategyName}</span> once for every combination of
-          the parameters below, over one market.
+          Run a saved strategy once for every combination of the parameters below, over one
+          market.
         </p>
       </header>
 
@@ -78,7 +68,7 @@ export function LaunchStudy(): React.JSX.Element {
         className="space-y-4"
         onSubmit={(event) => {
           event.preventDefault()
-          if (blocked !== null) return
+          if (blocked !== null || strategyId === null) return
           create.mutate(toStudyRequest(form, strategyId), {
             onSuccess: (created) => {
               setStudy(created.id, studyLabel(form))
@@ -88,6 +78,15 @@ export function LaunchStudy(): React.JSX.Element {
         }}
       >
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          {/* ⚠️ Chosen from what the server has, not from what this tab remembers. Before the
+              strategy listing existed this screen simply refused to open unless you had built
+              something since the last reload — with forty-five strategies in the database. */}
+          <StrategyPicker
+            value={strategyId ?? ''}
+            onChange={(id, name) => {
+              setStrategy(id, name)
+            }}
+          />
           <label className="flex flex-col gap-1 text-sm text-slate-300">
             Market
             <select

@@ -389,7 +389,7 @@ class ZoneOut(BaseModel):
     Three instants, none interchangeable. `from_time` is where the rectangle begins — the candle
     before the gap, routinely far older than the break that revealed it. `confirmed_at` is when a
     strategy could first act on it; on this project's own data the gap between the two runs to a
-    median of twenty bars, so collapsing them would redraw most regions as much younger than they
+    median of 8 bars, so collapsing them would redraw most regions as much younger than they
     are. `mitigated_at` is the bar whose wick took the region, and `null` means it was still
     standing when the run ended — a chart extends that one to its own right edge rather than
     closing it somewhere invented.

@@ -333,8 +333,11 @@ class ZoneMark:
       rectangle begins, and it is routinely far older than the break that revealed it.
     * `confirmed_at` — the bar whose close broke structure and made the region *visible*. A
       strategy may only act from here. The stretch between the two is time price spent working
-      a zone nothing yet knew was one, and it is a median of sixteen bars on this project's own
-      data — long enough that collapsing the two would redraw most regions as much younger.
+      a zone nothing yet knew was one: a median of **8 bars** over this project's 124 regions
+      on real AAPL H1 data — long enough that collapsing the two would redraw most regions as
+      much younger. ⚠️ The **mean** is 16 and the longest is 160, so quoting an average here
+      would describe a typical region as twice its real age; the distribution has a long tail
+      and the median is the honest summary of it.
     * `mitigated_at` — the bar that took it, or `None` for a region price never came back to.
       `None` is not "unknown": it is a region still standing when the run ended, and a chart
       extends it to its own right edge.

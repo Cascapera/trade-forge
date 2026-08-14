@@ -10,13 +10,16 @@ import type {
   CandlesResponse,
   CreateBacktestRequest,
   CreateBasketRequest,
+  CreateStudyRequest,
   CreatedBacktest,
   CreatedBasket,
+  CreatedStudy,
   EquityPoint,
   Instrument,
   OverlaysResponse,
   Snapshot,
   StrategyOut,
+  StudyOut,
   TradesPage,
 } from './types'
 
@@ -104,4 +107,7 @@ export const api = {
   createBasket: (payload: CreateBasketRequest): Promise<CreatedBasket> =>
     request('POST', '/baskets', payload),
   getBasket: (id: string): Promise<BasketOut> => request('GET', `/baskets/${id}`),
+  createStudy: (payload: CreateStudyRequest): Promise<CreatedStudy> =>
+    request('POST', '/studies', payload),
+  getStudy: (id: string): Promise<StudyOut> => request('GET', `/studies/${id}`),
 }

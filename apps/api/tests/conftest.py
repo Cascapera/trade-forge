@@ -20,6 +20,11 @@ TABLES_CHILD_FIRST = (
     "backtest_metrics",
     "backtests",
     "baskets",
+    # Named rather than left to the CASCADE that would reach it from `strategies` anyway. A
+    # tuple whose name says "child first" and which in practice relies on a cascade is one that
+    # breaks the day the cascade changes — and it breaks as a test leaving rows behind for the
+    # next one, which is the hardest kind of failure to attribute.
+    "studies",
     "strategies",
     "datasets",
     "instruments",

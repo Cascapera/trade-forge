@@ -373,6 +373,75 @@ class Basket(Base):
     )
 
 
+class Study(Base):
+    """One strategy launched over a grid of its own parameters, to see the shape of the result.
+
+    The sibling of `Basket`, and the pair is the point: a basket varies the **market** and
+    holds the parameters still; a study varies the **parameters** and holds the market still.
+    Both exist because one number from one run cannot tell a method apart from a lucky corner,
+    and they attack that from the two directions available.
+
+    **It groups runs; it is not a run.** Each point of the grid executes as its own `Backtest`
+    against its own stored `Strategy` — so a run still answers "what did I execute?" by
+    pointing at one immutable document, exactly as every other run in the system does. The
+    alternative, one strategy plus a per-run override, would put that answer in two places
+    joined by merge logic, and nothing would raise the day they disagreed.
+
+    ⚠️ **What this table cannot do, and it is the reason the next PR exists.** A grid finds the
+    best point *in the data it searched*. That is not a prediction; it is a description, and
+    the wider the grid the more of it is description of noise. Reading the maximum of a
+    hundred runs as "the parameters to trade" is the central mistake this whole feature makes
+    easy, which is why the read side reports dispersion beside the best point and says the
+    best point is in-sample. Walk-forward (PR-204) is what turns a study into evidence: train
+    on one window, *test* on the next, and see whether the choice survives being made blind.
+
+    No `cost_model` column, and the absence is deliberate — same as `Basket`. The concrete
+    model lands on each `Backtest` row, which is what keeps every point independently
+    reproducible. Here the points do share one model by construction, since they are written
+    in a single transaction from a single request; storing it twice would create a second
+    place for it to be true.
+    """
+
+    __tablename__ = "studies"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+
+    strategy_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("strategies.id", ondelete="RESTRICT"), nullable=False
+    )
+    instrument_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("instruments.id", ondelete="RESTRICT"), nullable=False
+    )
+    timeframe: Mapped[str] = mapped_column(TIMEFRAME, nullable=False)
+
+    date_from: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    date_to: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    initial_capital: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+
+    grid: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    """The axes as declared: `{"setup.params.period": [5, 9, 20], ...}`, in order.
+
+    Kept because it is **not recoverable from the runs**. Each point's values survive as text
+    inside its strategy's name, and reading a heatmap's axes back out of parsed names is the
+    kind of reconstruction that works right up until a value contains a comma.
+    """
+
+    created_at: Mapped[dt.datetime] = _created_at()
+
+    backtests: Mapped[list[Backtest]] = relationship(back_populates="study", passive_deletes="all")
+
+    __table_args__ = (
+        _timeframe_check(),
+        CheckConstraint("date_to >= date_from", name="date_range"),
+        CheckConstraint("initial_capital > 0", name="initial_capital_positive"),
+        # A study that varies nothing is a backtest. Enforced here as well as in the router
+        # because a row with an empty grid claims an experiment and describes none.
+        CheckConstraint(
+            "jsonb_typeof(grid) = 'object' AND grid <> '{}'::jsonb", name="grid_not_empty"
+        ),
+    )
+
+
 class Backtest(Base):
     """One run of one strategy version over one instrument and period.
 
@@ -404,6 +473,15 @@ class Backtest(Base):
         ForeignKey("baskets.id", ondelete="SET NULL"), index=True
     )
     basket: Mapped[Basket | None] = relationship(back_populates="backtests")
+
+    # The other grouping, on the same terms. A run belongs to no study unless a grid produced
+    # it, and the two columns are independent: a run carrying both would be one point of a
+    # grid that was also launched across markets, which is a coherent thing to want rather
+    # than a state to forbid.
+    study_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("studies.id", ondelete="SET NULL"), index=True
+    )
+    study: Mapped[Study | None] = relationship(back_populates="backtests")
 
     timeframe: Mapped[str] = mapped_column(TIMEFRAME, nullable=False)
 

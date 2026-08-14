@@ -31,6 +31,7 @@ EXPECTED_TABLES = {
     "datasets",
     "strategies",
     "baskets",
+    "studies",
     "backtests",
     "backtest_metrics",
     "trades",
@@ -43,6 +44,12 @@ MONETARY_COLUMNS = {
     ("instruments", "tick_value"),
     ("instruments", "contract_size"),
     ("backtests", "initial_capital"),
+    # The two groupings carry the capital their runs are launched with. `baskets` was missing
+    # here since it was added — caught while adding `studies`, and worth closing rather than
+    # matching: this list is the specific check that a money column is an exact decimal of the
+    # right scale, and a rule this file calls absolute cannot have two rows exempt from it.
+    ("baskets", "initial_capital"),
+    ("studies", "initial_capital"),
     ("backtest_metrics", "net_profit"),
     ("backtest_metrics", "gross_profit"),
     ("backtest_metrics", "gross_loss"),

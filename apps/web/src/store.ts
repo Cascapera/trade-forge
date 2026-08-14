@@ -19,6 +19,10 @@ interface SessionState {
   basketId: string | null
   basketLabel: string | null
   setBasket: (id: string, label: string) => void
+  /** The study launched most recently, on exactly the same terms as the basket above. */
+  studyId: string | null
+  studyLabel: string | null
+  setStudy: (id: string, label: string) => void
   clear: () => void
 }
 
@@ -27,13 +31,25 @@ export const useSession = create<SessionState>((set) => ({
   strategyName: null,
   basketId: null,
   basketLabel: null,
+  studyId: null,
+  studyLabel: null,
   setStrategy: (id, name) => {
     set({ strategyId: id, strategyName: name })
   },
   setBasket: (id, label) => {
     set({ basketId: id, basketLabel: label })
   },
+  setStudy: (id, label) => {
+    set({ studyId: id, studyLabel: label })
+  },
   clear: () => {
-    set({ strategyId: null, strategyName: null, basketId: null, basketLabel: null })
+    set({
+      strategyId: null,
+      strategyName: null,
+      basketId: null,
+      basketLabel: null,
+      studyId: null,
+      studyLabel: null,
+    })
   },
 }))

@@ -75,6 +75,42 @@ class StrategyOut(_Out):
     created_at: dt.datetime
 
 
+class StrategyListItem(_Out):
+    """One row of the strategy picker: enough to choose between lineages without opening any.
+
+    Deliberately **not** `StrategyOut`, which carries the whole DSL document. A picker renders
+    forty-five of these and reads none of the documents; shipping them would send megabytes of
+    JSONB to draw a list of names.
+
+    `runs` is here because it is what tells a real strategy from an experiment somebody typed
+    once and abandoned — the reader scanning this list is looking for the one they have been
+    working on, and how often it has been executed says that better than a date does.
+    """
+
+    id: uuid.UUID
+    name: str
+    version: int
+    """The **latest** version of this lineage; the id above is that version's row."""
+
+    schema_version: str
+    setup: str | None
+    """The named setup this strategy runs (`mme9_breakout`, `structure_choch`), or null for a
+    DSL document built from indicators and conditions. It is what a reader recognises a
+    strategy by, and every strategy in this project's database has one."""
+
+    runs: int
+    created_at: dt.datetime
+
+
+class StrategiesPage(BaseModel):
+    """A page of lineages. `total` lets a client size the pager without walking every page."""
+
+    total: int
+    limit: int
+    offset: int
+    items: list[StrategyListItem]
+
+
 class InstrumentOut(_Out):
     """A tradable symbol and the numbers that price a position in it."""
 

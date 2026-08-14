@@ -456,8 +456,12 @@ class Backtest(Base):
 
     id: Mapped[uuid.UUID] = _uuid_pk()
 
+    # Indexed, because Postgres does not index a foreign key for you — only the referenced
+    # side gets one, from its primary key. "Which runs used this strategy?" is what the
+    # strategy listing asks to leave out the strategies a grid generated, and without this it
+    # is a sequential scan of every run ever made, once per strategy.
     strategy_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("strategies.id", ondelete="RESTRICT"), nullable=False
+        ForeignKey("strategies.id", ondelete="RESTRICT"), nullable=False, index=True
     )
     instrument_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("instruments.id", ondelete="RESTRICT"), nullable=False

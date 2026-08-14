@@ -1,4 +1,5 @@
 import { useStrategies } from '../api/hooks'
+import type { StrategyListItem } from '../api/types'
 import { count } from '../format'
 
 /**
@@ -18,7 +19,9 @@ import { count } from '../format'
  */
 export function StrategyPicker(props: {
   value: string
-  onChange: (id: string, name: string) => void
+  /** The chosen row, not just its id: a caller that needs the setup would otherwise have to
+   * fetch the list a second time to find out what it just picked. */
+  onChange: (chosen: StrategyListItem) => void
   label?: string
 }): React.JSX.Element {
   // The whole list in one request: forty-five rows is not a paging problem, and a picker that
@@ -34,7 +37,7 @@ export function StrategyPicker(props: {
         value={props.value}
         onChange={(event) => {
           const chosen = items.find((item) => item.id === event.target.value)
-          if (chosen !== undefined) props.onChange(chosen.id, chosen.name)
+          if (chosen !== undefined) props.onChange(chosen)
         }}
       >
         <option value="">

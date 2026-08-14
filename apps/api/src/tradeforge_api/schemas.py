@@ -558,3 +558,138 @@ class BasketOut(_Out):
 
     aggregate: BasketAggregate
     runs: list[BacktestListItem]
+
+
+class CreateStudyRequest(BaseModel):
+    """Launch one strategy over a grid of its own parameters, one run per combination.
+
+    The mirror of `CreateBasketRequest`: that one lists **symbols** and holds the parameters
+    still, this one lists **parameter values** and holds the symbol still. Holding the market
+    still is what makes the points comparable to each other at all.
+
+    `cost_model` is taken from the request, exactly as `POST /backtests` takes it, because a
+    study is N of those over one instrument — one market, so one cost, and no reason for a
+    second rule. (A basket resolves costs per instrument only because it spans several.)
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    strategy_id: uuid.UUID
+    symbol: str
+    timeframe: str
+    date_from: dt.datetime
+    date_to: dt.datetime
+    initial_capital: Decimal = Field(gt=0)
+    cost_model: dict[str, Any] = Field(default_factory=lambda: {"type": "none"})
+
+    grid: dict[str, list[Any]] = Field(min_length=1)
+    """Paths into the strategy document, and the values to try at each.
+
+    `{"setup.params.period": [5, 9, 20], "setup.params.take_profit_rr": [2, 3]}` expands to
+    six runs. Dotted paths, with a numeric segment indexing a list, so a DSL strategy's first
+    indicator is `indicators.0.params.period`.
+
+    Only the emptiness is checked here; everything else is `grid.expand`'s, because the answers
+    depend on the document being varied. ⚠️ In particular a path this strategy has *nothing* at
+    is refused there rather than tolerated — substituting at one would add a parameter nothing
+    reads, and the study would run N identical backtests and draw a flat heatmap that looks
+    like a finding about the market.
+    """
+
+
+class StudyPointOut(_Out):
+    """One combination: the run it became, and the strategy that was stored for it."""
+
+    backtest_id: uuid.UUID
+    strategy_id: uuid.UUID
+    label: str
+    """`period=9, take_profit_rr=3` — what makes this point different from the others."""
+
+    values: dict[str, Any]
+    """The same thing keyed by full path, for a client that lays out an axis rather than
+    printing a caption. The label is for people; this is for the heatmap."""
+
+    status: str
+
+
+class CreatedStudy(_Out):
+    """The 202 body: the study exists, and every point of the grid is queued."""
+
+    id: uuid.UUID
+    points: list[StudyPointOut]
+
+
+class StudyAggregate(BaseModel):
+    """What a grid says once its runs finish — **dispersion, and never the maximum alone.**
+
+    ⚠️ **The most important thing in this schema is what the headline is not.** A grid always
+    has a best point; a grid of pure noise has a best point. Reporting that number on its own
+    is how an optimiser becomes a machine for producing convincing false results, and the wider
+    the grid the more convincing they get — searching a hundred parameter sets and keeping the
+    winner is, statistically, mostly a search for the luckiest arrangement of the same noise.
+
+    So the honest summary is here in three parts, and they answer different questions:
+
+    * `median_return` — what a parameter set picked *without* hindsight would have returned.
+      This is the closest thing to "does the method work", and it is the number to read first.
+    * `points_profitable` out of `points_finished` — how much of the searched space works at
+      all. Ninety out of a hundred is a property of the method; three out of a hundred is a
+      corner, whatever the best of those three returned.
+    * `best_return` beside `worst_return` — the range, so the best is read as one end of a
+      spread rather than as a result.
+
+    **Every figure here is in-sample**, including the best one: these runs were scored on the
+    same data the grid was searched over, so nothing in this response is evidence that the
+    winning parameters will work next month. Walk-forward (PR-204) is the experiment that can
+    say that — choose on one window, measure on the *next*, and see whether the choice survives
+    being made blind. Until then, this is a description of a past, not a prediction.
+
+    No summed curve, for the same reason a basket has none: every point starts with the whole
+    `initial_capital`, so the runs cannot be added up.
+    """
+
+    points_total: int
+    points_finished: int
+    points_failed: int
+    points_profitable: int
+
+    best_label: str | None
+    best_return: Money | None
+    worst_label: str | None
+    worst_return: Money | None
+    median_return: Money | None
+    """All four are null until at least one run finishes. Null is "nothing has landed yet",
+    never zero — zero would be a measured result of no profit."""
+
+
+class StudyOut(_Out):
+    """A study read back: how it was launched, the grid it searched, and where it landed."""
+
+    id: uuid.UUID
+    strategy_id: uuid.UUID
+    strategy_name: str
+    """The **base** strategy's name — the lineage the grid was built from. Each point has its
+    own stored strategy, named for its own values; those names are on the runs."""
+
+    symbol: str
+    timeframe: str
+    date_from: dt.datetime
+    date_to: dt.datetime
+    initial_capital: Money
+    created_at: dt.datetime
+
+    grid: dict[str, list[Any]]
+    """As declared, in order. Served because it is **not recoverable from the runs**: each
+    point's values survive only as text inside its strategy's name, and a client laying out a
+    heatmap's axes needs the axes, not a parse of captions."""
+
+    points: list[StudyPointOut]
+    """Each run's coordinates on the grid, read back out of the document that ran.
+
+    Parallel to `runs` and in the same order, but it is `points` a heatmap should place cells
+    from — a client that derived coordinates by parsing `strategy_name` would be splitting a
+    caption on commas and equals signs, and that works until a value contains one.
+    """
+
+    aggregate: StudyAggregate
+    runs: list[BacktestListItem]

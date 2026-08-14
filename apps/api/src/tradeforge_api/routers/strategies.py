@@ -35,7 +35,7 @@ _CONFLICT: _Responses = {status.HTTP_409_CONFLICT: {"description": "this name an
 _BAD_BODY: _Responses = {status.HTTP_400_BAD_REQUEST: {"description": "malformed request body"}}
 
 
-def _validate(document: dict[str, Any]) -> None:
+def validate_document(document: dict[str, Any]) -> None:
     """Run the DSL's shape and meaning checks, turning either failure into a 422 the client can
     read. `json.loads(exc.json())` is used because a raw `ValidationError.errors()` can carry
     exception objects that will not serialise."""
@@ -79,7 +79,7 @@ def _persist(session: SessionDep, strategy: Strategy) -> Strategy:
 )
 def create_strategy(document: dict[str, Any], session: SessionDep) -> Strategy:
     """The first version of a strategy. Validated, then stored verbatim."""
-    _validate(document)
+    validate_document(document)
     return _persist(session, Strategy(definition=document, version=1))
 
 
@@ -104,7 +104,7 @@ def update_strategy(
     parent = session.get(Strategy, strategy_id)
     if parent is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="strategy not found")
-    _validate(document)
+    validate_document(document)
     successor = Strategy(
         definition=document, version=parent.version + 1, parent_version_id=parent.id
     )

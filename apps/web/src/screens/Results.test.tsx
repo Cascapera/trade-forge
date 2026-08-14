@@ -115,7 +115,7 @@ beforeEach(() => {
   mockedTrades.mockReturnValue({ data: { total: 0, limit: 100, offset: 0, items: [] } } as never)
   mockedEquity.mockReturnValue({ data: [] } as never)
   mockedCandles.mockReturnValue({ data: candles(), isPending: false, isError: false } as never)
-  mockedOverlays.mockReturnValue({ data: { symbol: 'AAPL', timeframe: 'H1', candles_seen: 3, count: 3, series: [] } } as never)
+  mockedOverlays.mockReturnValue({ data: { symbol: 'AAPL', timeframe: 'H1', candles_seen: 3, count: 3, series: [], zones: [] } } as never)
 })
 
 afterEach(() => {

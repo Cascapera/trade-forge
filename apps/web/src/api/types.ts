@@ -254,6 +254,26 @@ export interface OverlaySeries {
   points: [string, string][]
 }
 
+/**
+ * One region over the whole run, with both ends of its life.
+ *
+ * Three instants, none interchangeable. `from_time` is where the rectangle begins — the candle
+ * before the gap, routinely far older than the break that revealed it. `confirmed_at` is when a
+ * strategy could first act on it; the two are a median of twenty bars apart on real data, so
+ * collapsing them draws most regions much younger than they are. `mitigated_at` is the bar whose
+ * wick took the region, and `null` means it was still standing when the run ended — extend that
+ * one to the chart's right edge rather than closing it somewhere invented.
+ */
+export interface Zone {
+  kind: 'demand' | 'supply'
+  top: string
+  bottom: string
+  from_time: string
+  confirmed_at: string
+  mitigated_at: string | null
+  primary: boolean
+}
+
 /** Every curve the run's strategy was reading. Empty for a setup whose overlay is zones. */
 export interface OverlaysResponse {
   symbol: string
@@ -266,6 +286,9 @@ export interface OverlaysResponse {
   candles_seen: number
   count: number
   series: OverlaySeries[]
+  /** Empty for the swing setups, which read a curve and mark no zones. The two halves are
+   * independent: having one says nothing about whether a strategy has the other. */
+  zones: Zone[]
 }
 
 export interface TradesPage {

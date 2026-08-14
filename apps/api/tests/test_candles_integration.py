@@ -28,7 +28,7 @@ from tradeforge_db.models import Backtest, BacktestStatus, Instrument
 from tradeforge_engine.domain import AssetClass, Candle
 from tradeforge_engine.indicators import EMA
 from tradeforge_engine.loop import ENGINE_CONTEXT
-from tradeforge_engine.testing import bar
+from tradeforge_engine.testing import BULLISH_START, GAPPING_IMPULSE, bar
 
 pytestmark = pytest.mark.integration
 
@@ -347,7 +347,9 @@ def _setup_strategy() -> dict[str, Any]:
     }
 
 
-def _launch_with(client: TestClient, document: dict[str, Any]) -> str:
+def _launch_with(
+    client: TestClient, document: dict[str, Any], *, date_from: dt.datetime = START
+) -> str:
     created = client.post("/strategies", json=document)
     assert created.status_code == 201, created.text
     enqueued = client.post(
@@ -356,7 +358,7 @@ def _launch_with(client: TestClient, document: dict[str, Any]) -> str:
             "strategy_id": created.json()["id"],
             "symbol": "EURUSD",
             "timeframe": "H1",
-            "date_from": START.isoformat(),
+            "date_from": date_from.isoformat(),
             "date_to": (START + 100 * HOUR).isoformat(),
             "initial_capital": "10000",
             "cost_model": {"type": "none"},
@@ -579,3 +581,192 @@ def test_the_two_provenance_numbers_are_reported_when_they_disagree(
     # And the overlay reports the same disagreement, over the same window.
     assert overlays["candles_seen"] == candles["candles_seen"]
     assert overlays["count"] == candles["count"]
+
+
+# --------------------------------------------------------------------------- #
+# `/overlays` — the regions the strategy marked                                 #
+# --------------------------------------------------------------------------- #
+
+_TAKES_THE_SECONDARY = [
+    bar(10, open_="123", close="121", high="124", low="120"),
+    bar(11, open_="121", close="119", high="122", low="118"),
+    bar(12, open_="119", close="118", high="120", low="116"),  # low 116 <= 117 -> takes it
+    bar(13, open_="118", close="119", high="120", low="117"),
+    bar(14, open_="119", close="120", high="121", low="118"),
+    bar(15, open_="120", close="119", high="121", low="115"),  # a SECOND visit, deeper
+    bar(16, open_="119", close="120", high="121", low="118"),
+]
+"""A pullback that reaches one region's entry edge and stops clear of the other.
+
+`GAPPING_IMPULSE` leaves both its regions standing, which is only half of what a chart has to
+draw. These bars dip to 116, under the secondary's top of 117 and nowhere near the primary's 100 —
+so the same run serves one taken region and one still standing, and the two `mitigated_at` values
+can be told apart within a single response.
+
+⚠️ **Bar 15 goes deeper than bar 12, and that is the point of it.** The engine folds `mitigated`
+forward with `or`, so a stamp written on the condition rather than on the transition would keep
+being overwritten and land on 15. Verified by mutation: with `if reached:` in `_advance`, the
+served `mitigated_at` moves from bar 12 to bar 15 and this file goes red. Without a second visit
+the two implementations are indistinguishable here.
+
+Probed before it was written, never derived on paper: driven through the real setup these bars add
+**no** region of their own, so the scenario stays two zones wide and legible.
+"""
+
+
+def _structure_strategy() -> dict[str, Any]:
+    """A CHoCH setup with secondaries on, which is what makes the scenario mark two regions.
+
+    Left off, the pause's zone would never be offered and the primary/secondary distinction — a
+    solid border against a dashed one on the chart — would have nothing to draw.
+    """
+    return {
+        "schema_version": "1.0",
+        "name": "CHoCH for the region chart",
+        "timeframe": "H1",
+        "setup": {"type": "structure_choch", "params": {"allow_secondary": True}},
+        "risk": {"sizing": {"type": "percent_risk", "params": {"percent": 1.0}}},
+    }
+
+
+def _structured_candles() -> list[Candle]:
+    """A series that breaks structure and leaves regions behind — the author's own example.
+
+    Three parts, and none of them optional. `BULLISH_START` is the toll: `MarketStructure` starts
+    at `DIR = -1`, so a series that simply rises never leaves the starting gate and marks nothing.
+    `GAPPING_IMPULSE` is the validated impulse that marks two demand regions. `_TAKES_THE_SECONDARY`
+    comes back for one of them.
+    """
+    return [*BULLISH_START, *GAPPING_IMPULSE, *_TAKES_THE_SECONDARY]
+
+
+def _launch_over_the_structure(client: TestClient) -> str:
+    """The window has to open before `START` — `BULLISH_START` sits in the hours in front of it."""
+    return _launch_with(client, _structure_strategy(), date_from=START - len(BULLISH_START) * HOUR)
+
+
+def test_a_structure_setup_is_drawn_as_regions_and_a_swing_setup_as_curves(
+    session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+) -> None:
+    """The two halves of the overlay are independent, and each setup fills exactly one of them.
+
+    Asserted together on purpose. Either half alone would pass against an endpoint that returned
+    an empty overlay for everything — "the structure setup has no curves" is true of a response
+    with nothing in it at all. It is the *pair* that says the two are populated by different
+    strategies, which is the whole shape of the payload.
+    """
+    seeding = session_factory()
+    _seed_instrument(seeding)
+    seeding.close()
+    write_candles(tmp_path, "EURUSD", "H1", _structured_candles())
+
+    with TestClient(_app(settings, session_factory, tmp_path)) as client:
+        structure_id = _launch_over_the_structure(client)
+        _run(session_factory, tmp_path, structure_id)
+        structure = client.get(f"/backtests/{structure_id}/overlays").json()
+
+        swing_id = _launch_with(client, _setup_strategy())
+        _run(session_factory, tmp_path, swing_id)
+        swing = client.get(f"/backtests/{swing_id}/overlays").json()
+
+    assert structure["zones"] != []
+    assert structure["series"] == []
+    assert swing["series"] != []
+    assert swing["zones"] == []
+
+
+def test_the_regions_served_are_the_ones_the_author_s_example_marks(
+    session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+) -> None:
+    """Two demand regions, primary and secondary, at the levels the engine's golden pins.
+
+    The prices are asserted here as well as in `test_structure.py` because they are what reaches
+    the browser: an endpoint that served a region's *origin* leg instead of its marking candle
+    would still return two plausible rectangles at plausible prices, and only the numbers say
+    which.
+    """
+    seeding = session_factory()
+    _seed_instrument(seeding)
+    seeding.close()
+    write_candles(tmp_path, "EURUSD", "H1", _structured_candles())
+
+    with TestClient(_app(settings, session_factory, tmp_path)) as client:
+        backtest_id = _launch_over_the_structure(client)
+        _run(session_factory, tmp_path, backtest_id)
+        zones = client.get(f"/backtests/{backtest_id}/overlays").json()["zones"]
+
+    # ⚠️ Compared as `Decimal`, never as the rendered text. The dataset's own scale rides along
+    # (`100` arrives as `100.0000000000`), so asserting the literal would pin the number of
+    # decimal places a Parquet column happens to carry inside an assertion about a *price*.
+    assert [(z["kind"], Decimal(z["top"]), Decimal(z["bottom"]), z["primary"]) for z in zones] == [
+        ("demand", Decimal(100), Decimal(98), True),
+        ("demand", Decimal(117), Decimal(110), False),
+    ]
+    # Strings on the wire like every other price here — a float would round the rectangle's
+    # edges, and an edge is where a limit order rests.
+    assert all(isinstance(z["top"], str) and isinstance(z["bottom"], str) for z in zones)
+
+
+def test_the_three_instants_of_a_region_do_not_collapse_into_one(
+    session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+) -> None:
+    """Marked, confirmed and taken are three different bars, and the chart reads all three.
+
+    ⚠️ The `confirmed_at > from_time` assertion is the load-bearing one. Ordering alone
+    (`>=`) is satisfied by a payload that served the same instant three times, and a fixture where
+    every region happened to confirm on its own marking bar would sail through the whole loop
+    proving nothing. Here the gap is real and large: both regions are drawn on bars the break that
+    reveals them is still six and two hours away from.
+    """
+    seeding = session_factory()
+    _seed_instrument(seeding)
+    seeding.close()
+    write_candles(tmp_path, "EURUSD", "H1", _structured_candles())
+
+    with TestClient(_app(settings, session_factory, tmp_path)) as client:
+        backtest_id = _launch_over_the_structure(client)
+        _run(session_factory, tmp_path, backtest_id)
+        zones = client.get(f"/backtests/{backtest_id}/overlays").json()["zones"]
+
+    for zone in zones:
+        marked, confirmed = _moment(zone["from_time"]), _moment(zone["confirmed_at"])
+        assert confirmed > marked, zone
+        if zone["mitigated_at"] is not None:
+            assert _moment(zone["mitigated_at"]) >= marked, zone
+
+    # And they are the bars the scenario says: both regions are revealed by the one break on
+    # bar 9, having been drawn on bars 3 and 7.
+    assert [_moment(z["from_time"]) for z in zones] == [START + 3 * HOUR, START + 7 * HOUR]
+    assert [_moment(z["confirmed_at"]) for z in zones] == [START + 9 * HOUR] * 2
+
+
+def test_a_region_still_standing_is_served_as_null_not_as_the_last_bar(
+    session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+) -> None:
+    """`null` is "price never came back", and the chart draws it to its own right edge.
+
+    Serving the final bar instead would be an assertion that price returned on the last candle of
+    the run — and on a chart the two are indistinguishable, because a rectangle ending at the last
+    bar is exactly where one extended to the edge ends up. Every region in the database would
+    quietly read as taken.
+
+    The taken one is asserted in the same breath, and has to be: `mitigated_at: None` for
+    everything would pass the null half on its own.
+    """
+    seeding = session_factory()
+    _seed_instrument(seeding)
+    seeding.close()
+    bars = _structured_candles()
+    write_candles(tmp_path, "EURUSD", "H1", bars)
+
+    with TestClient(_app(settings, session_factory, tmp_path)) as client:
+        backtest_id = _launch_over_the_structure(client)
+        _run(session_factory, tmp_path, backtest_id)
+        zones = client.get(f"/backtests/{backtest_id}/overlays").json()["zones"]
+
+    standing, taken = zones
+    assert standing["mitigated_at"] is None
+    # The first touch, not the deepest and not the last: bar 15 dips further under 117 than
+    # bar 12 did. See `_TAKES_THE_SECONDARY`.
+    assert _moment(taken["mitigated_at"]) == START + 12 * HOUR
+    assert _moment(taken["mitigated_at"]) < bars[-1].time

@@ -153,6 +153,47 @@ reaching further left, not a curve at different heights.
 """
 
 
+GAPPING_IMPULSE = [
+    bar(0, open_="122", close="122", high="123", low="120"),  # top 123
+    bar(1, open_="119", close="119", high="122", low="118"),  # correction 1
+    bar(2, open_="117", close="117", high="121", low="116"),  # correction 2 -> armed
+    bar(3, open_="99", close="99", high="100", low="98"),  # impulse starts; origin low 98
+    bar(4, open_="104", close="104", high="105", low="103"),
+    bar(5, open_="108", close="108", high="110", low="102"),  # gap A
+    bar(6, open_="113", close="113", high="115", low="107"),  # gap B
+    bar(7, open_="112", close="112", high="117", low="110"),  # pause
+    bar(8, open_="116", close="118", high="119", low="112"),  # pause; closes clear of 117
+    bar(9, open_="124", close="124", high="125", low="120"),  # gap C, and close 124 > 123 -> BOS
+]
+"""The author's validated example: one impulse, gapping twice, that marks exactly two regions.
+
+Prepend `BULLISH_START` and it is a complete order-block scenario — the shortest series in the
+project that breaks structure *and* leaves something behind. Bars 0-2 leave a top at 123 and two
+corrections that arm it; bars 3-9 are the impulse that breaks it, and inside that impulse the
+gaps come in two events separated by a pause::
+
+    bar 3  high 100  low  98  ┐
+    bar 4  high 105  low 103  │ gap A: 100 < 102  (confirms on bar 5)
+    bar 5  high 110  low 102  ┘
+    bar 6  high 115  low 107    gap B: 105 < 107  (confirms on bar 6) -- adjacent to A, same event
+    bar 7  high 117  low 110    no gap: 110 < 110 is not strict      -- THE PAUSE
+    bar 8  high 118  low 112    no gap
+    bar 9  high 125  low 120    gap C: 117 < 120  (confirms on bar 9) -- a second event
+
+So **two** zones, not three: A and B are one continuous push, and both are marked on bar 9 by the
+break that reveals them. The primary is drawn on bar 3 (100/98), the secondary on bar 7 (117/110).
+
+⚠️ **Both regions are still standing when the last bar closes.** Price never returns to either
+entry edge inside these ten bars, so a scenario that needs a *taken* region has to add its own
+pullback — see `test_candles_integration._TAKES_THE_SECONDARY` for one.
+
+Lives here rather than in a test file for the same reason `BULLISH_START` does: the engine's
+golden and the API's route test both assert against it, and a fixture two suites copy is a
+fixture that drifts into two versions. Copied, a change to the author's marking rule would fail
+the golden while the route test went on asserting prices nobody marks any more.
+"""
+
+
 def rising(count: int, *, start: str = "1.10000", step: str = "0.00100") -> list[Candle]:
     """A market that only goes up. Boring on purpose — the loop is what is under test."""
     price = Decimal(start)

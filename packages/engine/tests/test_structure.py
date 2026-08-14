@@ -39,7 +39,7 @@ from tradeforge_engine.structure import (
     _Region,
     _WedgeTracker,
 )
-from tradeforge_engine.testing import BULLISH_START, HOUR, START, bar
+from tradeforge_engine.testing import BULLISH_START, GAPPING_IMPULSE, HOUR, START, bar
 
 
 def _run(detector: SwingDetector, candles: list[Candle]) -> list[tuple[int, Swing]]:
@@ -1702,31 +1702,11 @@ def test_an_outside_bar_cannot_open_the_zig_zag() -> None:
 
 # --- Order blocks -------------------------------------------------------------------------------
 #
-# The author's validated example, with three bars in front to set up the break. Bars 0-2 leave a
-# top at 123 and two corrections that arm it; bars 3-9 are the impulse that breaks it, and inside
-# that impulse the gaps come in two events separated by a pause:
-#
-#   bar 3  high 100  low  98  ┐
-#   bar 4  high 105  low 103  │ gap A: 100 < 102  (confirms on bar 5)
-#   bar 5  high 110  low 102  ┘
-#   bar 6  high 115  low 107    gap B: 105 < 107  (confirms on bar 6) -- adjacent to A, same event
-#   bar 7  high 117  low 110    no gap: 110 < 110 is not strict      -- THE PAUSE
-#   bar 8  high 118  low 112    no gap
-#   bar 9  high 125  low 120    gap C: 117 < 120  (confirms on bar 9) -- a second event
-#
-# So two zones, not three: A and B are one continuous push.
-_OB_IMPULSE = [
-    bar(0, open_="122", close="122", high="123", low="120"),  # top 123
-    bar(1, open_="119", close="119", high="122", low="118"),  # correction 1
-    bar(2, open_="117", close="117", high="121", low="116"),  # correction 2 -> armed
-    bar(3, open_="99", close="99", high="100", low="98"),  # impulse starts; origin low 98
-    bar(4, open_="104", close="104", high="105", low="103"),
-    bar(5, open_="108", close="108", high="110", low="102"),  # gap A
-    bar(6, open_="113", close="113", high="115", low="107"),  # gap B
-    bar(7, open_="112", close="112", high="117", low="110"),  # pause
-    bar(8, open_="116", close="118", high="119", low="112"),  # pause; closes clear of 117
-    bar(9, open_="124", close="124", high="125", low="120"),  # gap C, and close 124 > 123 -> BOS
-]
+# The author's validated example — three bars to set up the break, then the impulse that breaks it
+# while leaving two gap events separated by a pause. The bar-by-bar reading of why it marks two
+# regions and not three is on the fixture itself, in `tradeforge_engine.testing`; it moved there
+# when the API's route tests came to need the same scenario.
+_OB_IMPULSE = GAPPING_IMPULSE
 
 
 def _zones(candles: list[Candle]) -> list[tuple[int, OrderBlock]]:

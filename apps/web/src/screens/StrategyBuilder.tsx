@@ -286,15 +286,20 @@ export function StrategyBuilder(): React.JSX.Element {
   /**
    * Save, then enqueue, then go and watch it.
    *
-   * The save is a `PUT` whenever this name has been saved before in this session, because the API
-   * writes version 1 on every `POST` and (name, version) is unique — so re-running after nudging a
-   * parameter is a *new version* of the same strategy, which is what the lineage in the database
-   * was built for. Under a new name it is a `POST` and a new lineage.
+   * The save is a `PUT` whenever this name has been saved before, because the API writes version
+   * 1 on every `POST` and (name, version) is unique — so re-running after nudging a parameter is
+   * a *new version* of the same strategy, which is what the lineage in the database was built
+   * for. Under a new name it is a `POST` and a new lineage.
+   *
+   * ⚠️ **"Has been saved before" is now asked of the server, and that is what removes the 409.**
+   * This used to compare the typed name against the one *this tab* had created, so a strategy
+   * saved in another tab, or before a reload, was invisible — and saving under its name was a
+   * `POST` onto a name that already had a version 1. The lookup lives in `useSaveStrategy`, so
+   * every caller of it gets the same answer.
    */
   const launch = (): void => {
-    const parentId = session.strategyName === form.name ? session.strategyId : null
     save.mutate(
-      { definition: document, parentId },
+      { definition: document },
       {
         onSuccess: (strategy) => {
           session.setStrategy(strategy.id, strategy.name)

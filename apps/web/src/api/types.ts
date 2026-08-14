@@ -481,3 +481,41 @@ export interface StudyOut {
   aggregate: StudyAggregate
   runs: BacktestListItem[]
 }
+
+/** One row of the strategy picker: enough to choose between lineages without opening any. */
+export interface StrategyListItem {
+  id: string
+  name: string
+  /** The **latest** version of this lineage; the id above is that version's row. */
+  version: number
+  schema_version: string
+  /**
+   * The named setup this strategy runs, or null for a DSL document built from indicators.
+   *
+   * ⚠️ Read from the document, never from the name — and the difference is not theoretical.
+   * This project's own database holds a strategy called `Structure — CHoCH 56454` that runs
+   * `mme9_breakout`: a name is typed by a person, a setup is executed by the engine.
+   */
+  setup: string | null
+  /** How many backtests have used it — what tells a real strategy from an abandoned draft. */
+  runs: number
+  created_at: string
+}
+
+export interface StrategiesPage {
+  total: number
+  limit: number
+  offset: number
+  items: StrategyListItem[]
+}
+
+export interface StrategyFilters {
+  /** Case-insensitive substring, for a person searching. */
+  q?: string
+  /** Exact, for asking whether a name is taken. */
+  name?: string
+  /** Include the strategies a grid generated — hidden by default, but never *free*. */
+  include_generated?: boolean
+  limit?: number
+  offset?: number
+}

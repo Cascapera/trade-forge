@@ -182,8 +182,11 @@ describe('running the backtest', () => {
     fireEvent.click(screen.getByRole('button', { name: /run backtest/i }))
 
     expect(save).toHaveBeenCalledTimes(1)
+    // ⚠️ The document, and only the document. Whether this is a new lineage or the next version
+    // of one is no longer the screen's call — it used to be decided from the id *this tab* had
+    // created, which is exactly why saving a name from another tab was a 409. `useSaveStrategy`
+    // asks the server now, and its own test pins that.
     expect(save.mock.calls[0]?.[0]).toMatchObject({
-      parentId: null,
       definition: { setup: { type: 'ponto_continuo', params: { side: 'long', period: 20 } } },
     })
 
@@ -209,12 +212,14 @@ describe('running the backtest', () => {
     renderWithProviders(<StrategyBuilder />)
     answerTheOpenQuestions()
     fireEvent.click(screen.getByRole('button', { name: /run backtest/i }))
-    expect(save.mock.calls[0]?.[0]).toMatchObject({ parentId: null })
 
     fireEvent.change(screen.getByLabelText('setup period'), { target: { value: '21' } })
     fireEvent.click(screen.getByRole('button', { name: /run backtest/i }))
+
+    // The edited document reaches the save both times; which of them becomes a new version is
+    // `useSaveStrategy`'s decision, taken against the database rather than against this tab.
+    expect(save).toHaveBeenCalledTimes(2)
     expect(save.mock.calls[1]?.[0]).toMatchObject({
-      parentId: 's1',
       definition: { setup: { params: { period: 21 } } },
     })
   })
@@ -227,7 +232,12 @@ describe('running the backtest', () => {
 
     fireEvent.change(screen.getByLabelText('name'), { target: { value: 'MME9 wider stop' } })
     fireEvent.click(screen.getByRole('button', { name: /run backtest/i }))
-    expect(save.mock.calls[1]?.[0]).toMatchObject({ parentId: null })
+
+    // The new name reaches the save; that a new name starts a new lineage is now a fact the
+    // server settles, not one the screen assumes.
+    expect(save.mock.calls[1]?.[0]).toMatchObject({
+      definition: { name: 'MME9 wider stop' },
+    })
   })
 
   it('carries the spread through when costs are switched on', () => {

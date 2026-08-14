@@ -5,6 +5,7 @@ import { useCreateStudy, useInstruments } from '../api/hooks'
 import { StrategyPicker } from '../components/StrategyPicker'
 import { useSession } from '../store'
 import { TIMEFRAMES } from '../strategy/builder'
+import { axesFor } from '../study/axes'
 import {
   MAX_POINTS,
   combinationCount,
@@ -39,6 +40,10 @@ export function LaunchStudy(): React.JSX.Element {
   const navigate = useNavigate()
 
   const [form, setForm] = useState<StudyForm>(emptyStudyForm)
+  // The chosen strategy's setup, which is what says *which* parameters can be varied. Held here
+  // rather than looked up again: the picker already had the row in its hand.
+  const [setup, setSetup] = useState<string | null>(null)
+  const options = axesFor(setup)
 
 
   const blocked = strategyId === null ? 'Choose a strategy.' : whyNotLaunchable(form)
@@ -83,8 +88,13 @@ export function LaunchStudy(): React.JSX.Element {
               something since the last reload — with forty-five strategies in the database. */}
           <StrategyPicker
             value={strategyId ?? ''}
-            onChange={(id, name) => {
-              setStrategy(id, name)
+            onChange={(chosen) => {
+              setStrategy(chosen.id, chosen.name)
+              setSetup(chosen.setup)
+              // The axes belong to the setup that was just replaced, so keeping them would leave
+              // paths pointing at a document that no longer has them — refused by the server,
+              // but only after the reader had filled in values for nothing.
+              set({ axes: [{ path: '', raw: '' }] })
             }}
           />
           <label className="flex flex-col gap-1 text-sm text-slate-300">
@@ -175,28 +185,71 @@ export function LaunchStudy(): React.JSX.Element {
 
         <fieldset className="space-y-2 rounded border border-slate-800 p-4">
           <legend className="px-1 text-sm text-slate-300">Parameters to vary</legend>
-          {form.axes.map((axis, at) => (
-            <div key={at} className="flex flex-wrap items-center gap-2">
-              <input
-                className={`${inputClass} min-w-64 flex-1`}
-                placeholder="setup.params.period"
-                aria-label={`Parameter ${String(at + 1)} path`}
-                value={axis.path}
-                onChange={(event) => {
-                  setAxis(at, { path: event.target.value })
-                }}
-              />
-              <input
-                className={`${inputClass} min-w-48 flex-1`}
-                placeholder="5, 9, 20"
-                aria-label={`Parameter ${String(at + 1)} values`}
-                value={axis.raw}
-                onChange={(event) => {
-                  setAxis(at, { raw: event.target.value })
-                }}
-              />
-            </div>
-          ))}
+          {form.axes.map((axis, at) => {
+            const chosen = options.find((option) => option.path === axis.path)
+            return (
+              <div key={at} className="space-y-1">
+                <div className="flex flex-wrap items-center gap-2">
+                  {/* A dropdown rather than a text field, and the options are **derived**: they
+                      come from the JSON Schema the DSL generates, so a parameter added in
+                      Python appears here with nothing changed. A typed path is still accepted
+                      for a DSL strategy, whose axes this list cannot describe. */}
+                  {options.length > 0 ? (
+                    <select
+                      className={`${inputClass} min-w-64 flex-1`}
+                      aria-label={`Parameter ${String(at + 1)}`}
+                      value={axis.path}
+                      onChange={(event) => {
+                        setAxis(at, { path: event.target.value, raw: '' })
+                      }}
+                    >
+                      <option value="">Choose a parameter…</option>
+                      {options.map((option) => (
+                        <option key={option.path} value={option.path}>
+                          {option.label}
+                        </option>
+                      ))}
+                    </select>
+                  ) : (
+                    <input
+                      className={`${inputClass} min-w-64 flex-1`}
+                      placeholder="setup.params.period"
+                      aria-label={`Parameter ${String(at + 1)} path`}
+                      value={axis.path}
+                      onChange={(event) => {
+                        setAxis(at, { path: event.target.value })
+                      }}
+                    />
+                  )}
+                  <input
+                    className={`${inputClass} min-w-48 flex-1`}
+                    placeholder={chosen?.example ?? '5, 9, 20'}
+                    aria-label={`Parameter ${String(at + 1)} values`}
+                    value={axis.raw}
+                    onChange={(event) => {
+                      setAxis(at, { raw: event.target.value })
+                    }}
+                  />
+                  {chosen !== undefined && axis.raw === '' && (
+                    <button
+                      type="button"
+                      className="text-xs text-sky-400 hover:text-sky-300"
+                      onClick={() => {
+                        setAxis(at, { raw: chosen.example })
+                      }}
+                    >
+                      use {chosen.example}
+                    </button>
+                  )}
+                </div>
+                {/* The format *and* what is legal, both read from the parameter's own schema —
+                    so the sentence tightens on its own the day a bound does. */}
+                {chosen !== undefined && (
+                  <p className="text-xs text-slate-500">{chosen.hint}</p>
+                )}
+              </div>
+            )
+          })}
           <button
             type="button"
             className="text-xs text-sky-400 hover:text-sky-300"

@@ -1,4 +1,4 @@
-import { fireEvent, screen, waitFor } from '@testing-library/react'
+import { fireEvent, screen, waitFor, within } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { api } from '../api/client'
@@ -290,5 +290,98 @@ describe('LaunchStudy', () => {
     // ("nothing at 'setup.params.periodd'", "expands to 900 combinations"), and each of them is
     // the one sentence that tells the reader what to change.
     expect(await screen.findByText(/900 combinations/)).toBeInTheDocument()
+  })
+
+  it('offers the parameters of the strategy that was chosen, not a list to remember', async () => {
+    // ⚠️ Before this the left field was free text and you had to know `setup.params.period` by
+    // heart — reported from the screen as "no parameters, what do I fill in and how". The
+    // options are **derived** from the JSON Schema the DSL generates, so nothing here is a
+    // second copy of the parameter list.
+    renderWithProviders(<LaunchStudy />)
+
+    await screen.findByRole('option', { name: /MME9 · mme9_breakout/ })
+    fireEvent.change(screen.getByLabelText(/Strategy/), { target: { value: 'strategy-1' } })
+
+    const parameter = screen.getByLabelText('Parameter 1')
+    expect(within(parameter).getByRole('option', { name: 'period' })).toBeInTheDocument()
+    expect(within(parameter).getByRole('option', { name: 'breakeven_at_r' })).toBeInTheDocument()
+  })
+
+  it('says how to fill the values, in the parameter own bounds', async () => {
+    renderWithProviders(<LaunchStudy />)
+
+    await screen.findByRole('option', { name: /MME9/ })
+    fireEvent.change(screen.getByLabelText(/Strategy/), { target: { value: 'strategy-1' } })
+    fireEvent.change(screen.getByLabelText('Parameter 1'), {
+      target: { value: 'setup.params.period' },
+    })
+
+    // The sentence comes from the schema's own minimum and maximum, so it tightens on its own
+    // the day a bound does.
+    expect(
+      screen.getByText('whole numbers between 1 and 1000, separated by commas'),
+    ).toBeInTheDocument()
+  })
+
+  it('offers a line of values that will actually run', async () => {
+    renderWithProviders(<LaunchStudy />)
+
+    await screen.findByRole('option', { name: /MME9/ })
+    fireEvent.change(screen.getByLabelText(/Strategy/), { target: { value: 'strategy-1' } })
+    fireEvent.change(screen.getByLabelText('Parameter 1'), {
+      target: { value: 'setup.params.period' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: /use 4, 9, 14/ }))
+
+    expect(screen.getByLabelText('Parameter 1 values')).toHaveValue('4, 9, 14')
+    expect(screen.getByRole('status')).toHaveTextContent('3 combinations')
+  })
+
+  it('clears the axes when the strategy changes, so no path points at the old document', async () => {
+    // ⚠️ Keeping them would leave `setup.params.period` selected against a structure setup that
+    // has no period — refused by the server, but only after the reader had filled in values for
+    // a parameter that was never going to exist.
+    listStrategies.mockResolvedValue({
+      total: 2,
+      limit: 200,
+      offset: 0,
+      items: [
+        {
+          id: 'strategy-1',
+          name: 'MME9',
+          version: 1,
+          schema_version: '1.0',
+          setup: 'mme9_breakout',
+          runs: 3,
+          created_at: '2024-01-01T00:00:00Z',
+        },
+        {
+          id: 'strategy-2',
+          name: 'CHoCH',
+          version: 1,
+          schema_version: '1.0',
+          setup: 'structure_choch',
+          runs: 1,
+          created_at: '2024-01-01T00:00:00Z',
+        },
+      ],
+    })
+
+    renderWithProviders(<LaunchStudy />)
+    await screen.findByRole('option', { name: /MME9/ })
+    fireEvent.change(screen.getByLabelText(/Strategy/), { target: { value: 'strategy-1' } })
+    fireEvent.change(screen.getByLabelText('Parameter 1'), {
+      target: { value: 'setup.params.period' },
+    })
+    fireEvent.change(screen.getByLabelText('Parameter 1 values'), { target: { value: '5, 9' } })
+
+    fireEvent.change(screen.getByLabelText(/Strategy/), { target: { value: 'strategy-2' } })
+
+    expect(screen.getByLabelText('Parameter 1')).toHaveValue('')
+    expect(screen.getByLabelText('Parameter 1 values')).toHaveValue('')
+    // And the options are the *new* setup's.
+    const parameter = screen.getByLabelText('Parameter 1')
+    expect(within(parameter).getByRole('option', { name: 'allow_secondary' })).toBeInTheDocument()
+    expect(within(parameter).queryByRole('option', { name: 'period' })).not.toBeInTheDocument()
   })
 })

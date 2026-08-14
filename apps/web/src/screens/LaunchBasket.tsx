@@ -74,8 +74,8 @@ export function LaunchBasket(): React.JSX.Element {
 
       <StrategyPicker
         value={strategyId ?? ''}
-        onChange={(id, name) => {
-          setStrategy(id, name)
+        onChange={(chosen) => {
+          setStrategy(chosen.id, chosen.name)
         }}
       />
 

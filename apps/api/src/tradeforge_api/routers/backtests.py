@@ -48,11 +48,7 @@ from tradeforge_db.models import (
 )
 from tradeforge_engine.domain import AccountState, Candle, Context
 from tradeforge_engine.loop import ENGINE_CONTEXT
-
-# Aliased: `Strategy` in this module is already the ORM row. Two very different
-# things with one name is how a signature ends up quietly accepting the wrong one.
 from tradeforge_engine.protocols import Charted, Zoned
-from tradeforge_engine.protocols import Strategy as EngineStrategy
 from tradeforge_engine.strategy import compile_strategy
 
 router = APIRouter(tags=["backtests"])
@@ -450,7 +446,7 @@ def get_candles(backtest_id: uuid.UUID, session: SessionDep, settings: SettingsD
     )
 
 
-def _zones_of(strategy: EngineStrategy, read: _Window) -> list[ZoneOut]:
+def _zones_of(read: _Window) -> list[ZoneOut]:
     """Replay the run's bars through the strategy and collect the regions it marked.
 
     **This one has to run `on_bar`, unlike the curves.** An indicator can be driven on its own
@@ -467,7 +463,15 @@ def _zones_of(strategy: EngineStrategy, read: _Window) -> list[ZoneOut]:
     The account is a plausible stand-in rather than the run's real equity, and it cannot matter:
     nothing on the marking path reads it. Sizing does, and sizing is the risk manager's, which
     is not in this loop at all.
+
+    ⚠️ **It compiles its own strategy rather than sharing the caller's.** The curve loop has
+    already driven that one over the whole window, and a strategy that was both `Charted` and
+    `Zoned` would arrive here with its indicators a full window ahead of the bars about to be
+    replayed — so the `series` served would no longer be the state the strategy held bar by bar.
+    No strategy is both today, which is exactly why the day one becomes both is the day nobody
+    would think to look here. One `compile_strategy` is the whole prevention.
     """
+    strategy = compile_strategy(read.strategy.definition)
     # Two views of one object, and they are kept apart on purpose: `Zoned` declares only
     # `zones()`, so narrowing to it would take `on_bar` away — and this is the one reader that
     # needs both. The protocol stays minimal rather than growing a method it does not mean.
@@ -556,5 +560,5 @@ def get_overlays(backtest_id: uuid.UUID, session: SessionDep, settings: Settings
         candles_seen=read.seen,
         count=len(read.candles),
         series=[OverlaySeriesOut(label=label, points=found) for label, found in points.items()],
-        zones=_zones_of(strategy, read),
+        zones=_zones_of(read),
     )

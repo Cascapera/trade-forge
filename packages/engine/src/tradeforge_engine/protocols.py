@@ -243,7 +243,15 @@ class Zoned(Protocol):
     """
 
     def zones(self) -> Sequence[ZoneMark]:
-        """Every region marked so far, oldest first. Empty is a valid answer."""
+        """The regions the strategy still holds, oldest first. Empty is a valid answer.
+
+        ⚠️ **Still holds, not "every one it ever marked".** A detector keeps a bounded history
+        — `OrderBlockDetector` drops the oldest past `_MAX_ZONES` — so a long run's earliest
+        regions are gone from this answer, and nothing in it says so. That bound is the
+        strategy's own and predates any of this: what a reader gets here is what the strategy
+        was actually carrying, which is the honest thing to draw. A reader wanting a complete
+        history has to record marks as they happen; it cannot ask afterwards.
+        """
         ...
 
 

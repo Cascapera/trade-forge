@@ -33,6 +33,7 @@ from tradeforge_engine.domain import (
     SnapshotPoint,
     SnapshotRegion,
     SnapshotSeries,
+    ZoneMark,
 )
 from tradeforge_engine.loop import SNAPSHOT_BARS_BEFORE, RunResult, run
 from tradeforge_engine.risk import PercentRiskManager
@@ -195,6 +196,101 @@ def test_a_region_of_zero_height_is_allowed() -> None:
     is an honest picture of a marking candle that was a doji."""
     region = SnapshotRegion(label="zone", top=Decimal(100), bottom=Decimal(100), from_time=START)
     assert region.top == region.bottom
+
+
+# --- `ZoneMark`, the run-length sibling ---------------------------------------------------------
+#
+# Same rectangle, different lifetime: `SnapshotRegion` is sealed at the fill and says nothing
+# about where a zone stopped, while `ZoneMark` carries both ends. Its guards are tested here
+# beside its sibling's, and for the same reason those exist — the only producer today is
+# `StructureStrategy.zones()`, which by construction cannot violate any of them, so nothing else
+# in the suite would notice if they were deleted as dead code. What they stand between is the
+# *next* producer and a rectangle the chart renders as zero-width, which is not an error on
+# screen: it is a region that quietly disappears.
+
+
+def _mark(**overrides: object) -> ZoneMark:
+    """A valid mark, so each test can break exactly one thing about it."""
+    fields: dict[str, object] = {
+        "kind": "demand",
+        "top": Decimal(100),
+        "bottom": Decimal(90),
+        "from_time": START,
+        "confirmed_at": START + 5 * HOUR,
+        "mitigated_at": START + 9 * HOUR,
+        "primary": True,
+    }
+    return ZoneMark(**{**fields, **overrides})  # type: ignore[arg-type]
+
+
+def test_a_zone_mark_keeps_its_three_instants_apart() -> None:
+    """The happy path, stated: marked, confirmed and taken are three separate fields, and a
+    valid mark carries three different values in them."""
+    mark = _mark()
+
+    assert mark.from_time < mark.confirmed_at < mark.mitigated_at  # type: ignore[operator]
+    assert (mark.top, mark.bottom, mark.primary) == (Decimal(100), Decimal(90), True)
+
+
+def test_a_zone_mark_cannot_be_upside_down() -> None:
+    """Same hazard as the snapshot's: inverted edges draw as negative height, which chart
+    libraries normalise away — leaving a region that looks right and is wrong."""
+    with pytest.raises(ValueError, match="is below bottom"):
+        _mark(top=Decimal(90), bottom=Decimal(100))
+
+
+def test_a_zone_mark_of_zero_height_is_allowed() -> None:
+    """A doji marking candle is degenerate, not invalid — the same answer `SnapshotRegion`
+    gives, and the two have to agree or one rejects a region the other drew."""
+    assert _mark(top=Decimal(100), bottom=Decimal(100)).top == Decimal(100)
+
+
+def test_a_zone_cannot_be_confirmed_before_it_was_marked() -> None:
+    """The break that reveals a region is always later than the gap that marked it. Reversed,
+    the rectangle runs backwards in time and a client clamping to the chart's edges renders it
+    as zero-width — a region that vanishes rather than one that complains."""
+    with pytest.raises(ValueError, match="before it was marked"):
+        _mark(confirmed_at=START - HOUR)
+
+
+def test_a_zone_cannot_be_taken_before_it_was_marked() -> None:
+    """The other end of the same rule. Left unchecked the rectangle has a right edge to the left
+    of its left edge, which is the same vanishing act."""
+    with pytest.raises(ValueError, match="before it was marked"):
+        _mark(mitigated_at=START - HOUR)
+
+
+def test_a_zone_taken_on_its_marking_bar_is_allowed() -> None:
+    """Deliberately legal, and the boundary is the point: the candle that marks a region can be
+    the one whose own wick reaches its entry edge.
+
+    ⚠️ **No producer in this engine does it today, and the guard is left loose on purpose.**
+    `OrderBlockDetector` advances the zones it already holds before appending the ones a break
+    revealed, and a region touched before that break is filtered out of the leg — so here
+    `mitigated_at` is strictly *after* `confirmed_at`, always. Tightening the guard to match
+    would encode the backtest detector's bookkeeping order into the record type, and a live
+    producer, where a region can be reached before the close that reveals it, would then be
+    refused for being honest.
+    """
+    assert _mark(from_time=START, confirmed_at=START, mitigated_at=START).mitigated_at == START
+
+
+def test_a_zone_that_still_stands_carries_no_taking_instant() -> None:
+    """`None` is a region price never came back to, and it has to survive validation — a guard
+    that demanded an instant would reject exactly the regions the chart extends to its edge."""
+    assert _mark(mitigated_at=None).mitigated_at is None
+
+
+@pytest.mark.parametrize("field", ["from_time", "confirmed_at", "mitigated_at"])
+def test_every_instant_on_a_zone_mark_must_carry_a_timezone(field: str) -> None:
+    """All three, including the optional one — its check sits behind an `if` of its own, so it
+    is the one that can be dropped without the other two noticing.
+
+    A naive instant is not a formatting problem: the rectangle is placed on a time axis, and a
+    left edge read as local time lands the region hours away from the candles that made it.
+    """
+    with pytest.raises(ValueError, match=f"ZoneMark.{field}"):
+        _mark(**{field: dt.datetime(2024, 1, 1, 12)})  # noqa: DTZ001
 
 
 def test_a_region_may_start_before_the_window_but_not_after_the_decision() -> None:

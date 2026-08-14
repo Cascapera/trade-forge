@@ -393,12 +393,16 @@ class StructureStrategy:
         self._fill_bar: datetime | None = None
 
     def zones(self) -> Sequence[ZoneMark]:
-        """Every region the detector has marked, as records — see `protocols.Zoned`.
+        """The regions the detector is still holding, as records — see `protocols.Zoned`.
 
         Translated here rather than handed over: `TrackedZone` is the detector's live
         bookkeeping, and a reader holding it could advance the very machinery it is describing.
         `mitigated_at` is `None` while a region still stands, which is what tells a chart to
         extend the rectangle to its own edge instead of closing it somewhere arbitrary.
+
+        ⚠️ Bounded by the detector's own `_MAX_ZONES`, so a long enough run has marked regions
+        this no longer returns. Faithful rather than complete, and faithful is the right one: it
+        is exactly the set the setup itself could still have traded.
         """
         return tuple(
             ZoneMark(

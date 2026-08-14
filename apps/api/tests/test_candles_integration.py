@@ -348,7 +348,11 @@ def _setup_strategy() -> dict[str, Any]:
 
 
 def _launch_with(
-    client: TestClient, document: dict[str, Any], *, date_from: dt.datetime = START
+    client: TestClient,
+    document: dict[str, Any],
+    *,
+    date_from: dt.datetime = START,
+    date_to: dt.datetime = START + 100 * HOUR,
 ) -> str:
     created = client.post("/strategies", json=document)
     assert created.status_code == 201, created.text
@@ -359,7 +363,7 @@ def _launch_with(
             "symbol": "EURUSD",
             "timeframe": "H1",
             "date_from": date_from.isoformat(),
-            "date_to": (START + 100 * HOUR).isoformat(),
+            "date_to": date_to.isoformat(),
             "initial_capital": "10000",
             "cost_model": {"type": "none"},
         },
@@ -640,9 +644,16 @@ def _structured_candles() -> list[Candle]:
     return [*BULLISH_START, *GAPPING_IMPULSE, *_TAKES_THE_SECONDARY]
 
 
-def _launch_over_the_structure(client: TestClient) -> str:
+def _launch_over_the_structure(
+    client: TestClient, *, date_to: dt.datetime = START + 100 * HOUR
+) -> str:
     """The window has to open before `START` — `BULLISH_START` sits in the hours in front of it."""
-    return _launch_with(client, _structure_strategy(), date_from=START - len(BULLISH_START) * HOUR)
+    return _launch_with(
+        client,
+        _structure_strategy(),
+        date_from=START - len(BULLISH_START) * HOUR,
+        date_to=date_to,
+    )
 
 
 def test_a_structure_setup_is_drawn_as_regions_and_a_swing_setup_as_curves(
@@ -770,3 +781,38 @@ def test_a_region_still_standing_is_served_as_null_not_as_the_last_bar(
     # bar 12 did. See `_TAKES_THE_SECONDARY`.
     assert _moment(taken["mitigated_at"]) == START + 12 * HOUR
     assert _moment(taken["mitigated_at"]) < bars[-1].time
+
+
+def test_the_last_bar_of_the_window_is_replayed_like_every_other(
+    session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+) -> None:
+    """⚠️ The test that separates a full replay from one that stops a bar short.
+
+    Every other scenario here ends on a bar that marks nothing and takes nothing, so dropping it
+    changes no answer — `read.candles[:-1]` survives all of them. This one ends on bar 12, the
+    bar whose wick takes the secondary, so the region's death *is* the final candle.
+
+    Both halves of the damage are real and neither shows on screen. A run stopping mid-pullback
+    would serve `mitigated_at: null`, and a rectangle drawn to the right edge is exactly what a
+    region that survived looks like. The mirror is worse: a break confirming on the last bar
+    would mark regions that never reach the response at all, and nothing in the payload could
+    say a region was missing.
+
+    It also pins the window itself. The bars on disk run to bar 16; the run was launched to bar
+    12, and the reply has to honour the provenance the run recorded rather than the dataset it
+    can see — the same contract `/candles` is built on.
+    """
+    seeding = session_factory()
+    _seed_instrument(seeding)
+    seeding.close()
+    write_candles(tmp_path, "EURUSD", "H1", _structured_candles())
+
+    with TestClient(_app(settings, session_factory, tmp_path)) as client:
+        backtest_id = _launch_over_the_structure(client, date_to=START + 12 * HOUR)
+        _run(session_factory, tmp_path, backtest_id)
+        body = client.get(f"/backtests/{backtest_id}/overlays").json()
+
+    _, taken = body["zones"]
+    # Read on the run's very last candle, and therefore only reported by a replay that fed it.
+    assert _moment(taken["mitigated_at"]) == START + 12 * HOUR
+    assert body["candles_seen"] == len(BULLISH_START) + 13

@@ -370,9 +370,15 @@ class ZoneMark:
             raise ValueError(
                 f"zone confirmed at {self.confirmed_at} before it was marked at {self.from_time}"
             )
-        # And it cannot be taken before it is drawn. Taken *on* the marking bar is legal and is
-        # not a degenerate case — the candle that marks a zone can be the one whose own wick
-        # reaches its entry edge.
+        # And it cannot be taken before it is drawn. Taken *on* the marking bar is legal here,
+        # and left legal on purpose even though **this engine never produces it**: measured
+        # against the code, `OrderBlockDetector` advances the zones it already holds before
+        # appending the ones a break revealed, and a region touched before that break is
+        # filtered out of the leg — so from `StructureStrategy` the taking instant is strictly
+        # later than the confirming one, always. Tightening this to `>= confirmed_at` would
+        # write the backtest detector's bookkeeping order into the record type, and refuse a
+        # live producer, where price can reach a region before the close that reveals it.
+        # See `test_a_zone_taken_on_its_marking_bar_is_allowed`, which states both halves.
         if self.mitigated_at is not None and self.mitigated_at < self.from_time:
             raise ValueError(
                 f"zone taken at {self.mitigated_at} before it was marked at {self.from_time}"

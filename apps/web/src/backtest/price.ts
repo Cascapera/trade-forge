@@ -268,7 +268,14 @@ export interface ZoneRect {
   width: number
   height: number
   kind: 'demand' | 'supply'
-  /** Still standing when the run ended, or when the visible window ends. */
+  /**
+   * Still standing when the run ended — never merely when the visible window ends.
+   *
+   * A region taken off to the right of what is on screen is drawn to the edge like a live one,
+   * because that is where its rectangle genuinely runs, but it is `live: false` and keeps the
+   * faded styling of a region that died. Panning cannot bring a zone back to life: what the
+   * fill says is what the run found, not what happens to be scrolled into view.
+   */
   live: boolean
   primary: boolean
   /** Clipped at the chart's left edge — the region began before anything on screen. */

@@ -318,6 +318,74 @@ class SnapshotRegion:
 
 
 @dataclass(frozen=True, slots=True)
+class ZoneMark:
+    """One region over a whole run, with both ends of its life.
+
+    The run-length sibling of `SnapshotRegion`, and the difference between them is the right
+    edge. A snapshot is sealed at the fill, so it cannot know where a zone stopped and says
+    nothing; a finished run knows exactly — the bar whose wick reached the entry edge and took
+    it. Carrying that lets a chart draw the rectangle's *length* as how long the region stood,
+    which is the one thing the picture is for.
+
+    **Three instants, all different, none interchangeable.**
+
+    * `from_time` — the bar the region is drawn on: the candle before the gap. It is where the
+      rectangle begins, and it is routinely far older than the break that revealed it.
+    * `confirmed_at` — the bar whose close broke structure and made the region *visible*. A
+      strategy may only act from here. The stretch between the two is time price spent working
+      a zone nothing yet knew was one, and it is a median of sixteen bars on this project's own
+      data — long enough that collapsing the two would redraw most regions as much younger.
+    * `mitigated_at` — the bar that took it, or `None` for a region price never came back to.
+      `None` is not "unknown": it is a region still standing when the run ended, and a chart
+      extends it to its own right edge.
+
+    Immutable, and deliberately not the detector's `TrackedZone`. That type is the detector's
+    live bookkeeping — mutable, and its own business. What a reader needs is a record of what
+    happened, and handing out the working copy would let a chart advance the machinery it is
+    supposed to be describing.
+    """
+
+    kind: str
+    """`demand` or `supply` — the side of the book, from `ZoneKind`."""
+
+    top: Money
+    bottom: Money
+    from_time: dt.datetime
+    confirmed_at: dt.datetime
+    mitigated_at: dt.datetime | None
+    primary: bool
+    """First gap event of the impulse. Secondaries are only tradable with `allow_secondary`."""
+
+    def __post_init__(self) -> None:
+        _require_utc(self.from_time, "ZoneMark.from_time")
+        _require_utc(self.confirmed_at, "ZoneMark.confirmed_at")
+        if self.mitigated_at is not None:
+            _require_utc(self.mitigated_at, "ZoneMark.mitigated_at")
+        if self.top < self.bottom:
+            raise ValueError(f"zone top {self.top} is below bottom {self.bottom}")
+        # A region cannot be confirmed before it exists: the break that reveals a zone is always
+        # later than the gap that marked it. Reversed, the rectangle would be drawn backwards in
+        # time and a client clamping to the chart edge would silently render it as zero-width.
+        if self.confirmed_at < self.from_time:
+            raise ValueError(
+                f"zone confirmed at {self.confirmed_at} before it was marked at {self.from_time}"
+            )
+        # And it cannot be taken before it is drawn. Taken *on* the marking bar is legal here,
+        # and left legal on purpose even though **this engine never produces it**: measured
+        # against the code, `OrderBlockDetector` advances the zones it already holds before
+        # appending the ones a break revealed, and a region touched before that break is
+        # filtered out of the leg — so from `StructureStrategy` the taking instant is strictly
+        # later than the confirming one, always. Tightening this to `>= confirmed_at` would
+        # write the backtest detector's bookkeeping order into the record type, and refuse a
+        # live producer, where price can reach a region before the close that reveals it.
+        # See `test_a_zone_taken_on_its_marking_bar_is_allowed`, which states both halves.
+        if self.mitigated_at is not None and self.mitigated_at < self.from_time:
+            raise ValueError(
+                f"zone taken at {self.mitigated_at} before it was marked at {self.from_time}"
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class EntrySnapshot:
     """The bars the strategy had seen when it decided to enter — the picture, not the numbers.
 

@@ -5,15 +5,17 @@ import {
   createChart,
   createSeriesMarkers,
   type IChartApi,
+  type ISeriesApi,
   type ISeriesMarkersPluginApi,
   type SeriesMarker,
   type Time,
   type UTCTimestamp,
 } from 'lightweight-charts'
-import { useEffect, useMemo, useRef } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 
-import type { Candle, OverlaySeries, Trade } from '../api/types'
-import { toBars, toCurves, toMarkers, visibleRangeFor } from '../backtest/price'
+import type { Candle, OverlaySeries, Trade, Zone } from '../api/types'
+import type { View, ZoneRect } from '../backtest/price'
+import { toBars, toCurves, toMarkers, toZones, visibleRangeFor, zoneRects } from '../backtest/price'
 
 // The price a run was executed over, with its trades marked on it.
 //
@@ -40,6 +42,7 @@ const INK = '#94a3b8'
 // so the curves recompute, the effect's dependency changes, and the chart is torn down and
 // rebuilt — discarding whatever the reader had zoomed to, on every click.
 const NO_OVERLAYS: readonly OverlaySeries[] = []
+const NO_ZONES: readonly Zone[] = []
 
 interface Props {
   candles: readonly Candle[]
@@ -48,8 +51,57 @@ interface Props {
   selectedTradeId: number | null
   /** What the strategy was reading. Empty is ordinary — a structure setup draws zones, not lines. */
   overlays?: readonly OverlaySeries[]
+  /** The regions it marked. Empty is ordinary too — a swing setup reads a curve and marks none. */
+  zones?: readonly Zone[]
   symbol: string
   timeframe: string
+}
+
+/**
+ * One region: a band of price from the bar that marked it to the bar that took it.
+ *
+ * Three things are encoded, and none of them is colour alone.
+ *
+ * * **Which side of the book** is the candle hue — a demand zone in the up colour, a supply zone
+ *   in the down one — *and* the thickness of its entry edge. That pair separates by only ΔE 7.5
+ *   under deuteranopia, so the edge is not decoration: it is the second encoding. It also carries
+ *   real meaning, being the price the limit order actually rests at.
+ * * **Still standing or already taken** is fill. A live region is filled; a mitigated one keeps
+ *   only its outline, so the chart still shows where it died — which is what explains a stretch
+ *   the strategy sat out — without competing with the regions that are still in play.
+ * * **Primary or secondary** is a solid against a dashed border. Without it there is no way to
+ *   see the effect of the `allow_secondary` flag the run was launched with.
+ */
+function ZoneShape({ rect }: { rect: ZoneRect }): React.JSX.Element {
+  const hue = rect.kind === 'demand' ? UP : DOWN
+  // The side price must come back to: a demand region's top, a supply region's bottom.
+  const entryEdgeY = rect.kind === 'demand' ? rect.y : rect.y + rect.height
+  return (
+    <g>
+      <rect
+        x={rect.x}
+        y={rect.y}
+        width={rect.width}
+        height={rect.height}
+        fill={rect.live ? hue : 'none'}
+        fillOpacity={rect.live ? 0.1 : 0}
+        stroke={hue}
+        strokeOpacity={rect.live ? 0.55 : 0.28}
+        strokeWidth={1}
+        strokeDasharray={rect.primary ? undefined : '4 3'}
+      />
+      <line
+        x1={rect.x}
+        x2={rect.x + rect.width}
+        y1={entryEdgeY}
+        y2={entryEdgeY}
+        stroke={hue}
+        strokeOpacity={rect.live ? 0.9 : 0.4}
+        strokeWidth={2}
+        strokeDasharray={rect.primary ? undefined : '4 3'}
+      />
+    </g>
+  )
 }
 
 export function PriceChart({
@@ -59,9 +111,11 @@ export function PriceChart({
   symbol,
   timeframe,
   overlays = NO_OVERLAYS,
+  zones = NO_ZONES,
 }: Props): React.JSX.Element {
   const container = useRef<HTMLDivElement>(null)
   const chartRef = useRef<IChartApi | null>(null)
+  const priceRef = useRef<ISeriesApi<'Candlestick'> | null>(null)
   // `Time`, not `UTCTimestamp`: the plugin is generic over whatever the series' horizontal scale
   // is, and a candlestick series declares the library's open `Time`. Pinning the ref narrower
   // than the value it holds is what makes the assignment fail rather than the data be wrong.
@@ -70,6 +124,10 @@ export function PriceChart({
   const bars = useMemo(() => toBars(candles), [candles])
   const marks = useMemo(() => toMarkers(trades, selectedTradeId), [trades, selectedTradeId])
   const curves = useMemo(() => toCurves(overlays), [overlays])
+  const regions = useMemo(() => toZones(zones), [zones])
+  // Recomputed on every pan and zoom, because the rectangles live in pixel space. `null` while
+  // the chart has not reported a view yet — an empty layer, not a layer of nothing at 0,0.
+  const [rects, setRects] = useState<ZoneRect[] | null>(null)
 
   // The chart itself, rebuilt only when the bars change — which for a finished run is once.
   // Keeping it out of the marker and selection effects is what lets a reader click through
@@ -118,11 +176,13 @@ export function PriceChart({
     }
 
     chartRef.current = chart
+    priceRef.current = drawn
     plugin.current = createSeriesMarkers(drawn)
     chart.timeScale().fitContent()
 
     return () => {
       chartRef.current = null
+      priceRef.current = null
       plugin.current = null
       chart.remove()
     }
@@ -159,6 +219,44 @@ export function PriceChart({
     })
   }, [selectedTradeId, trades, bars])
 
+  // The zone layer. lightweight-charts has no rectangle primitive, so the regions are drawn as an
+  // SVG layer over the canvas, positioned by the chart's own coordinate conversions. The
+  // alternative was a series primitive, which would pan and zoom for free — and would put the
+  // geometry inside a canvas renderer, where none of it could be tested. Everything that decides
+  // *where* a rectangle goes lives in `zoneRects`; this only asks the chart where things are.
+  useEffect(() => {
+    const chart = chartRef.current
+    const price = priceRef.current
+    const element = container.current
+    if (!chart || !price || !element || regions.length === 0) {
+      setRects(null)
+      return
+    }
+
+    const measure = (): void => {
+      const scale = chart.timeScale()
+      const span = scale.getVisibleRange()
+      if (span === null) {
+        setRects(null)
+        return
+      }
+      const view: View = {
+        from: span.from as number,
+        to: span.to as number,
+        width: element.clientWidth,
+        toX: (time) => scale.timeToCoordinate(time as UTCTimestamp),
+        toY: (value) => price.priceToCoordinate(value),
+      }
+      setRects(zoneRects(regions, view))
+    }
+
+    measure()
+    chart.timeScale().subscribeVisibleTimeRangeChange(measure)
+    return () => {
+      chart.timeScale().unsubscribeVisibleTimeRangeChange(measure)
+    }
+  }, [regions, bars])
+
   if (bars.length === 0) {
     return (
       <p className="rounded-lg border border-slate-800 bg-slate-900/40 p-8 text-center text-sm text-slate-400">
@@ -169,12 +267,27 @@ export function PriceChart({
 
   return (
     <div className="space-y-3">
-      <div
-        ref={container}
-        role="img"
-        aria-label={`${symbol} ${timeframe} price, ${String(bars.length)} candles, with ${String(trades.length)} trades marked`}
-        className="rounded-lg border border-slate-800 bg-slate-900/40 p-2"
-      />
+      <div className="relative">
+        <div
+          ref={container}
+          role="img"
+          aria-label={`${symbol} ${timeframe} price, ${String(bars.length)} candles, with ${String(trades.length)} trades marked`}
+          className="rounded-lg border border-slate-800 bg-slate-900/40 p-2"
+        />
+        {rects !== null && (
+          // `pointer-events-none`: the crosshair, the pan and the zoom belong to the canvas
+          // underneath. A layer that swallowed the pointer would leave a chart that looks
+          // interactive and is not.
+          <svg
+            className="pointer-events-none absolute inset-0 h-full w-full"
+            aria-hidden="true"
+          >
+            {rects.map((rect, index) => (
+              <ZoneShape key={`${String(rect.x)}-${String(rect.y)}-${String(index)}`} rect={rect} />
+            ))}
+          </svg>
+        )}
+      </div>
       <ul className="flex flex-wrap gap-x-5 gap-y-2 text-xs text-slate-300">
         {/* The curves first, each directly named. A legend is not optional here: the line hues are
             only legal alongside a label, and "which average is this" is the question the caption

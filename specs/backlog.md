@@ -426,3 +426,14 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
   monotônica o MME9 rearma a cada barra e a ordem em repouso nunca é tomada — construir o cenário
   que preenche é trabalho próprio. Fazer junto do PR que desenhar as regiões (ele vai precisar de
   uma fixture que negocia de qualquer jeito).
+- [origem: PR-230] **A janela terminando na barra que CONFIRMA uma região** — o replay de
+  `_zones_of` já é provado alimentar o último candle da janela, mas só pelo lado da *mitigação*:
+  `test_the_last_bar_of_the_window_is_replayed_like_every_other` fecha a janela na barra cujo
+  pavio toma a secundária. O simétrico não tem cenário — uma janela que termina exatamente no
+  rompimento que **revela** regiões novas, que sob um replay curto sumiriam da resposta sem que
+  nada no payload pudesse dizer que faltou alguma. Não é bloqueante e não é regressão deste PR:
+  o laço é o mesmo para os dois eventos (não há ramo separado para "confirmar" e "mitigar"), e o
+  mutante genérico de truncamento já morre pelo teste que existe. O que falta é o cenário que
+  afirma o caso **pelo seu próprio nome** — construí-lo custa um probe novo sobre o
+  `GAPPING_IMPULSE` com a janela cortada na barra 9. Fazer junto do próximo trabalho que já for
+  tocar a marcação de regiões.

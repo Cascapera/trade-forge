@@ -5,7 +5,7 @@
 // else — which is what lets these rules be tested without a chart at all, since jsdom has no
 // canvas for lightweight-charts to draw on.
 
-import type { Candle, OverlaySeries, Trade } from '../api/types'
+import type { Candle, OverlaySeries, Trade, Zone } from '../api/types'
 
 /** A bar as lightweight-charts wants it: seconds, and numbers rather than exact decimals. */
 export interface Bar {
@@ -223,4 +223,107 @@ function indexAtOrBefore(bars: readonly Bar[], time: number): number {
     found = i
   }
   return found
+}
+
+// --------------------------------------------------------------------------- //
+// Regions                                                                       //
+// --------------------------------------------------------------------------- //
+
+/** A region with its numbers parsed: seconds on the axis, floats for the price band. */
+export interface DrawableZone {
+  kind: 'demand' | 'supply'
+  top: number
+  bottom: number
+  fromTime: number
+  mitigatedAt: number | null
+  primary: boolean
+}
+
+export function toZones(zones: readonly Zone[]): DrawableZone[] {
+  return zones.map((zone) => ({
+    kind: zone.kind,
+    top: Number(zone.top),
+    bottom: Number(zone.bottom),
+    fromTime: toSeconds(zone.from_time),
+    mitigatedAt: zone.mitigated_at === null ? null : toSeconds(zone.mitigated_at),
+    primary: zone.primary,
+  }))
+}
+
+/** What the chart can tell us about where things are, in pixels. */
+export interface View {
+  /** The visible span in seconds, from the chart's own time scale. */
+  from: number
+  to: number
+  width: number
+  /** Seconds to an x offset, or null when the instant falls outside the visible span. */
+  toX: (time: number) => number | null
+  /** Price to a y offset, or null when it falls off the price scale. */
+  toY: (price: number) => number | null
+}
+
+export interface ZoneRect {
+  x: number
+  y: number
+  width: number
+  height: number
+  kind: 'demand' | 'supply'
+  /**
+   * Still standing when the run ended — never merely when the visible window ends.
+   *
+   * A region taken off to the right of what is on screen is drawn to the edge like a live one,
+   * because that is where its rectangle genuinely runs, but it is `live: false` and keeps the
+   * faded styling of a region that died. Panning cannot bring a zone back to life: what the
+   * fill says is what the run found, not what happens to be scrolled into view.
+   */
+  live: boolean
+  primary: boolean
+  /** Clipped at the chart's left edge — the region began before anything on screen. */
+  clippedLeft: boolean
+}
+
+/**
+ * Regions as rectangles in the chart's pixel space.
+ *
+ * **Clipped at the edges, never moved to them.** A region routinely begins long before the
+ * visible window — the rectangle really does start there — so a zone whose `fromTime` is off
+ * screen is drawn from x=0 and flagged `clippedLeft`. Moving its start to the first visible bar
+ * would redraw the zone as younger than it is, which is the one thing the rectangle exists to
+ * say. The same rule the entry snapshot states for its own regions.
+ *
+ * **A region with no mitigation runs to the right edge.** `mitigatedAt === null` is "still
+ * standing", not "unknown", and closing it at some invented bar would claim price came back when
+ * it never did.
+ *
+ * Zones wholly outside the window are dropped rather than clamped to zero width: a rectangle of
+ * no width is still a rectangle, and a row of them along an edge reads as regions that existed
+ * there.
+ */
+export function zoneRects(zones: readonly DrawableZone[], view: View): ZoneRect[] {
+  const out: ZoneRect[] = []
+  for (const zone of zones) {
+    const ends = zone.mitigatedAt
+    if (zone.fromTime > view.to) continue
+    if (ends !== null && ends < view.from) continue
+
+    const clippedLeft = zone.fromTime < view.from
+    const left = clippedLeft ? 0 : (view.toX(zone.fromTime) ?? 0)
+    const right = ends === null || ends > view.to ? view.width : (view.toX(ends) ?? view.width)
+
+    const top = view.toY(zone.top)
+    const bottom = view.toY(zone.bottom)
+    if (top === null || bottom === null) continue
+
+    out.push({
+      x: left,
+      y: top,
+      width: Math.max(right - left, 1),
+      height: Math.max(bottom - top, 1),
+      kind: zone.kind,
+      live: ends === null,
+      primary: zone.primary,
+      clippedLeft,
+    })
+  }
+  return out
 }

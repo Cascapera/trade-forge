@@ -2,7 +2,7 @@ import { useMemo, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 
 import { useBacktest, useCandles, useEquity, useOverlays, useTrades } from '../api/hooks'
-import type { BacktestStatus, OverlaySeries } from '../api/types'
+import type { BacktestStatus, OverlaySeries, Zone } from '../api/types'
 import { coverageNotice } from '../backtest/coverage'
 import { count } from '../format'
 import { EquityCurve } from '../components/EquityCurve'
@@ -28,6 +28,7 @@ type Tab = 'results' | 'price'
 // A module constant, not `[]` inline: a fresh array each render would recompute every curve
 // and rebuild the chart, throwing away the zoom the reader had set.
 const EMPTY_SERIES: OverlaySeries[] = []
+const EMPTY_ZONES: Zone[] = []
 
 const TABS: { id: Tab; label: string }[] = [
   { id: 'results', label: 'Results' },
@@ -182,6 +183,7 @@ export function Results(): React.JSX.Element {
                     trades={tradeItems}
                     selectedTradeId={locatedTrade}
                     overlays={overlays.data?.series ?? EMPTY_SERIES}
+                    zones={overlays.data?.zones ?? EMPTY_ZONES}
                     symbol={price.symbol}
                     timeframe={price.timeframe}
                   />

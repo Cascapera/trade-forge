@@ -1,5 +1,15 @@
-import type { Candle, OverlaySeries, Trade } from '../api/types'
-import { CURVE_COLORS, toBars, toCurves, toMarkers, toSeconds, visibleRangeFor } from './price'
+import type { Candle, OverlaySeries, Trade, Zone } from '../api/types'
+import type { DrawableZone, View } from './price'
+import {
+  CURVE_COLORS,
+  toBars,
+  toCurves,
+  toMarkers,
+  toSeconds,
+  toZones,
+  visibleRangeFor,
+  zoneRects,
+} from './price'
 
 function candle(over: Partial<Candle>): Candle {
   return {
@@ -300,5 +310,137 @@ describe('toCurves', () => {
 
     expect(curve?.points).toHaveLength(1)
     expect(curve?.points[0]?.time).toBe(toSeconds('2024-08-01T18:00:00Z'))
+  })
+})
+
+describe('toZones', () => {
+  function zone(over: Partial<Zone> = {}): Zone {
+    return {
+      kind: 'demand',
+      top: '226.9800000000',
+      bottom: '225.7600000000',
+      from_time: '2024-08-01T14:00:00Z',
+      confirmed_at: '2024-08-01T16:00:00Z',
+      mitigated_at: '2024-08-01T18:00:00Z',
+      primary: true,
+      ...over,
+    }
+  }
+
+  it('parses the band and both instants', () => {
+    const [drawable] = toZones([zone()])
+
+    expect(drawable).toEqual({
+      kind: 'demand',
+      top: 226.98,
+      bottom: 225.76,
+      fromTime: toSeconds('2024-08-01T14:00:00Z'),
+      mitigatedAt: toSeconds('2024-08-01T18:00:00Z'),
+      primary: true,
+    })
+  })
+
+  it('keeps "still standing" as null rather than inventing an end', () => {
+    const [drawable] = toZones([zone({ mitigated_at: null })])
+
+    expect(drawable?.mitigatedAt).toBeNull()
+  })
+})
+
+describe('zoneRects', () => {
+  const HOUR = 3600
+  const NOON = toSeconds('2024-08-01T12:00:00Z')
+
+  /** A window of twelve hours across 600px, with price 100–110 over 300px. */
+  function view(over: Partial<View> = {}): View {
+    const from = NOON
+    const to = NOON + 12 * HOUR
+    return {
+      from,
+      to,
+      width: 600,
+      toX: (time) => (time < from || time > to ? null : ((time - from) / (to - from)) * 600),
+      toY: (price) => (price < 100 || price > 110 ? null : ((110 - price) / 10) * 300),
+      ...over,
+    }
+  }
+
+  function drawable(over: Partial<DrawableZone> = {}): DrawableZone {
+    return {
+      kind: 'demand',
+      top: 106,
+      bottom: 104,
+      fromTime: NOON + 2 * HOUR,
+      mitigatedAt: NOON + 6 * HOUR,
+      primary: true,
+      ...over,
+    }
+  }
+
+  it('places the rectangle between the bar that marked it and the bar that took it', () => {
+    const [rect] = zoneRects([drawable()], view())
+
+    expect(rect?.x).toBe(100) // 2h into a 12h window across 600px
+    expect(rect?.width).toBe(200) // 4h wide
+    expect(rect?.y).toBe(120) // 106 on a 100–110 scale across 300px
+    expect(rect?.height).toBe(60)
+  })
+
+  it('runs a still-standing region to the right edge', () => {
+    // `null` is "price never came back", not "unknown". Closing it anywhere would claim a return
+    // that did not happen.
+    const [rect] = zoneRects([drawable({ mitigatedAt: null })], view())
+
+    expect(rect).toBeDefined()
+    expect((rect?.x ?? 0) + (rect?.width ?? 0)).toBe(600)
+    expect(rect?.live).toBe(true)
+  })
+
+  it('clips a region that began off screen at the left edge, and says so', () => {
+    // ⚠️ Clipped, never moved. The rectangle really does start before the window; redrawing it
+    // from the first visible bar would show the zone as younger than it is, which is the single
+    // thing its length is for.
+    const [rect] = zoneRects([drawable({ fromTime: NOON - 50 * HOUR })], view())
+
+    expect(rect?.x).toBe(0)
+    expect(rect?.clippedLeft).toBe(true)
+  })
+
+  it('drops a region that lived entirely before the window', () => {
+    // Not clamped to zero width: a rectangle of no width is still a rectangle, and a row of them
+    // stacked on an edge reads as regions that were there.
+    const gone = drawable({ fromTime: NOON - 50 * HOUR, mitigatedAt: NOON - 40 * HOUR })
+
+    expect(zoneRects([gone], view())).toEqual([])
+  })
+
+  it('drops a region that begins after the window ends', () => {
+    expect(zoneRects([drawable({ fromTime: NOON + 40 * HOUR })], view())).toEqual([])
+  })
+
+  it('drops a region whose band is off the price scale', () => {
+    expect(zoneRects([drawable({ top: 500, bottom: 480 })], view())).toEqual([])
+  })
+
+  it('never yields a rectangle too thin to see', () => {
+    // A zone marked and taken on the same bar is a real thing, and a zero-width rectangle
+    // renders as nothing at all — the reader would see no region where there was one.
+    const instant = drawable({ mitigatedAt: NOON + 2 * HOUR })
+
+    const [rect] = zoneRects([instant], view())
+
+    expect(rect?.width).toBeGreaterThanOrEqual(1)
+  })
+
+  it('carries primary and the side of the book through, for the drawing to encode', () => {
+    const rects = zoneRects(
+      [drawable({ primary: false, kind: 'supply' }), drawable({ primary: true, kind: 'demand' })],
+      view(),
+    )
+
+    expect(rects.map((r) => [r.kind, r.primary])).toEqual([
+      ['supply', false],
+      ['demand', true],
+    ])
   })
 })

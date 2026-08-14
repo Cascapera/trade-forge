@@ -1,12 +1,25 @@
 import { cleanup, render, screen } from '@testing-library/react'
 
-import type { Candle, Trade } from '../api/types'
+import type { Candle, Trade, Zone } from '../api/types'
 
 // lightweight-charts draws to a real canvas, which jsdom does not provide. The library is mocked
 // and the test asserts what this component is responsible for: the bars reaching the series, the
 // second encoding on the candles, markers going through the plugin rather than a rebuild, and the
 // chosen trade moving the view.
-const { createChart, setData, setMarkers, setVisibleRange, fitContent, remove, options, kinds } =
+const {
+  createChart,
+  setData,
+  setMarkers,
+  setVisibleRange,
+  fitContent,
+  remove,
+  options,
+  kinds,
+  getVisibleRange,
+  subscribeRange,
+  unsubscribeRange,
+  NOON,
+} =
   vi.hoisted(() => {
     const setData = vi.fn()
     const setMarkers = vi.fn()
@@ -15,17 +28,45 @@ const { createChart, setData, setMarkers, setVisibleRange, fitContent, remove, o
     const remove = vi.fn()
     const options: Record<string, unknown>[] = []
     const kinds: string[] = []
+    // A twelve-hour window across 600px, price 100-110 across 300px — the same shape the
+    // geometry tests in `price.test.ts` use, so a rectangle here lands where they say it does.
+    const NOON = 1722513600
+    const getVisibleRange = vi.fn(() => ({ from: NOON, to: NOON + 12 * 3600 }))
+    const timeToCoordinate = vi.fn((time: number) => ((time - NOON) / (12 * 3600)) * 600)
+    const priceToCoordinate = vi.fn((price: number) => ((110 - price) / 10) * 300)
+    const subscribeRange = vi.fn()
+    const unsubscribeRange = vi.fn()
     const addSeries = vi.fn((kind: string, given: Record<string, unknown>) => {
       kinds.push(kind)
       options.push(given)
-      return { setData }
+      return { setData, priceToCoordinate }
     })
     const createChart = vi.fn(() => ({
       addSeries,
-      timeScale: () => ({ fitContent, setVisibleRange }),
+      timeScale: () => ({
+        fitContent,
+        setVisibleRange,
+        getVisibleRange,
+        timeToCoordinate,
+        subscribeVisibleTimeRangeChange: subscribeRange,
+        unsubscribeVisibleTimeRangeChange: unsubscribeRange,
+      }),
       remove,
     }))
-    return { createChart, setData, setMarkers, setVisibleRange, fitContent, remove, options, kinds }
+    return {
+      createChart,
+      setData,
+      setMarkers,
+      setVisibleRange,
+      fitContent,
+      remove,
+      options,
+      kinds,
+      getVisibleRange,
+      subscribeRange,
+      unsubscribeRange,
+      NOON,
+    }
   })
 
 vi.mock('lightweight-charts', () => ({
@@ -234,5 +275,94 @@ describe('PriceChart — the curves the strategy was reading', () => {
       { time: 1722524400, value: 226.1 },
       { time: 1722528000, value: 226.4 },
     ])
+  })
+})
+
+describe('PriceChart — the regions the strategy marked', () => {
+  const HOUR = 3600
+
+  function zone(over: Partial<Zone> = {}): Zone {
+    return {
+      kind: 'demand',
+      top: '106',
+      bottom: '104',
+      from_time: new Date((NOON + 2 * HOUR) * 1000).toISOString(),
+      confirmed_at: new Date((NOON + 3 * HOUR) * 1000).toISOString(),
+      mitigated_at: new Date((NOON + 6 * HOUR) * 1000).toISOString(),
+      primary: true,
+      ...over,
+    }
+  }
+
+  /** The rectangles on the overlay layer, in document order. */
+  function drawn(container: HTMLElement): SVGRectElement[] {
+    return Array.from(container.querySelectorAll('svg rect'))
+  }
+
+  it('draws one rectangle per region', () => {
+    const view = draw({ zones: [zone(), zone({ primary: false })] })
+
+    expect(drawn(view.container)).toHaveLength(2)
+  })
+
+  it('draws no layer at all when the strategy marked none', () => {
+    // A swing setup. The chart must be an ordinary chart, not an empty overlay.
+    const view = draw({ zones: [] })
+
+    expect(view.container.querySelector('svg')).toBeNull()
+  })
+
+  it('fills a region still standing and leaves a taken one as an outline', () => {
+    // His rule, on screen: a mitigated region stops competing with the ones still in play, but
+    // stays visible — where a region died is what explains a stretch the strategy sat out.
+    const live = drawn(draw({ zones: [zone({ mitigated_at: null })] }).container)[0]
+    cleanup()
+    const taken = drawn(draw({ zones: [zone()] }).container)[0]
+
+    expect(live?.getAttribute('fill')).not.toBe('none')
+    expect(taken?.getAttribute('fill')).toBe('none')
+  })
+
+  it('dashes a secondary region, so the allow_secondary flag is visible', () => {
+    const primary = drawn(draw({ zones: [zone({ primary: true })] }).container)[0]
+    cleanup()
+    const secondary = drawn(draw({ zones: [zone({ primary: false })] }).container)[0]
+
+    expect(primary?.getAttribute('stroke-dasharray')).toBeNull()
+    expect(secondary?.getAttribute('stroke-dasharray')).toBe('4 3')
+  })
+
+  it('thickens the edge price has to come back to, which differs by side', () => {
+    // The second encoding, and it is not decoration: the up and down hues separate by only
+    // ΔE 7.5 under deuteranopia. It is also the price the limit order rests at — a demand
+    // region is entered at its top, a supply region at its bottom.
+    const demand = draw({ zones: [zone({ kind: 'demand' })] }).container.querySelector('svg line')
+    cleanup()
+    const supply = draw({ zones: [zone({ kind: 'supply' })] }).container.querySelector('svg line')
+
+    // 106 and 104 on a 100-110 scale over 300px: y = 120 and y = 180.
+    expect(demand?.getAttribute('y1')).toBe('120')
+    expect(supply?.getAttribute('y1')).toBe('180')
+  })
+
+  it('follows the chart as it is panned, and lets go on unmount', () => {
+    // The rectangles live in pixel space, so they are meaningless until re-measured. A layer
+    // that subscribed and never unsubscribed would keep measuring a chart that is gone.
+    const view = draw({ zones: [zone()] })
+    expect(subscribeRange).toHaveBeenCalledTimes(1)
+
+    view.unmount()
+
+    expect(unsubscribeRange).toHaveBeenCalledTimes(1)
+  })
+
+  it('draws nothing while the chart cannot say what is visible', () => {
+    // Before the first layout there is no range, and rectangles placed against a missing one
+    // would all land at the origin — a stack of zones in the corner, which reads as data.
+    getVisibleRange.mockReturnValueOnce(null as never)
+
+    const view = draw({ zones: [zone()] })
+
+    expect(view.container.querySelector('svg')).toBeNull()
   })
 })

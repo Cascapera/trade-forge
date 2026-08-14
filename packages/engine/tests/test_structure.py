@@ -39,7 +39,7 @@ from tradeforge_engine.structure import (
     _Region,
     _WedgeTracker,
 )
-from tradeforge_engine.testing import BULLISH_START, HOUR, START, bar
+from tradeforge_engine.testing import BULLISH_START, GAPPING_IMPULSE, HOUR, START, bar
 
 
 def _run(detector: SwingDetector, candles: list[Candle]) -> list[tuple[int, Swing]]:
@@ -1702,31 +1702,11 @@ def test_an_outside_bar_cannot_open_the_zig_zag() -> None:
 
 # --- Order blocks -------------------------------------------------------------------------------
 #
-# The author's validated example, with three bars in front to set up the break. Bars 0-2 leave a
-# top at 123 and two corrections that arm it; bars 3-9 are the impulse that breaks it, and inside
-# that impulse the gaps come in two events separated by a pause:
-#
-#   bar 3  high 100  low  98  ┐
-#   bar 4  high 105  low 103  │ gap A: 100 < 102  (confirms on bar 5)
-#   bar 5  high 110  low 102  ┘
-#   bar 6  high 115  low 107    gap B: 105 < 107  (confirms on bar 6) -- adjacent to A, same event
-#   bar 7  high 117  low 110    no gap: 110 < 110 is not strict      -- THE PAUSE
-#   bar 8  high 118  low 112    no gap
-#   bar 9  high 125  low 120    gap C: 117 < 120  (confirms on bar 9) -- a second event
-#
-# So two zones, not three: A and B are one continuous push.
-_OB_IMPULSE = [
-    bar(0, open_="122", close="122", high="123", low="120"),  # top 123
-    bar(1, open_="119", close="119", high="122", low="118"),  # correction 1
-    bar(2, open_="117", close="117", high="121", low="116"),  # correction 2 -> armed
-    bar(3, open_="99", close="99", high="100", low="98"),  # impulse starts; origin low 98
-    bar(4, open_="104", close="104", high="105", low="103"),
-    bar(5, open_="108", close="108", high="110", low="102"),  # gap A
-    bar(6, open_="113", close="113", high="115", low="107"),  # gap B
-    bar(7, open_="112", close="112", high="117", low="110"),  # pause
-    bar(8, open_="116", close="118", high="119", low="112"),  # pause; closes clear of 117
-    bar(9, open_="124", close="124", high="125", low="120"),  # gap C, and close 124 > 123 -> BOS
-]
+# The author's validated example — three bars to set up the break, then the impulse that breaks it
+# while leaving two gap events separated by a pause. The bar-by-bar reading of why it marks two
+# regions and not three is on the fixture itself, in `tradeforge_engine.testing`; it moved there
+# when the API's route tests came to need the same scenario.
+_OB_IMPULSE = GAPPING_IMPULSE
 
 
 def _zones(candles: list[Candle]) -> list[tuple[int, OrderBlock]]:
@@ -2172,3 +2152,53 @@ def _grid_candle(index: int, prices: tuple[str, str, str, str]) -> Candle:
         high=max(values),
         low=min(values),
     )
+
+
+def test_the_stamp_is_the_bar_that_took_the_zone_not_the_last_one_to_visit() -> None:
+    """⚠️ The whole subtlety of carrying a time alongside the boolean.
+
+    `mitigated` is folded forward with `or`, so once true it stays true through every later bar —
+    including the many that also reach the edge, because price ranges around a level it has just
+    worked. A stamp written on the same terms ("if it is reached, record this bar") would keep
+    moving to the most recent visit.
+
+    Nothing about the run's decisions would change: `usable` only reads the boolean. What changes
+    is the picture. The chart draws a region from the bar that marked it to the bar that took it,
+    so the rectangle's length is *how long the region stood* — and a stamp that crept forward
+    would draw a zone as having survived until the last time price happened to be there, which
+    across a range is many bars past the touch that actually killed it. A longer rectangle is not
+    an obviously wrong one.
+
+    Three visits here, and only the first may be recorded.
+    """
+    tracked = _live(
+        _demand_90_100(),
+        [
+            bar(0, open_="105", close="104", high="106", low="100"),  # takes it, at the edge
+            bar(1, open_="104", close="103", high="105", low="98"),  # deep inside, later
+            bar(2, open_="103", close="106", high="107", low="95"),  # deeper still, later again
+        ],
+    )
+
+    assert tracked.mitigated
+    assert tracked.mitigated_at == _at(0)
+
+
+def test_a_zone_nothing_came_back_to_carries_no_time_at_all() -> None:
+    """`None` is "still standing", not "unknown" — and it is what tells a chart to extend the
+    rectangle to its own right edge rather than closing it at some invented bar."""
+    tracked = _live(_demand_90_100(), [bar(0, open_="105", close="112", high="115", low="104")])
+
+    assert not tracked.mitigated
+    assert tracked.mitigated_at is None
+
+
+def test_the_stamp_and_the_flag_are_set_by_the_same_bar() -> None:
+    """They are two readings of one event, and a scenario where they disagree is a bug in one of
+    them. Sampled on the exact boundary, where a `<` against a `<=` would separate the pair."""
+    grazed = _live(_demand_90_100(), [bar(0, open_="105", close="104", high="106", low="100.01")])
+    assert (grazed.mitigated, grazed.mitigated_at) == (False, None)
+
+    touched = _live(_demand_90_100(), [bar(0, open_="105", close="104", high="106", low="100")])
+    assert touched.mitigated
+    assert touched.mitigated_at == _at(0)

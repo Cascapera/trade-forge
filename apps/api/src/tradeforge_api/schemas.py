@@ -19,6 +19,7 @@ from decimal import Decimal
 from typing import Annotated, Any
 
 from pydantic import (
+    AfterValidator,
     AliasChoices,
     BaseModel,
     ConfigDict,
@@ -29,6 +30,31 @@ from pydantic import (
 
 # A Decimal that always serialises to a string. Applied to every monetary/ratio field below.
 Money = Annotated[Decimal, PlainSerializer(str, return_type=str)]
+
+
+def _storable(value: str) -> str:
+    """Refuse a string Postgres cannot hold, which is exactly one character: NUL.
+
+    ⚠️ Not a guess at what a symbol looks like. Broker symbols are genuinely strange —
+    `EURUSD.raw`, `#AAPL`, `US500.cash` — so a pattern invented here would refuse real
+    instruments to catch a fuzzer. The **one** constraint that is a fact rather than a taste is
+    that a text column cannot store a NUL byte: Postgres raises `DataError` from inside the
+    driver, and a value a client fully controls turns into a 500.
+
+    Found by schemathesis drawing `?symbol=%00` for the first time, on a route that had been
+    green for weeks — the same way the `offset` bigint overflow was found. Both are the same
+    shape: a parameter whose whole range was never actually tried.
+    """
+    # `chr(0)` rather than the escape, so nothing that edits this file can turn the escape into
+    # an actual NUL — which is precisely what happened while writing it, and Python then refuses
+    # to parse its own source.
+    if chr(0) in value:
+        raise ValueError("must not contain a NUL byte")
+    return value
+
+
+Symbol = Annotated[str, AfterValidator(_storable)]
+"""An instrument symbol as it arrives from a client, refused only where the database would."""
 
 
 class _Out(BaseModel):
@@ -82,7 +108,7 @@ class CreateBacktestRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     strategy_id: uuid.UUID
-    symbol: str
+    symbol: Symbol
     timeframe: str
     date_from: dt.datetime
     date_to: dt.datetime
@@ -466,7 +492,7 @@ class CreateBasketRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     strategy_id: uuid.UUID
-    symbols: list[str] = Field(min_length=_MIN_SYMBOLS, max_length=_MAX_SYMBOLS)
+    symbols: list[Symbol] = Field(min_length=_MIN_SYMBOLS, max_length=_MAX_SYMBOLS)
     timeframe: str
     date_from: dt.datetime
     date_to: dt.datetime
@@ -575,7 +601,7 @@ class CreateStudyRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     strategy_id: uuid.UUID
-    symbol: str
+    symbol: Symbol
     timeframe: str
     date_from: dt.datetime
     date_to: dt.datetime

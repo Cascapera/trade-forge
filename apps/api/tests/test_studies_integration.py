@@ -28,7 +28,14 @@ from sqlalchemy.orm import Session
 
 from tradeforge_api.config import Settings
 from tradeforge_api.main import create_app
-from tradeforge_db.models import Backtest, BacktestStatus, Instrument, Strategy, Study
+from tradeforge_db.models import (
+    Backtest,
+    BacktestMetrics,
+    BacktestStatus,
+    Instrument,
+    Strategy,
+    Study,
+)
 from tradeforge_engine.domain import AssetClass
 
 pytestmark = pytest.mark.integration
@@ -44,7 +51,7 @@ class _CapturingQueue:
     def __init__(self) -> None:
         self.jobs: list[tuple[str, tuple[Any, ...]]] = []
 
-    async def enqueue_job(self, function: str, *args: Any) -> None:
+    async def enqueue_job(self, function: str, *args: Any, **options: Any) -> None:
         self.jobs.append((function, args))
 
 
@@ -358,6 +365,77 @@ def test_a_point_is_labelled_the_same_way_whether_it_is_created_or_read_back(
     assert read_back["points"][0]["label"] == "period=5, breakeven_at_r=1.0"
 
 
+def test_the_summary_names_its_best_point_the_way_the_points_are_named(
+    session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+) -> None:
+    """⚠️ The third place a label is produced, and the one that got it wrong.
+
+    `points[].label` and `aggregate.best_label` are two answers to "which combination is this",
+    and a reader's whole use for the second is to find the first. Served as the *stored
+    strategy's* name — `MME9 for the grid [period=20, …]` against `period=20, …` — they never
+    match, and a screen highlighting the best point highlights nothing.
+
+    Neither existing suite could see it. The unit tests hand `_aggregate` a label and assert
+    what comes back, which proves the function and says nothing about its caller; the test
+    above compares the creation body with the read body and never looks at the summary. This
+    one closes the loop by asserting the summary against the points in the **same** response.
+
+    Metrics are written by hand because the runs are only queued here — the point is the
+    naming, and waiting for six backtests to execute would test the worker instead.
+    """
+    seeding = session_factory()
+    _seed_instruments(seeding)
+    seeding.close()
+
+    with TestClient(_app(settings, session_factory, tmp_path)) as client:
+        created = _launch(client)
+
+        session = session_factory()
+        try:
+            # Ascending profits in grid order, so the best is the last point and the worst the
+            # first — an arrangement where naming them backwards would also be visible.
+            for at, point in enumerate(created["points"]):
+                run = session.get(Backtest, uuid.UUID(point["backtest_id"]))
+                assert run is not None
+                run.status = BacktestStatus.DONE
+                net = Decimal(at * 100 - 200)
+                session.add(
+                    BacktestMetrics(
+                        backtest_id=run.id,
+                        # The table enforces `net = gross_profit + gross_loss`, with the two
+                        # signed. Writing a net that does not balance would be a row the engine
+                        # can never produce, and the fixture would be describing an impossible
+                        # run to make a point about naming.
+                        net_profit=net,
+                        gross_profit=max(net, Decimal(0)),
+                        gross_loss=min(net, Decimal(0)),
+                        total_trades=0,
+                        long_trades=0,
+                        short_trades=0,
+                        win_rate=Decimal(0),
+                        max_drawdown_abs=Decimal(0),
+                        max_drawdown_pct=Decimal(0),
+                        max_dd_duration_days=0,
+                        # NOT NULL, and the column is honest to insist: a run that finished
+                        # produced a curve, even a flat one. Empty is the shape of a run that
+                        # took no trades, which is what these hand-written rows describe.
+                        equity_curve=[],
+                    )
+                )
+            session.commit()
+        finally:
+            session.close()
+
+        read_back = client.get(f"/studies/{created['id']}").json()
+
+    labels = [point["label"] for point in read_back["points"]]
+    assert read_back["aggregate"]["best_label"] in labels
+    assert read_back["aggregate"]["worst_label"] in labels
+    # And they are the right ends of it, so the pair cannot pass by being named backwards.
+    assert read_back["aggregate"]["best_label"] == labels[-1]
+    assert read_back["aggregate"]["worst_label"] == labels[0]
+
+
 def test_the_grid_is_served_back_because_it_cannot_be_recovered_from_the_runs(
     session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
 ) -> None:
@@ -409,3 +487,74 @@ def test_an_unknown_study_is_a_404(
         response = client.get(f"/studies/{uuid.uuid4()}")
 
     assert response.status_code == 404
+
+
+def test_a_study_refuses_a_request_it_cannot_run_and_says_which_part(
+    session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+) -> None:
+    """The three refusals before the grid is even looked at, none of which had a test.
+
+    They were the last uncovered lines of `create_study`, and the symbol one is the reason it
+    matters: delete that check and the next line reads `instrument.id` off `None`, which is an
+    `AttributeError` and therefore a **500** on an ordinary typo.
+
+    Asserted with their messages rather than only their status, because all three are 422 and a
+    test that checked the number alone would pass with any two of them deleted.
+    """
+    seeding = session_factory()
+    _seed_instruments(seeding)
+    seeding.close()
+
+    with TestClient(_app(settings, session_factory, tmp_path)) as client:
+        created = client.post("/strategies", json=_strategy())
+        strategy_id = created.json()["id"]
+        before = _counts(session_factory)
+
+        unknown_symbol = client.post("/studies", json=_body(strategy_id, symbol="NOPE"))
+        bad_timeframe = client.post("/studies", json=_body(strategy_id, timeframe="H7"))
+        # Past `date_to`, not equal to it: the rule is `date_to >= date_from`, so a window of
+        # zero length is legal and would have passed while proving nothing.
+        backwards = client.post(
+            "/studies",
+            json=_body(strategy_id, date_from=(START + 200 * HOUR).isoformat()),
+        )
+        missing_strategy = client.post("/studies", json=_body(str(uuid.uuid4())))
+
+    assert unknown_symbol.status_code == 422
+    assert unknown_symbol.json()["detail"] == "unknown symbol: NOPE"
+    assert bad_timeframe.status_code == 422
+    assert backwards.status_code == 422
+    assert backwards.json()["detail"] == "date_to precedes date_from"
+    assert missing_strategy.status_code == 404
+    # None of the four wrote anything.
+    assert _counts(session_factory) == before
+
+
+@pytest.mark.parametrize("symbol", ["EURUSD.raw", "#AAPL", "US500.cash"])
+def test_a_strange_but_legal_symbol_reaches_the_handler(
+    session_factory: Callable[[], Session],
+    settings: Settings,
+    tmp_path: Path,
+    symbol: str,
+) -> None:
+    """⚠️ The half of the NUL guard that keeps it from growing an opinion.
+
+    Broker symbols are genuinely strange — this project's own collector has met `EURUSD.raw`
+    and a broker whose whole tree is `05Stocks2`. A pattern invented to catch a fuzzer would
+    refuse real instruments, and the refusal would look exactly like a validation rule someone
+    meant.
+
+    The assertion is the **message**, not the status: an unknown symbol and a malformed one are
+    both 422 here, and only the body says which happened. `unknown symbol` is the handler
+    talking, which is the proof that validation let it through.
+    """
+    seeding = session_factory()
+    _seed_instruments(seeding)
+    seeding.close()
+
+    with TestClient(_app(settings, session_factory, tmp_path)) as client:
+        created = client.post("/strategies", json=_strategy())
+        response = client.post("/studies", json=_body(created.json()["id"], symbol=symbol))
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == f"unknown symbol: {symbol}"

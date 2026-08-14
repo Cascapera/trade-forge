@@ -41,7 +41,7 @@ class _CapturingQueue:
     def __init__(self) -> None:
         self.jobs: list[tuple[str, tuple[Any, ...]]] = []
 
-    async def enqueue_job(self, function: str, *args: Any) -> None:
+    async def enqueue_job(self, function: str, *args: Any, **options: Any) -> None:
         self.jobs.append((function, args))
 
 

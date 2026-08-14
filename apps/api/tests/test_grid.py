@@ -228,3 +228,35 @@ def test_a_point_is_named_by_what_makes_it_different() -> None:
     [point] = expand(_BASE, {"setup.params.period": [9]})
 
     assert named("MME9 breakout", point) == "MME9 breakout [period=9]"
+
+
+def test_an_axis_can_replace_a_whole_list_element() -> None:
+    """The last segment being a list index, which no other test reaches.
+
+    `indicators.0.params.period` walks *through* a list and lands in a dict; `indicators.0`
+    lands on the list itself, which is the only shape that exercises writing and reading by
+    position. A grid over it swaps one indicator for another wholesale — coarse, but the DSL
+    permits it and the substitution has to be right or a study would run documents nobody asked
+    for.
+    """
+    points = expand(
+        _DSL,
+        {"indicators.0": [{"id": "fast", "type": "EMA", "params": {"period": 2}}]},
+    )
+
+    [point] = points
+    assert point.document["indicators"][0]["type"] == "EMA"
+    # And the sibling is untouched, so the write went to the named index rather than to the list.
+    assert point.document["indicators"][1]["type"] == "SMA"
+
+
+@pytest.mark.parametrize("path", ["", ".", "setup..params", "setup.params."])
+def test_a_malformed_path_is_refused_before_anything_is_walked(path: str) -> None:
+    """The grid's keys are raw strings from a client, so the empty segment is reachable input.
+
+    Untested until now, and the failure without it is not a refusal: an empty segment would be
+    looked up as a key, miss, and produce a message about the strategy having nothing at `''` —
+    which reads as a fact about the strategy rather than as a malformed request.
+    """
+    with pytest.raises(GridError, match="not a path into a strategy document"):
+        expand(_BASE, {path: [1, 2]})

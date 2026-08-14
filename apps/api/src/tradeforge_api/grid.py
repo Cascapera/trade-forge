@@ -156,7 +156,13 @@ def _copy(value: Json) -> Json:
 
 
 def _check_axes(document: Mapping[str, Any], grid: Mapping[str, Sequence[Any]]) -> None:
-    """Refuse a grid before expanding it — every axis reachable, populated, and not constant."""
+    """Refuse a grid before expanding it — every axis reachable, populated, distinct.
+
+    ⚠️ A **single-valued** axis is deliberately allowed, and this docstring used to claim
+    otherwise. `{"period": [9], "rr": [2, 3]}` is a perfectly good study: it pins one parameter
+    while searching another, which is how a reader isolates one axis of a grid they have already
+    looked at. Refusing it would make a two-axis study impossible to narrow.
+    """
     if not grid:
         raise GridError("a study needs at least one parameter to vary")
 

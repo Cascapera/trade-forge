@@ -22,6 +22,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, status
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
 from tradeforge_api.deps import QueueDep, SessionDep
@@ -234,15 +235,42 @@ async def create_study(
         for strategy in strategies
     ]
     session.add_all(runs)
-    session.commit()
-    for run in runs:
-        session.refresh(run)
+    try:
+        session.commit()
+    except IntegrityError as exc:
+        # ⚠️ Two identical grids launched at the same moment. Both read `existing` before either
+        # wrote, so both build the same `(name, version)` and the loser blocks on the unique
+        # index until the winner commits — then raises. Measured, not theorised: the window runs
+        # from the SELECT to the COMMIT, which is about half a second for five hundred points.
+        #
+        # The rollback is total, so nothing is left half-written; what was missing was a reply a
+        # caller can act on. 409 is the same answer `strategies._persist` gives to the same
+        # collision one layer down, which is why this is the shape rather than a retry: the
+        # honest thing to tell a client is that the strategies it needs were created a moment
+        # ago by someone else, and asking again will find and reuse them.
+        session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="another study created these strategies at the same time; try again",
+        ) from exc
+
+    # ⚠️ No `session.refresh` loop here, and its absence is deliberate. The session is built with
+    # `expire_on_commit=False` and the ids are UUIDs generated in Python, so every field this
+    # response reads — `id`, `strategy_id`, `status` — is already on the object. Refreshing would
+    # be one SELECT per point: five hundred sequential round trips, on the event loop, buying
+    # nothing.
 
     # After the commit, exactly as the single-run endpoint does it: a worker is fast enough to
     # claim a job before an uncommitted row is visible, and would then fail looking up a
     # backtest that does exist.
+    #
+    # ⚠️ `_job_id` is the run's own id, which makes the enqueue **idempotent**. This loop is the
+    # one part of the request that is not inside the transaction: if it dies at point k, the
+    # study and all N runs are committed while the rest sit `queued` for ever. With the job id
+    # derived from the run, re-sending the same study's jobs is safe — arq drops a duplicate —
+    # so recovery is a retry rather than an archaeology exercise.
     for run in runs:
-        await queue.enqueue_job(RUN_BACKTEST, str(run.id))
+        await queue.enqueue_job(RUN_BACKTEST, str(run.id), _job_id=str(run.id))
 
     return CreatedStudy(
         id=study.id,
@@ -346,8 +374,12 @@ def get_study(study_id: uuid.UUID, session: SessionDep) -> StudyOut:
     # Each run's coordinates, read back out of the document that actually ran. Not parsed from
     # the strategy's name: a name is a caption, and splitting one on commas and equals signs
     # works until a value contains either.
+    # ⚠️ `_at` rather than `value_at` directly, because `_coordinates` below spends three
+    # sentences explaining why an unknown value sorts last instead of raising — and `value_at`,
+    # which runs first, would have raised for the same class of hand-edited row. Two guards over
+    # one hazard have to agree; the reading endpoint defends, so both defend.
     placed = [
-        (run, strategy, {path: value_at(strategy.definition, path) for path in grid})
+        (run, strategy, {path: _at(strategy.definition, path) for path in grid})
         for run, strategy in rows
     ]
     placed.sort(key=lambda row: _coordinates(grid, row[2]))
@@ -363,8 +395,14 @@ def get_study(study_id: uuid.UUID, session: SessionDep) -> StudyOut:
         initial_capital=study.initial_capital,
         created_at=study.created_at,
         grid=grid,
+        # ⚠️ `label_for(values)`, not `strategy.name`. The stored name carries the base
+        # strategy's name in front of the values — `MME9 [period=20]` — and serving that here
+        # while `points[].label` serves `period=20` leaves a client unable to match the best
+        # point to any point. It is the same defect `label_for` was extracted to close, reopened
+        # one call site over, and neither suite saw it: the unit tests pass the label *into*
+        # `_aggregate`, so they prove the function rather than its caller.
         aggregate=_aggregate(
-            [(run, strategy.name) for run, strategy, _ in placed], study.initial_capital
+            [(run, label_for(values)) for run, _, values in placed], study.initial_capital
         ),
         points=[
             StudyPointOut(
@@ -381,6 +419,20 @@ def get_study(study_id: uuid.UUID, session: SessionDep) -> StudyOut:
             for run, strategy, _ in placed
         ],
     )
+
+
+def _at(document: dict[str, Any], path: str) -> Any:  # noqa: ANN401
+    """The value a stored document holds at `path`, or `None` if it holds nothing there.
+
+    `None` rather than an exception: the path comes from `studies.grid`, which is a row someone
+    could edit, and a study whose grid names a parameter its documents lack is a study that can
+    still be read — every other point places, and the odd one out sorts to the end. A reporting
+    endpoint that 500s on a surprising value is worse than one that shows what it has.
+    """
+    try:
+        return value_at(document, path)
+    except GridError:
+        return None
 
 
 def _coordinates(grid: dict[str, list[Any]], values: dict[str, Any]) -> tuple[int, ...]:

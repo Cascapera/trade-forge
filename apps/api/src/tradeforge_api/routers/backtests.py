@@ -33,6 +33,7 @@ from tradeforge_api.schemas import (
     OverlaySeriesOut,
     OverlaysOut,
     SnapshotOut,
+    Symbol,
     TradeOut,
     TradesPage,
     ZoneOut,
@@ -255,7 +256,9 @@ def list_backtests(  # noqa: PLR0913 — one filter per column a run is chosen b
     # instead of the default value, which is what FastAPI now recommends and what keeps the
     # status filter out of B008. It has to be spelled `status` on the wire and cannot be named
     # that here, because `fastapi.status` is already in scope for the response codes.
-    symbol: Annotated[str | None, Query(description="exact instrument symbol, e.g. EURUSD")] = None,
+    symbol: Annotated[
+        Symbol | None, Query(description="exact instrument symbol, e.g. EURUSD")
+    ] = None,
     timeframe: Annotated[str | None, Query(description="exact timeframe, e.g. H1")] = None,
     run_status: Annotated[BacktestStatus | None, Query(alias="status")] = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,

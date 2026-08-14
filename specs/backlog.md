@@ -437,3 +437,13 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
   afirma o caso **pelo seu próprio nome** — construí-lo custa um probe novo sobre o
   `GAPPING_IMPULSE` com a janela cortada na barra 9. Fazer junto do próximo trabalho que já for
   tocar a marcação de regiões.
+- [origem: PR-203] **`_key` diverge em float ≥ 1e16 e a reutilização de estratégia falha em
+  silêncio** — o estudo compara documentos por `json.dumps(sort_keys=True)` para reusar a linha
+  já existente em vez de colidir no `unique(name, version)`. Medido no round-trip real por
+  `::jsonb`: `0.1`, `2.0`, `3.30`, `1e-07` e inteiros de 20 dígitos batem byte a byte, mas a
+  partir de `1e16` o Python escreve `1e+16` e o Postgres devolve `10000000000000000` — as duas
+  cadeias diferem, a reutilização não acontece, e o ponto vira **versão N+1 de uma linhagem
+  nova sem que nada dê erro**. Não é alcançável hoje: todo parâmetro numérico do DSL tem teto
+  (`le=1000`, `le=100`, `le=10_000`), e o único float sem teto é `Condition.value`
+  (`packages/schema/.../models.py:80`). Consertar comparando por JSONB do lado do banco, ou pôr
+  teto no `Condition.value`, no dia em que uma grade puder varrer esse campo.

@@ -25,7 +25,14 @@ class JobQueue(Protocol):
     this rather than on `ArqRedis` keeps the handlers testable — the real pool and the test
     fakes both satisfy it structurally, so a test can inject a recorder in the pool's place."""
 
-    async def enqueue_job(self, function: str, *args: object) -> object: ...
+    async def enqueue_job(self, function: str, *args: object, **options: object) -> object: ...
+
+    """⚠️ `**options` is not decoration: arq's own `enqueue_job` takes keyword options, and
+    `_job_id` is the one that matters here. A job id derived from the row it runs makes an
+    enqueue **idempotent**, so a request that dies partway through queueing N jobs can be
+    retried rather than reconciled by hand. A protocol that omitted them would be narrower than
+    the thing it describes, and the narrowing would only ever be discovered by a caller that
+    needed one."""
 
 
 def redis_settings(settings: RedisConfig) -> RedisSettings:

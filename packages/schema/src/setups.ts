@@ -37,7 +37,11 @@ export type SetupParam =
       /** Whether an explicit `null` is a legal value — "off", not "unset". */
       nullable: boolean
       min?: number
+      /** The bound is `> min`, not `>= min`. A form that ignores this offers a refused value. */
+      minExclusive?: boolean
       max?: number
+      /** The bound is `< max`, not `<= max`. */
+      maxExclusive?: boolean
     }
   | { name: string; kind: 'boolean'; required: boolean; default: boolean }
 
@@ -60,6 +64,7 @@ interface Node {
   minimum?: number
   maximum?: number
   exclusiveMinimum?: number
+  exclusiveMaximum?: number
   properties?: Record<string, Node>
   required?: readonly string[]
   discriminator?: { propertyName: string; mapping: Record<string, string> }
@@ -117,7 +122,13 @@ export function readSetups(root: unknown): readonly SetupSpec[] {
       return { name, kind: 'boolean', required, default: fallback === true }
     }
     if (branch.type === 'integer' || branch.type === 'number') {
+      // ⚠️ `exclusiveMinimum` is carried as its own flag, never folded into `minimum`. It used
+      // to be `minimum ?? exclusiveMinimum`, which turned "greater than 0" into "at least 0" —
+      // and every form built on this then offered a value the API refuses. Reported from the
+      // screen as a 422 on a study whose `breakeven_at_r` axis started at 0, which is exactly
+      // what the hint had said was legal.
       const min = branch.minimum ?? branch.exclusiveMinimum
+      const max = branch.maximum ?? branch.exclusiveMaximum
       return {
         name,
         kind: branch.type,
@@ -125,7 +136,13 @@ export function readSetups(root: unknown): readonly SetupSpec[] {
         default: typeof fallback === 'number' ? fallback : null,
         nullable,
         ...(min === undefined ? {} : { min }),
-        ...(branch.maximum === undefined ? {} : { max: branch.maximum }),
+        ...(branch.minimum === undefined && branch.exclusiveMinimum !== undefined
+          ? { minExclusive: true }
+          : {}),
+        ...(max === undefined ? {} : { max }),
+        ...(branch.maximum === undefined && branch.exclusiveMaximum !== undefined
+          ? { maxExclusive: true }
+          : {}),
       }
     }
     throw new Error(`setup parameter ${name} has a kind no form control can hold: ${String(branch.type)}`)

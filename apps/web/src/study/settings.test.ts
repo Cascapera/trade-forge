@@ -1,10 +1,13 @@
 import { describe, expect, it } from 'vitest'
 
+import { ApiError } from '../api/client'
+
 import {
   axesOf,
   combinationCount,
   emptyStudyForm,
   parseValues,
+  launchFailure,
   studyLabel,
   toStudyRequest,
   whyNotLaunchable,
@@ -182,5 +185,47 @@ describe('studyLabel', () => {
     )
 
     expect(label).toBe('AAPL H1 · period, rr')
+  })
+})
+
+describe('launchFailure', () => {
+  it("shows the server's sentence, not the status it arrived with", () => {
+    // ⚠️ `ApiError.message` is built from the status alone — "API error 422" — which is the one
+    // thing a reader cannot act on. The reasons the server sends are specific by design, and
+    // each is the sentence that says what to change.
+    const refused = new ApiError(422, "'setup.params.periodd': this strategy has nothing at it")
+
+    expect(launchFailure(refused)).toBe(
+      "'setup.params.periodd': this strategy has nothing at it",
+    )
+  })
+
+  it('reads the DSL validator body, which is the other shape a refusal takes', () => {
+    // A path that resolves but a *value* that does not is refused by a different validator, and
+    // it answers with a structure rather than a sentence. This is the more confusing of the two
+    // to meet blind, so it is the one that most needs unpacking.
+    const refused = new ApiError(422, {
+      message: 'strategy failed schema validation',
+      errors: [
+        {
+          loc: ['setup', 'mme9_breakout', 'params', 'breakeven_at_r'],
+          msg: 'Input should be greater than 0',
+        },
+      ],
+    })
+
+    expect(launchFailure(refused)).toBe(
+      'strategy failed schema validation: breakeven_at_r input should be greater than 0',
+    )
+  })
+
+  it('keeps the message of an error that is not the API refusing', () => {
+    // The network dying is not a validation problem, and its own message is the only thing that
+    // knows what happened. Swallowing it would send a reader to fix a form that was fine.
+    expect(launchFailure(new Error('Failed to fetch'))).toBe('Failed to fetch')
+  })
+
+  it('says something usable even for a shape it does not recognise', () => {
+    expect(launchFailure({ weird: true })).toMatch(/Check the parameters/)
   })
 })

@@ -210,3 +210,27 @@ describe('reading a schema that is not the one we generate', () => {
     expect(readSetups(withEnum)[0]?.params[0]).toMatchObject({ kind: 'enum', default: null })
   })
 })
+
+describe('exclusive bounds', () => {
+  it('does not report an exclusive minimum as an inclusive one', () => {
+    // ⚠️ The defect this closes, met on screen rather than in a test. `breakeven_at_r` is `gt=0`
+    // in the DSL; the spec used to fold that into `minimum: 0`, so every form built on it
+    // offered zero — the strategy builder's number input as well as the study's parameter hint.
+    // The reader typed `0` meaning "no breakeven" and the API refused it, which is the right
+    // refusal of a value the screen should never have suggested. Zero is not "off" here; null is.
+    const [breakeven] = setupSpec('mme9_breakout').params.filter(
+      (param) => param.name === 'breakeven_at_r',
+    )
+
+    expect(breakeven).toMatchObject({ kind: 'number', min: 0, minExclusive: true })
+  })
+
+  it('leaves an inclusive minimum unflagged, so the two stay tellable apart', () => {
+    // The pair is the test. Flagging everything exclusive would be just as wrong and would pass
+    // the assertion above on its own.
+    const [period] = setupSpec('mme9_breakout').params.filter((param) => param.name === 'period')
+
+    expect(period).toMatchObject({ kind: 'integer', min: 1 })
+    expect(period).not.toHaveProperty('minExclusive')
+  })
+})

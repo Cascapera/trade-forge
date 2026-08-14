@@ -25,7 +25,7 @@ describe('axesFor', () => {
       (axis) => axis.path === 'setup.params.period',
     )
 
-    expect(period?.hint).toBe('whole numbers between 1 and 1000, separated by commas')
+    expect(period?.hint).toBe('whole numbers at least 1 and at most 1000, separated by commas')
   })
 
   it('lists the choices for a parameter that has them', () => {
@@ -89,5 +89,28 @@ describe('axesFor', () => {
     )
 
     expect(buffer?.example).toBe('0.05, 0.1, 0.15')
+  })
+
+  it('says greater-than when the bound is exclusive, because at-least is a lie', () => {
+    // ⚠️ **This is the bug a reader actually met.** `breakeven_at_r` is `gt=0` in the DSL, and
+    // the spec used to fold that into `minimum: 0` — so the hint read "between 0 and 100", the
+    // reader typed `0, 1, 2, 3, 4` meaning "no breakeven", and the study came back 422 for
+    // doing exactly what the screen had suggested. Zero is not "off" here; null is.
+    const [breakeven] = axesFor('mme9_breakout').filter(
+      (axis) => axis.path === 'setup.params.breakeven_at_r',
+    )
+
+    expect(breakeven?.hint).toBe('numbers greater than 0 and at most 100, separated by commas')
+    expect(breakeven?.hint).not.toMatch(/between 0/)
+  })
+
+  it('keeps the example off an exclusive bound too', () => {
+    // The hint and the example have to agree, or the button fills in the value the sentence
+    // above it just called illegal.
+    const [breakeven] = axesFor('mme9_breakout').filter(
+      (axis) => axis.path === 'setup.params.breakeven_at_r',
+    )
+
+    expect(breakeven?.example.split(', ')).not.toContain('0')
   })
 })

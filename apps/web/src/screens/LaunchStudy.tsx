@@ -10,6 +10,7 @@ import {
   MAX_POINTS,
   combinationCount,
   emptyStudyForm,
+  launchFailure,
   studyLabel,
   toStudyRequest,
   whyNotLaunchable,
@@ -280,7 +281,7 @@ export function LaunchStudy(): React.JSX.Element {
 
         {blocked !== null && total > 0 && <p className="text-sm text-amber-300">{blocked}</p>}
         {create.isError && (
-          <p className="text-sm text-red-400">{create.error.message || 'The study was refused.'}</p>
+          <p className="text-sm text-red-400">{launchFailure(create.error)}</p>
         )}
       </form>
 

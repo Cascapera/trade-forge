@@ -4,8 +4,10 @@ import { BasketResult } from './screens/BasketResult'
 import { LaunchBacktest } from './screens/LaunchBacktest'
 import { LaunchBasket } from './screens/LaunchBasket'
 import { Results } from './screens/Results'
+import { LaunchStudy } from './screens/LaunchStudy'
 import { RunLog } from './screens/RunLog'
 import { StrategyBuilder } from './screens/StrategyBuilder'
+import { StudyResult } from './screens/StudyResult'
 import { useSession } from './store'
 
 function navClass({ isActive }: { isActive: boolean }): string {
@@ -18,6 +20,9 @@ export function App(): React.JSX.Element {
   // is exactly the reader who wants to return to it.
   const basketId = useSession((state) => state.basketId)
   const basketLabel = useSession((state) => state.basketLabel)
+  // The same thread for a study, and for the same reason: there is no `GET /studies` either.
+  const studyId = useSession((state) => state.studyId)
+  const studyLabel = useSession((state) => state.studyLabel)
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100">
@@ -28,8 +33,10 @@ export function App(): React.JSX.Element {
             {/* The first route builds a strategy and runs it in one go; the second re-runs the one
                 already saved this session over a different instrument or window, which costs no
                 new version. The third runs it over several markets at once — the question of
-                whether it travels, which no single run can answer. The fourth looks back at
-                everything already run. */}
+                whether it travels, which no single run can answer. The fourth varies the
+                strategy's own parameters instead — the same question turned inward, asking
+                whether a result is a property of the method or of the corner that was picked.
+                The fifth looks back at everything already run. */}
             <NavLink to="/" end className={navClass}>
               New backtest
             </NavLink>
@@ -39,12 +46,20 @@ export function App(): React.JSX.Element {
             <NavLink to="/basket" className={navClass}>
               Basket
             </NavLink>
+            <NavLink to="/study" className={navClass}>
+              Study
+            </NavLink>
             <NavLink to="/runs" className={navClass}>
               Run log
             </NavLink>
             {basketId !== null && (
               <NavLink to={`/baskets/${basketId}`} className={navClass}>
                 ▸ {basketLabel}
+              </NavLink>
+            )}
+            {studyId !== null && (
+              <NavLink to={`/studies/${studyId}`} className={navClass}>
+                ▸ {studyLabel}
               </NavLink>
             )}
           </nav>
@@ -56,6 +71,8 @@ export function App(): React.JSX.Element {
           <Route path="/launch" element={<LaunchBacktest />} />
           <Route path="/basket" element={<LaunchBasket />} />
           <Route path="/baskets/:id" element={<BasketResult />} />
+          <Route path="/study" element={<LaunchStudy />} />
+          <Route path="/studies/:id" element={<StudyResult />} />
           <Route path="/runs" element={<RunLog />} />
           <Route path="/results/:id" element={<Results />} />
           <Route path="*" element={<Navigate to="/" replace />} />

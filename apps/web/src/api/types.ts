@@ -402,3 +402,82 @@ export interface BasketOut {
   aggregate: BasketAggregate
   runs: BacktestListItem[]
 }
+
+/** One combination of a study's grid: the run it became, and where it sits on the axes. */
+export interface StudyPoint {
+  backtest_id: string
+  strategy_id: string
+  /** `period=9, breakeven_at_r=2.0` — what makes this point different from the others. */
+  label: string
+  /**
+   * The point's coordinates, keyed by the same dotted paths the grid declares.
+   *
+   * Place a heatmap cell from these, never from `label`: a label is a caption, and deriving
+   * coordinates by splitting one on commas and equals signs works until a value contains either.
+   */
+  values: Record<string, unknown>
+  status: BacktestStatus
+}
+
+/**
+ * What a grid says once its runs finish — dispersion, and never the maximum alone.
+ *
+ * ⚠️ A grid **always** has a best point; a grid of pure noise has a best point. Reading that
+ * number on its own is how an optimiser becomes a machine for producing convincing false
+ * results, and the wider the grid the more convincing they get. So the headline is
+ * `median_return` — what a parameter set chosen without hindsight would have returned — beside
+ * how much of the searched space works at all, with the best as one end of a range.
+ *
+ * **Every figure here is in-sample**, the best one included: these runs were scored on the same
+ * data the grid was searched over.
+ */
+export interface StudyAggregate {
+  points_total: number
+  points_finished: number
+  points_failed: number
+  points_profitable: number
+  best_label: string | null
+  best_return: string | null
+  worst_label: string | null
+  worst_return: string | null
+  /** Null until at least one run finishes — "nothing has landed yet", never a measured zero. */
+  median_return: string | null
+}
+
+export interface CreateStudyRequest {
+  strategy_id: string
+  symbol: string
+  timeframe: string
+  date_from: string
+  date_to: string
+  initial_capital: string
+  cost_model: Record<string, unknown>
+  /** Dotted paths into the strategy document, and the values to try at each. */
+  grid: Record<string, unknown[]>
+}
+
+export interface CreatedStudy {
+  id: string
+  points: StudyPoint[]
+}
+
+export interface StudyOut {
+  id: string
+  strategy_id: string
+  /** The **base** strategy's name. Each point has its own, carried on its run. */
+  strategy_name: string
+  symbol: string
+  timeframe: string
+  date_from: string
+  date_to: string
+  initial_capital: string
+  created_at: string
+  /**
+   * The axes as declared, in order. Served because it is not recoverable from the runs: each
+   * point's values survive only as text inside its strategy's name.
+   */
+  grid: Record<string, unknown[]>
+  points: StudyPoint[]
+  aggregate: StudyAggregate
+  runs: BacktestListItem[]
+}

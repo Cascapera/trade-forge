@@ -16,17 +16,25 @@ import type {
   CandlesResponse,
   CreateBacktestRequest,
   CreateBasketRequest,
+  CreateStudyRequest,
   CreatedBacktest,
   CreatedBasket,
+  CreatedStudy,
   EquityPoint,
   Instrument,
   OverlaysResponse,
   Snapshot,
   StrategyOut,
+  StudyOut,
   TradesPage,
 } from './types'
 
 const POLL_MS = 1000
+
+// A grid is up to five hundred runs on the same worker pool, so it settles on a scale of minutes
+// rather than seconds — and every response carries every run in it. Polling a study at the
+// single-run cadence would add hundreds of requests to the queue being waited on.
+const STUDY_POLL_MS = 3000
 const TERMINAL: readonly BacktestStatus[] = ['done', 'failed']
 
 export function isTerminal(status: BacktestStatus | undefined): boolean {
@@ -229,5 +237,41 @@ export function useTradeSnapshot(backtestId: string | undefined, tradeId: number
         : skipToken,
     // A recorded window never changes: it was frozen with the trade. Nothing to refetch.
     staleTime: Infinity,
+  })
+}
+
+export function useCreateStudy() {
+  return useMutation<CreatedStudy, Error, CreateStudyRequest>({
+    mutationFn: (payload) => api.createStudy(payload),
+  })
+}
+
+/**
+ * Has every point of this grid landed? — the study's version of `isTerminal`.
+ *
+ * A study has no status of its own, only N runs finishing at their own pace, so the poll stops
+ * when the **last** one does. Separate from a basket's `isSettled` because the two read different
+ * bodies: one function over a union would be a seam where a future field on one shape silently
+ * applies to the other.
+ */
+export function isStudySettled(study: StudyOut | undefined): boolean {
+  return study?.runs.every((run) => isTerminal(run.status)) ?? false
+}
+
+/**
+ * One study, polled until every point has landed.
+ *
+ * ⚠️ **The interval is longer than a basket's, and the reason is arithmetic.** A basket is a
+ * handful of runs; a grid is up to five hundred, drained by the same worker pool one after
+ * another. Polling a five-minute study at a basket's cadence would add hundreds of requests to
+ * the very queue being waited on, and each response carries every run in the study.
+ */
+export function useStudy(id: string | undefined) {
+  return useQuery<StudyOut>({
+    queryKey: ['study', id],
+    // `skipToken` rather than `enabled` plus a cast: it narrows the type for real, which is the
+    // idiom the rest of this file already uses.
+    queryFn: id === undefined ? skipToken : () => api.getStudy(id),
+    refetchInterval: (query) => (isStudySettled(query.state.data) ? false : STUDY_POLL_MS),
   })
 }

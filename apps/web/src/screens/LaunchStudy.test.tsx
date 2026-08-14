@@ -182,4 +182,50 @@ describe('LaunchStudy', () => {
 
     expect(screen.getByText(/measured on the same data it searched/)).toBeInTheDocument()
   })
+
+  it('carries a spread through as the cost every point pays', () => {
+    // One market, so one cost — and it has to be one, or the points are not comparable to each
+    // other, which is the only thing a study is for.
+    createStudy.mockResolvedValue({ id: 'study-1', points: [] })
+    renderWithProviders(<LaunchStudy />)
+
+    return (async () => {
+      await screen.findByRole('option', { name: 'AAPL' })
+      fireEvent.change(screen.getByLabelText('Market'), { target: { value: 'AAPL' } })
+      fireEvent.change(screen.getByLabelText('From'), { target: { value: '2024-01-01' } })
+      fireEvent.change(screen.getByLabelText('To'), { target: { value: '2025-01-01' } })
+      fireEvent.change(screen.getByLabelText(/Spread \(ticks\)/), { target: { value: '8' } })
+      fireEvent.change(screen.getByLabelText('Parameter 1 path'), {
+        target: { value: 'setup.params.period' },
+      })
+      fireEvent.change(screen.getByLabelText('Parameter 1 values'), { target: { value: '5, 9' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Run the study' }))
+
+      await waitFor(() => {
+        expect(createStudy).toHaveBeenCalledWith(
+          expect.objectContaining({ cost_model: { type: 'spread', spread_points: '8' } }),
+        )
+      })
+    })()
+  })
+
+  it('reports a refusal from the server instead of failing silently', async () => {
+    createStudy.mockRejectedValue(new Error('this grid expands to 900 combinations'))
+    renderWithProviders(<LaunchStudy />)
+
+    await screen.findByRole('option', { name: 'AAPL' })
+    fireEvent.change(screen.getByLabelText('Market'), { target: { value: 'AAPL' } })
+    fireEvent.change(screen.getByLabelText('From'), { target: { value: '2024-01-01' } })
+    fireEvent.change(screen.getByLabelText('To'), { target: { value: '2025-01-01' } })
+    fireEvent.change(screen.getByLabelText('Parameter 1 path'), {
+      target: { value: 'setup.params.period' },
+    })
+    fireEvent.change(screen.getByLabelText('Parameter 1 values'), { target: { value: '5, 9' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Run the study' }))
+
+    // ⚠️ The server's own words, not a generic apology: the refusals it sends are specific
+    // ("nothing at 'setup.params.periodd'", "expands to 900 combinations"), and each of them is
+    // the one sentence that tells the reader what to change.
+    expect(await screen.findByText(/900 combinations/)).toBeInTheDocument()
+  })
 })

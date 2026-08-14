@@ -140,4 +140,42 @@ describe('StudyHeatmap', () => {
 
     expect(screen.getByText(/Read the shape, not the best cell/)).toBeInTheDocument()
   })
+
+  it('says a study has nothing to draw rather than rendering an empty grid', () => {
+    // A study with no axes cannot happen through the API, which refuses an empty grid — but a
+    // heatmap that rendered a table with no rows would read as a study that found nothing,
+    // which is a different and much more alarming claim.
+    const nothing = study(['1000'], {})
+
+    renderWithProviders(<StudyHeatmap study={{ ...nothing, grid: {}, points: [] }} />)
+
+    expect(screen.getByText(/no points to draw/)).toBeInTheDocument()
+    expect(screen.queryByRole('table')).not.toBeInTheDocument()
+  })
+
+  it('says how many points it could not place instead of leaving a hole', () => {
+    // A point whose value is not on its axis cannot be positioned. Dropping it silently would
+    // leave a gap in the picture with nothing to say a cell is missing — and a gap reads as a
+    // combination that failed rather than as one the chart could not draw.
+    const base = study(['1000', '-500', '0', '2000'])
+    const stray = {
+      ...base,
+      points: base.points.map((point, at) =>
+        at === 0
+          ? { ...point, values: { 'setup.params.period': 999, 'setup.params.rr': 2 } }
+          : point,
+      ),
+    }
+
+    renderWithProviders(<StudyHeatmap study={stray} />)
+
+    expect(screen.getByText(/1 point could not be placed/)).toBeInTheDocument()
+  })
+
+  it('shows a dash for the scale when nothing has a return yet', () => {
+    renderWithProviders(<StudyHeatmap study={study([null, null, null, null])} />)
+
+    // The legend's two ends, which have no numbers to carry until something lands.
+    expect(screen.getAllByText('—').length).toBeGreaterThanOrEqual(2)
+  })
 })

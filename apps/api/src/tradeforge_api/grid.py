@@ -250,6 +250,47 @@ def value_at(document: Mapping[str, Any], path: str) -> Any:  # noqa: ANN401
     raise GridError(f"{path!r} does not name a place a value can be read from")
 
 
+def read_point(document: Mapping[str, Any], grid: Mapping[str, Sequence[Any]]) -> dict[str, Any]:
+    """Which point of `grid` a stored document is: the value it holds at each axis.
+
+    The inverse of expanding, and it exists so a reader can place a run on the grid without
+    parsing the caption it was given. Two callers need it — the study read and the walk-forward
+    read — and they need it to agree, since one places heatmap cells and the other names the
+    point a fold chose.
+
+    ⚠️ **An unreachable path yields `None` rather than raising.** The grid comes from a stored
+    row somebody could edit, and a study whose grid names a parameter its documents lack is a
+    study that can still be read: every other axis places and the odd one out sorts last. A
+    reporting endpoint that 500s on a surprising value is worse than one that shows what it has.
+    """
+    return {path: _read_or_none(document, path) for path in grid}
+
+
+def _read_or_none(document: Mapping[str, Any], path: str) -> Any:  # noqa: ANN401
+    try:
+        return value_at(document, path)
+    except GridError:
+        return None
+
+
+def coordinates(grid: Mapping[str, Sequence[Any]], values: Mapping[str, Any]) -> tuple[int, ...]:
+    """Where a point sits on the grid: one index per axis, in the order the axes were declared.
+
+    Sorting by this reproduces the order `expand` produced — last axis varying fastest — from
+    nothing but the stored grid and the documents, which is why the ordering survives a
+    re-collection, a re-read, or rows arriving in any order at all. It is also the tie-break a
+    walk-forward's `choose` uses, and the two must be the same rule: a tie broken one way here
+    and another way there would make "the best point" depend on which endpoint was asked.
+
+    An axis value the grid no longer lists sorts last rather than raising, for the reason
+    `read_point` gives.
+    """
+    return tuple(
+        list(axis).index(values[path]) if values[path] in list(axis) else len(axis)
+        for path, axis in grid.items()
+    )
+
+
 def named(base_name: str, point: GridPoint) -> str:
     """The stored name for a point's strategy: the base name plus what makes it different.
 

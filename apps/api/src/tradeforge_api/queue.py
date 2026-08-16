@@ -19,6 +19,17 @@ from tradeforge_api.config import RedisConfig
 # and the router enqueues by it — a mismatch would enqueue jobs no worker ever claims.
 RUN_BACKTEST = "run_backtest"
 
+RUN_WALK_FORWARD = "run_walk_forward"
+"""The orchestrating job: one per walk-forward, not one per run.
+
+⚠️ **A walk-forward's training runs are deliberately never enqueued.** They are written as
+`queued` rows and executed by this job, in order, inside a single worker slot. Queueing them
+too would mean two claimants for the same row, and the alternative — this job enqueuing them
+and *waiting* — deadlocks outright on one worker, because `execute_backtest` is CPU-bound and
+synchronous, so the waiter holds the only slot the runs it waits for would need. See
+`worker.process_walk_forward`.
+"""
+
 
 class JobQueue(Protocol):
     """The one capability the API needs from the queue: enqueue a job by name. Depending on

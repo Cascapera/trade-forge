@@ -482,6 +482,111 @@ export interface StudyOut {
   runs: BacktestListItem[]
 }
 
+export type SelectionMetric = 'net_profit' | 'profit_factor' | 'sharpe' | 'expectancy'
+
+export interface CreateWalkForwardRequest {
+  /**
+   * The study to re-run honestly. The only thing named, and deliberately so: the comparison
+   * this produces is "the heatmap said X, a blind choice got Y", and it only holds if both
+   * halves searched the same grid over the same market.
+   */
+  study_id: string
+  folds: number
+  /** How many times longer the training window is than the test window that follows it. */
+  train_multiple: number
+  /** `false` slides a fixed-length training window; `true` trains on all prior history. */
+  anchored: boolean
+  metric: SelectionMetric
+}
+
+/** One train→test pair: the windows, the choice, and what the choice was worth on each side. */
+export interface WalkForwardFold {
+  index: number
+  /** The training grid, with its own heatmap at `/studies/{id}`. */
+  study_id: string
+  train_from: string
+  train_to: string
+  test_from: string
+  test_to: string
+  /**
+   * The candles counted into each window. Shown because the split was cut by counting bars and
+   * expressed as dates — a reader who only saw the dates could not tell an even split from one
+   * where a holiday week halved a fold's evidence.
+   */
+  train_bars: number
+  test_bars: number
+  /**
+   * `period=9` — the point this fold selected, or null if it could not select one.
+   *
+   * ⚠️ Null is a **result**, not a pending state: nothing in the grid traded that window, or
+   * nothing that traded had a defined score. Rendering it as a blank cell would read as
+   * "still running".
+   */
+  chosen_label: string | null
+  chosen_strategy_id: string | null
+  test_backtest_id: string | null
+  /** What the chosen point returned over the window it was chosen on. The promise. */
+  in_sample_return: string | null
+  /** What it returned over the window that followed. The delivery — and the only evidence. */
+  out_of_sample_return: string | null
+  test_status: BacktestStatus | null
+  /** Read before believing the return: a fold that traded twice has a number, not a finding. */
+  test_trades: number | null
+}
+
+/**
+ * What the folds add up to.
+ *
+ * `degradation` is the headline and is normally negative: a small gap is a method that
+ * generalises, a gap that swallows the whole in-sample result is a grid that was fitting noise.
+ */
+export interface WalkForwardVerdict {
+  folds_total: number
+  folds_decided: number
+  folds_scored: number
+  folds_profitable: number
+  in_sample_median: string | null
+  out_of_sample_median: string | null
+  /** `out_of_sample_median - in_sample_median`. Null until at least one fold has both. */
+  degradation: string | null
+  /** The folds multiplied together, `Π(1 + r) - 1` — what an account would have done. */
+  compounded: string | null
+  /**
+   * How many *different* points the folds chose. 1 is the strongest evidence a grid can give;
+   * a number near `folds_decided` means there is no "the parameters" to go and trade.
+   */
+  distinct_choices: number
+}
+
+export interface CreatedWalkForward {
+  id: string
+  folds: WalkForwardFold[]
+  runs_queued: number
+}
+
+export interface WalkForwardOut {
+  id: string
+  study_id: string
+  strategy_id: string
+  strategy_name: string
+  symbol: string
+  timeframe: string
+  initial_capital: string
+  grid: Record<string, unknown[]>
+  /** The number of folds asked for, as against the rows in `folds`. They agree. */
+  folds_requested: number
+  train_multiple: number
+  anchored: boolean
+  metric: SelectionMetric
+  status: BacktestStatus
+  error: string | null
+  created_at: string
+  started_at: string | null
+  finished_at: string | null
+  folds: WalkForwardFold[]
+  verdict: WalkForwardVerdict
+}
+
 /** One row of the strategy picker: enough to choose between lineages without opening any. */
 export interface StrategyListItem {
   id: string

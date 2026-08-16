@@ -13,6 +13,7 @@ from tradeforge_collector.storage import (
     dataset_path,
     normalise,
     read_candles,
+    read_times,
     write_candles,
 )
 
@@ -183,6 +184,54 @@ def test_a_window_with_nothing_in_it_is_empty_not_an_error(tmp_path: Path) -> No
     assert (
         read_candles(tmp_path, "EURUSD", "D1", start=dt.datetime(2030, 1, 1, tzinfo=dt.UTC)) == []
     )
+
+
+# --------------------------------------------------------------------------- #
+# Reading only the instants                                                     #
+# --------------------------------------------------------------------------- #
+
+
+def test_the_instants_are_the_ones_the_candles_carry(tmp_path: Path) -> None:
+    """`read_times` and `read_candles` must never disagree about which bars exist.
+
+    They are two functions over one dataset, and the caller of the cheap one uses it to *count*
+    bars — a walk-forward cuts its folds by counting candles. A count taken from one function
+    and windows executed from the other would silently place a boundary on a bar that is not
+    where it was thought to be.
+    """
+    _five_days(tmp_path)
+
+    assert read_times(tmp_path, "EURUSD", "D1") == [
+        candle.time for candle in read_candles(tmp_path, "EURUSD", "D1")
+    ]
+
+
+def test_the_instants_honour_the_same_window_on_both_edges(tmp_path: Path) -> None:
+    """Inclusive at both ends, exactly as `read_candles` is — the same bars, or it is a different
+    dataset wearing the same name."""
+    _five_days(tmp_path)
+
+    assert read_times(tmp_path, "EURUSD", "D1", start=_DAYS[1], end=_DAYS[3]) == _DAYS[1:4]
+
+
+def test_the_instants_come_back_sorted_and_in_utc(tmp_path: Path) -> None:
+    """Order is the whole contract: a fold's boundaries are positions in this list.
+
+    A dataset is a set of files and the order they are listed in is the filesystem's business.
+    Instants arriving shuffled would make "the 40th bar" a different bar on a different machine
+    — and the walk-forward would be non-deterministic without a single number looking wrong.
+    """
+    written = [_DAYS[3], _DAYS[0], _DAYS[2], _DAYS[1], _DAYS[4]]
+    write_candles(tmp_path, "EURUSD", "D1", [a_candle(day) for day in written])
+
+    times = read_times(tmp_path, "EURUSD", "D1")
+
+    assert times == sorted(written)
+    assert all(moment.tzinfo is dt.UTC for moment in times)
+
+
+def test_asking_for_the_instants_of_nothing_is_empty_not_an_error(tmp_path: Path) -> None:
+    assert read_times(tmp_path, "NOPE", "H1") == []
 
 
 def test_writing_nothing_is_an_error_not_a_silent_no_op(tmp_path: Path) -> None:

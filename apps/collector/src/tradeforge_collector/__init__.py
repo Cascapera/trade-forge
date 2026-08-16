@@ -13,7 +13,12 @@ for real data; everything else in this package runs anywhere.
 from tradeforge_collector.backfill import BackfillReport, backfill
 from tradeforge_collector.gaps import Gap, anomalies, find_gaps, format_report
 from tradeforge_collector.source import Candle, InstrumentSpec, MarketDataSource
-from tradeforge_collector.storage import OHLCV_SCHEMA, read_candles, write_candles
+from tradeforge_collector.storage import (
+    OHLCV_SCHEMA,
+    read_candles,
+    read_times,
+    write_candles,
+)
 from tradeforge_collector.synthetic import SyntheticSource
 from tradeforge_collector.timeframes import TIMEFRAME_STEP, step
 
@@ -32,6 +37,7 @@ __all__ = [
     "find_gaps",
     "format_report",
     "read_candles",
+    "read_times",
     "step",
     "write_candles",
 ]

@@ -261,6 +261,9 @@ def list_backtests(  # noqa: PLR0913 — one filter per column a run is chosen b
     ] = None,
     timeframe: Annotated[str | None, Query(description="exact timeframe, e.g. H1")] = None,
     run_status: Annotated[BacktestStatus | None, Query(alias="status")] = None,
+    include_generated: Annotated[
+        bool, Query(description="include the runs a grid generated (hidden by default)")
+    ] = False,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     offset: Annotated[int, Query(ge=0, le=_MAX_OFFSET)] = 0,
 ) -> BacktestsPage:
@@ -297,6 +300,21 @@ def list_backtests(  # noqa: PLR0913 — one filter per column a run is chosen b
         filters.append(Backtest.timeframe == timeframe)
     if run_status is not None:
         filters.append(Backtest.status == run_status)
+    if not include_generated:
+        # ⚠️ **The runs a grid generated are hidden by default**, mirroring what
+        # `GET /strategies` does with the strategies a grid generated, and for the same reason:
+        # this is a research log, and one study of a hundred points buries every run made by
+        # hand under a wall of `MME9 [period=17]`. A walk-forward makes that fatal rather than
+        # annoying — six folds over a fifty-point grid is three hundred rows in one request.
+        #
+        # Derived, not marked: a generated run is one that belongs to a study. A `generated`
+        # column would be a second place for the same truth, free to disagree with the first.
+        #
+        # ⚠️ **A walk-forward's out-of-sample runs stay visible, and that is the point of
+        # drawing the line here.** They carry no `study_id` because nothing searched them —
+        # they are the one run per fold that a *decision* produced, and they are exactly what a
+        # reader scanning this log wants to find.
+        filters.append(Backtest.study_id.is_(None))
 
     base = (
         select(Backtest, Instrument.symbol, Strategy.name, Strategy.version)

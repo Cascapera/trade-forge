@@ -16,18 +16,31 @@ from __future__ import annotations
 import datetime as dt
 import json
 import uuid
+from collections.abc import Callable, Sequence
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 from redis.asyncio import Redis
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from tradeforge_api.config import RedisConfig, Settings
+from tradeforge_api.grid import coordinates, label_for, read_point
 from tradeforge_api.queue import progress_channel, redis_settings
-from tradeforge_api.runner import execute_backtest
+from tradeforge_api.runner import ENGINE_VERSION, execute_backtest
+from tradeforge_api.walkforward import Candidate, choose
 from tradeforge_collector import read_candles
-from tradeforge_db.models import Backtest, BacktestStatus, Instrument, Strategy
+from tradeforge_db.models import (
+    Backtest,
+    BacktestMetrics,
+    BacktestStatus,
+    Instrument,
+    SelectionMetric,
+    Strategy,
+    WalkForward,
+    WalkForwardFold,
+)
 from tradeforge_db.results import to_rows
 from tradeforge_db.session import create_db_engine, create_session_factory
 
@@ -106,6 +119,192 @@ async def process_backtest(
         await _announce(redis, backtest_id, {"status": "failed", "error": _reason(exc)})
 
 
+# --------------------------------------------------------------------------- #
+# Walk-forward: the one job in this system that decides something               #
+# --------------------------------------------------------------------------- #
+
+
+_METRIC_OF: dict[SelectionMetric, Callable[[BacktestMetrics], Decimal | None]] = {
+    SelectionMetric.NET_PROFIT: lambda metrics: metrics.net_profit,
+    SelectionMetric.PROFIT_FACTOR: lambda metrics: metrics.profit_factor,
+    SelectionMetric.SHARPE: lambda metrics: metrics.sharpe,
+    SelectionMetric.EXPECTANCY: lambda metrics: metrics.expectancy,
+}
+"""Which column each selection metric reads.
+
+Spelled out rather than `getattr(metrics, walk_forward.metric.value)`, even though the enum's
+values were named after the columns on purpose. The reflective version works until a column is
+renamed, and then it fails at the moment a fold picks a winner — inside a job, hours into a run
+— instead of at the line that is now wrong. Three of the four are nullable, which is the whole
+reason `choose` refuses to read a null as a zero.
+"""
+
+
+async def process_walk_forward(
+    *,
+    session: Session,
+    redis: Redis,
+    parquet_root: Path,
+    walk_forward_id: uuid.UUID,
+) -> None:
+    """Run every fold in order: train the whole grid, choose, then test the choice.
+
+    ⚠️ **The runs are executed here, inline and sequentially, rather than queued.** The
+    alternative — enqueue a fold's training runs and wait for them — deadlocks on a single
+    worker: `execute_backtest` is CPU-bound and synchronous, so this coroutine holds the only
+    slot the runs it is waiting for would need to claim. Reactive completion (whichever run
+    finishes last enqueues the test) trades that for a distributed "who was last?" question
+    with a race in it. Sequential is slower and has no failure mode: measured on this project's
+    own runs, three hundred backtests is two to four minutes.
+
+    Idempotent by construction, and it has to be: this job is enqueued under the walk-forward's
+    own id, so a retry runs it again. Runs already `done` are skipped rather than re-executed —
+    re-running one would try to write a second metrics row against the same primary key and
+    turn a completed fold into a failed one.
+    """
+    walk_forward = session.get(WalkForward, walk_forward_id)
+    if walk_forward is None:
+        return  # the row was deleted between enqueue and pickup; nothing to run
+
+    try:
+        walk_forward.status = BacktestStatus.RUNNING
+        walk_forward.started_at = _now()
+        session.commit()
+
+        for fold in walk_forward.fold_rows:
+            await _process_fold(
+                session=session,
+                redis=redis,
+                parquet_root=parquet_root,
+                walk_forward=walk_forward,
+                fold=fold,
+            )
+
+        walk_forward.status = BacktestStatus.DONE
+        walk_forward.finished_at = _now()
+        session.commit()
+
+    except Exception as exc:  # noqa: BLE001 — a failed experiment is a recorded result
+        session.rollback()
+        _record_walk_forward_failure(session, walk_forward_id, exc)
+
+
+async def _process_fold(
+    *,
+    session: Session,
+    redis: Redis,
+    parquet_root: Path,
+    walk_forward: WalkForward,
+    fold: WalkForwardFold,
+) -> None:
+    """One fold: every training run, the choice, and the single run that scores it."""
+    training = list(
+        session.scalars(
+            select(Backtest).where(Backtest.study_id == fold.study_id).order_by(Backtest.id)
+        )
+    )
+    for run in training:
+        if run.status is BacktestStatus.DONE:
+            continue
+        await process_backtest(
+            session=session, redis=redis, parquet_root=parquet_root, backtest_id=run.id
+        )
+
+    ranked = _candidates(session, fold, training, walk_forward.metric)
+    winner = choose(ranked)
+    if winner is None:
+        # A terminal answer, not a gap: nothing in the grid traded this window, or nothing that
+        # traded had a defined score. Recorded by leaving the choice null and moving on — the
+        # fold reports itself as undecided, which is a finding about the method.
+        return
+
+    fold.chosen_strategy_id = ranked[winner]
+    session.commit()
+
+    test = Backtest(
+        strategy_id=fold.chosen_strategy_id,
+        instrument_id=fold.study.instrument_id,
+        timeframe=fold.study.timeframe,
+        date_from=fold.test_from,
+        date_to=fold.test_to,
+        initial_capital=fold.study.initial_capital,
+        # The same costs the training runs were charged. A test window scored under a different
+        # spread than the window that chose it would make the two sides of this comparison
+        # incomparable in the one respect the whole feature is a comparison of.
+        cost_model=dict(training[0].cost_model),
+        status=BacktestStatus.QUEUED,
+        engine_version=ENGINE_VERSION,
+    )
+    session.add(test)
+    session.commit()
+
+    await process_backtest(
+        session=session, redis=redis, parquet_root=parquet_root, backtest_id=test.id
+    )
+
+    # Linked after the run exists, never before: `test_backtest_id` is a foreign key, and the
+    # fold's own CHECK refuses a test run without a choice behind it.
+    fold.test_backtest_id = test.id
+    session.commit()
+
+
+def _candidates(
+    session: Session,
+    fold: WalkForwardFold,
+    training: Sequence[Backtest],
+    metric: SelectionMetric,
+) -> dict[Candidate, uuid.UUID]:
+    """Every training run of this fold as something `choose` can rank, mapped to its strategy.
+
+    A mapping rather than a list, because `choose` hands back one candidate and the caller then
+    needs the row that produced it. Keyed by the candidate itself — it is frozen, so hashable —
+    which keeps the pure ranking type free of any notion of a database id.
+
+    Coordinates come from the document each run actually executed, never from parsing the
+    strategy's name: that works until a parameter value contains a comma. They are also the
+    tie-break, and they are computed by the same `grid.coordinates` the study read sorts by, so
+    "the best point" cannot mean two different things in two endpoints.
+    """
+    grid: dict[str, list[Any]] = dict(fold.study.grid)
+    definitions = {
+        strategy.id: strategy.definition
+        for strategy in session.scalars(
+            select(Strategy).where(Strategy.id.in_({run.strategy_id for run in training}))
+        )
+    }
+
+    built: dict[Candidate, uuid.UUID] = {}
+    for run in training:
+        document = definitions.get(run.strategy_id)
+        if document is None:  # pragma: no cover — the FK is RESTRICT
+            continue
+        values = read_point(document, grid)
+        candidate = Candidate(
+            coordinates=coordinates(grid, values),
+            label=label_for(values),
+            # `None` when the run failed, has not finished, or the metric is undefined for it.
+            # All three are the same thing to a ranking — no score — and none of them is a zero.
+            score=None if run.metrics is None else _METRIC_OF[metric](run.metrics),
+            trades=0 if run.metrics is None else run.metrics.total_trades,
+        )
+        built[candidate] = run.strategy_id
+    return built
+
+
+def _record_walk_forward_failure(
+    session: Session, walk_forward_id: uuid.UUID, exc: Exception
+) -> None:
+    walk_forward = session.get(WalkForward, walk_forward_id)
+    if walk_forward is None:  # pragma: no cover — deleted mid-run
+        return
+    walk_forward.status = BacktestStatus.FAILED
+    walk_forward.error = _reason(exc)
+    if walk_forward.started_at is None:  # pragma: no cover — set before anything can throw
+        walk_forward.started_at = _now()
+    walk_forward.finished_at = _now()
+    session.commit()
+
+
 def _record_failure(session: Session, backtest_id: uuid.UUID, exc: Exception) -> None:
     backtest = session.get(Backtest, backtest_id)
     if backtest is None:
@@ -146,6 +345,28 @@ async def run_backtest(ctx: dict[str, Any], backtest_id: str) -> None:
         session.close()
 
 
+async def run_walk_forward(ctx: dict[str, Any], walk_forward_id: str) -> None:
+    """The registered orchestrating job — one per walk-forward, never one per run.
+
+    ⚠️ **This job occupies a worker slot for the whole experiment**, minutes rather than
+    seconds, because it executes every fold's backtests itself. That is deliberate (see
+    `process_walk_forward`), and it is why `docker compose up -d --scale worker=4` matters
+    here more than anywhere else: with one worker, a running walk-forward means ordinary
+    backtests queue behind it.
+    """
+    session: Session = ctx["session_factory"]()
+    settings: Settings = ctx["settings"]
+    try:
+        await process_walk_forward(
+            session=session,
+            redis=ctx["redis"],
+            parquet_root=settings.parquet_root,
+            walk_forward_id=uuid.UUID(walk_forward_id),
+        )
+    finally:
+        session.close()
+
+
 async def startup(ctx: dict[str, Any]) -> None:
     settings = Settings()
     engine = create_db_engine(settings.sqlalchemy_dsn)
@@ -161,7 +382,7 @@ async def shutdown(ctx: dict[str, Any]) -> None:
 class WorkerSettings:
     """`arq tradeforge_api.worker.WorkerSettings` starts the worker from this."""
 
-    functions = (run_backtest,)
+    functions = (run_backtest, run_walk_forward)
     # Built from RedisConfig, not Settings: this line runs at import, and importing the worker
     # must not require the Postgres password. The DB config is read later, in `startup`.
     redis_settings = redis_settings(RedisConfig())
@@ -169,4 +390,10 @@ class WorkerSettings:
     on_shutdown = shutdown
 
 
-__all__ = ["WorkerSettings", "process_backtest", "run_backtest"]
+__all__ = [
+    "WorkerSettings",
+    "process_backtest",
+    "process_walk_forward",
+    "run_backtest",
+    "run_walk_forward",
+]

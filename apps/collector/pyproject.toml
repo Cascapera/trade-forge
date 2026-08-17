@@ -10,7 +10,7 @@ dependencies = [
     # it does not get to define what a candle is.
     "tradeforge-engine",
     "tradeforge-schema",
-    "pyarrow>=18.1",
+    "pyarrow>=25.0.1",
     # The official MT5 library ships Windows wheels only. The environment marker is
     # what turns ADR-02 (isolate the broker dependency) into a build-time fact:
     # Linux CI simply cannot resolve this package outside collector/executor.

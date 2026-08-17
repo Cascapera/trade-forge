@@ -29,6 +29,10 @@ SCHEMA_ERRORS = {
     "unknown_operator.json": "greater_than",
     "zero_candle_offset.json": "candle[-0].high",
     "misspelled_param.json": "perod",
+    # An indicator defined over the whole candle, asked for one price series. The refusal is
+    # the same `extra="forbid"` that catches a typo, doing the other half of its job: a field
+    # the engine could not honour is a request the document believes was granted.
+    "atr_with_a_price_source.json": "source",
 }
 
 SEMANTIC_ERRORS = {

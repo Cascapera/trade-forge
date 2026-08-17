@@ -520,12 +520,22 @@ def test_the_new_indicators_are_reachable_by_the_names_a_document_uses() -> None
         assert indicator.value() is None
 
 
-def test_an_atr_cannot_be_asked_for_a_price_source_it_does_not_read() -> None:
-    """⚠️ Silently ignoring a `source` would be worse than refusing it.
+def test_the_candle_readers_take_a_period_and_nothing_else() -> None:
+    """⚠️ Silently ignoring a `source` would be worse than refusing it — but the refusal that
+    matters is not this one.
 
-    A document asking for `ATR(source="close")` believes it is getting something; there is no
-    such measurement, and running the ordinary ATR under that name is the engine agreeing to a
-    request it did not honour.
+    An earlier version of this test called `ATR(period=3, source="close")` and asserted the
+    `TypeError`. That asserts CPython's handling of an unexpected keyword, not a rule of ours,
+    and static analysis flags the call as the mistake it is written to be. The rule lives where
+    a *document* is read: `PeriodParams` forbids extra keys, and
+    `fixtures/invalid-schema/atr_with_a_price_source.json` is that refusal as a test.
+
+    What is worth pinning here is the builder's side of the same contract — the params it reads
+    off the document. It reads a period; the ATR that comes back is the same one either way,
+    which is what makes an ignored `source` invisible without the schema.
     """
-    with pytest.raises(TypeError):
-        ATR(period=3, source="close")  # type: ignore[call-arg]
+    _, indicator = build_indicator({"id": "atr", "type": "ATR", "params": {"period": 3}})
+    assert isinstance(indicator, ATR)
+
+    with pytest.raises(KeyError):
+        build_indicator({"id": "atr", "type": "ATR", "params": {"source": "close"}})

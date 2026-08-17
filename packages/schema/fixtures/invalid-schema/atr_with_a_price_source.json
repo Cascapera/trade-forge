@@ -1,0 +1,17 @@
+{
+  "schema_version": "1.0",
+  "name": "ATR com fonte de preço",
+  "description": "O ATR é definido sobre máxima, mínima e o fechamento anterior juntos — não existe \"ATR do fechamento\". Sem additionalProperties:false o campo seria ignorado em silêncio, e o documento pediria uma medição que a engine nunca faria.",
+  "timeframe": "H1",
+  "indicators": [{ "id": "atr", "type": "ATR", "params": { "period": 14, "source": "close" } }],
+  "entry": {
+    "long": { "op": "gt", "left": { "ref": "atr" }, "right": { "value": 0.001 } },
+    "short": null
+  },
+  "exit": {
+    "stop_loss": { "type": "candle_extreme", "params": { "lookback": 1, "side": "low" } },
+    "take_profit": null,
+    "conditions": []
+  },
+  "risk": { "sizing": { "type": "percent_risk", "params": { "percent": 1.0 } } }
+}

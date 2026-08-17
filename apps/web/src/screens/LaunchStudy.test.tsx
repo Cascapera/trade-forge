@@ -62,6 +62,31 @@ beforeEach(() => {
   useSession.setState({ strategyId: 'strategy-1', strategyName: 'MME9' })
 })
 
+/**
+ * Put a set of values on a numeric axis.
+ *
+ * The values field is no longer one text box: a value is typed (or a list pasted) and then
+ * added, which is what turns it into the axis. Every caller below went through the same two
+ * steps by hand before this existed.
+ */
+function setValues(axis: number, values: string): void {
+  const label = `Parameter ${String(axis)} values`
+  fireEvent.change(screen.getByLabelText(label), { target: { value: values } })
+  // ⚠️ Only a described parameter has an add button. With no strategy chosen there is no setup
+  // and so no schema, and the axis falls back to a plain field where typing *is* the value —
+  // the same fallback a DSL strategy gets. Asserting the button exists would make this helper
+  // demand a screen state half of its callers deliberately do not set up.
+  const add = screen.queryByLabelText(`${label} add`)
+  if (add !== null) fireEvent.click(add)
+}
+
+/** Tick a set of names on an axis whose parameter has a fixed set of them. */
+function tickValues(axis: number, values: readonly string[]): void {
+  for (const value of values) {
+    fireEvent.click(screen.getByLabelText(`Parameter ${String(axis)} values ${value}`))
+  }
+}
+
 describe('LaunchStudy', () => {
   it('offers the strategies that exist rather than demanding one built just now', async () => {
     // ⚠️ This screen used to *refuse to open* unless a strategy had been created since the last
@@ -83,7 +108,7 @@ describe('LaunchStudy', () => {
     fireEvent.change(screen.getByLabelText('Parameter 1 path'), {
       target: { value: 'setup.params.period' },
     })
-    fireEvent.change(screen.getByLabelText('Parameter 1 values'), { target: { value: '5, 9' } })
+    setValues(1, '5, 9')
 
     expect(screen.getByText('Choose a strategy.')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Run the study' })).toBeDisabled()
@@ -128,9 +153,7 @@ describe('LaunchStudy', () => {
     fireEvent.change(screen.getByLabelText('Parameter 1'), {
       target: { value: 'setup.params.period' },
     })
-    fireEvent.change(screen.getByLabelText('Parameter 1 values'), {
-      target: { value: '5, 9, 20' },
-    })
+    setValues(1, '5, 9, 20')
     expect(screen.getByRole('status')).toHaveTextContent('3 combinations, so 3 backtests.')
 
     fireEvent.click(screen.getByRole('button', { name: 'Add a parameter' }))
@@ -141,9 +164,7 @@ describe('LaunchStudy', () => {
     fireEvent.change(screen.getByLabelText('Parameter 2'), {
       target: { value: 'setup.params.breakeven_at_r' },
     })
-    fireEvent.change(screen.getByLabelText('Parameter 2 values'), {
-      target: { value: '1, 2, 3, 4' },
-    })
+    setValues(2, '1, 2, 3, 4')
 
     expect(screen.getByRole('status')).toHaveTextContent('12 combinations, so 12 backtests.')
   })
@@ -180,20 +201,12 @@ describe('LaunchStudy', () => {
     fireEvent.change(screen.getByLabelText('Parameter 1'), {
       target: { value: 'setup.params.period' },
     })
-    fireEvent.change(screen.getByLabelText('Parameter 1 values'), {
-      target: {
-        value: Array.from({ length: 26 }, (_, at) => at + 1).join(','),
-      },
-    })
+    setValues(1, Array.from({ length: 26 }, (_, at) => at + 1).join(','))
     fireEvent.click(screen.getByRole('button', { name: 'Add a parameter' }))
     fireEvent.change(screen.getByLabelText('Parameter 2'), {
       target: { value: 'setup.params.breakeven_at_r' },
     })
-    fireEvent.change(screen.getByLabelText('Parameter 2 values'), {
-      target: {
-        value: Array.from({ length: 20 }, (_, at) => at + 1).join(','),
-      },
-    })
+    setValues(2, Array.from({ length: 20 }, (_, at) => at + 1).join(','))
 
     expect(screen.getByText(/520 combinations, over the 500/)).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Run the study' })).toBeDisabled()
@@ -227,16 +240,12 @@ describe('LaunchStudy', () => {
     fireEvent.change(screen.getByLabelText('Parameter 1'), {
       target: { value: 'setup.params.period' },
     })
-    fireEvent.change(screen.getByLabelText('Parameter 1 values'), {
-      target: { value: '5, 9' },
-    })
+    setValues(1, '5, 9')
     fireEvent.click(screen.getByRole('button', { name: 'Add a parameter' }))
     fireEvent.change(screen.getByLabelText('Parameter 2'), {
       target: { value: 'setup.params.side' },
     })
-    fireEvent.change(screen.getByLabelText('Parameter 2 values'), {
-      target: { value: 'long, short' },
-    })
+    tickValues(2, ['long', 'short'])
 
     fireEvent.click(screen.getByRole('button', { name: 'Run the study' }))
 
@@ -283,7 +292,7 @@ describe('LaunchStudy', () => {
       fireEvent.change(screen.getByLabelText('Parameter 1'), {
         target: { value: 'setup.params.period' },
       })
-      fireEvent.change(screen.getByLabelText('Parameter 1 values'), { target: { value: '5, 9' } })
+      setValues(1, '5, 9')
       fireEvent.click(screen.getByRole('button', { name: 'Run the study' }))
 
       await waitFor(() => {
@@ -315,7 +324,7 @@ describe('LaunchStudy', () => {
     fireEvent.change(screen.getByLabelText('Parameter 1'), {
       target: { value: 'setup.params.period' },
     })
-    fireEvent.change(screen.getByLabelText('Parameter 1 values'), { target: { value: '5, 9' } })
+    setValues(1, '5, 9')
     fireEvent.click(screen.getByRole('button', { name: 'Run the study' }))
 
     // ⚠️ The server's own words, not a generic apology: the refusals it sends are specific
@@ -363,9 +372,12 @@ describe('LaunchStudy', () => {
     fireEvent.change(screen.getByLabelText('Parameter 1'), {
       target: { value: 'setup.params.period' },
     })
-    fireEvent.click(screen.getByRole('button', { name: /use 4, 9, 14/ }))
+    // Each suggestion is its own button now, and each is a value built around the parameter's
+    // default and clamped to its bounds — so every one of them is a grid point that will run.
+    fireEvent.click(screen.getByLabelText('Parameter 1 values suggest 4'))
+    fireEvent.click(screen.getByLabelText('Parameter 1 values suggest 9'))
+    fireEvent.click(screen.getByLabelText('Parameter 1 values suggest 14'))
 
-    expect(screen.getByLabelText('Parameter 1 values')).toHaveValue('4, 9, 14')
     expect(screen.getByRole('status')).toHaveTextContent('3 combinations')
   })
 
@@ -405,7 +417,7 @@ describe('LaunchStudy', () => {
     fireEvent.change(screen.getByLabelText('Parameter 1'), {
       target: { value: 'setup.params.period' },
     })
-    fireEvent.change(screen.getByLabelText('Parameter 1 values'), { target: { value: '5, 9' } })
+    setValues(1, '5, 9')
 
     fireEvent.change(screen.getByLabelText(/Strategy/), { target: { value: 'strategy-2' } })
 

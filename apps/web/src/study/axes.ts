@@ -18,6 +18,15 @@ export interface AxisOption {
   hint: string
   /** A ready-made line of values, so the first study can be launched without inventing any. */
   example: string
+  /**
+   * The parameter as the schema describes it — kind, bounds, default, nullability.
+   *
+   * Carried rather than flattened into more strings, because the *control* a value is entered
+   * with is decided by the same facts as the sentence describing it: a set of names wants
+   * checkboxes, a bounded number wants arrows that know its step. Two readings of one schema
+   * node would be two places to disagree about what a parameter is.
+   */
+  param: SetupParam
 }
 
 /**
@@ -43,6 +52,7 @@ export function axesFor(setup: string | null): AxisOption[] {
     label: param.name,
     hint: hintFor(param),
     example: exampleFor(param),
+    param,
   }))
 }
 

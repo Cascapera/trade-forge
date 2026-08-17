@@ -11,6 +11,7 @@ import { useNavigate } from 'react-router-dom'
 import { useCreateBacktest, useInstruments, useSaveStrategy } from '../api/hooks'
 import { emptyBacktestForm, toBacktestRequest, whyNotRunnable, type BacktestForm } from '../backtest/settings'
 import { BacktestSettings } from '../components/BacktestSettings'
+import { NumberStepper } from '../components/NumberStepper'
 import { useSession } from '../store'
 import {
   buildStrategy,
@@ -199,17 +200,15 @@ function SetupField(props: {
           ))}
         </select>
       ) : (
-        <input
-          aria-label={`setup ${param.name}`}
-          type="number"
-          step={param.kind === 'integer' ? '1' : '0.1'}
-          min={param.min}
-          max={param.max}
-          className={inputClass}
+        // ⚠️ Arrows that know the parameter, replacing `<input min={param.min}>` — which ignored
+        // exclusivity and so let `breakeven_at_r` be stepped to exactly 0, the one value in its
+        // range the API refuses. #106 fixed that sentence in the hint and left it live in the
+        // field. The step was a constant `0.1` for every fraction, too.
+        <NumberStepper
+          param={param}
+          label={`setup ${param.name}`}
           value={typeof value === 'string' ? value : ''}
-          onChange={(event) => {
-            onChange(event.target.value)
-          }}
+          onChange={onChange}
         />
       )}
     </label>

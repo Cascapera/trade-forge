@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 
 import { useCreateStudy, useInstruments, useStrategies } from '../api/hooks'
+import { AxisValues } from '../components/AxisValues'
 import { StrategyPicker } from '../components/StrategyPicker'
 import { useSession } from '../store'
 import { TIMEFRAMES } from '../strategy/builder'
@@ -226,26 +227,17 @@ export function LaunchStudy(): React.JSX.Element {
                       }}
                     />
                   )}
-                  <input
-                    className={`${inputClass} min-w-48 flex-1`}
-                    placeholder={chosen?.example ?? '5, 9, 20'}
-                    aria-label={`Parameter ${String(at + 1)} values`}
-                    value={axis.raw}
-                    onChange={(event) => {
-                      setAxis(at, { raw: event.target.value })
+                  {/* The control the parameter deserves — checkboxes for a set of names, arrows
+                      for a number with bounds — chosen from what the JSON Schema says it is. The
+                      values still travel as the same comma-separated line underneath. */}
+                  <AxisValues
+                    option={chosen}
+                    raw={axis.raw}
+                    label={`Parameter ${String(at + 1)} values`}
+                    onChange={(raw) => {
+                      setAxis(at, { raw })
                     }}
                   />
-                  {chosen !== undefined && axis.raw === '' && (
-                    <button
-                      type="button"
-                      className="text-xs text-sky-400 hover:text-sky-300"
-                      onClick={() => {
-                        setAxis(at, { raw: chosen.example })
-                      }}
-                    >
-                      use {chosen.example}
-                    </button>
-                  )}
                 </div>
                 {/* The format *and* what is legal, both read from the parameter's own schema —
                     so the sentence tightens on its own the day a bound does. */}

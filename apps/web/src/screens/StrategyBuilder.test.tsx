@@ -72,14 +72,14 @@ describe('the strategy picker', () => {
   it('opens on a setup, so the strategies are visible without choosing a mode first', () => {
     renderWithProviders(<StrategyBuilder />)
     expect(screen.getByLabelText('strategy')).toHaveValue('mme9_breakout')
-    expect(screen.getByLabelText('setup period')).toHaveValue(9)
+    expect(screen.getByLabelText('setup period')).toHaveValue('9')
   })
 
   it('loads the chosen setup, defaults and all', () => {
     renderWithProviders(<StrategyBuilder />)
     fireEvent.change(screen.getByLabelText('strategy'), { target: { value: 'ponto_continuo' } })
 
-    expect(screen.getByLabelText('setup period')).toHaveValue(20)
+    expect(screen.getByLabelText('setup period')).toHaveValue('20')
     expect(screen.getByLabelText('setup average')).toHaveValue('EMA')
     // The name is stamped, not typed: the abbreviation of the setup and the instant it was picked.
     expect(screen.getByLabelText('name')).toHaveValue('PCONT-20260807-151230')
@@ -110,7 +110,7 @@ describe('the strategy picker', () => {
     vi.setSystemTime(new Date(2026, 7, 7, 16, 0, 0))
     fireEvent.change(screen.getByLabelText('setup period'), { target: { value: '30' } })
 
-    expect(screen.getByLabelText('setup period')).toHaveValue(30)
+    expect(screen.getByLabelText('setup period')).toHaveValue('30')
     expect(screen.getByLabelText('name')).toHaveValue('PCONT-20260807-151230')
   })
 
@@ -140,9 +140,9 @@ describe('the strategy picker', () => {
       target: { value: 'structure_continuation' },
     })
     expect(screen.queryByLabelText('setup side')).not.toBeInTheDocument()
-    expect(screen.getByLabelText('setup stop_buffer')).toHaveValue(0.1)
+    expect(screen.getByLabelText('setup stop_buffer')).toHaveValue('0.1')
     // `max_bos` defaults to null, which is uncapped — an empty box, not a zero.
-    expect(screen.getByLabelText('setup max_bos')).toHaveValue(null)
+    expect(screen.getByLabelText('setup max_bos')).toHaveValue('')
   })
 })
 

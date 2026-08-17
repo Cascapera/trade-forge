@@ -13,7 +13,7 @@ or an indicator type to the DSL and forget to teach the engine, and this test go
 import datetime as dt
 import json
 from collections.abc import Callable
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from pathlib import Path
 
 import pytest
@@ -21,7 +21,7 @@ import pytest
 from tradeforge_engine.domain import Candle, SignalKind
 from tradeforge_engine.errors import EngineError
 from tradeforge_engine.indicators import SMA
-from tradeforge_engine.loop import run
+from tradeforge_engine.loop import ENGINE_CONTEXT, run
 from tradeforge_engine.strategy import CompiledStrategy, StopRule, compile_strategy
 from tradeforge_engine.testing import EURUSD, HOUR, START, FixedRisk, ImmediateFillBroker, bar
 
@@ -645,3 +645,143 @@ def test_a_between_reaching_back_over_candles_sizes_the_window() -> None:
     strategy = _compiled(document)
 
     assert strategy._candles.maxlen == 6
+
+
+# --------------------------------------------------------------------------- #
+# Multi-output indicators: one declaration, one channel per component           #
+# --------------------------------------------------------------------------- #
+
+
+def _bands_strategy(right: str, *, period: int = 3) -> dict[str, object]:
+    """Enter when the close is above whichever band `right` names."""
+    return {
+        "schema_version": "1.0",
+        "name": "buy a band break",
+        "timeframe": "H1",
+        "indicators": [
+            {"id": "bb", "type": "BOLLINGER", "params": {"period": period, "deviations": 2.0}},
+        ],
+        "entry": {
+            "long": {"op": "gt", "left": {"ref": "price.close"}, "right": {"ref": right}},
+            "short": None,
+        },
+        "exit": {"conditions": []},
+        "risk": {"sizing": {"type": "percent_risk", "params": {"percent": 1.0}}},
+    }
+
+
+def test_a_composite_declaration_opens_one_channel_per_component() -> None:
+    """One `bb` in the document, three names a condition can reach — and the bare id is not one.
+
+    ⚠️ `bb` itself must NOT be a channel. Opening one would give the DSL two spellings of the
+    middle band the day a default was chosen, and it would silently make the semantic layer's
+    "name one of these" error unreachable — the compiler would happily resolve what validation
+    exists to refuse.
+    """
+    strategy = _compiled(_bands_strategy("bb.upper"))
+
+    assert set(strategy._indicator_history) == {"bb.upper", "bb.middle", "bb.lower"}
+    assert set(strategy._indicators) == {"bb"}
+
+
+def test_a_condition_on_one_band_actually_fires() -> None:
+    """The end-to-end claim: a component ref reaches a real number and produces a trade.
+
+    Every other test here could pass with `bb.upper` resolving to `None` for ever — that is the
+    whole failure mode of a widened ref grammar, and it looks exactly like a rule that declined.
+
+    ⚠️ **The period is 6 because of arithmetic, not taste, and getting it wrong made this test
+    fail against correct code.** Unlike `HIGHEST`, a Bollinger window *includes* the bar being
+    decided on, so a breakout bar widens the very band it is trying to cross. For a window of `n`
+    values where `n - 1` are equal and one differs by `d`, the deviation works out to
+    `d·sqrt(n-1)/n` and the outlier sits `d·(n-1)/n` from the mean — so its distance in deviations
+    is exactly **sqrt(n - 1)**, whatever `d` is. A 2-deviation band therefore cannot be crossed by
+    a single bar unless `n > 5`: at period 3 the ceiling is sqrt(2) = 1.41 deviations, and no
+    jump, however violent, reaches the band. Five flat bars and a jump at period 6 gives
+    sqrt(5) = 2.24, which does.
+    """
+    candles = _series(["1.10", "1.10", "1.10", "1.10", "1.10", "1.20", "1.21"])
+
+    result = run(
+        candles=candles,
+        timeframe=HOUR,
+        instrument=EURUSD,
+        strategy=compile_strategy(_bands_strategy("bb.upper", period=6)),
+        broker=ImmediateFillBroker(),
+        risk=FixedRisk(),
+    )
+
+    entries = [fill for fill in result.fills if fill.order.intent is SignalKind.ENTRY]
+    assert entries, "a condition on bb.upper never fired — the channel resolved to None"
+
+
+def test_the_three_bands_are_different_channels_and_not_one_repeated() -> None:
+    """A band break is not a middle break: the same series must enter on one and not the other.
+
+    ⚠️ This is the test that a `for component in ...` loop writing every channel from the same
+    value would fail. Reading the mapping by the wrong key, or by an insertion order that happens
+    to line up, produces three channels that all carry the upper band — and every condition in
+    the DSL keeps working, just against a level nobody asked for.
+    """
+    # Rising by a hair: the close is above the middle band on the last bar but nowhere near the
+    # upper one, so `> bb.middle` fires and `> bb.upper` does not.
+    candles = _series(["1.10", "1.101", "1.102", "1.103"])
+
+    def entries(right: str) -> int:
+        result = run(
+            candles=candles,
+            timeframe=HOUR,
+            instrument=EURUSD,
+            strategy=compile_strategy(_bands_strategy(right)),
+            broker=ImmediateFillBroker(),
+            risk=FixedRisk(),
+        )
+        return len([fill for fill in result.fills if fill.order.intent is SignalKind.ENTRY])
+
+    assert entries("bb.middle") > 0
+    assert entries("bb.upper") == 0
+
+
+def test_the_overlays_of_a_composite_are_its_components_under_their_channel_names() -> None:
+    """What a chart is handed, and it is three curves rather than one object it cannot draw.
+
+    The labels are the ref strings, for the same reason the single-valued ones are their own ids:
+    the label is the only join a reader has between the curve on screen and the rule that traded.
+    """
+    strategy = _compiled(_bands_strategy("bb.upper"))
+    overlays = strategy.overlays()
+
+    assert set(overlays) == {"bb.upper", "bb.middle", "bb.lower"}
+
+    with localcontext(ENGINE_CONTEXT):
+        for candle in _series(["3", "3", "5", "5"]):
+            # Driven per label, exactly as the overlay endpoint drives what it was handed.
+            for indicator in overlays.values():
+                indicator.update(candle)
+
+    read = {label: overlays[label].value() for label in ("bb.upper", "bb.middle", "bb.lower")}
+    assert None not in read.values()
+    # ⚠️ The numbers matter, not just that three curves came back: a composite folded once per
+    # component would have consumed twelve bars of a four-bar series. The window here is
+    # (3, 5, 5) — mean 13/3 — and a triple-folded run cannot produce it.
+    with localcontext(ENGINE_CONTEXT):
+        assert read["bb.middle"] == Decimal(13) / 3
+    assert read["bb.upper"] > read["bb.middle"] > read["bb.lower"]  # type: ignore[operator]
+
+
+def test_the_entry_snapshot_records_every_channel_by_the_name_a_rule_uses() -> None:
+    """The trade's `context` is what nothing downstream can recover, so it carries all three."""
+    candles = _series(["1.10", "1.10", "1.10", "1.10", "1.10", "1.20", "1.21"])
+
+    result = run(
+        candles=candles,
+        timeframe=HOUR,
+        instrument=EURUSD,
+        strategy=compile_strategy(_bands_strategy("bb.upper", period=6)),
+        broker=ImmediateFillBroker(),
+        risk=FixedRisk(),
+    )
+
+    entry = next(fill for fill in result.fills if fill.order.intent is SignalKind.ENTRY)
+    assert entry.order.context is not None
+    assert set(entry.order.context) == {"bb.upper", "bb.middle", "bb.lower"}

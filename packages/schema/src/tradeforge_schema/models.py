@@ -11,6 +11,7 @@ and tell whether a 2:1 take-profit means anything without a stop-loss to measure
 risk against. JSON Schema validates *shape*, never *meaning*.
 """
 
+from collections.abc import Mapping
 from typing import Annotated, Final, Literal, get_args
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -24,10 +25,47 @@ SCHEMA_VERSION = "1.0"
 REF_PATTERN = (
     r"^(?:"
     r"[a-z_][a-z0-9_]*"  # an indicator id
+    # One component of a multi-output indicator: `bb.upper`. ⚠️ This alternative also matches
+    # `price.clsoe` and `candle.high`, which the two dedicated forms below exist to refuse — and it
+    # **cannot** be narrowed here. See the note under this pattern.
+    r"|[a-z_][a-z0-9_]*\.[a-z_][a-z0-9_]*"
     r"|price\.(?:open|high|low|close)"  # the candle being decided on
     r"|candle\[-[1-9][0-9]*\]\.(?:open|high|low|close)"  # a closed candle, N back
     r")$"
 )
+# ⚠️ **Widening this pattern is how a typo becomes a backtest of nothing, and it happened twice
+# while this PR was being written.** The forms it accepts are the only thing standing between a
+# misspelled ref and a condition that is false on every bar for ever: the engine resolves an
+# unknown name through `indicator_at`, which answers `None` for anything it has no channel for,
+# and a comparison against `None` is false. Nothing raises, nothing logs, and the run reports a
+# rule that was never evaluated.
+#
+# The component alternative broke that twice over:
+#   1. `bb.uppper` — well-formed, and `semantic.py` used to decide "is this an indicator ref?" by
+#      asking whether the string contained a dot, so it skipped every component ref. Fixed by
+#      deciding on the NAMESPACE (`price`, `candle`) and checking the component against the
+#      indicator's declared type.
+#   2. `price.clsoe` — well-formed *because of the same alternative*, since `price` is a perfectly
+#      good identifier and `clsoe` a perfectly good component name. `semantic.py` then saw a
+#      reserved head and returned "not an indicator ref" without ever looking at the tail.
+#
+# ⚠️ **The second one cannot be fixed here, and the reason is worth knowing: this pattern is
+# compiled by Rust, not by Python.** Pydantic v2 validates `pattern=` with the `regex` crate, which
+# has no look-around at all — `(?!(?:price|candle)\.)` fails to compile with "look-around,
+# including look-ahead and look-behind, is not supported", and the failure is at import time, so
+# the whole package stops loading. Excluding two literal names from an identifier without
+# look-around means enumerating character prefixes, which is unreadable and goes stale.
+#
+# So the shape stays permissive here and `semantic.py` refuses the tail — which is the boundary
+# this project already documents: shape is what a schema can say, meaning is not, and a document
+# that passed in the browser is never assumed executable (`test_fixtures.py`). The consequence to
+# know: `price.clsoe` reaches the API as a **422 from the semantic layer**, not as a schema error,
+# and the frontend validator alone will accept it.
+#
+# The rule for anyone widening this again: any alternative that can reach a namespace with
+# enumerated fields must be matched by a check in `semantic.py`, and `test_semantic.py` holds the
+# cases that prove it. `expressions.py` refuses the same shape a third time, on the layer that
+# executes.
 
 INDICATOR_ID_PATTERN = r"^[a-z_][a-z0-9_]*$"
 
@@ -267,12 +305,72 @@ class Lowest(_Node):
     params: PeriodParams
 
 
+class BollingerParams(_Node):
+    """A window, the price it reads, and how many deviations wide the envelope is.
+
+    `deviations` is a float rather than an int because 1.5 and 2.5 are ordinary settings, and it
+    is bounded above 0 exclusively: a multiplier of zero collapses the three bands onto the
+    average, which is an SMA spelled in a way that hides that it is one. The upper bound is
+    generous — a band ten deviations out is useless, not malformed.
+    """
+
+    period: Annotated[int, Field(ge=1, le=1000)]
+    source: PriceSource = "close"
+    deviations: Annotated[float, Field(gt=0, le=10, allow_inf_nan=False)] = 2.0
+
+
+class Bollinger(_Node):
+    """Bollinger Bands — an average with a volatility envelope, read by component.
+
+    ⚠️ **One indicator with three readings, not three indicators.** Declared once as `bb`, its
+    bands are referenced as `bb.upper`, `bb.middle` and `bb.lower`. Three separate declarations
+    would let a document give the upper band a period of 20 and the lower one 50, and nothing
+    could object: for this schema they would be two well-formed indicators. What came out would
+    be a band whose rails describe different markets, and it would look exactly like a band.
+    """
+
+    id: Annotated[str, Field(pattern=INDICATOR_ID_PATTERN, max_length=40)]
+    type: Literal["BOLLINGER"]
+    params: BollingerParams
+
+
+class ADX(_Node):
+    """Average Directional Index (Wilder) — how strongly a market trends, read by component.
+
+    Referenced as `adx.adx` for the strength line and `adx.plus_di` / `adx.minus_di` for the two
+    direction lines. ⚠️ **The `adx` component has no direction**: it rises in a hard sell-off
+    exactly as it does in a rally, so a rule meaning "trending up" needs the `DI` pair as well.
+    Reads the whole candle, so there is no price source to name — same argument as `PeriodParams`.
+    """
+
+    id: Annotated[str, Field(pattern=INDICATOR_ID_PATTERN, max_length=40)]
+    type: Literal["ADX"]
+    params: PeriodParams
+
+
 # Discriminated on `type`: the generated JSON Schema gets a proper `oneOf` with a
-# discriminator, and a new indicator (phase 2: ADX, Bollinger...) is a new member —
-# an additive change that leaves every strategy already saved still valid. That is
-# ADR-03 working as designed: new blocks without touching the core (and ADR-13:
-# additive members keep the schema_version, they do not bump it).
-type Indicator = Annotated[SMA | EMA | RSI | ATR | Highest | Lowest, Field(discriminator="type")]
+# discriminator, and a new indicator is a new member — an additive change that leaves
+# every strategy already saved still valid. That is ADR-03 working as designed: new
+# blocks without touching the core (and ADR-13: additive members keep the
+# schema_version, they do not bump it).
+type Indicator = Annotated[
+    SMA | EMA | RSI | ATR | Highest | Lowest | Bollinger | ADX,
+    Field(discriminator="type"),
+]
+
+# Which component names each multi-output indicator answers to. A reference to one of these
+# indicators must name a component, and a reference to any other indicator must not.
+#
+# ⚠️ Duplicated in `tradeforge_engine.indicators.COMPOSITE_COMPONENTS` — the two packages do not
+# import each other — and pinned equal by a test in `apps/api`, which depends on both. Drift is
+# the silent kind of failure: this layer would accept `bb.uppper`, the engine would resolve it to
+# `None`, and a comparison against `None` is simply false on every bar for ever.
+# ⚠️ Ordered **primary first**: a consumer with no idea what a band is uses this order to tell
+# the subject from its envelope, and the chart draws the first solid and the rest dashed.
+COMPOSITE_COMPONENTS: Final[Mapping[str, tuple[str, ...]]] = {
+    "BOLLINGER": ("middle", "upper", "lower"),
+    "ADX": ("adx", "plus_di", "minus_di"),
+}
 
 
 # --------------------------------------------------------------------------- #

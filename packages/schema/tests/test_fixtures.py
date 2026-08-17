@@ -39,6 +39,16 @@ SEMANTIC_ERRORS = {
     "undeclared_indicator.json": "undeclared indicator 'sma_slow'",
     "take_profit_without_stop.json": "no risk to multiply",
     "no_entry_side.json": "at least one side",
+    # The two halves of the component grammar, and both fail the same silent way if unchecked:
+    # the engine opens no channel by that name, resolves it to `None`, and the condition is false
+    # on every bar of every run — a clean backtest of a rule that was never evaluated.
+    "component_of_a_single_valued_indicator.json": "answers with a single value",
+    "multi_output_indicator_without_a_component.json": "has several outputs",
+    # ⚠️ Here rather than in `invalid-schema/`, and that placement is the finding. `price.clsoe`
+    # became well-formed the moment the grammar gained `id.component`, and the pattern cannot take
+    # it back: Pydantic compiles `pattern=` with Rust's `regex`, which has no look-around, so
+    # "an identifier that is not `price`" is not expressible there. Meaning is this layer's job.
+    "typo_in_a_price_field.json": "is not a price field",
 }
 
 

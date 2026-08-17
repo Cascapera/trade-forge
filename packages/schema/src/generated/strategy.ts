@@ -219,7 +219,7 @@ export type Indicators =
       Indicator,
       Indicator
     ];
-export type Indicator = SMA | EMA | RSI | ATR | Highest | Lowest;
+export type Indicator = SMA | EMA | RSI | ATR | Highest | Lowest | Bollinger | ADX;
 export type Id = string;
 export type Period = number;
 export type Type2 = "SMA";
@@ -234,31 +234,37 @@ export type Id4 = string;
 export type Type6 = "HIGHEST";
 export type Id5 = string;
 export type Type7 = "LOWEST";
+export type Id6 = string;
+export type Deviations = number;
+export type Period2 = number;
+export type Type8 = "BOLLINGER";
+export type Id7 = string;
+export type Type9 = "ADX";
 export type Name = string;
 export type MaxDailyLossPercent = number;
 export type MaxOpenPositions = number;
 export type Percent = number;
-export type Type8 = "percent_risk";
+export type Type10 = "percent_risk";
 export type SchemaVersion = "1.0";
 export type Setup = Mme9BreakoutSetup | PontoContinuoSetup | StructureChochSetup | StructureContinuationSetup;
 export type BreakevenAtR = number | null;
-export type Period2 = number;
+export type Period3 = number;
 export type SetupSide = "long" | "short";
 export type StopBufferTicks = number;
-export type Type9 = "mme9_breakout";
+export type Type11 = "mme9_breakout";
 export type BreakevenAtR1 = number | null;
-export type Period3 = number;
+export type Period4 = number;
 export type StopBufferTicks1 = number;
-export type Type10 = "ponto_continuo";
+export type Type12 = "ponto_continuo";
 export type AllowSecondary = boolean;
 export type BreakevenAtR2 = number | null;
 export type StopBuffer = number;
-export type Type11 = "structure_choch";
+export type Type13 = "structure_choch";
 export type AllowSecondary1 = boolean;
 export type BreakevenAtR3 = number | null;
 export type MaxBos = number | null;
 export type StopBuffer1 = number;
-export type Type12 = "structure_continuation";
+export type Type14 = "structure_continuation";
 export type Timeframe = "M1" | "M5" | "M15" | "M30" | "H1" | "H4" | "D1" | "W1";
 
 /**
@@ -470,6 +476,46 @@ export interface Lowest {
   params: PeriodParams;
   type: Type7;
 }
+/**
+ * Bollinger Bands — an average with a volatility envelope, read by component.
+ *
+ * ⚠️ **One indicator with three readings, not three indicators.** Declared once as `bb`, its
+ * bands are referenced as `bb.upper`, `bb.middle` and `bb.lower`. Three separate declarations
+ * would let a document give the upper band a period of 20 and the lower one 50, and nothing
+ * could object: for this schema they would be two well-formed indicators. What came out would
+ * be a band whose rails describe different markets, and it would look exactly like a band.
+ */
+export interface Bollinger {
+  id: Id6;
+  params: BollingerParams;
+  type: Type8;
+}
+/**
+ * A window, the price it reads, and how many deviations wide the envelope is.
+ *
+ * `deviations` is a float rather than an int because 1.5 and 2.5 are ordinary settings, and it
+ * is bounded above 0 exclusively: a multiplier of zero collapses the three bands onto the
+ * average, which is an SMA spelled in a way that hides that it is one. The upper bound is
+ * generous — a band ten deviations out is useless, not malformed.
+ */
+export interface BollingerParams {
+  deviations?: Deviations;
+  period: Period2;
+  source?: "open" | "high" | "low" | "close";
+}
+/**
+ * Average Directional Index (Wilder) — how strongly a market trends, read by component.
+ *
+ * Referenced as `adx.adx` for the strength line and `adx.plus_di` / `adx.minus_di` for the two
+ * direction lines. ⚠️ **The `adx` component has no direction**: it rises in a hard sell-off
+ * exactly as it does in a rally, so a rule meaning "trending up" needs the `DI` pair as well.
+ * Reads the whole candle, so there is no price source to name — same argument as `PeriodParams`.
+ */
+export interface ADX {
+  id: Id7;
+  params: PeriodParams;
+  type: Type9;
+}
 export interface Risk {
   max_daily_loss_percent?: MaxDailyLossPercent;
   max_open_positions?: MaxOpenPositions;
@@ -480,27 +526,27 @@ export interface Risk {
  */
 export interface PercentRiskSizing {
   params: PercentRiskParams;
-  type: Type8;
+  type: Type10;
 }
 export interface PercentRiskParams {
   percent: Percent;
 }
 export interface Mme9BreakoutSetup {
   params: Mme9BreakoutParams;
-  type: Type9;
+  type: Type11;
 }
 /**
  * The break of the candle that closed across the MME9 (ADR-0016).
  */
 export interface Mme9BreakoutParams {
   breakeven_at_r?: BreakevenAtR;
-  period?: Period2;
+  period?: Period3;
   side: SetupSide;
   stop_buffer_ticks?: StopBufferTicks;
 }
 export interface PontoContinuoSetup {
   params: PontoContinuoParams;
-  type: Type10;
+  type: Type12;
 }
 /**
  * Two corrections back to the average, then the bar that touches it and closes back.
@@ -508,7 +554,7 @@ export interface PontoContinuoSetup {
 export interface PontoContinuoParams {
   average?: "EMA" | "SMA";
   breakeven_at_r?: BreakevenAtR1;
-  period?: Period3;
+  period?: Period4;
   side: SetupSide;
   stop_buffer_ticks?: StopBufferTicks1;
 }
@@ -517,7 +563,7 @@ export interface PontoContinuoParams {
  */
 export interface StructureChochSetup {
   params?: StructureParams;
-  type: Type11;
+  type: Type13;
 }
 /**
  * Shared by every setup that arms a limit order on a zone market structure left behind.
@@ -535,7 +581,7 @@ export interface StructureParams {
  */
 export interface StructureContinuationSetup {
   params?: ContinuationParams;
-  type: Type12;
+  type: Type14;
 }
 /**
  * `max_bos` caps how many breaks after a change of character may still be traded.

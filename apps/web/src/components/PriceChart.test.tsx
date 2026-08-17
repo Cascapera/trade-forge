@@ -75,6 +75,9 @@ vi.mock('lightweight-charts', () => ({
   CandlestickSeries: 'CandlestickSeries',
   LineSeries: 'LineSeries',
   ColorType: { Solid: 'solid' },
+  // The real enum's own numbering, so an assertion on `lineStyle` reads against the library's
+  // values rather than against a stand-in this file invented.
+  LineStyle: { Solid: 0, Dotted: 1, Dashed: 2 },
 }))
 
 import { PriceChart } from './PriceChart'
@@ -275,6 +278,37 @@ describe('PriceChart — the curves the strategy was reading', () => {
       { time: 1722524400, value: 226.1 },
       { time: 1722528000, value: 226.4 },
     ])
+  })
+
+  it('draws the bands of one indicator in one hue, told apart by line style', () => {
+    // ⚠️ The stroke has to reach the library, not just the model. `toCurves` deciding `dashed`
+    // and this component ignoring it would put three identical lines on the chart in one colour —
+    // and the legend would name three curves the reader cannot match to anything on screen.
+    draw({
+      overlays: [
+        { ...ema, label: 'bb.middle' },
+        { ...ema, label: 'bb.upper' },
+        { ...ema, label: 'bb.lower' },
+      ],
+    })
+
+    const lines = options.slice(1)
+    expect(new Set(lines.map((given) => given.color)).size).toBe(1)
+    // The library's own enum values, from the mock: Solid 0, Dotted 1, Dashed 2.
+    expect(lines.map((given) => given.lineStyle)).toEqual([0, 2, 1])
+    expect(lines.map((given) => given.lineWidth)).toEqual([2, 1, 1])
+  })
+
+  it('names each band separately in the legend', () => {
+    draw({
+      overlays: [
+        { ...ema, label: 'bb.middle' },
+        { ...ema, label: 'bb.upper' },
+      ],
+    })
+
+    expect(screen.getByText('bb.middle')).toBeInTheDocument()
+    expect(screen.getByText('bb.upper')).toBeInTheDocument()
   })
 })
 

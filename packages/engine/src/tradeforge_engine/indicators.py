@@ -29,13 +29,15 @@ practice: new blocks without touching the core.
 """
 
 import collections
+import datetime as dt
 from collections.abc import Callable, Mapping
-from decimal import Decimal
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from typing import Final
 
 from tradeforge_engine.domain import ZERO, Candle, Money
 from tradeforge_engine.errors import EngineError
-from tradeforge_engine.protocols import Indicator
+from tradeforge_engine.protocols import CompositeIndicator, Indicator
 
 _PRICE_SOURCES: Final = frozenset({"open", "high", "low", "close"})
 
@@ -362,19 +364,365 @@ class Lowest(_Extreme):
         super().__init__(period=period, field="low", keep_higher=False)
 
 
+class _FoldsOnce:
+    """The repeat guard every composite needs — see `protocols.CompositeIndicator`.
+
+    A single-valued indicator has one caller and never meets this. A composite is reached
+    through one channel per component, and the overlay reader drives every channel it was
+    handed, so the same closed bar arrives once per component. Counting it three times would
+    build an ADX from three times the bars anyone asked for — a number that looks like an ADX.
+
+    ⚠️ **A bar strictly older than the last one raises rather than being ignored.** Nothing in
+    this engine can currently produce that: the loop feeds a run in order, and the overlay
+    reader replays a sorted window. Ignoring it silently would be the same shape of failure as
+    the one this class exists to stop, only harder to find — the state would simply be built
+    from a different set of bars than the caller believes. Failing loudly on a case that cannot
+    happen costs nothing until the day it can.
+    """
+
+    def __init__(self) -> None:
+        self._folded_at: dt.datetime | None = None
+
+    def _is_repeat(self, candle: Candle) -> bool:
+        if self._folded_at is not None:
+            if candle.time == self._folded_at:
+                return True
+            if candle.time < self._folded_at:
+                raise EngineError(
+                    f"candle at {candle.time.isoformat()} is older than the last one folded "
+                    f"({self._folded_at.isoformat()}); indicators read a series forwards"
+                )
+        self._folded_at = candle.time
+        return False
+
+
+class Bollinger(_FoldsOnce):
+    """Bollinger Bands — a moving average with a volatility envelope around it.
+
+        middle = SMA(period)
+        upper  = middle + deviations * sd
+        lower  = middle - deviations * sd
+
+    where `sd` is the standard deviation of the same `period` prices the average was taken over.
+    The width is the reading: the bands squeeze when the market goes quiet and flare when it
+    moves, so "price touched the upper band" means something different in each regime, which is
+    the whole point of the indicator over a fixed-width channel like `HIGHEST`/`LOWEST`.
+
+    **Population sd (divide by n), not sample sd (n-1).** The window *is* the population being
+    described — these `period` bars, not a sample drawn from some larger set of bars we are
+    inferring about. It is also what every charting platform computes, and the difference is
+    real: at period 20 the sample form is 2.6% wider, which moves the band by a fifth of a
+    standard deviation and turns a touch into a non-touch on the exact bars the strategy cares
+    about.
+
+    **`sd` from `sum` and `sum_of_squares`, not a pass over the window.** `variance = E[x2] - E[x]2`
+    keeps the O(1) discipline of this module. The classic objection is catastrophic
+    cancellation: the two terms are nearly equal when prices are large and variance is small, and
+    subtracting them throws away the leading digits they share.
+
+    That objection was **measured** here rather than argued, against a two-pass sum of squared
+    deviations over the same windows, at 28 digits. The two agree to the last digit — zero
+    relative error — for every price scale up to 1e9, at period 20 and at period 200. The first
+    divergence is at 1e10 (0.039% on the standard deviation), it reaches 4% at 1e11, and from
+    1e12 the one-pass form returns exactly zero for a window that genuinely moves. Real
+    instruments live at 1e0 (GBPUSD) to 1e5 (BTCUSD), so this leaves four orders of magnitude of
+    margin — and the boundary is written down so the day something reads a price near 1e10, the
+    form has to change rather than be trusted. Under binary floating point this would already be
+    the wrong implementation at forex prices, which is worth knowing rather than inheriting.
+
+    ⚠️ **The variance is clamped at zero before the square root**, because `Decimal.sqrt()`
+    raises `InvalidOperation` on a negative and the subtraction above can produce one. A *flat*
+    window cannot: `n·x / n` is exact, so the two terms cancel to exactly zero. What does reach
+    it is a **nearly** flat window at a high price scale — measured from 1e6 upward, when the
+    window's spread is orders of magnitude below one tick — where cancellation eats the whole
+    value and tips it a last place below zero. Removing the clamp turns that into a crash inside
+    an indicator, and the true variance there is zero to every digit that survived, so zero is
+    also the right answer rather than a papered-over one.
+    """
+
+    # ⚠️ Ordered **primary first**, and that is a contract rather than a style choice: a reader
+    # with no knowledge of what a band is uses this order to decide which line is the subject and
+    # which are its envelope (the chart draws the first solid and the rest dashed). Alphabetical
+    # or "upper, middle, lower" order would make the upper band the subject of its own average.
+    COMPONENTS: Final = ("middle", "upper", "lower")
+
+    def __init__(self, *, period: int, source: str = "close", deviations: Money) -> None:
+        if period < 1:
+            raise ValueError(f"Bollinger period must be >= 1, got {period}")
+        if deviations <= ZERO:
+            raise ValueError(f"Bollinger deviations must be > 0, got {deviations}")
+        super().__init__()
+        self._period = period
+        self._source = source
+        # Unlike `EMA`'s alpha, this one is safe to hold from construction: it arrives as an
+        # exact decimal (the builder parses it through `str`) and is never *computed* here, so
+        # there is no inexact division to bake the ambient context's precision into.
+        self._deviations = deviations
+        self._window: collections.deque[Money] = collections.deque(maxlen=period)
+        self._sum: Money = ZERO
+        self._sum_of_squares: Money = ZERO
+
+    def update(self, candle: Candle) -> None:
+        if self._is_repeat(candle):
+            return
+        price = _price(candle, self._source)
+        # Same eviction discipline as `SMA`: subtract what is about to fall out of the window
+        # *before* the deque drops it, or both running totals drift upward for ever.
+        if len(self._window) == self._period:
+            oldest = self._window[0]
+            self._sum -= oldest
+            self._sum_of_squares -= oldest * oldest
+        self._window.append(price)
+        self._sum += price
+        self._sum_of_squares += price * price
+
+    def components(self) -> Mapping[str, Money | None]:
+        if len(self._window) < self._period:
+            return {"middle": None, "upper": None, "lower": None}
+        middle = self._sum / self._period
+        # Clamped: a negative here is only ever a rounding artefact of a flat window, and
+        # `Decimal.sqrt()` raises on it — see the class docstring.
+        variance = max(self._sum_of_squares / self._period - middle * middle, ZERO)
+        spread = self._deviations * variance.sqrt()
+        return {"middle": middle, "upper": middle + spread, "lower": middle - spread}
+
+
+class ADX(_FoldsOnce):
+    """Average Directional Index (Wilder, 1978) — how *strongly* a market is trending, not which
+    way.
+
+    Three readings, and the pair is what the headline is built from:
+
+        +DM = up move,   if this bar's high rose more than its low fell, else 0
+        -DM = down move, if this bar's low fell more than its high rose, else 0
+        +DI = 100 · smoothed(+DM) / smoothed(TR)      (and -DI likewise)
+        DX  = 100 · |+DI - -DI| / (+DI + -DI)
+        ADX = smoothed(DX)
+
+    `+DI` and `-DI` say which side is winning; `DX` says by how much, as a share of all the
+    movement there was; `ADX` smooths `DX` so a single decisive bar cannot read as a trend.
+    ⚠️ **`ADX` has no direction** — it rises in a hard sell-off exactly as it does in a rally,
+    because `DX` takes an absolute value. Reading it as bullish is the classic misuse; the
+    direction is in the `+DI`/`-DI` pair, which is why they are components rather than internals.
+
+    **Only one `-DM` or `+DM` can be non-zero on a bar.** An outside bar that made both a higher
+    high and a lower low is not two units of directional movement — the larger move wins and the
+    other is zero. An implementation that credits both reports a market as trending both ways at
+    once, and `DX` (their difference over their sum) collapses toward zero exactly when the bar
+    was most decisive.
+
+    **True Range is the same definition `ATR` uses**, gaps included, and for the same reason.
+    ⚠️ But unlike `ATR`, the first bar contributes **nothing**: `TR` alone could be seeded from
+    `high - low`, while `+DM` needs a previous high to have moved from. Seeding `TR` a bar
+    earlier than the `DM`s would put one more bar of range under a ratio whose numerator had not
+    started counting, and every `DI` in the run would read slightly low.
+
+    **Wilder smoothing throughout** (weight `1 / period`), written in the same stable increment
+    form as `EMA`, `RSI` and `ATR`. Wilder's own notation accumulates sums rather than averages —
+    `S = S_prev - S_prev/period + x` — which is this form scaled by `period`; the scale cancels
+    in `+DM / TR`, so the `DI` values are identical either way.
+
+    ⚠️ **The components warm up at different bars, and the gap is `period - 1`.** The `DM`/`TR`
+    averages seed on bar `period`, so `+DI`/`-DI` answer from there. `ADX` is a *second*
+    smoothing, seeded from the first `period` values of `DX`, so it answers only on bar
+    `2·period - 1` — bar 27 for the standard period of 14. An implementation that reports `ADX`
+    as soon as the `DI` pair exists is reporting a single `DX` under the name of an average, and
+    it is the most common way an ADX disagrees with a chart at the start of a series.
+    """
+
+    COMPONENTS: Final = ("adx", "plus_di", "minus_di")
+
+    def __init__(self, *, period: int) -> None:
+        if period < 1:
+            raise ValueError(f"ADX period must be >= 1, got {period}")
+        super().__init__()
+        self._period = period
+        self._previous: Candle | None = None
+        self._seed_count = 0
+        self._seed_plus: Money = ZERO
+        self._seed_minus: Money = ZERO
+        self._seed_true_range: Money = ZERO
+        self._average_plus: Money | None = None
+        self._average_minus: Money | None = None
+        self._average_true_range: Money | None = None
+        self._dx_count = 0
+        self._dx_sum: Money = ZERO
+        self._adx: Money | None = None
+
+    def _directional_movement(self, candle: Candle, previous: Candle) -> tuple[Money, Money]:
+        up = candle.high - previous.high
+        down = previous.low - candle.low
+        # Strictly greater on both counts: an equal move is not a directional one, and two
+        # non-zero DMs on one bar is the failure the class docstring describes.
+        plus = up if up > down and up > ZERO else ZERO
+        minus = down if down > up and down > ZERO else ZERO
+        return plus, minus
+
+    def update(self, candle: Candle) -> None:
+        if self._is_repeat(candle):
+            return
+        previous = self._previous
+        self._previous = candle
+        if previous is None:
+            # No prior bar to have moved from — see the docstring on why TR does not start here
+            # either, though it could.
+            return
+
+        plus, minus = self._directional_movement(candle, previous)
+        true_range = max(
+            candle.high - candle.low,
+            abs(candle.high - previous.close),
+            abs(candle.low - previous.close),
+        )
+
+        # The three are asked about together rather than through `_average_true_range` alone:
+        # they seed on the same bar, and testing all three is what lets the type checker know
+        # the other branch has numbers — no assertion standing in for the invariant.
+        if (
+            self._average_plus is None
+            or self._average_minus is None
+            or self._average_true_range is None
+        ):
+            self._seed_count += 1
+            self._seed_plus += plus
+            self._seed_minus += minus
+            self._seed_true_range += true_range
+            if self._seed_count < self._period:
+                return
+            self._average_plus = self._seed_plus / self._period
+            self._average_minus = self._seed_minus / self._period
+            self._average_true_range = self._seed_true_range / self._period
+        else:
+            self._average_plus += (plus - self._average_plus) / self._period
+            self._average_minus += (minus - self._average_minus) / self._period
+            self._average_true_range += (true_range - self._average_true_range) / self._period
+
+        # DX exists from the bar the averages seed on, including that bar — it is the first of
+        # the `period` values the ADX seed is the mean of. The pair is computed from the three
+        # averages directly rather than through `_di_pair`, whose `None` case cannot arise here:
+        # every path above either returned or left all three set. Routing through it would add a
+        # branch no test could reach, and an unreachable branch reads as a case somebody handled.
+        dx = self._directional_index(
+            *self._direction(self._average_plus, self._average_minus, self._average_true_range)
+        )
+        if self._adx is None:
+            self._dx_count += 1
+            self._dx_sum += dx
+            if self._dx_count == self._period:
+                self._adx = self._dx_sum / self._period
+        else:
+            self._adx += (dx - self._adx) / self._period
+
+    def _direction(self, plus: Money, minus: Money, true_range: Money) -> tuple[Money, Money]:
+        """The `+DI`/`-DI` pair from three smoothed averages that are known to exist."""
+        if true_range == ZERO:
+            # A window with no range at all: every bar an identical doji, no gaps. There is no
+            # movement to apportion, so neither side is winning — 0, not a division by zero.
+            return ZERO, ZERO
+        scale = Decimal(100) / true_range
+        return plus * scale, minus * scale
+
+    def _di_pair(self) -> tuple[Money, Money] | None:
+        """The same pair for a reader, `None` while the averages are still seeding."""
+        if (
+            self._average_true_range is None
+            or self._average_plus is None
+            or self._average_minus is None
+        ):
+            return None
+        return self._direction(self._average_plus, self._average_minus, self._average_true_range)
+
+    def _directional_index(self, plus: Money, minus: Money) -> Money:
+        total = plus + minus
+        if total == ZERO:
+            # No directional movement either way. `DX` measures how one-sided the movement was;
+            # with none to be one-sided about, the honest reading is zero, and it is what keeps
+            # a flat stretch from raising instead of reporting "no trend".
+            return ZERO
+        return Decimal(100) * abs(plus - minus) / total
+
+    def components(self) -> Mapping[str, Money | None]:
+        pair = self._di_pair()
+        plus, minus = (None, None) if pair is None else pair
+        return {"adx": self._adx, "plus_di": plus, "minus_di": minus}
+
+
+@dataclass(frozen=True, slots=True)
+class ComponentView:
+    """One component of a composite, wearing the single-valued `Indicator` shape.
+
+    It exists for `Charted.overlays`, whose contract is a mapping of label to `Indicator` and
+    whose reader drives what it is handed. Three views over one `Bollinger` let a chart draw
+    three curves without the overlay path learning that composites exist — and the repeat guard
+    in `_FoldsOnce` is what makes the three `update` calls per bar mean one bar.
+    """
+
+    composite: CompositeIndicator
+    component: str
+
+    def update(self, candle: Candle) -> None:
+        self.composite.update(candle)
+
+    def value(self) -> Money | None:
+        return self.composite.components()[self.component]
+
+
 # The registry. A DSL indicator names a `type`; this maps it to a constructor. Each indicator
 # satisfies the `Indicator` Protocol structurally — none inherits anything — so the registry is
 # typed against the Protocol, and a new indicator is genuinely one new class plus one line here.
+def _params_of(spec: Mapping[str, object]) -> Mapping[str, object]:
+    """The `params` block, or a sentence saying it is not one.
+
+    ⚠️ `spec["params"]` used to be a bare subscript, so a document without the key left this module
+    raising `KeyError: 'params'` — a traceback, against this file's own promise of a sentence.
+    Reachable only by a mapping that did not come through the schema, which is exactly the case
+    where the message has to carry its own context: the caller has no validator to consult.
+    """
+    params = spec.get("params")
+    if not isinstance(params, Mapping):
+        raise EngineError(f"indicator {spec.get('id')!r}: params must be an object, got {params!r}")
+    return params
+
+
+def _whole_number(spec: Mapping[str, object], params: Mapping[str, object], name: str) -> int:
+    """Read one required integer parameter, refusing absence and nonsense in the same voice.
+
+    `bool` is excluded even though it is an `int` subclass: a period of `true` is a mistake, not
+    the number 1 — the same line `compile_constant` draws in `expressions`.
+    """
+    value = params.get(name)
+    if value is None:
+        raise EngineError(f"indicator {spec.get('id')!r}: params.{name} is required")
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise EngineError(
+            f"indicator {spec.get('id')!r}: params.{name} must be a whole number, got {value!r}"
+        )
+    try:
+        number = int(value)
+    # ⚠️ `OverflowError` alongside `ValueError`: `int(float("inf"))` raises the first and not the
+    # second, so an infinity used to escape as a raw traceback — the very thing this function was
+    # written to stop. `nan` was only caught because `int(nan)` happens to raise `ValueError`.
+    except (ValueError, OverflowError) as error:
+        raise EngineError(
+            f"indicator {spec.get('id')!r}: params.{name} must be a whole number, got {value!r}"
+        ) from error
+    # ⚠️ And a whole number means a whole number. `int(2.7)` is 2, so a period of 2.7 used to be
+    # silently truncated by a function whose refusal message says "must be a whole number" — the
+    # document would run a 2-period average while its author read 2.7 off the screen.
+    if isinstance(value, float) and number != value:
+        raise EngineError(
+            f"indicator {spec.get('id')!r}: params.{name} must be a whole number, got {value!r}"
+        )
+    return number
+
+
 def _period_source_builder(
     cls: Callable[..., Indicator],
 ) -> Callable[[Mapping[str, object]], Indicator]:
     def build(spec: Mapping[str, object]) -> Indicator:
-        params = spec["params"]
-        if not isinstance(params, Mapping):
-            raise EngineError(f"indicator {spec.get('id')!r}: params must be an object")
-        period = params["period"]
+        params = _params_of(spec)
         source = params.get("source", "close")
-        return cls(period=int(period), source=str(source))
+        return cls(period=_whole_number(spec, params, "period"), source=str(source))
 
     return build
 
@@ -385,25 +733,59 @@ def _period_builder(
     """For the indicators that read the whole candle, so a price source has nothing to name."""
 
     def build(spec: Mapping[str, object]) -> Indicator:
-        params = spec["params"]
-        if not isinstance(params, Mapping):
-            raise EngineError(f"indicator {spec.get('id')!r}: params must be an object")
-        return cls(period=int(params["period"]))
+        params = _params_of(spec)
+        return cls(period=_whole_number(spec, params, "period"))
 
     return build
 
 
-INDICATOR_BUILDERS: Final[dict[str, Callable[[Mapping[str, object]], Indicator]]] = {
+def _bollinger_builder(spec: Mapping[str, object]) -> CompositeIndicator:
+    params = _params_of(spec)
+    # Through `str`, never `float(...)`: a document asking for 2.5 deviations must widen the
+    # band by exactly 2.5 standard deviations, not by the binary approximation (ADR-0011).
+    try:
+        deviations = Decimal(str(params.get("deviations", 2)))
+    except InvalidOperation as error:
+        raise EngineError(
+            f"indicator {spec.get('id')!r}: params.deviations must be a number, "
+            f"got {params.get('deviations')!r}"
+        ) from error
+    return Bollinger(
+        period=_whole_number(spec, params, "period"),
+        source=str(params.get("source", "close")),
+        deviations=deviations,
+    )
+
+
+def _adx_builder(spec: Mapping[str, object]) -> CompositeIndicator:
+    return ADX(period=_whole_number(spec, _params_of(spec), "period"))
+
+
+INDICATOR_BUILDERS: Final[
+    dict[str, Callable[[Mapping[str, object]], Indicator | CompositeIndicator]]
+] = {
     "SMA": _period_source_builder(SMA),
     "EMA": _period_source_builder(EMA),
     "RSI": _period_source_builder(RSI),
     "ATR": _period_builder(ATR),
     "HIGHEST": _period_builder(Highest),
     "LOWEST": _period_builder(Lowest),
+    "BOLLINGER": _bollinger_builder,
+    "ADX": _adx_builder,
+}
+
+# The component names of every composite type, for the compiler to expand a declaration into
+# one readable channel per component. ⚠️ Duplicated in `tradeforge_schema.models` — the two
+# packages do not import each other — and pinned equal by a test in `apps/api`, which depends on
+# both. Drift here is silent: the schema would accept `bb.uppper`, the engine would resolve it
+# to `None`, and a comparison against `None` is false for ever.
+COMPOSITE_COMPONENTS: Final[Mapping[str, tuple[str, ...]]] = {
+    "BOLLINGER": Bollinger.COMPONENTS,
+    "ADX": ADX.COMPONENTS,
 }
 
 
-def build_indicator(spec: Mapping[str, object]) -> tuple[str, Indicator]:
+def build_indicator(spec: Mapping[str, object]) -> tuple[str, Indicator | CompositeIndicator]:
     """Turn one DSL indicator spec into `(id, indicator)`.
 
     Raises rather than guess on a `type` the engine was not built for: a strategy naming an
@@ -424,11 +806,15 @@ def build_indicator(spec: Mapping[str, object]) -> tuple[str, Indicator]:
 
 
 __all__ = [
+    "ADX",
     "ATR",
+    "COMPOSITE_COMPONENTS",
     "EMA",
     "INDICATOR_BUILDERS",
     "RSI",
     "SMA",
+    "Bollinger",
+    "ComponentView",
     "Highest",
     "Lowest",
     "build_indicator",

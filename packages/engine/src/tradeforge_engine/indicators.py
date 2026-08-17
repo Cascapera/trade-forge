@@ -211,6 +211,157 @@ class RSI:
         return Decimal(100) - Decimal(100) / (Decimal(1) + rs)
 
 
+class ATR:
+    """Average True Range (Wilder, 1978) — how far this market moves in a bar, in price.
+
+    **True Range first, and it is why this indicator reads a candle rather than a price.** A
+    bar's range is not `high - low`: a market that gapped opens away from yesterday's close, and
+    the distance it travelled includes the gap. So TR is the widest of three spans:
+
+        TR = max(high - low, |high - previous close|, |low - previous close|)
+
+    On a bar that gapped up, the second term wins and the first understates the move by the size
+    of the gap. The first bar of a run has no previous close, so its TR is `high - low` — the
+    only reading available, and it is seeded rather than skipped so a short run still warms up.
+
+    **Wilder smoothing — not the `EMA` in this file.** The average uses weight `1 / period`, not
+    `2 / (period + 1)`. For period 14 that is ~0.071 against ~0.133, nearly double, and swapping
+    them is the most common reason an ATR disagrees with every charting tool. The golden test
+    pins a series where the two answers differ (5 against 6) precisely so the confusion cannot
+    survive here.
+
+    **Seeding** is the simple mean of the first `period` true ranges, which needs `period` bars.
+
+    ⚠️ **No `source` parameter, unlike SMA and EMA.** ATR reads high, low *and* the previous
+    close by definition; an "ATR of the close" is not a smaller version of this, it is a
+    different measurement. Offering the parameter would let a document ask for something this
+    class cannot mean.
+    """
+
+    def __init__(self, *, period: int) -> None:
+        if period < 1:
+            raise ValueError(f"ATR period must be >= 1, got {period}")
+        self._period = period
+        self._previous_close: Money | None = None
+        self._seed_count = 0
+        self._seed_total: Money = ZERO
+        self._average: Money | None = None
+
+    def _true_range(self, candle: Candle) -> Money:
+        span = candle.high - candle.low
+        if self._previous_close is None:
+            return span
+        return max(
+            span,
+            abs(candle.high - self._previous_close),
+            abs(candle.low - self._previous_close),
+        )
+
+    def update(self, candle: Candle) -> None:
+        true_range = self._true_range(candle)
+        self._previous_close = candle.close
+        if self._average is None:
+            self._seed_count += 1
+            self._seed_total += true_range
+            if self._seed_count == self._period:
+                self._average = self._seed_total / self._period
+            return
+        # Wilder smoothing, in the same stable increment form `EMA` and `RSI` use.
+        self._average = self._average + (true_range - self._average) / self._period
+
+    def value(self) -> Money | None:
+        return self._average
+
+
+class _Extreme:
+    """The highest high or the lowest low of the last `period` bars, in O(1) amortised.
+
+    **A monotonic deque, not a scan of the window.** Taking `max()` over the window on every bar
+    is O(period) per bar, which this module's whole discipline exists to avoid — a 200-period
+    channel over a decade of M1 is a billion comparisons. The deque holds only the candidates
+    that could still become the extreme: a new value pops every value it beats, because those
+    can never be the answer again while the newcomer is in the window. Each value is pushed once
+    and popped once, so the amortised cost is constant however long the window is.
+
+    ⚠️ **The window ends at the previous bar: the current one is not in it.** This is the whole
+    difference between a channel that can be broken and one that cannot, and the inclusive
+    version was measured failing before this line was written. Fold the current bar in first and
+    `HIGHEST(20) >= high` holds by construction on every bar of every market — so
+    `breaks_above(price.high, channel)` is constantly false, and `between(close, low, high)` is
+    constantly true, because `lower <= low <= close <= high <= upper`. Both rails of the feature
+    degenerate at once, and neither says a word: the backtest runs and reports no trades.
+
+    The escape a charting platform offers is a shifted read (`ta.highest(high, 20)[1]`), and the
+    DSL v1 has no shift for an indicator ref — `shift` exists only inside `Trend`. So the level
+    is defined where it can be used. The cost is a documented deviation from Pine, whose
+    `ta.highest` does include the current bar; a general `{"ref": ..., "shift": N}` would let
+    both readings coexist and is in the backlog.
+
+    Consequence for warm-up: the first answer lands on bar `period` (zero-based), one bar later
+    than an inclusive window, because `period` bars must have *closed before* this one.
+    """
+
+    def __init__(self, *, period: int, field: str, keep_higher: bool) -> None:
+        if period < 1:
+            raise ValueError(f"period must be >= 1, got {period}")
+        self._period = period
+        self._field = field
+        self._keep_higher = keep_higher
+        self._seen = 0
+        # (index, value) pairs, ordered from the extreme outwards. The index is what lets a
+        # value leave when the window slides past it.
+        self._candidates: collections.deque[tuple[int, Money]] = collections.deque()
+        # The answer for the bar being processed, captured before that bar joins the window.
+        self._current: Money | None = None
+
+    def _beats(self, incoming: Money, held: Money) -> bool:
+        # ⚠️ `>=`, not `>`: a newer bar holding the *same* extreme outlives the older one, so the
+        # older can never be the answer again and is dropped. Strict comparison is not wrong —
+        # the front of the deque would still be a correct value — it just parks one candidate per
+        # tie, which on a flat market is one per bar of the window. Memory, not correctness.
+        return incoming >= held if self._keep_higher else incoming <= held
+
+    def update(self, candle: Candle) -> None:
+        # ⚠️ Read **before** the current bar joins: the level this bar is measured against is the
+        # extreme of the bars that closed before it. `None` until `period` of them have, like
+        # every other indicator here — a channel answering on bar 3 of a 20-bar lookback would
+        # report the extreme of three bars as if it were the extreme of twenty.
+        self._current = self._candidates[0][1] if self._seen >= self._period else None
+
+        value = _price(candle, self._field)
+        while self._candidates and self._beats(value, self._candidates[-1][1]):
+            self._candidates.pop()
+        self._candidates.append((self._seen, value))
+        # Drop the front once it is older than the window. `_seen` is the index of the bar just
+        # added, so the oldest bar still inside is `_seen - period + 1`.
+        if self._candidates[0][0] <= self._seen - self._period:
+            self._candidates.popleft()
+        self._seen += 1
+
+    def value(self) -> Money | None:
+        return self._current
+
+
+class Highest(_Extreme):
+    """The highest **high** of the `period` bars that closed *before* this one.
+
+    The upper rail of a breakout channel, and the exclusion is what makes it one — see
+    `_Extreme`. Highs rather than closes, so the level is where price actually traded and a
+    break of it fires on the wick; requiring a close beyond it is the same channel compared
+    against `price.close` instead.
+    """
+
+    def __init__(self, *, period: int) -> None:
+        super().__init__(period=period, field="high", keep_higher=True)
+
+
+class Lowest(_Extreme):
+    """The lowest **low** of the `period` bars that closed *before* this one — the lower rail."""
+
+    def __init__(self, *, period: int) -> None:
+        super().__init__(period=period, field="low", keep_higher=False)
+
+
 # The registry. A DSL indicator names a `type`; this maps it to a constructor. Each indicator
 # satisfies the `Indicator` Protocol structurally — none inherits anything — so the registry is
 # typed against the Protocol, and a new indicator is genuinely one new class plus one line here.
@@ -228,10 +379,27 @@ def _period_source_builder(
     return build
 
 
+def _period_builder(
+    cls: Callable[..., Indicator],
+) -> Callable[[Mapping[str, object]], Indicator]:
+    """For the indicators that read the whole candle, so a price source has nothing to name."""
+
+    def build(spec: Mapping[str, object]) -> Indicator:
+        params = spec["params"]
+        if not isinstance(params, Mapping):
+            raise EngineError(f"indicator {spec.get('id')!r}: params must be an object")
+        return cls(period=int(params["period"]))
+
+    return build
+
+
 INDICATOR_BUILDERS: Final[dict[str, Callable[[Mapping[str, object]], Indicator]]] = {
     "SMA": _period_source_builder(SMA),
     "EMA": _period_source_builder(EMA),
     "RSI": _period_source_builder(RSI),
+    "ATR": _period_builder(ATR),
+    "HIGHEST": _period_builder(Highest),
+    "LOWEST": _period_builder(Lowest),
 }
 
 
@@ -255,4 +423,13 @@ def build_indicator(spec: Mapping[str, object]) -> tuple[str, Indicator]:
     return indicator_id, builder(spec)
 
 
-__all__ = ["EMA", "INDICATOR_BUILDERS", "RSI", "SMA", "build_indicator"]
+__all__ = [
+    "ATR",
+    "EMA",
+    "INDICATOR_BUILDERS",
+    "RSI",
+    "SMA",
+    "Highest",
+    "Lowest",
+    "build_indicator",
+]

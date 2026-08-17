@@ -111,6 +111,45 @@ class Comparison(_Node):
     right: Operand
 
 
+class Between(_Node):
+    """Three operands: is `value` inside the band `[low, high]`?
+
+    ⚠️ **Both bounds are inclusive**, and it is written down here because "between" is the kind
+    of word every reader is sure they already know. Exclusive would make `between 0 and 100`
+    reject the two values a bounded oscillator can actually reach.
+
+    A node of its own rather than an `op` on `Comparison`, because it takes three operands and
+    `Comparison` takes two. Folding it in would make `right` mean one thing for seven operators
+    and another for this one — and the untagged union below discriminates on *shape*, so the
+    distinct shape is what keeps a document unambiguous.
+
+    The bounds are operands, not numbers, so a band can be drawn between two indicators — a
+    price inside its own channel is `between(price.close, lower, upper)`.
+    """
+
+    op: Literal["between"]
+    value: Operand
+    low: Operand
+    high: Operand
+
+
+class Trend(_Node):
+    """Has `of` moved in one direction on each of the last `bars` bars?
+
+    ⚠️ **Monotonic over the window, not "higher than it was N bars ago".** The looser reading
+    calls a series that fell for four bars and jumped on the fifth "rising", which is the
+    opposite of what anybody writing the rule meant. Matching the reading used by the charting
+    platforms this project's indicators were transcribed from is the point: a rule that means
+    something different here than on his chart is a rule he cannot check.
+
+    `bars: 1` is the base case and the default — "higher than the previous bar".
+    """
+
+    op: Literal["rising", "falling"]
+    of: Operand
+    bars: Annotated[int, Field(ge=1, le=100)] = 1
+
+
 class AllOf(_Node):
     """Logical AND."""
 
@@ -131,7 +170,12 @@ class NotOf(_Node):
 
 # Untagged union: the shape of the object decides which node it is. `extra="forbid"`
 # is what makes that unambiguous — exactly one member can accept any given object.
-type Condition = Comparison | AllOf | AnyOf | NotOf
+#
+# ⚠️ The three leaf shapes are distinguished by their *field names*, not by `op` alone:
+# `left`/`right`, `value`/`low`/`high`, `of`. `extra="forbid"` is what makes that a proof
+# rather than a hope — a `between` carrying a `left` matches nothing and is refused, instead
+# of being read as a comparison with a stray key.
+type Condition = Comparison | Between | Trend | AllOf | AnyOf | NotOf
 
 
 # --------------------------------------------------------------------------- #
@@ -142,7 +186,8 @@ type Condition = Comparison | AllOf | AnyOf | NotOf
 class PeriodSourceParams(_Node):
     """A window length and which price it reads — shared by every single-period indicator
     (SMA, EMA, RSI, and ATR to come). Named for its shape, not for one indicator, because a
-    period over a price source is exactly what they all take."""
+    period over a price source is exactly what they all take. ATR is *not* one of them — see
+    `PeriodParams`."""
 
     period: Annotated[int, Field(ge=1, le=1000)]
     source: PriceSource = "close"
@@ -170,12 +215,64 @@ class RSI(_Node):
     params: PeriodSourceParams
 
 
+class PeriodParams(_Node):
+    """A window length and nothing else — for the indicators that read the whole candle.
+
+    ⚠️ Deliberately **not** `PeriodSourceParams` with the source defaulted. ATR is defined over
+    high, low and the previous close together; a channel is defined over highs and lows. An
+    "ATR of the close" is not a variant of ATR, it is a different measurement — and a parameter
+    the engine would have to ignore is a request the document believes was honoured.
+    """
+
+    period: Annotated[int, Field(ge=1, le=1000)]
+
+
+class ATR(_Node):
+    """Average True Range (Wilder) — the size of a typical bar, in price.
+
+    True Range counts the gap: a bar that opens away from the previous close travelled further
+    than its own high minus its low. Used to size stops and to ask whether a market is moving
+    at all.
+    """
+
+    id: Annotated[str, Field(pattern=INDICATOR_ID_PATTERN, max_length=40)]
+    type: Literal["ATR"]
+    params: PeriodParams
+
+
+class Highest(_Node):
+    """The highest **high** of the N bars that closed *before* this one — a breakout's rail.
+
+    ⚠️ **The current bar is not in the window**, and that is what makes the level breakable:
+    include it and `HIGHEST(20) >= high` holds on every bar of every market, so a comparison
+    against it is constantly false and a band drawn with it is constantly true. A charting
+    platform's `ta.highest` does include the current bar and is read shifted (`[1]`); the DSL
+    has no shift for an indicator ref, so the level is defined where it can be used.
+
+    Highs, not closes, so the level is where price actually traded. A breakout of it therefore
+    fires on the wick, which is the classical reading and the more sensitive one; comparing
+    against `price.close` instead is how the same channel is made to require a close beyond it.
+    """
+
+    id: Annotated[str, Field(pattern=INDICATOR_ID_PATTERN, max_length=40)]
+    type: Literal["HIGHEST"]
+    params: PeriodParams
+
+
+class Lowest(_Node):
+    """The lowest **low** of the N bars that closed before this one — the lower rail."""
+
+    id: Annotated[str, Field(pattern=INDICATOR_ID_PATTERN, max_length=40)]
+    type: Literal["LOWEST"]
+    params: PeriodParams
+
+
 # Discriminated on `type`: the generated JSON Schema gets a proper `oneOf` with a
-# discriminator, and a new indicator (phase 2: ATR, ADX, MACD...) is a new member —
+# discriminator, and a new indicator (phase 2: ADX, Bollinger...) is a new member —
 # an additive change that leaves every strategy already saved still valid. That is
 # ADR-03 working as designed: new blocks without touching the core (and ADR-13:
 # additive members keep the schema_version, they do not bump it).
-type Indicator = Annotated[SMA | EMA | RSI, Field(discriminator="type")]
+type Indicator = Annotated[SMA | EMA | RSI | ATR | Highest | Lowest, Field(discriminator="type")]
 
 
 # --------------------------------------------------------------------------- #

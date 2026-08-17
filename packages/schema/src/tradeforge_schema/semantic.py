@@ -19,10 +19,12 @@ from dataclasses import dataclass
 from tradeforge_schema.models import (
     AllOf,
     AnyOf,
+    Between,
     Comparison,
     Condition,
     Ref,
     Strategy,
+    Trend,
 )
 
 # `price` and `candle` are namespaces in the ref grammar. An indicator called
@@ -52,9 +54,15 @@ class SemanticValidationError(ValueError):
 def _iter_refs(condition: Condition, path: str) -> Iterator[tuple[Ref, str]]:
     """Walk the expression tree, yielding every operand with the path that reached it.
 
-    Written as early returns rather than a `match`: the union has exactly four members,
-    so the last one is reached by elimination — which mypy proves, and which leaves no
-    unreachable "nothing matched" branch for the coverage report to complain about.
+    Written as early returns rather than a `match`: the union is closed — six members as of
+    the `between` and `rising`/`falling` nodes — so the last one is reached by elimination,
+    which mypy proves, and which leaves no unreachable "nothing matched" branch for the
+    coverage report to complain about.
+
+    ⚠️ That proof is also the guard on this function. Adding a member to `Condition` without a
+    branch here does not fall through to a default: it makes the final line read `not_` off a
+    node that has no such attribute, and mypy refuses the file. It is how the two nodes above
+    got their branches — the type checker asked for them before any test did.
     """
     if isinstance(condition, Comparison):
         # Only refs need checking against declared indicators; a constant operand references
@@ -62,6 +70,23 @@ def _iter_refs(condition: Condition, path: str) -> Iterator[tuple[Ref, str]]:
         for operand, side in ((condition.left, "left"), (condition.right, "right")):
             if isinstance(operand, Ref):
                 yield operand, f"{path}.{side}"
+        return
+
+    if isinstance(condition, Between):
+        # Three operands, and every one of them can name an indicator: a band drawn between two
+        # curves is the reason this node takes operands rather than two numbers.
+        for operand, side in (
+            (condition.value, "value"),
+            (condition.low, "low"),
+            (condition.high, "high"),
+        ):
+            if isinstance(operand, Ref):
+                yield operand, f"{path}.{side}"
+        return
+
+    if isinstance(condition, Trend):
+        if isinstance(condition.of, Ref):
+            yield condition.of, f"{path}.of"
         return
 
     if isinstance(condition, AllOf):

@@ -465,3 +465,29 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
   sem banco, que é honesto mas não resolve a causa. Ver [[portao-de-cobertura-nao-ve-integracao]].
   Opções: combinar os dois relatórios (`coverage combine` entre os jobs) e medir o total, ou
   medir a integração com piso próprio. Não fazer dentro de um PR de produto.
+- [origem: PR-201] **`between`, `rising` e `falling` não são construíveis pela tela** — os três nós
+  novos existem na DSL, na engine e no validador semântico, com teste de ouro cada um, mas a linha
+  de condição do builder é `esquerda | operador | direita` e eles não cabem nela: `between` tem
+  três operandos e `rising`/`falling` têm um mais um contador de barras. Reestruturar essa linha É
+  o **PR-206** (builder visual de blocos), que o próprio `specs/fase-2.md` separa. Até lá são
+  alcançáveis por JSON — o que serve para o motor e para a fixture, e não serve para ele. ⚠️ Ao
+  fazer o PR-206, lembrar que `OPS` no `strategy/builder.ts` é hoje uma lista só de operadores
+  binários: acrescentar os três ali **sem** mudar a linha produz documentos que o schema recusa.
+- [origem: PR-201] **`stop_buffer_ticks` e `stop_buffer` convivem e ninguém explicou a diferença**
+  — descoberto sondando o `setupSpec`: `mme9_breakout` e `ponto_continuo` têm `stop_buffer_ticks`
+  (inteiro, 0 a 10000, default 0) e os dois setups de estrutura têm `stop_buffer` (número, 0 a 10,
+  default 0,1, fração da largura da região). Nomes quase iguais, unidades diferentes, e a tela
+  mostra os dois com o mesmo tipo de campo. Não é bug — é dois conceitos com um nome parecido. Vale
+  renomear um dos dois ou fazer a dica dizer a unidade, no próximo PR que tocar a tela do builder.
+- [origem: PR-201, achado do guardian] **`_period_builder` e `_period_source_builder` levantam
+  `KeyError` cru** quando falta `params.period` (`indicators.py`), contra a promessa do módulo de
+  entregar "uma frase, não um traceback" — o `build_indicator` ao lado já refuta tipo desconhecido
+  e id ausente com `EngineError` legível. Não é regressão do PR-201: o `_period_source_builder`
+  sempre fez isso, e o builder novo herdou o padrão. Alcançável só por documento que não passou
+  pelo schema (a engine recebe mapping cru, por desenho). Consertar junto do próximo PR que tocar
+  o registro de indicadores — que é o PR-201-B (Bollinger e ADX).
+- [origem: PR-201, achado do guardian] **`hypothesis` não cobre os indicadores novos** — existe
+  property de aquecimento para o RSI e nenhuma para `ATR`/`Highest`/`Lowest`. As candidatas
+  óbvias: o ATR nunca é negativo e nunca é menor que o maior `high-low` da janela dividido pelo
+  período; o `Highest` é sempre >= ao `Lowest` do mesmo período; e ambos são `None` exatamente
+  até a barra `period`. Barato, e pega a classe de erro que cenário escrito à mão não pega.

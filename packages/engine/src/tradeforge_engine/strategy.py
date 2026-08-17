@@ -37,8 +37,10 @@ from tradeforge_engine.errors import EngineError
 from tradeforge_engine.expressions import (
     AllOf,
     AnyOf,
+    Between,
     Comparison,
     Condition,
+    Trend,
     compile_condition,
 )
 from tradeforge_engine.indicators import build_indicator
@@ -66,9 +68,35 @@ def _max_lookback(condition: Condition) -> int:
     """The deepest closed candle any operand in this tree reaches at the current bar."""
     if isinstance(condition, Comparison):
         return max(condition.left.lookback, condition.right.lookback)
+    if isinstance(condition, Between):
+        return max(condition.value.lookback, condition.low.lookback, condition.high.lookback)
+    if isinstance(condition, Trend):
+        return condition.of.lookback
     if isinstance(condition, (AllOf, AnyOf)):
         return max((_max_lookback(child) for child in condition.conditions), default=0)
     return _max_lookback(condition.condition)  # NotOf
+
+
+def _max_shift(condition: Condition) -> int:
+    """How many bars back the deepest node *shifts* its operands.
+
+    ⚠️ **This exists because a buffer one bar too short fails silently.** Every operator used to
+    shift by at most one — `crosses_above` asks about this bar and the previous — so the sizes
+    below were the constant 1, spelled `+2` and `maxlen=2`. `rising` with `bars: 5` reaches five
+    bars back; against a window of two it resolves to `None`, the condition is false, and the
+    strategy simply never trades. Nothing raises, nothing logs, and the backtest is a clean run
+    of a rule that was never evaluated.
+
+    A `Comparison` counts as 1 whatever its operator, because a level comparison costs nothing
+    to over-allocate by one bar and the alternative is a table of which operators are edges.
+    """
+    if isinstance(condition, Trend):
+        return condition.bars
+    if isinstance(condition, (Comparison, Between)):
+        return 1
+    if isinstance(condition, (AllOf, AnyOf)):
+        return max((_max_shift(child) for child in condition.conditions), default=1)
+    return _max_shift(condition.condition)  # NotOf
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,6 +153,11 @@ class CompiledStrategy:
         exit_conditions: tuple[Condition, ...],
         stop_rule: StopRule | None,
         history_depth: int,
+        # ⚠️ No default, deliberately. A default of 1 is right for every tree that existed
+        # before `Trend` and silently wrong for one that contains it — and the failure is the
+        # silent one this whole mechanism was built to remove. Required, so a caller that
+        # forgets is refused rather than served a strategy whose deep conditions never fire.
+        shift_depth: int,
     ) -> None:
         self.name = name
         self.timeframe = timeframe
@@ -133,12 +166,15 @@ class CompiledStrategy:
         self._entry_short = entry_short
         self._exit_conditions = exit_conditions
         self._stop_rule = stop_rule
-        # Newest-first, bounded: the deepest ref plus one bar for the edge operators' "previous
-        # bar", plus the current bar. A window any shorter would resolve a legal ref to None.
+        # Newest-first, bounded: the deepest ref plus the deepest shift applied to it, plus the
+        # current bar. A window any shorter would resolve a legal ref to None.
         self._candles: deque[Candle] = deque(maxlen=history_depth)
-        # Two values per indicator — this bar and last — is all an edge operator can ask for.
+        # ⚠️ Sized from the tree, not fixed at two. An indicator carries its own history rather
+        # than a candle depth, so a `rising` over `sma_fast` with `bars: 5` asks this deque for
+        # five bars back — and against the old `maxlen=2` it got `None`, which reads as "the
+        # indicator is warming up" and makes the condition false on every bar of the run.
         self._indicator_history: dict[str, deque[Money | None]] = {
-            indicator_id: deque(maxlen=2) for indicator_id in self._indicators
+            indicator_id: deque(maxlen=shift_depth + 1) for indicator_id in self._indicators
         }
 
     def overlays(self) -> Mapping[str, Indicator]:
@@ -280,9 +316,12 @@ def compile_strategy(document: Mapping[str, object]) -> Strategy:
     trees = [tree for tree in (entry_long, entry_short, *exit_conditions) if tree is not None]
     tree_lookback = max((_max_lookback(tree) for tree in trees), default=0)
     stop_lookback = stop_rule.lookback if stop_rule is not None else 0
-    # +2: the current bar (index 0) and the one bar back every edge operator can reach. The
+    # How far back a node shifts its operands: 1 for an edge operator, `bars` for a trend.
+    shift_depth = max((_max_shift(tree) for tree in trees), default=1)
+    # The deepest ref, plus the deepest shift applied to it, plus the current bar. With only
+    # comparisons in the tree `shift_depth` is 1 and this is the `+2` it has always been. The
     # stop's own lookback competes for the same window — a stop over 20 bars needs 20 kept.
-    history_depth = max(tree_lookback, stop_lookback) + 2
+    history_depth = max(tree_lookback, stop_lookback) + shift_depth + 1
 
     return CompiledStrategy(
         name=name,
@@ -293,6 +332,7 @@ def compile_strategy(document: Mapping[str, object]) -> Strategy:
         exit_conditions=exit_conditions,
         stop_rule=stop_rule,
         history_depth=history_depth,
+        shift_depth=shift_depth,
     )
 
 

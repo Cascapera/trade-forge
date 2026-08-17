@@ -6,12 +6,15 @@
  */
 
 export type Description = string;
-export type Condition = Comparison | AllOf | AnyOf | NotOf;
+export type Condition = Comparison | Between | Trend | AllOf | AnyOf | NotOf;
 export type Operand = Ref | Constant;
 export type Ref1 = string;
 export type Value = number;
 export type ComparisonOp =
   "gt" | "lt" | "gte" | "lte" | "crosses_above" | "crosses_below" | "breaks_above" | "breaks_below";
+export type Op = "between";
+export type Bars = number;
+export type Op1 = "rising" | "falling";
 /**
  * @minItems 1
  */
@@ -216,7 +219,7 @@ export type Indicators =
       Indicator,
       Indicator
     ];
-export type Indicator = SMA | EMA | RSI;
+export type Indicator = SMA | EMA | RSI | ATR | Highest | Lowest;
 export type Id = string;
 export type Period = number;
 export type Type2 = "SMA";
@@ -224,31 +227,38 @@ export type Id1 = string;
 export type Type3 = "EMA";
 export type Id2 = string;
 export type Type4 = "RSI";
+export type Id3 = string;
+export type Period1 = number;
+export type Type5 = "ATR";
+export type Id4 = string;
+export type Type6 = "HIGHEST";
+export type Id5 = string;
+export type Type7 = "LOWEST";
 export type Name = string;
 export type MaxDailyLossPercent = number;
 export type MaxOpenPositions = number;
 export type Percent = number;
-export type Type5 = "percent_risk";
+export type Type8 = "percent_risk";
 export type SchemaVersion = "1.0";
 export type Setup = Mme9BreakoutSetup | PontoContinuoSetup | StructureChochSetup | StructureContinuationSetup;
 export type BreakevenAtR = number | null;
-export type Period1 = number;
+export type Period2 = number;
 export type SetupSide = "long" | "short";
 export type StopBufferTicks = number;
-export type Type6 = "mme9_breakout";
+export type Type9 = "mme9_breakout";
 export type BreakevenAtR1 = number | null;
-export type Period2 = number;
+export type Period3 = number;
 export type StopBufferTicks1 = number;
-export type Type7 = "ponto_continuo";
+export type Type10 = "ponto_continuo";
 export type AllowSecondary = boolean;
 export type BreakevenAtR2 = number | null;
 export type StopBuffer = number;
-export type Type8 = "structure_choch";
+export type Type11 = "structure_choch";
 export type AllowSecondary1 = boolean;
 export type BreakevenAtR3 = number | null;
 export type MaxBos = number | null;
 export type StopBuffer1 = number;
-export type Type9 = "structure_continuation";
+export type Type12 = "structure_continuation";
 export type Timeframe = "M1" | "M5" | "M15" | "M30" | "H1" | "H4" | "D1" | "W1";
 
 /**
@@ -296,6 +306,43 @@ export interface Ref {
  */
 export interface Constant {
   value: Value;
+}
+/**
+ * Three operands: is `value` inside the band `[low, high]`?
+ *
+ * ⚠️ **Both bounds are inclusive**, and it is written down here because "between" is the kind
+ * of word every reader is sure they already know. Exclusive would make `between 0 and 100`
+ * reject the two values a bounded oscillator can actually reach.
+ *
+ * A node of its own rather than an `op` on `Comparison`, because it takes three operands and
+ * `Comparison` takes two. Folding it in would make `right` mean one thing for seven operators
+ * and another for this one — and the untagged union below discriminates on *shape*, so the
+ * distinct shape is what keeps a document unambiguous.
+ *
+ * The bounds are operands, not numbers, so a band can be drawn between two indicators — a
+ * price inside its own channel is `between(price.close, lower, upper)`.
+ */
+export interface Between {
+  high: Operand;
+  low: Operand;
+  op: Op;
+  value: Operand;
+}
+/**
+ * Has `of` moved in one direction on each of the last `bars` bars?
+ *
+ * ⚠️ **Monotonic over the window, not "higher than it was N bars ago".** The looser reading
+ * calls a series that fell for four bars and jumped on the fifth "rising", which is the
+ * opposite of what anybody writing the rule meant. Matching the reading used by the charting
+ * platforms this project's indicators were transcribed from is the point: a rule that means
+ * something different here than on his chart is a rule he cannot check.
+ *
+ * `bars: 1` is the base case and the default — "higher than the previous bar".
+ */
+export interface Trend {
+  bars?: Bars;
+  of: Operand;
+  op: Op1;
 }
 /**
  * Logical AND.
@@ -352,7 +399,8 @@ export interface SMA {
 /**
  * A window length and which price it reads — shared by every single-period indicator
  * (SMA, EMA, RSI, and ATR to come). Named for its shape, not for one indicator, because a
- * period over a price source is exactly what they all take.
+ * period over a price source is exactly what they all take. ATR is *not* one of them — see
+ * `PeriodParams`.
  */
 export interface PeriodSourceParams {
   period: Period;
@@ -373,6 +421,55 @@ export interface RSI {
   params: PeriodSourceParams;
   type: Type4;
 }
+/**
+ * Average True Range (Wilder) — the size of a typical bar, in price.
+ *
+ * True Range counts the gap: a bar that opens away from the previous close travelled further
+ * than its own high minus its low. Used to size stops and to ask whether a market is moving
+ * at all.
+ */
+export interface ATR {
+  id: Id3;
+  params: PeriodParams;
+  type: Type5;
+}
+/**
+ * A window length and nothing else — for the indicators that read the whole candle.
+ *
+ * ⚠️ Deliberately **not** `PeriodSourceParams` with the source defaulted. ATR is defined over
+ * high, low and the previous close together; a channel is defined over highs and lows. An
+ * "ATR of the close" is not a variant of ATR, it is a different measurement — and a parameter
+ * the engine would have to ignore is a request the document believes was honoured.
+ */
+export interface PeriodParams {
+  period: Period1;
+}
+/**
+ * The highest **high** of the N bars that closed *before* this one — a breakout's rail.
+ *
+ * ⚠️ **The current bar is not in the window**, and that is what makes the level breakable:
+ * include it and `HIGHEST(20) >= high` holds on every bar of every market, so a comparison
+ * against it is constantly false and a band drawn with it is constantly true. A charting
+ * platform's `ta.highest` does include the current bar and is read shifted (`[1]`); the DSL
+ * has no shift for an indicator ref, so the level is defined where it can be used.
+ *
+ * Highs, not closes, so the level is where price actually traded. A breakout of it therefore
+ * fires on the wick, which is the classical reading and the more sensitive one; comparing
+ * against `price.close` instead is how the same channel is made to require a close beyond it.
+ */
+export interface Highest {
+  id: Id4;
+  params: PeriodParams;
+  type: Type6;
+}
+/**
+ * The lowest **low** of the N bars that closed before this one — the lower rail.
+ */
+export interface Lowest {
+  id: Id5;
+  params: PeriodParams;
+  type: Type7;
+}
 export interface Risk {
   max_daily_loss_percent?: MaxDailyLossPercent;
   max_open_positions?: MaxOpenPositions;
@@ -383,27 +480,27 @@ export interface Risk {
  */
 export interface PercentRiskSizing {
   params: PercentRiskParams;
-  type: Type5;
+  type: Type8;
 }
 export interface PercentRiskParams {
   percent: Percent;
 }
 export interface Mme9BreakoutSetup {
   params: Mme9BreakoutParams;
-  type: Type6;
+  type: Type9;
 }
 /**
  * The break of the candle that closed across the MME9 (ADR-0016).
  */
 export interface Mme9BreakoutParams {
   breakeven_at_r?: BreakevenAtR;
-  period?: Period1;
+  period?: Period2;
   side: SetupSide;
   stop_buffer_ticks?: StopBufferTicks;
 }
 export interface PontoContinuoSetup {
   params: PontoContinuoParams;
-  type: Type7;
+  type: Type10;
 }
 /**
  * Two corrections back to the average, then the bar that touches it and closes back.
@@ -411,7 +508,7 @@ export interface PontoContinuoSetup {
 export interface PontoContinuoParams {
   average?: "EMA" | "SMA";
   breakeven_at_r?: BreakevenAtR1;
-  period?: Period2;
+  period?: Period3;
   side: SetupSide;
   stop_buffer_ticks?: StopBufferTicks1;
 }
@@ -420,7 +517,7 @@ export interface PontoContinuoParams {
  */
 export interface StructureChochSetup {
   params?: StructureParams;
-  type: Type8;
+  type: Type11;
 }
 /**
  * Shared by every setup that arms a limit order on a zone market structure left behind.
@@ -438,7 +535,7 @@ export interface StructureParams {
  */
 export interface StructureContinuationSetup {
   params?: ContinuationParams;
-  type: Type9;
+  type: Type12;
 }
 /**
  * `max_bos` caps how many breaks after a change of character may still be traded.

@@ -8,7 +8,14 @@
 // hand-written. The runtime option lists below are checked against those types with `satisfies`,
 // so an invalid value (a timeframe the schema does not know) is a compile error.
 
-import { SETUP_TYPES, setupSpec, type SetupType } from '@tradeforge/schema'
+import {
+  INDICATOR_TYPES,
+  SETUP_TYPES,
+  setupSpec,
+  takesSource,
+  type IndicatorType,
+  type SetupType,
+} from '@tradeforge/schema'
 import type { Comparison, ComparisonOp, Condition, Strategy, Timeframe } from '@tradeforge/schema'
 
 import { runName } from './naming'
@@ -30,8 +37,11 @@ export const OPS = [
 export const SOURCES = ['open', 'high', 'low', 'close'] as const
 export type Source = (typeof SOURCES)[number]
 
-export const INDICATOR_KINDS = ['SMA', 'EMA', 'RSI'] as const
-export type IndicatorKind = (typeof INDICATOR_KINDS)[number]
+// ⚠️ Not a list. `INDICATOR_TYPES` is read from the discriminator of the JSON Schema the
+// Pydantic models generate, so an indicator added in Python appears in the builder with nothing
+// changed here — the same discipline `axesFor` follows for setup parameters.
+export const INDICATOR_KINDS = INDICATOR_TYPES
+export type IndicatorKind = IndicatorType
 
 export type Combine = 'all' | 'any'
 
@@ -243,7 +253,13 @@ export function buildConditionStrategy(form: StrategyForm): ConditionStrategy {
     strategy.indicators = form.indicators.map((indicator) => ({
       id: indicator.id,
       type: indicator.kind,
-      params: { period: indicator.period, source: indicator.source },
+      // ⚠️ `source` only for the indicators whose params model declares it. ATR and the two
+      // channels are defined over the whole candle, and their params forbid extra keys — so
+      // emitting a source for them produces a document the API refuses, with a message about an
+      // unexpected field rather than about the indicator the reader chose.
+      params: takesSource(indicator.kind)
+        ? { period: indicator.period, source: indicator.source }
+        : { period: indicator.period },
     })) as NonNullable<Strategy['indicators']>
   }
   return strategy

@@ -1,5 +1,32 @@
 {
   "$defs": {
+    "ATR": {
+      "additionalProperties": false,
+      "description": "Average True Range (Wilder) — the size of a typical bar, in price.\n\nTrue Range counts the gap: a bar that opens away from the previous close travelled further\nthan its own high minus its low. Used to size stops and to ask whether a market is moving\nat all.",
+      "properties": {
+        "id": {
+          "maxLength": 40,
+          "pattern": "^[a-z_][a-z0-9_]*$",
+          "title": "Id",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/$defs/PeriodParams"
+        },
+        "type": {
+          "const": "ATR",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "params"
+      ],
+      "title": "ATR",
+      "type": "object"
+    },
     "AllOf": {
       "additionalProperties": false,
       "description": "Logical AND.",
@@ -44,6 +71,34 @@
         "SMA"
       ],
       "type": "string"
+    },
+    "Between": {
+      "additionalProperties": false,
+      "description": "Three operands: is `value` inside the band `[low, high]`?\n\n⚠️ **Both bounds are inclusive**, and it is written down here because \"between\" is the kind\nof word every reader is sure they already know. Exclusive would make `between 0 and 100`\nreject the two values a bounded oscillator can actually reach.\n\nA node of its own rather than an `op` on `Comparison`, because it takes three operands and\n`Comparison` takes two. Folding it in would make `right` mean one thing for seven operators\nand another for this one — and the untagged union below discriminates on *shape*, so the\ndistinct shape is what keeps a document unambiguous.\n\nThe bounds are operands, not numbers, so a band can be drawn between two indicators — a\nprice inside its own channel is `between(price.close, lower, upper)`.",
+      "properties": {
+        "high": {
+          "$ref": "#/$defs/Operand"
+        },
+        "low": {
+          "$ref": "#/$defs/Operand"
+        },
+        "op": {
+          "const": "between",
+          "title": "Op",
+          "type": "string"
+        },
+        "value": {
+          "$ref": "#/$defs/Operand"
+        }
+      },
+      "required": [
+        "op",
+        "value",
+        "low",
+        "high"
+      ],
+      "title": "Between",
+      "type": "object"
     },
     "CandleExtremeParams": {
       "additionalProperties": false,
@@ -129,6 +184,12 @@
       "anyOf": [
         {
           "$ref": "#/$defs/Comparison"
+        },
+        {
+          "$ref": "#/$defs/Between"
+        },
+        {
+          "$ref": "#/$defs/Trend"
         },
         {
           "$ref": "#/$defs/AllOf"
@@ -301,10 +362,40 @@
       "title": "Exit",
       "type": "object"
     },
+    "Highest": {
+      "additionalProperties": false,
+      "description": "The highest **high** of the N bars that closed *before* this one — a breakout's rail.\n\n⚠️ **The current bar is not in the window**, and that is what makes the level breakable:\ninclude it and `HIGHEST(20) >= high` holds on every bar of every market, so a comparison\nagainst it is constantly false and a band drawn with it is constantly true. A charting\nplatform's `ta.highest` does include the current bar and is read shifted (`[1]`); the DSL\nhas no shift for an indicator ref, so the level is defined where it can be used.\n\nHighs, not closes, so the level is where price actually traded. A breakout of it therefore\nfires on the wick, which is the classical reading and the more sensitive one; comparing\nagainst `price.close` instead is how the same channel is made to require a close beyond it.",
+      "properties": {
+        "id": {
+          "maxLength": 40,
+          "pattern": "^[a-z_][a-z0-9_]*$",
+          "title": "Id",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/$defs/PeriodParams"
+        },
+        "type": {
+          "const": "HIGHEST",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "params"
+      ],
+      "title": "Highest",
+      "type": "object"
+    },
     "Indicator": {
       "discriminator": {
         "mapping": {
+          "ATR": "#/$defs/ATR",
           "EMA": "#/$defs/EMA",
+          "HIGHEST": "#/$defs/Highest",
+          "LOWEST": "#/$defs/Lowest",
           "RSI": "#/$defs/RSI",
           "SMA": "#/$defs/SMA"
         },
@@ -319,8 +410,44 @@
         },
         {
           "$ref": "#/$defs/RSI"
+        },
+        {
+          "$ref": "#/$defs/ATR"
+        },
+        {
+          "$ref": "#/$defs/Highest"
+        },
+        {
+          "$ref": "#/$defs/Lowest"
         }
       ]
+    },
+    "Lowest": {
+      "additionalProperties": false,
+      "description": "The lowest **low** of the N bars that closed before this one — the lower rail.",
+      "properties": {
+        "id": {
+          "maxLength": 40,
+          "pattern": "^[a-z_][a-z0-9_]*$",
+          "title": "Id",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/$defs/PeriodParams"
+        },
+        "type": {
+          "const": "LOWEST",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "params"
+      ],
+      "title": "Lowest",
+      "type": "object"
     },
     "Mme9BreakoutParams": {
       "additionalProperties": false,
@@ -443,9 +570,26 @@
       "title": "PercentRiskSizing",
       "type": "object"
     },
+    "PeriodParams": {
+      "additionalProperties": false,
+      "description": "A window length and nothing else — for the indicators that read the whole candle.\n\n⚠️ Deliberately **not** `PeriodSourceParams` with the source defaulted. ATR is defined over\nhigh, low and the previous close together; a channel is defined over highs and lows. An\n\"ATR of the close\" is not a variant of ATR, it is a different measurement — and a parameter\nthe engine would have to ignore is a request the document believes was honoured.",
+      "properties": {
+        "period": {
+          "maximum": 1000,
+          "minimum": 1,
+          "title": "Period",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "period"
+      ],
+      "title": "PeriodParams",
+      "type": "object"
+    },
     "PeriodSourceParams": {
       "additionalProperties": false,
-      "description": "A window length and which price it reads — shared by every single-period indicator\n(SMA, EMA, RSI, and ATR to come). Named for its shape, not for one indicator, because a\nperiod over a price source is exactly what they all take.",
+      "description": "A window length and which price it reads — shared by every single-period indicator\n(SMA, EMA, RSI, and ATR to come). Named for its shape, not for one indicator, because a\nperiod over a price source is exactly what they all take. ATR is *not* one of them — see\n`PeriodParams`.",
       "properties": {
         "period": {
           "maximum": 1000,
@@ -791,6 +935,36 @@
         "W1"
       ],
       "type": "string"
+    },
+    "Trend": {
+      "additionalProperties": false,
+      "description": "Has `of` moved in one direction on each of the last `bars` bars?\n\n⚠️ **Monotonic over the window, not \"higher than it was N bars ago\".** The looser reading\ncalls a series that fell for four bars and jumped on the fifth \"rising\", which is the\nopposite of what anybody writing the rule meant. Matching the reading used by the charting\nplatforms this project's indicators were transcribed from is the point: a rule that means\nsomething different here than on his chart is a rule he cannot check.\n\n`bars: 1` is the base case and the default — \"higher than the previous bar\".",
+      "properties": {
+        "bars": {
+          "default": 1,
+          "maximum": 100,
+          "minimum": 1,
+          "title": "Bars",
+          "type": "integer"
+        },
+        "of": {
+          "$ref": "#/$defs/Operand"
+        },
+        "op": {
+          "enum": [
+            "rising",
+            "falling"
+          ],
+          "title": "Op",
+          "type": "string"
+        }
+      },
+      "required": [
+        "op",
+        "of"
+      ],
+      "title": "Trend",
+      "type": "object"
     }
   },
   "$id": "https://tradeforge.dev/schema/strategy/v1.json",

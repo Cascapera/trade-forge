@@ -39,6 +39,11 @@ from tradeforge_engine.errors import EngineError
 _PRICE_REF = re.compile(r"^price\.(open|high|low|close)$")
 _CANDLE_REF = re.compile(r"^candle\[-([1-9][0-9]*)\]\.(open|high|low|close)$")
 
+# The heads no indicator may take, mirroring `RESERVED_IDS` in the schema package (which this one
+# does not import). A ref starting with one of these and matching neither pattern above is a
+# misspelling, and the fall-through would silently turn it into an indicator nobody declared.
+_RESERVED_NAMESPACES = frozenset({"price", "candle"})
+
 
 @dataclass(frozen=True, slots=True)
 class Operand:
@@ -89,6 +94,19 @@ def compile_operand(ref: str) -> Operand:
             return None if candle is None else read(candle)
 
         return Operand(resolve=resolve_candle, lookback=offset)
+
+    # ⚠️ Anything left that reaches into a reserved namespace is a mistake, and refusing it here is
+    # the difference between a sentence and a backtest of nothing. The fall-through below treats an
+    # unmatched ref as an indicator name, and `indicator_at` answers `None` for a name it has no
+    # channel for — so `price.clsoe` would compare against nothing on every bar, for ever, and the
+    # run would report a rule it never evaluated. The schema refuses this shape and so does the
+    # semantic layer; this is the third lock, on the one layer that actually executes.
+    namespace = ref.partition(".")[0].partition("[")[0]
+    if namespace in _RESERVED_NAMESPACES:
+        raise EngineError(
+            f"{ref!r} reaches into the {namespace!r} namespace but is not one of its forms; "
+            f"expected price.<open|high|low|close> or candle[-N].<open|high|low|close>"
+        )
 
     # A bare id: an indicator. Its own value history carries the shift; it costs no candle
     # depth of its own.

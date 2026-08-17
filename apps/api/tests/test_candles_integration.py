@@ -444,6 +444,90 @@ def test_a_dsl_strategy_is_charted_under_the_ids_its_own_rules_refer_to(
     assert sorted(series["label"] for series in body["series"]) == ["fast", "slow"]
 
 
+def _bands_strategy() -> dict[str, Any]:
+    """A document whose only indicator has three outputs, referenced by component."""
+    return {
+        "schema_version": "1.0",
+        "name": "Bollinger for the price chart",
+        "timeframe": "H1",
+        "indicators": [
+            {"id": "bb", "type": "BOLLINGER", "params": {"period": 4, "deviations": 2.0}},
+        ],
+        "entry": {
+            "long": {"op": "gt", "left": {"ref": "price.close"}, "right": {"ref": "bb.upper"}},
+            "short": None,
+        },
+        "exit": {
+            "stop_loss": {"type": "candle_extreme", "params": {"lookback": 2, "side": "low"}},
+            "conditions": [
+                {"op": "lt", "left": {"ref": "price.close"}, "right": {"ref": "bb.middle"}}
+            ],
+        },
+        "risk": {"sizing": {"type": "percent_risk", "params": {"percent": 1.0}}},
+    }
+
+
+def test_one_multi_output_indicator_is_charted_as_one_curve_per_component(
+    session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+) -> None:
+    """⚠️ The whole reason this endpoint needed nothing changed for multi-output indicators.
+
+    `Charted.overlays` is a mapping of label to `Indicator`, and this handler drives every entry it
+    is handed. A composite is published as one entry per component wrapped in a `ComponentView`, so
+    three curves arrive here under the ref strings a rule would name — and the handler stays
+    ignorant of what a composite is.
+
+    That also means this handler drives the *same* underlying Bollinger three times per bar, once
+    per component. The values below are what proves it folds each bar only once: a triple-folded
+    window would produce a middle band from a third as many bars, and the three series would still
+    have the right labels, the right length, and a perfectly plausible shape.
+    """
+    seeding = session_factory()
+    _seed_instrument(seeding)
+    seeding.close()
+    bars = _candles()
+    write_candles(tmp_path, "EURUSD", "H1", bars)
+
+    with TestClient(_app(settings, session_factory, tmp_path)) as client:
+        backtest_id = _launch_with(client, _bands_strategy())
+        _run(session_factory, tmp_path, backtest_id)
+        overlays = client.get(f"/backtests/{backtest_id}/overlays").json()
+        candles = client.get(f"/backtests/{backtest_id}/candles").json()
+
+    by_label = {series["label"]: series for series in overlays["series"]}
+    assert sorted(by_label) == ["bb.lower", "bb.middle", "bb.upper"]
+
+    # ⚠️ Every label is a declared id or one of its components — the invariant the web's `toCurves`
+    # rests on when it groups curves by the text before the dot. It is asserted here, at the
+    # boundary that produces the labels, rather than by pinning what `entityOf('price.close')`
+    # returns: a ref to a price is never an overlay label because labels come from the compiled
+    # strategy's channels, and that is a fact about this endpoint, not about a string function.
+    indicators = _bands_strategy()["indicators"]
+    assert isinstance(indicators, list)
+    declared = {indicator["id"] for indicator in indicators}
+    for label in by_label:
+        assert label.split(".")[0] in declared, label
+
+    # A 4-period band: three bars of warm-up, so three fewer points than there are candles. This
+    # is the assertion a triple fold cannot satisfy — it would warm up in a third of the bars.
+    for label, series in by_label.items():
+        assert len(series["points"]) == candles["count"] - 3, label
+
+    # And the three are genuinely different levels, in the right order, on every bar they share.
+    for upper, middle, lower in zip(
+        by_label["bb.upper"]["points"],
+        by_label["bb.middle"]["points"],
+        by_label["bb.lower"]["points"],
+        strict=True,
+    ):
+        assert Decimal(upper[1]) >= Decimal(middle[1]) >= Decimal(lower[1])
+    # ⚠️ Strictly apart somewhere, or the loop above would pass on three identical series — which
+    # is exactly what reading the wrong key out of the components mapping would produce.
+    assert Decimal(by_label["bb.upper"]["points"][-1][1]) > Decimal(
+        by_label["bb.middle"]["points"][-1][1]
+    )
+
+
 def test_prices_on_the_curve_are_strings_like_every_other_price(
     session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
 ) -> None:

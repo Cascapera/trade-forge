@@ -43,8 +43,8 @@ from tradeforge_engine.expressions import (
     Trend,
     compile_condition,
 )
-from tradeforge_engine.indicators import build_indicator
-from tradeforge_engine.protocols import Indicator, Strategy
+from tradeforge_engine.indicators import ComponentView, build_indicator
+from tradeforge_engine.protocols import CompositeIndicator, Indicator, Strategy
 from tradeforge_engine.setup_factory import build_setup
 
 SUPPORTED_SCHEMA_VERSION: Final = "1.0"
@@ -147,7 +147,7 @@ class CompiledStrategy:
         *,
         name: str,
         timeframe: dt.timedelta,
-        indicators: Mapping[str, Indicator],
+        indicators: Mapping[str, Indicator | CompositeIndicator],
         entry_long: Condition | None,
         entry_short: Condition | None,
         exit_conditions: tuple[Condition, ...],
@@ -161,7 +161,33 @@ class CompiledStrategy:
     ) -> None:
         self.name = name
         self.timeframe = timeframe
-        self._indicators: dict[str, Indicator] = dict(indicators)
+        self._indicators: dict[str, Indicator | CompositeIndicator] = dict(indicators)
+        # A declaration becomes one or more **channels** — the ref strings a condition can name.
+        # A single-valued indicator is one channel under its own id; a composite is one per
+        # component, spelled `id.component`. The split is decided here, once, and never per bar:
+        # the update loop below walks two flat tuples with the channel names already built, so a
+        # run pays no isinstance check and no string formatting for the shape of its indicators.
+        simple: list[tuple[str, Indicator]] = []
+        composites: list[tuple[CompositeIndicator, tuple[tuple[str, str], ...]]] = []
+        channels: list[str] = []
+        for indicator_id, indicator in self._indicators.items():
+            if isinstance(indicator, CompositeIndicator):
+                # Asked of the object rather than read off its class: `components()` is the
+                # protocol's own surface, so a composite is free to decide its names however it
+                # likes as long as it decides them before the first bar.
+                pairs = tuple(
+                    (component, f"{indicator_id}.{component}")
+                    for component in indicator.components()
+                )
+                composites.append((indicator, pairs))
+                channels.extend(channel for _, channel in pairs)
+            else:
+                simple.append((indicator_id, indicator))
+                channels.append(indicator_id)
+        self._simple: tuple[tuple[str, Indicator], ...] = tuple(simple)
+        self._composites: tuple[tuple[CompositeIndicator, tuple[tuple[str, str], ...]], ...] = (
+            tuple(composites)
+        )
         self._entry_long = entry_long
         self._entry_short = entry_short
         self._exit_conditions = exit_conditions
@@ -174,26 +200,45 @@ class CompiledStrategy:
         # five bars back — and against the old `maxlen=2` it got `None`, which reads as "the
         # indicator is warming up" and makes the condition false on every bar of the run.
         self._indicator_history: dict[str, deque[Money | None]] = {
-            indicator_id: deque(maxlen=shift_depth + 1) for indicator_id in self._indicators
+            channel: deque(maxlen=shift_depth + 1) for channel in channels
         }
 
     def overlays(self) -> Mapping[str, Indicator]:
-        """Every indicator the document declared, under its own id — see `protocols.Charted`.
+        """Every channel the document declared, under the name a condition refers to it by —
+        see `protocols.Charted`.
 
         Its own id and not a prettier label: in the DSL the id is what the conditions refer to
         (`{"ref": "sma_fast"}`), so a chart labelled that way can be read straight against the
         rules that produced the trades. A generated name like "SMA 20" would be tidier and would
         break the only join a reader has between the curve and the rule.
+
+        ⚠️ **A composite appears as one entry per component**, labelled `bb.upper` and the rest,
+        each wrapped in a `ComponentView` so the mapping keeps its `Indicator` shape. The reader
+        therefore drives the same underlying object once per component, which is exactly what
+        `CompositeIndicator.update` is required to tolerate. Handing back the composite under a
+        single label instead would make the chart choose one of its three lines, or learn what a
+        composite is — and the second is a whole protocol leaking into a drawing routine.
         """
-        return dict(self._indicators)
+        views: dict[str, Indicator] = dict(self._simple)
+        for composite, pairs in self._composites:
+            for component, channel in pairs:
+                views[channel] = ComponentView(composite=composite, component=component)
+        return views
 
     def on_bar(self, context: Context) -> Sequence[Signal]:
         candle = context.candle
         self._candles.appendleft(candle)
 
-        for indicator_id, indicator in self._indicators.items():
+        for indicator_id, indicator in self._simple:
             indicator.update(candle)
             self._indicator_history[indicator_id].appendleft(indicator.value())
+        for composite, pairs in self._composites:
+            # Updated once, read once: `components()` is asked for the whole mapping rather than
+            # per channel, so a three-band indicator costs one fold and one read per bar.
+            composite.update(candle)
+            values = composite.components()
+            for component, channel in pairs:
+                self._indicator_history[channel].appendleft(values[component])
 
         eval_context = EvalContext(
             candles=tuple(self._candles),
@@ -224,9 +269,22 @@ class CompiledStrategy:
 
     def _entry(self, side: Side, candle: Candle) -> Signal:
         stop = self._stop_rule.level(self._candles) if self._stop_rule is not None else None
-        # Snapshot every indicator at the instant of the decision — this is the trade's
-        # `context`, captured here because nowhere downstream can see these values again.
-        context = {name: indicator.value() for name, indicator in self._indicators.items()}
+        # Snapshot every channel at the instant of the decision — this is the trade's `context`,
+        # captured here because nowhere downstream can see these values again. Read from the
+        # front of each history rather than from the indicators: `on_bar` has just pushed this
+        # bar's value there, so the two agree by construction, and a composite is not asked to
+        # rebuild its mapping a second time on the one bar that matters most.
+        #
+        # ⚠️ **Every channel gets a key, warming up or not.** An earlier version skipped an empty
+        # history — unreachable, since `on_bar` pushes to every channel before this runs, and
+        # `maxlen >= 1` — but the failure mode if it ever became reachable was the wrong shape: the
+        # channel would *vanish* from the context instead of being recorded as `None`, so a reader
+        # asking for `context["bb.upper"]` would get a `KeyError` rather than "not ready yet". The
+        # code this replaced always emitted every key, and that is the contract worth keeping.
+        context = {
+            channel: history[0] if history else None
+            for channel, history in self._indicator_history.items()
+        }
         return Signal(
             kind=SignalKind.ENTRY,
             side=side,
@@ -288,7 +346,7 @@ def compile_strategy(document: Mapping[str, object]) -> Strategy:
             f"unknown timeframe {timeframe_key!r}; this engine knows {sorted(TIMEFRAME_DELTAS)}"
         )
 
-    indicators: dict[str, Indicator] = {}
+    indicators: dict[str, Indicator | CompositeIndicator] = {}
     raw_indicators = document.get("indicators", [])
     if not isinstance(raw_indicators, list):
         raise EngineError(f"indicators must be a list, got {raw_indicators!r}")

@@ -48,6 +48,59 @@ def test_a_ref_past_the_start_of_history_is_none() -> None:
     assert compile_operand("candle[-1].close").resolve(_ctx((only,)), 0) is None
 
 
+def test_a_misspelling_inside_a_reserved_namespace_is_refused_at_compile() -> None:
+    """⚠️ The one refusal in this file that exists because of a *silent* failure, not a loud one.
+
+    Anything that matches neither price pattern falls through to "it must be an indicator name", and
+    `indicator_at` answers `None` for a name it has no channel for. So `price.clsoe` — two letters
+    transposed in the most-typed ref in the DSL — used to compile happily and compare against
+    nothing on every bar of every run: the rule reads as declined rather than as broken, and no
+    layer says a word.
+
+    It became reachable when the DSL's grammar gained `id.component` for Bollinger's bands, because
+    `price` is a perfectly good identifier and `clsoe` a perfectly good component name. The schema
+    package refuses it too, in `semantic.py`; this is the lock on the layer that executes, for a
+    mapping that never passed through validation — which the engine accepts by design.
+    """
+    for bad in ("price.clsoe", "price.volume", "candle.high", "candle"):
+        with pytest.raises(EngineError, match="namespace"):
+            compile_operand(bad)
+
+    # ⚠️ **The bracketed form too, and it is a separate half of the check.** The namespace is read by
+    # splitting at the dot *and* at the bracket, because `candle[-1].hihg` splits at the dot into
+    # `candle[-1]` — which is not a reserved name, so without the second split the typo falls
+    # straight through to "it must be an indicator" and resolves to nothing on every bar. Same
+    # silent failure as `price.clsoe` in the neighbouring shape, and a mutation run is what showed
+    # this line had no test: dropping `.partition("[")[0]` survived the whole suite.
+    for bracketed in ("candle[-1].hihg", "candle[0].close", "candle[-2].closee"):
+        with pytest.raises(EngineError, match="namespace"):
+            compile_operand(bracketed)
+
+
+def test_an_indicator_whose_name_merely_starts_like_a_namespace_is_fine() -> None:
+    """The neighbour the refusal above must not take with it.
+
+    `pricey` and `candles` are legal indicator ids — the check is on the namespace *head*, split at
+    the dot, not on a string prefix. A `startswith("price")` would have refused both, and the
+    failure would be a compile error on a strategy that was always correct.
+    """
+    candle = bar(0, open_="1.0", close="1.5")
+    for good in ("pricey", "candles", "price_channel", "candle_body"):
+        operand = compile_operand(good)
+        # Resolves to None here only because no such indicator is registered in this context —
+        # what matters is that compiling it did not raise.
+        assert operand.resolve(_ctx((candle,)), 0) is None
+
+    # And the legal forms inside those namespaces still compile and still read. The pair matters for
+    # the same reason the price pair does: a check that refused `candle[-1].high` along with the
+    # typo would be worse than the hole it closed, and "refuses the typo" alone passes just as
+    # happily on a check that refuses everything.
+    prev = bar(0, open_="1.0", close="1.0")
+    now = bar(1, open_="2.0", close="2.0")
+    assert compile_operand("price.close").resolve(_ctx((now, prev)), 0) == Decimal("2.0")
+    assert compile_operand("candle[-1].close").resolve(_ctx((now, prev)), 0) == Decimal("1.0")
+
+
 def test_indicator_ref_reads_the_named_value() -> None:
     ctx = _ctx(indicators={"sma_fast": (Decimal("1.2345"), None)})
     assert compile_operand("sma_fast").resolve(ctx, 0) == Decimal("1.2345")

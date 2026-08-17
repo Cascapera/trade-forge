@@ -2,6 +2,7 @@ import {
   CandlestickSeries,
   ColorType,
   LineSeries,
+  LineStyle,
   createChart,
   createSeriesMarkers,
   type IChartApi,
@@ -11,10 +12,10 @@ import {
   type Time,
   type UTCTimestamp,
 } from 'lightweight-charts'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 
 import type { Candle, OverlaySeries, Trade, Zone } from '../api/types'
-import type { View, ZoneRect } from '../backtest/price'
+import type { CurveStroke, View, ZoneRect } from '../backtest/price'
 import { toBars, toCurves, toMarkers, toZones, visibleRangeFor, zoneRects } from '../backtest/price'
 
 // The price a run was executed over, with its trades marked on it.
@@ -42,6 +43,23 @@ const INK = '#94a3b8'
 // so the curves recompute, the effect's dependency changes, and the chart is torn down and
 // rebuilt — discarding whatever the reader had zoomed to, on every click.
 const NO_OVERLAYS: readonly OverlaySeries[] = []
+
+// The library's own enum, mapped from the stroke `toCurves` decided. Kept here rather than in
+// `price.ts` so the curve model stays free of the charting library — the same reason `toBars`
+// returns plain numbers and the `as UTCTimestamp` casts all happen in this file.
+const LINE_STYLES: Record<CurveStroke, LineStyle> = {
+  solid: LineStyle.Solid,
+  dashed: LineStyle.Dashed,
+  dotted: LineStyle.Dotted,
+}
+
+// The legend swatch has to carry the stroke too, or three same-hue bands get three identical
+// swatches and the legend stops answering "which line is this".
+const SWATCH: Record<CurveStroke, CSSProperties['borderTopStyle']> = {
+  solid: 'solid',
+  dashed: 'dashed',
+  dotted: 'dotted',
+}
 const NO_ZONES: readonly Zone[] = []
 
 interface Props {
@@ -168,7 +186,10 @@ export function PriceChart({
     for (const curve of curves) {
       const line = chart.addSeries(LineSeries, {
         color: curve.color,
-        lineWidth: 2,
+        // The bands of one indicator share a hue, so the stroke is what tells them apart — see
+        // `toCurves`. A thinner line for the envelope, too: the subject should read as the subject.
+        lineWidth: curve.stroke === 'solid' ? 2 : 1,
+        lineStyle: LINE_STYLES[curve.stroke],
         lastValueVisible: false,
         priceLineVisible: false,
       })
@@ -296,8 +317,12 @@ export function PriceChart({
           <li key={curve.label} className="flex items-center gap-2">
             <span
               aria-hidden
-              className="h-0.5 w-4 shrink-0 rounded-full"
-              style={{ backgroundColor: curve.color }}
+              className="w-4 shrink-0"
+              style={{
+                borderTopColor: curve.color,
+                borderTopStyle: SWATCH[curve.stroke],
+                borderTopWidth: curve.stroke === 'solid' ? 2 : 1,
+              }}
             />
             {curve.label}
           </li>

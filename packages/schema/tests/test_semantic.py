@@ -107,6 +107,157 @@ def test_price_and_candle_refs_need_no_declaration() -> None:
     assert validate_semantics(model) == []
 
 
+# --------------------------------------------------------------------------- #
+# Multi-output indicators: the component half of the ref grammar                 #
+# --------------------------------------------------------------------------- #
+
+
+def bands(**overrides: object) -> Strategy:
+    """A strategy whose only indicator is a Bollinger, so refs to it can be varied."""
+    document: dict[str, object] = {
+        "indicators": [{"id": "bb", "type": "BOLLINGER", "params": {"period": 20}}],
+        "entry": {
+            "long": {"op": "gt", "left": {"ref": "price.close"}, "right": {"ref": "bb.upper"}},
+        },
+    }
+    document.update(overrides)
+    return strategy(**document)
+
+
+def test_a_component_of_a_declared_multi_output_indicator_resolves() -> None:
+    assert validate_semantics(bands()) == []
+
+
+def test_every_component_a_composite_answers_to_is_accepted() -> None:
+    """All three bands, and all three ADX lines — the mapping is the contract, not one entry."""
+    for component in ("upper", "middle", "lower"):
+        model = bands(
+            entry={
+                "long": {
+                    "op": "gt",
+                    "left": {"ref": "price.close"},
+                    "right": {"ref": f"bb.{component}"},
+                },
+            },
+        )
+        assert validate_semantics(model) == []
+
+    for component in ("adx", "plus_di", "minus_di"):
+        model = strategy(
+            indicators=[{"id": "trend", "type": "ADX", "params": {"period": 14}}],
+            entry={
+                "long": {
+                    "op": "gt",
+                    "left": {"ref": f"trend.{component}"},
+                    "right": {"value": 25},
+                },
+            },
+        )
+        assert validate_semantics(model) == []
+
+
+def test_a_misspelled_component_is_refused_rather_than_read_as_nothing() -> None:
+    """⚠️ The regression this whole layer exists to prevent, and it is the silent kind.
+
+    Widening `REF_PATTERN` to accept `id.component` also made `bb.uppper` well-formed. The old
+    test for "is this an indicator ref" asked whether the string contained a dot — so a typo would
+    have sailed through here, reached the engine, resolved to `None` for want of a channel by that
+    name, and made its condition **false on every bar of every run**. Nothing raises, nothing logs,
+    and the backtest reports zero trades as though the market never qualified.
+    """
+    model = bands(
+        entry={
+            "long": {"op": "gt", "left": {"ref": "price.close"}, "right": {"ref": "bb.uppper"}},
+        },
+    )
+
+    assert "has no component 'uppper'" in messages(model)
+    assert "middle, upper, lower" in messages(model)
+
+
+def test_a_multi_output_indicator_cannot_be_referenced_bare() -> None:
+    """No default component: `bb` alone is a question with three answers.
+
+    "The middle band" is the tempting default, and there is no defensible one for ADX at all. A
+    default would also make `bb` and `bb.middle` two spellings of one value, which `REF_PATTERN`'s
+    own comment gives as how a DSL starts to rot.
+    """
+    model = bands(
+        entry={"long": {"op": "gt", "left": {"ref": "price.close"}, "right": {"ref": "bb"}}},
+    )
+
+    assert "has several outputs" in messages(model)
+    # In the order the components are declared, which is primary first — so the message reads as
+    # a suggestion ("did you mean the average?") rather than as an alphabetical dump.
+    assert "bb.middle, bb.upper, bb.lower" in messages(model)
+
+
+def test_a_single_valued_indicator_cannot_be_referenced_by_component() -> None:
+    """The mirror image, and it fails the same silent way if unchecked: `sma.upper` names a channel
+    the compiler never opens, so the comparison is false for ever."""
+    model = strategy(
+        entry={"long": {"op": "gt", "left": {"ref": "price.close"}, "right": {"ref": "sma.upper"}}},
+    )
+
+    assert "answers with a single value" in messages(model)
+    assert "reference it as 'sma'" in messages(model)
+
+
+def test_a_misspelled_price_field_is_refused() -> None:
+    """The second half of the same hole, and the one that got past the first fix.
+
+    `price.clsoe` is well-formed under the component alternative — `price` is a fine identifier and
+    `clsoe` a fine component name — so widening the grammar for `bb.upper` quietly made a
+    misspelling of the DSL's most-typed ref legal. The engine has no channel by that name, resolves
+    it to `None`, and the condition is false on every bar of every run: the rule reports as declined
+    rather than as broken, and nothing anywhere says a word.
+
+    Caught here rather than by the pattern, and not by choice. Pydantic compiles `pattern=` with
+    Rust's `regex` crate, which has no look-around at all, so "an identifier that is not `price`"
+    cannot be stated there — the negative lookahead refuses to compile and takes the package's
+    import with it. Which lands the check exactly where this file's subject is: a schema states
+    shape, and this is meaning.
+    """
+    for bad in ("price.clsoe", "price.volume"):
+        model = bands(
+            entry={"long": {"op": "gt", "left": {"ref": bad}, "right": {"ref": "bb.upper"}}},
+        )
+        assert "is not a price field" in messages(model), bad
+        assert "price.close" in messages(model), bad
+
+    bare = bands(
+        entry={"long": {"op": "gt", "left": {"ref": "candle.high"}, "right": {"ref": "bb.upper"}}},
+    )
+    assert "must name a closed candle and a field" in messages(bare)
+
+
+def test_the_legal_price_and_candle_forms_are_still_legal() -> None:
+    """The other half of the pair, and it is not decoration.
+
+    A check that refused `price.close` along with the typo would be worse than the hole it closed,
+    and "refuses the misspelling" on its own passes just as happily on a check that refuses
+    everything. Same shape as [[golden-separa-do-antigo-nao-do-vizinho]]: the test that proves the
+    fix has to exclude the neighbour it must not break.
+    """
+    for good in ("price.close", "price.open", "price.high", "price.low", "candle[-2].high"):
+        model = bands(
+            entry={"long": {"op": "gt", "left": {"ref": good}, "right": {"ref": "bb.upper"}}},
+        )
+        assert validate_semantics(model) == [], good
+
+
+def test_an_undeclared_composite_component_names_the_indicator_not_the_channel() -> None:
+    """The error has to point at `ghost`, not at `ghost.upper` — the missing thing is the
+    declaration, and a message naming the channel would send someone hunting for a component."""
+    model = bands(
+        entry={
+            "long": {"op": "gt", "left": {"ref": "price.close"}, "right": {"ref": "ghost.upper"}},
+        },
+    )
+
+    assert "reference to undeclared indicator 'ghost'" in messages(model)
+
+
 def test_exit_conditions_are_checked_too() -> None:
     model = strategy(
         exit={

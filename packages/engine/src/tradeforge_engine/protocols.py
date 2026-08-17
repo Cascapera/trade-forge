@@ -194,6 +194,53 @@ class Indicator(Protocol):
 
 
 @runtime_checkable
+class CompositeIndicator(Protocol):
+    """One state machine, several readings — Bollinger's three bands, ADX's three lines.
+
+    **Why not three ordinary `Indicator`s.** A document could then declare `bb_upper` with
+    period 20 and `bb_lower` with period 50, and nothing anywhere would object: for the schema
+    they are two independent, well-formed indicators. What comes out is a band whose rails
+    describe different markets, and it looks exactly like a band. Making the three readings one
+    object means the parameters cannot disagree, because there is only one set of them. The
+    computation being shared instead of run three times is a consequence, not the reason.
+
+    **Why a second protocol rather than widening `Indicator`.** Widening it would touch all six
+    single-valued indicators and `Charted.overlays`, to give five of them a components mapping
+    with one entry that no caller wants. Structural typing means the two can simply coexist:
+    `build_indicator` returns either, and the compiler asks which it got — once, at compile
+    time, never per bar.
+
+    **The components warm up independently, and that is load-bearing.** ADX's `plus_di` is
+    available `period - 1` bars before its `adx`, because the ADX line is a second Wilder
+    smoothing *of* the DX built from the DI pair. So the mapping is `str -> Money | None`, not
+    `None` for the whole object: a condition reading `adx_14.plus_di` must be answerable while
+    `adx_14.adx` is still warming.
+
+    ⚠️ **`update` must ignore a candle it has already folded**, identified by its time. The
+    single-valued indicators never meet this: one object, one caller. A composite is reached
+    through one channel per component, and the overlay reader drives *each channel it was
+    handed* — so the same bar arrives once per component, and a state machine that counted it
+    three times would report an ADX built from three times the bars anyone asked for. Folding
+    the same closed bar twice is not two bars.
+    """
+
+    def update(self, candle: Candle) -> None:
+        """Fold one **closed** candle into the state, unless this one is already in it."""
+        ...
+
+    def components(self) -> Mapping[str, Money | None]:
+        """Each reading under its own name, `None` while that one is still warming up.
+
+        The names are the second half of a DSL reference: `bb.upper` reaches the `"upper"` of
+        the indicator declared as `bb`. They are fixed per indicator type and duplicated in the
+        schema package, which cannot import this one — `apps/api` depends on both and pins them
+        equal, because drift here is the silent kind: the schema would accept a reference the
+        engine resolves to `None`, and a comparison against `None` is simply false for ever.
+        """
+        ...
+
+
+@runtime_checkable
 class Charted(Protocol):
     """A strategy that can say which curves it was reading, for something to draw them.
 

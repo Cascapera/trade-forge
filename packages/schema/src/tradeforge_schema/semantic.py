@@ -15,8 +15,10 @@ meaning. Never assume a document that passed in the browser is executable.
 
 from collections.abc import Iterator
 from dataclasses import dataclass
+from typing import Final
 
 from tradeforge_schema.models import (
+    COMPOSITE_COMPONENTS,
     AllOf,
     AnyOf,
     Between,
@@ -30,6 +32,10 @@ from tradeforge_schema.models import (
 # `price` and `candle` are namespaces in the ref grammar. An indicator called
 # `price` would make `price.close` ambiguous, so the name is not available.
 RESERVED_IDS = frozenset({"price", "candle"})
+
+# The fields those namespaces expose, in the order a reader expects them. Kept as a tuple rather
+# than a set so an error message lists them the same way twice running.
+PRICE_FIELDS: Final[tuple[str, ...]] = ("open", "high", "low", "close")
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,9 +117,98 @@ def _strategy_refs(strategy: Strategy) -> Iterator[tuple[Ref, str]]:
         yield from _iter_refs(condition, f"exit.conditions[{index}]")
 
 
-def _is_indicator_ref(ref: Ref) -> bool:
-    """`price.close` and `candle[-1].high` resolve without an indicator; a bare name does not."""
-    return "." not in ref.ref and "[" not in ref.ref
+def _indicator_target(ref: Ref) -> tuple[str, str | None] | None:
+    """Split a ref into `(indicator id, component)`, or `None` if it names no indicator.
+
+    ⚠️ **Decided by namespace, not by the presence of a dot.** The earlier version answered
+    "contains no `.` and no `[`", which was exactly right while the grammar's only dotted forms
+    were `price.*` and `candle[-N].*`. Once `bb.upper` became well-formed, that test started
+    classifying every component ref as "not an indicator" — so a typo like `bb.uppper` passed this
+    layer, reached the engine, resolved to `None`, and made its condition false on every bar of
+    every run. Nothing raised, nothing logged, and the backtest simply never traded.
+
+    So the two namespaces are named, and everything else that looks like an identifier is an
+    indicator reference whose component (if any) is checked against the indicator's type.
+    """
+    text = ref.ref
+    if "[" in text:
+        return None  # `candle[-N].field` — the only bracketed form the grammar has
+    head, _, component = text.partition(".")
+    if head in RESERVED_IDS:
+        return None
+    return head, component or None
+
+
+def _reserved_namespace_error(ref: Ref, path: str) -> SemanticError | None:
+    """Refuse `price.clsoe` — a reserved namespace with a field it does not have.
+
+    ⚠️ **This is the only layer that can refuse it, and `REF_PATTERN` cannot help.** The component
+    alternative added for `bb.upper` also matches `price.clsoe`, because `price` is a perfectly good
+    identifier and `clsoe` a perfectly good component name. Narrowing it there would need a negative
+    lookahead, and Pydantic compiles `pattern=` with Rust's `regex` crate, which has no look-around
+    at all — the expression fails to compile at import time and takes the package with it.
+
+    Without this check the misspelling reaches the engine, resolves through `indicator_at` — which
+    has no channel by that name and answers `None` — and the condition is false on every bar of the
+    run. The rule reads as declined rather than as broken, and nothing raises or logs.
+
+    `expressions.compile_operand` refuses the same shape a second time, on the layer that actually
+    executes, for documents that never came through here.
+    """
+    text = ref.ref
+    head, _, tail = text.partition(".")
+    if head not in RESERVED_IDS:
+        return None
+    if head == "price":
+        if tail in PRICE_FIELDS:
+            return None
+        return SemanticError(path, f"{text!r} is not a price field; expected one of {_fields()}")
+    # ⚠️ Reaching here at all means the ref is illegal, so there is nothing left to check. The legal
+    # candle form carries its offset *before* the dot — `candle[-1].high` splits into a head of
+    # `candle[-1]`, which is not a reserved id and left this function two lines up. So a head of
+    # exactly `candle` is either the bare namespace or `candle.something`, and neither names a bar.
+    # (An earlier version re-matched the legal pattern here; the branch where it succeeded was
+    # unreachable, and the copied pattern was doing nothing but inviting drift.)
+    return SemanticError(
+        path, f"{text!r} must name a closed candle and a field, as candle[-1].close"
+    )
+
+
+def _fields() -> str:
+    return ", ".join(f"price.{name}" for name in PRICE_FIELDS)
+
+
+def _component_error(
+    indicator_id: str,
+    component: str | None,
+    components: tuple[str, ...],
+    text: str,
+    path: str,
+) -> SemanticError | None:
+    """Whether the component half of a ref agrees with what the indicator answers to.
+
+    Three ways it can disagree, and every one of them resolves to `None` in the engine if it gets
+    through — a condition false on every bar rather than an error anybody sees.
+    """
+    if components and component is None:
+        # No default component, deliberately. "The middle band" is a tempting default for
+        # Bollinger and there is no defensible one for ADX — and a default would make `bb`
+        # and `bb.middle` two spellings of one value, which is how a DSL starts to rot.
+        named = ", ".join(f"{indicator_id}.{name}" for name in components)
+        return SemanticError(path, f"{indicator_id!r} has several outputs; name one of {named}")
+    if components and component not in components:
+        return SemanticError(
+            path,
+            f"{indicator_id!r} has no component {component!r}; "
+            f"it answers to {', '.join(components)}",
+        )
+    if not components and component is not None:
+        return SemanticError(
+            path,
+            f"{indicator_id!r} answers with a single value; "
+            f"reference it as {indicator_id!r}, not {text!r}",
+        )
+    return None
 
 
 def _validate_setup_document(strategy: Strategy) -> list[SemanticError]:
@@ -170,7 +265,8 @@ def validate_semantics(strategy: Strategy) -> list[SemanticError]:
 
     errors: list[SemanticError] = []
 
-    declared: set[str] = set()
+    # id -> the component names it answers to, empty for a single-valued indicator.
+    declared: dict[str, tuple[str, ...]] = {}
     for index, indicator in enumerate(strategy.indicators):
         path = f"indicators[{index}]"
         if indicator.id in declared:
@@ -184,13 +280,25 @@ def validate_semantics(strategy: Strategy) -> list[SemanticError]:
                     f"{indicator.id!r} is a reserved namespace and cannot name an indicator",
                 ),
             )
-        declared.add(indicator.id)
+        declared[indicator.id] = COMPOSITE_COMPONENTS.get(indicator.type, ())
 
     for ref, path in _strategy_refs(strategy):
-        if _is_indicator_ref(ref) and ref.ref not in declared:
+        reserved = _reserved_namespace_error(ref, path)
+        if reserved is not None:
+            errors.append(reserved)
+            continue
+        target = _indicator_target(ref)
+        if target is None:
+            continue
+        indicator_id, component = target
+        if indicator_id not in declared:
             errors.append(
-                SemanticError(path, f"reference to undeclared indicator {ref.ref!r}"),
+                SemanticError(path, f"reference to undeclared indicator {indicator_id!r}"),
             )
+            continue
+        mismatch = _component_error(indicator_id, component, declared[indicator_id], ref.ref, path)
+        if mismatch is not None:
+            errors.append(mismatch)
 
     if strategy.entry.long is None and strategy.entry.short is None:
         errors.append(

@@ -1,5 +1,32 @@
 {
   "$defs": {
+    "ADX": {
+      "additionalProperties": false,
+      "description": "Average Directional Index (Wilder) — how strongly a market trends, read by component.\n\nReferenced as `adx.adx` for the strength line and `adx.plus_di` / `adx.minus_di` for the two\ndirection lines. ⚠️ **The `adx` component has no direction**: it rises in a hard sell-off\nexactly as it does in a rally, so a rule meaning \"trending up\" needs the `DI` pair as well.\nReads the whole candle, so there is no price source to name — same argument as `PeriodParams`.",
+      "properties": {
+        "id": {
+          "maxLength": 40,
+          "pattern": "^[a-z_][a-z0-9_]*$",
+          "title": "Id",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/$defs/PeriodParams"
+        },
+        "type": {
+          "const": "ADX",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "params"
+      ],
+      "title": "ADX",
+      "type": "object"
+    },
     "ATR": {
       "additionalProperties": false,
       "description": "Average True Range (Wilder) — the size of a typical bar, in price.\n\nTrue Range counts the gap: a bar that opens away from the previous close travelled further\nthan its own high minus its low. Used to size stops and to ask whether a market is moving\nat all.",
@@ -98,6 +125,61 @@
         "high"
       ],
       "title": "Between",
+      "type": "object"
+    },
+    "Bollinger": {
+      "additionalProperties": false,
+      "description": "Bollinger Bands — an average with a volatility envelope, read by component.\n\n⚠️ **One indicator with three readings, not three indicators.** Declared once as `bb`, its\nbands are referenced as `bb.upper`, `bb.middle` and `bb.lower`. Three separate declarations\nwould let a document give the upper band a period of 20 and the lower one 50, and nothing\ncould object: for this schema they would be two well-formed indicators. What came out would\nbe a band whose rails describe different markets, and it would look exactly like a band.",
+      "properties": {
+        "id": {
+          "maxLength": 40,
+          "pattern": "^[a-z_][a-z0-9_]*$",
+          "title": "Id",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/$defs/BollingerParams"
+        },
+        "type": {
+          "const": "BOLLINGER",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "params"
+      ],
+      "title": "Bollinger",
+      "type": "object"
+    },
+    "BollingerParams": {
+      "additionalProperties": false,
+      "description": "A window, the price it reads, and how many deviations wide the envelope is.\n\n`deviations` is a float rather than an int because 1.5 and 2.5 are ordinary settings, and it\nis bounded above 0 exclusively: a multiplier of zero collapses the three bands onto the\naverage, which is an SMA spelled in a way that hides that it is one. The upper bound is\ngenerous — a band ten deviations out is useless, not malformed.",
+      "properties": {
+        "deviations": {
+          "default": 2.0,
+          "exclusiveMinimum": 0,
+          "maximum": 10,
+          "title": "Deviations",
+          "type": "number"
+        },
+        "period": {
+          "maximum": 1000,
+          "minimum": 1,
+          "title": "Period",
+          "type": "integer"
+        },
+        "source": {
+          "$ref": "#/$defs/PriceSource",
+          "default": "close"
+        }
+      },
+      "required": [
+        "period"
+      ],
+      "title": "BollingerParams",
       "type": "object"
     },
     "CandleExtremeParams": {
@@ -392,7 +474,9 @@
     "Indicator": {
       "discriminator": {
         "mapping": {
+          "ADX": "#/$defs/ADX",
           "ATR": "#/$defs/ATR",
+          "BOLLINGER": "#/$defs/Bollinger",
           "EMA": "#/$defs/EMA",
           "HIGHEST": "#/$defs/Highest",
           "LOWEST": "#/$defs/Lowest",
@@ -419,6 +503,12 @@
         },
         {
           "$ref": "#/$defs/Lowest"
+        },
+        {
+          "$ref": "#/$defs/Bollinger"
+        },
+        {
+          "$ref": "#/$defs/ADX"
         }
       ]
     },
@@ -719,7 +809,7 @@
             "price.close",
             "candle[-1].high"
           ],
-          "pattern": "^(?:[a-z_][a-z0-9_]*|price\\.(?:open|high|low|close)|candle\\[-[1-9][0-9]*\\]\\.(?:open|high|low|close))$",
+          "pattern": "^(?:[a-z_][a-z0-9_]*|[a-z_][a-z0-9_]*\\.[a-z_][a-z0-9_]*|price\\.(?:open|high|low|close)|candle\\[-[1-9][0-9]*\\]\\.(?:open|high|low|close))$",
           "title": "Ref",
           "type": "string"
         }

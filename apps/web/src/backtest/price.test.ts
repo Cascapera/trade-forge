@@ -311,6 +311,82 @@ describe('toCurves', () => {
     expect(curve?.points).toHaveLength(1)
     expect(curve?.points[0]?.time).toBe(toSeconds('2024-08-01T18:00:00Z'))
   })
+
+  it('gives the readings of one indicator a single hue', () => {
+    // The three bands are one `bb`. Three hues would read as three unrelated indicators, and the
+    // reader would have no way to see that the outer two describe the middle one.
+    const curves = toCurves([
+      series({ label: 'bb.middle' }),
+      series({ label: 'bb.upper' }),
+      series({ label: 'bb.lower' }),
+    ])
+
+    expect(new Set(curves.map((c) => c.color)).size).toBe(1)
+    expect(curves.map((c) => c.label)).toEqual(['bb.middle', 'bb.upper', 'bb.lower'])
+  })
+
+  it('tells the readings apart by stroke, the first being the subject', () => {
+    // Nothing in this module knows what a band is: the order is the engine's, which declares
+    // components primary first so a drawing routine can make exactly this call without knowing.
+    const curves = toCurves([
+      series({ label: 'bb.middle' }),
+      series({ label: 'bb.upper' }),
+      series({ label: 'bb.lower' }),
+    ])
+
+    expect(curves.map((c) => c.stroke)).toEqual(['solid', 'dashed', 'dotted'])
+  })
+
+  it('spends the palette per indicator, so one band does not crowd out the others', () => {
+    // ⚠️ The regression this grouping exists for. Colouring by position would give the three
+    // bands the whole three-hue palette and drop every later curve — a strategy reading a band
+    // and an average would silently lose the average, which is indistinguishable from a strategy
+    // that never declared one.
+    const curves = toCurves([
+      series({ label: 'bb.middle' }),
+      series({ label: 'bb.upper' }),
+      series({ label: 'bb.lower' }),
+      series({ label: 'ema' }),
+      series({ label: 'atr' }),
+    ])
+
+    expect(curves.map((c) => c.label)).toContain('ema')
+    expect(curves.map((c) => c.label)).toContain('atr')
+    const byLabel = new Map(curves.map((c) => [c.label, c.color]))
+    expect(byLabel.get('bb.upper')).toBe(byLabel.get('bb.middle'))
+    expect(byLabel.get('ema')).not.toBe(byLabel.get('bb.middle'))
+    expect(byLabel.get('atr')).not.toBe(byLabel.get('ema'))
+  })
+
+  it('drops the indicator past the palette rather than the reading past it', () => {
+    // The cap is per indicator now, and a family that survives keeps *all* of its readings — a
+    // band missing its lower rail is a worse picture than a band that is not drawn at all.
+    const curves = toCurves([
+      series({ label: 'a' }),
+      series({ label: 'b' }),
+      series({ label: 'bb.middle' }),
+      series({ label: 'bb.upper' }),
+      series({ label: 'bb.lower' }),
+      series({ label: 'dropped' }),
+    ])
+
+    expect(curves.map((c) => c.label)).toEqual([
+      'a',
+      'b',
+      'bb.middle',
+      'bb.upper',
+      'bb.lower',
+    ])
+    expect(new Set(curves.map((c) => c.color)).size).toBe(CURVE_COLORS.length)
+  })
+
+  it('keeps a single-valued indicator on its own hue and solid', () => {
+    // The shape every strategy in the database has today: no dots in the label, one curve each.
+    const curves = toCurves([series({ label: 'fast' }), series({ label: 'slow' })])
+
+    expect(curves.map((c) => c.stroke)).toEqual(['solid', 'solid'])
+    expect(curves.map((c) => c.color)).toEqual([CURVE_COLORS[0], CURVE_COLORS[1]])
+  })
 })
 
 describe('toZones', () => {

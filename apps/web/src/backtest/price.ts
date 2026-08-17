@@ -85,36 +85,80 @@ export function toBars(candles: readonly Candle[]): Bar[] {
  */
 export const CURVE_COLORS: readonly string[] = ['#BC8620', '#d55181', '#3987e5']
 
+/** How a curve is drawn within its family. The first component of an indicator is the subject. */
+export type CurveStroke = 'solid' | 'dashed' | 'dotted'
+
+const STROKES: readonly CurveStroke[] = ['solid', 'dashed', 'dotted']
+
 export interface Curve {
   label: string
   color: string
+  stroke: CurveStroke
   points: { time: number; value: number }[]
+}
+
+/**
+ * The indicator a series belongs to: `bb.upper` and `bb.lower` are two readings of one `bb`.
+ *
+ * Splitting on the first dot is enough because the ref grammar has exactly two shapes that reach
+ * an indicator — a bare id, and `id.component` — and neither `price.*` nor `candle[-N].*` is ever
+ * an overlay label.
+ */
+function entityOf(label: string): string {
+  const dot = label.indexOf('.')
+  return dot === -1 ? label : label.slice(0, dot)
 }
 
 /**
  * Overlay series off the wire, ready to draw.
  *
- * Curves past the palette are **dropped, not recycled**. A fourth line repeating the first
- * colour would be two different indicators the reader is invited to read as one, and a legend
- * naming both in the same swatch says nothing. No strategy in the DSL declares more than three
- * today; if one ever does, this loses a line visibly rather than lying about the ones it keeps.
+ * ⚠️ **The palette is spent per indicator, not per curve, and that is the whole reason this
+ * function has to group.** A Bollinger is one declaration with three readings, so colouring by
+ * position would hand its bands three unrelated hues — the reader sees three indicators — and
+ * exhaust a three-hue palette on a single `bb`, dropping every other curve the strategy declared.
+ * Hue therefore follows the *entity*: the three bands share one, and are told apart by stroke and
+ * by where they sit on the chart. Same principle the run-comparison chart needed a seating chart
+ * for: colour follows the thing, never the slot it arrived in.
+ *
+ * Within a family, the **first component is solid and the rest are dashed then dotted**. Nothing
+ * here knows what a band is — the order comes from the engine, which declares components primary
+ * first precisely so a drawing routine can make this call without knowing.
+ *
+ * Indicators past the palette are **dropped, not recycled**. A fourth hue repeating the first
+ * would be two indicators the reader is invited to read as one, and a legend naming both in the
+ * same swatch says nothing. Losing a line visibly beats lying about the ones that are kept.
  */
 export function toCurves(series: readonly OverlaySeries[]): Curve[] {
-  // Walking the palette rather than the series is what makes the cap structural: there is no
+  const families: string[] = []
+  const grouped = new Map<string, OverlaySeries[]>()
+  for (const one of series) {
+    const entity = entityOf(one.label)
+    const family = grouped.get(entity)
+    if (family === undefined) {
+      families.push(entity)
+      grouped.set(entity, [one])
+    } else {
+      family.push(one)
+    }
+  }
+
+  // Walking the palette rather than the families is what makes the cap structural: there is no
   // index here the palette does not have, so no assertion is needed to say so.
   return CURVE_COLORS.flatMap((color, index) => {
-    const one = series[index]
-    if (one === undefined) return []
-    return [
-      {
-        label: one.label,
-        color,
-        points: one.points.map(([time, value]) => ({
-          time: toSeconds(time),
-          value: Number(value),
-        })),
-      },
-    ]
+    const entity = families[index]
+    if (entity === undefined) return []
+    const family = grouped.get(entity) ?? []
+    return family.map((one, position) => ({
+      label: one.label,
+      color,
+      // Past the third component every further reading stays dotted rather than dropping out:
+      // an indicator with four outputs is a legend problem, not a reason to hide a line.
+      stroke: STROKES[position] ?? 'dotted',
+      points: one.points.map(([time, value]) => ({
+        time: toSeconds(time),
+        value: Number(value),
+      })),
+    }))
   })
 }
 

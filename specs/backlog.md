@@ -479,15 +479,55 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
   default 0,1, fração da largura da região). Nomes quase iguais, unidades diferentes, e a tela
   mostra os dois com o mesmo tipo de campo. Não é bug — é dois conceitos com um nome parecido. Vale
   renomear um dos dois ou fazer a dica dizer a unidade, no próximo PR que tocar a tela do builder.
-- [origem: PR-201, achado do guardian] **`_period_builder` e `_period_source_builder` levantam
+- ~~[origem: PR-201, achado do guardian]~~ **FEITO no PR-201-B.** `_period_builder` e `_period_source_builder` levantavam
   `KeyError` cru** quando falta `params.period` (`indicators.py`), contra a promessa do módulo de
   entregar "uma frase, não um traceback" — o `build_indicator` ao lado já refuta tipo desconhecido
   e id ausente com `EngineError` legível. Não é regressão do PR-201: o `_period_source_builder`
   sempre fez isso, e o builder novo herdou o padrão. Alcançável só por documento que não passou
   pelo schema (a engine recebe mapping cru, por desenho). Consertar junto do próximo PR que tocar
   o registro de indicadores — que é o PR-201-B (Bollinger e ADX).
-- [origem: PR-201, achado do guardian] **`hypothesis` não cobre os indicadores novos** — existe
+- [origem: PR-201, achado do guardian] **PARCIAL — `hypothesis` não cobre `ATR`/`Highest`/`Lowest`**
+  (o PR-201-B cobriu Bollinger e ADX: bandas nunca se cruzam e aquecem juntas; `+DI + -DI <= 100`,
+  que é o limite que pega denominador errado). Segue valendo para os três de PR-201-A. Originalmente: — existe
   property de aquecimento para o RSI e nenhuma para `ATR`/`Highest`/`Lowest`. As candidatas
   óbvias: o ATR nunca é negativo e nunca é menor que o maior `high-low` da janela dividido pelo
   período; o `Highest` é sempre >= ao `Lowest` do mesmo período; e ambos são `None` exatamente
   até a barra `period`. Barato, e pega a classe de erro que cenário escrito à mão não pega.
+
+- [origem: PR-201-B] **O ADX não pertence ao painel de preço** — as três linhas vivem em 0–100 e o
+  gráfico é de preço, então um `adx.adx` desenhado sai fora de escala e achata os candles.
+  ⚠️ **Não é regressão deste PR: o RSI tem o mesmo problema desde que existe** (`INDICATOR_TYPES`
+  sempre o ofereceu), e nenhuma estratégia dele desenha um até agora. O conserto é um painel
+  separado por escala no `PriceChart`, ou uma regra de "indicadores limitados não vão no painel de
+  preço". Enquanto isso, um Bollinger desenha certo porque é medido **em preço**.
+- [origem: PR-201-B] **O builder não tem controle para `deviations`** — a tela emite só
+  `{period, source}`, então uma banda montada nela é sempre de 2,0 desvios. O documento é válido
+  (o schema tem default 2.0), então não é bug: é um parâmetro inalcançável pela tela. O caminho é o
+  mesmo do PR-206 (builder visual), que já precisa de trabalho no formulário de indicador.
+- [origem: PR-201-B] **`IndicatorSpec.params` vem em ordem alfabética** — é a ordem em que o JSON
+  Schema lista `properties`, então um formulário que renderiza a lista em sequência mostra
+  `deviations` **antes** de `period`. Passou desapercebido até agora porque `period` < `source` nos
+  outros sete. Vale o mesmo tratamento que o `setupSpec` já tem (required primeiro), no PR que tocar
+  o formulário de indicadores.
+- [origem: PR-201-B] **Referenciar um componente exige digitar `bb.upper` à mão** — os campos de
+  operando do builder são texto livre, então funciona, mas nada oferece os três nomes nem avisa que
+  `bb` sozinho é recusado. O erro que chega é legível (a camada semântica lista os componentes), o
+  que torna isto atrito e não defeito. Some no PR-206.
+- [origem: PR-201-B, achado do guardian] **O motor não recusa um indicador declarado com `id: "price"`
+  ou `"candle"`** — o schema recusa (`RESERVED_IDS` em `semantic.py`), então é inalcançável pela API,
+  mas num mapping direto o canal nasce e fica **permanentemente inalcançável**: o
+  `compile_operand("price.close")` casa `_PRICE_REF` primeiro e o indicador declarado desaparece sem
+  uma palavra. Mesma família do `price.clsoe` que este PR fechou, e alcançabilidade idêntica (a
+  engine aceita mapping cru por desenho). O conserto é uma linha em `compile_strategy`, junto do
+  `duplicate indicator id` que já está lá. Fora de escopo aqui porque não é regressão do PR-201-B.
+- [origem: PR-201-B, achado do professor, **verificado**] **O motor não recusa um componente que não
+  existe** — `compile_strategy` aceita `{"ref": "bb.uppper"}` sobre um `bb` do tipo BOLLINGER sem
+  levantar nada, e o canal resolve para nulo em toda barra. A camada semântica pega isto para tudo
+  que entra pela API, e a trava nova do `compile_operand` só cobre as cabeças **reservadas**
+  (`price`/`candle`), não um componente errado de indicador declarado. Alcançável só por mapping cru
+  — mesma classe do item do `id: "price"` acima, e mesma família do `price.clsoe` que este PR fechou.
+  ⚠️ O conserto é barato e o material já existe: no `compile_strategy` os canais estão montados
+  **antes** de as condições serem compiladas, então dá para passar o conjunto de canais válidos ao
+  `compile_operand` e recusar um ref de indicador que não seja um deles — o que de quebra pega
+  `{"ref": "sma_lenta"}` para uma `sma_lento` declarada, que hoje também é nulo silencioso. Fora de
+  escopo aqui: não é regressão do PR-201-B, e um PR = um escopo.

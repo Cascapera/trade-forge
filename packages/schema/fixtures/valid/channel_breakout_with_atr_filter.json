@@ -1,0 +1,38 @@
+{
+  "schema_version": "1.0",
+  "name": "Rompimento de canal com filtro de ATR",
+  "description": "Compra quando o preço rompe a máxima de 20 barras, desde que o mercado esteja se movendo (ATR subindo há 3 barras) e a volatilidade esteja dentro de uma faixa utilizável",
+  "timeframe": "H1",
+  "indicators": [
+    { "id": "canal_alto", "type": "HIGHEST", "params": { "period": 20 } },
+    { "id": "canal_baixo", "type": "LOWEST", "params": { "period": 20 } },
+    { "id": "atr", "type": "ATR", "params": { "period": 14 } }
+  ],
+  "entry": {
+    "long": {
+      "all": [
+        {
+          "op": "gt",
+          "left": { "ref": "price.high" },
+          "right": { "ref": "canal_alto" }
+        },
+        { "op": "rising", "of": { "ref": "atr" }, "bars": 3 },
+        {
+          "op": "between",
+          "value": { "ref": "atr" },
+          "low": { "value": 0.0005 },
+          "high": { "value": 0.005 }
+        }
+      ]
+    },
+    "short": null
+  },
+  "exit": {
+    "stop_loss": { "type": "candle_extreme", "params": { "lookback": 3, "side": "low" } },
+    "take_profit": { "type": "risk_multiple", "params": { "rr": 2.0 } },
+    "conditions": [
+      { "op": "falling", "of": { "ref": "canal_baixo" }, "bars": 2 }
+    ]
+  },
+  "risk": { "sizing": { "type": "percent_risk", "params": { "percent": 1.0 } } }
+}

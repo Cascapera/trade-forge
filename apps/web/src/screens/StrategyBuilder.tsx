@@ -1,6 +1,7 @@
 import {
   SETUPS,
   setupSpec,
+  takesSource,
   validateStrategy,
   type SetupParam,
   type SetupType,
@@ -628,20 +629,27 @@ function IndicatorRow(props: {
           onChange({ ...indicator, period: Number(event.target.value) })
         }}
       />
-      <select
-        aria-label="indicator source"
-        className={inputClass}
-        value={indicator.source}
-        onChange={(event) => {
-          onChange({ ...indicator, source: event.target.value as IndicatorForm['source'] })
-        }}
-      >
-        {SOURCES.map((source) => (
-          <option key={source} value={source}>
-            {source}
-          </option>
-        ))}
-      </select>
+      {/* ⚠️ Offered only where the schema declares it. ATR and the two channels read the whole
+          candle, so "the ATR of the close" is not a setting they have — showing the dropdown
+          would let a reader choose something the document cannot carry and the API refuses. */}
+      {takesSource(indicator.kind) ? (
+        <select
+          aria-label="indicator source"
+          className={inputClass}
+          value={indicator.source}
+          onChange={(event) => {
+            onChange({ ...indicator, source: event.target.value as IndicatorForm['source'] })
+          }}
+        >
+          {SOURCES.map((source) => (
+            <option key={source} value={source}>
+              {source}
+            </option>
+          ))}
+        </select>
+      ) : (
+        <span className="self-center text-xs text-slate-500">whole candle</span>
+      )}
       <button type="button" className="text-slate-500 hover:text-red-400" onClick={onRemove}>
         remove
       </button>

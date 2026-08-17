@@ -107,6 +107,37 @@ describe('buildStrategy', () => {
     ])
   })
 
+  it('leaves the price source off an indicator that reads the whole candle', () => {
+    // ⚠️ ATR and the two channels are defined over high, low and the previous close together,
+    // and their params model forbids extra keys. Carrying the form's `source` through would
+    // build a document the API refuses — and refuses with a message about an unexpected field
+    // rather than about the indicator that was chosen, which is a report nobody can act on.
+    //
+    // The form keeps a `source` regardless, because switching an indicator's kind back and
+    // forth must not lose what was picked. Deciding at the boundary is what keeps the two facts
+    // apart: what the reader has selected, and what this document is allowed to say.
+    const built = buildStrategy({
+      ...emptyForm(),
+      indicators: [
+        { id: 'atr', kind: 'ATR', period: 14, source: 'high' },
+        { id: 'canal', kind: 'HIGHEST', period: 20, source: 'close' },
+      ],
+    })
+
+    expect(built.indicators).toEqual([
+      { id: 'atr', type: 'ATR', params: { period: 14 } },
+      { id: 'canal', type: 'HIGHEST', params: { period: 20 } },
+    ])
+    // And the whole document passes the same validator the API runs — the assertion that makes
+    // the one above about a contract rather than about a shape this test happens to prefer.
+    const checked = validateStrategy({
+      ...built,
+      name: 'canal com filtro de ATR',
+      entry: { long: { op: 'gt', left: { ref: 'atr' }, right: { value: 0 } }, short: null },
+    })
+    expect(checked.valid ? [] : checked.errors).toEqual([])
+  })
+
   it('emits the stop and target only when enabled', () => {
     const without = buildConditionStrategy(emptyForm())
     expect(without.exit.stop_loss).toBeNull()

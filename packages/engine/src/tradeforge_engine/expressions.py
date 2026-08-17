@@ -203,6 +203,67 @@ class Comparison:
 
 
 @dataclass(frozen=True, slots=True)
+class Between:
+    """A leaf: is `value` inside `[low, high]`, both ends included?
+
+    Three operands, so it cannot be an `Operator` like the eight above — those take a left and a
+    right. Written as its own node rather than as `low <= v AND v <= high` because the reader
+    wrote one idea, and a tree that says it twice is a tree where the two halves can be edited
+    apart.
+
+    Both bounds inclusive: `between 0 and 100` has to admit the two values a bounded oscillator
+    actually reaches. Any operand still resolving to `None` makes it false, like every other
+    leaf — a warming-up indicator does not put price "outside" a band that does not exist yet.
+    """
+
+    value: Operand
+    low: Operand
+    high: Operand
+
+    def evaluate(self, context: EvalContext) -> bool:
+        value = self.value.resolve(context, 0)
+        low = self.low.resolve(context, 0)
+        high = self.high.resolve(context, 0)
+        if value is None or low is None or high is None:
+            return False
+        return low <= value <= high
+
+
+@dataclass(frozen=True, slots=True)
+class Trend:
+    """A leaf: has `of` moved one way on **each** of the last `bars` bars?
+
+    ⚠️ **Monotonic, not "higher than it was N bars ago".** The loose reading calls a series that
+    fell four bars and jumped on the fifth "rising for five bars", which is the opposite of the
+    rule anybody writing it meant.
+
+    ⚠️ **Strict.** A repeated value is not a rise. A flat stretch inside the window makes this
+    false, which is what stops a stalled market from reading as a trend — and it is the one line
+    where `>` versus `>=` changes the meaning rather than an edge case.
+
+    Reaching `bars` steps back is why the compiler has to *ask* how deep a tree goes: the candle
+    buffer and the indicator history are both sized from it, and a window one bar too short
+    resolves a legal ref to `None` and makes this silently false for ever.
+    """
+
+    rising: bool
+    of: Operand
+    bars: int
+
+    def evaluate(self, context: EvalContext) -> bool:
+        series: list[Money] = []
+        for shift in range(self.bars + 1):
+            value = self.of.resolve(context, shift)
+            if value is None:
+                return False
+            series.append(value)
+        # `series` is newest-first, so each value must beat the one after it.
+        if self.rising:
+            return all(series[at] > series[at + 1] for at in range(self.bars))
+        return all(series[at] < series[at + 1] for at in range(self.bars))
+
+
+@dataclass(frozen=True, slots=True)
 class AllOf:
     """Logical AND. Empty is impossible — the schema requires at least one child."""
 
@@ -233,7 +294,7 @@ class NotOf:
 
 
 # A compiled node. The union is closed in v1; each satisfies the `Condition` protocol.
-Condition = Comparison | AllOf | AnyOf | NotOf
+Condition = Comparison | Between | Trend | AllOf | AnyOf | NotOf
 
 
 def _operand_of(node: Mapping[str, object], side: str) -> Operand:
@@ -259,6 +320,20 @@ def compile_condition(node: Mapping[str, object]) -> Condition:
     """
     if "op" in node:
         op_name = node["op"]
+        # ⚠️ Dispatched on the operator's *value*, not merely on `op` being present. `between`
+        # and `rising` carry an `op` too, and the earlier version of this branch read every one
+        # of them as a two-operand comparison and refused them as unknown operators.
+        if op_name == "between":
+            return Between(
+                value=_operand_of(node, "value"),
+                low=_operand_of(node, "low"),
+                high=_operand_of(node, "high"),
+            )
+        if op_name in ("rising", "falling"):
+            bars = node.get("bars", 1)
+            if not isinstance(bars, int) or isinstance(bars, bool) or bars < 1:
+                raise EngineError(f"{op_name!r} bars must be a positive int, got {bars!r}")
+            return Trend(rising=op_name == "rising", of=_operand_of(node, "of"), bars=bars)
         if not isinstance(op_name, str) or op_name not in OPERATORS:
             raise EngineError(
                 f"unknown comparison operator {op_name!r}; this engine knows {sorted(OPERATORS)}"
@@ -298,11 +373,13 @@ __all__ = [
     "OPERATORS",
     "AllOf",
     "AnyOf",
+    "Between",
     "Comparison",
     "Condition",
     "NotOf",
     "Operand",
     "Operator",
+    "Trend",
     "compile_condition",
     "compile_constant",
     "compile_operand",

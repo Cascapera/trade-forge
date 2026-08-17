@@ -32,7 +32,14 @@ from tradeforge_api.main import create_app
 from tradeforge_api.queue import RUN_WALK_FORWARD
 from tradeforge_api.worker import process_walk_forward
 from tradeforge_collector import write_candles
-from tradeforge_db.models import Backtest, Instrument, Strategy, Study, WalkForward
+from tradeforge_db.models import (
+    Backtest,
+    BacktestStatus,
+    Instrument,
+    Strategy,
+    Study,
+    WalkForward,
+)
 from tradeforge_engine.domain import AssetClass, Candle
 from tradeforge_engine.testing import bar
 
@@ -98,12 +105,21 @@ def _zigzag() -> list[Candle]:
     The drift is deliberate too: a perfectly symmetric saw returns to the same price every
     cycle, and then every parameter set returns exactly zero and the ranking has nothing to
     rank.
+
+    ⚠️ **And the drift steepens from one window to the next, which is a second thing entirely.**
+    A saw with one constant drift makes every 40-bar stretch an exact copy of its neighbours:
+    forex profit is linear in the price *difference*, so all three windows return the same
+    number to the cent. Every fold then reports the same figure on both sides of its line, the
+    verdict's degradation is exactly zero — and a report that read its in-sample number off the
+    wrong row would still say zero. Measured over these bars: flat drift gives every window
+    +608.00 for `period=5`; stepped, the windows separate.
     """
     levels: list[str] = []
     price = Decimal("1.10000")
     for index in range(BARS + 1):
-        # Six bars up, four bars down, and a small net drift upward over each cycle.
-        swing = Decimal("0.00080") if index % 10 < 6 else Decimal("-0.00100")
+        # Six bars up, four bars down, and a net drift upward that steepens once per window.
+        rising = Decimal("0.00080") + Decimal("0.00010") * (index // WINDOW)
+        swing = rising if index % 10 < 6 else Decimal("-0.00100")
         price += swing
         levels.append(f"{price:.5f}")
     return [bar(i, open_=levels[i], close=levels[i + 1]) for i in range(BARS)]
@@ -274,10 +290,25 @@ def test_only_one_job_is_queued_for_the_whole_experiment(prepared: Callable[[], 
     """
     app = prepared()
     with TestClient(app) as client:
-        _, created = _launch(client)
+        strategy_id = client.post("/strategies", json=_strategy()).json()["id"]
+        study = client.post("/studies", json=_study_body(strategy_id))
+        # ⚠️ Counted from *here*, not from an empty queue. The study on the previous line is a
+        # real study and enqueues its own two points, so a walk-forward that queued nothing at
+        # all would leave a queue that still looked busy.
+        before = len(app.state.arq_pool.jobs)
 
-    assert [name for name, _ in app.state.arq_pool.jobs] == [RUN_WALK_FORWARD]
-    assert app.state.arq_pool.jobs[0][1] == (created["id"],)
+        response = client.post(
+            "/walkforwards",
+            json={"study_id": study.json()["id"], "folds": FOLDS, "train_multiple": TRAIN_MULTIPLE},
+        )
+        assert response.status_code == 202, response.text
+        created = response.json()
+
+    added = app.state.arq_pool.jobs[before:]
+    # One job for `FOLDS x 2` training runs: the count is the assertion, since queueing them as
+    # well is the mistake that reads as ordinary and gives every row two claimants.
+    assert [name for name, _ in added] == [RUN_WALK_FORWARD]
+    assert added[0][1] == (created["id"],)
     assert created["runs_queued"] == FOLDS * 2
 
 
@@ -311,14 +342,24 @@ def test_the_point_chosen_in_sample_is_the_point_that_runs_out_of_sample(
     session = session_factory()
     try:
         for fold in decided:
-            assert fold["chosen_label"] in ("period=5", "period=9")
+            # ⚠️ **The point that actually wins, not "one of the two".** Measured by driving the
+            # engine over these very bars: on fold 0's training window `period=5` makes 608.00
+            # against `period=9`'s -294.40, and on fold 1's, 604.80 against 198.00. Accepting
+            # either label would pass against a fold that ranked by the wrong column, or that
+            # picked whichever run Postgres returned first — which is the failure this whole
+            # file exists to catch, since both still produce a complete, plausible report.
+            assert fold["chosen_label"] == "period=5"
             assert fold["test_backtest_id"] is not None
 
             test_run = session.get(Backtest, uuid.UUID(fold["test_backtest_id"]))
             assert test_run is not None
             assert str(test_run.strategy_id) == fold["chosen_strategy_id"]
-            assert test_run.date_from.isoformat() == fold["test_from"]
-            assert test_run.date_to.isoformat() == fold["test_to"]
+            # ⚠️ Compared as instants, never as text. The column hands back `+00:00` and the
+            # wire carries `Z` for the very same moment, so a string comparison fails on two
+            # spellings of one timestamp — and would just as happily pass two different moments
+            # that happened to be spelled alike.
+            assert test_run.date_from == dt.datetime.fromisoformat(fold["test_from"])
+            assert test_run.date_to == dt.datetime.fromisoformat(fold["test_to"])
             # The out-of-sample run belongs to no study, which is what keeps it visible in the
             # run log while the three hundred training runs stay hidden.
             assert test_run.study_id is None
@@ -399,6 +440,10 @@ def test_a_second_run_of_the_same_walk_forward_changes_nothing(
     primary key, and a completed fold would come back `failed`. The guard is that runs already
     `done` are skipped — asserted by counting rows, because the visible symptom of getting this
     wrong is not an error but a *second* test run per fold.
+
+    The clock is asserted too, and separately: a completed experiment whose `started_at` moves
+    because a queue redelivered a message is a row that now describes the redelivery. Nothing
+    errors, and the duration on screen is simply wrong from then on.
     """
     with TestClient(prepared()) as client:
         _, created = _launch(client)
@@ -407,6 +452,9 @@ def test_a_second_run_of_the_same_walk_forward_changes_nothing(
     session = session_factory()
     try:
         before = session.scalar(select(func.count()).select_from(Backtest))
+        finished = session.get(WalkForward, uuid.UUID(created["id"]))
+        assert finished is not None
+        clock = (finished.started_at, finished.finished_at)
     finally:
         session.close()
 
@@ -417,7 +465,56 @@ def test_a_second_run_of_the_same_walk_forward_changes_nothing(
         assert session.scalar(select(func.count()).select_from(Backtest)) == before
         walk_forward = session.get(WalkForward, uuid.UUID(created["id"]))
         assert walk_forward is not None
-        assert walk_forward.status.value == "done"
+        assert walk_forward.status.value == "done", walk_forward.error
+        assert (walk_forward.started_at, walk_forward.finished_at) == clock
+    finally:
+        session.close()
+
+
+def test_an_experiment_that_died_halfway_resumes_instead_of_failing_again(
+    prepared: Callable[[], Any],
+    session_factory: Callable[[], Session],
+    tmp_path: Path,
+) -> None:
+    """⚠️ **The retry path, which is the one this job actually needs, and it was broken.**
+
+    A worker killed mid-experiment leaves the row `failed` with a `finished_at` from the attempt
+    that ended. arq re-enqueues under the walk-forward's own id, so the job runs again — and
+    `walk_forwards` carries a CHECK that a finish may not precede its start. A retry that kept
+    those stamps died on its first commit, and the constraint violation was then recorded as the
+    experiment's failure: a message about a timestamp, standing where the reason the experiment
+    failed used to be.
+
+    The row is failed by hand here rather than by killing a worker, because the state a crash
+    leaves *is* this row, and arranging a real crash inside a fold would test the crash.
+    """
+    with TestClient(prepared()) as client:
+        _, created = _launch(client)
+        _drive(session_factory, tmp_path, created["id"])
+
+    session = session_factory()
+    try:
+        walk_forward = session.get(WalkForward, uuid.UUID(created["id"]))
+        assert walk_forward is not None
+        walk_forward.status = BacktestStatus.FAILED
+        walk_forward.error = "the worker was killed"
+        session.commit()
+        before = session.scalar(select(func.count()).select_from(Backtest))
+    finally:
+        session.close()
+
+    _drive(session_factory, tmp_path, created["id"])
+
+    session = session_factory()
+    try:
+        walk_forward = session.get(WalkForward, uuid.UUID(created["id"]))
+        assert walk_forward is not None
+        assert walk_forward.status.value == "done", walk_forward.error
+        # The stale reason is gone, not carried into a run that succeeded. A completed
+        # experiment showing why its previous attempt failed is a screen nobody can read.
+        assert walk_forward.error is None
+        # And no fold was scored twice: the ones already holding a test run are skipped whole.
+        assert session.scalar(select(func.count()).select_from(Backtest)) == before
     finally:
         session.close()
 

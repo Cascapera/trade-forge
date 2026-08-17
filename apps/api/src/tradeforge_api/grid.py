@@ -245,9 +245,14 @@ def value_at(document: Mapping[str, Any], path: str) -> Any:  # noqa: ANN401
         return container[int(key)]
     if isinstance(container, dict):
         return container[key]
-    # pragma: no cover — `_walk` resolves the last segment, so the container is always one of
-    # the two above. Kept loud for the same reason `_set`'s twin is.
-    raise GridError(f"{path!r} does not name a place a value can be read from")
+    # `_walk` resolves the last segment through `_descend`, which refuses anything that is not a
+    # list with that index or a dict with that key — so by here the container is always one of
+    # the two above. Kept loud rather than deleted for the same reason `_set`'s twin is: without
+    # it the function would fall off the end and return `None`, and a point whose value could
+    # not be read would place on the grid as an axis nobody set.
+    raise GridError(  # pragma: no cover — unreachable while `_walk` resolves the last segment
+        f"{path!r} does not name a place a value can be read from"
+    )
 
 
 def read_point(document: Mapping[str, Any], grid: Mapping[str, Sequence[Any]]) -> dict[str, Any]:

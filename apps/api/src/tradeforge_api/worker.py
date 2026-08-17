@@ -165,10 +165,20 @@ async def process_walk_forward(
     walk_forward = session.get(WalkForward, walk_forward_id)
     if walk_forward is None:
         return  # the row was deleted between enqueue and pickup; nothing to run
+    if walk_forward.status is BacktestStatus.DONE:
+        return  # complete; a retry has nothing to add and would restamp a finished clock
 
     try:
         walk_forward.status = BacktestStatus.RUNNING
         walk_forward.started_at = _now()
+        # ⚠️ **Cleared, not left standing, and this is the whole retry path.** An attempt that
+        # ended leaves `finished_at` and `error` behind, and the row's own CHECK refuses a
+        # finish that precedes its start — so a retry that kept them would die on this very
+        # commit with a constraint violation, recorded as the experiment's failure. The message
+        # a reader would then see is about a timestamp, and it has *replaced* the reason the
+        # experiment failed in the first place.
+        walk_forward.finished_at = None
+        walk_forward.error = None
         session.commit()
 
         for fold in walk_forward.fold_rows:
@@ -198,6 +208,14 @@ async def _process_fold(
     fold: WalkForwardFold,
 ) -> None:
     """One fold: every training run, the choice, and the single run that scores it."""
+    if fold.test_backtest_id is not None:
+        # Decided and scored by an earlier attempt. Skipped whole rather than re-derived: the
+        # training runs below would each be skipped for being `done` anyway, but the run that
+        # scores the choice is *created* here, so re-entering writes a **second** out-of-sample
+        # run for a fold that already has one. Two answers to "what did this fold make", with
+        # nothing on either row to say which one is the fold's.
+        return
+
     training = list(
         session.scalars(
             select(Backtest).where(Backtest.study_id == fold.study_id).order_by(Backtest.id)

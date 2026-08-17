@@ -447,3 +447,21 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
   (`le=1000`, `le=100`, `le=10_000`), e o único float sem teto é `Condition.value`
   (`packages/schema/.../models.py:80`). Consertar comparando por JSONB do lado do banco, ou pôr
   teto no `Condition.value`, no dia em que uma grade puder varrer esse campo.
+- [origem: PR-204] **A corrida de teste órfã, entre criá-la e ligá-la à dobra** — o resume pula a
+  dobra que já tem `test_backtest_id`, o que fecha o caso normal. Resta uma janela estreita: o
+  `_process_fold` grava a corrida out-of-sample (`session.commit()`) e só depois escreve
+  `fold.test_backtest_id = test.id` num segundo commit. Um worker morto **entre os dois** deixa
+  uma corrida real, executada e sem dono — e o retry, vendo a dobra sem link, cria uma segunda.
+  Não é regressão deste PR (a ordem é obrigatória: `test_backtest_id` é FK e o CHECK da dobra
+  recusa corrida de teste sem escolha por trás) e o sintoma é uma linha a mais no run log, não um
+  número errado no relatório. Consertar escrevendo as duas coisas na mesma transação, ou
+  adotando a corrida órfã pelo par (estratégia escolhida, janela de teste) antes de criar outra.
+- [origem: PR-204] **O portão de cobertura não enxerga o job que ele mais precisa medir** —
+  `ci.yml:53` roda `uv run pytest` sem integração e é aí que mora o `--cov-fail-under=90`; a
+  integração roda em `ci.yml:119` com `--no-cov`. Consequência estrutural: `worker.py` (30%),
+  `routers/walkforwards.py` (47%), `studies.py`, `backtests.py` e `baskets.py` contam como
+  descobertos mesmo com 103 testes de integração passando por eles, e a margem do portão vive
+  em torno de 0,2 pp — o PR-204 furou o piso pela primeira vez e o conserto foi escrever teste
+  sem banco, que é honesto mas não resolve a causa. Ver [[portao-de-cobertura-nao-ve-integracao]].
+  Opções: combinar os dois relatórios (`coverage combine` entre os jobs) e medir o total, ou
+  medir a integração com piso próprio. Não fazer dentro de um PR de produto.

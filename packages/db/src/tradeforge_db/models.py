@@ -26,6 +26,7 @@ from typing import Any
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     CheckConstraint,
     Computed,
     DateTime,
@@ -64,6 +65,25 @@ class BacktestStatus(StrEnum):
     RUNNING = "running"
     DONE = "done"
     FAILED = "failed"
+
+
+class SelectionMetric(StrEnum):
+    """What a walk-forward fold maximises when it picks a winner from its training grid.
+
+    An enum rather than a free string because this is the one input that decides what the
+    whole experiment *means*. "The best parameters" is not a fact about a grid; it is a fact
+    about a grid **and a ranking**, and a walk-forward that could not say which ranking it
+    used would report an out-of-sample number nobody could reproduce.
+
+    All four name a column on `BacktestMetrics`, and three of them are nullable there —
+    which is the reason `walkforward.choose` refuses to treat a null as a zero. Sharpe over
+    zero trades is undefined, not flat.
+    """
+
+    NET_PROFIT = "net_profit"
+    PROFIT_FACTOR = "profit_factor"
+    SHARPE = "sharpe"
+    EXPECTANCY = "expectancy"
 
 
 class ExitReason(StrEnum):
@@ -721,4 +741,240 @@ class Trade(Base):
         CheckConstraint("costs IS NULL OR costs >= 0", name="costs_non_negative"),
         CheckConstraint("net_pnl IS NULL OR net_pnl = gross_pnl - costs", name="net_pnl_balances"),
         Index("ix_trades_backtest_id_entry_time", "backtest_id", "entry_time"),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Walk-forward — the experiment that scores a choice it did not get to see      #
+# --------------------------------------------------------------------------- #
+
+
+class WalkForward(Base):
+    """A study re-asked honestly: choose the parameters on one window, score them on the next.
+
+    `Study` above ends its own docstring by naming the thing it cannot do, and this is that
+    thing. A grid searches and scores on **the same candles**, so its best point is the
+    luckiest arrangement of one sample — and the wider the grid, the luckier. That number is a
+    description of a past. It is not evidence about a future, and no amount of dispersion
+    reported beside it makes it one.
+
+    A walk-forward splits the period into folds. In each fold the entire grid runs over a
+    *training* window, one point is chosen by a stated rule, and **that point alone** runs over
+    the *test* window that follows it. The test window was not searched, so its result is what
+    the method would have returned to somebody making the choice blind. Stitched across folds
+    it answers the only question that matters before risking money.
+
+    **It re-runs a study rather than taking a grid of its own**, which is why the sole input
+    here is `study_id`. The comparison this table exists to support is *"the heatmap said this,
+    the blind choice got that"* — and that comparison is only sound if both used the same grid
+    over the same market. Accepting a grid again would let the two drift apart with nothing
+    able to notice, since a retyped grid that differs by one value still looks like the same
+    experiment.
+
+    ⚠️ **Its own status column, and the reason is that this row can fail on its own.** Every
+    other grouping in this schema (`Basket`, `Study`) is inert: it writes its runs, and each
+    run then succeeds or fails by itself. A walk-forward *decides* — it reads the training
+    metrics, applies `metric`, and creates the test run from the answer. A fold whose training
+    grid finished but whose choice could not be made (every point failed, or none traded) is a
+    state no `backtests` row can express, and silence there would read as a fold that was never
+    reached.
+
+    ⚠️ **The folds share one set of strategies, and that falls out of a PR-203 decision.** A
+    grid point's document contains no symbol and no dates, so the document for `period=9` is
+    byte-identical in every fold; `_strategies_for` reuses the stored row. Six folds over a
+    fifty-point grid is fifty strategies and three hundred runs, not three hundred strategies.
+    """
+
+    __tablename__ = "walk_forwards"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+
+    # RESTRICT, like every other pointer at a study or a strategy: the walk-forward's whole
+    # meaning is "this grid, tested blind", and a row whose grid had been deleted would state a
+    # result about an experiment nobody could describe any more.
+    study_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("studies.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+
+    folds: Mapped[int] = mapped_column(Integer, nullable=False)
+    """How many train→test pairs the period is cut into.
+
+    The knob with the sharpest trade-off in the whole feature, in both directions. Few folds
+    give each test window enough bars for its result to mean something, but too few points to
+    tell a stable parameter from one that wanders. Many folds show the wandering clearly and
+    measure each fold on a sample so short that the wandering could be noise — which is the
+    very failure the experiment was built to expose, reintroduced one level up.
+    """
+
+    train_multiple: Mapped[int] = mapped_column(Integer, nullable=False)
+    """How many times longer the training window is than the test window that follows it.
+
+    Stored rather than derived because it, `folds` and the number of candles are what produced
+    every boundary in `walk_forward_folds`, and a boundary whose reasoning cannot be recovered
+    is a boundary nobody can audit later.
+    """
+
+    anchored: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    """`True`: every fold trains on **all** history before its test window, so the training set
+    grows. `False` (rolling): the training window is a fixed length that slides forward.
+
+    Not a detail — the two ask different questions. Anchored asks *"does everything I know so
+    far predict what comes next?"*, and uses more data each fold, so its later choices are the
+    steadier ones. Rolling asks *"does the recent past predict the near future?"*, which is the
+    honest question if a market's behaviour changes, and it keeps every fold's choice made from
+    a sample of the same size — so the folds are comparable to each other, which anchored's are
+    not.
+    """
+
+    metric: Mapped[SelectionMetric] = mapped_column(
+        _enum(SelectionMetric, "selection_metric"), nullable=False
+    )
+    """The ranking that decides each fold's winner. See `SelectionMetric`."""
+
+    status: Mapped[BacktestStatus] = mapped_column(
+        _enum(BacktestStatus, "walk_forward_status"),
+        nullable=False,
+        default=BacktestStatus.QUEUED,
+    )
+    """Reusing the runs' state machine, deliberately: this row goes through exactly the same
+    four states for exactly the same reasons, and a second vocabulary for `queued → running →
+    done | failed` would be two words for one idea. The enum is stored as VARCHAR + CHECK
+    (`native_enum=False`), so the constraint is this table's own and the two can diverge later
+    without a migration touching both."""
+
+    error: Mapped[str | None] = mapped_column(Text)
+
+    created_at: Mapped[dt.datetime] = _created_at()
+    started_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+
+    fold_rows: Mapped[list[WalkForwardFold]] = relationship(
+        back_populates="walk_forward",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        order_by="WalkForwardFold.index",
+    )
+    """Ordered in SQL, and the ordering is not cosmetic. A fold's number *is* its position in
+    time, so folds arriving shuffled would put a later test window before an earlier one and
+    the stitched out-of-sample result would be a different experiment. The same `now()`-per-
+    transaction trap that shuffled a study's points applies here, and this is the fix that
+    costs nothing: the fold carries its own index."""
+
+    __table_args__ = (
+        # One fold is a single train/test split — a useful thing, but not a walk-forward: it
+        # cannot say whether a choice was stable, which is half of what this experiment reports.
+        CheckConstraint("folds >= 2", name="folds_at_least_two"),
+        CheckConstraint("train_multiple >= 1", name="train_at_least_as_long_as_test"),
+        CheckConstraint("status <> 'failed' OR error IS NOT NULL", name="failed_needs_error"),
+        CheckConstraint(
+            "finished_at IS NULL OR started_at IS NOT NULL", name="finished_implies_started"
+        ),
+        CheckConstraint(
+            "finished_at IS NULL OR finished_at >= started_at", name="finished_after_started"
+        ),
+    )
+
+
+class WalkForwardFold(Base):
+    """One train→test pair: the grid that was searched, and the single point that was tested.
+
+    The row records **decisions and boundaries, never results.** Every number a reader wants
+    from a fold — what the winner returned in training, what it returned out of sample, how
+    many trades either took — is already stored on the runs, and copying any of it here would
+    create a second place for it to be true.
+
+    ⚠️ **The training window is not a column, and its absence is the design.** A fold's
+    training grid *is* a `Study` — the same table `POST /studies` writes, over this fold's
+    window — so the window is that study's own `date_from`/`date_to`. Writing it here as well
+    would let a fold claim one window while the runs underneath it executed another. The test
+    window has no such owner at write time (its run does not exist until a winner is known), so
+    it does live here.
+    """
+
+    __tablename__ = "walk_forward_folds"
+
+    # A composite primary key rather than a surrogate id, because the pair *is* the identity:
+    # there is exactly one fold 3 of a given walk-forward, and no other row can be it. It also
+    # makes the ordering above free, since the index is already part of the key.
+    walk_forward_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("walk_forwards.id", ondelete="CASCADE"), primary_key=True
+    )
+    index: Mapped[int] = mapped_column(Integer, primary_key=True)
+
+    study_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("studies.id", ondelete="RESTRICT"), nullable=False, unique=True
+    )
+    """The in-sample grid over this fold's training window — a full `Study`, readable through
+    `GET /studies/{id}` with its own heatmap.
+
+    Reused rather than reinvented because that heatmap is the evidence. Fold 1's heatmap beside
+    fold 5's is what over-fitting *looks like*: if the bright region moves every fold, the grid
+    was reading noise, and no summary number states it as plainly as the two pictures do.
+
+    Unique: a study belongs to at most one fold, so the link cannot be quietly shared.
+    """
+
+    test_from: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    test_to: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    train_bars: Mapped[int] = mapped_column(Integer, nullable=False)
+    test_bars: Mapped[int] = mapped_column(Integer, nullable=False)
+    """How many candles the splitter counted into each window.
+
+    Stored because the boundaries were cut **by bars and expressed as dates**, and only these
+    two columns preserve the reasoning. A market has holidays, half-days and weekends, so equal
+    stretches of calendar hold wildly unequal amounts of trading; cutting by time would give
+    one fold twice the evidence of its neighbour while the row still read as an even split.
+    These say what was actually counted, so a reader can check the split was even instead of
+    trusting that it was.
+
+    ⚠️ Planned, not observed. What each run *read* is on the run (`candles_seen`), and the two
+    can honestly differ — a training window whose grid all failed reads nothing at all.
+    """
+
+    chosen_strategy_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("strategies.id", ondelete="RESTRICT")
+    )
+    """The point this fold's training grid selected — null until the fold has been decided.
+
+    Null is also a **terminal** answer, not only a pending one: a fold whose every point failed,
+    or whose every point took no trades, has no winner to name, and the walk-forward reports it
+    as a fold that could not choose rather than inventing one. The two are told apart by the
+    walk-forward's status, not by this column.
+    """
+
+    test_backtest_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("backtests.id", ondelete="SET NULL"), unique=True
+    )
+    """The out-of-sample run of the chosen point. The number the whole feature exists to
+    produce, stored the same way every other run in the system is stored — as a `Backtest`,
+    reproducible from its own strategy document, openable on the results screen like any other.
+
+    SET NULL, not CASCADE, on the same principle as `backtests.basket_id`: deleting a run must
+    not take the fold's record of what was decided with it.
+    """
+
+    walk_forward: Mapped[WalkForward] = relationship(back_populates="fold_rows")
+
+    study: Mapped[Study] = relationship()
+    """The training grid, reached as an object — this is where the fold's **training window**
+    is read from, since the study's `date_from`/`date_to` are that window and this table
+    deliberately does not copy them.
+
+    No `back_populates`: a `Study` has no business knowing it is part of a fold. Studies exist
+    on their own and predate this table, and a reverse link would have to be nullable on every
+    one of them to describe a relationship most of them are not in.
+    """
+
+    __table_args__ = (
+        CheckConstraint("index >= 0", name="index_non_negative"),
+        CheckConstraint("test_to >= test_from", name="test_range"),
+        # A window is cut by counting candles, so a window of none of them was never cut.
+        CheckConstraint("train_bars > 0 AND test_bars > 0", name="windows_have_bars"),
+        # A test run exists only because a choice was made. The reverse is allowed and happens:
+        # the winner is recorded, then its run is created and executed.
+        CheckConstraint(
+            "test_backtest_id IS NULL OR chosen_strategy_id IS NOT NULL",
+            name="test_run_implies_a_choice",
+        ),
     )

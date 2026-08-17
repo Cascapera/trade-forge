@@ -32,6 +32,8 @@ EXPECTED_TABLES = {
     "strategies",
     "baskets",
     "studies",
+    "walk_forwards",
+    "walk_forward_folds",
     "backtests",
     "backtest_metrics",
     "trades",

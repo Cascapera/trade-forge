@@ -17,9 +17,11 @@ import type {
   CreateBacktestRequest,
   CreateBasketRequest,
   CreateStudyRequest,
+  CreateWalkForwardRequest,
   CreatedBacktest,
   CreatedBasket,
   CreatedStudy,
+  CreatedWalkForward,
   EquityPoint,
   Instrument,
   OverlaysResponse,
@@ -29,6 +31,7 @@ import type {
   StrategyOut,
   StudyOut,
   TradesPage,
+  WalkForwardOut,
 } from './types'
 
 const POLL_MS = 1000
@@ -297,6 +300,33 @@ export function isStudySettled(study: StudyOut | undefined): boolean {
  * another. Polling a five-minute study at a basket's cadence would add hundreds of requests to
  * the very queue being waited on, and each response carries every run in the study.
  */
+export function useCreateWalkForward() {
+  return useMutation<CreatedWalkForward, Error, CreateWalkForwardRequest>({
+    mutationFn: (payload) => api.createWalkForward(payload),
+  })
+}
+
+/**
+ * One walk-forward, polled until the orchestrating job stops.
+ *
+ * ⚠️ **This one has a status of its own, unlike a study or a basket**, and the poll reads it
+ * rather than inspecting the runs. That is not a shortcut — it is the only correct source. A
+ * walk-forward's runs do not all exist yet while it is working: a fold's out-of-sample run is
+ * created *after* its training grid has finished and a winner has been picked, so "every run I
+ * can see has landed" is true several times over the course of one experiment, and each time it
+ * would stop the poll on a screen that is still filling in.
+ *
+ * The interval matches a study's, and for the same arithmetic: the folds run one grid after
+ * another inside a single worker slot, so this settles on a scale of minutes.
+ */
+export function useWalkForward(id: string | undefined) {
+  return useQuery<WalkForwardOut>({
+    queryKey: ['walkforward', id],
+    queryFn: id === undefined ? skipToken : () => api.getWalkForward(id),
+    refetchInterval: (query) => (isTerminal(query.state.data?.status) ? false : STUDY_POLL_MS),
+  })
+}
+
 export function useStudy(id: string | undefined) {
   return useQuery<StudyOut>({
     queryKey: ['study', id],

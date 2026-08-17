@@ -16,6 +16,15 @@ vi.mock('../components/ComparisonChart', () => ({
   ),
 }))
 
+// Stubbed for the same reason the chart is: it owns a mutation and a router navigation, neither
+// of which this screen decides. What this screen decides is that it is offered at all, and with
+// **this** study — so the stub reports the study id it was handed.
+vi.mock('../components/WalkForwardLauncher', () => ({
+  WalkForwardLauncher: ({ study }: { study: { id: string } }) => (
+    <div data-testid="walk-forward-launcher">{study.id}</div>
+  ),
+}))
+
 import { useEquityCurves, useStudy } from '../api/hooks'
 
 import { StudyResult } from './StudyResult'
@@ -178,6 +187,20 @@ describe('StudyResult', () => {
     fireEvent.click(screen.getAllByRole('checkbox')[0]!)
 
     expect(screen.getByTestId('chart')).toHaveTextContent('p5')
+  })
+
+  it('offers the walk-forward of this study, under everything else', () => {
+    // ⚠️ **Under**, and that is the reading order the feature depends on. The dispersion, then
+    // the shape of the grid, then the runs — and only then the experiment that can say whether
+    // any of it survives being chosen without hindsight. Offered above them it would read as
+    // another way to search; offered here it reads as the question the screen just raised.
+    showing(study(['-500', '2000']))
+
+    renderWithProviders(<StudyResult />)
+
+    // Handed *this* study, not a grid retyped somewhere else — which is the only thing that
+    // makes "the heatmap said this, a blind choice got that" a comparison at all.
+    expect(screen.getByTestId('walk-forward-launcher')).toHaveTextContent('study-1')
   })
 
   it('says it is loading rather than rendering an empty study', () => {

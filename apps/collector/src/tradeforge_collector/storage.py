@@ -163,6 +163,42 @@ def read_candles(
     ]
 
 
+def read_times(
+    root: Path,
+    symbol: str,
+    timeframe: str,
+    *,
+    start: dt.datetime | None = None,
+    end: dt.datetime | None = None,
+) -> list[dt.datetime]:
+    """Just the instants of a symbol's bars, in order — the same window rules as `read_candles`.
+
+    Separate from `read_candles` rather than derived from it, because the caller that needs
+    this needs *only* this. A walk-forward cuts its folds by counting candles, so it asks how
+    many there are and when each one falls, and never opens a price. Reading the whole table to
+    take one column would decode six numbers per row into Python objects and drop all six —
+    over a decade of M5 that is a million allocations for a list of timestamps.
+
+    Columnar storage is what makes the difference free rather than clever: Parquet keeps each
+    column separately, so naming one means the others are never read off disk at all.
+    """
+    directory = Path(dataset_path(root, symbol, timeframe))
+    if not directory.exists():
+        return []
+
+    window = None
+    if start is not None:
+        window = ds.field("time") >= start
+    if end is not None:
+        upper = ds.field("time") <= end
+        window = upper if window is None else window & upper
+
+    table = ds.dataset(directory, format="parquet", partitioning="hive").to_table(
+        columns=["time"], filter=window
+    )
+    return [_as_utc(moment) for moment in table.sort_by("time").column("time").to_pylist()]
+
+
 def _as_utc(moment: dt.datetime) -> dt.datetime:
     """Arrow hands back an aware datetime; make the timezone explicitly `dt.UTC`."""
     return moment.astimezone(dt.UTC)

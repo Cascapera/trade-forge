@@ -8,6 +8,7 @@ import { LaunchStudy } from './screens/LaunchStudy'
 import { RunLog } from './screens/RunLog'
 import { StrategyBuilder } from './screens/StrategyBuilder'
 import { StudyResult } from './screens/StudyResult'
+import { WalkForwardResult } from './screens/WalkForwardResult'
 import { useSession } from './store'
 
 function navClass({ isActive }: { isActive: boolean }): string {
@@ -23,6 +24,10 @@ export function App(): React.JSX.Element {
   // The same thread for a study, and for the same reason: there is no `GET /studies` either.
   const studyId = useSession((state) => state.studyId)
   const studyLabel = useSession((state) => state.studyLabel)
+  // And again for a walk-forward, which needs the thread most of the three: it runs for minutes,
+  // so the reader launches one and goes to look at something else.
+  const walkForwardId = useSession((state) => state.walkForwardId)
+  const walkForwardLabel = useSession((state) => state.walkForwardLabel)
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100">
@@ -62,6 +67,11 @@ export function App(): React.JSX.Element {
                 ▸ {studyLabel}
               </NavLink>
             )}
+            {walkForwardId !== null && (
+              <NavLink to={`/walkforwards/${walkForwardId}`} className={navClass}>
+                ▸ {walkForwardLabel}
+              </NavLink>
+            )}
           </nav>
         </div>
       </header>
@@ -73,6 +83,7 @@ export function App(): React.JSX.Element {
           <Route path="/baskets/:id" element={<BasketResult />} />
           <Route path="/study" element={<LaunchStudy />} />
           <Route path="/studies/:id" element={<StudyResult />} />
+          <Route path="/walkforwards/:id" element={<WalkForwardResult />} />
           <Route path="/runs" element={<RunLog />} />
           <Route path="/results/:id" element={<Results />} />
           <Route path="*" element={<Navigate to="/" replace />} />

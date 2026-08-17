@@ -11,9 +11,11 @@ import type {
   CreateBacktestRequest,
   CreateBasketRequest,
   CreateStudyRequest,
+  CreateWalkForwardRequest,
   CreatedBacktest,
   CreatedBasket,
   CreatedStudy,
+  CreatedWalkForward,
   EquityPoint,
   Instrument,
   OverlaysResponse,
@@ -23,6 +25,7 @@ import type {
   StrategyOut,
   StudyOut,
   TradesPage,
+  WalkForwardOut,
 } from './types'
 
 const BASE_URL = import.meta.env.VITE_API_URL ?? '/api'
@@ -112,6 +115,12 @@ export const api = {
   createStudy: (payload: CreateStudyRequest): Promise<CreatedStudy> =>
     request('POST', '/studies', payload),
   getStudy: (id: string): Promise<StudyOut> => request('GET', `/studies/${id}`),
+  // Takes a study, not a grid: the comparison a walk-forward exists to support only holds if
+  // both halves searched the same parameter space over the same market, and a grid retyped
+  // here could differ by one value while still looking like the same experiment.
+  createWalkForward: (payload: CreateWalkForwardRequest): Promise<CreatedWalkForward> =>
+    request('POST', '/walkforwards', payload),
+  getWalkForward: (id: string): Promise<WalkForwardOut> => request('GET', `/walkforwards/${id}`),
   // The same `query` helper the run log's filters use: an absent filter and an empty one are
   // different requests, and that distinction is already written down once.
   listStrategies: (filters: StrategyFilters = {}): Promise<StrategiesPage> =>

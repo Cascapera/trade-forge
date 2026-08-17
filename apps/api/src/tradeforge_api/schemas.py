@@ -28,6 +28,9 @@ from pydantic import (
     field_validator,
 )
 
+from tradeforge_api.walkforward import MAX_FOLDS, MIN_FOLDS
+from tradeforge_db.models import SelectionMetric
+
 # A Decimal that always serialises to a string. Applied to every monetary/ratio field below.
 Money = Annotated[Decimal, PlainSerializer(str, return_type=str)]
 
@@ -755,3 +758,148 @@ class StudyOut(_Out):
 
     aggregate: StudyAggregate
     runs: list[BacktestListItem]
+
+
+class CreateWalkForwardRequest(BaseModel):
+    """Re-run a study honestly: choose the parameters on one window, score them on the next.
+
+    The only thing named here is the study, and that is the design. This experiment exists to
+    support one comparison — *"the heatmap said this, a blind choice got that"* — and the
+    comparison is only sound if both halves searched the same grid over the same market. Taking
+    a grid again would let the two drift apart with nothing able to notice: a retyped grid that
+    differs by one value still looks like the same experiment.
+
+    Everything else on the wire is about how the period is cut and how a winner is picked.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    study_id: uuid.UUID
+
+    folds: int = Field(default=6, ge=MIN_FOLDS, le=MAX_FOLDS)
+    """How many train→test pairs. Six over a couple of years of H1 leaves each test window a
+    few hundred bars — enough for a result to mean something, and enough folds to see whether
+    the winning parameters stay put."""
+
+    train_multiple: int = Field(default=3, ge=1, le=MAX_FOLDS)
+    """How many times longer the training window is than the test window that follows.
+
+    Three is the usual starting point: the choice is made on three times the evidence it is
+    then scored on. Raising it buys steadier choices and costs test windows, since the period
+    is divided into `train_multiple + folds` parts and the folds get `folds` of them.
+    """
+
+    anchored: bool = False
+    """`False` (rolling, the default) slides a fixed-length training window forward, so every
+    fold chooses from a sample of the same size and the folds are comparable to each other.
+    `True` trains on all history before each test window instead. See `walkforward.split`."""
+
+    metric: SelectionMetric = SelectionMetric.NET_PROFIT
+    """What each fold maximises when it picks its winner. The result is always reported as a
+    *return*, whatever this is set to — selecting by Sharpe and reporting Sharpe would leave a
+    reader unable to answer "so what would this have made?"."""
+
+
+class WalkForwardFoldOut(_Out):
+    """One fold: the windows, the choice, and what the choice was worth on each side of it."""
+
+    index: int
+    study_id: uuid.UUID
+    """The training grid, readable through `GET /studies/{id}` — heatmap included. Fold 1's
+    heatmap beside fold 5's is what over-fitting looks like, and no number states it as
+    plainly."""
+
+    train_from: dt.datetime
+    train_to: dt.datetime
+    test_from: dt.datetime
+    test_to: dt.datetime
+    train_bars: int
+    test_bars: int
+    """The counts the split was cut from. Served because the boundaries were decided by
+    counting candles and expressed as dates: a reader who only saw the dates could not tell an
+    even split from one where a holiday week halved a fold's evidence."""
+
+    chosen_label: str | None
+    """`period=9, take_profit_rr=3` — the point this fold selected, or null if it could not
+    select one. Null is a **result**, not a pending state: it says nothing in the grid traded
+    that window, or nothing that traded had a defined score."""
+
+    chosen_strategy_id: uuid.UUID | None
+    test_backtest_id: uuid.UUID | None
+
+    in_sample_return: Money | None
+    """What the chosen point returned over the window it was chosen on. The promise."""
+
+    out_of_sample_return: Money | None
+    """What it returned over the window that followed — which no part of the choice had seen.
+    The delivery, and the only figure here that is evidence about a future."""
+
+    test_status: str | None
+    test_trades: int | None
+    """How many trades the out-of-sample run actually took. Read before believing its return:
+    a fold that traded twice has a return, not a finding."""
+
+
+class WalkForwardVerdict(BaseModel):
+    """What the folds add up to. See `walkforward.Verdict` for why each figure is this one."""
+
+    folds_total: int
+    folds_decided: int
+    folds_scored: int
+    folds_profitable: int
+
+    in_sample_median: Money | None
+    out_of_sample_median: Money | None
+    degradation: Money | None
+    """`out_of_sample_median - in_sample_median` — **the headline**. Normally negative; a small
+    gap is a method that generalises, a gap that swallows the whole in-sample result is a grid
+    that was fitting noise."""
+
+    compounded: Money | None
+    """The folds multiplied together, `Π(1 + r) - 1`: what an account would have done trading
+    this and re-choosing its parameters every window. An approximation — each run starts from
+    the same capital, so this models an account that scales position size with equity."""
+
+    distinct_choices: int
+    """How many *different* points the folds chose. 1 is the strongest evidence a grid can
+    give; a number near `folds_decided` means there is no "the parameters" to go and trade."""
+
+
+class CreatedWalkForward(_Out):
+    """The 202 body: the walk-forward exists, its folds are cut, and its training runs queued."""
+
+    id: uuid.UUID
+    folds: list[WalkForwardFoldOut]
+    runs_queued: int
+    """`folds x grid points`. Stated back because it is the cost of the request and it grows
+    multiplicatively — a fourth axis on the grid multiplies this, and so does a seventh fold."""
+
+
+class WalkForwardOut(_Out):
+    """A walk-forward read back: how it was cut, what each fold decided, and what it adds up to."""
+
+    id: uuid.UUID
+    study_id: uuid.UUID
+    strategy_id: uuid.UUID
+    strategy_name: str
+    symbol: str
+    timeframe: str
+    initial_capital: Money
+    grid: dict[str, list[Any]]
+
+    folds_requested: int = Field(validation_alias=AliasChoices("folds_requested", "folds"))
+    """Spelled apart from the `folds` list below, which is the same word for a different thing:
+    the number asked for, against the rows that were cut. They agree, and a client showing
+    "3 of 6 decided" needs both to say so."""
+
+    train_multiple: int
+    anchored: bool
+    metric: str
+    status: str
+    error: str | None
+    created_at: dt.datetime
+    started_at: dt.datetime | None
+    finished_at: dt.datetime | None
+
+    folds: list[WalkForwardFoldOut]
+    verdict: WalkForwardVerdict

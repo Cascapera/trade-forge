@@ -13,6 +13,7 @@ import { ComparisonChart } from '../components/ComparisonChart'
 import { RunTable } from '../components/RunTable'
 import { StudyDispersion } from '../components/StudyDispersion'
 import { StudyHeatmap } from '../components/StudyHeatmap'
+import { WalkForwardLauncher } from '../components/WalkForwardLauncher'
 import { money } from '../format'
 
 /** The calendar day of an ISO instant — the granularity a window is read at. */
@@ -97,6 +98,11 @@ export function StudyResult(): React.JSX.Element {
       </section>
 
       <RunTable runs={runs} seats={seats} onToggle={toggle} />
+
+      {/* Last on the screen, and that is the reading order the whole feature depends on: the
+          dispersion, then the shape, then the runs — and only then the experiment that can say
+          whether any of it survives being chosen without hindsight. */}
+      <WalkForwardLauncher study={data} />
     </div>
   )
 }

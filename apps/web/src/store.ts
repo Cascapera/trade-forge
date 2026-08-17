@@ -23,6 +23,17 @@ interface SessionState {
   studyId: string | null
   studyLabel: string | null
   setStudy: (id: string, label: string) => void
+  /**
+   * The walk-forward launched most recently, on the same terms again — and it needs the thread
+   * more than the other two do.
+   *
+   * A walk-forward runs for minutes: the reader launches one and goes to look at something
+   * else, which is exactly when a link back has to exist. There is no `GET /walkforwards`
+   * listing either, so without this the only way back is the browser's history.
+   */
+  walkForwardId: string | null
+  walkForwardLabel: string | null
+  setWalkForward: (id: string, label: string) => void
   clear: () => void
 }
 
@@ -33,6 +44,8 @@ export const useSession = create<SessionState>((set) => ({
   basketLabel: null,
   studyId: null,
   studyLabel: null,
+  walkForwardId: null,
+  walkForwardLabel: null,
   setStrategy: (id, name) => {
     set({ strategyId: id, strategyName: name })
   },
@@ -42,6 +55,9 @@ export const useSession = create<SessionState>((set) => ({
   setStudy: (id, label) => {
     set({ studyId: id, studyLabel: label })
   },
+  setWalkForward: (id, label) => {
+    set({ walkForwardId: id, walkForwardLabel: label })
+  },
   clear: () => {
     set({
       strategyId: null,
@@ -50,6 +66,8 @@ export const useSession = create<SessionState>((set) => ({
       basketLabel: null,
       studyId: null,
       studyLabel: null,
+      walkForwardId: null,
+      walkForwardLabel: null,
     })
   },
 }))

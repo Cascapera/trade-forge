@@ -17,6 +17,7 @@ point; a grid of pure noise has a best point. See `StudyAggregate`.
 
 import json
 import uuid
+from collections.abc import Mapping, Sequence
 from decimal import Decimal
 from typing import Any
 
@@ -26,7 +27,15 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
 from tradeforge_api.deps import QueueDep, SessionDep
-from tradeforge_api.grid import GridError, GridPoint, expand, label_for, named, value_at
+from tradeforge_api.grid import (
+    GridError,
+    GridPoint,
+    coordinates,
+    expand,
+    label_for,
+    named,
+    read_point,
+)
 from tradeforge_api.queue import RUN_BACKTEST
 from tradeforge_api.routers.backtests import list_item
 from tradeforge_api.routers.strategies import validate_document
@@ -55,8 +64,13 @@ _NOT_FOUND: _Responses = {status.HTTP_404_NOT_FOUND: {"description": "not found"
 _BAD_BODY: _Responses = {status.HTTP_400_BAD_REQUEST: {"description": "malformed request body"}}
 
 
-def _points(base: Strategy, request: CreateStudyRequest) -> list[GridPoint]:
+def points_for(base: Strategy, grid: Mapping[str, Sequence[Any]]) -> list[GridPoint]:
     """Expand the grid, or refuse — and validate every document before any of them is written.
+
+    Public because `/walkforwards` runs the same grid over each of its folds, and it has to
+    produce *identical* documents to the ones the study ran: the whole comparison is between a
+    heatmap and a blind choice over the same parameter space. A second expansion written next
+    door would be the same code until the day one of them was fixed.
 
     Two refusals, and the order matters. `expand` rejects a grid that cannot be applied to
     *this* document (an unreachable path, an empty axis, a product over the cap). Then each
@@ -69,7 +83,7 @@ def _points(base: Strategy, request: CreateStudyRequest) -> list[GridPoint]:
     runs plus an error answers a question nobody asked.
     """
     try:
-        points = expand(base.definition, request.grid)
+        points = expand(base.definition, grid)
     except GridError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
@@ -87,8 +101,12 @@ def _points(base: Strategy, request: CreateStudyRequest) -> list[GridPoint]:
     return points
 
 
-def _strategies_for(session: SessionDep, points: list[GridPoint]) -> list[Strategy]:
+def strategies_for(session: SessionDep, points: list[GridPoint]) -> list[Strategy]:
     """One stored strategy per point, reusing an identical one where it already exists.
+
+    Public for `/walkforwards`, where the reuse stops being a nicety and becomes the mechanism:
+    a point's document carries no symbol and no dates, so `period=9` is byte-identical in every
+    fold, and six folds over fifty points write fifty strategies rather than three hundred.
 
     ⚠️ **Reuse is not an optimisation here; without it the second study fails outright.** A
     point's document contains no symbol and no dates — those live on the run — so launching the
@@ -194,7 +212,7 @@ async def create_study(
             detail=f"unknown symbol: {request.symbol}",
         )
 
-    points = _points(base, request)
+    points = points_for(base, request.grid)
 
     study = Study(
         strategy_id=base.id,
@@ -212,7 +230,7 @@ async def create_study(
     # of the strategy at v101 — and a run log row reading `MME9 v37` says nothing about which
     # combination it was. The ancestry lives on the study, which is what `studies.strategy_id`
     # is for.
-    strategies = _strategies_for(session, points)
+    strategies = strategies_for(session, points)
     session.add_all(strategies)
     # Flushed, not committed: `Backtest` reaches its strategy by id and there is no relationship
     # to defer the resolution — the ids have to exist before the runs are built. Still one
@@ -374,15 +392,12 @@ def get_study(study_id: uuid.UUID, session: SessionDep) -> StudyOut:
     # Each run's coordinates, read back out of the document that actually ran. Not parsed from
     # the strategy's name: a name is a caption, and splitting one on commas and equals signs
     # works until a value contains either.
-    # ⚠️ `_at` rather than `value_at` directly, because `_coordinates` below spends three
-    # sentences explaining why an unknown value sorts last instead of raising — and `value_at`,
-    # which runs first, would have raised for the same class of hand-edited row. Two guards over
-    # one hazard have to agree; the reading endpoint defends, so both defend.
-    placed = [
-        (run, strategy, {path: _at(strategy.definition, path) for path in grid})
-        for run, strategy in rows
-    ]
-    placed.sort(key=lambda row: _coordinates(grid, row[2]))
+    # ⚠️ `read_point` rather than `value_at` directly: `coordinates` tolerates a value the grid
+    # no longer lists, and `value_at`, which runs first, would have raised for the same class of
+    # hand-edited row. Two guards over one hazard have to agree, so both defend. Shared with the
+    # walk-forward read, which names the point a fold chose by exactly this rule.
+    placed = [(run, strategy, read_point(strategy.definition, grid)) for run, strategy in rows]
+    placed.sort(key=lambda row: coordinates(grid, row[2]))
 
     return StudyOut(
         id=study.id,
@@ -418,35 +433,4 @@ def get_study(study_id: uuid.UUID, session: SessionDep) -> StudyOut:
             list_item(run, instrument.symbol, strategy.name, strategy.version)
             for run, strategy, _ in placed
         ],
-    )
-
-
-def _at(document: dict[str, Any], path: str) -> Any:  # noqa: ANN401
-    """The value a stored document holds at `path`, or `None` if it holds nothing there.
-
-    `None` rather than an exception: the path comes from `studies.grid`, which is a row someone
-    could edit, and a study whose grid names a parameter its documents lack is a study that can
-    still be read — every other point places, and the odd one out sorts to the end. A reporting
-    endpoint that 500s on a surprising value is worse than one that shows what it has.
-    """
-    try:
-        return value_at(document, path)
-    except GridError:
-        return None
-
-
-def _coordinates(grid: dict[str, list[Any]], values: dict[str, Any]) -> tuple[int, ...]:
-    """Where a point sits on the grid: one index per axis, in the order the axes were declared.
-
-    This is the sort key, and sorting by it reproduces the order `expand` produced — last axis
-    varying fastest — from nothing but the stored grid and the documents. It is also why the
-    ordering survives a re-collection, a re-read, or rows arriving in any order at all.
-
-    An axis value the grid no longer lists sorts last rather than raising. It cannot happen
-    through this API, but a study is a row someone could edit, and a reporting endpoint that
-    500s on a surprising value is worse than one that puts it at the end.
-    """
-    return tuple(
-        axis.index(values[path]) if values[path] in axis else len(axis)
-        for path, axis in grid.items()
     )

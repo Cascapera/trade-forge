@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 
-from tradeforge_api.grid import GridError, expand, named, size_of
+from tradeforge_api.grid import GridError, coordinates, expand, named, read_point, size_of
 
 # A setup document, because every strategy in this project's database is one of these. The
 # nesting is what matters: the axes reach two levels down, into a dict shared by every point
@@ -260,3 +260,28 @@ def test_a_malformed_path_is_refused_before_anything_is_walked(path: str) -> Non
     """
     with pytest.raises(GridError, match="not a path into a strategy document"):
         expand(_BASE, {path: [1, 2]})
+
+
+def test_an_axis_the_documents_do_not_have_reads_as_nothing_rather_than_raising() -> None:
+    """⚠️ The read is deliberately forgiving where the expansion is deliberately loud.
+
+    A grid is a stored column somebody can edit, and a study whose grid names a parameter its
+    documents lack is a study that can still be *read*: every other axis places, and the odd one
+    out sorts last. Raising here would 500 a reporting endpoint over a value that is merely
+    surprising — the heatmap, the fold's chosen label and the run ordering all go through this.
+
+    Expanding the same grid still refuses, and the asymmetry is the point: writing a document
+    from a path nothing reads would create a parameter the engine ignores.
+    """
+    document = {"setup": {"type": "mme9_breakout", "params": {"period": 9}}}
+    grid = {"setup.params.period": [9], "setup.params.nothing_reads_this": [1, 2]}
+
+    assert read_point(document, grid) == {
+        "setup.params.period": 9,
+        "setup.params.nothing_reads_this": None,
+    }
+    # Unplaceable sorts last: `len(axis)` is one past the final index, whatever the axis holds.
+    assert coordinates(grid, read_point(document, grid)) == (0, 2)
+
+    with pytest.raises(GridError, match=re.escape("nothing at 'setup.params.nothing_reads_this'")):
+        expand(document, grid)

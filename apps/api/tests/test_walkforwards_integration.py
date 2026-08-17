@@ -16,6 +16,7 @@ the environment points at, which on a developer machine is the real one.
 
 import asyncio
 import datetime as dt
+import random
 import uuid
 from collections.abc import Callable
 from decimal import Decimal
@@ -552,3 +553,166 @@ def test_a_walk_forward_of_a_study_that_does_not_exist_is_a_404(
         response = client.post("/walkforwards", json={"study_id": str(uuid.uuid4())})
 
     assert response.status_code == 404
+
+
+# --------------------------------------------------------------------------- #
+# The acceptance criterion: a market where the grid over-fits, caught          #
+# --------------------------------------------------------------------------- #
+
+# `specs/fase-2.md`, PR-204: "teste com dataset sintético onde estratégia overfit falha no
+# out-of-sample". Everything above proves the pipeline is *correct*; this proves it is
+# *useful* — that the report says so when a choice was fitted to its own sample.
+#
+# Three windows of 200 bars, and the middle one behaves differently from its neighbours:
+#
+#   0-199    calm    half-cycle 10, jitter ±5 ticks    ->  fold 0 trains here
+#   200-399  rough   half-cycle 3,  jitter ±20 ticks   ->  fold 0 is tested here, fold 1 trains
+#   400-599  calm    half-cycle 10, jitter ±5 ticks    ->  fold 1 is tested here
+OVERFIT_WINDOW = 200
+OVERFIT_GRID = [3, 5, 8, 13, 21]
+
+
+def _two_regimes() -> list[Candle]:
+    """A market that changes character once, and changes back.
+
+    ⚠️ **The jitter is what makes the over-fitting possible, and it took measuring to find.**
+    On a clean saw every period from 3 to 13 catches the same swings and returns the same
+    number, so no parameter can be "tuned" to anything — the first version of this fixture
+    produced five identical columns. A *little* noise breaks the tie in favour of the **longer**
+    average, because the short one is the one that gets sawn by it. That is the whole trick: the
+    calm window teaches "longer is better", which is a fact about the noise, not about the
+    market.
+
+    Deterministic by seed. A fixture that depended on chance would be a test that sometimes
+    proves the feature and sometimes proves nothing.
+    """
+    # S311: this is a market fixture, not a secret. A seeded generator is exactly what is
+    # wanted — the same bars on every run, on every machine.
+    noise = random.Random(7)  # noqa: S311
+    closes: list[Decimal] = []
+    price = Decimal("1.10000")
+    for span, half, jitter in (
+        (OVERFIT_WINDOW, 10, 5),
+        (OVERFIT_WINDOW, 3, 20),
+        (OVERFIT_WINDOW, 10, 5),
+    ):
+        for index in range(span):
+            # Symmetric: up as far as it comes down. A drift would make the market profitable
+            # on its own, and then every point wins and nothing can degrade.
+            rising = (index // half) % 2 == 0
+            price += Decimal("0.00100") if rising else Decimal("-0.00100")
+            closes.append(price + Decimal(noise.randint(-jitter, jitter)) * Decimal("0.00001"))
+
+    candles: list[Candle] = []
+    previous = closes[0]
+    for index, close in enumerate(closes):
+        candles.append(
+            Candle(
+                time=START + index * HOUR,
+                open=previous,
+                high=max(previous, close) + Decimal("0.00020"),
+                low=min(previous, close) - Decimal("0.00020"),
+                close=close,
+            )
+        )
+        previous = close
+    return candles
+
+
+@pytest.fixture
+def over_fitting(
+    session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+) -> Callable[[], Any]:
+    """The same app, over the two-regime market. `tmp_path` is per-test, so this dataset and
+    the zigzag above never share a directory."""
+    seeding = session_factory()
+    _seed_instrument(seeding)
+    seeding.close()
+    write_candles(tmp_path, SYMBOL, "H1", _two_regimes())
+
+    def build() -> Any:
+        return _app(settings, session_factory, tmp_path)
+
+    return build
+
+
+def test_a_choice_fitted_to_its_own_window_is_reported_as_the_loss_it_becomes(
+    over_fitting: Callable[[], Any],
+    session_factory: Callable[[], Session],
+    tmp_path: Path,
+) -> None:
+    """**The acceptance criterion of PR-204, and the only test here that exercises its purpose.**
+
+    Every other test in this file proves the pipeline is correct: the windows do not overlap,
+    the chosen point is the one that runs, the folds share their strategies. None of them proves
+    the thing the feature exists for — that when a grid fits its own sample, the report says so.
+    A walk-forward that silently reported healthy numbers over an over-fitted choice would pass
+    all of them.
+
+    Measured over these bars before any of it was asserted:
+
+    | slow | f0 train (calm) | f0 test (rough) | f1 train (rough) | f1 test (calm) |
+    |------|----------------:|----------------:|-----------------:|---------------:|
+    | 3    |        1 925,18 |         -391,37 |          -391,37 |       1 930,90 |
+    | 13   |    **1 936,00** |    **-1 379,62** |        -1 379,62 |       1 932,80 |
+
+    **Fold 0 is the over-fitting.** The calm window prefers `period=13` — by eleven currency
+    units over `period=3`, an edge that is entirely an artefact of the jitter — and that choice
+    then loses **1 379**, three and a half times what the point it beat would have lost.
+
+    **Fold 1 is the method working**, and it is here so the test cannot pass on a walk-forward
+    that simply reports everything as bad: trained on the rough window it picks `period=3`, and
+    that earns **+1 930** on the calm one.
+
+    The assertions are on the *shape* rather than on the cents: which point each fold chose, the
+    signs on either side of its line, and a negative degradation. The figures above document what
+    was measured; pinning them to the cent would make an engine change look like a broken test.
+    """
+    with TestClient(over_fitting()) as client:
+        strategy_id = client.post("/strategies", json=_strategy()).json()["id"]
+        study = client.post(
+            "/studies",
+            json={
+                "strategy_id": strategy_id,
+                "symbol": SYMBOL,
+                "timeframe": "H1",
+                "date_from": START.isoformat(),
+                "date_to": (START + (3 * OVERFIT_WINDOW + 10) * HOUR).isoformat(),
+                "initial_capital": CAPITAL,
+                "cost_model": {"type": "none"},
+                "grid": {"indicators.1.params.period": OVERFIT_GRID},
+            },
+        )
+        assert study.status_code == 202, study.text
+
+        created = client.post(
+            "/walkforwards",
+            json={"study_id": study.json()["id"], "folds": 2, "train_multiple": 1},
+        )
+        assert created.status_code == 202, created.text
+        walk_forward_id = created.json()["id"]
+
+        _drive(session_factory, tmp_path, walk_forward_id)
+        body = client.get(f"/walkforwards/{walk_forward_id}").json()
+
+    assert body["status"] == "done", body["error"]
+    first, second = body["folds"]
+
+    # The fold that fitted its window: it chose the long average the calm sample rewarded...
+    assert first["chosen_label"] == "period=13"
+    assert Decimal(first["in_sample_return"]) > 0
+    # ...and the window it never saw took the money back.
+    assert Decimal(first["out_of_sample_return"]) < 0
+
+    # The fold that did not: a different choice, and it survived out of sample.
+    assert second["chosen_label"] == "period=3"
+    assert Decimal(second["out_of_sample_return"]) > 0
+
+    verdict = body["verdict"]
+    # ⚠️ The two symptoms a reader is meant to see, and the reason both are reported. The folds
+    # disagreeing says the grid was reading the sample; the negative degradation says what that
+    # cost. Either alone is ambiguous — a stable choice can still degrade, and folds can disagree
+    # while every one of them earns.
+    assert verdict["distinct_choices"] == 2
+    assert Decimal(verdict["degradation"]) < 0
+    assert verdict["folds_profitable"] == 1

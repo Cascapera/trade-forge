@@ -20,7 +20,12 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
 from tradeforge_api.deps import SessionDep
-from tradeforge_api.schemas import StrategiesPage, StrategyListItem, StrategyOut
+from tradeforge_api.schemas import (
+    StorableText,
+    StrategiesPage,
+    StrategyListItem,
+    StrategyOut,
+)
 from tradeforge_db.models import Backtest, Strategy
 from tradeforge_schema import SemanticValidationError, assert_executable
 from tradeforge_schema import Strategy as StrategyDSL
@@ -93,9 +98,11 @@ _MAX_OFFSET = 9_223_372_036_854_775_807
 @router.get("/strategies", response_model=StrategiesPage)
 def list_strategies(  # noqa: PLR0913 — one query parameter per question a picker asks
     session: SessionDep,
-    q: Annotated[str | None, Query(description="case-insensitive substring of the name")] = None,
+    q: Annotated[
+        StorableText | None, Query(description="case-insensitive substring of the name")
+    ] = None,
     name: Annotated[
-        str | None, Query(description="exact name, for asking whether one is taken")
+        StorableText | None, Query(description="exact name, for asking whether one is taken")
     ] = None,
     include_generated: Annotated[bool, Query(description="include a grid's own points")] = False,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,

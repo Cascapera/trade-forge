@@ -33,6 +33,7 @@ from tradeforge_api.schemas import (
     OverlaySeriesOut,
     OverlaysOut,
     SnapshotOut,
+    StorableText,
     Symbol,
     TradeOut,
     TradesPage,
@@ -259,7 +260,7 @@ def list_backtests(  # noqa: PLR0913 — one filter per column a run is chosen b
     symbol: Annotated[
         Symbol | None, Query(description="exact instrument symbol, e.g. EURUSD")
     ] = None,
-    timeframe: Annotated[str | None, Query(description="exact timeframe, e.g. H1")] = None,
+    timeframe: Annotated[StorableText | None, Query(description="exact timeframe, e.g. H1")] = None,
     run_status: Annotated[BacktestStatus | None, Query(alias="status")] = None,
     include_generated: Annotated[
         bool, Query(description="include the runs a grid generated (hidden by default)")

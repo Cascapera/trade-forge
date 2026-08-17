@@ -59,6 +59,16 @@ def _storable(value: str) -> str:
 Symbol = Annotated[str, AfterValidator(_storable)]
 """An instrument symbol as it arrives from a client, refused only where the database would."""
 
+StorableText = Annotated[str, AfterValidator(_storable)]
+"""Any free text from a client that reaches a query against a text column.
+
+⚠️ **The same validator as `Symbol`, named for the reason rather than for the field.** When
+`Symbol` was introduced the guard travelled with the one parameter the fuzzer had drawn a NUL
+into, and its three siblings — `?q=`, `?name=`, `?timeframe=` — kept the plain `str` and kept
+the 500. A rule attached to one field is a rule the next field does not inherit; naming it for
+what it protects is what makes the next one obvious.
+"""
+
 
 class _Out(BaseModel):
     """Base for response bodies. `from_attributes` lets a handler return an ORM row directly and

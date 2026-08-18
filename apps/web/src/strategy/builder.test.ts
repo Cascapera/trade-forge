@@ -6,8 +6,16 @@ import {
   buildSetupStrategy,
   buildStrategy,
   emptyForm,
+  emptyRow,
   maCrossForm,
+  OP_GROUPS,
+  opOf,
   OPS,
+  refOperand,
+  shapeOf,
+  subjectOf,
+  valueOperand,
+  withOp,
   rsiOversoldForm,
   SETUP_LABELS,
   setupForm,
@@ -15,12 +23,26 @@ import {
   STRATEGY_CHOICES,
   strategyChoice,
   TIMEFRAMES,
+  type ConditionRow,
   type SideForm,
   type StrategyForm,
 } from './builder'
 
 function side(rows: SideForm['rows'], combine: SideForm['combine'] = 'all'): SideForm {
   return { enabled: true, combine, rows }
+}
+
+/** A blank row of any shape, with every box a person would have to fill actually filled — so the
+ *  only thing a validation failure can be about is the shape the row folded into. */
+function fill(row: ConditionRow): ConditionRow {
+  switch (row.shape) {
+    case 'comparison':
+      return { ...row, left: 'fast', right: refOperand('slow') }
+    case 'between':
+      return { ...row, value: 'fast', low: valueOperand('1'), high: valueOperand('2') }
+    case 'trend':
+      return { ...row, of: 'fast', bars: '3' }
+  }
 }
 
 /** The instant every form in this file is "picked" at. Fixed, because a form factory that read the
@@ -43,7 +65,7 @@ describe('buildCondition', () => {
 
   it('collapses a single row to a bare comparison', () => {
     expect(
-      buildCondition(side([{ left: 'fast', op: 'gt', right: 'slow', rightKind: 'ref' }])),
+      buildCondition(side([{ shape: 'comparison', left: 'fast', op: 'gt', right: refOperand('slow') }])),
     ).toEqual({
       op: 'gt',
       left: { ref: 'fast' },
@@ -53,7 +75,7 @@ describe('buildCondition', () => {
 
   it('folds a value operand into a literal constant', () => {
     expect(
-      buildCondition(side([{ left: 'rsi', op: 'lt', right: '30', rightKind: 'value' }])),
+      buildCondition(side([{ shape: 'comparison', left: 'rsi', op: 'lt', right: valueOperand('30') }])),
     ).toEqual({
       op: 'lt',
       left: { ref: 'rsi' },
@@ -63,8 +85,8 @@ describe('buildCondition', () => {
 
   it('wraps several rows in all or any', () => {
     const rows = [
-      { left: 'a', op: 'gt' as const, right: 'b', rightKind: 'ref' as const },
-      { left: 'c', op: 'lt' as const, right: 'd', rightKind: 'ref' as const },
+      { shape: 'comparison' as const, left: 'a', op: 'gt' as const, right: refOperand('b') },
+      { shape: 'comparison' as const, left: 'c', op: 'lt' as const, right: refOperand('d') },
     ]
     expect(buildCondition(side(rows, 'all'))).toEqual({
       all: [
@@ -73,6 +95,126 @@ describe('buildCondition', () => {
       ],
     })
     expect(buildCondition(side(rows, 'any'))).toHaveProperty('any')
+  })
+})
+
+describe('the three shapes a row can take', () => {
+  it('folds a band into the between node, with an operand kind per edge', () => {
+    // Mixed on purpose: a floor typed as a number and a ceiling that names an indicator. A fold
+    // that hard-coded either kind for the bounds would pass a test where both edges matched.
+    const row: ConditionRow = {
+      shape: 'between',
+      value: 'rsi',
+      low: valueOperand('30'),
+      high: refOperand('ceiling'),
+    }
+    expect(buildCondition(side([row]))).toEqual({
+      op: 'between',
+      value: { ref: 'rsi' },
+      low: { value: 30 },
+      high: { ref: 'ceiling' },
+    })
+  })
+
+  it('folds a trend row into the node, carrying the window it was given', () => {
+    const row: ConditionRow = { shape: 'trend', of: 'fast', op: 'rising', bars: '3' }
+    expect(buildCondition(side([row]))).toEqual({ op: 'rising', of: { ref: 'fast' }, bars: 3 })
+  })
+
+  it('leaves bars off the node entirely when the box is empty', () => {
+    // ⚠️ Not `bars: 1` written out, and above all not a zero. Omitting the key is how the form
+    // says "whatever the engine's own answer is"; sending `0` would ask a question about a window
+    // of no bars, which is a different strategy and one nobody chose. `toEqual` alone would not
+    // separate the two, because it ignores an explicit `undefined` — hence the property check.
+    const row: ConditionRow = { shape: 'trend', of: 'fast', op: 'falling', bars: '' }
+    const node = buildCondition(side([row]))
+    expect(node).toEqual({ op: 'falling', of: { ref: 'fast' } })
+    expect(node).not.toHaveProperty('bars')
+  })
+
+  it('emits a schema-valid document for every operator the picker offers', () => {
+    // The backlog's warning, turned into a test: adding an operator to the picker without giving
+    // its row the arity it needs produces documents the API refuses. Here every offered operator
+    // has to survive the same validator the screen runs.
+    for (const group of OP_GROUPS) {
+      for (const op of group.ops) {
+        const filled = fill(withOp(emptyRow(), op))
+        const document = buildConditionStrategy({
+          ...maCrossForm(PICKED_AT),
+          long: side([filled]),
+        })
+        const result = validateStrategy(document)
+        expect(shapeOf(op)).toBe(group.shape)
+        // The operator is named in the message, because a bare `false` here would send the reader
+        // looking through eleven of them for the one that failed.
+        expect(result.valid, `${op}: ${result.valid ? '' : JSON.stringify(result.errors)}`).toBe(
+          true,
+        )
+      }
+    }
+  })
+})
+
+describe('changing a row operator', () => {
+  const threshold: ConditionRow = {
+    shape: 'comparison',
+    left: 'rsi',
+    op: 'lt',
+    right: valueOperand('30'),
+  }
+
+  it('keeps the whole row when the shape does not change', () => {
+    expect(withOp(threshold, 'gte')).toEqual({ ...threshold, op: 'gte' })
+  })
+
+  it('carries the series across shapes and starts the new bounds empty', () => {
+    // ⚠️ The `30` does **not** become the floor of the band. It was the far side of `rsi < 30`;
+    // as the low edge of `between` it is a number the author never chose, and a form that moved
+    // it there would write a strategy by itself.
+    expect(withOp(threshold, 'between')).toEqual({
+      shape: 'between',
+      value: 'rsi',
+      low: valueOperand(''),
+      high: valueOperand(''),
+    })
+    expect(withOp(threshold, 'rising')).toEqual({
+      shape: 'trend',
+      of: 'rsi',
+      op: 'rising',
+      bars: '',
+    })
+  })
+
+  it('carries the series back out of a band', () => {
+    const band: ConditionRow = {
+      shape: 'between',
+      value: 'rsi',
+      low: valueOperand('30'),
+      high: valueOperand('70'),
+    }
+    expect(withOp(band, 'gt')).toEqual({
+      shape: 'comparison',
+      left: 'rsi',
+      op: 'gt',
+      right: refOperand(''),
+    })
+    expect(subjectOf(withOp(band, 'falling'))).toBe('rsi')
+  })
+
+  it('switches direction inside the trend shape without losing the window', () => {
+    const row: ConditionRow = { shape: 'trend', of: 'fast', op: 'rising', bars: '4' }
+    expect(withOp(row, 'falling')).toEqual({ ...row, op: 'falling' })
+  })
+
+  it('answers the band with itself, because the band has no operator field to patch', () => {
+    const band: ConditionRow = {
+      shape: 'between',
+      value: 'rsi',
+      low: valueOperand('30'),
+      high: valueOperand('70'),
+    }
+    expect(withOp(band, 'between')).toEqual(band)
+    expect(opOf(band)).toBe('between')
   })
 })
 

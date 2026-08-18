@@ -308,6 +308,54 @@ describe('editing a condition strategy still works', () => {
     expect(screen.getByLabelText('timeframe')).toHaveValue('M15')
   })
 
+  it('builds a band, renaming the subject field to what the DSL calls it there', () => {
+    renderWithProviders(<StrategyBuilder />)
+    fireEvent.change(screen.getByLabelText('strategy'), { target: { value: 'ma_cross' } })
+
+    fireEvent.change(screen.getByLabelText('Long op 0'), { target: { value: 'between' } })
+
+    // ⚠️ The subject box answers to a different name now, and that is the point: labelling a
+    // band's `value` "left" would be the screen describing a node the DSL does not have.
+    expect(screen.queryByLabelText('Long left 0')).not.toBeInTheDocument()
+    expect(screen.getByLabelText('Long value 0')).toHaveValue('fast')
+
+    fireEvent.change(screen.getByLabelText('Long low 0'), { target: { value: '10' } })
+    fireEvent.change(screen.getByLabelText('Long high 0 kind'), { target: { value: 'ref' } })
+    fireEvent.change(screen.getByLabelText('Long high 0'), { target: { value: 'slow' } })
+
+    succeed()
+    answerTheOpenQuestions()
+    fireEvent.click(screen.getByRole('button', { name: /run backtest/i }))
+
+    expect(save.mock.calls[0]?.[0]).toMatchObject({
+      definition: {
+        entry: {
+          long: { op: 'between', value: { ref: 'fast' }, low: { value: 10 }, high: { ref: 'slow' } },
+        },
+      },
+    })
+  })
+
+  it('builds a trend row, and an untouched window leaves the key off the node', () => {
+    renderWithProviders(<StrategyBuilder />)
+    fireEvent.change(screen.getByLabelText('strategy'), { target: { value: 'ma_cross' } })
+
+    fireEvent.change(screen.getByLabelText('Long op 0'), { target: { value: 'rising' } })
+    expect(screen.getByLabelText('Long of 0')).toHaveValue('fast')
+
+    succeed()
+    answerTheOpenQuestions()
+    fireEvent.click(screen.getByRole('button', { name: /run backtest/i }))
+
+    const definition = (save.mock.calls[0]?.[0] as { definition: { entry: { long: object } } })
+      .definition
+    expect(definition.entry.long).toEqual({ op: 'rising', of: { ref: 'fast' } })
+
+    // The box was never touched, so the node carries no window at all — the engine's own default
+    // applies. `toEqual` above would accept an explicit `undefined`; this will not.
+    expect(definition.entry.long).not.toHaveProperty('bars')
+  })
+
   it('shows the schema errors when the document is not valid yet', () => {
     renderWithProviders(<StrategyBuilder />)
     fireEvent.change(screen.getByLabelText('strategy'), { target: { value: 'ma_cross' } })

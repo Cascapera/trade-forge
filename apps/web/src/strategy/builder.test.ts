@@ -6,7 +6,8 @@ import {
   buildSetupStrategy,
   buildStrategy,
   catalogueHas,
-  CUSTOM_REF_SEED,
+  CANDLE_REF_SEED,
+  candleRef,
   emptyForm,
   emptyRow,
   foldParams,
@@ -15,6 +16,7 @@ import {
   OP_GROUPS,
   opOf,
   OPS,
+  parseCandleRef,
   refCatalogue,
   refOperand,
   retypedValues,
@@ -247,6 +249,32 @@ describe('an indicator form driven by the schema', () => {
   })
 })
 
+describe('the closed-candle reference', () => {
+  it('takes one apart and puts it back together', () => {
+    expect(parseCandleRef('candle[-3].high')).toEqual({ bars: '3', field: 'high' })
+    expect(candleRef('3', 'high')).toBe('candle[-3].high')
+  })
+
+  it('is not a candle ref unless it is exactly one', () => {
+    expect(parseCandleRef('price.close')).toBeNull()
+    expect(parseCandleRef('fast')).toBeNull()
+    // ⚠️ `candle[-0]` is refused by the DSL — it is the forming candle under a second name, and
+    // two spellings of one thing is how a grammar starts to rot. Accepting it here would draw the
+    // candle controls for a value the API refuses, so the reader would be editing a ref that
+    // cannot be saved with no sign of which field is at fault.
+    expect(parseCandleRef('candle[-0].close')).toBeNull()
+    expect(parseCandleRef('candle[-1].volume')).toBeNull()
+  })
+
+  it('falls back to one bar when the offset box is emptied', () => {
+    // ⚠️ Reachable by clearing the box, and the alternative is `candle[-].close` — a ref that
+    // matches nothing, so the document stops validating and the message is about a pattern
+    // rather than about the empty field the reader is looking at.
+    expect(candleRef('', 'close')).toBe('candle[-1].close')
+    expect(candleRef('  ', 'high')).toBe('candle[-1].high')
+  })
+})
+
 describe('the refs the picker can offer', () => {
   const sma = (id: string): IndicatorForm =>
     ({ id, kind: 'SMA', values: { period: '9', source: 'close' } })
@@ -288,7 +316,7 @@ describe('the refs the picker can offer', () => {
     expect(catalogueHas(groups, 'fast')).toBe(true)
     // ⚠️ The form the catalogue cannot hold: N is unbounded, so no list enumerates it. This
     // answering `false` is what keeps the box on screen for it.
-    expect(catalogueHas(groups, CUSTOM_REF_SEED)).toBe(false)
+    expect(catalogueHas(groups, CANDLE_REF_SEED)).toBe(false)
     // And a ref left dangling by an indicator that was renamed reads the same way — shown in the
     // box exactly as written, rather than silently swapped for something offerable.
     expect(catalogueHas(groups, 'slow')).toBe(false)

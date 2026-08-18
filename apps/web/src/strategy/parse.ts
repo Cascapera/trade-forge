@@ -25,7 +25,7 @@ import {
 
 import {
   emptySide,
-  refOperand,
+  type ConditionNode,
   type ConditionRow,
   type IndicatorForm,
   type OperandForm,
@@ -113,22 +113,27 @@ function rowOf(node: Comparison | Between | Trend, path: string, bad: Unsupporte
 }
 
 /**
- * One child of a group: a row, or a named refusal and a placeholder that never survives.
+ * Any node of the tree, at any depth.
  *
- * ⚠️ **`not` is checked here and not only at the top of a side**, and a mutation is what found
- * that: dropping the top-level guard changed nothing, because the only `not` in the corpus is
- * nested and was being reported as "a group inside a group" — a true statement about the wrong
- * thing. A reader told to look for a nested group would not find one.
+ * ⚠️ **The recursion has no depth limit and does not need one.** The DSL's own union is
+ * recursive, the engine evaluates it recursively, and a form that stopped at some level would be
+ * a different grammar drawn on top of the real one — which is exactly the state this slice ends:
+ * `all`, `any` and `not` were runnable and unopenable for as long as the builder existed.
  */
-function childRow(node: Condition, path: string, bad: Unsupported): ConditionRow {
+function nodeOf(node: Condition, path: string, bad: Unsupported): ConditionNode {
   if (isLeaf(node)) return rowOf(node, path, bad)
-  bad.add(
-    path,
-    'not' in node
-      ? 'a `not`, which the builder has no control for yet'
-      : 'a group inside a group, which the builder shows one level of',
-  )
-  return { shape: 'comparison', left: '', op: 'gt', right: refOperand() }
+  if ('not' in node) {
+    return { shape: 'not', child: nodeOf(node.not, `${path}.not`, bad) }
+  }
+  const combine = 'all' in node ? 'all' : 'any'
+  const children: readonly Condition[] = 'all' in node ? node.all : node.any
+  return {
+    shape: 'group',
+    combine,
+    children: children.map((child, index) =>
+      nodeOf(child, `${path}.${combine}[${String(index)}]`, bad),
+    ),
+  }
 }
 
 /**
@@ -142,27 +147,21 @@ function isLeaf(node: Condition): node is Comparison | Between | Trend {
   return 'left' in node || 'low' in node || 'of' in node
 }
 
-/**
- * A side of the entry, as the flat list of rows the builder can show.
- *
- * ⚠️ **Flat is the limit of this PR, and it is enforced rather than assumed.** `all` and `any`
- * may nest, and `not` exists; the form has one level and no negation. Both are refused here, by
- * name, so that the tree the builder grows in the next slice arrives with this test already
- * written against it.
- */
+/** A side of the entry, as the tree the builder shows. */
 function sideOf(condition: Condition | null | undefined, path: string, bad: Unsupported): SideForm {
   if (condition === null || condition === undefined) return emptySide()
-  if (isLeaf(condition)) {
-    return { enabled: true, combine: 'all', rows: [rowOf(condition, path, bad)] }
+  // A leaf or a `not` at the root is one row; the side's own combiner has nothing to combine.
+  if (isLeaf(condition) || 'not' in condition) {
+    return { enabled: true, combine: 'all', rows: [nodeOf(condition, path, bad)] }
   }
-  if ('not' in condition) {
-    bad.add(path, 'a `not`, which the builder has no control for yet')
-    return emptySide()
-  }
+  // ⚠️ The root group is unwrapped into the side's list rather than kept as one node, so opening
+  // a two-rule strategy shows two rules and not a box containing them. The cost is one
+  // normalisation — a side that is `{all: [x]}` comes back as `x` — which is not a loss, because
+  // a group of one *is* its child, and the fixed-point test is what holds that line.
   const combine = 'all' in condition ? 'all' : 'any'
   const children: readonly Condition[] = 'all' in condition ? condition.all : condition.any
   const rows = children.map((child, index) =>
-    childRow(child, `${path}.${combine}[${String(index)}]`, bad),
+    nodeOf(child, `${path}.${combine}[${String(index)}]`, bad),
   )
   return { enabled: true, combine, rows }
 }
@@ -268,7 +267,7 @@ export function formOf(strategy: Strategy): ParseResult {
   const stop = strategy.exit?.stop_loss ?? null
   const exitConditions = strategy.exit?.conditions ?? []
   const exitRows = exitConditions.map((condition, index) =>
-    childRow(condition, `exit.conditions[${String(index)}]`, bad),
+    nodeOf(condition, `exit.conditions[${String(index)}]`, bad),
   )
 
   const form: StrategyForm = {

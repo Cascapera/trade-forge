@@ -97,6 +97,34 @@ class SyntheticSource:
         self.instrument(symbol)  # raises on an unknown symbol, like every other method here
         return None
 
+    def latest_closed(self, symbol: str, timeframe: str) -> Candle | None:
+        """The bar that closed most recently before `now`.
+
+        ⚠️ **The one place in this class where the clock is allowed in**, and it is confined to
+        choosing which bar rather than to deciding whether a bar closed: `now` is floored to the
+        timeframe and one bar is taken from before that boundary, so the answer is the same
+        function of the same instant every time. The candles themselves stay seeded on
+        (symbol, timeframe), which is what keeps the rest of the suite deterministic.
+
+        `now` is a parameter with a default rather than a bare `dt.datetime.now()` inside, for
+        the reason the form factories in the web builder give: a function that reads the wall
+        clock can only be tested for having produced *something*.
+        """
+        return self.latest_closed_at(symbol, timeframe, dt.datetime.now(tz=dt.UTC))
+
+    def latest_closed_at(self, symbol: str, timeframe: str, now: dt.datetime) -> Candle | None:
+        bar = step(timeframe)
+        # Floor to the boundary, then step back one: the bar containing `now` is still forming.
+        boundary = dt.datetime.fromtimestamp(
+            (int(now.timestamp()) // int(bar.total_seconds())) * int(bar.total_seconds()),
+            tz=dt.UTC,
+        )
+        opened = boundary - bar
+        # A weekend has no bars, and this is what makes the live loop meet that fact in a test
+        # rather than for the first time on a Saturday.
+        found = self.candles(symbol, timeframe, opened, opened)
+        return found[0] if found else None
+
     def candles(
         self, symbol: str, timeframe: str, start: dt.datetime, end: dt.datetime
     ) -> list[Candle]:

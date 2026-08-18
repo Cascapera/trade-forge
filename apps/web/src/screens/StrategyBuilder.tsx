@@ -16,15 +16,23 @@ import { NumberStepper } from '../components/NumberStepper'
 import { useSession } from '../store'
 import {
   buildStrategy,
+  emptyRow,
   INDICATOR_KINDS,
-  OPS,
+  OP_GROUPS,
+  opOf,
   setupValues,
   SOURCES,
   STRATEGY_CHOICES,
   strategyChoice,
+  subjectName,
+  subjectOf,
   TIMEFRAMES,
+  withOp,
+  withSubject,
   type ConditionRow,
   type IndicatorForm,
+  type OperandForm,
+  type RowOp,
   type SetupForm,
   type SideForm,
   type StrategyChoice,
@@ -38,14 +46,56 @@ const inputClass =
   'rounded border border-slate-700 bg-slate-900 px-2 py-1 text-sm text-slate-100 focus:border-sky-500 focus:outline-none'
 const sectionClass = 'rounded-lg border border-slate-800 bg-slate-900/40 p-4'
 
+/**
+ * An operand box and the one-word question that says how to read it: a name the engine resolves
+ * (`fast`, `price.close`, `bb.upper`) or a number typed literally.
+ *
+ * Shared by every bounded operand — the right-hand side of a comparison and both edges of a band
+ * — because they are the same widget. The subject of a row is deliberately *not* one of these:
+ * asking whether `rsi` is inside `[30, 70]` is a question about a series, and a literal there
+ * would be a band drawn around a constant.
+ */
+function OperandInput(props: {
+  label: string
+  value: OperandForm
+  onChange: (next: OperandForm) => void
+}): React.JSX.Element {
+  const { label, value, onChange } = props
+  return (
+    <>
+      <select
+        aria-label={`${label} kind`}
+        className={inputClass}
+        value={value.kind}
+        onChange={(event) => {
+          onChange({ ...value, kind: event.target.value as OperandForm['kind'] })
+        }}
+      >
+        <option value="ref">ref</option>
+        <option value="value">value</option>
+      </select>
+      <input
+        aria-label={label}
+        className={inputClass}
+        type={value.kind === 'value' ? 'number' : 'text'}
+        placeholder={value.kind === 'value' ? '30' : 'slow'}
+        value={value.text}
+        onChange={(event) => {
+          onChange({ ...value, text: event.target.value })
+        }}
+      />
+    </>
+  )
+}
+
 function ConditionRows(props: {
   label: string
   side: SideForm
   onChange: (next: SideForm) => void
 }): React.JSX.Element {
   const { label, side, onChange } = props
-  const setRow = (index: number, patch: Partial<ConditionRow>): void => {
-    onChange({ ...side, rows: side.rows.map((row, i) => (i === index ? { ...row, ...patch } : row)) })
+  const setRow = (index: number, next: ConditionRow): void => {
+    onChange({ ...side, rows: side.rows.map((row, i) => (i === index ? next : row)) })
   }
   return (
     <div className="space-y-2">
@@ -78,49 +128,79 @@ function ConditionRows(props: {
         side.rows.map((row, index) => (
           <div key={index} className="flex items-center gap-2">
             <input
-              aria-label={`${label} left ${String(index)}`}
+              aria-label={`${label} ${subjectName(row.shape)} ${String(index)}`}
               className={inputClass}
               placeholder="fast"
-              value={row.left}
+              value={subjectOf(row)}
               onChange={(event) => {
-                setRow(index, { left: event.target.value })
+                setRow(index, withSubject(row, event.target.value))
               }}
             />
             <select
               aria-label={`${label} op ${String(index)}`}
               className={inputClass}
-              value={row.op}
+              value={opOf(row)}
               onChange={(event) => {
-                setRow(index, { op: event.target.value as ConditionRow['op'] })
+                setRow(index, withOp(row, event.target.value as RowOp))
               }}
             >
-              {OPS.map((op) => (
-                <option key={op} value={op}>
-                  {op}
-                </option>
+              {OP_GROUPS.map((group) => (
+                <optgroup key={group.shape} label={group.label}>
+                  {group.ops.map((op) => (
+                    <option key={op} value={op}>
+                      {op}
+                    </option>
+                  ))}
+                </optgroup>
               ))}
             </select>
-            <select
-              aria-label={`${label} right kind ${String(index)}`}
-              className={inputClass}
-              value={row.rightKind}
-              onChange={(event) => {
-                setRow(index, { rightKind: event.target.value as ConditionRow['rightKind'] })
-              }}
-            >
-              <option value="ref">ref</option>
-              <option value="value">value</option>
-            </select>
-            <input
-              aria-label={`${label} right ${String(index)}`}
-              className={inputClass}
-              type={row.rightKind === 'value' ? 'number' : 'text'}
-              placeholder={row.rightKind === 'value' ? '30' : 'slow'}
-              value={row.right}
-              onChange={(event) => {
-                setRow(index, { right: event.target.value })
-              }}
-            />
+            {row.shape === 'comparison' && (
+              <OperandInput
+                label={`${label} right ${String(index)}`}
+                value={row.right}
+                onChange={(next) => {
+                  setRow(index, { ...row, right: next })
+                }}
+              />
+            )}
+            {row.shape === 'between' && (
+              <>
+                <OperandInput
+                  label={`${label} low ${String(index)}`}
+                  value={row.low}
+                  onChange={(next) => {
+                    setRow(index, { ...row, low: next })
+                  }}
+                />
+                <span className="text-sm text-slate-500">and</span>
+                <OperandInput
+                  label={`${label} high ${String(index)}`}
+                  value={row.high}
+                  onChange={(next) => {
+                    setRow(index, { ...row, high: next })
+                  }}
+                />
+              </>
+            )}
+            {row.shape === 'trend' && (
+              <>
+                <span className="text-sm text-slate-500">for</span>
+                <input
+                  aria-label={`${label} bars ${String(index)}`}
+                  className={inputClass}
+                  type="number"
+                  min={1}
+                  // Empty is not 1 typed out: it leaves the key off the node, so the engine's own
+                  // default applies. The placeholder says which number that is.
+                  placeholder="1"
+                  value={row.bars}
+                  onChange={(event) => {
+                    setRow(index, { ...row, bars: event.target.value })
+                  }}
+                />
+                <span className="text-sm text-slate-500">bars</span>
+              </>
+            )}
             <button
               type="button"
               className="text-slate-500 hover:text-red-400"
@@ -139,7 +219,7 @@ function ConditionRows(props: {
           onClick={() => {
             onChange({
               ...side,
-              rows: [...side.rows, { left: '', op: 'gt', right: '', rightKind: 'ref' }],
+              rows: [...side.rows, emptyRow()],
             })
           }}
         >

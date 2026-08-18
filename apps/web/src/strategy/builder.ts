@@ -16,7 +16,15 @@ import {
   type IndicatorType,
   type SetupType,
 } from '@tradeforge/schema'
-import type { Comparison, ComparisonOp, Condition, Strategy, Timeframe } from '@tradeforge/schema'
+import type {
+  BetweenOp,
+  ComparisonOp,
+  Condition,
+  Operand,
+  Strategy,
+  Timeframe,
+  TrendOp,
+} from '@tradeforge/schema'
 
 import { runName } from './naming'
 
@@ -34,6 +42,55 @@ export const OPS = [
   'breaks_below',
 ] as const satisfies readonly ComparisonOp[]
 
+export const TREND_OPS = ['rising', 'falling'] as const satisfies readonly TrendOp[]
+export const BETWEEN_OP = 'between' satisfies BetweenOp
+
+/** Every operator a row can carry — the eight that compare two operands, plus the three the DSL
+ *  gives nodes of their own because they do not take two. */
+export type RowOp = ComparisonOp | BetweenOp | TrendOp
+
+/** Which DSL node an operator produces. The row's discriminator, and the reason the operator
+ *  picker can stay a single question when the answers have three different arities. */
+export type RowShape = ConditionRow['shape']
+
+/**
+ * The operator picker, grouped by the shape each choice produces.
+ *
+ * ⚠️ The grouping is not decoration. Picking `between` or `rising` **changes the row's shape**,
+ * and the reader is entitled to see that coming before the fields under the cursor rearrange
+ * themselves. A flat list of eleven would make the rearrangement look like a glitch.
+ */
+export const OP_GROUPS = [
+  { shape: 'comparison', label: 'compares two', ops: OPS },
+  { shape: 'between', label: 'inside a band', ops: [BETWEEN_OP] },
+  { shape: 'trend', label: 'reads a window', ops: TREND_OPS },
+] as const satisfies readonly { shape: RowShape; label: string; ops: readonly RowOp[] }[]
+
+/**
+ * Every operator the picker actually offers — read back off `OP_GROUPS` rather than listed again.
+ *
+ * ⚠️ The line below is the completeness proof, and it runs in the **compiler**, not in a test:
+ * `RowOp` is built from the types generated out of the JSON Schema, so an operator added in
+ * Python and left out of a group makes `Missing` non-empty and this file stop compiling. A
+ * runtime test could only check the lists against each other, which is the tautology; this
+ * checks them against the contract.
+ */
+type OfferedOp = (typeof OP_GROUPS)[number]['ops'][number]
+type MissingOp = Exclude<RowOp, OfferedOp>
+const _everyOperatorIsOffered: MissingOp extends never ? true : MissingOp = true
+void _everyOperatorIsOffered
+
+/** The shape an operator belongs to. Derived from `OP_GROUPS`, so the two can never disagree. */
+export function shapeOf(op: RowOp): RowShape {
+  for (const group of OP_GROUPS) {
+    if ((group.ops as readonly RowOp[]).includes(op)) return group.shape
+  }
+  // Unreachable through the picker, whose options *are* `OP_GROUPS`. Loud rather than silent:
+  // an operator added to the schema and not to a group would otherwise pick up `comparison`'s
+  // fields and emit a document the API refuses, with a message about the wrong node.
+  throw new Error(`no shape for operator ${op}`)
+}
+
 export const SOURCES = ['open', 'high', 'low', 'close'] as const
 export type Source = (typeof SOURCES)[number]
 
@@ -45,10 +102,28 @@ export type IndicatorKind = IndicatorType
 
 export type Combine = 'all' | 'any'
 
-// The right-hand operand is either another reference (`fast`, `price.close`) or a literal number
-// (the `30` in `rsi < 30`). The form keeps `right` a string in both cases and this flag decides
+// An operand is either another reference (`fast`, `price.close`, `bb.upper`) or a literal number
+// (the `30` in `rsi < 30`). The form keeps the text a string in both cases and this flag decides
 // how it is folded — a `{ ref }` or a `{ value }` — so RSI thresholds become expressible.
 export type OperandKind = 'ref' | 'value'
+
+/** An operand as the form holds it: what was typed, and what the typing means. */
+export interface OperandForm {
+  text: string
+  kind: OperandKind
+}
+
+export function refOperand(text = ''): OperandForm {
+  return { text, kind: 'ref' }
+}
+
+export function valueOperand(text = ''): OperandForm {
+  return { text, kind: 'value' }
+}
+
+function operand(form: OperandForm): Operand {
+  return form.kind === 'value' ? { value: Number(form.text) } : { ref: form.text }
+}
 
 export interface IndicatorForm {
   id: string
@@ -57,11 +132,97 @@ export interface IndicatorForm {
   source: Source
 }
 
-export interface ConditionRow {
-  left: string
-  op: ComparisonOp
-  right: string
-  rightKind: OperandKind
+/**
+ * One line of a condition, in whichever of the three shapes its operator takes.
+ *
+ * **A union rather than one row with optional fields**, and the reason is written down in
+ * `models.py` next to `Between`: folding a third operand into the comparison row would make
+ * `right` mean one thing for eight operators and another for the ninth. The DSL refused that
+ * and discriminates on shape; a form that did otherwise would be a picture of a grammar the
+ * engine does not have.
+ *
+ * **The subject travels between shapes.** `left`, `value` and `of` are the same question —
+ * *which series are you asking about* — under three names the DSL chose per node. Switching the
+ * operator carries it over (see `withOp`); only the bounds, which mean nothing in the new shape,
+ * are dropped.
+ */
+export type ConditionRow =
+  | { shape: 'comparison'; left: string; op: ComparisonOp; right: OperandForm }
+  | { shape: 'between'; value: string; low: OperandForm; high: OperandForm }
+  | { shape: 'trend'; of: string; op: TrendOp; bars: string }
+
+/** The series the row asks about, whatever the DSL calls it in this shape. */
+export function subjectOf(row: ConditionRow): string {
+  switch (row.shape) {
+    case 'comparison':
+      return row.left
+    case 'between':
+      return row.value
+    case 'trend':
+      return row.of
+  }
+}
+
+/** What the DSL calls the subject here — the name the field answers to, so the screen never
+ *  labels a band's `value` "left". */
+export function subjectName(shape: RowShape): 'left' | 'value' | 'of' {
+  switch (shape) {
+    case 'comparison':
+      return 'left'
+    case 'between':
+      return 'value'
+    case 'trend':
+      return 'of'
+  }
+}
+
+/** The row with a new subject, written to whichever field this shape keeps it in. */
+export function withSubject(row: ConditionRow, text: string): ConditionRow {
+  switch (row.shape) {
+    case 'comparison':
+      return { ...row, left: text }
+    case 'between':
+      return { ...row, value: text }
+    case 'trend':
+      return { ...row, of: text }
+  }
+}
+
+/** The operator the picker should show. `between` carries no field of its own — the shape *is*
+ *  the operator — so it is answered from the shape. */
+export function opOf(row: ConditionRow): RowOp {
+  return row.shape === 'between' ? BETWEEN_OP : row.op
+}
+
+/**
+ * The row that answers `op`, keeping everything the new shape still has a place for.
+ *
+ * Staying inside a shape is a field patch and nothing is lost. Crossing shapes keeps the subject
+ * and starts the bounds empty: a `30` typed as the right-hand side of `rsi lt 30` is not the
+ * lower bound of a band, and pre-filling it there would be the form putting a number into a
+ * strategy that nobody chose.
+ */
+export function withOp(row: ConditionRow, op: RowOp): ConditionRow {
+  const shape = shapeOf(op)
+  if (shape === row.shape) {
+    // Same shape: `between` carries no operator of its own to patch, the other two do.
+    if (row.shape === 'between') return row
+    return { ...row, op } as ConditionRow
+  }
+  const subject = subjectOf(row)
+  switch (shape) {
+    case 'comparison':
+      return { shape, left: subject, op: op as ComparisonOp, right: refOperand() }
+    case 'between':
+      return { shape, value: subject, low: valueOperand(), high: valueOperand() }
+    case 'trend':
+      return { shape, of: subject, op: op as TrendOp, bars: '' }
+  }
+}
+
+/** A blank comparison — what `+ condition` adds, and the shape eight of the eleven operators take. */
+export function emptyRow(): ConditionRow {
+  return { shape: 'comparison', left: '', op: 'gt', right: refOperand() }
 }
 
 export interface SideForm {
@@ -121,20 +282,47 @@ export interface StrategyForm {
   percent: number
 }
 
-function comparison(row: ConditionRow): Comparison {
-  const right = row.rightKind === 'value' ? { value: Number(row.right) } : { ref: row.right }
-  return { op: row.op, left: { ref: row.left }, right }
+/**
+ * One row, as the DSL node its shape names.
+ *
+ * ⚠️ **An empty `bars` box leaves the key out**, rather than sending a zero or a one. The schema
+ * declares `bars: 1` as the node's default, and omitting it is how the form says "whatever the
+ * engine's own answer is" — the same rule `setupParams` follows one screen over, and the same
+ * reason: an untouched box is not a number the author chose. Sending `0` would be worse than
+ * wrong, because `rising` over zero bars asks nothing.
+ */
+export function conditionOf(row: ConditionRow): Condition {
+  switch (row.shape) {
+    case 'comparison':
+      return { op: row.op, left: { ref: row.left }, right: operand(row.right) }
+    case 'between':
+      return {
+        op: BETWEEN_OP,
+        value: { ref: row.value },
+        low: operand(row.low),
+        high: operand(row.high),
+      }
+    case 'trend': {
+      const bars = row.bars.trim()
+      return bars === ''
+        ? { op: row.op, of: { ref: row.of } }
+        : { op: row.op, of: { ref: row.of }, bars: Number(bars) }
+    }
+  }
 }
 
 /** A side's condition, in the DSL's shape: `null` if empty, a bare comparison if there is one
  *  row, an `all`/`any` group if there are several. */
 export function buildCondition(side: SideForm): Condition | null {
   if (!side.enabled) return null
-  const comparisons = side.rows.map(comparison)
-  if (comparisons.length === 0) return null
-  if (comparisons.length === 1) return comparisons[0] as Condition
-  const group = comparisons as [Condition, ...Condition[]]
-  return side.combine === 'all' ? { all: group } : { any: group }
+  // Destructured rather than indexed, and that is not a style choice: `all` and `any` take a
+  // *non-empty* list in the schema, and `[first, ...rest]` satisfies that tuple structurally.
+  // Indexing would hand back `Condition | undefined` and force an assertion to paper over it —
+  // which is the compiler being told to stop asking the one question the schema is asking.
+  const [first, ...rest] = side.rows.map(conditionOf)
+  if (first === undefined) return null
+  if (rest.length === 0) return first
+  return side.combine === 'all' ? { all: [first, ...rest] } : { any: [first, ...rest] }
 }
 
 /**
@@ -243,7 +431,7 @@ export function buildConditionStrategy(form: StrategyForm): ConditionStrategy {
       take_profit: form.takeProfit.enabled
         ? { type: 'risk_multiple', params: { rr: form.takeProfit.rr } }
         : null,
-      conditions: form.exit.rows.map(comparison),
+      conditions: form.exit.rows.map(conditionOf),
     },
     risk: { sizing: { type: 'percent_risk', params: { percent: form.percent } } },
   }
@@ -307,7 +495,7 @@ export function maCrossForm(now: Date): StrategyForm {
     long: {
       enabled: true,
       combine: 'all',
-      rows: [{ left: 'fast', op: 'crosses_above', right: 'slow', rightKind: 'ref' }],
+      rows: [{ shape: 'comparison', left: 'fast', op: 'crosses_above', right: refOperand('slow') }],
     },
     short: emptySide(),
     stop: { enabled: true, lookback: 2, side: 'low' },
@@ -315,7 +503,7 @@ export function maCrossForm(now: Date): StrategyForm {
     exit: {
       enabled: true,
       combine: 'all',
-      rows: [{ left: 'fast', op: 'crosses_below', right: 'slow', rightKind: 'ref' }],
+      rows: [{ shape: 'comparison', left: 'fast', op: 'crosses_below', right: refOperand('slow') }],
     },
     percent: 1,
   }
@@ -334,7 +522,7 @@ export function rsiOversoldForm(now: Date): StrategyForm {
     long: {
       enabled: true,
       combine: 'all',
-      rows: [{ left: 'rsi', op: 'crosses_below', right: '30', rightKind: 'value' }],
+      rows: [{ shape: 'comparison', left: 'rsi', op: 'crosses_below', right: valueOperand('30') }],
     },
     short: emptySide(),
     stop: { enabled: true, lookback: 5, side: 'low' },
@@ -342,7 +530,7 @@ export function rsiOversoldForm(now: Date): StrategyForm {
     exit: {
       enabled: true,
       combine: 'all',
-      rows: [{ left: 'rsi', op: 'crosses_above', right: '70', rightKind: 'value' }],
+      rows: [{ shape: 'comparison', left: 'rsi', op: 'crosses_above', right: valueOperand('70') }],
     },
     percent: 1,
   }

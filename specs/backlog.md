@@ -465,7 +465,11 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
   sem banco, que é honesto mas não resolve a causa. Ver [[portao-de-cobertura-nao-ve-integracao]].
   Opções: combinar os dois relatórios (`coverage combine` entre os jobs) e medir o total, ou
   medir a integração com piso próprio. Não fazer dentro de um PR de produto.
-- [origem: PR-201] **`between`, `rising` e `falling` não são construíveis pela tela** — os três nós
+- ~~[origem: PR-201]~~ **FEITO no PR-206-A.** A linha do builder virou uma união discriminada por
+  forma (`comparison` | `between` | `trend`), o seletor de operador passou a oferecer os onze em
+  três `optgroup`, e a completude é provada **no compilador** (`MissingOp extends never`) contra os
+  tipos gerados do schema — um operador novo em Python que ninguém colocar num grupo faz o
+  `builder.ts` parar de compilar. Originalmente: **`between`, `rising` e `falling` não são construíveis pela tela** — os três nós
   novos existem na DSL, na engine e no validador semântico, com teste de ouro cada um, mas a linha
   de condição do builder é `esquerda | operador | direita` e eles não cabem nela: `between` tem
   três operandos e `rising`/`falling` têm um mais um contador de barras. Reestruturar essa linha É

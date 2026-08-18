@@ -6,7 +6,7 @@ export { SETUP_TYPES, SETUPS, setupSpec } from './setups.js'
 export type { SetupParam, SetupSpec, SetupType } from './setups.js'
 // The indicators a document may declare, and which parameters each takes — read from the same
 // schema, so a form cannot offer `source` to an indicator defined over the whole candle.
-export { INDICATOR_TYPES, INDICATORS, indicatorSpec, takesSource } from './indicators.js'
+export { INDICATOR_TYPES, INDICATORS, indicatorSpec, refsFor, takesSource } from './indicators.js'
 export type { IndicatorSpec, IndicatorType } from './indicators.js'
 // The DSL's own sub-types, re-exported from the generated source so a consumer (the web
 // strategy builder) composes a strategy against the same types the schema defines — never a

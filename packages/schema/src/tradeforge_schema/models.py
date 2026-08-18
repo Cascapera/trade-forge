@@ -329,6 +329,13 @@ class Bollinger(_Node):
     be a band whose rails describe different markets, and it would look exactly like a band.
     """
 
+    # ⚠️ **The component names belong in the schema, as data.** They used to live only in the
+    # `COMPOSITE_COMPONENTS` map below and in the prose above, which meant a consumer without a
+    # Python runtime — the web builder — could not offer `bb.upper` without writing a third copy
+    # of the list by hand. `json_schema_extra` puts them in this node's schema, and the map below
+    # is now *read back* from here, so this class is the one place they are written.
+    model_config = ConfigDict(json_schema_extra={"components": ["middle", "upper", "lower"]})
+
     id: Annotated[str, Field(pattern=INDICATOR_ID_PATTERN, max_length=40)]
     type: Literal["BOLLINGER"]
     params: BollingerParams
@@ -342,6 +349,8 @@ class ADX(_Node):
     exactly as it does in a rally, so a rule meaning "trending up" needs the `DI` pair as well.
     Reads the whole candle, so there is no price source to name — same argument as `PeriodParams`.
     """
+
+    model_config = ConfigDict(json_schema_extra={"components": ["adx", "plus_di", "minus_di"]})
 
     id: Annotated[str, Field(pattern=INDICATOR_ID_PATTERN, max_length=40)]
     type: Literal["ADX"]
@@ -358,19 +367,63 @@ type Indicator = Annotated[
     Field(discriminator="type"),
 ]
 
+
+def _declared_components(model: type[BaseModel]) -> tuple[str, ...]:
+    """The component names a model publishes in its own schema, or `()` for a single-valued one.
+
+    Read off `json_schema_extra` rather than a list kept beside it, so the names reach three
+    consumers from one place: this map, the generated JSON Schema, and — through the schema — a
+    frontend with no Python runtime. The type check is not ceremony: a `json_schema_extra` given
+    as a *callable* is legal Pydantic and would silently answer "no components", which reads as
+    "this indicator is single-valued" and quietly makes every `bb.upper` a reference error.
+    """
+    extra = model.model_config.get("json_schema_extra")
+    if extra is None:
+        return ()
+    if not isinstance(extra, dict):
+        raise TypeError(f"{model.__name__} publishes a json_schema_extra no reader can inspect")
+    components = extra.get("components", ())
+    if not isinstance(components, list | tuple):
+        raise TypeError(f"{model.__name__} declares components that are not a list")
+    # Built by comprehension rather than `tuple(components)` behind an `all(isinstance(...))`
+    # guard: the guard convinces a reader and not the type checker, and `json_schema_extra` is
+    # typed loosely enough that anything at all can be in there.
+    names = tuple(name for name in components if isinstance(name, str))
+    if len(names) != len(components):
+        raise TypeError(f"{model.__name__} declares a component that is not a name")
+    return names
+
+
+def _composite_components() -> Mapping[str, tuple[str, ...]]:
+    """Walk the indicator union and collect what each member answers to, keyed by its DSL type."""
+    # `Indicator` is a PEP-695 alias, so the annotation is behind `__value__`; `get_args` on the
+    # alias itself answers `()`, which would make this map silently empty — every composite
+    # indicator reclassified as single-valued, and every `bb.upper` a reference error.
+    union, *_ = get_args(Indicator.__value__)
+    found: dict[str, tuple[str, ...]] = {}
+    for member in get_args(union):
+        declared = _declared_components(member)
+        if declared:
+            (dsl_type,) = get_args(member.model_fields["type"].annotation)
+            found[dsl_type] = declared
+    return found
+
+
 # Which component names each multi-output indicator answers to. A reference to one of these
 # indicators must name a component, and a reference to any other indicator must not.
 #
-# ⚠️ Duplicated in `tradeforge_engine.indicators.COMPOSITE_COMPONENTS` — the two packages do not
-# import each other — and pinned equal by a test in `apps/api`, which depends on both. Drift is
+# ⚠️ **Derived from the classes, not written here.** It used to be a literal map, which made the
+# names exist twice inside this file alone — and the copy the *schema* carried was prose, so the
+# web builder could not read it at all. A new composite indicator now appears here by declaring
+# its components on itself, and nothing in this file needs editing.
+#
+# ⚠️ Still duplicated in `tradeforge_engine.indicators.COMPOSITE_COMPONENTS` — the two packages do
+# not import each other — and pinned equal by a test in `apps/api`, which depends on both. Drift is
 # the silent kind of failure: this layer would accept `bb.uppper`, the engine would resolve it to
 # `None`, and a comparison against `None` is simply false on every bar for ever.
 # ⚠️ Ordered **primary first**: a consumer with no idea what a band is uses this order to tell
 # the subject from its envelope, and the chart draws the first solid and the rest dashed.
-COMPOSITE_COMPONENTS: Final[Mapping[str, tuple[str, ...]]] = {
-    "BOLLINGER": ("middle", "upper", "lower"),
-    "ADX": ("adx", "plus_di", "minus_di"),
-}
+COMPOSITE_COMPONENTS: Final[Mapping[str, tuple[str, ...]]] = _composite_components()
 
 
 # --------------------------------------------------------------------------- #

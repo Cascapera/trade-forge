@@ -4,6 +4,7 @@ import {
   INDICATOR_TYPES,
   indicatorSpec,
   readIndicators,
+  refsFor,
   takesSource,
   type IndicatorType,
 } from './indicators.js'
@@ -63,6 +64,45 @@ describe('the indicators a document may declare', () => {
     // contract that is perfectly fine.
     expect(indicatorSpec('HIGHEST').params).toEqual(['period'])
     expect(indicatorSpec('LOWEST').params).toEqual(['period'])
+  })
+
+  it('reads the component names of the two composites, primary first', () => {
+    // ⚠️ Order, not membership. The chart draws the first component solid and thick as the
+    // subject of its family, so a set comparison here would pass while the upper band was being
+    // drawn as the subject of its own average.
+    expect(indicatorSpec('BOLLINGER').components).toEqual(['middle', 'upper', 'lower'])
+    expect(indicatorSpec('ADX').components).toEqual(['adx', 'plus_di', 'minus_di'])
+  })
+
+  it('reports no components for a single-valued indicator', () => {
+    // The negative half, and the one that decides how a ref is spelled: an SMA that reported
+    // components would make `fast` alone unofferable, and that is the spelling every strategy
+    // saved so far uses.
+    expect(indicatorSpec('SMA').components).toEqual([])
+    expect(indicatorSpec('ATR').components).toEqual([])
+  })
+
+  it('spells a ref by the bare id, or by component, according to the indicator', () => {
+    expect(refsFor('SMA', 'fast')).toEqual(['fast'])
+    // ⚠️ Never the bare `bb`. The semantic layer refuses it — "the middle band" is a tempting
+    // default and a wrong one for `adx`, whose first component is not a price at all.
+    expect(refsFor('BOLLINGER', 'bb')).toEqual(['bb.middle', 'bb.upper', 'bb.lower'])
+    expect(refsFor('ADX', 'trend')).toEqual(['trend.adx', 'trend.plus_di', 'trend.minus_di'])
+  })
+
+  it('refuses an indicator that publishes a component which is not a name', () => {
+    // ⚠️ The alternative reading is `[]`, which is indistinguishable from "single-valued" — so
+    // the generator changing under this file would silently make every `bb.upper` unofferable
+    // instead of failing.
+    expect(() =>
+      readIndicators({
+        $defs: {
+          Indicator: { discriminator: { propertyName: 'type', mapping: { WAT: '#/$defs/Wat' } } },
+          Wat: { properties: { params: { $ref: '#/$defs/P' } }, components: ['upper', 3] },
+          P: { properties: { period: {} } },
+        },
+      }),
+    ).toThrow(/component that is not a name/)
   })
 
   it('refuses a schema whose indicator union lost its discriminator', () => {

@@ -10,6 +10,7 @@
 
 import {
   INDICATOR_TYPES,
+  refsFor,
   SETUP_TYPES,
   setupSpec,
   takesSource,
@@ -130,6 +131,52 @@ export interface IndicatorForm {
   kind: IndicatorKind
   period: number
   source: Source
+}
+
+/** A heading in the ref picker and the names under it. */
+export interface RefGroup {
+  label: string
+  refs: readonly string[]
+}
+
+/** The four fields of the candle being decided on. */
+export const PRICE_REFS: readonly string[] = SOURCES.map((source) => `price.${source}`)
+
+/**
+ * The option that means "none of these", and what picking it puts in the box.
+ *
+ * ⚠️ **The ref grammar has a form no list can hold.** `price.close` and `bb.upper` are
+ * enumerable; `candle[-N].field` is not, because N is unbounded. A picker with no escape would
+ * make that form unreachable from the screen — trading one unreachable corner of the grammar for
+ * another. So picking `custom` seeds the shortest well-formed candle ref and reveals the box,
+ * which both keeps the form reachable and shows its shape to somebody who has never typed one.
+ */
+export const CUSTOM_REF = '__custom__'
+export const CUSTOM_REF_SEED = 'candle[-1].close'
+
+/**
+ * Every ref the screen can offer, given what this strategy declares.
+ *
+ * The indicator half is spelled by `refsFor`, so a composite contributes its components and never
+ * its bare id — the distinction lives in the schema, not here. Ids are de-duplicated: two
+ * indicators sharing a name is a document the semantic layer refuses, but it is also a state the
+ * form passes through while somebody is typing, and a picker is not the place to find that out.
+ */
+export function refCatalogue(indicators: readonly IndicatorForm[]): readonly RefGroup[] {
+  const declared = [
+    ...new Set(
+      indicators.filter((one) => one.id !== '').flatMap((one) => refsFor(one.kind, one.id)),
+    ),
+  ]
+  return [
+    { label: 'this candle', refs: PRICE_REFS },
+    ...(declared.length === 0 ? [] : [{ label: 'indicators', refs: declared }]),
+  ]
+}
+
+/** Whether the picker can offer this ref, which is what decides if the free-text box shows. */
+export function catalogueHas(groups: readonly RefGroup[], ref: string): boolean {
+  return groups.some((group) => group.refs.includes(ref))
 }
 
 /**

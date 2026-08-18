@@ -10,11 +10,12 @@
 
 import {
   INDICATOR_TYPES,
+  indicatorSpec,
   refsFor,
   SETUP_TYPES,
   setupSpec,
-  takesSource,
   type IndicatorType,
+  type SchemaParam,
   type SetupType,
 } from '@tradeforge/schema'
 import type {
@@ -126,11 +127,22 @@ function operand(form: OperandForm): Operand {
   return form.kind === 'value' ? { value: Number(form.text) } : { ref: form.text }
 }
 
+/**
+ * A declared indicator, and the values typed into whatever parameters it happens to have.
+ *
+ * ⚠️ **`values` by name, not `period` and `source` as fields**, and the difference is not style.
+ * The hand-written version could only carry the parameters somebody had remembered to add — which
+ * is exactly how a Bollinger's `deviations` stayed unreachable from the screen for a release
+ * while being perfectly valid in the DSL, and every band built here came out at 2.0. Driven by
+ * the spec, an indicator that gains a parameter in Python gains a control here with no edit.
+ *
+ * Values are held as the form holds them — strings, or booleans for flags — for the reason
+ * `SetupForm` gives: an empty box is a state a number cannot represent.
+ */
 export interface IndicatorForm {
   id: string
   kind: IndicatorKind
-  period: number
-  source: Source
+  values: Record<string, string | boolean>
 }
 
 /** A heading in the ref picker and the names under it. */
@@ -399,31 +411,75 @@ export type SetupStrategy = Strategy & { setup: NonNullable<Strategy['setup']> }
  * schema makes it required, and a form that pre-selected "long" would turn a forgotten choice into
  * an entire long-only backtest read as the setup's result.
  */
-export function setupValues(type: SetupType): Record<string, string | boolean> {
+export function initialValues(params: readonly SchemaParam[]): Record<string, string | boolean> {
   const values: Record<string, string | boolean> = {}
-  for (const param of setupSpec(type).params) {
+  for (const param of params) {
     values[param.name] = param.kind === 'boolean' ? param.default : (param.default?.toString() ?? '')
   }
   return values
 }
 
+export function setupValues(type: SetupType): Record<string, string | boolean> {
+  return initialValues(setupSpec(type).params)
+}
+
+/** The same, for an indicator. A fresh SMA arrives with `period` blank and `source` at `close`,
+ *  because that is what the schema says — never a number written here. */
+export function indicatorValues(kind: IndicatorKind): Record<string, string | boolean> {
+  return initialValues(indicatorSpec(kind).params)
+}
+
+/**
+ * The values after changing an indicator's kind: whatever the new kind still has a place for,
+ * kept; everything else from its own defaults.
+ *
+ * ⚠️ **Deliberately not what the setup picker does**, which starts from scratch. The reasoning
+ * there is that a setup's parameters are the knobs of one named machine, so a name carried into
+ * another setup would mean something else. An indicator's are a small shared vocabulary: `period`
+ * is a window on all eight of them and `source` is a price series on the four that read one. A
+ * reader comparing an SMA(20) with an EMA(20) is asking one question, and making them retype the
+ * 20 to ask it is how a comparison stops being made.
+ *
+ * The type check is the guard: a value only carries over if it is the kind of thing the new
+ * parameter holds, so a flag can never land in a number's box.
+ */
+export function retypedValues(
+  kind: IndicatorKind,
+  previous: Record<string, string | boolean>,
+): Record<string, string | boolean> {
+  const fresh = indicatorValues(kind)
+  for (const [name, value] of Object.entries(fresh)) {
+    const carried = previous[name]
+    if (carried !== undefined && typeof carried === typeof value) fresh[name] = carried
+  }
+  return fresh
+}
+
 /** Fold the typed values back into the document's `params`, per the rules in `SetupForm`. */
-function setupParams(form: SetupForm): Record<string, unknown> {
-  const params: Record<string, unknown> = {}
-  for (const param of setupSpec(form.type).params) {
-    const raw = form.values[param.name]
+export function foldParams(
+  params: readonly SchemaParam[],
+  values: Record<string, string | boolean>,
+): Record<string, unknown> {
+  const folded: Record<string, unknown> = {}
+  for (const param of params) {
+    const raw = values[param.name]
     if (param.kind === 'boolean') {
-      params[param.name] = raw === true
+      folded[param.name] = raw === true
       continue
     }
     const text = typeof raw === 'string' ? raw.trim() : ''
     if (text === '') {
-      if (param.kind !== 'enum' && param.nullable) params[param.name] = null
+      if (param.kind !== 'enum' && param.nullable) folded[param.name] = null
       continue
     }
-    params[param.name] = param.kind === 'enum' ? text : Number(text)
+    folded[param.name] = param.kind === 'enum' ? text : Number(text)
   }
-  return params
+  return folded
+}
+
+/** Fold the typed values back into the document's `params`, per the rules in `SetupForm`. */
+function setupParams(form: SetupForm): Record<string, unknown> {
+  return foldParams(setupSpec(form.type).params, form.values)
 }
 
 /**
@@ -485,16 +541,14 @@ export function buildConditionStrategy(form: StrategyForm): ConditionStrategy {
   if (form.indicators.length > 0) {
     // The generated `Indicators` type is a union of fixed-length tuples (0..20); a mapped array
     // does not match it structurally, so the assignment is asserted rather than inferred.
+    // ⚠️ There is no longer a case here for "the ones without a source". ATR and the two channels
+    // are defined over the whole candle, and their params forbid extra keys — so emitting a source
+    // for them produces a document the API refuses. That used to be a conditional; now the spec
+    // decides which parameters exist at all, so the wrong key has nowhere to come from.
     strategy.indicators = form.indicators.map((indicator) => ({
       id: indicator.id,
       type: indicator.kind,
-      // ⚠️ `source` only for the indicators whose params model declares it. ATR and the two
-      // channels are defined over the whole candle, and their params forbid extra keys — so
-      // emitting a source for them produces a document the API refuses, with a message about an
-      // unexpected field rather than about the indicator the reader chose.
-      params: takesSource(indicator.kind)
-        ? { period: indicator.period, source: indicator.source }
-        : { period: indicator.period },
+      params: foldParams(indicatorSpec(indicator.kind).params, indicator.values),
     })) as NonNullable<Strategy['indicators']>
   }
   return strategy
@@ -536,8 +590,8 @@ export function maCrossForm(now: Date): StrategyForm {
     mode: 'conditions',
     setup: emptySetup(),
     indicators: [
-      { id: 'fast', kind: 'SMA', period: 9, source: 'close' },
-      { id: 'slow', kind: 'SMA', period: 21, source: 'close' },
+      { id: 'fast', kind: 'SMA', values: { period: '9', source: 'close' } },
+      { id: 'slow', kind: 'SMA', values: { period: '21', source: 'close' } },
     ],
     long: {
       enabled: true,
@@ -565,7 +619,7 @@ export function rsiOversoldForm(now: Date): StrategyForm {
     timeframe: 'H1',
     mode: 'conditions',
     setup: emptySetup(),
-    indicators: [{ id: 'rsi', kind: 'RSI', period: 14, source: 'close' }],
+    indicators: [{ id: 'rsi', kind: 'RSI', values: { period: '14', source: 'close' } }],
     long: {
       enabled: true,
       combine: 'all',

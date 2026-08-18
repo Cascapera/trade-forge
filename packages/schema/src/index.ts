@@ -3,7 +3,9 @@ export type { Strategy, ValidationFailure, ValidationResult } from './validate.j
 // The setups a document may name, with each parameter's kind, bounds and default read out of the
 // JSON Schema — so the builder shows the author's own numbers without keeping a copy of them.
 export { SETUP_TYPES, SETUPS, setupSpec } from './setups.js'
-export type { SetupParam, SetupSpec, SetupType } from './setups.js'
+export type { SetupSpec, SetupType } from './setups.js'
+// The vocabulary a form control needs, read from any params model — a setup's or an indicator's.
+export type { SchemaParam } from './params.js'
 // The indicators a document may declare, and which parameters each takes — read from the same
 // schema, so a form cannot offer `source` to an indicator defined over the whole candle.
 export { INDICATOR_TYPES, INDICATORS, indicatorSpec, refsFor, takesSource } from './indicators.js'

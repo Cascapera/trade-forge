@@ -9,6 +9,17 @@ import {
   type IndicatorType,
 } from './indicators.js'
 
+/** The parameter names of an indicator, in the order a form would render them. */
+function names(type: IndicatorType): readonly string[] {
+  return indicatorSpec(type).params.map((param) => param.name)
+}
+
+function param(type: IndicatorType, name: string) {
+  const found = indicatorSpec(type).params.find((candidate) => candidate.name === name)
+  if (found === undefined) throw new Error(`${type} has no parameter ${name}`)
+  return found
+}
+
 describe('the indicators a document may declare', () => {
   it('is the schema own list, not one written here', () => {
     // Sorted so the assertion is about membership rather than about the order Pydantic happened
@@ -44,17 +55,41 @@ describe('the indicators a document may declare', () => {
   })
 
   it('reads the parameters of each one off its own params model', () => {
-    expect(indicatorSpec('SMA').params).toEqual(['period', 'source'])
-    expect(indicatorSpec('ATR').params).toEqual(['period'])
+    expect(names('SMA')).toEqual(['period', 'source'])
+    expect(names('ATR')).toEqual(['period'])
     // The one with a parameter no other indicator has. A form driven by this list offers it
-    // without anybody adding a case for it.
+    // without anybody adding a case for it — and for a whole release it did not, because the form
+    // rendered hand-written fields and `deviations` was never one of them.
     //
-    // ⚠️ Alphabetical, because that is the order the generated schema lists properties in — which
-    // is why `deviations` comes before `period` here. The `SMA` line above reads as declaration
-    // order only because `period` happens to sort before `source`. A form rendering these in
-    // sequence therefore puts the multiplier above the window; noted in the backlog rather than
-    // worked around here, since the fix belongs to whoever owns the form.
-    expect(indicatorSpec('BOLLINGER').params).toEqual(['deviations', 'period', 'source'])
+    // ⚠️ **`period` comes first, and the schema does not list it first.** The generator emits
+    // properties alphabetically, so `deviations` sorts ahead of `period` — and rendering that
+    // order puts the multiplier above the window it multiplies. `period` is the only one of the
+    // three with no default, so required-first is on its own enough to pull it back to the top;
+    // the two that follow keep the schema's order, which is harmless between them.
+    expect(names('BOLLINGER')).toEqual(['period', 'deviations', 'source'])
+  })
+
+  it('describes a parameter with everything a control needs, not just its name', () => {
+    // ⚠️ `> 0`, not `>= 0`, and the flag is what carries the difference. A multiplier of zero
+    // collapses the three bands onto the average — an SMA spelled in a way that hides that it is
+    // one — so the schema bounds it exclusively, and a stepper that stopped at `min` would offer
+    // the one value in range the API refuses. That defect was #106, on another parameter.
+    expect(param('BOLLINGER', 'deviations')).toEqual({
+      name: 'deviations',
+      kind: 'number',
+      required: false,
+      default: 2,
+      nullable: false,
+      min: 0,
+      minExclusive: true,
+      max: 10,
+    })
+    expect(param('SMA', 'period')).toMatchObject({ kind: 'integer', min: 1, max: 1000 })
+    expect(param('SMA', 'source')).toMatchObject({
+      kind: 'enum',
+      default: 'close',
+      options: ['open', 'high', 'low', 'close'],
+    })
   })
 
   it('follows the discriminator mapping rather than guessing a definition name', () => {
@@ -62,8 +97,8 @@ describe('the indicators a document may declare', () => {
     // the DSL type is shouted like every other indicator. Resolving `$defs.HIGHEST` finds
     // nothing — which would surface as "indicator HIGHEST has no params definition" on a
     // contract that is perfectly fine.
-    expect(indicatorSpec('HIGHEST').params).toEqual(['period'])
-    expect(indicatorSpec('LOWEST').params).toEqual(['period'])
+    expect(names('HIGHEST')).toEqual(['period'])
+    expect(names('LOWEST')).toEqual(['period'])
   })
 
   it('reads the component names of the two composites, primary first', () => {
@@ -99,7 +134,7 @@ describe('the indicators a document may declare', () => {
         $defs: {
           Indicator: { discriminator: { propertyName: 'type', mapping: { WAT: '#/$defs/Wat' } } },
           Wat: { properties: { params: { $ref: '#/$defs/P' } }, components: ['upper', 3] },
-          P: { properties: { period: {} } },
+          P: { properties: { period: { type: 'integer' } } },
         },
       }),
     ).toThrow(/component that is not a name/)

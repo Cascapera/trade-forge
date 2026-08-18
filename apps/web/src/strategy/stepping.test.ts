@@ -1,4 +1,4 @@
-import { setupSpec, type SetupParam } from '@tradeforge/schema'
+import { setupSpec, type SchemaParam } from '@tradeforge/schema'
 import { describe, expect, it } from 'vitest'
 
 import { startingPoint, stepFor, stepped, type NumericParam } from './stepping'
@@ -12,7 +12,7 @@ import { startingPoint, stepFor, stepped, type NumericParam } from './stepping'
  * Python, this file should be the thing that notices.
  */
 function param(setup: Parameters<typeof setupSpec>[0], name: string): NumericParam {
-  const found: SetupParam | undefined = setupSpec(setup).params.find((each) => each.name === name)
+  const found: SchemaParam | undefined = setupSpec(setup).params.find((each) => each.name === name)
   if (found === undefined) throw new Error(`${setup} has no parameter ${name}`)
   if (found.kind !== 'integer' && found.kind !== 'number') {
     throw new Error(`${name} is ${found.kind}, which no stepper drives`)

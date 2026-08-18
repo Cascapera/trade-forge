@@ -1,4 +1,4 @@
-import { SETUP_TYPES, validateStrategy } from '@tradeforge/schema'
+import { indicatorSpec, SETUP_TYPES, validateStrategy } from '@tradeforge/schema'
 
 import {
   buildCondition,
@@ -9,12 +9,15 @@ import {
   CUSTOM_REF_SEED,
   emptyForm,
   emptyRow,
+  foldParams,
+  indicatorValues,
   maCrossForm,
   OP_GROUPS,
   opOf,
   OPS,
   refCatalogue,
   refOperand,
+  retypedValues,
   shapeOf,
   subjectOf,
   valueOperand,
@@ -159,8 +162,67 @@ describe('the three shapes a row can take', () => {
   })
 })
 
+describe('an indicator form driven by the schema', () => {
+  it('starts every parameter at what the schema declares, and blank where it declares nothing', () => {
+    // ⚠️ `period` is blank on purpose. The Pydantic model gives it no default, so a form that
+    // pre-filled one would be writing a number the DSL never chose — and the reader would run an
+    // SMA of that window believing it was a considered setting. `source` is the opposite case:
+    // the schema does say `close`, so the box shows `close`.
+    expect(indicatorValues('SMA')).toEqual({ period: '', source: 'close' })
+    // The parameter this whole PR exists for. It arrives with the schema's own 2.0, which is why
+    // every band built before this could only ever be a 2.0 band: the value was right, and there
+    // was no way to say anything else.
+    expect(indicatorValues('BOLLINGER')).toEqual({ period: '', source: 'close', deviations: '2' })
+    // And an indicator that reads the whole candle has no `source` key at all — not a `source`
+    // the boundary later drops.
+    expect(indicatorValues('ATR')).toEqual({ period: '' })
+  })
+
+  it('folds the typed values into params, and a name the indicator does not have is not folded', () => {
+    expect(foldParams(indicatorSpec('BOLLINGER').params, { period: '20', deviations: '2.5' }))
+      .toEqual({ period: 20, deviations: 2.5 })
+    // ⚠️ `source` is a legal value on other indicators and simply not a parameter of this one.
+    // There is no branch deciding that any more — the spec is the only list consulted.
+    expect(foldParams(indicatorSpec('ATR').params, { period: '14', source: 'high' })).toEqual({
+      period: 14,
+    })
+  })
+
+  it('carries a value across a kind change wherever the new kind has a place for it', () => {
+    // The comparison this exists for: SMA(20) against EMA(20) is one question, and retyping the
+    // 20 to ask it is how the question stops being asked.
+    expect(retypedValues('EMA', { period: '20', source: 'high' })).toEqual({
+      period: '20',
+      source: 'high',
+    })
+  })
+
+  it('drops what the new kind has no place for, and fills the rest from its own defaults', () => {
+    // ATR has no `source`, so it goes; BOLLINGER has a `deviations` the previous kind never had,
+    // so it arrives at the schema's 2.0 rather than empty.
+    expect(retypedValues('ATR', { period: '14', source: 'high' })).toEqual({ period: '14' })
+    expect(retypedValues('BOLLINGER', { period: '14' })).toEqual({
+      period: '14',
+      source: 'close',
+      deviations: '2',
+    })
+  })
+
+  it('refuses to carry a value that is not the kind of thing the parameter holds', () => {
+    // ⚠️ No indicator has a flag today, so this guard is about the shape of the rule rather than
+    // about a case on screen — and it is the difference between carrying *a value by name* and
+    // carrying *a value a control can render*. A checkbox's `true` in a number box is a field
+    // nobody can fix by typing.
+    expect(retypedValues('SMA', { period: true, source: 'high' })).toEqual({
+      period: '',
+      source: 'high',
+    })
+  })
+})
+
 describe('the refs the picker can offer', () => {
-  const sma = (id: string): IndicatorForm => ({ id, kind: 'SMA', period: 9, source: 'close' })
+  const sma = (id: string): IndicatorForm =>
+    ({ id, kind: 'SMA', values: { period: '9', source: 'close' } })
 
   it('always offers the four fields of the candle being decided on', () => {
     expect(refCatalogue([])).toEqual([
@@ -176,7 +238,7 @@ describe('the refs the picker can offer', () => {
     // ⚠️ The whole point of the schema change behind this PR. `bb` alone is a document the
     // semantic layer refuses — "the middle band" is a tempting default and a wrong one for an
     // ADX, whose first component is not a price — so the picker must not be able to produce it.
-    const refs = refCatalogue([{ id: 'bb', kind: 'BOLLINGER', period: 20, source: 'close' }])[1]
+    const refs = refCatalogue([{ id: 'bb', kind: 'BOLLINGER', values: {} }])[1]
     expect(refs).toEqual({ label: 'indicators', refs: ['bb.middle', 'bb.upper', 'bb.lower'] })
     expect(refs?.refs).not.toContain('bb')
   })
@@ -293,7 +355,7 @@ describe('buildStrategy', () => {
 
     const withIndicators = buildStrategy({
       ...emptyForm(),
-      indicators: [{ id: 'fast', kind: 'SMA', period: 9, source: 'close' }],
+      indicators: [{ id: 'fast', kind: 'SMA', values: { period: '9', source: 'close' } }],
     })
     expect(withIndicators.indicators).toEqual([
       { id: 'fast', type: 'SMA', params: { period: 9, source: 'close' } },
@@ -302,18 +364,20 @@ describe('buildStrategy', () => {
 
   it('leaves the price source off an indicator that reads the whole candle', () => {
     // ⚠️ ATR and the two channels are defined over high, low and the previous close together,
-    // and their params model forbids extra keys. Carrying the form's `source` through would
-    // build a document the API refuses — and refuses with a message about an unexpected field
-    // rather than about the indicator that was chosen, which is a report nobody can act on.
+    // and their params model forbids extra keys. Carrying a `source` through would build a
+    // document the API refuses — and refuses with a message about an unexpected field rather
+    // than about the indicator that was chosen, which is a report nobody can act on.
     //
-    // The form keeps a `source` regardless, because switching an indicator's kind back and
-    // forth must not lose what was picked. Deciding at the boundary is what keeps the two facts
-    // apart: what the reader has selected, and what this document is allowed to say.
+    // ⚠️ **The form is given one here anyway, and that is the point of the fixture.** It used to
+    // be impossible for this to go wrong in an interesting way, because the boundary had an
+    // explicit "does this one take a source?" branch. There is no branch any more: the spec says
+    // which parameters exist, so a stray value under a name the indicator does not have is
+    // simply not folded. Handing it one proves that, instead of proving the form never has one.
     const built = buildStrategy({
       ...emptyForm(),
       indicators: [
-        { id: 'atr', kind: 'ATR', period: 14, source: 'high' },
-        { id: 'canal', kind: 'HIGHEST', period: 20, source: 'close' },
+        { id: 'atr', kind: 'ATR', values: { period: '14', source: 'high' } },
+        { id: 'canal', kind: 'HIGHEST', values: { period: '20', source: 'close' } },
       ],
     })
 

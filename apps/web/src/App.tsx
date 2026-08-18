@@ -78,6 +78,9 @@ export function App(): React.JSX.Element {
       <main className="mx-auto max-w-5xl px-6 py-8">
         <Routes>
           <Route path="/" element={<StrategyBuilder />} />
+          {/* The same screen, opened on a saved strategy. One component rather than a viewer and
+              an editor, because a builder that cannot show what it produced is how the two drift. */}
+          <Route path="/strategies/:id" element={<StrategyBuilder />} />
           <Route path="/launch" element={<LaunchBacktest />} />
           <Route path="/basket" element={<LaunchBasket />} />
           <Route path="/baskets/:id" element={<BasketResult />} />

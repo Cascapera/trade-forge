@@ -356,6 +356,81 @@ describe('editing a condition strategy still works', () => {
     expect(definition.entry.long).not.toHaveProperty('bars')
   })
 
+  it('offers every parameter the schema declares, in an order the window comes first in', () => {
+    renderWithProviders(<StrategyBuilder />)
+    fireEvent.change(screen.getByLabelText('strategy'), { target: { value: 'ma_cross' } })
+
+    fireEvent.click(screen.getByRole('button', { name: '+ indicator' }))
+    const last = screen.getAllByLabelText('indicator kind').length - 1
+    fireEvent.change(screen.getAllByLabelText('indicator kind')[last]!, {
+      target: { value: 'BOLLINGER' },
+    })
+
+    // ⚠️ The control this PR exists for. Before it, the form emitted `{period, source}` and
+    // nothing else, so every band anyone built on this screen was a 2.0 band — the value was
+    // right and there was no way to say anything else.
+    // Only one indicator on this form has a `deviations`, so it is unique by name — indexing the
+    // `period` list here would be indexing a different list.
+    const deviations = screen.getByLabelText('indicator deviations')
+    expect(deviations).toHaveValue('2')
+
+    // ⚠️ And `period` is rendered before it, which the schema's own order does not give: the
+    // generator lists properties alphabetically, so `deviations` sorts ahead of the window it
+    // multiplies. Compared by document position, because that is what a reader sees.
+    const period = screen.getAllByLabelText('indicator period')[last]!
+    expect(period.compareDocumentPosition(deviations)).toBe(Node.DOCUMENT_POSITION_FOLLOWING)
+  })
+
+  it('carries a band multiplier all the way into the saved document', () => {
+    renderWithProviders(<StrategyBuilder />)
+    fireEvent.change(screen.getByLabelText('strategy'), { target: { value: 'ma_cross' } })
+
+    fireEvent.click(screen.getByRole('button', { name: '+ indicator' }))
+    const last = screen.getAllByLabelText('indicator kind').length - 1
+    fireEvent.change(screen.getAllByLabelText('indicator id')[last]!, { target: { value: 'bb' } })
+    fireEvent.change(screen.getAllByLabelText('indicator kind')[last]!, {
+      target: { value: 'BOLLINGER' },
+    })
+    fireEvent.change(screen.getAllByLabelText('indicator period')[last]!, {
+      target: { value: '20' },
+    })
+    fireEvent.change(screen.getByLabelText('indicator deviations'), {
+      target: { value: '2.5' },
+    })
+
+    succeed()
+    answerTheOpenQuestions()
+    fireEvent.click(screen.getByRole('button', { name: /run backtest/i }))
+
+    const definition = (
+      save.mock.calls[0]?.[0] as { definition: { indicators: { params: object }[] } }
+    ).definition
+    expect(definition.indicators[2]).toEqual({
+      id: 'bb',
+      type: 'BOLLINGER',
+      params: { period: 20, source: 'close', deviations: 2.5 },
+    })
+  })
+
+  it('keeps a window that means the same thing when the indicator kind changes', () => {
+    renderWithProviders(<StrategyBuilder />)
+    fireEvent.change(screen.getByLabelText('strategy'), { target: { value: 'ma_cross' } })
+
+    // The first indicator of the template is an SMA(9).
+    expect(screen.getAllByLabelText('indicator period')[0]).toHaveValue('9')
+    fireEvent.change(screen.getAllByLabelText('indicator kind')[0]!, { target: { value: 'EMA' } })
+
+    // ⚠️ Still 9. Comparing an SMA(9) with an EMA(9) is one question, and retyping the 9 to ask
+    // it is how the question stops being asked — which is why this differs from the setup picker,
+    // where a name carried across means something else entirely.
+    expect(screen.getAllByLabelText('indicator period')[0]).toHaveValue('9')
+
+    // And switching to one that reads the whole candle drops the source rather than hiding it.
+    fireEvent.change(screen.getAllByLabelText('indicator kind')[0]!, { target: { value: 'ATR' } })
+    expect(screen.getAllByLabelText('indicator period')[0]).toHaveValue('9')
+    expect(screen.queryAllByLabelText('indicator source')).toHaveLength(1)
+  })
+
   it('offers a band by component, and lets a rule be built from one without typing', () => {
     renderWithProviders(<StrategyBuilder />)
     fireEvent.change(screen.getByLabelText('strategy'), { target: { value: 'ma_cross' } })
@@ -366,6 +441,12 @@ describe('editing a condition strategy still works', () => {
     fireEvent.change(ids[last]!, { target: { value: 'bb' } })
     fireEvent.change(screen.getAllByLabelText('indicator kind')[last]!, {
       target: { value: 'BOLLINGER' },
+    })
+    // ⚠️ A window has to be typed: the schema gives `period` no default, so the form starts it
+    // blank rather than inventing one. The `14` this used to arrive with was a number written in
+    // TypeScript, and an SMA(14) nobody chose is worse than an empty box that says so.
+    fireEvent.change(screen.getAllByLabelText('indicator period')[last]!, {
+      target: { value: '20' },
     })
 
     const subject = screen.getByLabelText('Long left 0')

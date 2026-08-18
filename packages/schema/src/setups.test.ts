@@ -1,15 +1,9 @@
 import { describe, expect, expectTypeOf, it } from 'vitest'
 
-import {
-  readSetups,
-  SETUP_TYPES,
-  SETUPS,
-  setupSpec,
-  type SetupParam,
-  type SetupType,
-} from './setups.js'
+import type { SchemaParam } from './params.js'
+import { readSetups, SETUP_TYPES, SETUPS, setupSpec, type SetupType } from './setups.js'
 
-function param(type: SetupType, name: string): SetupParam {
+function param(type: SetupType, name: string): SchemaParam {
   const found = setupSpec(type).params.find((candidate) => candidate.name === name)
   if (found === undefined) throw new Error(`${type} has no parameter ${name}`)
   return found

@@ -1,7 +1,7 @@
-import type { SetupParam } from '@tradeforge/schema'
+import type { SchemaParam } from '@tradeforge/schema'
 
 /** A parameter a stepper can drive: the two numeric kinds, with their bounds. */
-export type NumericParam = Extract<SetupParam, { kind: 'integer' | 'number' }>
+export type NumericParam = Extract<SchemaParam, { kind: 'integer' | 'number' }>
 
 /**
  * How far one press of an arrow moves this parameter.

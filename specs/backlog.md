@@ -504,11 +504,18 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
   sempre o ofereceu), e nenhuma estratégia dele desenha um até agora. O conserto é um painel
   separado por escala no `PriceChart`, ou uma regra de "indicadores limitados não vão no painel de
   preço". Enquanto isso, um Bollinger desenha certo porque é medido **em preço**.
-- [origem: PR-201-B] **O builder não tem controle para `deviations`** — a tela emite só
+- ~~[origem: PR-201-B]~~ **FEITO no PR-206-B2.** O `IndicatorForm` deixou de ter campos escritos à
+  mão (`period`, `source`) e passou a guardar `values` por nome, dirigido pelo spec — o mesmo
+  desenho que o `SetupForm` já usava. O leitor de parâmetros saiu de dentro do `setups.ts` para um
+  `params.ts` compartilhado, então indicador e setup leem kind, limites, default e nulabilidade do
+  mesmo lugar. Efeito colateral bom: sumiu o `if (takesSource)` na dobra — a chave errada não tem
+  mais de onde vir. Originalmente: **O builder não tem controle para `deviations`** — a tela emite só
   `{period, source}`, então uma banda montada nela é sempre de 2,0 desvios. O documento é válido
   (o schema tem default 2.0), então não é bug: é um parâmetro inalcançável pela tela. O caminho é o
   mesmo do PR-206 (builder visual), que já precisa de trabalho no formulário de indicador.
-- [origem: PR-201-B] **`IndicatorSpec.params` vem em ordem alfabética** — é a ordem em que o JSON
+- ~~[origem: PR-201-B]~~ **FEITO no PR-206-B2.** `readParams` ordena required primeiro para os
+  dois, e como `period` é o único dos três do Bollinger sem default, isso sozinho já o traz para o
+  topo. Originalmente: **`IndicatorSpec.params` vem em ordem alfabética** — é a ordem em que o JSON
   Schema lista `properties`, então um formulário que renderiza a lista em sequência mostra
   `deviations` **antes** de `period`. Passou desapercebido até agora porque `period` < `source` nos
   outros sete. Vale o mesmo tratamento que o `setupSpec` já tem (required primeiro), no PR que tocar
@@ -523,6 +530,15 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
   operando do builder são texto livre, então funciona, mas nada oferece os três nomes nem avisa que
   `bb` sozinho é recusado. O erro que chega é legível (a camada semântica lista os componentes), o
   que torna isto atrito e não defeito. Some no PR-206.
+- [origem: PR-206-B2] **Adicionar um indicador não pré-preenche mais o `period`** — não é defeito,
+  é a consequência de a tela ler o schema: `period` não tem default no Pydantic, então a caixa
+  nasce vazia e o botão de rodar fica desabilitado até alguém escolher a janela. O `14` que
+  aparecia antes era um número escrito no TypeScript — um SMA(14) que ninguém escolheu. Se em
+  algum momento isso incomodar, a correção certa é **dar um default ao `period` no Pydantic**, não
+  reescrever o número na tela. Anotado para o caso de ele reclamar do atrito.
+- [origem: PR-206-B2] **`stop_buffer_ticks` vs `stop_buffer` continua aberto** — este PR tocou a
+  tela do builder e **não** resolveu (um PR, um escopo). Segue valendo: nomes quase iguais,
+  unidades diferentes, e a tela mostra os dois com o mesmo tipo de campo.
 - [origem: PR-206-B1] **`candle[-N].field` só é alcançável digitando, atrás do `custom…`** — é a
   única das quatro formas da gramática de ref que **não é enumerável**, porque N não tem teto. O
   picker resolve isso semeando `candle[-1].close` na caixa e mostrando o texto, então nada se

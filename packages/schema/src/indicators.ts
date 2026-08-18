@@ -16,6 +16,7 @@
 // `deviations`, a parameter no other indicator has, and it appears in the form for free.
 
 import type { Indicator } from './generated/strategy.js'
+import { readParams, resolverFor, type SchemaNode, type SchemaParam } from './params.js'
 import schema from './tradeforge_schema/strategy.schema.json' with { type: 'json' }
 
 /** The DSL's `indicators[].type` — the union the generated types already define. */
@@ -23,8 +24,16 @@ export type IndicatorType = Indicator['type']
 
 export interface IndicatorSpec {
   type: IndicatorType
-  /** The parameter names this indicator's own params model declares, in schema order. */
-  params: readonly string[]
+  /**
+   * This indicator's own parameters, described for a form control — required first.
+   *
+   * ⚠️ **Names alone were not enough, and the gap had a name: `deviations`.** A Bollinger's
+   * multiplier is a perfectly valid parameter of the DSL that no screen could reach, because the
+   * form rendered hand-written fields and nobody had written that one. Read through the shared
+   * `readParams`, an indicator gains a parameter in Python and the form offers it — with its own
+   * bounds, its own default, and its exclusive lower bound honoured as exclusive.
+   */
+  params: readonly SchemaParam[]
   /**
    * The component names a reference must pick from — `middle`, `upper`, `lower` for a band —
    * or empty for an indicator referenced by its bare id.
@@ -41,13 +50,6 @@ export interface IndicatorSpec {
   components: readonly string[]
 }
 
-interface Node {
-  $ref?: string
-  properties?: Record<string, Node>
-  components?: readonly unknown[]
-  discriminator?: { propertyName: string; mapping: Record<string, string> }
-}
-
 /**
  * The component names on an indicator's schema node, refused rather than coerced if malformed.
  *
@@ -56,7 +58,7 @@ interface Node {
  * pass quietly is `[]`, which is indistinguishable from "single-valued" and would turn every
  * `bb.upper` in every saved strategy into a reference the builder cannot offer.
  */
-function readComponents(type: string, node: Node): readonly string[] {
+function readComponents(type: string, node: SchemaNode): readonly string[] {
   if (node.components === undefined) return []
   const names = node.components.filter((name): name is string => typeof name === 'string')
   if (names.length !== node.components.length) {
@@ -66,13 +68,7 @@ function readComponents(type: string, node: Node): readonly string[] {
 }
 
 export function readIndicators(root: unknown): readonly IndicatorSpec[] {
-  const defs = (root as { $defs?: Record<string, Node> }).$defs ?? {}
-
-  function resolve(ref: string): Node {
-    const node = defs[ref.replace('#/$defs/', '')]
-    if (node === undefined) throw new Error(`strategy schema has no definition for ${ref}`)
-    return node
-  }
+  const { defs, resolve } = resolverFor(root)
 
   // ⚠️ Reached through the discriminator mapping, never by guessing the definition's name from
   // the DSL type. They differ: `HIGHEST` maps to `#/$defs/Highest`, because the Python class is
@@ -86,7 +82,7 @@ export function readIndicators(root: unknown): readonly IndicatorSpec[] {
     if (paramsRef === undefined) throw new Error(`indicator ${type} has no params definition`)
     return {
       type: type as IndicatorType,
-      params: Object.keys(resolve(paramsRef).properties ?? {}),
+      params: readParams(resolve(paramsRef), resolve),
       components: readComponents(type, node),
     }
   })
@@ -107,7 +103,7 @@ export function indicatorSpec(type: IndicatorType): IndicatorSpec {
 
 /** Whether this indicator reads one price series, or the whole candle. */
 export function takesSource(type: IndicatorType): boolean {
-  return indicatorSpec(type).params.includes('source')
+  return indicatorSpec(type).params.some((param) => param.name === 'source')
 }
 
 /**

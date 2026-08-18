@@ -7,7 +7,7 @@
 // tightens the hint here. A hand-written copy would be a second version of the DSL that drifts
 // from it silently, which is the one failure mode this whole file exists to avoid.
 
-import { setupSpec, type SetupParam, type SetupType } from '@tradeforge/schema'
+import { setupSpec, type SchemaParam, type SetupType } from '@tradeforge/schema'
 
 export interface AxisOption {
   /** The dotted path the request carries: `setup.params.period`. */
@@ -26,7 +26,7 @@ export interface AxisOption {
    * checkboxes, a bounded number wants arrows that know its step. Two readings of one schema
    * node would be two places to disagree about what a parameter is.
    */
-  param: SetupParam
+  param: SchemaParam
 }
 
 /**
@@ -57,7 +57,7 @@ export function axesFor(setup: string | null): AxisOption[] {
 }
 
 /** What to type in the values field, in the parameter's own terms. */
-function hintFor(param: SetupParam): string {
+function hintFor(param: SchemaParam): string {
   if (param.kind === 'enum') {
     return `one or more of ${param.options.join(', ')}, separated by commas`
   }
@@ -92,7 +92,7 @@ function hintFor(param: SetupParam): string {
  * bounds so the example is never a request the server would refuse — an example that fails is
  * worse than none.
  */
-function exampleFor(param: SetupParam): string {
+function exampleFor(param: SchemaParam): string {
   if (param.kind === 'enum') return param.options.join(', ')
   if (param.kind === 'boolean') return 'true, false'
 

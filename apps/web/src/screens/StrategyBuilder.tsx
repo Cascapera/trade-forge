@@ -1,9 +1,10 @@
 import {
+  indicatorSpec,
   SETUPS,
   setupSpec,
   takesSource,
   validateStrategy,
-  type SetupParam,
+  type SchemaParam,
   type SetupType,
 } from '@tradeforge/schema'
 import { useMemo, useState } from 'react'
@@ -21,12 +22,13 @@ import {
   CUSTOM_REF_SEED,
   emptyRow,
   INDICATOR_KINDS,
+  indicatorValues,
   OP_GROUPS,
   opOf,
   setupValues,
-  SOURCES,
   STRATEGY_CHOICES,
   refCatalogue,
+  retypedValues,
   strategyChoice,
   subjectName,
   subjectOf,
@@ -310,17 +312,27 @@ function ConditionRows(props: {
 
 /** What an empty box means for this parameter, said out loud — the distinction is invisible
  *  otherwise, and it is the difference between two different experiments. */
-function emptyHint(param: SetupParam): string | null {
+function emptyHint(param: SchemaParam): string | null {
   if (param.kind === 'boolean' || !('nullable' in param) || !param.nullable) return null
   return param.name === 'max_bos' ? 'empty = uncapped' : 'empty = off'
 }
 
-function SetupField(props: {
-  param: SetupParam
+/**
+ * One parameter, rendered as whatever control its schema node calls for.
+ *
+ * ⚠️ **The prefix is a parameter because this renders indicator fields too.** It used to be
+ * hard-coded `setup`, and that was the visible half of a deeper problem: the indicator form was a
+ * separate, hand-written set of fields, so a parameter the DSL gained reached one form and not
+ * the other. `deviations` is what that cost — valid in the schema, unreachable from the screen.
+ */
+function ParamField(props: {
+  param: SchemaParam
+  /** What the control answers to: `setup side`, `indicator deviations`. */
+  prefix: string
   value: string | boolean | undefined
   onChange: (next: string | boolean) => void
 }): React.JSX.Element {
-  const { param, value, onChange } = props
+  const { param, prefix, value, onChange } = props
   const hint = emptyHint(param)
   return (
     <label className="flex flex-col gap-1 text-sm">
@@ -331,7 +343,7 @@ function SetupField(props: {
       </span>
       {param.kind === 'boolean' ? (
         <input
-          aria-label={`setup ${param.name}`}
+          aria-label={`${prefix} ${param.name}`}
           type="checkbox"
           className="self-start"
           checked={value === true}
@@ -341,7 +353,7 @@ function SetupField(props: {
         />
       ) : param.kind === 'enum' ? (
         <select
-          aria-label={`setup ${param.name}`}
+          aria-label={`${prefix} ${param.name}`}
           className={inputClass}
           value={typeof value === 'string' ? value : ''}
           onChange={(event) => {
@@ -365,7 +377,7 @@ function SetupField(props: {
         // field. The step was a constant `0.1` for every fraction, too.
         <NumberStepper
           param={param}
-          label={`setup ${param.name}`}
+          label={`${prefix} ${param.name}`}
           value={typeof value === 'string' ? value : ''}
           onChange={onChange}
         />
@@ -406,9 +418,10 @@ function SetupFields(props: {
       </label>
       <div className="flex flex-wrap gap-4">
         {spec.params.map((param) => (
-          <SetupField
+          <ParamField
             key={param.name}
             param={param}
+            prefix="setup"
             value={setup.values[param.name]}
             onChange={(next) => {
               onChange({ ...setup, values: { ...setup.values, [param.name]: next } })
@@ -576,7 +589,7 @@ export function StrategyBuilder(): React.JSX.Element {
                 patch({
                   indicators: [
                     ...form.indicators,
-                    { id: '', kind: 'SMA', period: 14, source: 'close' },
+                    { id: '', kind: 'SMA', values: indicatorValues('SMA') },
                   ],
                 })
               }}
@@ -759,62 +772,65 @@ function IndicatorRow(props: {
   onRemove: () => void
 }): React.JSX.Element {
   const { indicator, onChange, onRemove } = props
+  // Straight off the schema, exactly as the setup form reads its own: kind, bounds, nullability
+  // and default, required first. An indicator that gains a parameter in Python gains a control
+  // here once the types are regenerated, with no edit to this file — which is the whole reason
+  // `deviations` was unreachable before and is not now.
+  const spec = indicatorSpec(indicator.kind)
   return (
-    <div className="flex items-center gap-2">
-      <input
-        aria-label="indicator id"
-        className={inputClass}
-        placeholder="id"
-        value={indicator.id}
-        onChange={(event) => {
-          onChange({ ...indicator, id: event.target.value })
-        }}
-      />
-      <select
-        aria-label="indicator kind"
-        className={inputClass}
-        value={indicator.kind}
-        onChange={(event) => {
-          onChange({ ...indicator, kind: event.target.value as IndicatorForm['kind'] })
-        }}
-      >
-        {INDICATOR_KINDS.map((kind) => (
-          <option key={kind} value={kind}>
-            {kind}
-          </option>
-        ))}
-      </select>
-      <input
-        aria-label="indicator period"
-        type="number"
-        className={inputClass}
-        value={indicator.period}
-        onChange={(event) => {
-          onChange({ ...indicator, period: Number(event.target.value) })
-        }}
-      />
-      {/* ⚠️ Offered only where the schema declares it. ATR and the two channels read the whole
-          candle, so "the ATR of the close" is not a setting they have — showing the dropdown
-          would let a reader choose something the document cannot carry and the API refuses. */}
-      {takesSource(indicator.kind) ? (
-        <select
-          aria-label="indicator source"
+    <div className="flex flex-wrap items-end gap-2">
+      <label className="flex flex-col gap-1 text-sm">
+        <span>id</span>
+        <input
+          aria-label="indicator id"
           className={inputClass}
-          value={indicator.source}
+          placeholder="id"
+          value={indicator.id}
           onChange={(event) => {
-            onChange({ ...indicator, source: event.target.value as IndicatorForm['source'] })
+            onChange({ ...indicator, id: event.target.value })
+          }}
+        />
+      </label>
+      <label className="flex flex-col gap-1 text-sm">
+        <span>kind</span>
+        <select
+          aria-label="indicator kind"
+          className={inputClass}
+          value={indicator.kind}
+          onChange={(event) => {
+            // ⚠️ Values carry over where the new kind has a place for them — unlike the setup
+            // picker, which starts from scratch. `period` is a window on all eight indicators;
+            // making somebody retype 20 to compare an SMA(20) with an EMA(20) is how the
+            // comparison stops being made. See `retypedValues` for why setups differ.
+            const kind = event.target.value as IndicatorForm['kind']
+            onChange({ ...indicator, kind, values: retypedValues(kind, indicator.values) })
           }}
         >
-          {SOURCES.map((source) => (
-            <option key={source} value={source}>
-              {source}
+          {INDICATOR_KINDS.map((kind) => (
+            <option key={kind} value={kind}>
+              {kind}
             </option>
           ))}
         </select>
-      ) : (
+      </label>
+      {spec.params.map((param) => (
+        <ParamField
+          key={param.name}
+          param={param}
+          prefix="indicator"
+          value={indicator.values[param.name]}
+          onChange={(next) => {
+            onChange({ ...indicator, values: { ...indicator.values, [param.name]: next } })
+          }}
+        />
+      ))}
+      {/* ⚠️ Said out loud, because its absence is the interesting part. ATR and the two channels
+          are defined over the whole candle, so "the ATR of the close" is not a setting they have
+          — and a form that simply showed nothing there reads as a form that forgot. */}
+      {!takesSource(indicator.kind) && (
         <span className="self-center text-xs text-slate-500">whole candle</span>
       )}
-      <button type="button" className="text-slate-500 hover:text-red-400" onClick={onRemove}>
+      <button type="button" className="self-center text-slate-500 hover:text-red-400" onClick={onRemove}>
         remove
       </button>
     </div>

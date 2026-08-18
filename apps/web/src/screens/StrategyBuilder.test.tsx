@@ -3,12 +3,19 @@ import { fireEvent, screen, within } from '@testing-library/react'
 import { useSession } from '../store'
 import { renderWithProviders } from '../test-utils'
 
-const { save, run } = vi.hoisted(() => ({ save: vi.fn(), run: vi.fn() }))
+const { save, run, opened } = vi.hoisted(() => ({
+  save: vi.fn(),
+  run: vi.fn(),
+  // What `/strategies/:id` fetched. `undefined` is the plain builder, opened on nothing.
+  opened: { data: undefined as { definition: unknown } | undefined },
+}))
 
 vi.mock('../api/hooks', () => ({
   useSaveStrategy: () => ({ mutate: save, isPending: false, isError: false, error: null }),
   useCreateBacktest: () => ({ mutate: run, isPending: false, isError: false, error: null }),
   useInstruments: () => ({ data: [{ id: 'i1', symbol: 'AAPL' }] }),
+  // The builder asks for a saved strategy whenever the route carries an id.
+  useStrategy: () => opened,
 }))
 
 import { StrategyBuilder } from './StrategyBuilder'
@@ -46,6 +53,7 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  opened.data = undefined
   vi.useRealTimers()
   vi.clearAllMocks()
   useSession.getState().clear()
@@ -263,6 +271,80 @@ describe('running the backtest', () => {
 
     expect(save).toHaveBeenCalledTimes(1)
     expect(run).not.toHaveBeenCalled()
+  })
+})
+
+describe('opening a strategy that was already saved', () => {
+  const saved = {
+    schema_version: '1.0',
+    name: 'salva antes',
+    description: 'rompimento com filtro',
+    timeframe: 'M15',
+    indicators: [{ id: 'lenta', type: 'EMA', params: { period: 50, source: 'high' } }],
+    entry: {
+      long: { op: 'crosses_above', left: { ref: 'price.close' }, right: { ref: 'lenta' } },
+      short: null,
+    },
+    exit: { stop_loss: null, take_profit: null, conditions: [] },
+    risk: { sizing: { type: 'percent_risk', params: { percent: 0.5 } } },
+  }
+
+  it('fills the form from the document instead of starting a new strategy', () => {
+    opened.data = { definition: saved }
+    renderWithProviders(<StrategyBuilder />)
+
+    // ⚠️ Every one of these is a field the builder would otherwise have filled from its own
+    // template. Asserting only the name would pass against a parser that read the name and
+    // nothing else.
+    expect(screen.getByLabelText('name')).toHaveValue('salva antes')
+    expect(screen.getByLabelText('timeframe')).toHaveValue('M15')
+    expect(screen.getByLabelText('indicator id')).toHaveValue('lenta')
+    expect(screen.getByLabelText('indicator kind')).toHaveValue('EMA')
+    expect(screen.getByLabelText('indicator period')).toHaveValue('50')
+    expect(screen.getByLabelText('indicator source')).toHaveValue('high')
+    expect(screen.getByLabelText('Long left 0')).toHaveValue('price.close')
+    expect(screen.getByLabelText('Long op 0')).toHaveValue('crosses_above')
+    expect(screen.getByLabelText('Long right 0')).toHaveValue('lenta')
+    expect(screen.getByLabelText('percent')).toHaveValue(0.5)
+  })
+
+  it('saves it back unchanged when nothing was touched', () => {
+    // The round trip, through the screen rather than through the functions — which is where a
+    // wiring bug lives: a form adopted twice, or adopted after an edit, would show up here.
+    opened.data = { definition: saved }
+    renderWithProviders(<StrategyBuilder />)
+
+    succeed()
+    answerTheOpenQuestions()
+    fireEvent.click(screen.getByRole('button', { name: /run backtest/i }))
+
+    expect(save.mock.calls[0]?.[0]).toEqual({ definition: saved })
+  })
+
+  it('says what it cannot show, and does not pretend to have loaded it', () => {
+    opened.data = {
+      definition: {
+        ...saved,
+        entry: {
+          long: {
+            all: [
+              { op: 'gt', left: { ref: 'lenta' }, right: { value: 1 } },
+              { any: [{ op: 'lt', left: { ref: 'lenta' }, right: { value: 2 } }] },
+            ],
+          },
+          short: null,
+        },
+      },
+    }
+    renderWithProviders(<StrategyBuilder />)
+
+    expect(screen.getByText(/cannot be opened in the builder yet/i)).toBeInTheDocument()
+    expect(
+      screen.getByText('entry.long.all[1]: a group inside a group, which the builder shows one level of'),
+    ).toBeInTheDocument()
+    // ⚠️ And the form was not filled from it. Showing the parts that parsed would hand the reader
+    // a form that looks complete and writes a different strategy over their own on save.
+    expect(screen.getByLabelText('name')).not.toHaveValue('salva antes')
   })
 })
 

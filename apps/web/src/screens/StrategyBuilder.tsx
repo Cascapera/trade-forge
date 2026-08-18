@@ -8,9 +8,9 @@ import {
   type SetupType,
 } from '@tradeforge/schema'
 import { useMemo, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, useParams } from 'react-router-dom'
 
-import { useCreateBacktest, useInstruments, useSaveStrategy } from '../api/hooks'
+import { useCreateBacktest, useInstruments, useSaveStrategy, useStrategy } from '../api/hooks'
 import { emptyBacktestForm, toBacktestRequest, whyNotRunnable, type BacktestForm } from '../backtest/settings'
 import { BacktestSettings } from '../components/BacktestSettings'
 import { NumberStepper } from '../components/NumberStepper'
@@ -45,6 +45,7 @@ import {
   type StrategyChoice,
   type StrategyForm,
 } from '../strategy/builder'
+import { formOf, type ParseResult } from '../strategy/parse'
 
 /** The headings the picker groups by, in the order they are offered. */
 const GROUPS: readonly StrategyChoice['group'][] = ['Setups', 'Conditions']
@@ -440,11 +441,50 @@ export function StrategyBuilder(): React.JSX.Element {
   // `runName` for why that timing is what keeps versioning working.
   const [form, setForm] = useState<StrategyForm>(() => strategyChoice(choiceId).form(new Date()))
   const [backtest, setBacktest] = useState<BacktestForm>(emptyBacktestForm)
+  const { id: openedId } = useParams<{ id: string }>()
+  const opened = useStrategy(openedId)
   const navigate = useNavigate()
   const session = useSession()
   const instruments = useInstruments()
   const save = useSaveStrategy()
   const run = useCreateBacktest()
+
+  /**
+   * A saved strategy, read back into the form — or the reasons it cannot be shown.
+   *
+   * ⚠️ **Derived from the fetched document, not copied into state by an effect.** An effect that
+   * called `setForm` would fight every keystroke the moment the query refetched, and the bug it
+   * produces is edits vanishing under the reader's hands. `loaded` is the parse; the form state
+   * below adopts it once, keyed by the document itself.
+   */
+  const loaded = useMemo((): ParseResult | null => {
+    if (opened.data === undefined) return null
+    // ⚠️ Validated before it is parsed, rather than asserted into shape. The API only stores
+    // documents it validated — but under *its* schema, and a strategy saved by an older one is
+    // exactly the case where a cast would hand `formOf` a shape it reasons about wrongly and
+    // produce a form that looks fine. A refusal naming the field is the outcome worth having.
+    const checked = validateStrategy(opened.data.definition)
+    if (!checked.valid) {
+      return {
+        ok: false,
+        unsupported: checked.errors.map((error) => `${error.path}: ${error.message}`),
+      }
+    }
+    return formOf(checked.strategy)
+  }, [opened.data])
+  // Adopting the parsed form is a render-phase state update keyed on the document — React's own
+  // idiom for "derive state from props" — so typing is never overwritten by a refetch.
+  //
+  // ⚠️ **Keyed on the fetched object, not on the id from the route.** Keying on the id looks
+  // equivalent and loops forever the moment the id is absent: `adopted` would be set to `null`,
+  // which never equals `undefined`, so the condition stays true on every render. React caught it
+  // as "Too many re-renders"; the object reference is stable while the query result is, and it is
+  // what "the document was adopted" actually means.
+  const [adopted, setAdopted] = useState<unknown>(null)
+  if (loaded?.ok === true && adopted !== opened.data) {
+    setAdopted(opened.data)
+    setForm(loaded.form)
+  }
 
   // Recomputed whenever the indicator list changes: declaring an indicator has to make its name
   // offerable in the same keystroke, and renaming one has to stop offering the old spelling.
@@ -490,6 +530,23 @@ export function StrategyBuilder(): React.JSX.Element {
   return (
     <div className="space-y-6">
       <h2 className="text-xl font-semibold">Run a backtest</h2>
+
+      {/* ⚠️ Said out loud, and the form below is left as it was. The tempting alternative is to
+          show the parts that could be read and let the reader carry on — which hands them a form
+          that looks complete and writes a different strategy over their own the moment they save.
+          Refusing is the safe half of that trade, and naming the paths is what makes it useful. */}
+      {loaded?.ok === false && (
+        <div className="rounded border border-amber-700 bg-amber-950/40 p-3 text-sm">
+          <p className="mb-2 font-medium text-amber-300">
+            This strategy cannot be opened in the builder yet:
+          </p>
+          <ul className="list-inside list-disc text-amber-200">
+            {loaded.unsupported.map((reason) => (
+              <li key={reason}>{reason}</li>
+            ))}
+          </ul>
+        </div>
+      )}
 
       <section className={sectionClass}>
         <label className="flex flex-col gap-1 text-sm">

@@ -339,6 +339,34 @@ export interface StrategyForm {
   takeProfit: TakeProfitForm
   exit: SideForm
   percent: number
+  /**
+   * The three optional scalars a document may carry, held as text so that **empty means absent**.
+   *
+   * ⚠️ Not numbers with the schema's defaults pre-filled, and the reason is the round-trip. A
+   * document that omits `max_open_positions` and one that writes `1` are the same strategy today
+   * and would stop being so the day the default moved — so re-saving a document that omitted it
+   * must not quietly write it in. This is the rule `setupParams` and the `bars` box already
+   * follow: an untouched box is not a number the author chose.
+   */
+  description: string
+  maxOpenPositions: string
+  maxDailyLossPercent: string
+}
+
+/** The optional half of `risk`, in the shape the DSL carries it — absent where the box is empty. */
+function riskCaps(form: StrategyForm): Record<string, number> {
+  const caps: Record<string, number> = {}
+  if (form.maxOpenPositions.trim() !== '') caps.max_open_positions = Number(form.maxOpenPositions)
+  if (form.maxDailyLossPercent.trim() !== '') {
+    caps.max_daily_loss_percent = Number(form.maxDailyLossPercent)
+  }
+  return caps
+}
+
+/** The `description`, only when there is one. An empty string is what the schema defaults to, so
+ *  writing it would add a key that says nothing. */
+function describedAs(form: StrategyForm): { description?: string } {
+  return form.description === '' ? {} : { description: form.description }
 }
 
 /**
@@ -490,23 +518,38 @@ function setupParams(form: SetupForm): Record<string, unknown> {
  * *is* the entry, and places its stop from the bar it entered on. The semantic layer refuses a
  * setup document that carries any of them, so the form does not offer them either.
  */
+/**
+ * The `exit` block of a setup document — only the parts that say something.
+ *
+ * ⚠️ A setup places its own stop and conducts its own exit, so `stop_loss: null` and
+ * `conditions: []` are not settings: they are the absence of settings, spelled out. Writing them
+ * adds keys that carry no information, and it made re-saving a document that omitted them rewrite
+ * its shape. Same rule as `description`: a key equal to the schema's own default says nothing.
+ */
+function setupExit(
+  form: StrategyForm,
+): { exit: NonNullable<Strategy['exit']> } | Record<string, never> {
+  if (!form.takeProfit.enabled) return {}
+  return {
+    exit: { take_profit: { type: 'risk_multiple', params: { rr: form.takeProfit.rr } } },
+  }
+}
+
 export function buildSetupStrategy(form: StrategyForm): SetupStrategy {
   return {
     schema_version: '1.0',
     name: form.name,
+    ...describedAs(form),
     timeframe: form.timeframe,
     setup: {
       type: form.setup.type,
       params: setupParams(form.setup),
     } as SetupStrategy['setup'],
-    exit: {
-      stop_loss: null,
-      take_profit: form.takeProfit.enabled
-        ? { type: 'risk_multiple', params: { rr: form.takeProfit.rr } }
-        : null,
-      conditions: [],
+    ...setupExit(form),
+    risk: {
+      sizing: { type: 'percent_risk', params: { percent: form.percent } },
+      ...riskCaps(form),
     },
-    risk: { sizing: { type: 'percent_risk', params: { percent: form.percent } } },
   }
 }
 
@@ -525,6 +568,7 @@ export function buildConditionStrategy(form: StrategyForm): ConditionStrategy {
   const strategy: ConditionStrategy = {
     schema_version: '1.0',
     name: form.name,
+    ...describedAs(form),
     timeframe: form.timeframe,
     entry: { long: buildCondition(form.long), short: buildCondition(form.short) },
     exit: {
@@ -536,7 +580,10 @@ export function buildConditionStrategy(form: StrategyForm): ConditionStrategy {
         : null,
       conditions: form.exit.rows.map(conditionOf),
     },
-    risk: { sizing: { type: 'percent_risk', params: { percent: form.percent } } },
+    risk: {
+      sizing: { type: 'percent_risk', params: { percent: form.percent } },
+      ...riskCaps(form),
+    },
   }
   if (form.indicators.length > 0) {
     // The generated `Indicators` type is a union of fixed-length tuples (0..20); a mapped array
@@ -554,7 +601,7 @@ export function buildConditionStrategy(form: StrategyForm): ConditionStrategy {
   return strategy
 }
 
-function emptySide(): SideForm {
+export function emptySide(): SideForm {
   return { enabled: false, combine: 'all', rows: [] }
 }
 
@@ -578,6 +625,9 @@ export function emptyForm(): StrategyForm {
     takeProfit: { enabled: false, rr: 2 },
     exit: emptySide(),
     percent: 1,
+    description: '',
+    maxOpenPositions: '',
+    maxDailyLossPercent: '',
   }
 }
 
@@ -607,6 +657,9 @@ export function maCrossForm(now: Date): StrategyForm {
       rows: [{ shape: 'comparison', left: 'fast', op: 'crosses_below', right: refOperand('slow') }],
     },
     percent: 1,
+    description: '',
+    maxOpenPositions: '',
+    maxDailyLossPercent: '',
   }
 }
 
@@ -634,6 +687,9 @@ export function rsiOversoldForm(now: Date): StrategyForm {
       rows: [{ shape: 'comparison', left: 'rsi', op: 'crosses_above', right: valueOperand('70') }],
     },
     percent: 1,
+    description: '',
+    maxOpenPositions: '',
+    maxDailyLossPercent: '',
   }
 }
 

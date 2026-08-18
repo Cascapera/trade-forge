@@ -50,6 +50,18 @@ export function useInstruments() {
   return useQuery<Instrument[]>({ queryKey: ['instruments'], queryFn: api.listInstruments })
 }
 
+/**
+ * One saved strategy, by id — the endpoint that had no caller until the builder learned to open
+ * one. Immutable for its version, so it never needs refetching once it has arrived.
+ */
+export function useStrategy(id: string | undefined) {
+  return useQuery<StrategyOut>({
+    queryKey: ['strategy', id],
+    queryFn: id === undefined ? skipToken : () => api.getStrategy(id),
+    staleTime: Infinity,
+  })
+}
+
 export function useCreateStrategy() {
   return useMutation<StrategyOut, Error, Strategy>({
     mutationFn: (definition) => api.createStrategy(definition),

@@ -530,6 +530,24 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
   operando do builder são texto livre, então funciona, mas nada oferece os três nomes nem avisa que
   `bb` sozinho é recusado. O erro que chega é legível (a camada semântica lista os componentes), o
   que torna isto atrito e não defeito. Some no PR-206.
+- [origem: PR-206-C1] **A tela carrega três campos que não mostra** — `description`,
+  `max_open_positions` e `max_daily_loss_percent` agora sobrevivem ao round-trip (abrir e salvar
+  não os apaga), mas **nenhum controle os edita**. Foi escolha de escopo: sem eles no formulário o
+  round-trip perderia dado de documentos reais, e com controle para eles o PR viraria outro. Três
+  campos de texto no bloco de risco resolvem.
+- [origem: PR-206-C1] **Nada leva o usuário à rota `/strategies/:id`** — ela existe e funciona, e
+  só se chega nela digitando a URL. O `useStrategies` (lista) já existe desde o PR-104. Falta o
+  link, que é meia hora e provavelmente pertence ao PR que fizer a tela de lista de estratégias.
+- [origem: PR-206-C1] **Grupo aninhado e `not` são recusados, com o caminho nomeado** — é o
+  **PR-206-C2**, que transforma `SideForm.rows` em árvore. O teste de round-trip já está escrito e
+  a fixture `nested_logic` já está no corpus esperando: hoje ela é o caso de recusa, e no C2 vira
+  o caso de round-trip. Junto vai o controle próprio para `candle[-N]`.
+- [origem: PR-206-C1] **Abrir e salvar `setup_structure_continuation_defaults` escreve os
+  parâmetros que o documento omitia** — não é perda (é a mesma estratégia, soletrada), e é ponto
+  fixo a partir do segundo salvamento, o que está preso por teste. A causa é que o formulário tem
+  **um** estado vazio por campo e ele significa "não definido"; o documento distingue "ausente" de
+  "desligado" e o formulário não. Resolver de verdade exigiria um terceiro estado por campo —
+  registrar antes de alguém "consertar" isso sem saber o que está trocando.
 - [origem: PR-206-B2] **Adicionar um indicador não pré-preenche mais o `period`** — não é defeito,
   é a consequência de a tela ler o schema: `period` não tem default no Pydantic, então a caixa
   nasce vazia e o botão de rodar fica desabilitado até alguém escolher a janela. O `14` que

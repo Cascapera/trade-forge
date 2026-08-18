@@ -162,6 +162,33 @@ describe('the three shapes a row can take', () => {
   })
 })
 
+describe('the keys a document does not carry', () => {
+  it('writes no description when there is none', () => {
+    // ⚠️ `""` is the schema's own default, so writing it adds a key that says nothing — and a
+    // key that says nothing is what made re-saving a loaded document rewrite its shape. Same
+    // rule as the empty `exit` block on a setup document.
+    expect(buildStrategy(maCrossForm(PICKED_AT))).not.toHaveProperty('description')
+  })
+
+  it('writes a description when there is one', () => {
+    const form = { ...maCrossForm(PICKED_AT), description: 'rompimento com filtro de tendência' }
+    expect(buildStrategy(form)).toHaveProperty('description', 'rompimento com filtro de tendência')
+  })
+
+  it('writes a risk cap only when the box holds one', () => {
+    const blank = buildStrategy(maCrossForm(PICKED_AT))
+    expect(blank.risk).not.toHaveProperty('max_open_positions')
+    expect(blank.risk).not.toHaveProperty('max_daily_loss_percent')
+
+    const capped = buildStrategy({
+      ...maCrossForm(PICKED_AT),
+      maxOpenPositions: '2',
+      maxDailyLossPercent: '2.5',
+    })
+    expect(capped.risk).toMatchObject({ max_open_positions: 2, max_daily_loss_percent: 2.5 })
+  })
+})
+
 describe('an indicator form driven by the schema', () => {
   it('starts every parameter at what the schema declares, and blank where it declares nothing', () => {
     // ⚠️ `period` is blank on purpose. The Pydantic model gives it no default, so a form that
@@ -447,8 +474,20 @@ describe('buildSetupStrategy', () => {
     // layer refuses a setup document that carries any of them, so the builder must not emit them.
     expect(document).not.toHaveProperty('indicators')
     expect(document).not.toHaveProperty('entry')
-    expect(document.exit?.stop_loss).toBeNull()
-    expect(document.exit?.conditions).toEqual([])
+    // ⚠️ **Absent, not `null`.** These used to be written as `stop_loss: null, conditions: []`,
+    // which is the schema's own default spelled out — keys that say nothing. Writing them made
+    // opening a saved setup document and saving it again rewrite its shape, which is exactly the
+    // loss the round-trip in `parse.test.ts` exists to forbid.
+    expect(document.exit).not.toHaveProperty('stop_loss')
+    expect(document.exit).not.toHaveProperty('conditions')
+  })
+
+  it('leaves the whole exit block out when there is nothing to put in it', () => {
+    // A setup with no target carries no exit at all, matching `setup_mme9_breakout` in the
+    // fixtures — the document says nothing rather than saying "nothing" three times.
+    const form = pontoContinuoForm()
+    const document = buildSetupStrategy({ ...form, takeProfit: { enabled: false, rr: 5 } })
+    expect(document).not.toHaveProperty('exit')
   })
 
   it('fills every parameter with the number the schema declares', () => {

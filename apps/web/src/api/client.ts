@@ -81,6 +81,7 @@ export const api = {
     request('GET', `/backtests${query({ ...filters })}`),
   createStrategy: (definition: unknown): Promise<StrategyOut> =>
     request('POST', '/strategies', definition),
+  getStrategy: (id: string): Promise<StrategyOut> => request('GET', `/strategies/${id}`),
   // Editing is a new version, not an update: the API inserts the next version linked to this
   // parent. It is what makes iterating on a strategy possible at all — `POST` always writes
   // version 1, and name+version is unique, so re-saving under the same name can only conflict.

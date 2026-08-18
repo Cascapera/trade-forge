@@ -323,6 +323,46 @@ class MT5Source:
             for rate in rates
         ]
 
+    def latest_closed(self, symbol: str, timeframe: str) -> Candle | None:
+        """The bar that just closed — asked for by **position**, never worked out from a clock.
+
+        `copy_rates_from_pos(start_pos=1, count=1)` is the whole answer: position 0 is the bar
+        still forming and position 1 is the last one that closed. The terminal states which is
+        which, so this method never has to decide it.
+
+        ⚠️ **The version that computes it instead is wrong for as long as the market is shut.**
+        Comparing `bar.time + step <= now` needs `self._offset`, and that offset is measured
+        from the newest tick — so a market that stopped ticking freezes the measurement and the
+        comparison drifts by exactly the length of the stop. Measured on this broker on
+        18/08/2026: five symbols all stopped at 22:59:59 server time, and 46 minutes later the
+        measurement read +134 min against a real +180. Nothing raises; the loop simply decides
+        wrong. The offset is still applied below, to *label* the bar in UTC — translating is not
+        deciding.
+
+        `None` rather than an exception when there is no bar: a symbol the broker has never
+        quoted and a session that has not produced its first bar are both ordinary states of the
+        world, and a live loop that crashed on either would be a loop that cannot start before
+        the open.
+        """
+        mt5 = self._require_connection()
+        spec = self.instrument(symbol)
+
+        rates = mt5.copy_rates_from_pos(symbol, self._timeframe_constant(mt5, timeframe), 1, 1)
+        if rates is None or len(rates) == 0:
+            return None
+
+        rate = rates[0]
+        return Candle(
+            time=dt.datetime.fromtimestamp(int(rate["time"]), tz=dt.UTC) - self._offset,
+            open=normalise(Decimal(str(rate["open"])), spec.digits),
+            high=normalise(Decimal(str(rate["high"])), spec.digits),
+            low=normalise(Decimal(str(rate["low"])), spec.digits),
+            close=normalise(Decimal(str(rate["close"])), spec.digits),
+            tick_volume=int(rate["tick_volume"]),
+            spread=int(rate["spread"]),
+            real_volume=int(rate["real_volume"]),
+        )
+
     def _measure_offset(self) -> dt.timedelta:
         mt5 = self._require_connection()
 

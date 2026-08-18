@@ -16,12 +16,15 @@ collector refuses rather than guess — see `mt5_source.offset_is_plausible`.
 import argparse
 import datetime as dt
 import logging
+import os
 import sys
+import time
 from collections.abc import Sequence
 from pathlib import Path
 
 from tradeforge_collector.backfill import backfill
 from tradeforge_collector.gaps import format_report
+from tradeforge_collector.live import LiveSource, Subscription, poll_once
 from tradeforge_collector.source import MarketDataSource
 from tradeforge_collector.synthetic import SyntheticSource
 from tradeforge_collector.timeframes import TIMEFRAME_STEP
@@ -118,6 +121,62 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
 
+    # The loop the whole of phase 3 hangs from. It has no natural end, so it is a command that
+    # is expected to be killed — see `_live` for why Ctrl-C is a clean exit here.
+    live = commands.add_parser(
+        "live",
+        help="watch a symbol and publish each closed candle to a Redis stream",
+        description=(
+            "Polls the source for the bar that just closed and publishes it to "
+            "candles.{symbol}.{timeframe}. It never works out 'closed' from a clock: the "
+            "source is asked for the closed bar by position, because a broker's offset is "
+            "measured from the newest tick and a shut market freezes that measurement."
+        ),
+    )
+    live.add_argument("symbol")
+    live.add_argument(
+        "timeframes",
+        nargs="+",
+        choices=sorted(TIMEFRAME_STEP),
+        metavar="TIMEFRAME",
+        help="one or more timeframes to watch on this symbol, e.g. M1 M5",
+    )
+    live.add_argument(
+        "--source",
+        choices=("mock", "mt5"),
+        default="mock",
+        help="mock: deterministic synthetic data (default). mt5: a real terminal (Windows)",
+    )
+    live.add_argument(
+        "--asset-class",
+        choices=[member.value for member in AssetClass],
+        help="override the class inferred from the symbol's MT5 path",
+    )
+    live.add_argument(
+        "--server-offset",
+        type=_hours,
+        metavar="HOURS",
+        help=(
+            "the broker's clock, in hours ahead of UTC (e.g. +3). Only labels the candle here "
+            "— whether a bar closed is read from its position, never from this"
+        ),
+    )
+    live.add_argument(
+        "--every",
+        type=float,
+        default=5.0,
+        # Far shorter than the shortest bar, because a close is only noticed on the poll after
+        # it happens: five seconds on M1 means a bar is announced within 5s of closing.
+        help="seconds between polls (default: 5)",
+    )
+    live.add_argument(
+        "--once",
+        action="store_true",
+        help="poll a single time and exit — what a smoke test runs",
+    )
+    live.add_argument("--redis-host", default=os.environ.get("REDIS_HOST", "localhost"))
+    live.add_argument("--redis-port", type=int, default=int(os.environ.get("REDIS_PORT", "6379")))
+
     return parser
 
 
@@ -159,6 +218,49 @@ def _catalogue_command(args: argparse.Namespace) -> int:
     finally:
         engine.dispose()
     return 0
+
+
+def _live(args: argparse.Namespace) -> int:
+    """Watch one symbol on one or more timeframes until interrupted.
+
+    The source comes through the same `_source` seam the backfill uses, so `--source mock` runs
+    this entire loop on a Linux box with no terminal — which is the only reason its behaviour
+    can be under test at all.
+    """
+    # Imported here rather than at module scope so `--help` and the other subcommands never
+    # need a Redis client, the same reason `_source` defers the MetaTrader import.
+    from redis import Redis  # noqa: PLC0415
+
+    from tradeforge_collector.publisher import RedisCandlePublisher  # noqa: PLC0415
+
+    source = _source(args)
+    if not isinstance(source, LiveSource):
+        raise ValueError(f"the {args.source} source cannot be watched live")
+    subscriptions = [Subscription(args.symbol, timeframe) for timeframe in args.timeframes]
+
+    client = Redis(host=args.redis_host, port=args.redis_port, decode_responses=True)
+    publisher = RedisCandlePublisher(client)
+    seen: dict[Subscription, dt.datetime] = {}
+
+    logging.getLogger(__name__).info(
+        "watching %s on %s, polling every %.0fs",
+        args.symbol,
+        ", ".join(args.timeframes),
+        args.every,
+    )
+    try:
+        while True:
+            poll_once(source, publisher, subscriptions, seen=seen)
+            if args.once:
+                return 0
+            time.sleep(args.every)
+    except KeyboardInterrupt:
+        # ⚠️ A clean stop, not a failure. This command is meant to be killed — it is a loop with
+        # no natural end — and a traceback on Ctrl-C teaches the reader to ignore tracebacks.
+        logging.getLogger(__name__).info("stopped")
+        return 0
+    finally:
+        client.close()
 
 
 def _source(args: argparse.Namespace) -> MarketDataSource:
@@ -216,7 +318,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     args = _parser().parse_args(argv)
     try:
-        return _catalogue_command(args) if args.command == "catalogue" else _backfill(args)
+        commands = {
+            "catalogue": _catalogue_command,
+            "live": _live,
+            "backfill": _backfill,
+        }
+        return commands[args.command](args)
     except (LookupError, ValueError, ConnectionError) as error:
         # These are the ways either command legitimately fails: a symbol the broker does not
         # offer, a range with no data, a terminal that is not running. A stack trace

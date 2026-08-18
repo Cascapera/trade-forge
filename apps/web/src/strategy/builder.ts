@@ -155,16 +155,43 @@ export interface RefGroup {
 export const PRICE_REFS: readonly string[] = SOURCES.map((source) => `price.${source}`)
 
 /**
- * The option that means "none of these", and what picking it puts in the box.
+ * The option that opens the one ref form a list cannot enumerate, and what picking it starts from.
  *
- * ⚠️ **The ref grammar has a form no list can hold.** `price.close` and `bb.upper` are
- * enumerable; `candle[-N].field` is not, because N is unbounded. A picker with no escape would
- * make that form unreachable from the screen — trading one unreachable corner of the grammar for
- * another. So picking `custom` seeds the shortest well-formed candle ref and reveals the box,
- * which both keeps the form reachable and shows its shape to somebody who has never typed one.
+ * ⚠️ **`candle[-N].field` has no finite list**, because N is unbounded — which is why the picker
+ * carried a free-text escape when it was first built. It does not need one any more: N is just a
+ * number and the field is one of four, so the form gets a control of its own and the grammar is
+ * fully clickable. The box that remains is for a ref that is *stale* — one left dangling by an
+ * indicator that was renamed — which is shown as written rather than silently swapped.
  */
-export const CUSTOM_REF = '__custom__'
-export const CUSTOM_REF_SEED = 'candle[-1].close'
+export const CANDLE_REF = '__candle__'
+export const CANDLE_REF_SEED = 'candle[-1].close'
+
+// ⚠️ Built from `SOURCES` rather than spelling the four fields out again. Written by hand the
+// list would exist twice in this file, and the copy that goes stale is the one that decides
+// whether the candle controls are drawn at all — a fifth field would be accepted by the DSL and
+// silently treated here as "not a candle ref".
+const CANDLE_PATTERN = new RegExp(`^candle\\[-([1-9][0-9]*)\\]\\.(${SOURCES.join('|')})$`)
+
+/**
+ * A closed candle reference, taken apart — or `null` for anything that is not one.
+ *
+ * Destructured and checked rather than asserted: the two lint rules in this project forbid both
+ * `as` for removing `undefined` and `!`, and the check is what the compiler actually wanted. The
+ * `find` over `SOURCES` is what narrows the field to the union without an assertion at all.
+ */
+export function parseCandleRef(ref: string): { bars: string; field: Source } | null {
+  const [, bars, field] = CANDLE_PATTERN.exec(ref) ?? []
+  if (bars === undefined || field === undefined) return null
+  const source = SOURCES.find((one) => one === field)
+  return source === undefined ? null : { bars, field: source }
+}
+
+/** ...and put back together. The offset starts at 1: `candle[-0]` would be the forming candle
+ *  under a second name, which the DSL refuses. */
+export function candleRef(bars: string, field: Source): string {
+  const back = bars.trim() === '' ? '1' : bars.trim()
+  return `candle[-${back}].${field}`
+}
 
 /**
  * Every ref the screen can offer, given what this strategy declares.
@@ -209,6 +236,25 @@ export type ConditionRow =
   | { shape: 'comparison'; left: string; op: ComparisonOp; right: OperandForm }
   | { shape: 'between'; value: string; low: OperandForm; high: OperandForm }
   | { shape: 'trend'; of: string; op: TrendOp; bars: string }
+
+/**
+ * A node of the condition tree: one of the three leaves, a group of them, or a negation.
+ *
+ * ⚠️ **The same union the DSL has, and no more.** `all`, `any` and `not` were expressible in the
+ * engine and in every saved document from the first day; the form has shown one flat level of
+ * them since it existed, which is why a document like `nested_logic` could be run but never
+ * opened. Adding the two container shapes here is what closes that, and it is why they carry no
+ * fields of their own beyond what the DSL gives them — a group is a combiner and its children.
+ */
+export type ConditionNode =
+  | ConditionRow
+  | { shape: 'group'; combine: Combine; children: ConditionNode[] }
+  | { shape: 'not'; child: ConditionNode }
+
+/** The three shapes that are a single condition rather than a container. */
+export function isRow(node: ConditionNode): node is ConditionRow {
+  return node.shape !== 'group' && node.shape !== 'not'
+}
 
 /** The series the row asks about, whatever the DSL calls it in this shape. */
 export function subjectOf(row: ConditionRow): string {
@@ -279,6 +325,12 @@ export function withOp(row: ConditionRow, op: RowOp): ConditionRow {
   }
 }
 
+/** A blank group — what `+ group` adds. It starts with one condition, because a group with no
+ *  children is a document the schema refuses. */
+export function emptyGroup(): ConditionNode {
+  return { shape: 'group', combine: 'all', children: [emptyRow()] }
+}
+
 /** A blank comparison — what `+ condition` adds, and the shape eight of the eleven operators take. */
 export function emptyRow(): ConditionRow {
   return { shape: 'comparison', left: '', op: 'gt', right: refOperand() }
@@ -287,7 +339,17 @@ export function emptyRow(): ConditionRow {
 export interface SideForm {
   enabled: boolean
   combine: Combine
-  rows: ConditionRow[]
+  /**
+   * The top level of the tree, still a list.
+   *
+   * ⚠️ A list rather than a single root node, and the difference shows on screen: with a root the
+   * top of every side would be one group box, so opening a two-rule strategy would show a box
+   * containing two rules instead of the two rules. The cost is one normalisation — a document
+   * whose side is `{all: [x]}` comes back as `x` — and that is not a loss, because a group of one
+   * *is* its child. The fixed-point test in `parse.test.ts` is what keeps it from being anything
+   * more than that.
+   */
+  rows: ConditionNode[]
 }
 
 export interface StopForm {
@@ -378,8 +440,19 @@ function describedAs(form: StrategyForm): { description?: string } {
  * reason: an untouched box is not a number the author chose. Sending `0` would be worse than
  * wrong, because `rising` over zero bars asks nothing.
  */
-export function conditionOf(row: ConditionRow): Condition {
+export function conditionOf(row: ConditionNode): Condition {
   switch (row.shape) {
+    case 'group': {
+      // ⚠️ A group with one child is emitted as a group, not collapsed. At the *root* of a side
+      // the collapse is right — `buildCondition` does it, and a lone rule is a lone rule — but
+      // here the group is something the author built, and unwrapping it would delete a container
+      // they can see on screen.
+      const [first, ...rest] = row.children.map(conditionOf)
+      if (first === undefined) throw new Error('a group with no conditions cannot be built')
+      return row.combine === 'all' ? { all: [first, ...rest] } : { any: [first, ...rest] }
+    }
+    case 'not':
+      return { not: conditionOf(row.child) }
     case 'comparison':
       return { op: row.op, left: { ref: row.left }, right: operand(row.right) }
     case 'between':

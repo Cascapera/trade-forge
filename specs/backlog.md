@@ -530,6 +530,16 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
   operando do builder são texto livre, então funciona, mas nada oferece os três nomes nem avisa que
   `bb` sozinho é recusado. O erro que chega é legível (a camada semântica lista os componentes), o
   que torna isto atrito e não defeito. Some no PR-206.
+- [origem: PR-206-C2] **Uma ref pendurada aparece na lista mas não é editável** — o picker não tem
+  mais caixa de texto (as quatro formas da gramática viraram controles), então uma ref que deixou
+  de ser ofertável — porque o indicador foi renomeado — é acrescentada à própria lista para ficar
+  visível. Dá para trocá-la por qualquer opção válida, não dá para corrigir a digitação dela. É
+  o comportamento certo (a única correção de uma ref morta é escolher uma viva), mas se ele
+  incomodar, o caminho é renomear a ref junto com o indicador em vez de devolver a caixa.
+- [origem: PR-206-C2] **Não há como reordenar nem mover um nó entre grupos** — dá para adicionar,
+  negar e remover, e é só. Arrastar um nó para dentro de um grupo (ou para fora) é o que falta
+  para o builder ser "visual" no sentido pleno do `specs/fase-2.md`. Não bloqueia nada: a mesma
+  árvore é construível adicionando na ordem certa.
 - [origem: PR-206-C1] **A tela carrega três campos que não mostra** — `description`,
   `max_open_positions` e `max_daily_loss_percent` agora sobrevivem ao round-trip (abrir e salvar
   não os apaga), mas **nenhum controle os edita**. Foi escolha de escopo: sem eles no formulário o
@@ -538,10 +548,10 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
 - [origem: PR-206-C1] **Nada leva o usuário à rota `/strategies/:id`** — ela existe e funciona, e
   só se chega nela digitando a URL. O `useStrategies` (lista) já existe desde o PR-104. Falta o
   link, que é meia hora e provavelmente pertence ao PR que fizer a tela de lista de estratégias.
-- [origem: PR-206-C1] **Grupo aninhado e `not` são recusados, com o caminho nomeado** — é o
-  **PR-206-C2**, que transforma `SideForm.rows` em árvore. O teste de round-trip já está escrito e
-  a fixture `nested_logic` já está no corpus esperando: hoje ela é o caso de recusa, e no C2 vira
-  o caso de round-trip. Junto vai o controle próprio para `candle[-N]`.
+- ~~[origem: PR-206-C1]~~ **FEITO no PR-206-C2.** `SideForm.rows` virou `ConditionNode[]`, com
+  `group` e `not` como nós, e o editor virou recursivo. A fixture `nested_logic` saiu da lista de
+  recusa e entrou na de round-trip byte a byte — que é o **aceite do PR-206 no spec, e o fim da
+  fase 2**.
 - [origem: PR-206-C1] **Abrir e salvar `setup_structure_continuation_defaults` escreve os
   parâmetros que o documento omitia** — não é perda (é a mesma estratégia, soletrada), e é ponto
   fixo a partir do segundo salvamento, o que está preso por teste. A causa é que o formulário tem
@@ -557,12 +567,12 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
 - [origem: PR-206-B2] **`stop_buffer_ticks` vs `stop_buffer` continua aberto** — este PR tocou a
   tela do builder e **não** resolveu (um PR, um escopo). Segue valendo: nomes quase iguais,
   unidades diferentes, e a tela mostra os dois com o mesmo tipo de campo.
-- [origem: PR-206-B1] **`candle[-N].field` só é alcançável digitando, atrás do `custom…`** — é a
-  única das quatro formas da gramática de ref que **não é enumerável**, porque N não tem teto. O
-  picker resolve isso semeando `candle[-1].close` na caixa e mostrando o texto, então nada se
-  perdeu — mas continua sendo a única forma que exige acertar a sintaxe na mão. O conserto seria um
-  controle próprio: uma entrada "vela fechada" com um número de barras atrás e um seletor de campo,
-  o que a torna enumerável como as outras três. Candidato ao PR-206-C, junto do aninhamento.
+- ~~[origem: PR-206-B1]~~ **FEITO no PR-206-C2.** A entrada "a closed candle" no picker abre um
+  número de barras atrás e um seletor de campo, exatamente como estava previsto — e com isso a
+  **caixa de texto livre sumiu do picker**: as quatro formas da gramática de ref são controles
+  agora. O `CANDLE_PATTERN` é montado a partir de `SOURCES`, então a lista de campos existe uma
+  vez só. Originalmente: **`candle[-N].field` só é alcançável digitando, atrás do `custom…`** — é a
+  única das quatro formas da gramática de ref que **não é enumerável**, porque N não tem teto.
 - [origem: PR-201-B, achado do guardian] **O motor não recusa um indicador declarado com `id: "price"`
   ou `"candle"`** — o schema recusa (`RESERVED_IDS` em `semantic.py`), então é inalcançável pela API,
   mas num mapping direto o canal nasce e fica **permanentemente inalcançável**: o

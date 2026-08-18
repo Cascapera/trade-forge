@@ -18,8 +18,10 @@ import { useSession } from '../store'
 import {
   buildStrategy,
   catalogueHas,
-  CUSTOM_REF,
-  CUSTOM_REF_SEED,
+  CANDLE_REF,
+  CANDLE_REF_SEED,
+  candleRef,
+  emptyGroup,
   emptyRow,
   INDICATOR_KINDS,
   indicatorValues,
@@ -27,19 +29,24 @@ import {
   opOf,
   setupValues,
   STRATEGY_CHOICES,
+  parseCandleRef,
   refCatalogue,
   retypedValues,
+  SOURCES,
   strategyChoice,
   subjectName,
   subjectOf,
   TIMEFRAMES,
   withOp,
   withSubject,
+  type Combine,
+  type ConditionNode,
   type ConditionRow,
   type IndicatorForm,
   type OperandForm,
   type RefGroup,
   type RowOp,
+  type Source,
   type SetupForm,
   type SideForm,
   type StrategyChoice,
@@ -74,15 +81,20 @@ function RefPicker(props: {
   onChange: (next: string) => void
 }): React.JSX.Element {
   const { label, value, groups, onChange } = props
-  const custom = value !== '' && !catalogueHas(groups, value)
+  const candle = parseCandleRef(value)
+  const known = catalogueHas(groups, value)
+  // Neither offerable nor a closed-candle ref: a name somebody typed, or one left dangling by an
+  // indicator that was renamed. Derived, never stored — a stored flag could disagree with the
+  // value it describes, and the renamed case is exactly when it would.
+  const stale = value !== '' && !known && candle === null
   return (
     <>
       <select
         aria-label={label}
         className={inputClass}
-        value={custom ? CUSTOM_REF : value}
+        value={candle === null ? value : CANDLE_REF}
         onChange={(event) => {
-          onChange(event.target.value === CUSTOM_REF ? CUSTOM_REF_SEED : event.target.value)
+          onChange(event.target.value === CANDLE_REF ? CANDLE_REF_SEED : event.target.value)
         }}
       >
         <option value="">choose…</option>
@@ -95,17 +107,39 @@ function RefPicker(props: {
             ))}
           </optgroup>
         ))}
-        <option value={CUSTOM_REF}>custom…</option>
+        <optgroup label="a closed candle">
+          <option value={CANDLE_REF}>candle[-N].field</option>
+        </optgroup>
+        {stale && <option value={value}>{value}</option>}
       </select>
-      {custom && (
-        <input
-          aria-label={`${label} text`}
-          className={inputClass}
-          value={value}
-          onChange={(event) => {
-            onChange(event.target.value)
-          }}
-        />
+      {candle !== null && (
+        <>
+          <input
+            aria-label={`${label} bars back`}
+            className={inputClass}
+            type="number"
+            min={1}
+            value={candle.bars}
+            onChange={(event) => {
+              onChange(candleRef(event.target.value, candle.field))
+            }}
+          />
+          <span className="text-sm text-slate-500">bars back</span>
+          <select
+            aria-label={`${label} field`}
+            className={inputClass}
+            value={candle.field}
+            onChange={(event) => {
+              onChange(candleRef(candle.bars, event.target.value as Source))
+            }}
+          >
+            {SOURCES.map((source) => (
+              <option key={source} value={source}>
+                {source}
+              </option>
+            ))}
+          </select>
+        </>
       )}
     </>
   )
@@ -165,6 +199,277 @@ function OperandInput(props: {
   )
 }
 
+/**
+ * The fields of one leaf: its subject, its operator, and whatever operands that operator takes.
+ *
+ * `path` names the node's place in the tree and is what every control answers to — `0` at the top
+ * level, `1.0` for the first child of the second row. Top-level names are unchanged from when the
+ * list was flat, which is not an accident: a rename would have quietly rewritten every existing
+ * test's idea of what it was clicking.
+ */
+function RowFields(props: {
+  label: string
+  path: string
+  row: ConditionRow
+  groups: readonly RefGroup[]
+  onChange: (next: ConditionRow) => void
+}): React.JSX.Element {
+  const { label, path, row, groups, onChange } = props
+  return (
+    <>
+      <RefPicker
+        label={`${label} ${subjectName(row.shape)} ${path}`}
+        value={subjectOf(row)}
+        groups={groups}
+        onChange={(chosen) => {
+          onChange(withSubject(row, chosen))
+        }}
+      />
+      <select
+        aria-label={`${label} op ${path}`}
+        className={inputClass}
+        value={opOf(row)}
+        onChange={(event) => {
+          onChange(withOp(row, event.target.value as RowOp))
+        }}
+      >
+        {OP_GROUPS.map((group) => (
+          <optgroup key={group.shape} label={group.label}>
+            {group.ops.map((op) => (
+              <option key={op} value={op}>
+                {op}
+              </option>
+            ))}
+          </optgroup>
+        ))}
+      </select>
+      {row.shape === 'comparison' && (
+        <OperandInput
+          label={`${label} right ${path}`}
+          value={row.right}
+          groups={groups}
+          onChange={(next) => {
+            onChange({ ...row, right: next })
+          }}
+        />
+      )}
+      {row.shape === 'between' && (
+        <>
+          <OperandInput
+            label={`${label} low ${path}`}
+            value={row.low}
+            groups={groups}
+            onChange={(next) => {
+              onChange({ ...row, low: next })
+            }}
+          />
+          <span className="text-sm text-slate-500">and</span>
+          <OperandInput
+            label={`${label} high ${path}`}
+            value={row.high}
+            groups={groups}
+            onChange={(next) => {
+              onChange({ ...row, high: next })
+            }}
+          />
+        </>
+      )}
+      {row.shape === 'trend' && (
+        <>
+          <span className="text-sm text-slate-500">for</span>
+          <input
+            aria-label={`${label} bars ${path}`}
+            className={inputClass}
+            type="number"
+            min={1}
+            // Empty is not 1 typed out: it leaves the key off the node, so the engine's own
+            // default applies. The placeholder says which number that is.
+            placeholder="1"
+            value={row.bars}
+            onChange={(event) => {
+              onChange({ ...row, bars: event.target.value })
+            }}
+          />
+          <span className="text-sm text-slate-500">bars</span>
+        </>
+      )}
+    </>
+  )
+}
+
+/**
+ * The two things that can be added anywhere a condition can go.
+ *
+ * ⚠️ Every accessible name here **contains its visible text** (`Long + condition 1`, not
+ * `Long add condition 1`). The label has to disambiguate — there are now as many `+ condition`
+ * buttons as there are groups — and a name that replaces what the reader can see is the other
+ * half of the same a11y defect it is fixing.
+ */
+function AddButtons(props: {
+  label: string
+  path: string
+  onAdd: (node: ConditionNode) => void
+}): React.JSX.Element {
+  const { label, path, onAdd } = props
+  const at = path === '' ? '' : ` ${path}`
+  return (
+    <div className="flex gap-3">
+      <button
+        type="button"
+        aria-label={`${label} + condition${at}`}
+        className="text-sm text-sky-400 hover:text-sky-300"
+        onClick={() => {
+          onAdd(emptyRow())
+        }}
+      >
+        + condition
+      </button>
+      <button
+        type="button"
+        aria-label={`${label} + group${at}`}
+        className="text-sm text-sky-400 hover:text-sky-300"
+        onClick={() => {
+          onAdd(emptyGroup())
+        }}
+      >
+        + group
+      </button>
+    </div>
+  )
+}
+
+/**
+ * One node of the tree, whatever shape it is — the recursion that makes nesting possible.
+ *
+ * ⚠️ **`not` is drawn as a wrapper around its child rather than as a node with an editor of its
+ * own.** It has exactly one child and nothing to configure, so giving it a box with its own
+ * remove button would ask the reader to tell "remove the negation" from "remove the rule inside
+ * it" on every single one. The button toggles the wrapper; remove removes what is underneath.
+ */
+function NodeEditor(props: {
+  label: string
+  path: string
+  node: ConditionNode
+  groups: readonly RefGroup[]
+  onChange: (next: ConditionNode) => void
+  onRemove: () => void
+}): React.JSX.Element {
+  const { label, path, node, groups, onChange, onRemove } = props
+
+  if (node.shape === 'not') {
+    return (
+      <div className="flex items-start gap-2 rounded border border-rose-900/60 bg-rose-950/20 p-2">
+        <span className="mt-1 text-xs font-semibold tracking-wide text-rose-300">NOT</span>
+        <div className="flex-1">
+          <NodeEditor
+            label={label}
+            path={path}
+            node={node.child}
+            groups={groups}
+            onChange={(next) => {
+              onChange({ shape: 'not', child: next })
+            }}
+            onRemove={onRemove}
+          />
+        </div>
+        <button
+          type="button"
+          aria-label={`${label} un-not ${path}`}
+          className="text-xs text-rose-300 hover:text-rose-200"
+          onClick={() => {
+            onChange(node.child)
+          }}
+        >
+          un-not
+        </button>
+      </div>
+    )
+  }
+
+  const negate = (
+    <button
+      type="button"
+      aria-label={`${label} not ${path}`}
+      className="text-xs text-slate-500 hover:text-rose-300"
+      onClick={() => {
+        onChange({ shape: 'not', child: node })
+      }}
+    >
+      not
+    </button>
+  )
+  const remove = (
+    <button
+      type="button"
+      aria-label={`${label} remove ${path}`}
+      className="text-slate-500 hover:text-red-400"
+      onClick={onRemove}
+    >
+      remove
+    </button>
+  )
+
+  if (node.shape === 'group') {
+    return (
+      <div className="space-y-2 rounded border border-slate-700 bg-slate-900/40 p-2">
+        <div className="flex items-center gap-2">
+          <select
+            aria-label={`${label} combine ${path}`}
+            className={inputClass}
+            value={node.combine}
+            onChange={(event) => {
+              onChange({ ...node, combine: event.target.value as Combine })
+            }}
+          >
+            <option value="all">match all</option>
+            <option value="any">match any</option>
+          </select>
+          {negate}
+          {remove}
+        </div>
+        {node.children.map((child, index) => (
+          <NodeEditor
+            key={index}
+            label={label}
+            path={`${path}.${String(index)}`}
+            node={child}
+            groups={groups}
+            onChange={(next) => {
+              onChange({
+                ...node,
+                children: node.children.map((one, i) => (i === index ? next : one)),
+              })
+            }}
+            onRemove={() => {
+              // ⚠️ A group whose last child is removed goes with it. The alternative is a group
+              // with no children, which the schema refuses (`all` takes a non-empty list) and
+              // which would turn one click into a document nobody can save.
+              const rest = node.children.filter((_, i) => i !== index)
+              if (rest.length === 0) onRemove()
+              else onChange({ ...node, children: rest })
+            }}
+          />
+        ))}
+        <AddButtons
+          label={label}
+          path={path}
+          onAdd={(added) => {
+            onChange({ ...node, children: [...node.children, added] })
+          }}
+        />
+      </div>
+    )
+  }
+
+  return (
+    <div className="flex flex-wrap items-center gap-2">
+      <RowFields label={label} path={path} row={node} groups={groups} onChange={onChange} />
+      {negate}
+      {remove}
+    </div>
+  )
+}
+
 function ConditionRows(props: {
   label: string
   side: SideForm
@@ -173,9 +478,6 @@ function ConditionRows(props: {
   onChange: (next: SideForm) => void
 }): React.JSX.Element {
   const { label, side, groups, onChange } = props
-  const setRow = (index: number, next: ConditionRow): void => {
-    onChange({ ...side, rows: side.rows.map((row, i) => (i === index ? next : row)) })
-  }
   return (
     <div className="space-y-2">
       <div className="flex items-center gap-3">
@@ -205,107 +507,28 @@ function ConditionRows(props: {
       </div>
       {side.enabled &&
         side.rows.map((row, index) => (
-          <div key={index} className="flex items-center gap-2">
-            <RefPicker
-              label={`${label} ${subjectName(row.shape)} ${String(index)}`}
-              value={subjectOf(row)}
-              groups={groups}
-              onChange={(text) => {
-                setRow(index, withSubject(row, text))
-              }}
-            />
-            <select
-              aria-label={`${label} op ${String(index)}`}
-              className={inputClass}
-              value={opOf(row)}
-              onChange={(event) => {
-                setRow(index, withOp(row, event.target.value as RowOp))
-              }}
-            >
-              {OP_GROUPS.map((group) => (
-                <optgroup key={group.shape} label={group.label}>
-                  {group.ops.map((op) => (
-                    <option key={op} value={op}>
-                      {op}
-                    </option>
-                  ))}
-                </optgroup>
-              ))}
-            </select>
-            {row.shape === 'comparison' && (
-              <OperandInput
-                label={`${label} right ${String(index)}`}
-                value={row.right}
-                groups={groups}
-                onChange={(next) => {
-                  setRow(index, { ...row, right: next })
-                }}
-              />
-            )}
-            {row.shape === 'between' && (
-              <>
-                <OperandInput
-                  label={`${label} low ${String(index)}`}
-                  value={row.low}
-                  groups={groups}
-                  onChange={(next) => {
-                    setRow(index, { ...row, low: next })
-                  }}
-                />
-                <span className="text-sm text-slate-500">and</span>
-                <OperandInput
-                  label={`${label} high ${String(index)}`}
-                  value={row.high}
-                  groups={groups}
-                  onChange={(next) => {
-                    setRow(index, { ...row, high: next })
-                  }}
-                />
-              </>
-            )}
-            {row.shape === 'trend' && (
-              <>
-                <span className="text-sm text-slate-500">for</span>
-                <input
-                  aria-label={`${label} bars ${String(index)}`}
-                  className={inputClass}
-                  type="number"
-                  min={1}
-                  // Empty is not 1 typed out: it leaves the key off the node, so the engine's own
-                  // default applies. The placeholder says which number that is.
-                  placeholder="1"
-                  value={row.bars}
-                  onChange={(event) => {
-                    setRow(index, { ...row, bars: event.target.value })
-                  }}
-                />
-                <span className="text-sm text-slate-500">bars</span>
-              </>
-            )}
-            <button
-              type="button"
-              className="text-slate-500 hover:text-red-400"
-              onClick={() => {
-                onChange({ ...side, rows: side.rows.filter((_, i) => i !== index) })
-              }}
-            >
-              remove
-            </button>
-          </div>
+          <NodeEditor
+            key={index}
+            label={label}
+            path={String(index)}
+            node={row}
+            groups={groups}
+            onChange={(next) => {
+              onChange({ ...side, rows: side.rows.map((one, i) => (i === index ? next : one)) })
+            }}
+            onRemove={() => {
+              onChange({ ...side, rows: side.rows.filter((_, i) => i !== index) })
+            }}
+          />
         ))}
       {side.enabled && (
-        <button
-          type="button"
-          className="text-sm text-sky-400 hover:text-sky-300"
-          onClick={() => {
-            onChange({
-              ...side,
-              rows: [...side.rows, emptyRow()],
-            })
+        <AddButtons
+          label={label}
+          path=""
+          onAdd={(added) => {
+            onChange({ ...side, rows: [...side.rows, added] })
           }}
-        >
-          + condition
-        </button>
+        />
       )}
     </div>
   )

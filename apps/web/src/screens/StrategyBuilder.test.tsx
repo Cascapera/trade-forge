@@ -274,6 +274,98 @@ describe('running the backtest', () => {
   })
 })
 
+describe('building a nested rule on the screen', () => {
+  it('puts a group inside a side and a condition inside the group', () => {
+    renderWithProviders(<StrategyBuilder />)
+    fireEvent.change(screen.getByLabelText('strategy'), { target: { value: 'ma_cross' } })
+
+    // The template's long side is one comparison. Add a group beside it, then fill the group.
+    fireEvent.click(screen.getByLabelText('Long + group'))
+    fireEvent.change(screen.getByLabelText('Long combine 1'), { target: { value: 'any' } })
+    fireEvent.change(screen.getByLabelText('Long left 1.0'), { target: { value: 'slow' } })
+    fireEvent.change(screen.getByLabelText('Long op 1.0'), { target: { value: 'lt' } })
+    fireEvent.change(screen.getByLabelText('Long right 1.0 kind'), { target: { value: 'value' } })
+    fireEvent.change(screen.getByLabelText('Long right 1.0'), { target: { value: '30' } })
+
+    succeed()
+    answerTheOpenQuestions()
+    fireEvent.click(screen.getByRole('button', { name: /run backtest/i }))
+
+    expect(save.mock.calls[0]?.[0]).toMatchObject({
+      definition: {
+        entry: {
+          long: {
+            all: [
+              { op: 'crosses_above', left: { ref: 'fast' }, right: { ref: 'slow' } },
+              { any: [{ op: 'lt', left: { ref: 'slow' }, right: { value: 30 } }] },
+            ],
+          },
+        },
+      },
+    })
+  })
+
+  it('negates a condition, and takes the negation back off', () => {
+    renderWithProviders(<StrategyBuilder />)
+    fireEvent.change(screen.getByLabelText('strategy'), { target: { value: 'ma_cross' } })
+
+    fireEvent.click(screen.getByLabelText('Long not 0'))
+    // The fields stay where they were — a `not` wraps the rule, it does not replace it.
+    expect(screen.getByLabelText('Long left 0')).toHaveValue('fast')
+
+    succeed()
+    answerTheOpenQuestions()
+    fireEvent.click(screen.getByRole('button', { name: /run backtest/i }))
+    expect(save.mock.calls[0]?.[0]).toMatchObject({
+      definition: {
+        entry: {
+          long: { not: { op: 'crosses_above', left: { ref: 'fast' }, right: { ref: 'slow' } } },
+        },
+      },
+    })
+
+    // ⚠️ And it comes back off, which is the half a one-way button would fail. `un-not` is a
+    // different accessible name from `not` on purpose: the two are different states, and a
+    // toggle that kept one name would leave the reader guessing which way it goes.
+    fireEvent.click(screen.getByLabelText('Long un-not 0'))
+    fireEvent.click(screen.getByRole('button', { name: /run backtest/i }))
+    expect(save.mock.calls[1]?.[0]).toMatchObject({
+      definition: {
+        entry: { long: { op: 'crosses_above', left: { ref: 'fast' }, right: { ref: 'slow' } } },
+      },
+    })
+  })
+
+  it('removes the group when its last child goes, rather than leaving an empty one', () => {
+    // ⚠️ An empty group is a document the schema refuses — `all` takes a non-empty list — so the
+    // alternative to this is a click that produces a strategy nobody can save, with the error
+    // pointing at a container the reader cannot see is empty.
+    renderWithProviders(<StrategyBuilder />)
+    fireEvent.change(screen.getByLabelText('strategy'), { target: { value: 'ma_cross' } })
+
+    fireEvent.click(screen.getByLabelText('Long + group'))
+    expect(screen.getByLabelText('Long combine 1')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByLabelText('Long remove 1.0'))
+
+    expect(screen.queryByLabelText('Long combine 1')).not.toBeInTheDocument()
+    expect(screen.getByLabelText('Long left 0')).toHaveValue('fast')
+  })
+
+  it('names every control by its place in the tree', () => {
+    // ⚠️ The names carry a path because the tree makes them repeat: two groups both offer
+    // "+ condition", and a screen where several controls answer to one name is the duplicate
+    // accessible name defect, not a testing inconvenience.
+    renderWithProviders(<StrategyBuilder />)
+    fireEvent.change(screen.getByLabelText('strategy'), { target: { value: 'ma_cross' } })
+    fireEvent.click(screen.getByLabelText('Long + group'))
+    fireEvent.click(screen.getByLabelText('Long + group 1'))
+
+    expect(screen.getByLabelText('Long combine 1.1')).toBeInTheDocument()
+    expect(screen.getByLabelText('Long left 1.1.0')).toBeInTheDocument()
+  })
+})
+
 describe('opening a strategy that was already saved', () => {
   const saved = {
     schema_version: '1.0',
@@ -322,16 +414,15 @@ describe('opening a strategy that was already saved', () => {
   })
 
   it('says what it cannot show, and does not pretend to have loaded it', () => {
+    // ⚠️ Nested groups and `not` are shown now, so the refusal has to be demonstrated with what
+    // is still genuinely unshowable: a literal on the left of a comparison. `5 > lenta` is
+    // well-formed DSL that the builder has never offered, and quietly flipping it would be a
+    // different rule the day the operator is not symmetric.
     opened.data = {
       definition: {
         ...saved,
         entry: {
-          long: {
-            all: [
-              { op: 'gt', left: { ref: 'lenta' }, right: { value: 1 } },
-              { any: [{ op: 'lt', left: { ref: 'lenta' }, right: { value: 2 } }] },
-            ],
-          },
+          long: { op: 'gt', left: { value: 5 }, right: { ref: 'lenta' } },
           short: null,
         },
       },
@@ -340,7 +431,7 @@ describe('opening a strategy that was already saved', () => {
 
     expect(screen.getByText(/cannot be opened in the builder yet/i)).toBeInTheDocument()
     expect(
-      screen.getByText('entry.long.all[1]: a group inside a group, which the builder shows one level of'),
+      screen.getByText('entry.long: a literal (5) where the builder can only show a name'),
     ).toBeInTheDocument()
     // ⚠️ And the form was not filled from it. Showing the parts that parsed would hand the reader
     // a form that looks complete and writes a different strategy over their own on save.
@@ -364,19 +455,21 @@ describe('editing a condition strategy still works', () => {
     fireEvent.change(screen.getAllByLabelText('indicator source')[last]!, {
       target: { value: 'high' },
     })
+    // ⚠️ Only the indicator rows answer to a bare "remove" now. Every condition's remove carries
+    // its path (`Long remove 1.0`), because a tree of them all called "remove" is the duplicate
+    // accessible name problem, not a naming preference.
     const removeButtons = screen.getAllByRole('button', { name: 'remove' })
     fireEvent.click(removeButtons[removeButtons.length - 1]!)
 
     fireEvent.change(screen.getByLabelText('Long left 0'), { target: { value: 'fast' } })
     fireEvent.change(screen.getByLabelText('Long op 0'), { target: { value: 'gt' } })
     fireEvent.change(screen.getByLabelText('Long right 0'), { target: { value: 'slow' } })
-    fireEvent.click(screen.getAllByRole('button', { name: '+ condition' })[0]!)
+    fireEvent.click(screen.getByLabelText('Long + condition'))
     fireEvent.change(screen.getByLabelText('Long combine'), { target: { value: 'any' } })
-    const longRemoves = screen.getAllByRole('button', { name: 'remove' })
-    fireEvent.click(longRemoves[longRemoves.length - 1]!)
+    fireEvent.click(screen.getByLabelText('Long remove 1'))
 
     fireEvent.click(screen.getByLabelText('Short'))
-    fireEvent.click(screen.getAllByRole('button', { name: '+ condition' })[1]!)
+    fireEvent.click(screen.getByLabelText('Short + condition'))
     fireEvent.change(screen.getByLabelText('Short right 0'), { target: { value: 'slow' } })
 
     fireEvent.change(screen.getByLabelText('stop lookback'), { target: { value: '3' } })
@@ -554,21 +647,22 @@ describe('editing a condition strategy still works', () => {
     })
   })
 
-  it('keeps the one ref form no list can hold reachable, behind custom', () => {
+  it('builds a closed-candle reference from controls, with nothing typed', () => {
     renderWithProviders(<StrategyBuilder />)
     fireEvent.change(screen.getByLabelText('strategy'), { target: { value: 'ma_cross' } })
 
-    // No box while the value is offerable — the common case is a choice, not typing.
-    expect(screen.queryByLabelText('Long left 0 text')).not.toBeInTheDocument()
+    // ⚠️ This is the last corner of the ref grammar. It used to be reachable only by typing,
+    // behind a `custom…` escape, because `candle[-N].field` has no finite list — N is unbounded.
+    // It does have a finite *shape*: a number and one of four fields, which is a control.
+    fireEvent.change(screen.getByLabelText('Long left 0'), { target: { value: '__candle__' } })
 
-    fireEvent.change(screen.getByLabelText('Long left 0'), { target: { value: '__custom__' } })
+    // Seeded at the shortest well-formed one, so the reader starts from something that means
+    // something rather than from two empty boxes.
+    expect(screen.getByLabelText('Long left 0 bars back')).toHaveValue(1)
+    expect(screen.getByLabelText('Long left 0 field')).toHaveValue('close')
 
-    // ⚠️ Seeded, not blanked. `candle[-N].field` is the only form the catalogue cannot enumerate
-    // (N is unbounded), and somebody who has never written one needs to see its shape.
-    const box = screen.getByLabelText('Long left 0 text')
-    expect(box).toHaveValue('candle[-1].close')
-
-    fireEvent.change(box, { target: { value: 'candle[-3].high' } })
+    fireEvent.change(screen.getByLabelText('Long left 0 bars back'), { target: { value: '3' } })
+    fireEvent.change(screen.getByLabelText('Long left 0 field'), { target: { value: 'high' } })
 
     succeed()
     answerTheOpenQuestions()
@@ -577,6 +671,22 @@ describe('editing a condition strategy still works', () => {
     expect(save.mock.calls[0]?.[0]).toMatchObject({
       definition: { entry: { long: { left: { ref: 'candle[-3].high' } } } },
     })
+  })
+
+  it('shows a ref left dangling by a renamed indicator, written as it stands', () => {
+    // ⚠️ The picker no longer has a free-text box — every form of the grammar is a control now —
+    // so a ref that stopped being offerable has to appear in the list itself. Dropping it would
+    // silently repoint the rule at whatever the select fell back to, which is the same rule
+    // pointing somewhere else and no sign that it happened.
+    renderWithProviders(<StrategyBuilder />)
+    fireEvent.change(screen.getByLabelText('strategy'), { target: { value: 'ma_cross' } })
+    expect(screen.getByLabelText('Long left 0')).toHaveValue('fast')
+
+    fireEvent.change(screen.getAllByLabelText('indicator id')[0]!, { target: { value: 'rapida' } })
+
+    expect(screen.getByLabelText('Long left 0')).toHaveValue('fast')
+    expect(within(screen.getByLabelText('Long left 0')).getByRole('option', { name: 'rapida' }))
+      .toBeInTheDocument()
   })
 
   it('shows the schema errors when the document is not valid yet', () => {

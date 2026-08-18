@@ -33,9 +33,6 @@ const CORPUS: readonly { name: string; document: unknown }[] = [
   { name: 'setup_structure_continuation_defaults', document: setupContinuation },
 ]
 
-/** The one fixture whose shape the builder cannot show at all. */
-const REFUSED = 'nested_logic'
-
 /**
  * The one fixture that comes back **spelled out** rather than identical, and why.
  *
@@ -75,7 +72,12 @@ function document(entry: Record<string, unknown>): Record<string, unknown> {
 }
 
 describe('reading a saved document back into the form', () => {
-  it.each(CORPUS.filter((one) => one.name !== REFUSED && one.name !== SPELLED_OUT))(
+  // ⚠️ `nested_logic` is in this list now, and that single line is the phase-2 acceptance
+  // criterion arriving. It was written to exercise the expression tree in depth — `all > any >
+  // not > comparison` — and it was the one document in the repository that could be run and never
+  // opened. It is here rather than in a test of its own so that it is held to exactly the same
+  // standard as the flat ones: byte-for-byte, no normalisation.
+  it.each(CORPUS.filter((one) => one.name !== SPELLED_OUT))(
     'round-trips $name with nothing added and nothing lost',
     ({ document }) => {
       const result = formOf(document as Strategy)
@@ -90,41 +92,70 @@ describe('reading a saved document back into the form', () => {
     },
   )
 
-  it('refuses the one document whose shape the builder cannot show, naming every reason', () => {
+  it('reads the deep fixture as the tree it is, rather than flattening it', () => {
+    // Equality above proves the document survives; this proves it is *shaped* right on the way
+    // in, which equality alone does not — a parser that dropped the nesting and a builder that
+    // put it back the same way would agree with each other and be wrong about the form.
     const result = formOf(nested as unknown as Strategy)
-    if (result.ok) throw new Error('nested_logic should not be representable yet')
+    if (!result.ok) throw new Error(result.unsupported.join('; '))
 
-    // A group inside a group, and a `not` — both in `entry.long`, and both named with the path
-    // the reader has to go and look at.
-    expect(result.unsupported).toEqual([
-      'entry.long.all[1]: a group inside a group, which the builder shows one level of',
-      'entry.long.all[2]: a `not`, which the builder has no control for yet',
-    ])
+    const [first, second, third] = result.form.long.rows
+    expect(result.form.long.combine).toBe('all')
+    expect(first?.shape).toBe('comparison')
+    expect(second).toMatchObject({ shape: 'group', combine: 'any' })
+    expect(third).toMatchObject({ shape: 'not', child: { shape: 'comparison' } })
   })
 
-  it('names a `not` as a `not`, wherever in the tree it sits', () => {
-    // ⚠️ Found by a mutant: deleting the top-level `not` guard changed nothing, because the only
-    // `not` in the corpus is nested and was being reported as "a group inside a group" — true
-    // about the wrong thing, and a reader sent looking for a nested group would not find one.
+  it('round-trips a `not` sitting at the root of a side', () => {
+    // ⚠️ A separate case from the nested one, and a mutant is why: while `not` was a refusal, the
+    // top-level guard could be deleted with nothing failing, because the only `not` in the corpus
+    // is nested. The root and the interior are two paths and both need a document.
     const top = document({
       long: { not: { op: 'gt', left: { ref: 'fast' }, right: { value: 1 } } },
     })
     expect(validateStrategy(top).valid).toBe(true)
     const result = formOf(top as unknown as Strategy)
-    expect(result.ok).toBe(false)
-    if (!result.ok) {
-      expect(result.unsupported).toEqual([
-        'entry.long: a `not`, which the builder has no control for yet',
-      ])
-    }
+    if (!result.ok) throw new Error(result.unsupported.join('; '))
+    expect(result.form.long.rows[0]).toMatchObject({ shape: 'not' })
+    expect(buildStrategy(result.form)).toEqual(top)
+  })
+
+  it('round-trips a group nested inside a group inside a group', () => {
+    // The corpus goes three levels deep; nothing proves the recursion does not stop at three.
+    const deep = document({
+      long: {
+        all: [
+          { op: 'gt', left: { ref: 'fast' }, right: { ref: 'slow' } },
+          {
+            any: [
+              { op: 'lt', left: { ref: 'fast' }, right: { value: 1 } },
+              { all: [{ not: { op: 'gte', left: { ref: 'slow' }, right: { value: 2 } } }] },
+            ],
+          },
+        ],
+      },
+    })
+    expect(validateStrategy(deep).valid).toBe(true)
+    const result = formOf(deep as unknown as Strategy)
+    if (!result.ok) throw new Error(result.unsupported.join('; '))
+    expect(buildStrategy(result.form)).toEqual(deep)
   })
 
   it('reports every unsupported shape in one pass, not just the first', () => {
-    // ⚠️ The alternative — stopping at the first — turns a document with three problems into
-    // three attempts to find that out, and each attempt looks like a different bug.
-    const result = formOf(nested as unknown as Strategy)
+    // ⚠️ The alternative — stopping at the first — turns a document with two problems into two
+    // attempts to find that out, and each attempt looks like a different bug.
+    const doc = document({
+      long: {
+        all: [
+          { op: 'gt', left: { value: 5 }, right: { ref: 'fast' } },
+          { op: 'lt', left: { value: 6 }, right: { ref: 'slow' } },
+        ],
+      },
+    })
+    expect(validateStrategy(doc).valid).toBe(true)
+    const result = formOf(doc as unknown as Strategy)
     expect(result.ok).toBe(false)
-    if (!result.ok) expect(result.unsupported.length).toBeGreaterThan(1)
+    if (!result.ok) expect(result.unsupported).toHaveLength(2)
   })
 
   it('never returns a form it could not fill completely', () => {
@@ -140,7 +171,7 @@ describe('reading a saved document back into the form', () => {
     // Equality above says "the same document". This says "a legal one" — and the two are
     // different claims, because a bug that dropped a required field would break the second while
     // an equality check against an equally-broken expectation would not notice.
-    for (const { name, document } of CORPUS.filter((one) => one.name !== REFUSED)) {
+    for (const { name, document } of CORPUS) {
       const result = formOf(document as Strategy)
       if (!result.ok) throw new Error(`${name} refused`)
       const check = validateStrategy(buildStrategy(result.form))

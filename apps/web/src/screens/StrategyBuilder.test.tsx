@@ -1,4 +1,4 @@
-import { fireEvent, screen } from '@testing-library/react'
+import { fireEvent, screen, within } from '@testing-library/react'
 
 import { useSession } from '../store'
 import { renderWithProviders } from '../test-utils'
@@ -354,6 +354,66 @@ describe('editing a condition strategy still works', () => {
     // The box was never touched, so the node carries no window at all — the engine's own default
     // applies. `toEqual` above would accept an explicit `undefined`; this will not.
     expect(definition.entry.long).not.toHaveProperty('bars')
+  })
+
+  it('offers a band by component, and lets a rule be built from one without typing', () => {
+    renderWithProviders(<StrategyBuilder />)
+    fireEvent.change(screen.getByLabelText('strategy'), { target: { value: 'ma_cross' } })
+
+    fireEvent.click(screen.getByRole('button', { name: '+ indicator' }))
+    const ids = screen.getAllByLabelText('indicator id')
+    const last = ids.length - 1
+    fireEvent.change(ids[last]!, { target: { value: 'bb' } })
+    fireEvent.change(screen.getAllByLabelText('indicator kind')[last]!, {
+      target: { value: 'BOLLINGER' },
+    })
+
+    const subject = screen.getByLabelText('Long left 0')
+    // ⚠️ The bare id is not on offer, and that is the schema being obeyed rather than a style
+    // choice: `bb` alone is a document the semantic layer refuses.
+    expect(within(subject).queryByRole('option', { name: 'bb' })).not.toBeInTheDocument()
+    expect(within(subject).getByRole('option', { name: 'bb.upper' })).toBeInTheDocument()
+
+    // ⚠️ If the option did not exist this change would be a **silent no-op** and the row would
+    // keep saying `fast` — so the assertion on the saved document below is what makes this test
+    // about the picker rather than about `fireEvent`.
+    fireEvent.change(subject, { target: { value: 'bb.upper' } })
+
+    succeed()
+    answerTheOpenQuestions()
+    fireEvent.click(screen.getByRole('button', { name: /run backtest/i }))
+
+    expect(save.mock.calls[0]?.[0]).toMatchObject({
+      definition: {
+        indicators: [{ id: 'fast' }, { id: 'slow' }, { id: 'bb', type: 'BOLLINGER' }],
+        entry: { long: { left: { ref: 'bb.upper' } } },
+      },
+    })
+  })
+
+  it('keeps the one ref form no list can hold reachable, behind custom', () => {
+    renderWithProviders(<StrategyBuilder />)
+    fireEvent.change(screen.getByLabelText('strategy'), { target: { value: 'ma_cross' } })
+
+    // No box while the value is offerable — the common case is a choice, not typing.
+    expect(screen.queryByLabelText('Long left 0 text')).not.toBeInTheDocument()
+
+    fireEvent.change(screen.getByLabelText('Long left 0'), { target: { value: '__custom__' } })
+
+    // ⚠️ Seeded, not blanked. `candle[-N].field` is the only form the catalogue cannot enumerate
+    // (N is unbounded), and somebody who has never written one needs to see its shape.
+    const box = screen.getByLabelText('Long left 0 text')
+    expect(box).toHaveValue('candle[-1].close')
+
+    fireEvent.change(box, { target: { value: 'candle[-3].high' } })
+
+    succeed()
+    answerTheOpenQuestions()
+    fireEvent.click(screen.getByRole('button', { name: /run backtest/i }))
+
+    expect(save.mock.calls[0]?.[0]).toMatchObject({
+      definition: { entry: { long: { left: { ref: 'candle[-3].high' } } } },
+    })
   })
 
   it('shows the schema errors when the document is not valid yet', () => {

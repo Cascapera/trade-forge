@@ -513,10 +513,22 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
   `deviations` **antes** de `period`. Passou desapercebido até agora porque `period` < `source` nos
   outros sete. Vale o mesmo tratamento que o `setupSpec` já tem (required primeiro), no PR que tocar
   o formulário de indicadores.
-- [origem: PR-201-B] **Referenciar um componente exige digitar `bb.upper` à mão** — os campos de
+- ~~[origem: PR-201-B]~~ **FEITO no PR-206-B1.** Os campos de operando viraram picker: o catálogo
+  oferece `price.*` e, por indicador declarado, `refsFor` decide a grafia — id nu para os
+  single-valued, um item por componente para os compostos, e **nunca** o `bb` sozinho. Para isso as
+  classes `Bollinger`/`ADX` passaram a publicar os componentes via `json_schema_extra`, e
+  `COMPOSITE_COMPONENTS` deixou de ser um literal para ser **derivado da união** — o número de
+  cópias em Python caiu de duas para uma, e os nomes chegam ao schema como **dado** em vez de
+  prosa. Originalmente: **Referenciar um componente exige digitar `bb.upper` à mão** — os campos de
   operando do builder são texto livre, então funciona, mas nada oferece os três nomes nem avisa que
   `bb` sozinho é recusado. O erro que chega é legível (a camada semântica lista os componentes), o
   que torna isto atrito e não defeito. Some no PR-206.
+- [origem: PR-206-B1] **`candle[-N].field` só é alcançável digitando, atrás do `custom…`** — é a
+  única das quatro formas da gramática de ref que **não é enumerável**, porque N não tem teto. O
+  picker resolve isso semeando `candle[-1].close` na caixa e mostrando o texto, então nada se
+  perdeu — mas continua sendo a única forma que exige acertar a sintaxe na mão. O conserto seria um
+  controle próprio: uma entrada "vela fechada" com um número de barras atrás e um seletor de campo,
+  o que a torna enumerável como as outras três. Candidato ao PR-206-C, junto do aninhamento.
 - [origem: PR-201-B, achado do guardian] **O motor não recusa um indicador declarado com `id: "price"`
   ou `"candle"`** — o schema recusa (`RESERVED_IDS` em `semantic.py`), então é inalcançável pela API,
   mas num mapping direto o canal nasce e fica **permanentemente inalcançável**: o

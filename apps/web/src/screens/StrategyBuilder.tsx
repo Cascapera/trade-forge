@@ -16,6 +16,9 @@ import { NumberStepper } from '../components/NumberStepper'
 import { useSession } from '../store'
 import {
   buildStrategy,
+  catalogueHas,
+  CUSTOM_REF,
+  CUSTOM_REF_SEED,
   emptyRow,
   INDICATOR_KINDS,
   OP_GROUPS,
@@ -23,6 +26,7 @@ import {
   setupValues,
   SOURCES,
   STRATEGY_CHOICES,
+  refCatalogue,
   strategyChoice,
   subjectName,
   subjectOf,
@@ -32,6 +36,7 @@ import {
   type ConditionRow,
   type IndicatorForm,
   type OperandForm,
+  type RefGroup,
   type RowOp,
   type SetupForm,
   type SideForm,
@@ -47,8 +52,65 @@ const inputClass =
 const sectionClass = 'rounded-lg border border-slate-800 bg-slate-900/40 p-4'
 
 /**
+ * The name of something the engine can resolve, chosen rather than typed.
+ *
+ * ⚠️ **The box does not go away, and that is deliberate.** Three of the grammar's four ref forms
+ * are enumerable; `candle[-N].field` is not, because N is unbounded. So the list carries a
+ * `custom` entry that seeds a well-formed candle ref and reveals the box — a picker without one
+ * would make that form unreachable from the screen, which is trading one unreachable corner of
+ * the grammar for another.
+ *
+ * Whether the box shows is **derived** from the value, never stored: anything the catalogue
+ * cannot offer is being written by hand, including a ref left dangling by an indicator that was
+ * renamed. Storing a flag instead would let it disagree with the value it describes.
+ */
+function RefPicker(props: {
+  label: string
+  value: string
+  groups: readonly RefGroup[]
+  onChange: (next: string) => void
+}): React.JSX.Element {
+  const { label, value, groups, onChange } = props
+  const custom = value !== '' && !catalogueHas(groups, value)
+  return (
+    <>
+      <select
+        aria-label={label}
+        className={inputClass}
+        value={custom ? CUSTOM_REF : value}
+        onChange={(event) => {
+          onChange(event.target.value === CUSTOM_REF ? CUSTOM_REF_SEED : event.target.value)
+        }}
+      >
+        <option value="">choose…</option>
+        {groups.map((group) => (
+          <optgroup key={group.label} label={group.label}>
+            {group.refs.map((ref) => (
+              <option key={ref} value={ref}>
+                {ref}
+              </option>
+            ))}
+          </optgroup>
+        ))}
+        <option value={CUSTOM_REF}>custom…</option>
+      </select>
+      {custom && (
+        <input
+          aria-label={`${label} text`}
+          className={inputClass}
+          value={value}
+          onChange={(event) => {
+            onChange(event.target.value)
+          }}
+        />
+      )}
+    </>
+  )
+}
+
+/**
  * An operand box and the one-word question that says how to read it: a name the engine resolves
- * (`fast`, `price.close`, `bb.upper`) or a number typed literally.
+ * or a number typed literally.
  *
  * Shared by every bounded operand — the right-hand side of a comparison and both edges of a band
  * — because they are the same widget. The subject of a row is deliberately *not* one of these:
@@ -58,9 +120,10 @@ const sectionClass = 'rounded-lg border border-slate-800 bg-slate-900/40 p-4'
 function OperandInput(props: {
   label: string
   value: OperandForm
+  groups: readonly RefGroup[]
   onChange: (next: OperandForm) => void
 }): React.JSX.Element {
-  const { label, value, onChange } = props
+  const { label, value, groups, onChange } = props
   return (
     <>
       <select
@@ -74,16 +137,27 @@ function OperandInput(props: {
         <option value="ref">ref</option>
         <option value="value">value</option>
       </select>
-      <input
-        aria-label={label}
-        className={inputClass}
-        type={value.kind === 'value' ? 'number' : 'text'}
-        placeholder={value.kind === 'value' ? '30' : 'slow'}
-        value={value.text}
-        onChange={(event) => {
-          onChange({ ...value, text: event.target.value })
-        }}
-      />
+      {value.kind === 'ref' ? (
+        <RefPicker
+          label={label}
+          value={value.text}
+          groups={groups}
+          onChange={(text) => {
+            onChange({ ...value, text })
+          }}
+        />
+      ) : (
+        <input
+          aria-label={label}
+          className={inputClass}
+          type="number"
+          placeholder="30"
+          value={value.text}
+          onChange={(event) => {
+            onChange({ ...value, text: event.target.value })
+          }}
+        />
+      )}
     </>
   )
 }
@@ -91,9 +165,11 @@ function OperandInput(props: {
 function ConditionRows(props: {
   label: string
   side: SideForm
+  /** The refs this strategy's own indicators make available — the picker's second group. */
+  groups: readonly RefGroup[]
   onChange: (next: SideForm) => void
 }): React.JSX.Element {
-  const { label, side, onChange } = props
+  const { label, side, groups, onChange } = props
   const setRow = (index: number, next: ConditionRow): void => {
     onChange({ ...side, rows: side.rows.map((row, i) => (i === index ? next : row)) })
   }
@@ -127,13 +203,12 @@ function ConditionRows(props: {
       {side.enabled &&
         side.rows.map((row, index) => (
           <div key={index} className="flex items-center gap-2">
-            <input
-              aria-label={`${label} ${subjectName(row.shape)} ${String(index)}`}
-              className={inputClass}
-              placeholder="fast"
+            <RefPicker
+              label={`${label} ${subjectName(row.shape)} ${String(index)}`}
               value={subjectOf(row)}
-              onChange={(event) => {
-                setRow(index, withSubject(row, event.target.value))
+              groups={groups}
+              onChange={(text) => {
+                setRow(index, withSubject(row, text))
               }}
             />
             <select
@@ -158,6 +233,7 @@ function ConditionRows(props: {
               <OperandInput
                 label={`${label} right ${String(index)}`}
                 value={row.right}
+                groups={groups}
                 onChange={(next) => {
                   setRow(index, { ...row, right: next })
                 }}
@@ -168,6 +244,7 @@ function ConditionRows(props: {
                 <OperandInput
                   label={`${label} low ${String(index)}`}
                   value={row.low}
+                  groups={groups}
                   onChange={(next) => {
                     setRow(index, { ...row, low: next })
                   }}
@@ -176,6 +253,7 @@ function ConditionRows(props: {
                 <OperandInput
                   label={`${label} high ${String(index)}`}
                   value={row.high}
+                  groups={groups}
                   onChange={(next) => {
                     setRow(index, { ...row, high: next })
                   }}
@@ -355,6 +433,9 @@ export function StrategyBuilder(): React.JSX.Element {
   const save = useSaveStrategy()
   const run = useCreateBacktest()
 
+  // Recomputed whenever the indicator list changes: declaring an indicator has to make its name
+  // offerable in the same keystroke, and renaming one has to stop offering the old spelling.
+  const refs = useMemo(() => refCatalogue(form.indicators), [form.indicators])
   const document = useMemo(() => buildStrategy(form), [form])
   const validation = useMemo(() => validateStrategy(document), [document])
   const blocked = whyNotRunnable(backtest)
@@ -529,6 +610,7 @@ export function StrategyBuilder(): React.JSX.Element {
             <ConditionRows
               label="Long"
               side={form.long}
+              groups={refs}
               onChange={(next) => {
                 patch({ long: next })
               }}
@@ -536,6 +618,7 @@ export function StrategyBuilder(): React.JSX.Element {
             <ConditionRows
               label="Short"
               side={form.short}
+              groups={refs}
               onChange={(next) => {
                 patch({ short: next })
               }}
@@ -614,6 +697,7 @@ export function StrategyBuilder(): React.JSX.Element {
           <ConditionRows
             label="Exit conditions"
             side={form.exit}
+            groups={refs}
             onChange={(next) => {
               patch({ exit: next })
             }}

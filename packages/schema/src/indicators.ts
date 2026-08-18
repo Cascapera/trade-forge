@@ -25,12 +25,44 @@ export interface IndicatorSpec {
   type: IndicatorType
   /** The parameter names this indicator's own params model declares, in schema order. */
   params: readonly string[]
+  /**
+   * The component names a reference must pick from — `middle`, `upper`, `lower` for a band —
+   * or empty for an indicator referenced by its bare id.
+   *
+   * ⚠️ **Read from the schema, and it only became readable on purpose.** These names live in
+   * `COMPOSITE_COMPONENTS` in Python, and until the classes started publishing them through
+   * `json_schema_extra` the only trace of them in the schema was English prose inside a
+   * `description`. A builder that wanted to offer `bb.upper` had no choice but to write the
+   * list a third time, by hand, with nothing able to pin it to the two that already existed.
+   *
+   * ⚠️ **Ordered primary first**, like the Python map: a reader who does not know what a band
+   * is uses the order to tell the average from its envelope.
+   */
+  components: readonly string[]
 }
 
 interface Node {
   $ref?: string
   properties?: Record<string, Node>
+  components?: readonly unknown[]
   discriminator?: { propertyName: string; mapping: Record<string, string> }
+}
+
+/**
+ * The component names on an indicator's schema node, refused rather than coerced if malformed.
+ *
+ * Absent means single-valued, which is the common case and not an error. Present but not a list
+ * of strings means the generator changed under this file — and the reading that would let that
+ * pass quietly is `[]`, which is indistinguishable from "single-valued" and would turn every
+ * `bb.upper` in every saved strategy into a reference the builder cannot offer.
+ */
+function readComponents(type: string, node: Node): readonly string[] {
+  if (node.components === undefined) return []
+  const names = node.components.filter((name): name is string => typeof name === 'string')
+  if (names.length !== node.components.length) {
+    throw new Error(`indicator ${type} publishes a component that is not a name`)
+  }
+  return names
 }
 
 export function readIndicators(root: unknown): readonly IndicatorSpec[] {
@@ -49,11 +81,13 @@ export function readIndicators(root: unknown): readonly IndicatorSpec[] {
   if (mapping === undefined) throw new Error('the Indicator union lost its discriminator mapping')
 
   return Object.entries(mapping).map(([type, ref]) => {
-    const paramsRef = resolve(ref).properties?.params?.$ref
+    const node = resolve(ref)
+    const paramsRef = node.properties?.params?.$ref
     if (paramsRef === undefined) throw new Error(`indicator ${type} has no params definition`)
     return {
       type: type as IndicatorType,
       params: Object.keys(resolve(paramsRef).properties ?? {}),
+      components: readComponents(type, node),
     }
   })
 }
@@ -74,4 +108,16 @@ export function indicatorSpec(type: IndicatorType): IndicatorSpec {
 /** Whether this indicator reads one price series, or the whole candle. */
 export function takesSource(type: IndicatorType): boolean {
   return indicatorSpec(type).params.includes('source')
+}
+
+/**
+ * Every way a declared indicator with this id can be named in a ref.
+ *
+ * One name for a single-valued indicator, and one per component for a composite — never the bare
+ * id of a composite, because the semantic layer refuses it: "the middle band" is a tempting
+ * default for `bb` and a wrong one for `adx`, so the DSL makes the choice explicit.
+ */
+export function refsFor(type: IndicatorType, id: string): readonly string[] {
+  const { components } = indicatorSpec(type)
+  return components.length === 0 ? [id] : components.map((name) => `${id}.${name}`)
 }

@@ -2,6 +2,11 @@
   "$defs": {
     "ADX": {
       "additionalProperties": false,
+      "components": [
+        "adx",
+        "plus_di",
+        "minus_di"
+      ],
       "description": "Average Directional Index (Wilder) — how strongly a market trends, read by component.\n\nReferenced as `adx.adx` for the strength line and `adx.plus_di` / `adx.minus_di` for the two\ndirection lines. ⚠️ **The `adx` component has no direction**: it rises in a hard sell-off\nexactly as it does in a rally, so a rule meaning \"trending up\" needs the `DI` pair as well.\nReads the whole candle, so there is no price source to name — same argument as `PeriodParams`.",
       "properties": {
         "id": {
@@ -129,6 +134,11 @@
     },
     "Bollinger": {
       "additionalProperties": false,
+      "components": [
+        "middle",
+        "upper",
+        "lower"
+      ],
       "description": "Bollinger Bands — an average with a volatility envelope, read by component.\n\n⚠️ **One indicator with three readings, not three indicators.** Declared once as `bb`, its\nbands are referenced as `bb.upper`, `bb.middle` and `bb.lower`. Three separate declarations\nwould let a document give the upper band a period of 20 and the lower one 50, and nothing\ncould object: for this schema they would be two well-formed indicators. What came out would\nbe a band whose rails describe different markets, and it would look exactly like a band.",
       "properties": {
         "id": {

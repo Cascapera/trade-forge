@@ -5,12 +5,15 @@ import {
   buildConditionStrategy,
   buildSetupStrategy,
   buildStrategy,
+  catalogueHas,
+  CUSTOM_REF_SEED,
   emptyForm,
   emptyRow,
   maCrossForm,
   OP_GROUPS,
   opOf,
   OPS,
+  refCatalogue,
   refOperand,
   shapeOf,
   subjectOf,
@@ -24,6 +27,7 @@ import {
   strategyChoice,
   TIMEFRAMES,
   type ConditionRow,
+  type IndicatorForm,
   type SideForm,
   type StrategyForm,
 } from './builder'
@@ -152,6 +156,53 @@ describe('the three shapes a row can take', () => {
         )
       }
     }
+  })
+})
+
+describe('the refs the picker can offer', () => {
+  const sma = (id: string): IndicatorForm => ({ id, kind: 'SMA', period: 9, source: 'close' })
+
+  it('always offers the four fields of the candle being decided on', () => {
+    expect(refCatalogue([])).toEqual([
+      { label: 'this candle', refs: ['price.open', 'price.high', 'price.low', 'price.close'] },
+    ])
+  })
+
+  it('offers a single-valued indicator by its bare id', () => {
+    expect(refCatalogue([sma('fast')])[1]).toEqual({ label: 'indicators', refs: ['fast'] })
+  })
+
+  it('offers a composite by component, and never by its bare id', () => {
+    // ⚠️ The whole point of the schema change behind this PR. `bb` alone is a document the
+    // semantic layer refuses — "the middle band" is a tempting default and a wrong one for an
+    // ADX, whose first component is not a price — so the picker must not be able to produce it.
+    const refs = refCatalogue([{ id: 'bb', kind: 'BOLLINGER', period: 20, source: 'close' }])[1]
+    expect(refs).toEqual({ label: 'indicators', refs: ['bb.middle', 'bb.upper', 'bb.lower'] })
+    expect(refs?.refs).not.toContain('bb')
+  })
+
+  it('leaves out an indicator that has no name yet', () => {
+    // A fresh row starts blank, and `price.` prefixed nothing is not a ref anybody can pick.
+    expect(refCatalogue([sma('')])).toHaveLength(1)
+  })
+
+  it('offers a name once even when two indicators claim it', () => {
+    // A duplicate id is a document the semantic layer refuses — and also a state the form passes
+    // through while somebody is typing. A picker with the name twice would make a React key
+    // collision out of a message the API already gives properly.
+    expect(refCatalogue([sma('fast'), sma('fast')])[1]?.refs).toEqual(['fast'])
+  })
+
+  it('answers whether a ref is offerable, which is what reveals the free-text box', () => {
+    const groups = refCatalogue([sma('fast')])
+    expect(catalogueHas(groups, 'price.close')).toBe(true)
+    expect(catalogueHas(groups, 'fast')).toBe(true)
+    // ⚠️ The form the catalogue cannot hold: N is unbounded, so no list enumerates it. This
+    // answering `false` is what keeps the box on screen for it.
+    expect(catalogueHas(groups, CUSTOM_REF_SEED)).toBe(false)
+    // And a ref left dangling by an indicator that was renamed reads the same way — shown in the
+    // box exactly as written, rather than silently swapped for something offerable.
+    expect(catalogueHas(groups, 'slow')).toBe(false)
   })
 })
 

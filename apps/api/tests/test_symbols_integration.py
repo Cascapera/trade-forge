@@ -127,6 +127,25 @@ def test_a_limit_beyond_the_ceiling_is_refused_rather_than_clamped(client: TestC
     assert client.get("/symbols/search", params={"limit": 10_000}).status_code == 422
 
 
+def test_a_nul_byte_is_refused_rather_than_reaching_postgres(client: TestClient) -> None:
+    """⚠️ **Regression. This endpoint was green on the previous commit by luck.**
+
+    `q` goes straight into an `ILIKE` against a text column, and Postgres cannot hold a NUL
+    byte: `?q=%00` raises `DataError` from inside the driver, so a value the client fully
+    controls becomes a 500. Schemathesis found it on the run after the one that passed, because
+    a fuzzer has to *draw* the value — a green fuzz run is a lottery ticket, not a proof.
+
+    The project already had `StorableText` for exactly this, created the last time it happened,
+    and its docstring predicted this: a rule attached to one field is a rule the next field does
+    not inherit. `?q=` was the next field.
+    """
+    # `chr(0)` and not the escape, for the reason `_storable` gives about itself: writing
+    # this file put a real NUL in the source, and Python then refuses to parse it.
+    response = client.get("/symbols/search", params={"q": chr(0)})
+
+    assert response.status_code == 422
+
+
 def test_syncing_hands_the_job_to_the_queue_only_the_host_agent_drains(
     client: TestClient, queue: _CapturingQueue
 ) -> None:

@@ -19,7 +19,7 @@ from fastapi import APIRouter, Query, status
 
 from tradeforge_api.deps import QueueDep, SessionDep
 from tradeforge_api.queue import COLLECT_QUEUE, SYNC_SYMBOLS
-from tradeforge_api.schemas import EnqueuedOut, SymbolSearchOut
+from tradeforge_api.schemas import EnqueuedOut, StorableText, SymbolSearchOut
 from tradeforge_db.broker_symbols import DEFAULT_LIMIT, search_symbols, snapshot_taken_at
 
 router = APIRouter(tags=["symbols"])
@@ -33,8 +33,16 @@ _MAX_LIMIT = 100
 @router.get("/symbols/search", response_model=SymbolSearchOut)
 def search(
     session: SessionDep,
+    # ⚠️ `StorableText`, not `str`. This parameter goes straight into an `ILIKE` against a text
+    # column, and Postgres cannot hold a NUL byte — `?q=%00` raises `DataError` from inside the
+    # driver and turns a value the client fully controls into a 500. Found by schemathesis on
+    # this very endpoint, which had been green on the previous commit purely because the fuzzer
+    # had not drawn that value yet.
+    #
+    # The type exists because of the last time this happened, and its docstring says why the
+    # mistake repeats: a rule attached to one field is a rule the next field does not inherit.
     q: Annotated[
-        str,
+        StorableText,
         Query(max_length=32, description="prefix of the symbol, e.g. 'eur' or 'aap'"),
     ] = "",
     limit: Annotated[int, Query(ge=1, le=_MAX_LIMIT)] = DEFAULT_LIMIT,

@@ -55,7 +55,11 @@ export function emptyBacktestForm(): BacktestForm {
 export function costlessReason(form: BacktestForm, instrument: Instrument | undefined): string | null {
   if (form.cost !== 'none') return null
   if (form.symbol === '') return null
-  if (instrument?.default_spread_points == null) {
+  // ⚠️ Silent when the instrument does not exist at all. That run cannot start — `whyNotRunnable`
+  // says so and the button is shut — and a second amber box describing the shape of its equity
+  // curve would be both redundant and wrong: it talks about a run that is going to happen.
+  if (instrument === undefined) return null
+  if (instrument.default_spread_points == null) {
     return 'no spread has been catalogued for this instrument, so this run charges nothing'
   }
   return 'costs are switched off for this run, so the result is an upper bound'
@@ -114,8 +118,22 @@ export function toBacktestRequest(
 
 /** Why the run cannot start yet, or `null` if it can. The screen shows this instead of a button
  *  that is disabled for reasons the user has to guess. */
-export function whyNotRunnable(form: BacktestForm): string | null {
+export function whyNotRunnable(
+  form: BacktestForm,
+  instruments?: Instrument[],
+): string | null {
   if (form.symbol === '') return 'choose an instrument'
+  // ⚠️ The symbol field offers everything the *broker* has, which is a far longer list than
+  // what this system has candles for — measured 19/08/2026: 84 against 1. A backtest on an
+  // uncollected symbol fails at the API, so the button has to be shut rather than the failure
+  // explained afterwards.
+  //
+  // `undefined` means the catalogue has not arrived yet, not that the symbol is missing from
+  // it. Blocking on that would flicker the button shut on every page load and, worse, would
+  // put a sentence on screen accusing a perfectly collected symbol of not existing.
+  if (instruments !== undefined && !instruments.some((one) => one.symbol === form.symbol)) {
+    return `${form.symbol} has never been collected, so there are no candles to run against`
+  }
   if (form.dateFrom === '' || form.dateTo === '') return 'set the backtest window'
   if (form.dateFrom >= form.dateTo) return 'the window ends before it starts'
   if (Number(form.capital) <= 0) return 'initial capital must be positive'

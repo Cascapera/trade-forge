@@ -17,6 +17,7 @@ from decimal import Decimal
 from types import TracebackType
 from typing import Any, Self
 
+from tradeforge_collector.source import SymbolInfo
 from tradeforge_collector.storage import normalise
 from tradeforge_engine.domain import AssetClass, Candle, InstrumentSpec
 
@@ -249,6 +250,47 @@ class MT5Source:
             contract_size=Decimal(str(info.trade_contract_size)),
             digits=digits,
         )
+
+    def symbols(self) -> list[SymbolInfo]:
+        """Every symbol this account can see — Market Watch or not.
+
+        ⚠️ **Not filtered by `visible`, and that is the measurement talking.** On this broker 74
+        of 84 symbols sit outside Market Watch, and all 74 answer a prefix query and hand over
+        history. Filtering here would hide seven eighths of the catalogue behind a distinction
+        that only the live loop needs to make.
+
+        Cheap enough to do whole rather than in pages: `symbols_get()` over 84 symbols measured
+        at 0.5 ms, and the largest account this project has seen (9550) is the same call.
+        """
+        mt5 = self._require_connection()
+        self._require_terminal(mt5)
+
+        return [
+            SymbolInfo(
+                symbol=info.name,
+                # `or None` on both: MetaTrader returns the empty string for "not set", and an
+                # empty description stored as `""` would read downstream as a description that
+                # happens to be blank rather than one the broker never gave.
+                description=(info.description or None),
+                path=(info.path or None),
+                digits=int(info.digits),
+                visible=bool(info.visible),
+            )
+            for info in mt5.symbols_get() or []
+        ]
+
+    def server(self) -> str | None:
+        """The broker server this terminal is logged into, e.g. `MetaQuotes-Demo`.
+
+        Stamped on the snapshot so a list of symbols carries where it came from. A user who
+        switched accounts and forgot is exactly the person an unlabelled list misleads — and
+        this project has already watched that account go from 9550 symbols to 84.
+
+        `None` when the terminal is running but not logged in: unknown, never a made-up name.
+        """
+        mt5 = self._require_connection()
+        account = mt5.account_info()
+        return None if account is None else (str(account.server) or None)
 
     def spread_points(self, symbol: str) -> Decimal | None:
         """The broker's quoted spread, converted from MT5 `point` into engine ticks.

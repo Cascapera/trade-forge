@@ -16,6 +16,13 @@ dependencies = [
     # for job progress, drops what nobody was listening for — and a paper session that
     # restarts has to be able to resume from where it stopped.
     "redis>=5",
+    # The same runner the API's worker uses, on a queue only this process drains. A job that
+    # needs MetaTrader can only be executed on Windows (ADR-02), so the segregation is a
+    # capability boundary rather than a priority one — see ADR-0021. Declared here rather than
+    # borrowed from the API: nothing in `apps/collector` imports `tradeforge_api`, and a
+    # dependency that works only because a sibling app happens to pull it in is a dependency
+    # that breaks the first time the sibling drops it.
+    "arq>=0.26",
     # The official MT5 library ships Windows wheels only. The environment marker is
     # what turns ADR-02 (isolate the broker dependency) into a build-time fact:
     # Linux CI simply cannot resolve this package outside collector/executor.

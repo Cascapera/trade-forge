@@ -1,4 +1,5 @@
 import type { Instrument } from '../api/types'
+import { SymbolCombobox } from './SymbolCombobox'
 import { costlessReason, withInstrumentCosts, type BacktestForm } from '../backtest/settings'
 
 const inputClass =
@@ -25,32 +26,20 @@ export function BacktestSettings(props: {
   const costless = costlessReason(form, chosen)
   return (
     <div className="grid grid-cols-2 gap-4 sm:grid-cols-3">
-      <label className="flex flex-col gap-1 text-sm">
-        Symbol
-        <select
-          aria-label="symbol"
-          className={inputClass}
-          value={form.symbol}
-          onChange={(event) => {
-            // Choosing an instrument chooses its costs too. The spread is a property of the
-            // symbol, not of the run, so leaving the previous instrument's number behind — or
-            // leaving `none` behind, which is what produced this project's costless history —
-            // would be the form quietly keeping an answer to a question that just changed.
-            const symbol = event.target.value
-            const next = instruments?.find((instrument) => instrument.symbol === symbol)
-            onChange(withInstrumentCosts({ ...form, symbol }, next))
-          }}
-        >
-          {/* Blank until the instruments arrive, so the field never shows a symbol that is really
-              just the first row of a list the user never saw. */}
-          <option value="">choose…</option>
-          {instruments?.map((instrument) => (
-            <option key={instrument.id} value={instrument.symbol}>
-              {instrument.symbol}
-            </option>
-          ))}
-        </select>
-      </label>
+      {/* A combobox over the *broker's* catalogue, not a select over what has been collected.
+          The old list was `GET /instruments` — measured on 19/08/2026, that was 1 symbol against
+          the 84 the account can actually see. */}
+      <SymbolCombobox
+        value={form.symbol}
+        onChange={(symbol) => {
+          // Choosing an instrument chooses its costs too. The spread is a property of the
+          // symbol, not of the run, so leaving the previous instrument's number behind — or
+          // leaving `none` behind, which is what produced this project's costless history —
+          // would be the form quietly keeping an answer to a question that just changed.
+          const next = instruments?.find((instrument) => instrument.symbol === symbol)
+          onChange(withInstrumentCosts({ ...form, symbol }, next))
+        }}
+      />
       {children}
       <label className="flex flex-col gap-1 text-sm">
         Initial capital

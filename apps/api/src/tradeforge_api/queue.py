@@ -31,6 +31,28 @@ synchronous, so the waiter holds the only slot the runs it waits for would need.
 """
 
 
+SYNC_SYMBOLS = "sync_symbols"
+"""Photograph the broker's symbol catalogue into `broker_symbols`.
+
+⚠️ **Runs on `COLLECT_QUEUE`, which no Linux worker drains.** The job needs MetaTrader, and
+MetaTrader exists only on the Windows host (ADR-02, and the wheel does not install on Linux).
+Enqueuing it on the default queue would hand it to a container that can never execute it — a
+job that sits `queued` for ever with nothing raised, which is the failure this constant's
+placement is here to prevent.
+"""
+
+COLLECT_QUEUE = "collect"
+"""The queue only the host agent (`tradeforge-collector agent`) drains.
+
+Two queues rather than one, for two independent reasons and either would be enough:
+
+* **Capability.** A worker in a container physically cannot run a job that calls MetaTrader.
+  Segregation is what makes "who can claim this" a property of the queue instead of a hope.
+* **Latency.** Syncing a symbol list is a sub-second job. Sharing a queue with a walk-forward
+  would put it behind twenty minutes of CPU-bound backtesting, on a click a human is watching.
+"""
+
+
 class JobQueue(Protocol):
     """The one capability the API needs from the queue: enqueue a job by name. Depending on
     this rather than on `ArqRedis` keeps the handlers testable — the real pool and the test

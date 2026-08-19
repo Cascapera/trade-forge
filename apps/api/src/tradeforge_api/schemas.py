@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import datetime as dt
 import uuid
+from collections.abc import Sequence
 from decimal import Decimal
 from typing import Annotated, Any
 
@@ -143,6 +144,86 @@ class InstrumentOut(_Out):
     # claim that trading it is free. The engine never reads this: costs reach a run as a
     # plugged-in `CostModel` (ADR-07), and this only decides what the screen offers first.
     default_spread_points: Money | None = None
+
+
+class BrokerSymbolOut(_Out):
+    """One line of the broker's own catalogue, as MetaTrader last described it.
+
+    ⚠️ Not an `InstrumentOut`, and it deliberately carries none of the pricing numbers. This is
+    a symbol the account *can see*; whether this system knows how to turn a tick of it into
+    money is a separate question, answered by `instruments`, and a symbol can be in this list
+    for a long time before anyone collects a candle of it.
+    """
+
+    symbol: str
+    description: str | None = None
+    path: str | None = None
+    digits: int | None = None
+    # Whether the symbol sits in Market Watch. For display only — measured on this project's
+    # broker, 74 of 84 symbols are outside it and every one still answers a search and hands
+    # over history. Only the live loop has to care.
+    visible: bool = False
+
+    # ⚠️ Whether this system has an `Instrument` row for the symbol, which is what a backtest
+    # needs. Without it the screen would offer 84 symbols of which one can be run, and the user
+    # would find out which by clicking. Not a claim that candles exist for any particular range
+    # — only that the symbol has been catalogued at all.
+    catalogued: bool = False
+
+
+class SymbolSnapshotOut(_Out):
+    """Where the symbol list came from, and when.
+
+    ⚠️ Named for the symbols and not just "snapshot", because this project already has a
+    `SnapshotOut`: the record of what a strategy was looking at when it entered a trade. Two
+    unrelated meanings under one name in one module is how a reader ends up reading the wrong
+    docstring and believing it.
+    """
+
+    server: str | None = None
+    synced_at: dt.datetime
+
+
+class SymbolSearchOut(BaseModel):
+    """Search results, plus the provenance of the list they came from.
+
+    ⚠️ **`snapshot` is nullable so that "no match" and "no catalogue" stay distinguishable.**
+    Both produce an empty `symbols`, and they are opposite problems: one means type fewer
+    letters, the other means nobody has ever synced this broker. A response that flattened them
+    would have the screen tell a user with no catalogue that their search found nothing —
+    technically true, and the least useful true sentence available.
+    """
+
+    symbols: list[BrokerSymbolOut]
+    snapshot: SymbolSnapshotOut | None = None
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        symbols: Sequence[object],
+        server: str | None,
+        synced_at: dt.datetime | None,
+    ) -> SymbolSearchOut:
+        """Assemble from ORM rows and the snapshot's own two fields."""
+        return cls(
+            symbols=[BrokerSymbolOut.model_validate(row) for row in symbols],
+            snapshot=(
+                None if synced_at is None else SymbolSnapshotOut(server=server, synced_at=synced_at)
+            ),
+        )
+
+
+class EnqueuedOut(BaseModel):
+    """A job was accepted for a worker that this process cannot see.
+
+    Carries the job's name and nothing else on purpose. There is no id worth returning: the
+    enqueue is idempotent by construction, so "your request is pending" is the whole truth, and
+    a handle would invite a caller to poll a job whose only observable result is the data it
+    replaces.
+    """
+
+    job: str
 
 
 class CreateBacktestRequest(BaseModel):

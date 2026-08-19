@@ -1,5 +1,15 @@
 import { fireEvent, render, screen } from '@testing-library/react'
 import { useState } from 'react'
+import { vi } from 'vitest'
+
+// ⚠️ This component used to fetch nothing at all — it took `instruments` as a prop and was
+// pure. The symbol field is now a combobox over the broker's catalogue, which searches, so the
+// two hooks behind it are stubbed. The alternative was threading six props of query state
+// through every caller, which is plumbing, not a boundary.
+vi.mock('../api/hooks', () => ({
+  useSymbolSearch: () => ({ data: { symbols: [], snapshot: null } }),
+  useSyncSymbols: () => ({ mutate: () => undefined, isPending: false }),
+}))
 
 import type { Instrument } from '../api/types'
 import { emptyBacktestForm, type BacktestForm } from '../backtest/settings'
@@ -41,7 +51,7 @@ function Harness({ instruments }: { instruments: Instrument[] }): React.JSX.Elem
 }
 
 function choose(symbol: string): void {
-  fireEvent.change(screen.getByLabelText('symbol'), { target: { value: symbol } })
+  fireEvent.change(screen.getByLabelText('Symbol'), { target: { value: symbol } })
 }
 
 describe('BacktestSettings', () => {

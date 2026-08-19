@@ -28,6 +28,10 @@ def ddl(name: str) -> str:
 
 EXPECTED_TABLES = {
     "instruments",
+    # The broker's own catalogue, photographed. Deliberately beside `instruments`
+    # rather than merged into it: nothing references this table, which is what lets a
+    # sync replace it wholesale when the account changes broker (ADR-0021).
+    "broker_symbols",
     "datasets",
     "strategies",
     "baskets",

@@ -139,6 +139,54 @@ describe('costs that come from the instrument', () => {
   })
 })
 
+describe('a symbol the broker has and this system has not collected', () => {
+  /**
+   * ⚠️ New with the symbol combobox. The field used to offer only what had been collected, so
+   * "chosen but uncollected" could not happen; it now offers everything the broker has —
+   * measured on 19/08/2026, 84 symbols against 1 with candles on disk.
+   */
+  it('shuts the run rather than letting it fail at the API', () => {
+    expect(whyNotRunnable(form({ symbol: 'BTCUSD' }), [instrument({ symbol: 'EURUSD' })])).toMatch(
+      /BTCUSD has never been collected/,
+    )
+  })
+
+  it('lets a collected one through', () => {
+    expect(whyNotRunnable(form({ symbol: 'EURUSD' }), [instrument({ symbol: 'EURUSD' })])).toBeNull()
+  })
+
+  it('does not accuse a symbol while the catalogue is still loading', () => {
+    /**
+     * ⚠️ `undefined` is "the list has not arrived", not "the symbol is missing from it". Reading
+     * the two the same way would flash the button shut on every page load and put a sentence on
+     * screen accusing a perfectly collected symbol of not existing.
+     */
+    expect(whyNotRunnable(form({ symbol: 'EURUSD' }), undefined)).toBeNull()
+  })
+
+  it('does not also complain about the spread', () => {
+    /**
+     * ⚠️ The screenshot that produced this test showed two amber boxes for one fact, and the
+     * second contradicted the first: it described the shape of an equity curve for a run that
+     * could not start. One fact, one message.
+     */
+    expect(costlessReason(form({ symbol: 'BTCUSD', cost: 'none' }), undefined)).toBeNull()
+  })
+
+  it('still complains about the spread for a symbol that IS collected', () => {
+    /**
+     * ⚠️ The separating case. Suppressing the costless warning whenever the spread is unknown
+     * would silence it for the instruments it exists for — the ones catalogued before the
+     * collector recorded a spread, which run perfectly well and charge nothing.
+     */
+    const collectedButUnmeasured = instrument({ symbol: 'US500', default_spread_points: null })
+
+    expect(costlessReason(form({ symbol: 'US500', cost: 'none' }), collectedButUnmeasured)).toMatch(
+      /no spread has been catalogued/,
+    )
+  })
+})
+
 describe('costlessReason', () => {
   it('says nothing while a run does charge costs', () => {
     expect(costlessReason(form({ cost: 'spread', spreadPoints: '12' }), instrument())).toBeNull()

@@ -169,9 +169,58 @@ class MT5Source:
         return self
 
     def close(self) -> None:
-        if self._mt5 is not None:
-            self._mt5.shutdown()
-            self._mt5 = None
+        """Detach. The handle is dropped **first**, so a failed shutdown still detaches.
+
+        ⚠️ Order matters here for one caller only, and it is the one that matters: `reconnect`
+        runs after the terminal has already gone away, which is exactly when `shutdown()` is
+        most likely to fail. Clearing the handle afterwards would leave the source believing it
+        is still attached, and the next `connect()` would be layered on a connection that no
+        longer exists.
+        """
+        mt5, self._mt5 = self._mt5, None
+        if mt5 is not None:
+            mt5.shutdown()
+
+    def reconnect(self) -> None:
+        """Drop whatever is left of the old attachment and initialise a new one.
+
+        Only the mechanism lives here; how often to try, and for how long, is `live.run`'s.
+
+        ⚠️ **A reconnection re-measures the broker's clock**, and with the market shut that
+        measurement is refused rather than guessed (`_measure_offset`). So a loop that is meant
+        to outlive a weekend has to be started with `--server-offset`: without it the terminal
+        can come back perfectly healthy and the reconnection will still fail, correctly, until
+        the market re-opens. Labelling bars with a number measured from a frozen tick would put
+        the whole outage's worth of candles into the stream at the wrong instant.
+        """
+        try:
+            self.close()
+        except Exception:  # noqa: BLE001 — a dead terminal is precisely what this survives
+            logger.debug("shutting the old connection down failed", exc_info=True)
+        self.connect()
+
+    def subscribe(self, symbol: str) -> None:
+        """Put the symbol into Market Watch, so that asking for its bars can actually answer.
+
+        ⚠️ **Measured, not defensive.** On this project's broker 5 of 9550 symbols were
+        selected, and an unselected one answers `symbol_info_tick` with `None` and
+        `copy_rates_from_pos` with nothing — for ever. "Nothing" is also the honest answer for
+        a symbol whose session has not produced a bar yet, so the two are indistinguishable
+        from the loop's side, and a watch on the wrong symbol would look like a quiet market
+        until somebody checked by hand.
+
+        This writes to the terminal, which is the reason it is a separate call rather than
+        something `recent_closed` does on the way past: selecting a symbol is a change to the
+        operator's Market Watch, and it belongs at the moment a watch is set up, once, not on
+        every poll.
+        """
+        mt5 = self._require_connection()
+        if not mt5.symbol_select(symbol, True):
+            raise LookupError(
+                f"MetaTrader 5 would not add {symbol!r} to Market Watch: {mt5.last_error()}. "
+                f"A symbol that is not selected reports no bars for ever, which reads exactly "
+                f"like a market that has not closed one yet."
+            )
 
     def instrument(self, symbol: str) -> InstrumentSpec:
         mt5 = self._require_connection()
@@ -309,26 +358,16 @@ class MT5Source:
         if rates is None:
             raise LookupError(f"MT5 returned no rates for {symbol} {timeframe}: {mt5.last_error()}")
 
-        return [
-            Candle(
-                time=dt.datetime.fromtimestamp(int(rate["time"]), tz=dt.UTC) - self._offset,
-                open=normalise(Decimal(str(rate["open"])), spec.digits),
-                high=normalise(Decimal(str(rate["high"])), spec.digits),
-                low=normalise(Decimal(str(rate["low"])), spec.digits),
-                close=normalise(Decimal(str(rate["close"])), spec.digits),
-                tick_volume=int(rate["tick_volume"]),
-                spread=int(rate["spread"]),
-                real_volume=int(rate["real_volume"]),
-            )
-            for rate in rates
-        ]
+        return [self._candle(rate, spec.digits) for rate in rates]
 
-    def latest_closed(self, symbol: str, timeframe: str) -> Candle | None:
-        """The bar that just closed — asked for by **position**, never worked out from a clock.
+    def recent_closed(self, symbol: str, timeframe: str, count: int) -> list[Candle]:
+        """The last `count` bars that closed — asked for by **position**, never from a clock.
 
-        `copy_rates_from_pos(start_pos=1, count=1)` is the whole answer: position 0 is the bar
-        still forming and position 1 is the last one that closed. The terminal states which is
-        which, so this method never has to decide it.
+        `copy_rates_from_pos(start_pos=1, count=n)` is the whole answer: position 0 is the bar
+        still forming and everything from position 1 back has closed. The terminal states which
+        is which, so this method never has to decide it — and asking for several is the same
+        question as asking for one, which is why there is no second method for the singular
+        case.
 
         ⚠️ **The version that computes it instead is wrong for as long as the market is shut.**
         Comparing `bar.time + step <= now` needs `self._offset`, and that offset is measured
@@ -339,29 +378,60 @@ class MT5Source:
         wrong. The offset is still applied below, to *label* the bar in UTC — translating is not
         deciding.
 
-        `None` rather than an exception when there is no bar: a symbol the broker has never
-        quoted and a session that has not produced its first bar are both ordinary states of the
-        world, and a live loop that crashed on either would be a loop that cannot start before
-        the open.
+        An empty list rather than an exception when there is no bar: a symbol the broker has
+        never quoted and a session that has not produced its first bar are both ordinary states
+        of the world, and a live loop that crashed on either would be a loop that cannot start
+        before the open. The terminal being **gone** is not one of those states, and it raises —
+        see `_require_terminal` for why that has to be checked before anything else is asked.
         """
+        if count < 1:
+            raise ValueError(f"a poll asks for at least one bar, got {count}")
+
         mt5 = self._require_connection()
+        self._require_terminal(mt5)
         spec = self.instrument(symbol)
 
-        rates = mt5.copy_rates_from_pos(symbol, self._timeframe_constant(mt5, timeframe), 1, 1)
-        if rates is None or len(rates) == 0:
-            return None
+        rates = mt5.copy_rates_from_pos(symbol, self._timeframe_constant(mt5, timeframe), 1, count)
+        if rates is None:
+            return []
 
-        rate = rates[0]
+        # MT5 returns them newest-last already; the sort makes that a guarantee of this method
+        # rather than an observation about a library, which is what every caller downstream —
+        # the gap fill, and `XADD`'s refusal of a non-increasing id — is relying on.
+        return sorted(
+            (self._candle(rate, spec.digits) for rate in rates), key=lambda candle: candle.time
+        )
+
+    def _candle(self, rate: Any, digits: int) -> Candle:  # noqa: ANN401 — a numpy record, no stubs
+        """One MT5 rate as a `Candle`, in UTC and quantised to the instrument's tick."""
         return Candle(
             time=dt.datetime.fromtimestamp(int(rate["time"]), tz=dt.UTC) - self._offset,
-            open=normalise(Decimal(str(rate["open"])), spec.digits),
-            high=normalise(Decimal(str(rate["high"])), spec.digits),
-            low=normalise(Decimal(str(rate["low"])), spec.digits),
-            close=normalise(Decimal(str(rate["close"])), spec.digits),
+            open=normalise(Decimal(str(rate["open"])), digits),
+            high=normalise(Decimal(str(rate["high"])), digits),
+            low=normalise(Decimal(str(rate["low"])), digits),
+            close=normalise(Decimal(str(rate["close"])), digits),
             tick_volume=int(rate["tick_volume"]),
             spread=int(rate["spread"]),
             real_volume=int(rate["real_volume"]),
         )
+
+    def _require_terminal(self, mt5: Any) -> None:  # noqa: ANN401 — no stubs
+        """Raise `ConnectionError` when the terminal itself has gone away.
+
+        ⚠️ **Checked first, before the symbol is looked up, and that ordering is the point.** A
+        dead terminal answers `symbol_info` with `None`, which this class already turns into
+        "that symbol is not available in this terminal" — a sentence that is both wrong and
+        convincing, and that the live loop would treat as one bad symbol rather than as the
+        feed being down. Asking `terminal_info` up front means the ambiguous answers never get
+        the chance to be read as the wrong thing.
+
+        What it does **not** cover: a terminal that is running but logged out of the broker.
+        That one still answers, with cached history that has stopped advancing, and telling it
+        apart from a quiet market needs state over time — which belongs to whatever is watching
+        the loop, not to a single call inside it.
+        """
+        if mt5.terminal_info() is None:
+            raise ConnectionError(f"MetaTrader 5 is not answering: {mt5.last_error()}")
 
     def _measure_offset(self) -> dt.timedelta:
         mt5 = self._require_connection()
@@ -402,8 +472,26 @@ class MT5Source:
         return dt.datetime.fromtimestamp(newest, tz=dt.UTC) if newest else None
 
     def _require_connection(self) -> Any:  # noqa: ANN401 — MetaTrader5 ships no type stubs
+        """The handle, or `ConnectionError` when this source is not attached to anything.
+
+        ⚠️ **`ConnectionError` and not `RuntimeError`, and a run against the real terminal is
+        what settled it.** Detached is a connection state, so it has to raise the exception the
+        live loop treats as "the feed is down" — otherwise it lands in the per-symbol handler,
+        gets logged, and the loop carries on polling a source it can never reach.
+
+        The path that makes this reachable is the one this file just added. `reconnect()` calls
+        `close()`, which clears the handle, and then `connect()`; when `connect()` fails — a
+        terminal that is still coming up, which is the *expected* case — the handle stays
+        cleared. With the old `RuntimeError` every later poll was swallowed as one bad symbol
+        and no further reconnection was ever attempted: **one failed retry wedged the collector
+        for good**, silently. 176 tests and 22 mutants did not see it, because the fake source
+        kept raising `ConnectionError` after a failed reconnection and the real one did not.
+
+        It still covers the programmer error of never calling `connect()` at all, and the
+        remedy the loop applies to it — call `connect()` — happens to be the right one.
+        """
         if self._mt5 is None:
-            raise RuntimeError(
+            raise ConnectionError(
                 "not connected: call connect() or use MT5Source as a context manager"
             )
         return self._mt5

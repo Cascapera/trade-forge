@@ -18,13 +18,17 @@ import datetime as dt
 import logging
 import os
 import sys
-import time
 from collections.abc import Sequence
 from pathlib import Path
 
 from tradeforge_collector.backfill import backfill
 from tradeforge_collector.gaps import format_report
-from tradeforge_collector.live import LiveSource, Subscription, poll_once
+from tradeforge_collector.live import (
+    DEFAULT_MAX_BACKFILL,
+    LiveSource,
+    Subscription,
+    run,
+)
 from tradeforge_collector.source import MarketDataSource
 from tradeforge_collector.synthetic import SyntheticSource
 from tradeforge_collector.timeframes import TIMEFRAME_STEP
@@ -174,6 +178,17 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="poll a single time and exit — what a smoke test runs",
     )
+    live.add_argument(
+        "--max-backfill",
+        type=int,
+        default=DEFAULT_MAX_BACKFILL,
+        metavar="BARS",
+        help=(
+            f"how many bars one gap fill may ask for after an outage "
+            f"(default: {DEFAULT_MAX_BACKFILL}). A longer hole is reported, not truncated "
+            f"quietly — repair it with a backfill"
+        ),
+    )
     live.add_argument("--redis-host", default=os.environ.get("REDIS_HOST", "localhost"))
     live.add_argument("--redis-port", type=int, default=int(os.environ.get("REDIS_PORT", "6379")))
 
@@ -233,6 +248,8 @@ def _live(args: argparse.Namespace) -> int:
 
     from tradeforge_collector.publisher import RedisCandlePublisher  # noqa: PLC0415
 
+    _refuse_unstamped_timeframes(args.timeframes)
+
     source = _source(args)
     if not isinstance(source, LiveSource):
         raise ValueError(f"the {args.source} source cannot be watched live")
@@ -240,7 +257,6 @@ def _live(args: argparse.Namespace) -> int:
 
     client = Redis(host=args.redis_host, port=args.redis_port, decode_responses=True)
     publisher = RedisCandlePublisher(client)
-    seen: dict[Subscription, dt.datetime] = {}
 
     logging.getLogger(__name__).info(
         "watching %s on %s, polling every %.0fs",
@@ -249,18 +265,49 @@ def _live(args: argparse.Namespace) -> int:
         args.every,
     )
     try:
-        while True:
-            poll_once(source, publisher, subscriptions, seen=seen)
-            if args.once:
-                return 0
-            time.sleep(args.every)
+        run(
+            source,
+            publisher,
+            subscriptions,
+            every=args.every,
+            polls=1 if args.once else None,
+            max_backfill=args.max_backfill,
+        )
     except KeyboardInterrupt:
         # ⚠️ A clean stop, not a failure. This command is meant to be killed — it is a loop with
         # no natural end — and a traceback on Ctrl-C teaches the reader to ignore tracebacks.
         logging.getLogger(__name__).info("stopped")
-        return 0
     finally:
         client.close()
+    return 0
+
+
+# Timeframes whose live stamp is known to be wrong, mapped to the sentence that says why.
+#
+# ⚠️ D1 is not a suspicion. Measured against the backfill: 499 of 499 daily bars carried the
+# date of the **following** session, because the broker's day starts at its own midnight —
+# UTC+3 — and the offset that shifts an intraday bar by three hours shifts a daily one across
+# a date boundary. Intraday was checked against H1 in the same pass and is sound.
+#
+# Refusing rather than warning, because the consumer of this stream is a paper session that
+# will not be reading the log: a bar labelled with tomorrow's date is a bar the engine will
+# happily trade at the wrong time, and the wrongness is a whole day rather than a rounding.
+_UNSTAMPED_TIMEFRAMES = {
+    "D1": (
+        "a daily bar is stamped one day ahead here: the broker's day opens at its own "
+        "midnight (UTC+3), so undoing the offset moves the bar across the date boundary. "
+        "Measured at 499 of 499 in the backfill. Intraday (M5, M15, H1, H4) is sound - watch "
+        "one of those, and use `backfill` for daily history until this is fixed"
+    ),
+}
+
+
+def _refuse_unstamped_timeframes(timeframes: Sequence[str]) -> None:
+    """Stop before the first poll on a timeframe this collector cannot label correctly."""
+    for timeframe in timeframes:
+        reason = _UNSTAMPED_TIMEFRAMES.get(timeframe)
+        if reason is not None:
+            raise ValueError(f"refusing to watch {timeframe} live: {reason}")
 
 
 def _source(args: argparse.Namespace) -> MarketDataSource:

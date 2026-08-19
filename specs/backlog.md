@@ -530,12 +530,10 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
   operando do builder são texto livre, então funciona, mas nada oferece os três nomes nem avisa que
   `bb` sozinho é recusado. O erro que chega é legível (a camada semântica lista os componentes), o
   que torna isto atrito e não defeito. Some no PR-206.
-- [origem: PR-301-A] **O laço não seleciona símbolos no MarketWatch** — medido em 18/08: dos 9550
-  símbolos do broker apenas **5** estão visíveis, e `symbol_info_tick("EURUSD")` devolve `None`
-  para os que não estão. O `latest_closed` de um símbolo não selecionado responde `None` para
-  sempre, o que o laço trata como "ainda não fechou nada" — correto para um símbolo sem histórico,
-  **indistinguível** de um símbolo que ninguém selecionou. Conserto: `mt5.symbol_select(symbol,
-  True)` ao assinar, o que escreve no terminal. Vale junto do 301-B, que já vai mexer em conexão.
+- ~~[origem: PR-301-A] **O laço não seleciona símbolos no MarketWatch**~~ — **FECHADO no PR-301-B**:
+  `LiveSource.subscribe` chama `symbol_select(symbol, True)` na subida e outra vez depois de cada
+  reconexão (Market Watch é estado do terminal, e sessão reatada é conversa nova). Um símbolo que
+  o terminal recusa agora para o watch com uma frase, em vez de virar silêncio permanente.
 - [origem: PR-301-A] **Um candle é anunciado até `--every` segundos depois de fechar** — o MT5 não
   tem push, então o laço só percebe o fechamento no poll seguinte. Com o default de 5 s isso é 5 s
   no pior caso. Não é defeito (é a natureza do poll), mas é latência que a sessão de paper herda, e
@@ -543,14 +541,30 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
 - [origem: PR-301-A] **Ninguém lê os streams ainda** — `candles.{symbol}.{tf}` é escrito e nenhum
   consumer group existe. Isso é o **PR-302** (PaperBroker). Enquanto isso os streams crescem até o
   `maxlen` de 10 000 e param, que é o desenhado.
-- [origem: PR-301-A] **O D1 continua carimbado um dia adiantado, e agora ao vivo também** — a
-  memória `d1-carimbado-um-dia-adiantado` mediu 499 de 499 batendo com o pregão do dia seguinte no
-  backfill. O `latest_closed` usa o mesmo `_offset`, então herda o mesmo carimbo. ⚠️ Não assinar
-  `D1` ao vivo até isso ser resolvido — intraday (M5/M15/H4) está são, medido contra o H1.
+- [origem: PR-301-A] **O D1 continua carimbado um dia adiantado** — a memória
+  `d1-carimbado-um-dia-adiantado` mediu 499 de 499 batendo com o pregão do dia seguinte no
+  backfill. ⚠️ **Ao vivo isto virou recusa no PR-301-B**: `tradeforge-collector live SYM D1` para
+  com a frase e o motivo, porque o consumidor do stream é uma sessão de paper que não lê log.
+  Falta o conserto de verdade — descobrir a fronteira do dia do broker e carimbar o D1 por ela,
+  no backfill **e** ao vivo, e então soltar a recusa (`cli._UNSTAMPED_TIMEFRAMES`).
 - [origem: PR-301-A] **O comando `live` é um processo de primeiro plano sem supervisão** — morre
-  com o terminal que o iniciou e não volta sozinho. O 301-B trata reconexão *do MT5*; reiniciar o
-  **processo** é outra coisa, e provavelmente pertence ao mesmo lugar que for cuidar do executor na
-  fase 3.
+  com o terminal que o iniciou e não volta sozinho. O 301-B tratou a reconexão *do MT5* e o
+  buraco que um processo reiniciado deixa (ele retoma do rabo do stream), mas **reiniciar o
+  processo** continua sendo trabalho de fora: pertence ao mesmo lugar que for cuidar do executor
+  na fase 3.
+- [origem: PR-301-B] **Terminal ligado mas deslogado do broker não é detectado** — `terminal_info()`
+  devolve objeto (não `None`), então o laço não vê `ConnectionError`; o `copy_rates_from_pos`
+  responde com histórico em cache que parou de avançar, e isso é **indistinguível de mercado
+  parado**. `terminal_info().connected` diz a verdade, mas separar "parou" de "está quieto" exige
+  estado ao longo do tempo — pertence a quem supervisiona o laço, não a uma chamada dentro dele.
+- [origem: PR-301-B] **O teto do gap-fill é por barras, não por relevância** — `--max-backfill`
+  default 500. Um outage maior que isso é anunciado com o intervalo que ficou faltando e o
+  operador tem de rodar um `backfill`; nada automatiza essa costura entre o Parquet e o stream.
+- [origem: PR-301-B] **A reconexão remede o relógio do servidor** — `connect()` chama
+  `_measure_offset` quando o offset não foi declarado, e com mercado fechado isso é recusado (é
+  o desenho). Consequência operacional: **um `live` que deve sobreviver a um fim de semana
+  precisa subir com `--server-offset`**, senão o terminal pode voltar são e a reconexão continuar
+  falhando, corretamente, até a abertura.
 - [origem: PR-206-C2] **Uma ref pendurada aparece na lista mas não é editável** — o picker não tem
   mais caixa de texto (as quatro formas da gramática viraram controles), então uma ref que deixou
   de ser ofertável — porque o indicador foi renomeado — é acrescentada à própria lista para ficar

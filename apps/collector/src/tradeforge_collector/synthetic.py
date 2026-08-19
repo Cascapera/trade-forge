@@ -97,33 +97,62 @@ class SyntheticSource:
         self.instrument(symbol)  # raises on an unknown symbol, like every other method here
         return None
 
-    def latest_closed(self, symbol: str, timeframe: str) -> Candle | None:
-        """The bar that closed most recently before `now`.
+    def subscribe(self, symbol: str) -> None:
+        """Nothing to select — but an unknown symbol is still refused here, and early.
+
+        A real terminal has a Market Watch and this does not, so there is no state to write.
+        What survives the difference is the *contract*: subscribing is the moment a bad symbol
+        is supposed to be caught, and a synthetic source that shrugged at `EURSUD` would let a
+        typo run as a silently empty watch — the exact failure `MT5Source.subscribe` exists to
+        prevent.
+        """
+        self.instrument(symbol)
+
+    def reconnect(self) -> None:
+        """A no-op: there is no connection here to lose, and pretending otherwise would lie.
+
+        Deliberately not raising. The live loop reconnects after a `ConnectionError`, and this
+        source never raises one — so this method is unreachable in practice and exists to
+        satisfy `LiveSource` structurally. Making it raise "not supported" would turn a
+        harmless impossibility into a crash the day something calls it defensively.
+        """
+
+    def recent_closed(self, symbol: str, timeframe: str, count: int) -> list[Candle]:
+        """The last `count` bars that closed before `now`, oldest first.
 
         ⚠️ **The one place in this class where the clock is allowed in**, and it is confined to
-        choosing which bar rather than to deciding whether a bar closed: `now` is floored to the
-        timeframe and one bar is taken from before that boundary, so the answer is the same
+        choosing which bars rather than to deciding whether a bar closed: `now` is floored to
+        the timeframe and the run is taken from before that boundary, so the answer is the same
         function of the same instant every time. The candles themselves stay seeded on
         (symbol, timeframe), which is what keeps the rest of the suite deterministic.
 
-        `now` is a parameter with a default rather than a bare `dt.datetime.now()` inside, for
-        the reason the form factories in the web builder give: a function that reads the wall
-        clock can only be tested for having produced *something*.
+        `now` is a parameter of `recent_closed_at` rather than a bare `dt.datetime.now()`
+        inside, for the reason the form factories in the web builder give: a function that reads
+        the wall clock can only be tested for having produced *something*.
         """
-        return self.latest_closed_at(symbol, timeframe, dt.datetime.now(tz=dt.UTC))
+        return self.recent_closed_at(symbol, timeframe, count, dt.datetime.now(tz=dt.UTC))
 
-    def latest_closed_at(self, symbol: str, timeframe: str, now: dt.datetime) -> Candle | None:
+    def recent_closed_at(
+        self, symbol: str, timeframe: str, count: int, now: dt.datetime
+    ) -> list[Candle]:
+        if count < 1:
+            raise ValueError(f"a poll asks for at least one bar, got {count}")
+
         bar = step(timeframe)
         # Floor to the boundary, then step back one: the bar containing `now` is still forming.
         boundary = dt.datetime.fromtimestamp(
             (int(now.timestamp()) // int(bar.total_seconds())) * int(bar.total_seconds()),
             tz=dt.UTC,
         )
-        opened = boundary - bar
+        newest = boundary - bar
+        # ⚠️ Asked for by *time* here and by *position* against a real terminal, and the two
+        # differ over a closure: this reaches back `count` slots and finds fewer bars, where MT5
+        # reaches back `count` bars and finds them all. The shorter answer is the safe direction
+        # — the loop treats a short fill as a hole it announces, never as one it hides.
+        oldest = newest - (count - 1) * bar
         # A weekend has no bars, and this is what makes the live loop meet that fact in a test
         # rather than for the first time on a Saturday.
-        found = self.candles(symbol, timeframe, opened, opened)
-        return found[0] if found else None
+        return self.candles(symbol, timeframe, oldest, newest)
 
     def candles(
         self, symbol: str, timeframe: str, start: dt.datetime, end: dt.datetime

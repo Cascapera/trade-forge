@@ -6,9 +6,10 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
+import redis
 
 # Importable on Linux: `mt5_source` defers its `MetaTrader5` import until `connect()`.
-from tradeforge_collector import cli, mt5_source
+from tradeforge_collector import cli, mt5_source, publisher
 from tradeforge_collector.storage import read_candles
 from tradeforge_db.instruments import CatalogueEntry
 
@@ -247,3 +248,159 @@ def test_the_catalogue_command_does_not_demand_an_offset_from_the_mock_source(
 
     assert cli.main(["catalogue", "EURUSD", "--source", "mock"]) == 0
     assert len(written) == 1
+
+
+# --------------------------------------------------------------------------- #
+# `live` — the loop, wired up                                                   #
+# --------------------------------------------------------------------------- #
+
+
+class _StubRedis:
+    """Enough of a client for `_live` to build one and close it."""
+
+    def __init__(self, **_kwargs: object) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _StubPublisher:
+    """A publisher that keeps what it is given and starts from an empty stream."""
+
+    def __init__(self, _client: object) -> None:
+        self.published: list[object] = []
+
+    def publish(self, _subscription: object, candle: object) -> bool:
+        self.published.append(candle)
+        return True
+
+    def last_published(self, _subscription: object) -> None:
+        return None
+
+
+@pytest.fixture
+def stub_redis(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Neither the client nor the publisher touches a real server in these tests."""
+    monkeypatch.setattr(redis, "Redis", _StubRedis)
+    monkeypatch.setattr(publisher, "RedisCandlePublisher", _StubPublisher)
+
+
+def test_a_single_poll_runs_end_to_end_against_the_mock_source(stub_redis: None) -> None:
+    """`--once` is the smoke test, and it has to work with no terminal and no broker."""
+    assert cli.main(["live", "EURUSD", "M5", "--once"]) == 0
+
+
+def test_watching_a_daily_bar_is_refused_with_the_reason(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """⚠️ Measured, not suspected: 499 of 499 daily bars carried the **next** session's
+    date, because the broker's day opens at its own midnight (UTC+3) and undoing that offset
+    moves a daily bar across the date boundary. Intraday was checked against H1 and is sound.
+
+    A refusal rather than a warning, because the consumer of this stream is a paper session
+    that will not be reading the log — and a bar stamped a day out is not a rounding error,
+    it is a trade placed on the wrong day.
+    """
+    exit_code = cli.main(["live", "EURUSD", "D1", "--once"])
+
+    assert exit_code == 1
+    error = capsys.readouterr().err
+    assert "refusing to watch D1" in error
+    assert "one day ahead" in error
+
+
+def test_the_refusal_happens_before_the_terminal_is_opened(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A guard that fires after the terminal is opened is a guard that needs a terminal.
+
+    ⚠️ The thing that must not have run is `_source`, not the Redis client. Against
+    `--source mt5` that call is what attaches to MetaTrader and measures its clock — so a guard
+    placed after it would refuse D1 only on a machine that already had a live terminal, which
+    is the one machine where the refusal is least likely to be read.
+    """
+
+    def _explode(_args: object) -> None:
+        raise AssertionError("the refusal must come before the source is built")
+
+    monkeypatch.setattr(cli, "_source", _explode)
+
+    assert cli.main(["live", "EURUSD", "M5", "D1", "--once"]) == 1
+    assert "refusing to watch D1" in capsys.readouterr().err
+
+
+def test_an_intraday_timeframe_is_not_caught_by_the_daily_guard(stub_redis: None) -> None:
+    # The guard names one timeframe. A blanket refusal would have taken the whole loop with it.
+    assert cli.main(["live", "EURUSD", "M5", "M15", "H4", "--once"]) == 0
+
+
+def test_the_backfill_ceiling_reaches_the_loop(
+    monkeypatch: pytest.MonkeyPatch, stub_redis: None
+) -> None:
+    """The flag is useless if it stops at the parser."""
+    seen: dict[str, object] = {}
+
+    def _record(*_args: object, **kwargs: object) -> int:
+        seen.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(cli, "run", _record)
+
+    cli.main(["live", "EURUSD", "M5", "--once", "--max-backfill", "42"])
+
+    assert seen["max_backfill"] == 42
+    # `--once` is one poll, and `None` would be the loop that never ends.
+    assert seen["polls"] == 1
+
+
+def test_without_once_the_loop_is_told_to_run_for_ever(
+    monkeypatch: pytest.MonkeyPatch, stub_redis: None
+) -> None:
+    seen: dict[str, object] = {}
+
+    def _record(*_args: object, **kwargs: object) -> int:
+        seen.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(cli, "run", _record)
+
+    cli.main(["live", "EURUSD", "M5"])
+
+    assert seen["polls"] is None
+
+
+def test_ctrl_c_is_a_clean_stop_and_not_a_failure(
+    monkeypatch: pytest.MonkeyPatch, stub_redis: None
+) -> None:
+    """⚠️ This command is meant to be killed — it is a loop with no natural end.
+
+    A traceback on Ctrl-C teaches the reader to ignore tracebacks, which is the habit that
+    hides the next real one.
+    """
+
+    def _interrupted(*_args: object, **_kwargs: object) -> int:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli, "run", _interrupted)
+
+    assert cli.main(["live", "EURUSD", "M5"]) == 0
+
+
+def test_a_source_that_cannot_be_watched_is_refused_with_a_sentence(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], stub_redis: None
+) -> None:
+    """⚠️ `LiveSource` is `runtime_checkable` for exactly this line.
+
+    Conforming structurally means having the methods, and that is what `isinstance` checks
+    here — so a source that cannot be watched is turned away with an explanation instead of
+    reaching the first poll and failing on a missing attribute.
+    """
+
+    class _NotWatchable:
+        """Satisfies `MarketDataSource` and nothing else."""
+
+    monkeypatch.setattr(cli, "_source", lambda _args: _NotWatchable())
+
+    assert cli.main(["live", "EURUSD", "M5", "--once"]) == 1
+    assert "cannot be watched live" in capsys.readouterr().err

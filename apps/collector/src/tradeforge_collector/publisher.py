@@ -16,6 +16,7 @@ unlikely, and it survives the loop being killed and restarted, which an in-proce
 
 import datetime as dt
 from decimal import Decimal
+from typing import cast
 
 from redis import Redis
 from redis.exceptions import ResponseError
@@ -116,3 +117,28 @@ class RedisCandlePublisher:
                 return False
             raise
         return True
+
+    def last_published(self, subscription: Subscription) -> dt.datetime | None:
+        """The opening instant of the newest bar on this stream, or `None` if it is empty.
+
+        This is where a restarted collector finds out what it owes. Reading it from the stream
+        rather than from a file beside the process is the same decision as publishing to a
+        stream in the first place: the durable record of what was announced belongs where the
+        announcements are, and any second copy of it is a copy that disagrees the first time
+        the process is killed between the two writes.
+
+        ⚠️ Read from the `time` **field**, not from the entry id, even though the id is derived
+        from it. The id is a transport detail — milliseconds, a sequence number, and a format
+        the stream owns — while the field is the candle's own statement of when it opened, in
+        the same text every consumer parses. Reconstructing an instant from the id would be a
+        second implementation of `entry_id`, running backwards, with nothing checking that the
+        two agree.
+        """
+        entries = cast(
+            "list[tuple[str, dict[str, str]]]",
+            self._client.xrevrange(stream_name(subscription), count=1),
+        )
+        if not entries:
+            return None
+        _id, fields = entries[0]
+        return dt.datetime.fromisoformat(fields["time"])

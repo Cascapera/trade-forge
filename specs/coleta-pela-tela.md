@@ -56,6 +56,76 @@ conhece" (`instruments`) e "o que a corretora oferece" (`broker_symbols`).
 
 ---
 
+## A janela padrão: orçamento de barras, com piso medido
+
+Decidido em 19/08/2026 a partir de duas medições no broker do Guilherme (`Tradeview-Demo`).
+
+### Medição 1 — barras reais por ano, EURUSD 2024
+
+| tf | barras/ano |
+|---|---|
+| M1 | 368.083 |
+| M5 | 73.705 |
+| M15 | 24.582 |
+| H1 | 6.150 |
+| H4 | 1.541 |
+| D1 | 259 |
+
+⚠️ **M1 × 1 ano = 368.083 e M5 × 5 anos = 368.525.** Os dois números que o Guilherme escolheu à
+mão são o mesmo número: um **orçamento de barras**, não um limite de calendário. É o critério
+certo, porque é barra que vira trade — e generaliza sozinho para timeframes mais lentos, que
+precisam de mais tempo de calendário para produzir a mesma quantidade de sinal.
+
+### Medição 2 — o ano em que o spread deixou de ser inventado
+
+Spread que o broker carimbou em cada barra do EURUSD H1:
+
+```
+2004: 40  constante o ano inteiro (min == max)   → CARIMBADO
+2005: 30  constante                              → CARIMBADO
+2006: 20  constante                              → CARIMBADO
+2007: 20  constante                              → CARIMBADO
+2008: 20  constante                              → CARIMBADO
+2009: 20  constante                              → CARIMBADO
+2010: 11  varia 8..20                            → medido
+2014:  1  varia 0..11                            → medido
+```
+
+⚠️ **A fronteira é 2010-01-01, e ela é medida e não escolhida.** Antes disso o broker escreveu um
+único número por ano inteiro: não é spread, é preenchimento. Um backtest ali tem custo fictício
+mesmo quando o preço não é — e nenhum `CostModel` conserta isso, porque não há o que modelar.
+
+Isso é **independente** do piso de 1999 (nascimento do euro), que separa preço real de série
+reconstruída. 2010 separa **custo** real de custo carimbado, e é o mais restritivo dos dois.
+
+### A regra
+
+**Janela padrão = `min(368.500 barras, desde 2010-01-01)`**, por timeframe:
+
+| tf | janela | barras | quem limitou |
+|---|---|---|---|
+| M1 | 1,0 ano | 368.000 | orçamento |
+| M5 | 5,0 anos | 368.500 | orçamento |
+| M15 | 15,0 anos | 368.500 | orçamento |
+| H1 | 16,6 anos | 102.300 | piso de 2010 |
+| H4 | 16,6 anos | 25.600 | piso de 2010 |
+| D1 | 16,6 anos | 4.300 | piso de 2010 |
+
+Os dois limites quase se encontram no M15, o que é um bom sinal de coerência entre eles.
+
+⚠️ **Isto é um default que a tela pré-preenche, nunca um limite que a engine impõe.** O operador
+sempre pode alargar; o sistema só não escolhe mal por omissão. E a tela mostra a **contagem de
+barras** da janela, não só as datas — "5 anos" não diz nada, "7.705 barras" diz.
+
+### O que a regra não conserta
+
+De 2010 a 2026 o spread ainda vai de 11 para 1 ponto. Cobrando um número só na janela inteira, o
+erro máximo é ~10 ticks — com a mediana de stop do EURUSD H1 já medida neste projeto (0,00116 =
+116 ticks), isso é **~9% de 1R**. Bem melhor que os 40 ticks (~35% de 1R) de antes de 2010, mas
+não é zero. O conserto é custo variável no tempo, e está no backlog.
+
+---
+
 ## PR-233 — Sonda de histórico
 
 **Escopo:**
@@ -70,9 +140,15 @@ conhece" (`instruments`) e "o que a corretora oferece" (`broker_symbols`).
 - API: `GET /symbols/{symbol}/history?timeframe=` (o que já foi sondado) e `POST .../probe` (202).
 - Web: ao escolher o símbolo, mostrar o span **utilizável** e o que o está limitando.
 
-**Aceite:** para EURUSD, o M1 aparece marcado como limitado pelo terminal (100.000 barras) e o D1
-aparece com 1971 como início **bruto** e 1999 como início utilizável; nenhuma chamada da API espera
-os 207 s da sondagem.
+  3. **Custo carimbado** — anos em que o `spread` da barra é constante (`min == max`) são anos em
+     que o broker inventou o custo. A sonda reporta o primeiro ano medido, que é o piso honesto
+     da janela padrão. ⚠️ Sondado **por símbolo**: 2010 é o número do EURUSD deste broker, e uma
+     ação americana tem outra história.
+
+**Aceite:** para EURUSD, o M1 aparece marcado como limitado pelo terminal (100.000 barras), o D1
+aparece com 1971 como início **bruto** e 1999 como início de preço real, e a janela padrão começa
+em 2010 porque antes disso o spread é constante; nenhuma chamada da API espera os 207 s da
+sondagem.
 
 **Você vai aprender:** que "mais histórico" e "mais validação" não são a mesma coisa — 28 anos de
 barras sem range fazem o backtest parecer melhor e ser menos validado; e como reportar uma medição

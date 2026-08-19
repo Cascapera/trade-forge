@@ -45,7 +45,7 @@ export function LaunchBacktest(): React.JSX.Element {
     )
   }
 
-  const blocked = whyNotRunnable(form)
+  const blocked = whyNotRunnable(form, instruments.data)
 
   const launch = (): void => {
     create.mutate(toBacktestRequest(form, strategyId, timeframe), {

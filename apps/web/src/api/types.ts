@@ -624,3 +624,46 @@ export interface StrategyFilters {
   limit?: number
   offset?: number
 }
+
+/**
+ * One line of the broker's own catalogue — what the account can *see*, which is a much longer
+ * list than what this system has collected.
+ *
+ * Deliberately not an `Instrument`: it carries no tick size and no tick value, because most of
+ * these symbols have never been catalogued and nothing has ever decided how to price them.
+ */
+export interface BrokerSymbol {
+  symbol: string
+  description: string | null
+  path: string | null
+  digits: number | null
+  /** In the terminal's Market Watch. Display only — a hidden symbol searches and collects
+   *  exactly the same, and 74 of this broker's 84 are hidden. */
+  visible: boolean
+  /**
+   * Whether this system has an instrument row for it, which is what a backtest needs.
+   *
+   * ⚠️ Without this the screen would offer every symbol the broker has and let the user find
+   * out which ones actually run by clicking. It is not a promise that candles exist for any
+   * particular window — only that the symbol has been catalogued at all.
+   */
+  catalogued: boolean
+}
+
+/** Where the symbol list came from. `null` means nobody has ever synced this broker. */
+export interface SymbolSnapshot {
+  server: string | null
+  synced_at: string
+}
+
+/**
+ * A search result, plus the provenance of the list it came from.
+ *
+ * ⚠️ `snapshot: null` and an empty `symbols` are the two different reasons the list can be
+ * empty, and the screen has to say different things: "no symbol starts with that" versus
+ * "there is no catalogue yet — sync your terminal".
+ */
+export interface SymbolSearch {
+  symbols: BrokerSymbol[]
+  snapshot: SymbolSnapshot | null
+}

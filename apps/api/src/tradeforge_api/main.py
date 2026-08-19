@@ -26,6 +26,7 @@ from tradeforge_api.routers import (
     instruments,
     strategies,
     studies,
+    symbols,
     walkforwards,
 )
 from tradeforge_db.session import create_db_engine, create_session_factory
@@ -71,6 +72,7 @@ def create_app(
         app.state.arq_pool = arq_pool
 
     app.include_router(instruments.router)
+    app.include_router(symbols.router)
     app.include_router(strategies.router)
     app.include_router(backtests.router)
     app.include_router(baskets.router)

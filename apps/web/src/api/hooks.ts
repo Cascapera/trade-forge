@@ -3,7 +3,7 @@
 // a backtest is asynchronous, so the query *polls* until the run reaches a terminal status, then
 // stops on its own. That is the whole point of the 202-plus-poll contract the API exposes.
 
-import { skipToken, useMutation, useQueries, useQuery } from '@tanstack/react-query'
+import { skipToken, useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query'
 import type { Strategy } from '@tradeforge/schema'
 
 import { api } from './client'
@@ -29,6 +29,7 @@ import type {
   StrategiesPage,
   StrategyFilters,
   StrategyOut,
+  SymbolSearch,
   StudyOut,
   TradesPage,
   WalkForwardOut,
@@ -48,6 +49,41 @@ export function isTerminal(status: BacktestStatus | undefined): boolean {
 
 export function useInstruments() {
   return useQuery<Instrument[]>({ queryKey: ['instruments'], queryFn: api.listInstruments })
+}
+
+/**
+ * The broker's catalogue, searched by prefix.
+ *
+ * `placeholderData` keeps the previous page on screen while the next one loads. Without it the
+ * list empties between keystrokes, and an empty list is the one thing this screen must not show
+ * casually — it is also how "nothing matches" and "no catalogue" look.
+ *
+ * The debounce is the caller's, not this hook's: React Query keys on `q`, so a hook that
+ * debounced internally would still be re-keyed on every character and would only be delaying
+ * the request it had already decided to make.
+ */
+export function useSymbolSearch(q: string) {
+  return useQuery<SymbolSearch>({
+    queryKey: ['symbols', q],
+    queryFn: () => api.searchSymbols(q),
+    placeholderData: (previous) => previous,
+  })
+}
+
+/**
+ * Ask the host agent to re-photograph the broker's catalogue.
+ *
+ * ⚠️ Invalidates every symbol search on success, and success here only means *queued*. The
+ * agent may be down, in which case the refetched list is the old one — which is the right
+ * outcome: the screen keeps working with a stale catalogue rather than emptying itself because
+ * a terminal on somebody's desk is closed.
+ */
+export function useSyncSymbols() {
+  const client = useQueryClient()
+  return useMutation<{ job: string }>({
+    mutationFn: () => api.syncSymbols(),
+    onSuccess: () => client.invalidateQueries({ queryKey: ['symbols'] }),
+  })
 }
 
 /**

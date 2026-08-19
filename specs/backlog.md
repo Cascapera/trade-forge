@@ -552,6 +552,37 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
   buraco que um processo reiniciado deixa (ele retoma do rabo do stream), mas **reiniciar o
   processo** continua sendo trabalho de fora: pertence ao mesmo lugar que for cuidar do executor
   na fase 3.
+- [origem: PR-232 / medição de 19/08] **O `CostModel` é um número por run, e o spread muda uma
+  ordem de grandeza dentro de uma janela longa** — medido no EURUSD H1 deste broker: 11 pontos em
+  2010, 1 ponto de 2020 em diante. Cobrando um valor só na janela padrão (16,6 anos no H1/H4/D1),
+  o erro máximo é ~10 ticks, que contra a mediana de stop já medida (0,00116 = 116 ticks) é **~9%
+  de 1R** por round trip. Não é ruído. Conserto: custo variável no tempo — um `CostModel` que
+  aceite uma curva em vez de um escalar, ou custo lido da própria barra (`rates['spread']`, que
+  existe e hoje é ignorado no backtest). ⚠️ Não é regressão de nada: é um limite que sempre
+  existiu e que só ficou visível quando a janela passou a poder ser longa.
+- [origem: PR-232 / medição de 19/08] **O piso de 2010 é do EURUSD deste broker e precisa ser por
+  símbolo** — a fronteira "spread carimbado vs medido" foi medida num par de forex. Uma ação
+  americana, um índice ou um cripto têm cada um a sua data (e alguns nem têm histórico antes de
+  existirem). A sonda do PR-233 deve descobrir isso por símbolo em vez de assumir 2010; usar o
+  número do EURUSD para tudo seria a mesma família de erro que este PR passou a sessão inteira
+  consertando.
+- [origem: PR-232] **`pytest -m integration` apaga o snapshot de símbolos** — `broker_symbols`
+  entrou na lista de TRUNCATE dos dois conftest, porque um teste que sincroniza vazaria linhas
+  para o próximo. O efeito colateral é operacional: rodar a suíte de integração deixa a busca da
+  tela vazia até alguém apertar *sync from MT5*. Some quando existir banco de teste separado —
+  ver [[integracao-apaga-o-banco]], que é o mesmo problema com seis tabelas a menos.
+- [origem: PR-232] **O agente do host não tem supervisão** — mesmo problema do comando `live`
+  (origem PR-301-A): morre com o terminal que o iniciou e não volta sozinho. Agora são **dois**
+  processos que o Guilherme precisa manter no ar no Windows, o que reforça o caso de resolver
+  isso de uma vez (serviço do Windows, ou um supervisor).
+- [origem: PR-232] **Dois terminais MT5 instalados continuam sem escolha** — `mt5.initialize()`
+  é chamado sem argumento, então "trocar de corretora pela tela" ainda depende de qual terminal
+  o Windows resolve primeiro. Já estava anotado desde o PR-223; agora tem consequência visível,
+  porque o botão *sync from MT5* fotografa o catálogo de um terminal que o usuário não escolheu.
+- [origem: PR-232] **A busca é por prefixo, e `usd` não acha `EURUSD`** — decisão consciente (um
+  ticker é lembrado pela frente, e substring enterraria AAPL sob tudo que tem essas letras no
+  meio), mas é atrito real para quem procura por moeda de cotação. Conserto candidato: casar
+  prefixo **primeiro** e substring depois, na mesma resposta, com os do prefixo no topo.
 - [origem: PR-301-B] **Terminal ligado mas deslogado do broker não é detectado** — `terminal_info()`
   devolve objeto (não `None`), então o laço não vê `ConnectionError`; o `copy_rates_from_pos`
   responde com histórico em cache que parou de avançar, e isso é **indistinguível de mercado

@@ -28,6 +28,10 @@ TABLES_CHILD_FIRST = (
     "strategies",
     "datasets",
     "instruments",
+    # ⚠️ Not a child of anything, and listed anyway. `broker_symbols` deliberately has no
+    # foreign key — that is what lets a sync replace it wholesale — so no CASCADE reaches it
+    # and a test that syncs would leak its rows into the next one.
+    "broker_symbols",
 )
 
 

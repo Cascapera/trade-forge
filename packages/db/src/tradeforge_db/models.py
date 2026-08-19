@@ -233,6 +233,85 @@ class Instrument(Base):
 
 
 # --------------------------------------------------------------------------- #
+# Broker symbols — a snapshot of what the account can see today                 #
+# --------------------------------------------------------------------------- #
+
+
+class BrokerSymbol(Base):
+    """One line of the broker's own catalogue, as MT5 last reported it.
+
+    ⚠️ **Deliberately not `Instrument`, and the split is the whole point of the table.**
+    `Instrument` is what *this system* knows and prices: it carries `tick_value` and
+    `contract_size`, it is what a `Backtest` and a `Dataset` point at with `ondelete="RESTRICT"`,
+    and a row there means somebody catalogued that symbol on purpose. This is a *photograph of
+    an account* — what the broker happens to offer right now, most of it never collected and
+    most of it never traded.
+
+    Folding the two together would make switching brokers destructive. The same terminal that
+    listed 9550 symbols with AAPL in it now lists 84 of forex and CFDs (measured 19/08/2026,
+    after the account changed), and a sync that owned `instruments` would have had to delete
+    rows that still have Parquet on disk and backtests pointing at them. Separate, a sync is
+    free to replace the whole table, because nothing points at it.
+
+    Not written by the API, which cannot reach MetaTrader at all (ADR-02, and the wheel does
+    not exist on Linux). Written by the host agent, read by `/symbols/search`.
+    """
+
+    __tablename__ = "broker_symbols"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False, unique=True)
+
+    # What the terminal calls it in a human sentence, and where it files it in its tree
+    # ("Forex\\Majors\\EURUSD"). The path is how the collector already infers an asset class,
+    # so keeping it lets the screen group results without a second round trip to the host.
+    description: Mapped[str | None] = mapped_column(String(256))
+    path: Mapped[str | None] = mapped_column(String(256))
+
+    digits: Mapped[int | None] = mapped_column(SmallInteger)
+
+    # Whether the symbol is in Market Watch. ⚠️ Kept for display only: measured on this
+    # broker, a *hidden* symbol answers `symbols_get(group=...)` and hands over history just
+    # like a visible one, so this must never be used to filter search results — it would hide
+    # 74 of 84 symbols for no reason. It matters to the live loop, which does have to select a
+    # symbol before watching it.
+    # ⚠️ Both defaults fire at **write** time, and neither at construction. `default` is what
+    # SQLAlchemy sends on an INSERT that omits the column; `server_default` is the DDL that
+    # covers a row inserted by anything else. So `BrokerSymbol(symbol="X")` has
+    # `visible = None` until it is flushed, which the `Mapped[bool]` annotation does nothing to
+    # prevent — a trap only a test that builds rows by hand ever meets, since every row this
+    # code reads came back from a NOT NULL column.
+    visible: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+
+    # ⚠️ Which broker this row came from, on every row rather than in a one-row side table.
+    # A sync replaces the whole snapshot inside one transaction, so denormalising cannot drift
+    # — and it lets the screen say "84 symbols from MetaQuotes-Demo, synced 5 minutes ago"
+    # instead of showing a list with no provenance. A user who switched accounts and forgot is
+    # exactly the person a stale list would mislead.
+    server: Mapped[str | None] = mapped_column(String(64))
+    synced_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        # ⚠️ `varchar_pattern_ops`, because the only query this table answers is a prefix
+        # match. Under a non-C collation a plain btree cannot serve `LIKE 'EUR%'` and Postgres
+        # falls back to a sequential scan — an index that looks present and does nothing. It
+        # would never be noticed either, because at this table's size the scan is fast.
+        #
+        # Spelled with `postgresql_ops` rather than as a text expression so alembic can compare
+        # it: an operator clause inside an expression makes the drift check warn and skip,
+        # which is a check that reports green about something it did not look at.
+        Index(
+            "ix_broker_symbols_symbol_prefix",
+            "symbol",
+            postgresql_ops={"symbol": "varchar_pattern_ops"},
+        ),
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Datasets — the catalogue of what exists in Parquet                            #
 # --------------------------------------------------------------------------- #
 

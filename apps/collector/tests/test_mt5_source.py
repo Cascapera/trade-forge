@@ -50,6 +50,7 @@ class _SymbolInfo:
     point: float = 1e-05
     spread: int = 12
     spread_float: bool = True
+    visible: bool = True
 
 
 class _FakeTerminal:
@@ -63,6 +64,12 @@ class _FakeTerminal:
         self.initialised = 0
         self.selected: list[str] = []
         self.from_pos: list[tuple[str, int, int]] = []
+        # Two symbols, one of them outside Market Watch — which is the ordinary state of a real
+        # terminal (measured: 74 of 84) and the case a `visible` filter would silently hide.
+        self.catalogue = [
+            _SymbolInfo(name="EURUSD", visible=True),
+            _SymbolInfo(name="AUDCAD", description="", path="", visible=False),
+        ]
 
     def initialize(self) -> bool:
         self.initialised += 1
@@ -95,7 +102,10 @@ class _FakeTerminal:
         return (-1, "fake")
 
     def symbols_get(self) -> list[_SymbolInfo]:
-        return [_SymbolInfo()]
+        return self.catalogue
+
+    def account_info(self) -> Any:
+        return type("Account", (), {"server": "MetaQuotes-Demo"})()
 
     def symbol_info(self, symbol: str) -> _SymbolInfo | None:
         return _SymbolInfo(name=symbol) if symbol == "EURUSD" else None
@@ -705,3 +715,66 @@ def test_a_failed_shutdown_does_not_stop_the_reconnection() -> None:
 def test_closing_a_source_that_was_never_connected_is_harmless() -> None:
     """Nothing to shut down, and the loop's cleanup path must not care whether there was."""
     MT5Source(terminal=_FakeTerminal(), server_offset=SERVER_OFFSET).close()
+
+
+def test_the_catalogue_lists_symbols_outside_market_watch_too() -> None:
+    """⚠️ Measured: 74 of 84 symbols on this broker are not in Market Watch, and every
+    one of them answers a prefix query and hands over history exactly like a selected one.
+
+    Filtering on `visible` would hide seven eighths of the catalogue to enforce a distinction
+    only the live loop needs — and the user searching for a symbol to test is precisely the
+    person who has not selected it yet.
+    """
+    with MT5Source(terminal=_FakeTerminal(), server_offset=SERVER_OFFSET) as source:
+        found = source.symbols()
+
+    assert [one.symbol for one in found] == ["EURUSD", "AUDCAD"]
+    assert [one.visible for one in found] == [True, False]
+
+
+def test_a_field_the_broker_left_blank_comes_back_as_unknown() -> None:
+    """MetaTrader says "not set" with the empty string.
+
+    ⚠️ Storing `""` would make "this broker gives no description" indistinguishable from
+    "the description is blank", and the screen renders an empty line for both with no way to
+    say which it is showing.
+    """
+    with MT5Source(terminal=_FakeTerminal(), server_offset=SERVER_OFFSET) as source:
+        blank = next(one for one in source.symbols() if one.symbol == "AUDCAD")
+
+    assert blank.description is None
+    assert blank.path is None
+
+
+def test_a_catalogue_read_from_a_dead_terminal_is_a_lost_connection() -> None:
+    """Not an empty catalogue — which would be read as "this broker offers nothing"."""
+
+    class _Gone(_FakeTerminal):
+        def terminal_info(self) -> object | None:
+            return None
+
+    with (
+        MT5Source(terminal=_Gone(), server_offset=SERVER_OFFSET) as source,
+        pytest.raises(ConnectionError, match="not answering"),
+    ):
+        source.symbols()
+
+
+def test_the_server_is_reported_so_a_symbol_list_carries_its_provenance() -> None:
+    with MT5Source(terminal=_FakeTerminal(), server_offset=SERVER_OFFSET) as source:
+        assert source.server() == "MetaQuotes-Demo"
+
+
+def test_a_terminal_that_is_not_logged_in_has_no_server_name() -> None:
+    """⚠️ Unknown, never a made-up name.
+
+    A snapshot stamped with a plausible-looking server nobody is connected to is worse than one
+    stamped `null`: the screen would show provenance that reads as verified.
+    """
+
+    class _LoggedOut(_FakeTerminal):
+        def account_info(self) -> Any:
+            return None
+
+    with MT5Source(terminal=_LoggedOut(), server_offset=SERVER_OFFSET) as source:
+        assert source.server() is None

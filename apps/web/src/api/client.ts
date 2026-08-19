@@ -24,6 +24,7 @@ import type {
   StrategyFilters,
   StrategyOut,
   StudyOut,
+  SymbolSearch,
   TradesPage,
   WalkForwardOut,
 } from './types'
@@ -77,6 +78,13 @@ function query(params: Record<string, string | number | undefined>): string {
 
 export const api = {
   listInstruments: (): Promise<Instrument[]> => request('GET', '/instruments'),
+  // The broker's catalogue, served from the snapshot the host agent wrote. Not a round trip to
+  // MetaTrader: the API runs in a Linux container and cannot reach it (ADR-02, ADR-0021).
+  searchSymbols: (q: string, limit?: number): Promise<SymbolSearch> =>
+    request('GET', `/symbols/search${query({ q, limit })}`),
+  // Asks the host agent to photograph the catalogue again. Returns as soon as the job is
+  // queued — it cannot know whether a terminal is even running.
+  syncSymbols: (): Promise<{ job: string }> => request('POST', '/symbols/sync'),
   listBacktests: (filters: BacktestFilters = {}): Promise<BacktestsPage> =>
     request('GET', `/backtests${query({ ...filters })}`),
   createStrategy: (definition: unknown): Promise<StrategyOut> =>

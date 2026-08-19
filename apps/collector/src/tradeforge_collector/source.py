@@ -20,12 +20,41 @@ collector found convenient is a candle the engine would have to translate foreve
 """
 
 import datetime as dt
+from dataclasses import dataclass
 from decimal import Decimal
 from typing import Protocol
 
 from tradeforge_engine.domain import Candle, InstrumentSpec
 
-__all__ = ["Candle", "InstrumentSpec", "MarketDataSource"]
+__all__ = ["Candle", "InstrumentSpec", "MarketDataSource", "SymbolInfo"]
+
+
+@dataclass(frozen=True, slots=True)
+class SymbolInfo:
+    """One line of a broker's catalogue: enough to find a symbol, not enough to price it.
+
+    ⚠️ **Deliberately not an `InstrumentSpec`.** That type is the engine's, and every field on
+    it — tick size, tick value, contract size — is a number the engine multiplies money by. To
+    fill one in you have to have decided the symbol's asset class, and the collector refuses to
+    guess that (see `asset_class_from_path`, which returns `None` rather than picking). A
+    catalogue listing must not require that decision: the whole point is to show a user the
+    9550 symbols the broker offers *before* anyone has committed to collecting any of them.
+
+    So this is the shallow view, and it is what a search result is made of. Turning one into an
+    `InstrumentSpec` is the deliberate act of cataloguing, and it happens later, per symbol.
+    """
+
+    symbol: str
+    description: str | None = None
+    path: str | None = None
+    digits: int | None = None
+    visible: bool = False
+    """Whether the symbol sits in the terminal's Market Watch.
+
+    Reported, never used to filter. Measured on this project's broker on 19/08/2026: 74 of 84
+    symbols are outside Market Watch, and every one of them answers `symbols_get(group=...)`
+    and hands over history exactly like a selected one. Only the live loop has to select.
+    """
 
 
 class MarketDataSource(Protocol):

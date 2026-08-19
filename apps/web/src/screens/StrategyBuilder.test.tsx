@@ -14,6 +14,11 @@ vi.mock('../api/hooks', () => ({
   useSaveStrategy: () => ({ mutate: save, isPending: false, isError: false, error: null }),
   useCreateBacktest: () => ({ mutate: run, isPending: false, isError: false, error: null }),
   useInstruments: () => ({ data: [{ id: 'i1', symbol: 'AAPL' }] }),
+  // The symbol field is a combobox over the broker's catalogue now, so it fetches. Stubbed
+  // with an empty snapshot: these tests type a ticker rather than picking from the list, which
+  // is the path that matters to them, and a real query here would be a network call in jsdom.
+  useSymbolSearch: () => ({ data: { symbols: [], snapshot: null } }),
+  useSyncSymbols: () => ({ mutate: () => undefined, isPending: false }),
   // The builder asks for a saved strategy whenever the route carries an id.
   useStrategy: () => opened,
 }))
@@ -24,7 +29,7 @@ import { StrategyBuilder } from './StrategyBuilder'
 function answerTheOpenQuestions(side = 'long'): void {
   const sideField = screen.queryByLabelText('setup side')
   if (sideField !== null) fireEvent.change(sideField, { target: { value: side } })
-  fireEvent.change(screen.getByLabelText('symbol'), { target: { value: 'AAPL' } })
+  fireEvent.change(screen.getByLabelText('Symbol'), { target: { value: 'AAPL' } })
 }
 
 /** Both calls succeed: the strategy is saved, then the backtest is enqueued. */
@@ -168,7 +173,7 @@ describe('running the backtest', () => {
     expect(button).toBeDisabled()
     expect(screen.getByText(/choose an instrument/i)).toBeInTheDocument()
 
-    fireEvent.change(screen.getByLabelText('symbol'), { target: { value: 'AAPL' } })
+    fireEvent.change(screen.getByLabelText('Symbol'), { target: { value: 'AAPL' } })
     expect(button).toBeEnabled()
   })
 

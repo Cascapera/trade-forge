@@ -714,7 +714,7 @@ export function StrategyBuilder(): React.JSX.Element {
   const refs = useMemo(() => refCatalogue(form.indicators), [form.indicators])
   const document = useMemo(() => buildStrategy(form), [form])
   const validation = useMemo(() => validateStrategy(document), [document])
-  const blocked = whyNotRunnable(backtest)
+  const blocked = whyNotRunnable(backtest, instruments.data)
 
   const patch = (update: Partial<StrategyForm>): void => {
     setForm({ ...form, ...update })

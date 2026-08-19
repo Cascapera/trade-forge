@@ -1121,6 +1121,7 @@ name = "tradeforge-collector"
 version = "0.1.0"
 source = { editable = "apps/collector" }
 dependencies = [
+    { name = "arq" },
     { name = "metatrader5", marker = "sys_platform == 'win32'" },
     { name = "pyarrow" },
     { name = "redis" },
@@ -1131,6 +1132,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "arq", specifier = ">=0.26" },
     { name = "metatrader5", marker = "sys_platform == 'win32'", specifier = ">=5.0.45" },
     { name = "pyarrow", specifier = ">=18.1" },
     { name = "redis", specifier = ">=5" },

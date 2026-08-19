@@ -7,6 +7,11 @@ const { mutate } = vi.hoisted(() => ({ mutate: vi.fn() }))
 
 vi.mock('../api/hooks', () => ({
   useInstruments: () => ({ data: [{ id: 'i1', symbol: 'EURUSD' }] }),
+  // The symbol field is a combobox over the broker's catalogue now, so it fetches. Stubbed
+  // with an empty snapshot: these tests type a ticker rather than picking from the list, which
+  // is the path that matters to them, and a real query here would be a network call in jsdom.
+  useSymbolSearch: () => ({ data: { symbols: [], snapshot: null } }),
+  useSyncSymbols: () => ({ mutate: () => undefined, isPending: false }),
   useCreateBacktest: () => ({ mutate, isPending: false, isError: false }),
 }))
 
@@ -33,7 +38,7 @@ describe('LaunchBacktest', () => {
     renderWithProviders(<LaunchBacktest />)
 
     // Touch every field so their handlers run.
-    fireEvent.change(screen.getByLabelText('symbol'), { target: { value: 'EURUSD' } })
+    fireEvent.change(screen.getByLabelText('Symbol'), { target: { value: 'EURUSD' } })
     fireEvent.change(screen.getByLabelText('timeframe'), { target: { value: 'H4' } })
     fireEvent.change(screen.getByLabelText('capital'), { target: { value: '5000' } })
     fireEvent.change(screen.getByLabelText('from'), { target: { value: '2023-01-01' } })

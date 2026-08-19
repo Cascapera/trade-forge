@@ -60,12 +60,36 @@ class _FakeTerminal:
     def __init__(self, *, rates: list[dict[str, Any]] | None = None) -> None:
         self._rates = rates or []
         self.shutdown_called = False
+        self.initialised = 0
+        self.selected: list[str] = []
+        self.from_pos: list[tuple[str, int, int]] = []
 
     def initialize(self) -> bool:
+        self.initialised += 1
         return True
 
     def shutdown(self) -> None:
         self.shutdown_called = True
+
+    def terminal_info(self) -> object | None:
+        """A live terminal answers with something; a dead one answers `None`.
+
+        That is the only reliable way to tell "the terminal is gone" from "that symbol has no
+        bars", because MetaTrader gives both of them the same shape of answer.
+        """
+        return object()
+
+    def symbol_select(self, symbol: str, enable: bool) -> bool:
+        self.selected.append(symbol)
+        return enable
+
+    def copy_rates_from_pos(
+        self, symbol: str, timeframe: int, start_pos: int, count: int
+    ) -> list[dict[str, Any]] | None:
+        # Position 0 is the bar still forming, so a caller asking from position 1 gets the
+        # closed ones — which is exactly what the fake's history is.
+        self.from_pos.append((symbol, start_pos, count))
+        return self._rates[-count:] if self._rates else None
 
     def last_error(self) -> tuple[int, str]:
         return (-1, "fake")
@@ -328,8 +352,47 @@ def test_asking_the_spread_of_an_unknown_symbol_is_the_same_clear_error() -> Non
 
 
 def test_using_the_source_before_connecting_is_refused() -> None:
-    with pytest.raises(RuntimeError, match="not connected"):
+    """⚠️ `ConnectionError`, because detached is a connection state.
+
+    The live loop routes on the *type*: a `ConnectionError` is the feed being down and costs a
+    reconnection, anything else is one symbol having a bad day and costs a log line. A source
+    that is not attached belongs squarely in the first category — see the test below for the
+    path that makes the difference load-bearing rather than pedantic.
+    """
+    with pytest.raises(ConnectionError, match="not connected"):
         MT5Source(terminal=_FakeTerminal()).instrument("EURUSD")
+
+
+def test_a_reconnection_that_failed_leaves_a_source_the_loop_can_still_reach() -> None:
+    """⚠️ **Found by running the acceptance against the real terminal**, not by a test.
+
+    `reconnect()` clears the handle and then re-initialises. When the second half fails — a
+    terminal that is still coming up, which is the *expected* case — the source stays detached.
+    Every later poll then has to keep saying "the feed is down", because that is the only
+    answer that buys another retry. Raising anything else meant the loop swallowed it as one
+    bad symbol and never attempted a reconnection again: **one failed retry wedged the
+    collector for good**, in silence.
+
+    22 mutants missed this. The fake source in `test_live.py` keeps raising `ConnectionError`
+    after a refused reconnection, so it agreed with the fixed code and with the broken code
+    alike — the divergence only existed in the real adapter.
+    """
+
+    class _WontComeBack(_FakeTerminal):
+        def initialize(self) -> bool:
+            self.initialised += 1
+            return self.initialised == 1
+
+    source = MT5Source(terminal=_WontComeBack(), server_offset=SERVER_OFFSET).connect()
+
+    with pytest.raises(ConnectionError, match="refused the connection"):
+        source.reconnect()
+
+    # And again, and again — every poll from here has to be a `ConnectionError`, or the loop
+    # stops asking.
+    for _ in range(3):
+        with pytest.raises(ConnectionError, match="not connected"):
+            source.recent_closed("EURUSD", "H1", 1)
 
 
 def test_leaving_the_context_shuts_the_terminal_down() -> None:
@@ -483,3 +546,162 @@ def test_a_stated_offset_that_is_not_a_timezone_is_refused_too() -> None:
     """`+30` is a typo whether a human typed it or a frozen tick implied it."""
     with pytest.raises(ValueError, match="is not a timezone"):
         MT5Source(terminal=_FakeTerminal(), server_offset=dt.timedelta(hours=30))
+
+
+# --------------------------------------------------------------------------- #
+# Watching a market: selecting, polling by position, and losing the terminal    #
+# --------------------------------------------------------------------------- #
+
+
+def test_the_closed_bar_is_asked_for_by_position_and_never_from_a_clock() -> None:
+    """⚠️ Position 1, count 1 — the whole of "did it close?".
+
+    The alternative compares `bar.time + step <= now`, which needs the server offset, and that
+    offset is measured from the newest tick: a market that stopped ticking freezes it, so the
+    comparison drifts by the length of the closure with nothing raised. Measured on this
+    project's broker: +134 min against a real +180, 46 minutes after the close.
+    """
+    terminal = _FakeTerminal(rates=[a_rate(10), a_rate(11)])
+
+    with MT5Source(terminal=terminal, server_offset=SERVER_OFFSET) as source:
+        found = source.recent_closed("EURUSD", "H1", 1)
+
+    assert terminal.from_pos == [("EURUSD", 1, 1)]
+    # Labelled in UTC by undoing the broker's clock — the offset still translates, it just
+    # never decides.
+    assert [one.time for one in found] == [dt.datetime(2024, 6, 3, 8, tzinfo=dt.UTC)]
+
+
+def test_a_run_of_bars_comes_back_oldest_first() -> None:
+    """The gap fill publishes in this order, and Redis refuses ids that do not increase.
+
+    ⚠️ Newest-first would land the first bar and have every older one rejected as a
+    duplicate — a stream one bar long where five were expected, and no error anywhere.
+    """
+    terminal = _FakeTerminal(rates=[a_rate(9), a_rate(10), a_rate(11)])
+
+    with MT5Source(terminal=terminal, server_offset=SERVER_OFFSET) as source:
+        found = source.recent_closed("EURUSD", "H1", 3)
+
+    assert [one.time.hour for one in found] == [6, 7, 8]
+
+
+def test_a_symbol_with_no_bars_is_an_answer_and_not_a_failure() -> None:
+    # A session that has not produced its first bar. A live loop that crashed on this could
+    # not be started before the opening bell.
+    with MT5Source(terminal=_FakeTerminal(), server_offset=SERVER_OFFSET) as source:
+        assert source.recent_closed("EURUSD", "H1", 1) == []
+
+
+def test_a_terminal_that_has_gone_away_is_not_a_symbol_with_no_bars() -> None:
+    """⚠️ The ambiguity this check exists to remove, and it has to be checked first.
+
+    A dead terminal answers `symbol_info` with `None`, which this class turns into "that symbol
+    is not available in this terminal" — wrong, convincing, and read by the live loop as one bad
+    symbol rather than as the feed being down. So `terminal_info` is asked before the symbol is,
+    and the answer is a `ConnectionError` that the loop knows how to wait out.
+    """
+
+    class _Gone(_FakeTerminal):
+        def terminal_info(self) -> object | None:
+            return None
+
+        def symbol_info(self, symbol: str) -> _SymbolInfo | None:
+            return None
+
+    with (
+        MT5Source(terminal=_Gone(), server_offset=SERVER_OFFSET) as source,
+        pytest.raises(ConnectionError, match="not answering"),
+    ):
+        source.recent_closed("EURUSD", "H1", 1)
+
+
+def test_a_poll_asks_for_at_least_one_bar() -> None:
+    with (
+        MT5Source(terminal=_FakeTerminal(), server_offset=SERVER_OFFSET) as source,
+        pytest.raises(ValueError, match="at least one bar"),
+    ):
+        source.recent_closed("EURUSD", "H1", 0)
+
+
+def test_subscribing_puts_the_symbol_into_market_watch() -> None:
+    """⚠️ Measured: 5 of 9550 symbols were selected on this project's broker.
+
+    An unselected symbol reports no bars for ever, which is also the honest answer for a market
+    that has not closed one — so a watch on the wrong symbol looks exactly like a quiet Sunday
+    until somebody checks by hand.
+    """
+    terminal = _FakeTerminal()
+
+    with MT5Source(terminal=terminal, server_offset=SERVER_OFFSET) as source:
+        source.subscribe("EURUSD")
+
+    assert terminal.selected == ["EURUSD"]
+
+
+def test_a_symbol_the_terminal_will_not_select_stops_the_watch() -> None:
+    class _Refusing(_FakeTerminal):
+        def symbol_select(self, symbol: str, enable: bool) -> bool:
+            return False
+
+    with (
+        MT5Source(terminal=_Refusing(), server_offset=SERVER_OFFSET) as source,
+        pytest.raises(LookupError, match="Market Watch"),
+    ):
+        source.subscribe("EURUSD")
+
+
+def test_reconnecting_detaches_and_initialises_again() -> None:
+    terminal = _FakeTerminal()
+    source = MT5Source(terminal=terminal, server_offset=SERVER_OFFSET).connect()
+
+    source.reconnect()
+
+    assert terminal.shutdown_called is True
+    assert terminal.initialised == 2
+
+
+def test_a_shutdown_that_fails_still_lets_the_reconnection_happen() -> None:
+    """⚠️ The one case that matters: reconnecting happens *after* the terminal died.
+
+    That is precisely when `shutdown()` is most likely to throw, and a source that kept its old
+    handle would believe it was still attached — so the next `connect()` would be layered on a
+    connection that no longer exists.
+    """
+
+    class _BadShutdown(_FakeTerminal):
+        def shutdown(self) -> None:
+            raise OSError("the terminal is already gone")
+
+    source = MT5Source(terminal=_BadShutdown(), server_offset=SERVER_OFFSET).connect()
+
+    with pytest.raises(OSError, match="already gone"):
+        source.close()
+
+    # ⚠️ Asserted on the *detachment*, not on the reconnection. Going through
+    # `reconnect()` proves nothing here: it swallows the failure and calls `connect()` either
+    # way, so a source that kept its stale handle reattaches and the test passes. The
+    # separating question is what the source believes right after a shutdown that threw.
+    with pytest.raises(ConnectionError, match="not connected"):
+        source.recent_closed("EURUSD", "H1", 1)
+
+
+def test_a_failed_shutdown_does_not_stop_the_reconnection() -> None:
+    """And the loop's side of it: `reconnect` survives a terminal that is already gone."""
+
+    class _BadShutdown(_FakeTerminal):
+        def shutdown(self) -> None:
+            raise OSError("the terminal is already gone")
+
+    terminal = _BadShutdown()
+    source = MT5Source(terminal=terminal, server_offset=SERVER_OFFSET).connect()
+
+    source.reconnect()
+
+    assert terminal.initialised == 2
+    assert source.recent_closed("EURUSD", "H1", 1) == []
+
+
+def test_closing_a_source_that_was_never_connected_is_harmless() -> None:
+    """Nothing to shut down, and the loop's cleanup path must not care whether there was."""
+    MT5Source(terminal=_FakeTerminal(), server_offset=SERVER_OFFSET).close()

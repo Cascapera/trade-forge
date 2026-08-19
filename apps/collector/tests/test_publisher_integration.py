@@ -152,3 +152,66 @@ def test_an_error_that_is_not_a_duplicate_is_raised(client: Redis) -> None:
 
     with pytest.raises(ResponseError):
         RedisCandlePublisher(client).publish(SUBSCRIPTION, candle(5))
+
+
+def test_an_empty_stream_has_no_last_bar(client: Redis) -> None:
+    """`None` is what tells a first run apart from a restart.
+
+    ⚠️ Not an exception and not epoch zero: a fresh subscription has genuinely never
+    published anything, and a sentinel instant would make the loop believe it owed every bar
+    since 1970 the first time it ran.
+    """
+    assert RedisCandlePublisher(client).last_published(SUBSCRIPTION) is None
+
+
+def test_the_stream_remembers_where_the_last_process_got_to(client: Redis) -> None:
+    """⚠️ The durable half of the gap fill, and the reason it is read from here.
+
+    A restarted collector has no memory of what it announced. The stream does, so the answer
+    comes back from the same place the candles went — any second copy of this fact is a copy
+    that disagrees the first time a process is killed between writing the two.
+    """
+    publisher = RedisCandlePublisher(client)
+    publisher.publish(SUBSCRIPTION, candle(5))
+    publisher.publish(SUBSCRIPTION, candle(10))
+
+    assert publisher.last_published(SUBSCRIPTION) == candle(10).time
+
+
+def test_the_last_bar_is_read_from_the_field_and_not_rebuilt_from_the_id(client: Redis) -> None:
+    """The id is a transport detail; the `time` field is the candle's own statement.
+
+    ⚠️ Reconstructing the instant from the id would be a second implementation of
+    `entry_id` running backwards, with nothing checking the two agree. Here a bar on a
+    half-minute boundary — one an id-parser could round — comes back exactly.
+    """
+    publisher = RedisCandlePublisher(client)
+    odd = Candle(
+        time=dt.datetime(2026, 8, 18, 12, 7, 30, tzinfo=dt.UTC),
+        open=Decimal("1.10000"),
+        high=Decimal("1.10009"),
+        low=Decimal("1.09998"),
+        close=Decimal("1.10001"),
+        tick_volume=42,
+        spread=3,
+        real_volume=1,
+    )
+    publisher.publish(SUBSCRIPTION, odd)
+
+    assert publisher.last_published(SUBSCRIPTION) == odd.time
+
+
+def test_a_bar_older_than_the_stream_is_refused_like_a_duplicate(client: Redis) -> None:
+    """⚠️ What makes the gap fill safe to write as "publish everything, oldest first".
+
+    A fill asks for a run of bars by position, and most of them are usually already on the
+    stream. Redis refuses every id that is not greater than the last — so an older bar offered
+    after a newer one is rejected exactly like a duplicate, and the loop needs no bookkeeping of
+    its own to avoid offering it. It is also why the fill must go out **oldest first**: reversed,
+    only the first bar would land.
+    """
+    publisher = RedisCandlePublisher(client)
+    publisher.publish(SUBSCRIPTION, candle(10))
+
+    assert publisher.publish(SUBSCRIPTION, candle(5)) is False
+    assert len(entries(client)) == 1

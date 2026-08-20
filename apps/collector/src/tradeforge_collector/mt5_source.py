@@ -13,10 +13,19 @@ tested directly.
 
 import datetime as dt
 import logging
+from collections import defaultdict
 from decimal import Decimal
 from types import TracebackType
 from typing import Any, Self
 
+from tradeforge_collector.history import (
+    FABRICATED_YEAR_THRESHOLD,
+    HistoryReport,
+    count_answering,
+    fabricated_fraction,
+    is_stamped_spread,
+    last_fabricated_year,
+)
 from tradeforge_collector.source import SymbolInfo
 from tradeforge_collector.storage import normalise
 from tradeforge_engine.domain import AssetClass, Candle, InstrumentSpec
@@ -429,11 +438,27 @@ class MT5Source:
         if count < 1:
             raise ValueError(f"a poll asks for at least one bar, got {count}")
 
+        return self.bars_from_pos(symbol, timeframe, 1, count)
+
+    def bars_from_pos(
+        self, symbol: str, timeframe: str, start_pos: int, count: int
+    ) -> list[Candle]:
+        """`count` bars ending at `start_pos`, oldest first. Position 0 is the forming bar.
+
+        The general form of `recent_closed`, which is this with `start_pos=1`. Separate only
+        because the protocol the live loop depends on should stay as narrow as the question it
+        asks; a probe walking backwards through years needs the wider one.
+        """
+        if count < 1:
+            raise ValueError(f"a poll asks for at least one bar, got {count}")
+
         mt5 = self._require_connection()
         self._require_terminal(mt5)
-        spec = self.instrument(symbol)
+        digits = self._digits(symbol)
 
-        rates = mt5.copy_rates_from_pos(symbol, self._timeframe_constant(mt5, timeframe), 1, count)
+        rates = mt5.copy_rates_from_pos(
+            symbol, self._timeframe_constant(mt5, timeframe), max(start_pos, 0), count
+        )
         if rates is None:
             return []
 
@@ -441,8 +466,28 @@ class MT5Source:
         # rather than an observation about a library, which is what every caller downstream —
         # the gap fill, and `XADD`'s refusal of a non-increasing id — is relying on.
         return sorted(
-            (self._candle(rate, spec.digits) for rate in rates), key=lambda candle: candle.time
+            (self._candle(rate, digits) for rate in rates), key=lambda candle: candle.time
         )
+
+    def _digits(self, symbol: str) -> int:
+        """How many decimals this symbol quotes, read straight off `symbol_info`.
+
+        ⚠️ **Not via `instrument()`, and that is the whole point of this method existing.**
+        `instrument()` builds a full `InstrumentSpec`, which means deciding the asset class —
+        and `asset_class_from_path` deliberately refuses to guess. Measured on this broker on
+        19/08/2026: 24 of 84 symbols file under `CFDs`, `Crypto Currency` or `Metals`, none of
+        which the map knows, so `MT5Source.recent_closed("BTCUSD", ...)` raised *cannot tell the
+        asset class* while asking for nothing that needed one.
+
+        The coupling was accidental — quantising a price needs a number of decimals, not a
+        taxonomy — and it made a quarter of the catalogue unwatchable and unprobeable for a
+        reason that has nothing to do with either job.
+        """
+        mt5 = self._require_connection()
+        info = mt5.symbol_info(symbol)
+        if info is None:
+            raise LookupError(f"symbol {symbol!r} is not available in this terminal")
+        return int(info.digits)
 
     def _candle(self, rate: Any, digits: int) -> Candle:  # noqa: ANN401 — a numpy record, no stubs
         """One MT5 rate as a `Candle`, in UTC and quantised to the instrument's tick."""
@@ -474,6 +519,138 @@ class MT5Source:
         """
         if mt5.terminal_info() is None:
             raise ConnectionError(f"MetaTrader 5 is not answering: {mt5.last_error()}")
+
+    def probe_history(self, symbol: str, timeframe: str) -> HistoryReport:
+        """How much history this symbol really offers, and what is bounding the answer.
+
+        Three independent bounds, measured rather than assumed — see `history.py` for why each
+        one exists and what it costs to ignore. The decisions all live there, as pure functions
+        over bars; what happens here is walking MetaTrader to feed them.
+
+        ⚠️ **Slow, and unavoidably so.** Measured on this broker: 0.6 ms on a warm H1 and **207
+        seconds** on a cold H4, because the terminal downloads the history while answering. That
+        is what makes this a queued job rather than a request handler.
+        """
+        mt5 = self._require_connection()
+        self._require_terminal(mt5)
+        constant = self._timeframe_constant(mt5, timeframe)
+
+        def answers(position: int) -> bool:
+            rates = mt5.copy_rates_from_pos(symbol, constant, position, 1)
+            return rates is not None and len(rates) > 0
+
+        # ⚠️ Positions, including position 0 — the bar still forming. `maxbars` governs the
+        # series the terminal keeps, and that series includes it, so counting closed bars here
+        # would make every capped symbol come back one short of its own ceiling and read as
+        # uncapped. The forming bar is announced in the docstring of the field rather than
+        # quietly subtracted.
+        positions = count_answering(answers, ceiling=_POSITION_CEILING)
+        maxbars = int(getattr(mt5.terminal_info(), "maxbars", 0) or 0)
+
+        if positions == 0:
+            return HistoryReport(
+                oldest=None,
+                bar_count=0,
+                terminal_maxbars=maxbars,
+                bar_count_is_a_ceiling=False,
+                last_fabricated=None,
+                first_measured_cost=None,
+            )
+
+        oldest = self.bars_from_pos(symbol, timeframe, positions - 1, 1)
+        return HistoryReport(
+            oldest=oldest[0].time if oldest else None,
+            bar_count=positions,
+            terminal_maxbars=maxbars,
+            # ⚠️ Reported, because otherwise this number is a lie that looks like a measurement.
+            # Seen for real: with `maxbars` raised to 100 million, EURUSD M1 answered every
+            # position the search asked for and came back as exactly 10,000,000 — the constant
+            # below, not the data. A docstring saying "the caller can tell because the number is
+            # round" is not a caller telling.
+            bar_count_is_a_ceiling=positions >= _POSITION_CEILING,
+            last_fabricated=self._last_fabricated_year(mt5, symbol),
+            first_measured_cost=self._first_measured_cost(mt5, symbol),
+        )
+
+    def _last_fabricated_year(self, mt5: Any, symbol: str) -> int | None:  # noqa: ANN401 — no stubs
+        """The most recent year that still holds bars nobody traded.
+
+        ⚠️ **Always counted on D1, whatever timeframe was asked for**, for the same reason the
+        cost floor is counted on H1: whether a year was filled in is a property of the symbol
+        and the year, not of the granularity. D1 answers it in about 260 bars a year — seven
+        thousand for a whole history — where M1 would need millions to reach the same verdict.
+
+        ⚠️ And it answers a narrower question than a reader will want. See
+        `history.last_fabricated_year`: a reconstruction carrying plausible prices and volumes
+        is invisible to every property a bar has, and EURUSD's own is.
+        """
+        constant = mt5.TIMEFRAME_D1
+
+        def answers(position: int) -> bool:
+            rates = mt5.copy_rates_from_pos(symbol, constant, position, 1)
+            return rates is not None and len(rates) > 0
+
+        positions = count_answering(answers, ceiling=_POSITION_CEILING)
+        if positions <= _ONLY_THE_FORMING_BAR:
+            return None
+
+        digits = self._digits(symbol)
+        rates = mt5.copy_rates_from_pos(symbol, constant, 1, positions - 1)
+        if rates is None:
+            return None
+
+        by_year: dict[int, list[Candle]] = defaultdict(list)
+        for rate in rates:
+            bar = self._candle(rate, digits)
+            by_year[bar.time.year].append(bar)
+
+        fractions = {year: fabricated_fraction(bars) for year, bars in by_year.items()}
+        return last_fabricated_year(fractions, threshold=FABRICATED_YEAR_THRESHOLD)
+
+    def _first_measured_cost(self, mt5: Any, symbol: str) -> int | None:  # noqa: ANN401 — no stubs
+        """The first year whose spread varied, i.e. was measured rather than typed.
+
+        ⚠️ **Always sampled on H1, whatever timeframe was asked for.** Whether a broker measured
+        its spread in 2007 is a property of the symbol and the year; asking it on M1 would pull
+        two orders of magnitude more bars to answer the same question, and asking it on D1 would
+        answer it from 259 samples a year.
+
+        Read from the raw rates rather than through `Candle`, because a hundred thousand
+        `Decimal` prices would be built to look at an integer field beside them.
+        """
+        info = mt5.symbol_info(symbol)
+        if info is None or not info.spread_float:
+            # Fixed-spread instruments cannot be judged this way at all — a flat year is the
+            # truth there. `is_stamped_spread` documents why that matters.
+            return None
+
+        constant = mt5.TIMEFRAME_H1
+
+        def answers(position: int) -> bool:
+            rates = mt5.copy_rates_from_pos(symbol, constant, position, 1)
+            return rates is not None and len(rates) > 0
+
+        positions = count_answering(answers, ceiling=_POSITION_CEILING)
+        # One position is the forming bar and nothing else — no closed history to judge.
+        if positions <= _ONLY_THE_FORMING_BAR:
+            return None
+
+        rates = mt5.copy_rates_from_pos(symbol, constant, 1, positions - 1)
+        if rates is None:
+            return None
+
+        by_year: dict[int, list[int]] = defaultdict(list)
+        for rate in rates:
+            # The server's clock, not UTC, and deliberately: the offset is at most hours and the
+            # question is asked at the resolution of a year. Undoing it here would buy nothing
+            # and would let a contaminated offset reach a decision.
+            year = dt.datetime.fromtimestamp(int(rate["time"]), tz=dt.UTC).year
+            by_year[year].append(int(rate["spread"]))
+
+        for year in sorted(by_year):
+            if is_stamped_spread(by_year[year], floating=True) is False:
+                return year
+        return None
 
     def _measure_offset(self) -> dt.timedelta:
         mt5 = self._require_connection()
@@ -547,6 +724,14 @@ class MT5Source:
 
 
 _HOUR = dt.timedelta(hours=1)
+
+# Where the depth search stops doubling. Ten million M1 bars is about twenty-seven years of
+# forex — past any history a broker actually keeps, and low enough that a source answering every
+# position cannot spin.
+_POSITION_CEILING = 10_000_000
+
+# A series of exactly one position holds the bar still forming and no closed history at all.
+_ONLY_THE_FORMING_BAR = 1
 
 # How old a quote may be before its spread stops describing the session. Generous on purpose:
 # a thinly traded symbol can go minutes without a print while the market is wide open, and

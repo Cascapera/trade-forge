@@ -91,25 +91,38 @@ Spread que o broker carimbou em cada barra do EURUSD H1:
 2014:  1  varia 0..11                            → medido
 ```
 
-⚠️ **A fronteira é 2010-01-01, e ela é medida e não escolhida.** Antes disso o broker escreveu um
-único número por ano inteiro: não é spread, é preenchimento. Um backtest ali tem custo fictício
-mesmo quando o preço não é — e nenhum `CostModel` conserta isso, porque não há o que modelar.
+⚠️ **A fronteira é medida e não escolhida.** Antes dela o broker escreveu um único número por ano
+inteiro: não é spread, é preenchimento. Um backtest ali tem custo fictício mesmo quando o preço
+não é — e nenhum `CostModel` conserta isso, porque não há o que modelar.
 
-Isso é **independente** do piso de 1999 (nascimento do euro), que separa preço real de série
-reconstruída. 2010 separa **custo** real de custo carimbado, e é o mais restritivo dos dois.
+⚠️ **CORREÇÃO (sonda do PR-233): o ano é 2009, não 2010.** A tabela acima veio de uma amostra de
+janeiro a abril de cada ano; a sonda varre o **ano inteiro** e encontra variação já em 2009. A
+medição mais completa ganha. O piso da janela padrão é **2009-01-01**.
+
+Isso é **independente** do piso de preço. E aqui o PR-233 recuou de propósito: **as barras não
+conseguem provar quando o instrumento passou a existir.** A assinatura de fabricação (`high ==
+low` com `tick_volume <= 1`) desaparece no EURUSD já em 1973 — mas o euro só nasceu em 1999, então
+1973 a 1998 é reconstrução com OHLC e volume plausíveis, invisível a qualquer propriedade de uma
+barra. A mediana de volume salta 38× em 1999 (156 → 5.907), mas os anos anteriores oscilam entre
+131 e 2.006 sem ordem, então um limiar ali seria um número escolhido para caber num símbolo.
+
+Então a sonda responde **"a partir de quando a série deixa de conter barras que ninguém negociou"**,
+que é mensurável, e recusa responder "a partir de quando este instrumento é real", que não é. A
+segunda pergunta tem resposta que um humano sabe — a data de listagem — e a tela pergunta em vez de
+inventar.
 
 ### A regra
 
-**Janela padrão = `min(368.500 barras, desde 2010-01-01)`**, por timeframe:
+**Janela padrão = `min(368.500 barras, desde 2009-01-01)`**, por timeframe:
 
 | tf | janela | barras | quem limitou |
 |---|---|---|---|
 | M1 | 1,0 ano | 368.000 | orçamento |
 | M5 | 5,0 anos | 368.500 | orçamento |
 | M15 | 15,0 anos | 368.500 | orçamento |
-| H1 | 16,6 anos | 102.300 | piso de 2010 |
-| H4 | 16,6 anos | 25.600 | piso de 2010 |
-| D1 | 16,6 anos | 4.300 | piso de 2010 |
+| H1 | 17,6 anos | 108.400 | piso de 2009 |
+| H4 | 17,6 anos | 27.100 | piso de 2009 |
+| D1 | 17,6 anos | 4.600 | piso de 2009 |
 
 Os dois limites quase se encontram no M15, o que é um bom sinal de coerência entre eles.
 
@@ -119,7 +132,7 @@ barras** da janela, não só as datas — "5 anos" não diz nada, "7.705 barras"
 
 ### O que a regra não conserta
 
-De 2010 a 2026 o spread ainda vai de 11 para 1 ponto. Cobrando um número só na janela inteira, o
+De 2009 a 2026 o spread ainda vai de ~11 para 1 ponto. Cobrando um número só na janela inteira, o
 erro máximo é ~10 ticks — com a mediana de stop do EURUSD H1 já medida neste projeto (0,00116 =
 116 ticks), isso é **~9% de 1R**. Bem melhor que os 40 ticks (~35% de 1R) de antes de 2010, mas
 não é zero. O conserto é custo variável no tempo, e está no backlog.

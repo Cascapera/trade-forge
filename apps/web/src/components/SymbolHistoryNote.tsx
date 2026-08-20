@@ -35,6 +35,20 @@ export function SymbolHistoryNote(props: {
     probe.mutate({ symbol, timeframe })
   }
 
+  // ⚠️ A read that failed is not a series nobody has measured, and the difference decides
+  // whether clicking helps. Without this branch the 404 check below is unobservable — any error
+  // leaves `data` undefined and falls into the invitation — so a broken API would answer "nobody
+  // has measured how much D1 history EURUSD has", which is a claim about the data, from a request
+  // that never reached it.
+  if (history.error != null && !neverProbed) {
+    return (
+      <p className="col-span-full text-xs text-amber-300">
+        ⚠️ could not read what has been measured for {symbol} {timeframe}. This is the read
+        failing, not the series being empty — measuring again will not fix it.
+      </p>
+    )
+  }
+
   if (neverProbed || history.data === undefined) {
     return (
       <p className="col-span-full flex items-center gap-2 text-xs text-slate-400">

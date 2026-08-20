@@ -60,6 +60,20 @@ it('offers to measure a series nobody has asked about', () => {
   expect(probe).toHaveBeenCalledWith({ symbol: 'EURUSD', timeframe: 'D1' })
 })
 
+it('a read that failed does not pose as a series nobody measured', () => {
+  /**
+   * ⚠️ Opposite remedies. "Nobody has asked yet" is fixed by clicking; a 500 is not, and
+   * offering the button there sends somebody to press it until they conclude their broker has
+   * no EURUSD. Only the 404 is an invitation.
+   */
+  answer = { data: undefined, error: new ApiError(500, 'boom') }
+
+  render(<SymbolHistoryNote symbol="EURUSD" timeframe="D1" />)
+
+  expect(screen.getByText(/could not read what has been measured/)).toBeInTheDocument()
+  expect(screen.queryByRole('button', { name: 'measure it' })).not.toBeInTheDocument()
+})
+
 it('reports the count and the start together', () => {
   // Neither alone is actionable: "since 2009" says nothing about how much signal that is, and
   // "14,343 bars" says nothing about which market they are.
@@ -71,7 +85,10 @@ it('reports the count and the start together', () => {
   // first version of this test pinned 14,343. The assertion is that the count is *shown*, so it
   // formats the expectation the same way the component does rather than choosing a separator.
   expect(screen.getByText(new RegExp(`${(14343).toLocaleString()} bars available`))).toBeInTheDocument()
-  expect(screen.getByText(/usable from 2009-01-01/)).toBeInTheDocument()
+  // ⚠️ Anchored: an unanchored /2009-01-01/ also matches the raw instant the API sends,
+  // `2009-01-01T00:00:00Z`, so it would pass on a note that printed a timestamp where a yearly
+  // floor belongs.
+  expect(screen.getByText(/usable from 2009-01-01$/)).toBeInTheDocument()
 })
 
 it('names the terminal when the terminal is the limit', () => {

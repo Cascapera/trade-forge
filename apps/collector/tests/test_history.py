@@ -256,6 +256,16 @@ class TestTheTerminalCeiling:
         # is a setting, not a broker.
         assert report(bar_count=100_000, terminal_maxbars=100_000).capped_by_terminal is True
 
+    def test_a_series_past_the_ceiling_is_still_the_machine_talking(self) -> None:
+        """⚠️ The case that separates `>=` from `==`, and the most capped series there is.
+
+        `bar_count` counts positions, including the bar still forming; `maxbars` is a count of
+        the series the terminal keeps. A terminal holding `maxbars` closed bars plus the
+        forming one answers one position more than its own ceiling — and `==` would call that
+        uncapped, which is the exact series the warning exists for.
+        """
+        assert report(bar_count=100_001, terminal_maxbars=100_000).capped_by_terminal is True
+
     def test_a_series_under_the_ceiling_is_the_broker_talking(self) -> None:
         assert report(bar_count=14_342, terminal_maxbars=100_000).capped_by_terminal is False
 

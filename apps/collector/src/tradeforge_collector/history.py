@@ -84,10 +84,19 @@ class HistoryReport:
 
     @property
     def capped_by_terminal(self) -> bool:
-        """⚠️ `>=`, not `==`. The terminal is free to hand back fewer than it holds, and a
-        reader who saw `bar_count == maxbars` as the only cap would miss the case where the
-        series was trimmed a little further. Either way the honest sentence is the same: this
-        number is your setting talking, not your broker."""
+        """⚠️ `>=`, not `==`, because the two numbers are not counted the same way.
+
+        `bar_count` counts positions and position 0 is the bar still forming, while `maxbars`
+        is the terminal's own setting for the series it keeps. A terminal that holds `maxbars`
+        *closed* bars alongside the forming one answers one position more than its ceiling, and
+        `==` would read that series — the most capped one there is — as uncapped. At the
+        ceiling or past it, the honest sentence is the same: this number is your setting
+        talking, not your broker.
+
+        The case `>=` deliberately does **not** catch is a series *below* the ceiling. A
+        terminal that trimmed further than its setting is indistinguishable from a broker that
+        has that much and no more, and guessing between them would put a settings warning on
+        data that has no such limit."""
         return self.bar_count >= self.terminal_maxbars > 0
 
 

@@ -17,6 +17,7 @@ from typing import Any
 
 import pytest
 
+from tradeforge_collector import mt5_source
 from tradeforge_collector.mt5_source import (
     MT5Source,
     asset_class_from_path,
@@ -907,6 +908,43 @@ def test_a_series_at_the_ceiling_says_whose_limit_it_is() -> None:
         report = source.probe_history("EURUSD", "D1")
 
     assert report.capped_by_terminal is True
+
+
+def test_a_search_that_hits_its_own_ceiling_says_so(monkeypatch: pytest.MonkeyPatch) -> None:
+    """⚠️ Seen for real: with `maxbars` raised to 100 million, EURUSD M1 answered every position
+    the search asked for and came back as exactly 10,000,000 — the constant, not a measurement.
+
+    The ceiling is lowered here rather than fed ten million bars, because its *value* is not the
+    behaviour under test: what has to hold is that a count which is the search's own bound comes
+    back marked, instead of arriving on screen as the number somebody sizes a window from.
+    """
+    monkeypatch.setattr(mt5_source, "_POSITION_CEILING", 8)
+    series = a_series(filler_years=0, real_years=2, stamped_years=0)
+    assert len(series) > 8, "the series must outrun the ceiling for the search to hit it"
+
+    with MT5Source(terminal=_SeriesTerminal(series), server_offset=SERVER_OFFSET) as source:
+        report = source.probe_history("EURUSD", "D1")
+
+    assert report.bar_count_is_a_ceiling is True
+    assert report.bar_count == 8
+
+
+def test_a_series_shorter_than_the_ceiling_is_a_measurement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other half: the flag must be able to be false while the same search runs.
+
+    Without this, a report that hard-coded `True` would pass the test above — and every count in
+    the product would carry a warning saying it cannot be trusted.
+    """
+    monkeypatch.setattr(mt5_source, "_POSITION_CEILING", 8)
+    series = a_series(filler_years=0, real_years=2, stamped_years=0)[:5]
+
+    with MT5Source(terminal=_SeriesTerminal(series), server_offset=SERVER_OFFSET) as source:
+        report = source.probe_history("EURUSD", "D1")
+
+    assert report.bar_count_is_a_ceiling is False
+    assert report.bar_count == len(series)
 
 
 def test_a_fixed_spread_instrument_gets_no_cost_floor() -> None:

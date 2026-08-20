@@ -35,18 +35,24 @@ and repair a lost one (`live.reconnect`).
 import datetime as dt
 import logging
 import os
+import uuid
+from pathlib import Path
 from typing import Any
 
 from arq.connections import RedisSettings
 
+from tradeforge_collector.collect import DatabaseJournal, run_collection
 from tradeforge_collector.source import SymbolInfo
 from tradeforge_db.broker_symbols import BrokerSymbolEntry, replace_snapshot
+from tradeforge_db.collections import read_collection
 from tradeforge_db.session import create_db_engine, create_session_factory, session_scope
 from tradeforge_db.symbol_history import HistoryProbe, upsert_history
 
 __all__ = [
     "COLLECT_QUEUE",
     "WorkerSettings",
+    "collect_range",
+    "data_root_from_env",
     "probe_history",
     "redis_settings_from_env",
     "sync_symbols",
@@ -173,6 +179,90 @@ async def probe_history(_context: dict[str, Any], symbol: str, timeframe: str) -
     return report.bar_count
 
 
+async def collect_range(_context: dict[str, Any], collection_id: str) -> int:
+    """Download the range one `collections` row asked for. Returns how many bars are on disk.
+
+    ⚠️ **The queue carries an id and nothing else, and that is the point.** Symbol, timeframe,
+    window and asset class are all already on the row the API wrote before answering 202 — the
+    same row `GET /collections/{id}` reports and the screen renders. A payload repeating them
+    would be a second copy free to disagree with the one a person is looking at, and the
+    disagreement would be invisible: the screen would show the window it stored while the agent
+    downloaded the window it was handed.
+
+    ⚠️ **Four lines of MetaTrader and nothing else.** Everything that can be gotten wrong —
+    where the range is cut, what an empty year means, what the catalogue should claim — lives in
+    `collect.run_collection`, which takes a source and a journal and therefore runs against
+    `SyntheticSource` on Linux CI. This function is the part that cannot be tested there, so it
+    is kept down to the part that cannot be tested there.
+    """
+    from tradeforge_collector.mt5_source import MT5Source  # noqa: PLC0415 — the ADR-02 boundary
+
+    root = data_root_from_env()
+    engine = create_db_engine()
+    try:
+        session = create_session_factory(engine)()
+        try:
+            request = read_collection(session, uuid.UUID(collection_id))
+            if request is None:
+                # Deleted between enqueue and pickup. Nothing to run and nothing to record —
+                # the row that would have held the error is the row that is gone.
+                logger.warning("collection %s no longer exists", collection_id)
+                return 0
+
+            # ⚠️ The class the requester supplied, or None to let the path decide. It reaches
+            # the source rather than the database because `instrument()` is what needs it: 24
+            # of this broker's 84 symbols file under roots `classify` refuses to guess at, and
+            # without an override those symbols cannot be catalogued at all.
+            source = MT5Source(
+                server_offset=_stated_offset(), asset_class=request.asset_class
+            ).connect()
+            try:
+                outcome = run_collection(
+                    source,
+                    DatabaseJournal(
+                        session,
+                        request.id,
+                        root=root,
+                        timeframe=request.timeframe,
+                    ),
+                    root=root,
+                    symbol=request.symbol,
+                    timeframe=request.timeframe,
+                    date_from=request.date_from,
+                    date_to=request.date_to,
+                )
+            finally:
+                source.close()
+
+            logger.info(
+                "collected %s %s: %d candles over %d of %d years",
+                request.symbol,
+                request.timeframe,
+                outcome.candles,
+                outcome.slices_with_data,
+                outcome.slices_total,
+            )
+            return outcome.candles
+        finally:
+            session.close()
+    finally:
+        engine.dispose()
+
+
+def data_root_from_env() -> Path:
+    """Where the Parquet goes, read from the environment because this process is outside compose.
+
+    ⚠️ **The host is the only writer, and the compose file enforces that**: `./data` is bind
+    mounted into the API and the worker as `:ro`. The containers read candles they cannot
+    create, which is the same boundary as ADR-02 seen from the filesystem — the process that
+    can talk to MetaTrader is the process that owns the files MetaTrader produced.
+
+    Defaults to the path the CLI has always used, so the ordinary invocation from the repo root
+    needs no environment at all.
+    """
+    return Path(os.environ.get("TRADEFORGE_DATA_DIR", "data/ohlcv"))
+
+
 def _stated_offset() -> dt.timedelta | None:
     """`TRADEFORGE_SERVER_OFFSET` in hours, or `None` to let the source measure it.
 
@@ -208,7 +298,7 @@ def redis_settings_from_env() -> RedisSettings:
 class WorkerSettings:
     """`arq tradeforge_collector.agent.WorkerSettings` starts the host agent from this."""
 
-    functions = (sync_symbols, probe_history)
+    functions = (sync_symbols, probe_history, collect_range)
     queue_name = COLLECT_QUEUE
 
     # ⚠️ One job at a time. The terminal is a single shared resource with one IPC channel, and

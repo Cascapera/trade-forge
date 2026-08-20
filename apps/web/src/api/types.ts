@@ -695,3 +695,40 @@ export interface SymbolHistory {
   /** The later of the two honest floors. A **lower** bound on trust, never an upper one. */
   usable_from: string | null
 }
+
+/** The five classes the system has a member for. `metal` is deliberately not among them. */
+export type AssetClass = 'forex' | 'stock' | 'index' | 'future' | 'crypto'
+
+export interface CreateCollection {
+  symbol: string
+  timeframe: string
+  date_from: string
+  date_to: string
+  /**
+   * Left out when the symbol's tree path already names the class, which it does for 60 of this
+   * broker's 84 symbols. Sent only when the API asked — its absence is not a default.
+   */
+  asset_class?: AssetClass
+}
+
+export interface Collection {
+  id: string
+  symbol: string
+  timeframe: string
+  /** ⚠️ What was **asked for**, not what was found. A window can legitimately come back shorter. */
+  date_from: string
+  date_to: string
+  /** `null` when the symbol's path decided; a value records that a person did. */
+  asset_class: string | null
+  status: 'queued' | 'running' | 'done' | 'failed'
+  /** Progress in years, because "3 of 5 years" is a sentence and 0.6 is not. */
+  years_done: number
+  years_total: number
+  /** ⚠️ `null` until it finishes — which is not the same claim as `0`, meaning nothing was there. */
+  candles: number | null
+  gaps: number | null
+  error: string | null
+  requested_at: string
+  started_at: string | null
+  finished_at: string | null
+}

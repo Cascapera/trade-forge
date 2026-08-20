@@ -49,7 +49,17 @@ measured at 207 seconds for a cold H4, because the terminal downloads the histor
 answers. A handler that waited would hold a request open for three and a half minutes.
 """
 
-COLLECT_JOBS = (SYNC_SYMBOLS, PROBE_HISTORY)
+COLLECT_RANGE = "collect_range"
+"""Download one `collections` row's range and catalogue what lands on disk.
+
+⚠️ **Takes the row's id and nothing else.** Symbol, timeframe, window and asset class are all
+already on the row this API wrote before answering 202 — the same row `GET /collections/{id}`
+reports and the screen renders. A payload repeating them would be a second copy free to
+disagree with the one on screen, and the disagreement would be silent: the screen would show
+the window it stored while the agent downloaded the window it was handed.
+"""
+
+COLLECT_JOBS = (SYNC_SYMBOLS, PROBE_HISTORY, COLLECT_RANGE)
 """Every job that only the Windows host can run, as one list.
 
 ⚠️ **Named as a set rather than left implicit, so the contract test can be exact in both

@@ -8,8 +8,10 @@ import type {
   BacktestsPage,
   BasketOut,
   CandlesResponse,
+  Collection,
   CreateBacktestRequest,
   CreateBasketRequest,
+  CreateCollection,
   CreateStudyRequest,
   CreateWalkForwardRequest,
   CreatedBacktest,
@@ -93,6 +95,12 @@ export const api = {
   // Measuring is slow enough to be a job: a cold H4 took 207 s on this project's own broker.
   probeSymbol: (symbol: string, timeframe: string): Promise<{ job: string }> =>
     request('POST', `/symbols/${encodeURIComponent(symbol)}/probe${query({ timeframe })}`),
+  // ⚠️ 202 **with a body**, unlike the sync above. A collection takes minutes and can fail with
+  // a reason worth reading, so the row it returns is the only handle anybody has on either.
+  createCollection: (body: CreateCollection): Promise<Collection> =>
+    request('POST', '/collections', body),
+  getCollection: (id: string): Promise<Collection> => request('GET', `/collections/${id}`),
+  listCollections: (): Promise<Collection[]> => request('GET', '/collections'),
   listBacktests: (filters: BacktestFilters = {}): Promise<BacktestsPage> =>
     request('GET', `/backtests${query({ ...filters })}`),
   createStrategy: (definition: unknown): Promise<StrategyOut> =>

@@ -32,6 +32,11 @@ TABLES_CHILD_FIRST = (
     # foreign key — that is what lets a sync replace it wholesale — so no CASCADE reaches it
     # and a test that syncs would leak its rows into the next one.
     "broker_symbols",
+    # The same argument, and the same absence of a foreign key. `symbol_history` is keyed on
+    # (symbol, timeframe), so a row left behind is not inert — it is the answer the next test
+    # reads. It was missed when the table was added, which is what this comment is for.
+    "symbol_history",
+    "collections",
 )
 
 

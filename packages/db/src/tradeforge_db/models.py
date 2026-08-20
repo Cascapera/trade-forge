@@ -421,6 +421,101 @@ class Dataset(Base):
 
 
 # --------------------------------------------------------------------------- #
+# Collections — one request to go and fetch history                             #
+# --------------------------------------------------------------------------- #
+
+
+class Collection(Base):
+    """One request to download a symbol's history, and what became of it.
+
+    Separate from `datasets` because the two answer different questions. `datasets` says
+    **what exists** — one row per (instrument, timeframe), overwritten every time the picture
+    changes. This says **what was asked for, by whom, and how it went**, one row per request,
+    kept afterwards. Collapsing them would mean a failed collection either erasing the
+    catalogue's account of the data already on disk, or leaving no trace at all.
+
+    ⚠️ **The row exists before the work does, and that is the point.** The API returns 202 and
+    an id; the host agent picks the job up seconds or minutes later. Without a row written at
+    request time there is nothing for `GET /collections/{id}` to answer with, and the screen
+    could not tell "queued behind another job" from "the agent is not running" — which are the
+    two states a person most needs to tell apart when nothing appears to be happening.
+    """
+
+    __tablename__ = "collections"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+
+    # No foreign key to `instruments`, on purpose and for the same reason `broker_symbols` has
+    # none: a collection is *how a symbol gets into that table*. Requiring the row to exist
+    # first would make the first collection of any new symbol impossible to record.
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False)
+    timeframe: Mapped[str] = mapped_column(TIMEFRAME, nullable=False)
+
+    date_from: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    date_to: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    """What was **asked for**, which is not what was found.
+
+    ⚠️ Kept apart from the coverage in `datasets` deliberately. Asking for 2015 on a symbol
+    listed in 2018 is an ordinary request with an ordinary answer, and a row that stored only
+    the outcome could never explain why a window came back shorter than the one on screen.
+    """
+
+    asset_class: Mapped[AssetClass | None] = mapped_column(_enum(AssetClass, "asset_class"))
+    """The class the requester supplied, or NULL when the symbol's path already said.
+
+    ⚠️ NULL means *the path decided*, not *nobody knows*. Measured on this broker: 24 of its 84
+    symbols file under `CFDs`, `Crypto Currency` or `Metals`, and `classify.asset_class_from_path`
+    refuses to guess at three of those roots — so the screen asks, and the answer lands here as
+    provenance for a value that a person, not a string, decided.
+    """
+
+    status: Mapped[BacktestStatus] = mapped_column(
+        _enum(BacktestStatus, "collection_status"),
+        nullable=False,
+        default=BacktestStatus.QUEUED,
+    )
+    """Reusing the runs' state machine, exactly as `walk_forwards` does: the same four states
+    for the same reasons, and a second vocabulary would buy nothing but a translation table."""
+
+    years_done: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    years_total: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    """Progress in the unit the work is actually done in.
+
+    ⚠️ Two integers rather than one fraction, because 0.6 is not a sentence. A download is cut
+    at calendar years (`collect.year_slices`), so "3 of 5 years" is both what happened and what
+    a person can read — and a percentage would have to be un-computed to say it.
+    """
+
+    candles: Mapped[int | None] = mapped_column(Integer)
+    gaps: Mapped[int | None] = mapped_column(Integer)
+    """How many interruptions the finished series holds. NULL until it finishes.
+
+    ⚠️ Counted over the **whole** collected window rather than per year. A gap that straddles
+    New Year — a holiday closure, the commonest kind there is — falls in no single slice, so
+    summing per-slice counts would report a number that is always slightly too small and never
+    obviously wrong.
+    """
+
+    error: Mapped[str | None] = mapped_column(Text)
+
+    requested_at: Mapped[dt.datetime] = _created_at()
+    started_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        # Newest first is the only order this is ever listed in, and the id is a UUID, so
+        # there is no implicit ordering to fall back on.
+        Index("ix_collections_requested_at", "requested_at"),
+        _timeframe_check(),
+        CheckConstraint("date_to >= date_from", name="date_range"),
+        CheckConstraint("candles IS NULL OR candles >= 0", name="candles_non_negative"),
+        CheckConstraint("gaps IS NULL OR gaps >= 0", name="gaps_non_negative"),
+        CheckConstraint("years_done >= 0", name="years_done_non_negative"),
+        CheckConstraint("years_done <= years_total", name="years_done_within_total"),
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Strategies — append-only                                                      #
 # --------------------------------------------------------------------------- #
 

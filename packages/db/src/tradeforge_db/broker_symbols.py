@@ -14,7 +14,14 @@ from sqlalchemy.orm import Session
 
 from tradeforge_db.models import BrokerSymbol, Instrument
 
-__all__ = ["BrokerSymbolEntry", "SymbolMatch", "replace_snapshot", "search_symbols"]
+__all__ = [
+    "BrokerSymbolEntry",
+    "SymbolMatch",
+    "replace_snapshot",
+    "search_symbols",
+    "snapshot_taken_at",
+    "symbol_path",
+]
 
 # What one search will hand back at most. A combobox that renders 9550 rows is a combobox that
 # renders none of them usefully, and the caller narrows by typing another letter — which is the
@@ -155,6 +162,20 @@ def search_symbols(
         )
         for row, instrument_id in session.execute(statement)
     ]
+
+
+def symbol_path(session: Session, symbol: str) -> str | None:
+    """The tree path the snapshot photographed for this symbol, or `None`.
+
+    ⚠️ **`None` covers two different situations and the caller has to keep them apart**: the
+    symbol is not in the snapshot at all (nobody has synced, or the account cannot see it), or
+    it is there with no path (MT5 returns the empty string for "not set", which
+    `replace_snapshot` stores as NULL). Neither one lets anybody decide an asset class, which
+    is what this is read for — so the collection screen asks in both cases rather than
+    distinguishing them for no gain.
+    """
+    statement = select(BrokerSymbol.path).where(BrokerSymbol.symbol == symbol)
+    return session.scalars(statement).one_or_none()
 
 
 def snapshot_taken_at(session: Session) -> tuple[str | None, dt.datetime] | None:

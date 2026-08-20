@@ -27,10 +27,12 @@ from pydantic import (
     Field,
     PlainSerializer,
     field_validator,
+    model_validator,
 )
 
 from tradeforge_api.walkforward import MAX_FOLDS, MIN_FOLDS
 from tradeforge_db.models import SelectionMetric
+from tradeforge_engine.domain import AssetClass
 from tradeforge_schema.models import TIMEFRAMES
 
 # A Decimal that always serialises to a string. Applied to every monetary/ratio field below.
@@ -1082,3 +1084,68 @@ class WalkForwardOut(_Out):
 
     folds: list[WalkForwardFoldOut]
     verdict: WalkForwardVerdict
+
+
+class CreateCollectionRequest(BaseModel):
+    """Go and fetch this symbol's history for this window.
+
+    ⚠️ **`asset_class` is optional and its absence is not a default.** It means "the symbol's
+    tree path already says", which is true for 60 of this broker's 84 symbols. For the other 24
+    — filed under `CFDs`, `Crypto Currency` or `Metals` — the path names no class among the five
+    the system has, so `POST /collections` refuses and the screen asks. Sending a class the path
+    would have decided anyway is allowed and overrides it, which is what makes a mis-filed
+    symbol fixable without a migration.
+    """
+
+    symbol: Symbol
+    timeframe: Timeframe
+    date_from: dt.datetime
+    date_to: dt.datetime
+    asset_class: AssetClass | None = None
+
+    @field_validator("date_from", "date_to")
+    @classmethod
+    def _must_be_aware(cls, value: dt.datetime) -> dt.datetime:
+        """⚠️ A naive instant is refused rather than assumed to be UTC.
+
+        The window reaches MetaTrader, which speaks the *server's* clock and nothing else — the
+        collector shifts UTC into it on the way in and back out on the way home. An instant that
+        arrived without a timezone would be shifted anyway, and every bar in the file would be
+        displaced by hours with nothing raised. This project has already paid for that once:
+        the first real backfill wrote candles 62 hours out of place without an error.
+        """
+        if value.tzinfo is None:
+            raise ValueError("an instant must carry a timezone; send UTC as ...Z")
+        return value
+
+    @model_validator(mode="after")
+    def _window_must_run_forwards(self) -> CreateCollectionRequest:
+        if self.date_to < self.date_from:
+            raise ValueError("date_to is before date_from")
+        return self
+
+
+class CollectionOut(_Out):
+    """One collection request and what became of it.
+
+    ⚠️ Carries the **requested** window, which is not what was found. Asking for 2015 on a
+    symbol listed in 2018 is an ordinary request with an ordinary answer, and a body that
+    reported only the outcome could never explain why the window on screen came back shorter
+    than the one that was asked for. What exists is `datasets`, read through `/instruments`.
+    """
+
+    id: uuid.UUID
+    symbol: str
+    timeframe: str
+    date_from: dt.datetime
+    date_to: dt.datetime
+    asset_class: str | None = None
+    status: str
+    years_done: int
+    years_total: int
+    candles: int | None = None
+    gaps: int | None = None
+    error: str | None = None
+    requested_at: dt.datetime
+    started_at: dt.datetime | None = None
+    finished_at: dt.datetime | None = None

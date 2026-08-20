@@ -311,6 +311,71 @@ class BrokerSymbol(Base):
     )
 
 
+class SymbolHistory(Base):
+    """What one (symbol, timeframe) can offer, and what is bounding the answer.
+
+    Written by the host agent, which is the only process that can ask MetaTrader; read by the
+    screen so somebody can size a backtest window before committing to a collection.
+
+    ⚠️ **Three bounds, kept apart on purpose.** A single "available from" date would be four
+    different claims wearing one hat, and a reader can only act on the one that binds them: the
+    terminal's ceiling is fixed in a settings dialog, the filler floor by starting later, the
+    cost floor by not trusting old costs at all. Measured on EURUSD D1 they are 1971, 1972 and
+    2009 - three answers to what looks like one question.
+
+    No foreign key, for the same reason `broker_symbols` has none: a probe is about a symbol
+    *name*, and both the snapshot beside it and the instruments table are free to be replaced
+    under it when the account changes broker.
+    """
+
+    __tablename__ = "symbol_history"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False)
+    timeframe: Mapped[str] = mapped_column(TIMEFRAME, nullable=False)
+
+    oldest: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    """The oldest bar the terminal will hand over. NULL when it has none at all."""
+
+    bar_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    """Positions the series holds, **including the bar still forming**.
+
+    ⚠️ Counted the way `maxbars` counts, so the two are comparable. Storing closed bars
+    instead would leave every capped series one short of its own ceiling and reading as uncapped.
+    """
+
+    terminal_maxbars: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    bar_count_is_a_ceiling: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    """⚠️ True when `bar_count` is the probe's own bound rather than the data's - seen for
+    real at exactly 10,000,000 once this machine's `maxbars` was raised. Without the flag that
+    number is indistinguishable from a measurement."""
+
+    last_fabricated: Mapped[int | None] = mapped_column(SmallInteger)
+    """The most recent year still holding bars nobody traded, or NULL if none does.
+
+    ⚠️ Not "when the instrument became real", which the bars cannot say: EURUSD's
+    fabricated bars stop in 1973 and the euro dates from 1999.
+    """
+
+    first_measured_cost: Mapped[int | None] = mapped_column(SmallInteger)
+    """The first year whose spread varied rather than being one number typed across it."""
+
+    probed_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        # One row per question asked. A re-probe updates it rather than appending a second,
+        # contradictory account of the same series - the same rule `datasets` follows.
+        UniqueConstraint("symbol", "timeframe"),
+        _timeframe_check(),
+        CheckConstraint("bar_count >= 0", name="bar_count_non_negative"),
+        CheckConstraint("terminal_maxbars >= 0", name="terminal_maxbars_non_negative"),
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Datasets — the catalogue of what exists in Parquet                            #
 # --------------------------------------------------------------------------- #

@@ -566,6 +566,20 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
   existirem). A sonda do PR-233 deve descobrir isso por símbolo em vez de assumir 2010; usar o
   número do EURUSD para tudo seria a mesma família de erro que este PR passou a sessão inteira
   consertando.
+- [origem: PR-232 / medição de 19/08] **24 dos 84 símbolos deste broker não são classificáveis
+  sozinhos** — `asset_class_from_path` conhece `forex/stocks/shares/indices/indexes/futures/crypto`,
+  e as raízes reais aqui são `Forex` (60, OK), **`CFDs` (14)**, **`Crypto Currency` (7)** e
+  **`Metals` (3)**. O collector **recusa em vez de chutar**, o que está certo — classe errada dá
+  aritmética de tick errada e P&L errado por um fator constante, que é o bug que parece uma ótima
+  estratégia — mas significa que o botão "coletar" do **PR-234 falha em 29% dos símbolos**.
+  Duas saídas: (a) alargar o mapa, barato e envelhece a cada corretora nova; (b) a tela
+  **perguntar** a classe quando o path não decide, reusando a recusa que já existe. (b) parece
+  melhor: transforma um erro de CLI num campo de formulário, e não finge saber o que não sabe.
+- [origem: PR-232 / coleta de 19/08] **O BTCUSD do broker fecha no fim de semana** — 216 dos 234
+  gaps do H1 são de fim de semana. Cripto negocia 24/7 no mundo real, então o que está sendo
+  testado é o **CFD do broker sobre o bitcoin**, não o bitcoin. Não é bug de nada; é uma
+  propriedade do instrumento que a tela deveria dizer antes de alguém tirar conclusão de um
+  backtest de cripto. Candidato a sair junto do PR-233, que já vai olhar a forma do histórico.
 - [origem: PR-232] **`pytest -m integration` apaga o snapshot de símbolos** — `broker_symbols`
   entrou na lista de TRUNCATE dos dois conftest, porque um teste que sincroniza vazaria linhas
   para o próximo. O efeito colateral é operacional: rodar a suíte de integração deixa a busca da

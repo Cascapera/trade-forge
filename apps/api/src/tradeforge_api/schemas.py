@@ -31,6 +31,7 @@ from pydantic import (
 
 from tradeforge_api.walkforward import MAX_FOLDS, MIN_FOLDS
 from tradeforge_db.models import SelectionMetric
+from tradeforge_schema.models import TIMEFRAMES
 
 # A Decimal that always serialises to a string. Applied to every monetary/ratio field below.
 Money = Annotated[Decimal, PlainSerializer(str, return_type=str)]
@@ -56,6 +57,26 @@ def _storable(value: str) -> str:
         raise ValueError("must not contain a NUL byte")
     return value
 
+
+def _known_timeframe(value: str) -> str:
+    """Refuse a timeframe the DSL does not define.
+
+    ⚠️ Checked against `tradeforge_schema.TIMEFRAMES` rather than a list retyped here — the DSL
+    owns the set, and a second copy is a copy that disagrees the first time one is added.
+
+    Worth validating at the edge rather than letting the lookup miss: an unknown timeframe would
+    otherwise come back as a 404 saying the series has not been probed, which sends somebody to
+    press a probe button for a timeframe that cannot exist. 422 says which of the two is wrong.
+    """
+    _storable(value)
+    if value not in TIMEFRAMES:
+        legal = ", ".join(TIMEFRAMES)
+        raise ValueError(f"unknown timeframe {value!r}; expected one of {legal}")
+    return value
+
+
+Timeframe = Annotated[str, AfterValidator(_known_timeframe)]
+"""A timeframe as it arrives from a client, refused unless the DSL defines it."""
 
 Symbol = Annotated[str, AfterValidator(_storable)]
 """An instrument symbol as it arrives from a client, refused only where the database would."""
@@ -211,6 +232,73 @@ class SymbolSearchOut(BaseModel):
             snapshot=(
                 None if synced_at is None else SymbolSnapshotOut(server=server, synced_at=synced_at)
             ),
+        )
+
+
+class SymbolHistoryOut(_Out):
+    """What a probe found about one series, and what bounded the answer.
+
+    ⚠️ **Four fields where a screen wants one date, on purpose.** "Available from" would be four
+    different claims wearing one hat, and only one of them is ever the binding one — measured on
+    EURUSD D1, the terminal's ceiling, the filler and the typed costs give 1971, 1972 and 2009.
+    A reader fixes the first in a settings dialog, the second by starting later and the third by
+    not trusting old costs at all; a single date makes all three unavailable.
+
+    `usable_from` is offered *as well*, because deriving it in three clients is three chances to
+    derive it differently.
+    """
+
+    symbol: str
+    timeframe: str
+    oldest: dt.datetime | None = None
+    bar_count: int
+    terminal_maxbars: int
+    bar_count_is_a_ceiling: bool
+    last_fabricated: int | None = None
+    first_measured_cost: int | None = None
+    probed_at: dt.datetime
+
+    capped_by_terminal: bool = False
+    """The bar count is this machine's setting talking, not the broker's history."""
+
+    usable_from: dt.datetime | None = None
+    """The later of the two honest floors, never earlier than the data actually goes.
+
+    ⚠️ A **lower** bound on trust and nothing more. It cannot see a reconstruction that carries
+    plausible prices and volumes — EURUSD's own runs to 1999 and is invisible here — so a screen
+    rendering this owes the reader that caveat.
+    """
+
+    @classmethod
+    def build(cls, row: Any) -> SymbolHistoryOut:  # noqa: ANN401 — an ORM row, typed by the caller
+        """Assemble from a stored probe, deriving the two answers a screen would otherwise
+        derive for itself.
+
+        ⚠️ Derived **here** rather than in each client. Three clients deriving "usable from"
+        independently is three chances to disagree about which floor dominates, and the
+        disagreement would show up as two screens recommending different windows for the same
+        symbol.
+        """
+        after_filler = None if row.last_fabricated is None else row.last_fabricated + 1
+        years = [year for year in (after_filler, row.first_measured_cost) if year is not None]
+        if years:
+            floor = dt.datetime(max(years), 1, 1, tzinfo=dt.UTC)
+            usable = floor if row.oldest is None else max(floor, row.oldest)
+        else:
+            usable = row.oldest
+
+        return cls(
+            symbol=row.symbol,
+            timeframe=row.timeframe,
+            oldest=row.oldest,
+            bar_count=row.bar_count,
+            terminal_maxbars=row.terminal_maxbars,
+            bar_count_is_a_ceiling=row.bar_count_is_a_ceiling,
+            last_fabricated=row.last_fabricated,
+            first_measured_cost=row.first_measured_cost,
+            probed_at=row.probed_at,
+            capped_by_terminal=row.bar_count >= row.terminal_maxbars > 0,
+            usable_from=usable,
         )
 
 

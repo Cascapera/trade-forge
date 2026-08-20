@@ -41,6 +41,24 @@ job that sits `queued` for ever with nothing raised, which is the failure this c
 placement is here to prevent.
 """
 
+PROBE_HISTORY = "probe_history"
+"""Measure how much history one (symbol, timeframe) really has.
+
+⚠️ Also on `COLLECT_QUEUE`, and slow enough that the queue is the point rather than a nicety:
+measured at 207 seconds for a cold H4, because the terminal downloads the history while it
+answers. A handler that waited would hold a request open for three and a half minutes.
+"""
+
+COLLECT_JOBS = (SYNC_SYMBOLS, PROBE_HISTORY)
+"""Every job that only the Windows host can run, as one list.
+
+⚠️ **Named as a set rather than left implicit, so the contract test can be exact in both
+directions.** Checking "is `sync_symbols` registered?" passes forever while a second job is
+added and forgotten; comparing this tuple against what the agent registers catches an addition
+on either side. The failure it prevents is silent by construction — the API returns 202, Redis
+accepts the job, and it waits in a queue nobody is watching.
+"""
+
 COLLECT_QUEUE = "collect"
 """The queue only the host agent (`tradeforge-collector agent`) drains.
 

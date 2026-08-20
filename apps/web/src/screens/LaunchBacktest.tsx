@@ -62,7 +62,12 @@ export function LaunchBacktest(): React.JSX.Element {
       </h2>
 
       <div className="rounded-lg border border-slate-800 bg-slate-900/40 p-4">
-        <BacktestSettings form={form} instruments={instruments.data} onChange={setForm}>
+        <BacktestSettings
+          form={form}
+          instruments={instruments.data}
+          onChange={setForm}
+          timeframe={timeframe}
+        >
           <label className="flex flex-col gap-1 text-sm">
             Timeframe
             <select

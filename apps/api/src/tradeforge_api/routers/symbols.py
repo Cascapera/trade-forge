@@ -15,12 +15,20 @@ which is the normal state of a machine somebody is building a strategy on.
 
 from typing import Annotated
 
-from fastapi import APIRouter, Query, status
+from fastapi import APIRouter, HTTPException, Query, status
 
 from tradeforge_api.deps import QueueDep, SessionDep
-from tradeforge_api.queue import COLLECT_QUEUE, SYNC_SYMBOLS
-from tradeforge_api.schemas import EnqueuedOut, StorableText, SymbolSearchOut
+from tradeforge_api.queue import COLLECT_QUEUE, PROBE_HISTORY, SYNC_SYMBOLS
+from tradeforge_api.schemas import (
+    EnqueuedOut,
+    StorableText,
+    Symbol,
+    SymbolHistoryOut,
+    SymbolSearchOut,
+    Timeframe,
+)
 from tradeforge_db.broker_symbols import DEFAULT_LIMIT, search_symbols, snapshot_taken_at
+from tradeforge_db.symbol_history import read_history
 
 router = APIRouter(tags=["symbols"])
 
@@ -89,3 +97,34 @@ async def sync(queue: QueueDep) -> EnqueuedOut:
     """
     await queue.enqueue_job(SYNC_SYMBOLS, _queue_name=COLLECT_QUEUE)
     return EnqueuedOut(job=SYNC_SYMBOLS)
+
+
+@router.get("/symbols/{symbol}/history", response_model=SymbolHistoryOut)
+def history(session: SessionDep, symbol: Symbol, timeframe: Timeframe) -> SymbolHistoryOut:
+    """What the last probe found about this series.
+
+    ⚠️ **404 when nobody has probed yet, which is not the same as a symbol with no bars.** One
+    invites a click and the other does not, and a screen that saw an empty row for both would
+    tell somebody their broker has no history for EURUSD because nobody had asked yet.
+    """
+    found = read_history(session, symbol, timeframe)
+    if found is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"{symbol} {timeframe} has not been probed yet",
+        )
+    return SymbolHistoryOut.build(found)
+
+
+@router.post(
+    "/symbols/{symbol}/probe", response_model=EnqueuedOut, status_code=status.HTTP_202_ACCEPTED
+)
+async def probe(queue: QueueDep, symbol: Symbol, timeframe: Timeframe) -> EnqueuedOut:
+    """Ask the host agent to measure this series. Returns immediately.
+
+    ⚠️ 202 is not politeness here, it is the measurement: a cold H4 took **207 seconds** on this
+    broker, because the terminal downloads the history while answering. A handler that waited
+    would hold a request open for three and a half minutes and time out somewhere in between.
+    """
+    await queue.enqueue_job(PROBE_HISTORY, symbol, timeframe, _queue_name=COLLECT_QUEUE)
+    return EnqueuedOut(job=PROBE_HISTORY)

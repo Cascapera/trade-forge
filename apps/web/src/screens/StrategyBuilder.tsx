@@ -1000,7 +1000,14 @@ export function StrategyBuilder(): React.JSX.Element {
 
       <section className={sectionClass}>
         <h3 className="mb-3 font-medium">Where and when</h3>
-        <BacktestSettings form={backtest} instruments={instruments.data} onChange={setBacktest} />
+        {/* The timeframe belongs to the strategy document, so the builder reads it from the
+            form it is editing rather than asking for it a second time. */}
+        <BacktestSettings
+          form={backtest}
+          instruments={instruments.data}
+          onChange={setBacktest}
+          timeframe={form.timeframe}
+        />
       </section>
 
       {!validation.valid && (

@@ -32,6 +32,8 @@ EXPECTED_TABLES = {
     # rather than merged into it: nothing references this table, which is what lets a
     # sync replace it wholesale when the account changes broker (ADR-0021).
     "broker_symbols",
+    # What a probe found about one (symbol, timeframe), including the bounds on the answer.
+    "symbol_history",
     "datasets",
     "strategies",
     "baskets",

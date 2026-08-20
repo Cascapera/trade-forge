@@ -29,6 +29,7 @@ import type {
   StrategiesPage,
   StrategyFilters,
   StrategyOut,
+  SymbolHistory,
   SymbolSearch,
   StudyOut,
   TradesPage,
@@ -78,6 +79,38 @@ export function useSymbolSearch(q: string) {
  * outcome: the screen keeps working with a stale catalogue rather than emptying itself because
  * a terminal on somebody's desk is closed.
  */
+/**
+ * What is known about one series. `enabled` only once both halves of the question exist.
+ *
+ * ⚠️ A 404 here is an answer, not a failure: nobody has probed this series yet. The component
+ * reads `error.status` rather than treating every error the same, because "press measure" and
+ * "something is broken" are different sentences and only one of them is actionable.
+ */
+export function useSymbolHistory(symbol: string, timeframe: string | undefined) {
+  return useQuery<SymbolHistory>({
+    queryKey: ['symbol-history', symbol, timeframe],
+    queryFn:
+      symbol === '' || timeframe === undefined
+        ? skipToken
+        : () => api.getSymbolHistory(symbol, timeframe),
+    retry: false,
+  })
+}
+
+/**
+ * Ask the host agent to measure a series.
+ *
+ * ⚠️ Success means *queued*, not measured — a cold H4 took 207 seconds on this broker — so the
+ * invalidation below is what eventually shows the answer, once the agent has written it.
+ */
+export function useProbeSymbol() {
+  const client = useQueryClient()
+  return useMutation<{ job: string }, Error, { symbol: string; timeframe: string }>({
+    mutationFn: ({ symbol, timeframe }) => api.probeSymbol(symbol, timeframe),
+    onSuccess: () => client.invalidateQueries({ queryKey: ['symbol-history'] }),
+  })
+}
+
 export function useSyncSymbols() {
   const client = useQueryClient()
   return useMutation<{ job: string }>({

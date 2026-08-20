@@ -778,3 +778,152 @@ def test_a_terminal_that_is_not_logged_in_has_no_server_name() -> None:
 
     with MT5Source(terminal=_LoggedOut(), server_offset=SERVER_OFFSET) as source:
         assert source.server() is None
+
+
+# --------------------------------------------------------------------------- #
+# The history probe                                                             #
+# --------------------------------------------------------------------------- #
+
+
+class _SeriesTerminal(_FakeTerminal):
+    """A terminal holding a real series, addressable by position like MetaTrader's.
+
+    Position 0 is the newest and counts into the past, and a request returns the `count` bars
+    *ending* at `start_pos`, oldest first. Getting that direction wrong is how a probe reads the
+    present when it means to read 1971 — which happened while writing these tests by hand.
+    """
+
+    TIMEFRAME_D1 = 16408
+    TIMEFRAME_H1 = 16385
+
+    def __init__(self, series: list[dict[str, Any]], *, maxbars: int = 100_000) -> None:
+        super().__init__()
+        self._series = series  # oldest first
+        self._maxbars = maxbars
+
+    def terminal_info(self) -> object:
+        return type("Terminal", (), {"maxbars": self._maxbars})()
+
+    def copy_rates_from_pos(
+        self, symbol: str, timeframe: int, start_pos: int, count: int
+    ) -> list[dict[str, Any]] | None:
+        self.from_pos.append((symbol, start_pos, count))
+        newest_first = list(reversed(self._series))
+        window = newest_first[start_pos : start_pos + count]
+        return list(reversed(window)) if window else None
+
+
+def a_bar(
+    when: dt.datetime, *, high: float, low: float, volume: int, spread: int
+) -> dict[str, Any]:
+    return {
+        "time": int((when + SERVER_OFFSET).timestamp()),
+        "open": low,
+        "high": high,
+        "low": low,
+        "close": high,
+        "tick_volume": volume,
+        "spread": spread,
+        "real_volume": 0,
+    }
+
+
+def a_series(
+    *, filler_years: int, real_years: int, stamped_years: int, start: int = 2000
+) -> list[dict[str, Any]]:
+    """A history shaped like the one this project measured: filler, then market.
+
+    `stamped_years` of the real era carry a constant spread, which is what a broker writing one
+    number across a year looks like. Thirty bars a year keeps the fixture small while staying
+    above `MIN_SPREAD_SAMPLES`.
+    """
+    bars: list[dict[str, Any]] = []
+    year = start
+    for _ in range(filler_years):
+        for day in range(30):
+            when = dt.datetime(year, 1, 1, tzinfo=dt.UTC) + dt.timedelta(days=day)
+            bars.append(a_bar(when, high=0.5, low=0.5, volume=1, spread=20))
+        year += 1
+    for index in range(real_years):
+        stamped = index < stamped_years
+        for day in range(30):
+            when = dt.datetime(year, 1, 1, tzinfo=dt.UTC) + dt.timedelta(days=day)
+            bars.append(
+                a_bar(when, high=1.2, low=1.1, volume=500, spread=20 if stamped else 8 + day % 5)
+            )
+        year += 1
+    return bars
+
+
+def test_the_probe_finds_the_depth_the_filler_and_the_costs() -> None:
+    """One series carrying all three bounds at once, because they are independent.
+
+    A fixture with only filler could not tell the cost floor from a default, and one with only
+    stamped costs could not tell the filler floor from `None`.
+    """
+    series = a_series(filler_years=2, real_years=3, stamped_years=1)
+    terminal = _SeriesTerminal(series)
+
+    with MT5Source(terminal=terminal, server_offset=SERVER_OFFSET) as source:
+        report = source.probe_history("EURUSD", "D1")
+
+    assert report.bar_count == len(series)
+    assert report.oldest == dt.datetime(2000, 1, 1, tzinfo=dt.UTC)
+    # Two filler years, so 2001 is the last one; the real era starts in 2002 and its first year
+    # carries a stamped spread, so costs are only measured from 2003.
+    assert report.last_fabricated == 2001
+    assert report.first_measured_cost == 2003
+
+
+def test_a_series_with_no_filler_reports_none_rather_than_a_year() -> None:
+    # BTCUSD measured exactly this: every year real, back to its first. `None` and not the
+    # oldest year, which a reader would take as "there is filler up to here".
+    terminal = _SeriesTerminal(a_series(filler_years=0, real_years=3, stamped_years=0))
+
+    with MT5Source(terminal=terminal, server_offset=SERVER_OFFSET) as source:
+        report = source.probe_history("EURUSD", "D1")
+
+    assert report.last_fabricated is None
+    assert report.first_measured_cost == 2000
+
+
+def test_a_symbol_the_terminal_has_nothing_for_is_an_empty_report() -> None:
+    """Not an error: a symbol the broker has never quoted is an ordinary state of the world."""
+    with MT5Source(terminal=_SeriesTerminal([]), server_offset=SERVER_OFFSET) as source:
+        report = source.probe_history("EURUSD", "D1")
+
+    assert report.bar_count == 0
+    assert report.oldest is None
+    assert report.last_fabricated is None
+
+
+def test_a_series_at_the_ceiling_says_whose_limit_it_is() -> None:
+    # ⚠️ The number a person sizes a window from. Measured before this machine's `maxbars` was
+    # raised: 100000 on four different timeframes, the same round number every time.
+    series = a_series(filler_years=0, real_years=2, stamped_years=0)
+    terminal = _SeriesTerminal(series, maxbars=len(series))
+
+    with MT5Source(terminal=terminal, server_offset=SERVER_OFFSET) as source:
+        report = source.probe_history("EURUSD", "D1")
+
+    assert report.capped_by_terminal is True
+
+
+def test_a_fixed_spread_instrument_gets_no_cost_floor() -> None:
+    """⚠️ The false positive that would land on the most trustworthy data in the catalogue.
+
+    `spread_float` false means the broker really does charge the same spread always — this
+    project's previous broker quoted AAPL that way. Every year is constant there, and reading
+    that as invented costs would warn about the one instrument whose costs are certain.
+    """
+
+    class _Fixed(_SeriesTerminal):
+        def symbol_info(self, symbol: str) -> _SymbolInfo | None:
+            return _SymbolInfo(name=symbol, spread_float=False)
+
+    terminal = _Fixed(a_series(filler_years=0, real_years=3, stamped_years=0))
+
+    with MT5Source(terminal=terminal, server_offset=SERVER_OFFSET) as source:
+        report = source.probe_history("EURUSD", "D1")
+
+    assert report.first_measured_cost is None

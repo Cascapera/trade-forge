@@ -7,8 +7,11 @@ that it keeps apart two situations which both produce an empty list and mean opp
 
 import datetime as dt
 
-from tradeforge_api.schemas import SymbolSearchOut
-from tradeforge_db.models import BrokerSymbol
+import pytest
+from pydantic import TypeAdapter, ValidationError
+
+from tradeforge_api.schemas import SymbolHistoryOut, SymbolSearchOut, Timeframe
+from tradeforge_db.models import BrokerSymbol, SymbolHistory
 
 SYNCED_AT = dt.datetime(2026, 8, 19, 12, 0, tzinfo=dt.UTC)
 
@@ -99,3 +102,111 @@ def test_a_result_does_not_pretend_to_know_how_to_price_the_symbol() -> None:
     assert "tick_value" not in serialised
     assert "tick_size" not in serialised
     assert "asset_class" not in serialised
+
+
+def probe(**patch: object) -> SymbolHistory:
+    """A stored probe, with EURUSD D1's measured numbers as the default."""
+    fields: dict[str, object] = {
+        "symbol": "EURUSD",
+        "timeframe": "D1",
+        "oldest": dt.datetime(1971, 1, 3, tzinfo=dt.UTC),
+        "bar_count": 14_343,
+        "terminal_maxbars": 100_000_000,
+        "bar_count_is_a_ceiling": False,
+        "last_fabricated": 1972,
+        "first_measured_cost": 2009,
+        "probed_at": SYNCED_AT,
+    }
+    fields.update(patch)
+    return SymbolHistory(**fields)
+
+
+class TestWhatTheScreenIsToldAboutHistory:
+    def test_the_later_floor_decides_where_a_window_may_start(self) -> None:
+        """Filler stops in 1972 and typed costs in 2009, so the honest start is 2009.
+
+        A run is only as trustworthy as its weaker half; picking the earlier floor would hand
+        somebody thirty-seven years of prices costed with a number that was typed.
+        """
+        assert SymbolHistoryOut.build(probe()).usable_from == dt.datetime(2009, 1, 1, tzinfo=dt.UTC)
+
+    def test_the_year_after_the_filler_is_the_first_usable_one(self) -> None:
+        # ⚠️ Off by one here puts a year of made-up bars inside every default window.
+        found = SymbolHistoryOut.build(probe(last_fabricated=1972, first_measured_cost=None))
+
+        assert found.usable_from == dt.datetime(1973, 1, 1, tzinfo=dt.UTC)
+
+    def test_a_floor_older_than_the_data_does_not_invent_history(self) -> None:
+        """⚠️ A lower bound on trust, never a claim that bars exist.
+
+        BTCUSD measured exactly this: costs measured since 2022 and no data before May of it.
+        Returning the floor would name a date the terminal cannot reach.
+        """
+        found = SymbolHistoryOut.build(
+            probe(
+                oldest=dt.datetime(2022, 5, 10, tzinfo=dt.UTC),
+                last_fabricated=None,
+                first_measured_cost=2022,
+            )
+        )
+
+        assert found.usable_from == dt.datetime(2022, 5, 10, tzinfo=dt.UTC)
+
+    def test_with_no_floors_known_it_falls_back_to_the_oldest_bar(self) -> None:
+        found = SymbolHistoryOut.build(probe(last_fabricated=None, first_measured_cost=None))
+
+        assert found.usable_from == dt.datetime(1971, 1, 3, tzinfo=dt.UTC)
+
+    def test_a_series_at_the_terminal_ceiling_says_whose_limit_it_is(self) -> None:
+        # Measured before `maxbars` was raised: 100000 on M1, M5, M15 and H1 alike. The same
+        # round number four times is a setting, not a broker.
+        found = SymbolHistoryOut.build(probe(bar_count=100_000, terminal_maxbars=100_000))
+
+        assert found.capped_by_terminal is True
+
+    def test_an_unknown_ceiling_never_reports_a_cap(self) -> None:
+        """⚠️ Zero would otherwise make every series look capped, since any count is >= 0."""
+        found = SymbolHistoryOut.build(probe(bar_count=14_343, terminal_maxbars=0))
+
+        assert found.capped_by_terminal is False
+
+    def test_the_four_bounds_survive_to_the_wire(self) -> None:
+        """⚠️ They are independent, and a reader can only act on the one that binds them.
+
+        The ceiling is fixed in a settings dialog, the filler by starting later, the costs by
+        not trusting them. A response that shipped only `usable_from` would leave all three
+        actions unavailable while looking complete.
+        """
+        body = SymbolHistoryOut.build(probe()).model_dump()
+
+        assert body["bar_count"] == 14_343
+        assert body["terminal_maxbars"] == 100_000_000
+        assert body["last_fabricated"] == 1972
+        assert body["first_measured_cost"] == 2009
+
+    def test_a_count_that_is_really_the_probes_own_bound_is_flagged(self) -> None:
+        # Seen for real at exactly 10,000,000 once maxbars was raised — the search ceiling, not
+        # a measurement, and the one number somebody would size a window from.
+        found = SymbolHistoryOut.build(probe(bar_count=10_000_000, bar_count_is_a_ceiling=True))
+
+        assert found.bar_count_is_a_ceiling is True
+
+
+class TestTheTimeframeAtTheEdge:
+    @pytest.mark.parametrize("timeframe", ["M1", "M5", "H1", "D1", "W1"])
+    def test_the_dsl_decides_what_is_legal(self, timeframe: str) -> None:
+        assert TypeAdapter(Timeframe).validate_python(timeframe) == timeframe
+
+    def test_a_timeframe_the_dsl_does_not_define_is_refused(self) -> None:
+        """⚠️ 422 rather than a 404 saying "not probed yet".
+
+        An unknown timeframe would otherwise miss the lookup and come back as "nobody has probed
+        this", sending somebody to press a probe button for a series that cannot exist.
+        """
+        with pytest.raises(ValidationError, match="unknown timeframe"):
+            TypeAdapter(Timeframe).validate_python("M2")
+
+    def test_a_nul_byte_is_refused_here_too(self) -> None:
+        # The same guard `?q=` needed, and for the same reason: this reaches a text column.
+        with pytest.raises(ValidationError):
+            TypeAdapter(Timeframe).validate_python(chr(0))

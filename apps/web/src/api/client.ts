@@ -24,6 +24,7 @@ import type {
   StrategyFilters,
   StrategyOut,
   StudyOut,
+  SymbolHistory,
   SymbolSearch,
   TradesPage,
   WalkForwardOut,
@@ -85,6 +86,13 @@ export const api = {
   // Asks the host agent to photograph the catalogue again. Returns as soon as the job is
   // queued — it cannot know whether a terminal is even running.
   syncSymbols: (): Promise<{ job: string }> => request('POST', '/symbols/sync'),
+  // What the last probe found. 404 when nobody has asked yet, which is a different thing from a
+  // symbol with no bars — one invites a click and the other does not.
+  getSymbolHistory: (symbol: string, timeframe: string): Promise<SymbolHistory> =>
+    request('GET', `/symbols/${encodeURIComponent(symbol)}/history${query({ timeframe })}`),
+  // Measuring is slow enough to be a job: a cold H4 took 207 s on this project's own broker.
+  probeSymbol: (symbol: string, timeframe: string): Promise<{ job: string }> =>
+    request('POST', `/symbols/${encodeURIComponent(symbol)}/probe${query({ timeframe })}`),
   listBacktests: (filters: BacktestFilters = {}): Promise<BacktestsPage> =>
     request('GET', `/backtests${query({ ...filters })}`),
   createStrategy: (definition: unknown): Promise<StrategyOut> =>

@@ -1,5 +1,6 @@
 import type { Instrument } from '../api/types'
 import { SymbolCombobox } from './SymbolCombobox'
+import { SymbolHistoryNote } from './SymbolHistoryNote'
 import { costlessReason, withInstrumentCosts, type BacktestForm } from '../backtest/settings'
 
 const inputClass =
@@ -16,9 +17,17 @@ export function BacktestSettings(props: {
   form: BacktestForm
   instruments: Instrument[] | undefined
   onChange: (next: BacktestForm) => void
+  /**
+   * Which timeframe the run will use. Still owned by whoever owns the strategy — this component
+   * only *reads* it, to ask how much history exists for the pair.
+   *
+   * ⚠️ Optional because the question needs both halves: a symbol with no timeframe has no
+   * answer, and a note that guessed one would report a span for a series nobody is running.
+   */
+  timeframe?: string
   children?: React.ReactNode
 }): React.JSX.Element {
-  const { form, instruments, onChange, children } = props
+  const { form, instruments, onChange, timeframe, children } = props
   const patch = (update: Partial<BacktestForm>): void => {
     onChange({ ...form, ...update })
   }
@@ -110,6 +119,7 @@ export function BacktestSettings(props: {
           )}
         </label>
       )}
+      <SymbolHistoryNote symbol={form.symbol} timeframe={timeframe} />
       {costless !== null && (
         <p
           role="status"

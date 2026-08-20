@@ -42,8 +42,15 @@ from arq.connections import RedisSettings
 from tradeforge_collector.source import SymbolInfo
 from tradeforge_db.broker_symbols import BrokerSymbolEntry, replace_snapshot
 from tradeforge_db.session import create_db_engine, create_session_factory, session_scope
+from tradeforge_db.symbol_history import HistoryProbe, upsert_history
 
-__all__ = ["COLLECT_QUEUE", "WorkerSettings", "redis_settings_from_env", "sync_symbols"]
+__all__ = [
+    "COLLECT_QUEUE",
+    "WorkerSettings",
+    "probe_history",
+    "redis_settings_from_env",
+    "sync_symbols",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +122,57 @@ async def sync_symbols(_context: dict[str, Any]) -> int:
     return count
 
 
+async def probe_history(_context: dict[str, Any], symbol: str, timeframe: str) -> int:
+    """Measure how much history one series really offers. Returns the bar count.
+
+    ⚠️ **This is the slow job, and unavoidably so.** Measured on this broker, a cold H4 took
+    **207 seconds** — the terminal downloads the history while answering. That is the whole
+    reason the API returns 202 and the screen polls instead of waiting.
+
+    Takes its arguments rather than reading a list, unlike `sync_symbols`: probing every symbol
+    on every timeframe would be 84 x 8 cold downloads, and the screen only ever needs the one a
+    person is looking at.
+    """
+    from tradeforge_collector.mt5_source import MT5Source  # noqa: PLC0415 — the ADR-02 boundary
+
+    source = MT5Source(server_offset=_stated_offset()).connect()
+    try:
+        report = source.probe_history(symbol, timeframe)
+    finally:
+        source.close()
+
+    engine = create_db_engine()
+    try:
+        with session_scope(create_session_factory(engine)) as session:
+            upsert_history(
+                session,
+                HistoryProbe(
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    oldest=report.oldest,
+                    bar_count=report.bar_count,
+                    terminal_maxbars=report.terminal_maxbars,
+                    bar_count_is_a_ceiling=report.bar_count_is_a_ceiling,
+                    last_fabricated=report.last_fabricated,
+                    first_measured_cost=report.first_measured_cost,
+                ),
+                probed_at=dt.datetime.now(tz=dt.UTC),
+            )
+    finally:
+        engine.dispose()
+
+    logger.info(
+        "probed %s %s: %d bars from %s (filler to %s, costs measured from %s)",
+        symbol,
+        timeframe,
+        report.bar_count,
+        report.oldest,
+        report.last_fabricated,
+        report.first_measured_cost,
+    )
+    return report.bar_count
+
+
 def _stated_offset() -> dt.timedelta | None:
     """`TRADEFORGE_SERVER_OFFSET` in hours, or `None` to let the source measure it.
 
@@ -150,7 +208,7 @@ def redis_settings_from_env() -> RedisSettings:
 class WorkerSettings:
     """`arq tradeforge_collector.agent.WorkerSettings` starts the host agent from this."""
 
-    functions = (sync_symbols,)
+    functions = (sync_symbols, probe_history)
     queue_name = COLLECT_QUEUE
 
     # ⚠️ One job at a time. The terminal is a single shared resource with one IPC channel, and

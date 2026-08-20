@@ -9,6 +9,10 @@ import { vi } from 'vitest'
 vi.mock('../api/hooks', () => ({
   useSymbolSearch: () => ({ data: { symbols: [], snapshot: null } }),
   useSyncSymbols: () => ({ mutate: () => undefined, isPending: false }),
+  // The symbol field now also asks how much history the pair has. Stubbed as "never probed",
+  // which is the state these tests are in and the one that renders the least.
+  useSymbolHistory: () => ({ data: undefined, error: null }),
+  useProbeSymbol: () => ({ mutate: () => undefined, isPending: false, isSuccess: false }),
 }))
 
 import type { Instrument } from '../api/types'

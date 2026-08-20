@@ -28,16 +28,21 @@ def test_the_queue_the_api_writes_to_is_the_one_the_agent_drains() -> None:
     assert host_agent.WorkerSettings.queue_name == host_agent.COLLECT_QUEUE
 
 
-def test_every_job_the_api_enqueues_is_registered_on_the_host_agent() -> None:
-    """⚠️ The typo this whole file exists for.
+def test_the_two_apps_agree_on_exactly_which_jobs_the_host_runs() -> None:
+    """⚠️ The typo this whole file exists for, checked in both directions.
 
     arq dispatches by the coroutine's `__name__`, so the name in `queue.py` and the name of the
     function in `agent.py` are the contract. Mistype either and the job is accepted, queued, and
     never claimed — no exception, no log, no timeout. The request even succeeds.
+
+    Compared as **sets**, not with an `in`. An `in` check passes forever while somebody adds a
+    second job to one side and forgets the other, which is precisely what happened between
+    `sync_symbols` and `probe_history` — the test stayed green through the addition and proved
+    nothing about it.
     """
     registered = {function.__name__ for function in host_agent.WorkerSettings.functions}
 
-    assert api_queue.SYNC_SYMBOLS in registered
+    assert set(api_queue.COLLECT_JOBS) == registered
 
 
 def test_the_host_agent_does_not_also_claim_the_backtest_jobs() -> None:

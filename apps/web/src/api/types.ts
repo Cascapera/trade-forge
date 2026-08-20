@@ -667,3 +667,31 @@ export interface SymbolSearch {
   symbols: BrokerSymbol[]
   snapshot: SymbolSnapshot | null
 }
+
+/**
+ * What a probe found about one (symbol, timeframe), and what bounded the answer.
+ *
+ * ⚠️ Four bounds where a screen wants one date, on purpose. Measured on EURUSD D1 they give
+ * 1971, 1972 and 2009 — three answers to what looks like one question — and a reader can only
+ * act on the one that binds them: the ceiling is fixed in a settings dialog, the filler by
+ * starting later, the costs by not trusting them.
+ */
+export interface SymbolHistory {
+  symbol: string
+  timeframe: string
+  /** The oldest bar the terminal will hand over. `null` when it has none. */
+  oldest: string | null
+  /** Positions the series holds, including the bar still forming — the unit `maxbars` counts in. */
+  bar_count: number
+  terminal_maxbars: number
+  /** ⚠️ `true` when `bar_count` is the probe's own bound rather than the data's. */
+  bar_count_is_a_ceiling: boolean
+  /** The most recent year still holding bars nobody traded. Not "when the instrument became real". */
+  last_fabricated: number | null
+  /** The first year whose spread varied rather than being one number typed across it. */
+  first_measured_cost: number | null
+  probed_at: string
+  capped_by_terminal: boolean
+  /** The later of the two honest floors. A **lower** bound on trust, never an upper one. */
+  usable_from: string | null
+}

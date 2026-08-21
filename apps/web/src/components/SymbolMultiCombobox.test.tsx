@@ -159,3 +159,86 @@ it('with nothing chosen it says so rather than showing an empty strip', () => {
 
   expect(screen.getByText(/no symbols chosen/i)).toBeInTheDocument()
 })
+
+describe('the keyboard', () => {
+  /**
+   * The list is how eighteen EUR pairs get chosen, and a person doing that is not reaching for
+   * the mouse between each one. These are the branches the single-symbol field's one keyboard
+   * test never reaches.
+   */
+  function search(): HTMLElement {
+    return screen.getByRole('combobox')
+  }
+
+  it('arrow down then enter picks the highlighted result', () => {
+    answer = { symbols: [symbol(), symbol({ symbol: 'GBPUSD' })], snapshot: null }
+    const { onToggle } = show()
+    typeInSearch('usd')
+
+    fireEvent.keyDown(search(), { key: 'ArrowDown' })
+    fireEvent.keyDown(search(), { key: 'Enter' })
+
+    expect(onToggle).toHaveBeenCalledWith(expect.objectContaining({ symbol: 'GBPUSD' }))
+  })
+
+  it('arrow up from the top wraps to the bottom', () => {
+    // ⚠️ Wrapping is deliberate. Stopping dead at the first row makes a person reach for the
+    // mouse to get to the last one, which is the opposite of what the keyboard is for.
+    answer = { symbols: [symbol(), symbol({ symbol: 'GBPUSD' })], snapshot: null }
+    const { onToggle } = show()
+    typeInSearch('usd')
+
+    fireEvent.keyDown(search(), { key: 'ArrowUp' })
+    fireEvent.keyDown(search(), { key: 'Enter' })
+
+    expect(onToggle).toHaveBeenCalledWith(expect.objectContaining({ symbol: 'GBPUSD' }))
+  })
+
+  it('arrowing an empty list does not crash or move', () => {
+    // `% 0` is NaN, and a NaN index would make every later Enter silently do nothing.
+    // A synced catalogue with no match, so the message is "nothing starts with that" rather
+    // than "never synced" — the two empty states are opposite problems.
+    answer = { symbols: [], snapshot: { server: 'Tradeview-Demo', synced_at: '2026-08-21T00:00:00Z' } }
+    show()
+    typeInSearch('zzz')
+
+    fireEvent.keyDown(search(), { key: 'ArrowDown' })
+
+    expect(screen.getByText(/no symbol starts with/)).toBeInTheDocument()
+  })
+
+  it('enter with the list closed picks nothing', () => {
+    // ⚠️ The guard that keeps Enter from re-picking whatever happens to be highlighted after
+    // the list was dismissed — a submit key quietly toggling a symbol back off.
+    answer = { symbols: [symbol()], snapshot: null }
+    const { onToggle } = show()
+    typeInSearch('eur')
+    fireEvent.keyDown(search(), { key: 'Escape' })
+
+    fireEvent.keyDown(search(), { key: 'Enter' })
+
+    expect(onToggle).not.toHaveBeenCalled()
+  })
+
+  it('escape closes the list without choosing anything', () => {
+    answer = { symbols: [symbol()], snapshot: null }
+    const { onToggle } = show()
+    typeInSearch('eur')
+    expect(screen.getByRole('option', { name: /EURUSD/ })).toBeInTheDocument()
+
+    fireEvent.keyDown(search(), { key: 'Escape' })
+
+    expect(screen.queryByRole('option')).not.toBeInTheDocument()
+    expect(onToggle).not.toHaveBeenCalled()
+  })
+
+  it('an ordinary letter is not swallowed by the key handling', () => {
+    answer = { symbols: [symbol()], snapshot: null }
+    show()
+
+    fireEvent.keyDown(screen.getByRole('combobox'), { key: 'e' })
+    typeInSearch('eur')
+
+    expect(screen.getByRole('combobox')).toHaveValue('eur')
+  })
+})

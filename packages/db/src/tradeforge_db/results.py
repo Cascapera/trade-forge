@@ -40,6 +40,38 @@ _EXIT_REASONS: dict[str, ExitReason] = {
     "exit.condition": ExitReason.CONDITION,
 }
 
+# The scale of `MONEY` (`base.MONEY` is `NUMERIC(20, 8)`). Kept as a quantum rather than read
+# from the column so the rounding is visible where it happens; `test_results.py` pins the two
+# together, because a widened column with this constant left behind would silently go back to
+# letting Postgres do the rounding.
+_MONEY_QUANTUM = Decimal(1).scaleb(-8)
+
+
+def _money(value: Decimal) -> Decimal:
+    """A money amount at the exact scale the column stores it.
+
+    The engine computes in unbounded `Decimal` — a `gross_pnl` carries ten decimal places and
+    a `net_pnl` twelve, because both come from a chain of price, tick value and volume. Postgres
+    rounds each of those to eight **independently** on the way in, and independent rounding does
+    not distribute over addition: `round(a) + round(b)` differs from `round(a + b)` whenever the
+    digits past the eighth carry. That is a millionth of a cent of arithmetic, and it is enough
+    to make the row contradict itself.
+
+    Two CHECK constraints state an identity between money columns — `net_profit_balances` and
+    `net_pnl_balances` — and both reject a row where that happens. It is *intermittent*: only
+    the minority of runs whose tails happen to carry hit it, which is why every backtest before
+    the AUDCAD acceptance run passed. Rounding here, and deriving each total from the already
+    rounded parts, makes the identity hold by construction: two eight-place numbers add to an
+    eight-place number, so Postgres stores the total verbatim and has nothing left to round.
+
+    The error lands on the total, never on the parts, and that is the deliberate half. Either
+    way some column is off by 1e-8 from the unbounded arithmetic; the one kept true is the one
+    the constraint — and every reader of the row — actually relies on. A row whose stated parts
+    do not add up to its stated total lies about itself; a total that is a hundred-millionth of
+    a currency unit from the ideal does not.
+    """
+    return value.quantize(_MONEY_QUANTUM)
+
 
 def to_rows(
     *,
@@ -64,6 +96,11 @@ def _trade_row(trade: ClosedTrade, backtest_id: uuid.UUID, instrument_id: uuid.U
     # Every trade here is a *closed* round trip — an open position at the end of a run never
     # enters `RunResult.trades` — so all four exit columns are always present, which is what
     # the `exit_is_all_or_nothing` CHECK on the table demands.
+    #
+    # `net_pnl` is derived from the two rounded legs rather than rounded itself, so the row
+    # satisfies `net_pnl_balances` by construction. See `_money`.
+    gross_pnl = _money(trade.gross_pnl)
+    costs = _money(trade.costs)
     return Trade(
         backtest_id=backtest_id,
         instrument_id=instrument_id,
@@ -76,9 +113,9 @@ def _trade_row(trade: ClosedTrade, backtest_id: uuid.UUID, instrument_id: uuid.U
         exit_reason=_exit_reason(trade.reason),
         stop_loss=trade.stop_loss,
         take_profit=trade.take_profit,
-        gross_pnl=trade.gross_pnl,
-        costs=trade.costs,
-        net_pnl=trade.net_pnl,
+        gross_pnl=gross_pnl,
+        costs=costs,
+        net_pnl=gross_pnl - costs,
         r_multiple=trade.r_multiple,
         context=_context(trade.context),
         snapshot=_snapshot(trade.snapshot),
@@ -173,11 +210,20 @@ def _snapshot(snapshot: EntrySnapshot | None) -> dict[str, Any]:
 
 
 def _metrics_row(metrics: RunMetrics, backtest_id: uuid.UUID) -> BacktestMetrics:
+    # `net_profit` is derived from the two rounded halves rather than rounded itself, so the
+    # row satisfies `net_profit_balances` by construction. See `_money`.
+    #
+    # Only these three of the row's money columns are rounded here, because only these three
+    # are bound by an identity the database enforces. Rounding `expectancy` or
+    # `max_drawdown_abs` too would change nothing observable — Postgres rounds them to the
+    # same value on the way in — so it would be ceremony that reads like a rule.
+    gross_profit = _money(metrics.gross_profit)
+    gross_loss = _money(metrics.gross_loss)
     return BacktestMetrics(
         backtest_id=backtest_id,
-        net_profit=metrics.net_profit,
-        gross_profit=metrics.gross_profit,
-        gross_loss=metrics.gross_loss,
+        net_profit=gross_profit + gross_loss,
+        gross_profit=gross_profit,
+        gross_loss=gross_loss,
         total_trades=metrics.total_trades,
         long_trades=metrics.long_trades,
         short_trades=metrics.short_trades,

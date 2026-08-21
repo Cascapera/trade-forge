@@ -193,3 +193,113 @@ def test_deleting_the_backtest_cascades_to_its_rows(session: Session) -> None:
 
     assert session.scalars(select(Trade)).all() == []
     assert session.scalars(select(BacktestMetrics)).all() == []
+
+
+# --------------------------------------------------------------------------- #
+# Rounding to the column scale, against the real NUMERIC(20, 8)                 #
+# --------------------------------------------------------------------------- #
+#
+# The fixtures above deal in whole hundreds, and whole hundreds cannot show this: the engine
+# computes money in unbounded `Decimal` (ten to twelve places, out of price, tick
+# value and volume) and every money column holds eight. Postgres rounds each column independently on
+# the way in, and independent rounding does not distribute over addition — so a row whose
+# three numbers balance exactly in `Decimal` can still be rejected by the CHECK that says so.
+#
+# It is intermittent: only the minority of runs whose digits past the eighth place carry hit
+# it, which is why every backtest before the AUDCAD acceptance run of PR-234 persisted fine.
+# The numbers below are that minority, taken from the engine driven end to end rather than
+# invented. Both tests read the row **back from Postgres** and compare its text: the identity
+# holds in unbounded `Decimal`, so asserting it as a `Decimal` comparison would pass against
+# the very defect these forbid. Only the scale on the wire separates them.
+
+
+def _tailed_trade(*, side: Side, gross: str, costs: str, net: str, offset: int) -> ClosedTrade:
+    return ClosedTrade(
+        symbol="EURUSD",
+        side=side,
+        volume=Decimal("1"),
+        entry_time=START + offset * HOUR,
+        entry_price=Decimal("1.10000"),
+        exit_time=START + (offset + 1) * HOUR,
+        exit_price=Decimal("1.10200"),
+        gross_pnl=Decimal(gross),
+        costs=Decimal(costs),
+        net_pnl=Decimal(net),
+        reason="tp" if side is Side.LONG else "sl",
+    )
+
+
+def _persist(session: Session, trades: list[ClosedTrade]) -> tuple[BacktestMetrics, list[Trade]]:
+    instrument = _instrument(session)
+    backtest = _backtest(session, instrument.id)
+    metrics_row, trade_rows = to_rows(
+        trades=trades,
+        metrics=compute_metrics(
+            trades=trades, equity_curve=_curve(), initial_capital=Decimal("10000")
+        ),
+        backtest_id=backtest.id,
+        instrument_id=instrument.id,
+    )
+    session.add(metrics_row)
+    session.add_all(trade_rows)
+    session.commit()
+    session.expire_all()  # force a real read, not the identity map's copy of what we wrote
+
+    summary = session.get(BacktestMetrics, backtest.id)
+    assert summary is not None
+    stored = list(
+        session.scalars(
+            select(Trade).where(Trade.backtest_id == backtest.id).order_by(Trade.entry_time)
+        ).all()
+    )
+    return summary, stored
+
+
+def test_metrics_whose_halves_round_apart_still_satisfy_the_check(session: Session) -> None:
+    """`net_profit_balances` against a run where rounding the engine's own total gives
+    90.98800910 while the rounded halves add to 90.98800909. Before the mapper rounded, this
+    insert raised `IntegrityError` — which is how the AUDCAD acceptance run died."""
+    summary, _ = _persist(
+        session,
+        [
+            _tailed_trade(
+                side=Side.LONG,
+                gross="191.44801914480",
+                costs="0",
+                net="191.44801914480",
+                offset=0,
+            ),
+            _tailed_trade(
+                side=Side.SHORT,
+                gross="-100.46001004600",
+                costs="0",
+                net="-100.46001004600",
+                offset=1,
+            ),
+        ],
+    )
+    assert str(summary.gross_profit) == "191.44801914"
+    assert str(summary.gross_loss) == "-100.46001005"
+    assert str(summary.net_profit) == "90.98800909"
+
+
+def test_a_trade_whose_legs_round_apart_still_satisfies_the_check(session: Session) -> None:
+    """`net_pnl_balances`, the same defect one table over: rounding the engine's own net gives
+    198.66520767 while the rounded legs give 198.66520766. Rarer than the metrics case — the
+    cost has to land on the rounding boundary — but the same arithmetic."""
+    _, stored = _persist(
+        session,
+        [
+            _tailed_trade(
+                side=Side.LONG,
+                gross="199.0882702401",
+                costs="0.423062575000",
+                net="198.665207665100",
+                offset=0,
+            )
+        ],
+    )
+    assert len(stored) == 1
+    assert str(stored[0].gross_pnl) == "199.08827024"
+    assert str(stored[0].costs) == "0.42306258"
+    assert str(stored[0].net_pnl) == "198.66520766"

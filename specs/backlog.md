@@ -735,3 +735,45 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
   a tela de resultados da fase 3. Consertar exigiria escolher **qual** das duas é a verdade, e essa
   escolha é de produto, não de encanamento: o total do sumário é o mais próximo do que a conta
   realmente fez, e a soma dos trades é a que o usuário consegue conferir na mão.
+
+- [origem: uso real da coleta multi-ativo, **medido em 21/08/2026**] ⚠️ **O `job_timeout` do agente
+  é inerte, e o laço de eventos fica bloqueado durante a coleta inteira.** `WorkerSettings` não
+  declara `job_timeout`, então vale o default do arq 0.28 — **300 s**, com `max_tries=5` e
+  `retry_jobs=True`. Nenhum desses três números foi escolhido por alguém.
+
+  **Mas trocar o número não resolve nada**, e essa é a parte que importa: o arq aplica o limite com
+  `asyncio.wait_for`, que só cancela num ponto de `await`. `run_collection` é **síncrona**
+  (`collect.py:160`) e `collect_range` a chama direto (`agent.py:220`), então o job bloqueia o
+  event loop do começo ao fim e o timeout nunca chega a disparar.
+
+  **A prova está no próprio Redis** — os dois heartbeats lado a lado, mesma instância:
+
+  ```
+  collect:health-check     Aug-21 14:29:29  j_ongoing=1  queued=7   <- agente coletor, parado
+  arq:queue:health-check   Aug-21 17:13:44  j_ongoing=0  queued=0   <- worker da API, atual
+  ```
+
+  O agente não consegue escrever o próprio batimento enquanto trabalha. Consequências medidas:
+
+  1. **A chave `in-progress` expira com o job ainda rodando.** O arq a define como
+     `job_timeout + 10` = 310 s (observei TTL 232 e 206 contando de 310). Uma coleta mais longa que
+     isso perde o próprio cadeado.
+  2. **Com `max_jobs = 1`, um job travado congela a fila inteira** — e a tela não sabe dizer isso.
+     As linhas ficam `queued`, que é indistinguível de "o agente não está rodando". São dois
+     estados com remédios opostos: um se resolve subindo o agente, o outro esperando ou matando o
+     processo. O docstring de `Collection` diz que a linha existe justamente para separar esses
+     dois casos — o modelo previu o problema, faltou o agente publicar que está vivo.
+  3. **300 s é curto e longo ao mesmo tempo.** Para uma coleta é curto (um ano frio de M1 são
+     ~368 mil barras); para uma conexão no terminal errado é longo. São dois números diferentes
+     hoje colapsados num só que ninguém escolheu.
+
+  **Conserto, na ordem:** (a) `await asyncio.to_thread(run_collection, ...)` em `collect_range` —
+  só depois disso o timeout passa a significar alguma coisa e o heartbeat volta a bater; (b) então
+  escolher `job_timeout` de propósito, e provavelmente `max_tries` também, porque recoletar é
+  idempotente mas ressondar custa 207 s; (c) a tela ler `collect:health-check` para distinguir
+  "enfileirado atrás de outro job" de "ninguém está drenando". ⚠️ Um heartbeat velho **não**
+  distingue "morto" de "bloqueado" — mas `j_ongoing=1` ao lado diz que ele parou trabalhando, que
+  já é mais do que a tela mostra hoje.
+
+  Descoberto porque havia **dois MT5 abertos** e o agente anexou ao errado — ver o item do
+  `--terminal-path`, que agora tem uma ocorrência real a favor.

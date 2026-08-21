@@ -45,6 +45,11 @@ async def create(
 ) -> list[CollectionOut]:
     """Accept a batch of collections and hand back the rows to watch them with.
 
+    The batch is the **product** of the symbols and the timeframe rows: three symbols across two
+    timeframes is six collections, six rows and six jobs. Symbols carry the asset class, rows
+    carry the window — each is a property of the thing it sits on, and neither belongs to the
+    request as a whole.
+
     ⚠️ **202 with a body, where the other queued endpoints answer with a job name.** `EnqueuedOut`
     carries no id because a sync's only observable result is the data it replaces, so there is
     nothing to poll. A collection is the opposite: it takes minutes, it can fail with a reason
@@ -83,23 +88,29 @@ async def create(
             ),
         )
 
-    # Counted once for the batch: every item shares the window, so every item has the same
-    # number of year slices. Computed here rather than left to the agent so the screen renders
-    # "0 of 5 years" the instant the request lands, and "0 of 0" reads as finished.
-    years_total = len(year_slices(request.date_from, request.date_to))
+    # Counted per **row**, because each timeframe carries its own window — a year of M1 and
+    # seventeen of H1 are the same budget of bars over very different spans. Computed here
+    # rather than left to the agent so the screen renders "0 of 5 years" the instant the
+    # request lands, and "0 of 0" reads as finished.
+    years_by_row = [len(year_slices(line.date_from, line.date_to)) for line in request.rows]
+
+    # ⚠️ Symbol-major, so the response reads the way the form does: everything asked for
+    # EURUSD, then everything asked for GBPUSD. Row-major would interleave them and make a
+    # caller zipping its own list against the answer get it subtly wrong.
     collections = [
         create_collection(
             session,
             symbol=item.symbol,
-            timeframe=request.timeframe,
-            date_from=request.date_from,
-            date_to=request.date_to,
+            timeframe=line.timeframe,
+            date_from=line.date_from,
+            date_to=line.date_to,
             # Stored only when a person supplied it, so the row records who decided. NULL means
             # the path did — the difference between provenance and a duplicated derivation.
             asset_class=item.asset_class,
-            years_total=years_total,
+            years_total=years,
         )
         for item in request.items
+        for line, years in zip(request.rows, years_by_row, strict=True)
     ]
     session.commit()
 

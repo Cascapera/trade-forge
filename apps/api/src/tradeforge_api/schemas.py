@@ -1149,11 +1149,67 @@ class CollectionItem(BaseModel):
     symbol fixable without a migration."""
 
 
-class CreateCollectionRequest(BaseModel):
-    """Go and fetch these symbols' history, all over the same window.
+MAX_COLLECTIONS_PER_REQUEST = 40
+"""How many collections one request may produce — symbols multiplied by rows.
 
-    One timeframe and one window for the whole batch; the class is per symbol, because it is a
-    property of the symbol and not of the request (see `CollectionItem`).
+⚠️ **A second ceiling, guarding a different thing from `MAX_COLLECTION_SYMBOLS`.** That one is
+about a list a person reads on one screen; this one is about a queue that drains one job at a
+time on a machine that downloads as it answers. Eight symbols across five timeframes and twenty
+across two are both forty collections, and neither ceiling subsumes the other: twenty-one
+symbols on a single row is under this limit and still refused, while ten symbols across five
+timeframes is under the symbol limit and still refused here.
+
+Forty is a working figure, not a measurement. Forty H1 collections of seven years took about
+three minutes each when measured on 21/08/2026; forty of M1 would be hours, because a year of
+M1 is sixty times the bars. The count cannot express that, which is why the screen shows the
+year-slice estimate beside it — the count is the guardrail, the estimate is the information.
+"""
+
+
+class CollectionRow(BaseModel):
+    """One timeframe over one window: the unit a batch multiplies the symbols by.
+
+    ⚠️ **The window belongs to the row, not to the request.** The bar budget this project
+    measured gives roughly one year for M1 and seventeen for H1 — the same number of bars over
+    wildly different spans, because a year of M1 is sixty times the bars of a year of H1. A
+    single window across several timeframes would therefore be wrong by construction for all
+    but one of them: either a year of H1 (far less history than the budget allows) or seventeen
+    years of M1 (far more than the terminal will even hand over).
+    """
+
+    timeframe: Timeframe
+    date_from: dt.datetime
+    date_to: dt.datetime
+
+    @field_validator("date_from", "date_to")
+    @classmethod
+    def _must_be_aware(cls, value: dt.datetime) -> dt.datetime:
+        """⚠️ A naive instant is refused rather than assumed to be UTC.
+
+        The window reaches MetaTrader, which speaks the *server's* clock and nothing else — the
+        collector shifts UTC into it on the way in and back out on the way home. An instant that
+        arrived without a timezone would be shifted anyway, and every bar in the file would be
+        displaced by hours with nothing raised. This project has already paid for that once:
+        the first real backfill wrote candles 62 hours out of place without an error.
+        """
+        if value.tzinfo is None:
+            raise ValueError("an instant must carry a timezone; send UTC as ...Z")
+        return value
+
+    @model_validator(mode="after")
+    def _window_must_run_forwards(self) -> CollectionRow:
+        if self.date_to < self.date_from:
+            raise ValueError("date_to is before date_from")
+        return self
+
+
+class CreateCollectionRequest(BaseModel):
+    """Go and fetch these symbols' history, over one window per timeframe.
+
+    Symbols are chosen once; each row adds a timeframe with its own window, and the batch is
+    the product — one collection per symbol per row. The class is per symbol, because it is a
+    property of the symbol and not of the request (see `CollectionItem`); the window is per row,
+    because it is a property of the timeframe (see `CollectionRow`).
 
     ⚠️ **A batch is N independent requests, not one grouped request.** Each item becomes its own
     `collections` row and its own queued job, exactly as N separate calls would have produced —
@@ -1167,9 +1223,40 @@ class CreateCollectionRequest(BaseModel):
     """
 
     items: list[CollectionItem] = Field(min_length=1, max_length=MAX_COLLECTION_SYMBOLS)
-    timeframe: Timeframe
-    date_from: dt.datetime
-    date_to: dt.datetime
+    rows: list[CollectionRow] = Field(min_length=1, max_length=MAX_COLLECTIONS_PER_REQUEST)
+
+    @field_validator("rows")
+    @classmethod
+    def _distinct_timeframes(cls, rows: list[CollectionRow]) -> list[CollectionRow]:
+        """The same timeframe twice is the same collection queued twice.
+
+        ⚠️ **Different windows do not rescue it.** A collection replaces whole year partitions
+        (`write_candles`), so two rows for H1 over overlapping years would have the second erase
+        what the first wrote — and the symptom would not be a duplicate but a *missing* year.
+        Refused rather than merged, because merging two windows into one is a decision the
+        caller can make and this endpoint cannot.
+        """
+        seen = [line.timeframe for line in rows]
+        repeated = sorted({tf for tf in seen if seen.count(tf) > 1})
+        if repeated:
+            raise ValueError(f"timeframes must be distinct; repeated: {', '.join(repeated)}")
+        return rows
+
+    @model_validator(mode="after")
+    def _within_the_work_ceiling(self) -> CreateCollectionRequest:
+        """The product is what reaches the queue, so the product is what is capped.
+
+        Stated as a model validator rather than as a `max_length` on either list, because
+        neither list is the thing being limited — their product is, and no field constraint can
+        say that.
+        """
+        total = len(self.items) * len(self.rows)
+        if total > MAX_COLLECTIONS_PER_REQUEST:
+            raise ValueError(
+                f"{len(self.items)} symbols across {len(self.rows)} timeframes is {total} "
+                f"collections; at most {MAX_COLLECTIONS_PER_REQUEST} in one request"
+            )
+        return self
 
     @field_validator("items")
     @classmethod
@@ -1189,27 +1276,6 @@ class CreateCollectionRequest(BaseModel):
         if repeated:
             raise ValueError(f"symbols must be distinct; repeated: {', '.join(repeated)}")
         return items
-
-    @field_validator("date_from", "date_to")
-    @classmethod
-    def _must_be_aware(cls, value: dt.datetime) -> dt.datetime:
-        """⚠️ A naive instant is refused rather than assumed to be UTC.
-
-        The window reaches MetaTrader, which speaks the *server's* clock and nothing else — the
-        collector shifts UTC into it on the way in and back out on the way home. An instant that
-        arrived without a timezone would be shifted anyway, and every bar in the file would be
-        displaced by hours with nothing raised. This project has already paid for that once:
-        the first real backfill wrote candles 62 hours out of place without an error.
-        """
-        if value.tzinfo is None:
-            raise ValueError("an instant must carry a timezone; send UTC as ...Z")
-        return value
-
-    @model_validator(mode="after")
-    def _window_must_run_forwards(self) -> CreateCollectionRequest:
-        if self.date_to < self.date_from:
-            raise ValueError("date_to is before date_from")
-        return self
 
 
 class CollectionOut(_Out):

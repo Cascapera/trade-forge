@@ -9,17 +9,19 @@ import {
 } from '../api/hooks'
 import type { AssetClass, BrokerSymbol, Collection } from '../api/types'
 import { SymbolMultiCombobox } from '../components/SymbolMultiCombobox'
+import { asInstant, bindingFloor, shortWindows } from '../collect/window'
 import {
-  asDateInput,
-  asInstant,
-  bindingFloor,
-  estimateSlices,
-  MAX_BATCH_SYMBOLS,
-  shortWindows,
-  suggestedWindow,
-} from '../collect/window'
-
-const TIMEFRAMES = ['M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1', 'W1'] as const
+  blockedReason,
+  MAX_COLLECTIONS,
+  newRow,
+  nextFreeTimeframe,
+  totalCollections,
+  totalSlices,
+  TIMEFRAMES,
+  withSuggestedWindows,
+} from '../collect/rows'
+import type { DraftRow } from '../collect/rows'
+import { MAX_BATCH_SYMBOLS } from '../collect/window'
 
 const ASSET_CLASSES: readonly AssetClass[] = ['forex', 'stock', 'index', 'future', 'crypto']
 
@@ -48,26 +50,32 @@ const fieldClass =
 export function CollectSymbol(): React.JSX.Element {
   const [chosen, setChosen] = useState<BrokerSymbol[]>([])
   const [classes, setClasses] = useState<Record<string, AssetClass>>({})
-  const [timeframe, setTimeframe] = useState<string>('H1')
-  const [touched, setTouched] = useState(false)
-  const [window, setWindow] = useState({ from: '', to: '' })
+  // ⚠️ Rows are state from the first render, not derived: the operator edits them, and a list
+  // recomputed from the timeframe would discard every hand-typed date the moment a measurement
+  // arrived. The opening row is H1 because it is the one this project measures everything in.
+  const [draft, setDraft] = useState<DraftRow[]>(() => [newRow('H1', undefined, new Date(), 'r0')])
+  const [nextId, setNextId] = useState(1)
 
   const symbols = chosen.map((found) => found.symbol)
-  const histories = useSymbolHistories(symbols, timeframe)
+  // The measurements are read for the **first** row's timeframe, which is the one whose floor
+  // the add button uses to open the next row. Probing every row's timeframe would multiply the
+  // queue by the number of rows before a single candle was fetched.
+  const histories = useSymbolHistories(symbols, draft[0]?.timeframe ?? 'H1')
   // ⚠️ Only the pairs that came back with nothing are measured, and each one only once — see
   // `useAutoProbe`. A probe shares the collection's single-job queue, so re-measuring on every
   // render would put hours of work in front of the first candle.
-  const probing = useAutoProbe({ missing: histories.missing, timeframe })
+  const probing = useAutoProbe({
+    missing: histories.missing,
+    timeframe: draft[0]?.timeframe ?? 'H1',
+  })
   const create = useCreateCollection()
   const collections = useCollections()
 
-  // ⚠️ The suggestion is recomputed on every render and only *adopted* while the operator has
-  // not touched the dates. Writing it into state on every change would fight a person mid-edit:
-  // they widen the start, a measurement arrives, and the field snaps back under the cursor.
   const floor = bindingFloor(histories.known.values())
-  const suggested = suggestedWindow(timeframe, floor, new Date())
-  const from = touched ? window.from : asDateInput(suggested.from)
-  const to = touched ? window.to : asDateInput(suggested.to)
+  // ⚠️ Untouched rows keep following the measurements. The opening row is created before any
+  // symbol exists, so its first window comes from the bar budget alone — and the floor arrives
+  // seconds later. A row somebody has edited is left exactly as they left it.
+  const rows = withSuggestedWindows(draft, floor, new Date())
 
   // Symbols the broker's filing cannot classify and nobody has answered for yet. Asked here
   // rather than discovered from a 409, because the person who can answer is the one holding the
@@ -76,14 +84,18 @@ export function CollectSymbol(): React.JSX.Element {
     (found) => found.asset_class_from_path === null && classes[found.symbol] === undefined,
   )
 
-  const slices = estimateSlices(chosen.length, from, to)
-  const short = shortWindows(symbols, histories.known, from)
+  const collectionCount = totalCollections(chosen.length, rows)
+  const slices = totalSlices(chosen.length, rows)
+  // Warned against the **earliest** start any row asks for: that is the row a short symbol
+  // falls off the front of, and warning once is enough to send somebody to look.
+  const earliest = rows.map((line) => line.from).filter(Boolean).sort()[0] ?? ''
+  const short = shortWindows(symbols, histories.known, earliest)
   const blocked = blockedReason({
-    chosen: chosen.length,
+    symbols: chosen.length,
+    rows,
     unanswered: unanswered.map((found) => found.symbol),
-    from,
-    to,
   })
+  const free = nextFreeTimeframe(rows.map((line) => line.timeframe))
 
   const toggle = (found: BrokerSymbol): void => {
     create.reset()
@@ -105,17 +117,31 @@ export function CollectSymbol(): React.JSX.Element {
         const answered = classes[found.symbol]
         return { symbol: found.symbol, ...(answered === undefined ? {} : { asset_class: answered }) }
       }),
-      timeframe,
-      date_from: asInstant(from),
-      // ⚠️ End of day, because the window is inclusive on both ends. Midnight would drop every
-      // bar of the final day — silently, and only on the day somebody chose as the end.
-      date_to: asInstant(to, true),
+      rows: rows.map((line) => ({
+        timeframe: line.timeframe,
+        date_from: asInstant(line.from),
+        // ⚠️ End of day, because the window is inclusive on both ends. Midnight would drop
+        // every bar of the final day — silently, and only on the day somebody chose as the end.
+        date_to: asInstant(line.to, true),
+      })),
     })
   }
 
-  const edit = (patch: { from?: string; to?: string }): void => {
-    setTouched(true)
-    setWindow({ from, to, ...patch })
+  // ⚠️ Edits are written against the **rendered** rows, not the raw draft: an untouched row
+  // shows a suggested window that state does not hold, and patching the draft alone would leave
+  // the other end of the window at whatever the draft was born with.
+  const editRow = (id: string, patch: Partial<DraftRow>): void => {
+    setDraft(rows.map((line) => (line.id === id ? { ...line, ...patch, touched: true } : line)))
+  }
+
+  const addRow = (): void => {
+    if (free === undefined) return
+    setDraft([...rows, newRow(free, floor, new Date(), `r${String(nextId)}`)])
+    setNextId((n) => n + 1)
+  }
+
+  const removeRow = (id: string): void => {
+    setDraft(rows.filter((line) => line.id !== id))
   }
 
   return (
@@ -130,66 +156,120 @@ export function CollectSymbol(): React.JSX.Element {
 
       <SymbolMultiCombobox chosen={chosen} onToggle={toggle} max={MAX_BATCH_SYMBOLS} />
 
-      <div className="grid grid-cols-2 gap-4 md:grid-cols-3">
-        <label className="flex flex-col gap-1 text-xs text-slate-400">
-          Timeframe
-          <select
-            className={fieldClass}
-            value={timeframe}
-            onChange={(event) => {
-              setTimeframe(event.target.value)
-              // ⚠️ The suggested window is per timeframe — a year on M1, seventeen on H1 — so a
-              // change here has to be allowed to move the dates again.
-              setTouched(false)
-            }}
+      <div className="space-y-2">
+        <div className="flex items-center justify-between">
+          <span className="text-xs text-slate-400">Timeframes</span>
+          <button
+            type="button"
+            // ⚠️ Disabled once every timeframe is on a row, rather than adding a duplicate the
+            // API would refuse. Two collections of the same series overwrite each other's year
+            // partitions, and the symptom is a *missing* year — a trap worth not setting.
+            disabled={free === undefined}
+            className="flex items-center gap-1 rounded border border-slate-700 px-2 py-0.5 text-xs text-slate-300 hover:border-sky-500 disabled:border-slate-800 disabled:text-slate-600"
+            onClick={addRow}
           >
-            {TIMEFRAMES.map((option) => (
-              <option key={option} value={option}>
-                {option}
-              </option>
-            ))}
-          </select>
-        </label>
+            <span aria-hidden="true">+</span>
+            {free === undefined ? 'every timeframe added' : 'Add timeframe'}
+          </button>
+        </div>
 
-        <label className="flex flex-col gap-1 text-xs text-slate-400">
-          From
-          <input
-            type="date"
-            className={fieldClass}
-            value={from}
-            onChange={(event) => {
-              edit({ from: event.target.value })
-            }}
-          />
-        </label>
+        {rows.map((line) => (
+          <div
+            key={line.id}
+            className="grid grid-cols-2 items-end gap-3 rounded border border-slate-800 p-2 md:grid-cols-4"
+          >
+            <label className="flex flex-col gap-1 text-xs text-slate-400">
+              Timeframe
+              <select
+                aria-label={`Timeframe of row ${line.id}`}
+                className={fieldClass}
+                value={line.timeframe}
+                onChange={(event) => {
+                  // ⚠️ Changing a row's timeframe re-opens its window, because the budget is per
+                  // timeframe: a year on M1 against seventeen on H1. Keeping the dates would
+                  // leave the row wrong by two orders of magnitude while looking deliberate.
+                  const reopened = newRow(event.target.value, floor, new Date(), line.id)
+                  // `touched: false` on purpose — a timeframe change is a new question, and the
+                  // window it deserves should keep following the measurements again.
+                  setDraft(rows.map((r) => (r.id === line.id ? reopened : r)))
+                }}
+              >
+                {TIMEFRAMES.map((option) => (
+                  <option
+                    key={option}
+                    value={option}
+                    disabled={option !== line.timeframe && rows.some((r) => r.timeframe === option)}
+                  >
+                    {option}
+                  </option>
+                ))}
+              </select>
+            </label>
 
-        <label className="flex flex-col gap-1 text-xs text-slate-400">
-          To
-          <input
-            type="date"
-            className={fieldClass}
-            value={to}
-            onChange={(event) => {
-              edit({ to: event.target.value })
-            }}
-          />
-        </label>
+            <label className="flex flex-col gap-1 text-xs text-slate-400">
+              From
+              <input
+                type="date"
+                aria-label={`${line.timeframe} from`}
+                className={fieldClass}
+                value={line.from}
+                onChange={(event) => {
+                  editRow(line.id, { from: event.target.value })
+                }}
+              />
+            </label>
 
-        {!touched && chosen.length > 0 && (
-          <p className="col-span-full text-xs text-slate-400">
-            Suggested: {suggested.bars.toLocaleString()} bars per symbol,{' '}
-            {suggested.bound === 'probe' && floor !== undefined
-              ? `starting where ${floor.symbol}'s measurement says the series stops being filler and typed costs — the latest floor among the chosen symbols, so it is the one that binds`
-              : 'as much as one run should carry — widen it if you want more'}
+            <label className="flex flex-col gap-1 text-xs text-slate-400">
+              To
+              <input
+                type="date"
+                aria-label={`${line.timeframe} to`}
+                className={fieldClass}
+                value={line.to}
+                onChange={(event) => {
+                  editRow(line.id, { to: event.target.value })
+                }}
+              />
+            </label>
+
+            <div className="flex items-center justify-end">
+              <button
+                type="button"
+                // ⚠️ Named for its own timeframe. Several rows on screen with a button each,
+                // all called "Remove", would be several controls nobody can tell apart.
+                aria-label={`Remove ${line.timeframe} row`}
+                disabled={rows.length === 1}
+                className="rounded border border-slate-700 px-2 py-1 text-xs text-slate-400 hover:border-rose-500 hover:text-rose-300 disabled:border-slate-800 disabled:text-slate-700"
+                onClick={() => {
+                  removeRow(line.id)
+                }}
+              >
+                Remove
+              </button>
+            </div>
+          </div>
+        ))}
+
+        {chosen.length > 0 && floor !== undefined && (
+          <p className="text-xs text-slate-400">
+            {/* ⚠️ Names the symbol doing the binding, not just the date. One window per row
+                covers every chosen symbol, so the **latest** floor decides where a row may open
+                — and "2022" with no explanation reads like a bug to somebody who picked EURUSD
+                expecting 2009. */}
+            Rows open no earlier than {floor.symbol}&apos;s measurement says the series stops
+            being filler and typed costs — the latest floor among the chosen symbols, so it is
+            the one that binds.
           </p>
         )}
 
         {chosen.length > 0 && (
-          <p className="col-span-full text-xs text-slate-400">
-            {/* ⚠️ Slices, not a duration. The screen cannot know how long a cold year takes on
-                this broker — it varies by symbol and by how much the terminal already holds —
-                but it knows exactly how many of them are being asked for. */}
-            That is <strong className="text-slate-200">{slices.toLocaleString()}</strong> year
+          <p className="text-xs text-slate-400">
+            {/* ⚠️ Two numbers, because they answer different questions. The count is what the
+                ceiling is about; the slices are what the *wait* is about — forty collections of
+                H1 and forty of M1 are the same count and nothing like the same afternoon. */}
+            <strong className="text-slate-200">{collectionCount}</strong> collection
+            {collectionCount === 1 ? '' : 's'} of {MAX_COLLECTIONS} —{' '}
+            <strong className="text-slate-200">{slices.toLocaleString()}</strong> year
             {slices === 1 ? '' : 's'} of history to fetch, one after another.
           </p>
         )}
@@ -302,22 +382,6 @@ export function CollectSymbol(): React.JSX.Element {
       <CollectionList rows={collections.data ?? []} />
     </div>
   )
-}
-
-/** Why the button is off, or `null` when it is not. */
-function blockedReason(args: {
-  chosen: number
-  unanswered: readonly string[]
-  from: string
-  to: string
-}): string | null {
-  if (args.chosen === 0) return 'Choose at least one symbol.'
-  if (args.from === '' || args.to === '') return 'Set both ends of the window.'
-  if (args.to < args.from) return 'The window runs backwards.'
-  if (args.unanswered.length > 0) {
-    return `Say what ${args.unanswered.join(', ')} ${args.unanswered.length === 1 ? 'is' : 'are'}.`
-  }
-  return null
 }
 
 /**

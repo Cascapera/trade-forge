@@ -671,3 +671,54 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
   `compile_operand` e recusar um ref de indicador que não seja um deles — o que de quebra pega
   `{"ref": "sma_lenta"}` para uma `sma_lento` declarada, que hoje também é nulo silencioso. Fora de
   escopo aqui: não é regressão do PR-201-B, e um PR = um escopo.
+- [origem: PR-234, **medido em 20/08/2026**] **O catálogo e o disco já divergiram na máquina do
+  Guilherme**: `select count(*) from datasets` devolve **0** enquanto `data/ohlcv` tem **42 arquivos
+  Parquet** de AAPL, BTCUSD, EURUSD, GBPJPY e GBPUSD. As linhas se perderam numa rodada de
+  `pytest -m integration` (que TRUNCA `datasets`), e o efeito é que a tela de backtest não oferece
+  nada apesar de os dados estarem lá. O PR-234 impede que isso volte a acontecer *por recoleta*
+  (`storage.coverage` lê o disco), mas **não repara o que já se perdeu**. Falta um `tradeforge-db
+  reconcile` que varra `data/ohlcv` e reescreva `instruments`/`datasets` a partir dos arquivos — o
+  mesmo `coverage()` já faz metade do trabalho.
+- [origem: PR-234] **A suíte de integração continua sem banco próprio**, e agora está provado que dá
+  para ter um: `POSTGRES_DB=tradeforge_pr234 uv run pytest -m integration` roda os 158 testes
+  inteiros contra um banco descartável, sem tocar nos dados de trabalho. O conserto é fazer disso o
+  default do `conftest` (criar/derrubar o banco na fixture de sessão) em vez de depender de quem
+  roda lembrar da variável. Enquanto não for, o TRUNCATE continua sendo uma armadilha carregada.
+- [origem: PR-234] **O progresso da coleta é lido por polling e não pelo pub/sub** que o spec
+  previa. A decisão é medida: uma coleta emite no máximo um evento por ano de calendário — cinco ou
+  dez no total — e o `GET /collections/{id}` a cada 3 s cobre isso sem WebSocket novo. Publicar num
+  canal sem assinante seria código morto, que é exatamente o defeito que o PR-233 fechou. Se o
+  progresso um dia ficar mais fino que "um ano", o `ws.py` já tem o formato para copiar.
+- [origem: PR-234] **`BARS_PER_YEAR.M30` é interpolado, não medido.** Os outros sete números vieram
+  de contagem real no EURUSD 2024; o M30 foi posto entre M15 e H1 porque ninguém contou. Está
+  marcado no código. Uma medição de um minuto resolve, e enquanto não vier a janela sugerida de M30
+  é a única que não tem lastro.
+- [origem: PR-234] **Nada reconcilia `datasets` quando um arquivo Parquet é apagado à mão.** A
+  cobertura é derivada do disco *na coleta*, então apagar um ano depois deixa a linha alegando mais
+  do que existe até a próxima recoleta. O mesmo `reconcile` do primeiro item resolve os dois.
+- [origem: aceite do PR-234, **medido em 20/08/2026**] ⚠️ **A invariante `net_profit = gross_profit
+  + gross_loss` é verdadeira quando calculada e falsa depois de gravada, e derruba o backtest.** O
+  CHECK `ck_backtest_metrics_net_profit_balances` recusou uma linha cujos três números fechavam em
+  `Decimal`: as parcelas atravessam para `NUMERIC(20,8)` **cada uma por si**, e a soma dos
+  arredondados não é o arredondado da soma. Medido no backtest do AUDCAD H1 coletado pela tela:
+
+  ```
+  em Decimal   -9944.7976321644 == 802.6520847921 + (-10747.4497169565)   ✅
+  em NUMERIC   -9944.79763216   ≠  802.65208479   + (-10747.44971696)
+                                 = -9944.79763217                          ❌  (1 na 8ª casa)
+  ```
+
+  ⚠️ **É intermitente**, que é o pior modo de falha possível: com números cujos arredondamentos
+  concordam a linha grava normal, e foi por isso que todos os backtests anteriores passaram. O
+  conserto é em `packages/db/src/tradeforge_db/results.py:176` (`_metrics_row`) e **não toca a
+  engine**: quantizar as parcelas para escala 8 e derivar `net_profit` da soma **das gravadas**, de
+  modo que as partes continuem sendo a verdade e o total siga elas. Afrouxar o CHECK para uma
+  tolerância está descartado — ele existe para pegar erro de sinal em `gross_loss`, e trocá-lo por
+  tolerância é trocar falha barulhenta por falha silenciosa. Aumentar a escala não resolve: o
+  desencontro reaparece na última casa, qualquer que seja ela. O teste precisa **reler do banco**,
+  porque `Decimal` compara numericamente e a perda de quantização só aparece no fio.
+  Mesma família, ainda não verificada: `ck_trades_net_pnl_balances` (`net_pnl = gross_pnl - costs`).
+- [origem: aceite do PR-234] **A metade "rodar um backtest nele" do aceite ficou pendente** por
+  causa do item acima, que é anterior ao PR-234 e independe dele. A metade da coleta fechou: AUDCAD
+  H1 coletado pela tela em 7 fatias (2020 → 2026), 41.216 candles, 358 gaps, uma linha em
+  `datasets` e 7 partições no disco. Refazer o backtest do AUDCAD assim que o CHECK for consertado.

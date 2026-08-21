@@ -19,10 +19,12 @@ approximation it never asked for and cannot undo.
 """
 
 import datetime as dt
+from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.dataset as ds
 
 from tradeforge_engine.domain import Candle
@@ -197,6 +199,52 @@ def read_times(
         columns=["time"], filter=window
     )
     return [_as_utc(moment) for moment in table.sort_by("time").column("time").to_pylist()]
+
+
+@dataclass(frozen=True, slots=True)
+class Coverage:
+    """What a dataset directory actually holds, read from the files rather than from a run."""
+
+    date_from: dt.datetime
+    date_to: dt.datetime
+    candle_count: int
+
+
+def coverage(root: Path, symbol: str, timeframe: str) -> Coverage | None:
+    """The span and size of what is on disk. `None` when nothing is.
+
+    ⚠️ **Asked of the disk, not of the download that just finished, and the difference is a
+    whole class of surprise.** `write_candles` only deletes the year partitions it is about to
+    write, so collecting 2015 after 2020 leaves 2020 exactly where it was — while a catalogue
+    row built from the second run's own candles would claim the symbol covers 2015 alone. The
+    files and the record of the files would disagree, and the screen believes the record: bars
+    the user paid three minutes to download would stop being offered to a backtest.
+
+    Deriving it here means the catalogue describes **what exists**, which is the only claim the
+    files can support, and it makes the answer independent of how many runs it took to get
+    there.
+
+    Costs a metadata read and one column. `count_rows` answers from the Parquet footers without
+    decoding a row, and `min_max` runs inside Arrow over the `time` column alone — the prices
+    are never touched, which is the layout at the top of this file paying for itself.
+    """
+    directory = Path(dataset_path(root, symbol, timeframe))
+    if not directory.exists():
+        return None
+
+    dataset = ds.dataset(directory, format="parquet", partitioning="hive")
+    count = dataset.count_rows()
+    if count == 0:
+        # A directory that exists and holds nothing. Reporting a span here would mean
+        # inventing two instants; reporting `None` says the same thing as never having run.
+        return None
+
+    span = pc.min_max(dataset.to_table(columns=["time"]).column("time"))
+    return Coverage(
+        date_from=_as_utc(span["min"].as_py()),
+        date_to=_as_utc(span["max"].as_py()),
+        candle_count=count,
+    )
 
 
 def _as_utc(moment: dt.datetime) -> dt.datetime:

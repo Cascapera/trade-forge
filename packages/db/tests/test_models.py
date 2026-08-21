@@ -35,6 +35,9 @@ EXPECTED_TABLES = {
     # What a probe found about one (symbol, timeframe), including the bounds on the answer.
     "symbol_history",
     "datasets",
+    # One request to fetch a range, kept after it finishes. Beside `datasets` and not folded
+    # into it: that one says what exists, this one says what was asked for and how it went.
+    "collections",
     "strategies",
     "baskets",
     "studies",

@@ -1,6 +1,7 @@
 import { NavLink, Navigate, Route, Routes } from 'react-router-dom'
 
 import { BasketResult } from './screens/BasketResult'
+import { CollectSymbol } from './screens/CollectSymbol'
 import { LaunchBacktest } from './screens/LaunchBacktest'
 import { LaunchBasket } from './screens/LaunchBasket'
 import { Results } from './screens/Results'
@@ -57,6 +58,11 @@ export function App(): React.JSX.Element {
             <NavLink to="/runs" className={navClass}>
               Run log
             </NavLink>
+            {/* Last, because it is upstream of everything else and reached least often: a symbol
+                is collected once and backtested for weeks. */}
+            <NavLink to="/collect" className={navClass}>
+              Collect
+            </NavLink>
             {basketId !== null && (
               <NavLink to={`/baskets/${basketId}`} className={navClass}>
                 ▸ {basketLabel}
@@ -87,6 +93,7 @@ export function App(): React.JSX.Element {
           <Route path="/study" element={<LaunchStudy />} />
           <Route path="/studies/:id" element={<StudyResult />} />
           <Route path="/walkforwards/:id" element={<WalkForwardResult />} />
+          <Route path="/collect" element={<CollectSymbol />} />
           <Route path="/runs" element={<RunLog />} />
           <Route path="/results/:id" element={<Results />} />
           <Route path="*" element={<Navigate to="/" replace />} />

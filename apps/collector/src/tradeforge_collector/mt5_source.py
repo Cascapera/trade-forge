@@ -5,10 +5,12 @@ import of `MetaTrader5` happens inside `connect()`, at the moment someone actual
 asks for real data. That is what lets CI import the rest of the package, run the whole
 backfill against `SyntheticSource`, and never touch a library it cannot install.
 
-Three things here are *pure functions* on purpose — `asset_class_from_path`,
-`infer_server_offset` and `offset_is_plausible`. They hold the only pieces of MT5
-behaviour that can be gotten wrong silently, so they are lifted out of the I/O and
-tested directly.
+Two things here are *pure functions* on purpose — `infer_server_offset` and
+`offset_is_plausible`. They hold the pieces of MT5 behaviour that can be gotten wrong
+silently, so they are lifted out of the I/O and tested directly. A third, the asset-class
+reader, was lifted further still: `classify.asset_class_from_path` is imported by the API,
+which needs the answer before a collection is queued, and importing it from here would
+have made the first line of this docstring false.
 """
 
 import datetime as dt
@@ -18,6 +20,7 @@ from decimal import Decimal
 from types import TracebackType
 from typing import Any, Self
 
+from tradeforge_collector.classify import asset_class_from_path
 from tradeforge_collector.history import (
     FABRICATED_YEAR_THRESHOLD,
     HistoryReport,
@@ -32,17 +35,6 @@ from tradeforge_engine.domain import AssetClass, Candle, InstrumentSpec
 
 logger = logging.getLogger(__name__)
 
-# MT5 groups symbols in a tree: "Forex\\Majors\\EURUSD", "Stocks\\US\\AAPL".
-_PATH_TO_ASSET_CLASS: dict[str, AssetClass] = {
-    "forex": AssetClass.FOREX,
-    "stocks": AssetClass.STOCK,
-    "shares": AssetClass.STOCK,
-    "indices": AssetClass.INDEX,
-    "indexes": AssetClass.INDEX,
-    "futures": AssetClass.FUTURE,
-    "crypto": AssetClass.CRYPTO,
-}
-
 # Brokers run their servers a couple of hours ahead of UTC, and most of them observe
 # daylight saving — so the offset is not even constant across a year. Rounded to the
 # half hour because a few seconds of clock skew between the two machines must not turn
@@ -52,17 +44,6 @@ _OFFSET_GRANULARITY = dt.timedelta(minutes=30)
 # A clock is a timezone, and the furthest any inhabited place sits from UTC is +14.
 # Beyond this the number being measured is not a clock at all — see `offset_is_plausible`.
 _MAX_PLAUSIBLE_OFFSET = dt.timedelta(hours=14)
-
-
-def asset_class_from_path(path: str) -> AssetClass | None:
-    """Read the asset class out of the symbol's tree path. `None` when it cannot tell.
-
-    Deliberately returns `None` rather than guessing: an instrument filed under the
-    wrong class gets the wrong tick arithmetic, and a wrong P&L that nobody questions is
-    worse than a backfill that stops and asks.
-    """
-    head = path.replace("/", "\\").split("\\")[0].strip().lower()
-    return _PATH_TO_ASSET_CLASS.get(head)
 
 
 def infer_server_offset(server_time: dt.datetime, real_now: dt.datetime) -> dt.timedelta:

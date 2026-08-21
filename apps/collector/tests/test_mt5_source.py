@@ -20,7 +20,6 @@ import pytest
 from tradeforge_collector import mt5_source
 from tradeforge_collector.mt5_source import (
     MT5Source,
-    asset_class_from_path,
     infer_server_offset,
     offset_is_plausible,
 )
@@ -148,29 +147,6 @@ def a_rate(server_hour: int) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # The pure functions — the two things that go wrong silently                     #
 # --------------------------------------------------------------------------- #
-
-
-@pytest.mark.parametrize(
-    ("path", "expected"),
-    [
-        ("Forex\\Majors\\EURUSD", AssetClass.FOREX),
-        ("Stocks\\US\\AAPL", AssetClass.STOCK),
-        ("Indices\\US500", AssetClass.INDEX),
-        ("Crypto\\BTCUSD", AssetClass.CRYPTO),
-        ("Futures\\CL", AssetClass.FUTURE),
-    ],
-)
-def test_the_asset_class_is_read_from_the_symbol_tree(path: str, expected: AssetClass) -> None:
-    assert asset_class_from_path(path) == expected
-
-
-def test_an_unrecognised_path_returns_none_instead_of_guessing() -> None:
-    """A symbol filed under the wrong class gets the wrong tick arithmetic.
-
-    And wrong tick arithmetic is a P&L that is off by a constant factor — which looks
-    exactly like a very good strategy. Better to stop and ask for `--asset-class`.
-    """
-    assert asset_class_from_path("CFD\\Exotic\\WHATEVER") is None
 
 
 def test_the_server_clock_is_measured_and_rounded_to_the_half_hour() -> None:

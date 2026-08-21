@@ -14,8 +14,10 @@ import type {
   BacktestsPage,
   BasketOut,
   CandlesResponse,
+  Collection,
   CreateBacktestRequest,
   CreateBasketRequest,
+  CreateCollection,
   CreateStudyRequest,
   CreateWalkForwardRequest,
   CreatedBacktest,
@@ -108,6 +110,51 @@ export function useProbeSymbol() {
   return useMutation<{ job: string }, Error, { symbol: string; timeframe: string }>({
     mutationFn: ({ symbol, timeframe }) => api.probeSymbol(symbol, timeframe),
     onSuccess: () => client.invalidateQueries({ queryKey: ['symbol-history'] }),
+  })
+}
+
+/**
+ * Launch a collection and get the row to watch it with.
+ *
+ * ⚠️ The invalidations are three, and each one is a different screen catching up. `collections`
+ * is the list under the form; `instruments` is what the backtest screens offer, and a first
+ * collection is exactly what puts a symbol there; `symbols` carries the `catalogued` flag that
+ * decides whether the combobox marks it "no data".
+ */
+export function useCreateCollection() {
+  const client = useQueryClient()
+  return useMutation<Collection, Error, CreateCollection>({
+    mutationFn: (body) => api.createCollection(body),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: ['collections'] })
+      void client.invalidateQueries({ queryKey: ['instruments'] })
+      void client.invalidateQueries({ queryKey: ['symbols'] })
+    },
+  })
+}
+
+/**
+ * One collection, polled while it runs.
+ *
+ * ⚠️ Polled at the **study** cadence rather than the single-run one. A collection advances once
+ * per calendar year of history and a cold year can take minutes on this broker, so a
+ * once-a-second poll would be hundreds of requests against a row that changes five times.
+ */
+export function useCollection(id: string | undefined) {
+  return useQuery<Collection>({
+    queryKey: ['collection', id],
+    queryFn: id === undefined ? skipToken : () => api.getCollection(id),
+    refetchInterval: (query) => (isTerminal(query.state.data?.status) ? false : STUDY_POLL_MS),
+  })
+}
+
+/** Every collection, newest first, refreshed while any of them is still going. */
+export function useCollections() {
+  return useQuery<Collection[]>({
+    queryKey: ['collections'],
+    queryFn: api.listCollections,
+    refetchInterval: (query) =>
+      (query.state.data ?? []).every((row) => isTerminal(row.status)) ? false : STUDY_POLL_MS,
   })
 }
 

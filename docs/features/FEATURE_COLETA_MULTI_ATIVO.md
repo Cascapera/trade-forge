@@ -4,8 +4,8 @@
 
 | | |
 |---|---|
-| **Status** | `em implementação` — PR 2 pronto na branch |
-| **Progresso** | **1/4 PRs mergeados** (#129 `8dac85d`) · **7/14 itens** (F-01 a F-07) |
+| **Status** | `em implementação` — PR 3 pronto na branch |
+| **Progresso** | **2/4 PRs mergeados** (#129 `8dac85d`, #130 `1d53d63`) · **10/14 itens** (F-01 a F-10) |
 | **Suposições** | 6 (§16) |
 | **Questões em aberto** | 1 — **Q-01 resolvida** (§16) |
 | **Migração de banco** | **nenhuma** — ver §8 |
@@ -26,7 +26,22 @@
    à mão de propósito, e só o tipo da **DSL** vem gerado de `packages/schema`. O item virou
    "espelhar à mão, seguindo a convenção documentada do arquivo".
 4. **Um `type: ignore` novo, contra o padrão da §14.** Ver a nota abaixo do checklist.
-5. **Constante própria em vez do `_MAX_SYMBOLS` do basket.** Reusar a do basket acoplaria dois
+5. **O seletor múltiplo é componente NOVO, não um modo no antigo.** O plano dizia
+   "`SymbolCombobox` ganha modo múltiplo". Os dois diferem no que uma escolha *significa*
+   — substituir contra alternar — e no que o campo faz depois: um guarda a escolha, o outro
+   limpa para o próximo ticker ser digitado. Um componente só ramificaria nisso em seis
+   lugares. O que era comum (busca, debounce, teclado, dropdown, rodapé) foi **extraído**
+   para `symbolSearch.ts` + `SymbolOptions.tsx`, e os 10 testes existentes do seletor
+   antigo provaram que a extração não regrediu nada.
+6. **A regra do eslint `react-refresh` forçou dois arquivos.** Um arquivo que exporta
+   componentes não pode exportar mais nada, então os hooks foram para o `.ts` e os
+   componentes para o `.tsx`.
+7. **`bindingFloor` e `useSymbolHistories` não estavam no plano, e precisavam estar.** A
+   janela sugerida é pisada pela sonda **de um símbolo**; com N, deixar isso para o PR 4
+   teria feito o caso de um símbolo *regredir* — ele perderia o piso de 2009 que já tem
+   hoje. Então a **leitura** das sondas veio para cá; a **sondagem automática** (a
+   mutação) continua no PR 4.
+8. **Constante própria em vez do `_MAX_SYMBOLS` do basket.** Reusar a do basket acoplaria dois
    tetos que a Q-02 prevê que podem divergir — e eles limitam trabalhos de custo muito diferente:
    vinte backtests são segundos, vinte coletas são horas. Nasceu `MAX_COLLECTION_SYMBOLS`, com o
    porquê no docstring.
@@ -565,26 +580,38 @@ troca de dez linhas — **diga e eu troco**.
 
 ### PR 3 — Tela: seleção múltipla
 
-- [ ] **F-08** · `SymbolCombobox` ganha modo múltiplo: chips, remoção, teto 20, nome acessível único por chip
-      risco: médio · 4h · ~140 linhas / 2 arquivos
-  - [ ] Testes escritos primeiro · [ ] Implementado · [ ] Cobertura 100% · [ ] eslint · [ ] tsc · [ ] suíte verde
-  - [ ] Critérios cobertos: CA-03
+- [x] **F-08** · ~~`SymbolCombobox` ganha modo múltiplo~~ → **`SymbolMultiCombobox` novo**, com a
+      busca compartilhada extraída: chips, remoção, teto, nome acessível único por chip
+      risco: médio
+  - [x] Testes escritos primeiro (11, vermelhos antes) · [x] Implementado · [x] Cobertura 100% · [x] eslint · [x] tsc · [x] suíte verde
+  - [x] Critérios cobertos: CA-03
   - [ ] PR aberto · [ ] Mergeado `<hash>` · [ ] Verificado
-  - Status: não iniciado · Notas:
+  - Status: **feito** · Notas: teto testado **dos dois lados** (no limite recusa, um abaixo aceita).
+    ⚠️ O teto bloqueia **adicionar, nunca remover** — recusar todo clique com a lista cheia
+    prenderia quem quisesse trocar um símbolo, com a única saída sendo os chips, que não é onde a
+    pessoa está olhando. Mutante que apaga essa distinção: morto.
 
-- [ ] **F-09** · `CollectSymbol` manda `items`; classe pedida por símbolo ambíguo; botão desabilitado com motivo visível
-      risco: médio · 4h · ~120 linhas
-  - [ ] Testes escritos primeiro · [ ] Implementado · [ ] Cobertura 100% · [ ] eslint · [ ] tsc · [ ] suíte verde
-  - [ ] Critérios cobertos: CA-06, CA-13
+- [x] **F-09** · `CollectSymbol` manda `items`; classe pedida por símbolo ambíguo; botão desabilitado com motivo visível
+      risco: médio
+  - [x] Testes escritos primeiro (17) · [x] Implementado · [x] Cobertura 100% · [x] eslint · [x] tsc · [x] suíte verde
+  - [x] Critérios cobertos: CA-06, CA-13, e **RN-12 em parte** (a janela sugerida já respeita o
+    piso mais tardio entre os escolhidos; o aviso por símbolo é o F-12)
   - [ ] PR aberto · [ ] Mergeado `<hash>` · [ ] Verificado
-  - Status: não iniciado · Notas:
+  - Status: **feito** · Notas: a resposta da classe **morre junto com o símbolo** — senão ela
+    sobrevive à pergunta e é reaplicada ao próximo que ocupar o lugar (mutante morto). O `<select>`
+    ganhou `aria-label` próprio: o rótulo lia "XAUUSD CFDs\\Metals\\XAUUSD", que um leitor de tela
+    anunciaria como o **nome** do controle — um caminho, onde a pergunta é que tipo de coisa é.
 
-- [ ] **F-10** · Estimativa em fatias de ano (símbolos × anos) antes do botão
-      risco: baixo · 1h · ~40 linhas
-  - [ ] Testes escritos primeiro · [ ] Implementado · [ ] Cobertura 100% · [ ] eslint · [ ] tsc · [ ] suíte verde
-  - [ ] Critérios cobertos: CA-12
+- [x] **F-10** · Estimativa em fatias de ano (símbolos × anos) antes do botão
+      risco: baixo
+  - [x] Testes escritos primeiro · [x] Implementado · [x] Cobertura 100% · [x] eslint · [x] tsc · [x] suíte verde
+  - [x] Critérios cobertos: CA-12
   - [ ] PR aberto · [ ] Mergeado `<hash>` · [ ] Verificado
-  - Status: não iniciado · Notas:
+  - Status: **feito** · Notas: ⚠️ **anos de calendário, não anos decorridos** — espelha
+    `collect.year_slices`, que corta na fronteira do ano porque é assim que o Parquet é
+    particionado. Dez meses que atravessam o ano novo são **duas** fatias; dividir dias por 365
+    diria uma, e erraria um download inteiro. Há um teste que usa as mesmas datas do teste de
+    integração da API, para os dois não poderem discordar em silêncio.
 
 ### PR 4 — Sonda automática e aviso de janela curta
 

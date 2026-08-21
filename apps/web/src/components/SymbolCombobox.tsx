@@ -1,18 +1,8 @@
-import { useEffect, useId, useState } from 'react'
+import { useId, useState } from 'react'
 
-import { useSymbolSearch, useSyncSymbols } from '../api/hooks'
 import type { BrokerSymbol } from '../api/types'
-
-const inputClass =
-  'rounded border border-slate-700 bg-slate-900 px-2 py-1 text-sm text-slate-100 focus:border-sky-500 focus:outline-none'
-
-/**
- * How long typing has to pause before the catalogue is asked. The query itself is a prefix
- * match on a table of tens to thousands of rows and costs microseconds — this is not about
- * load. It is about not putting a request in flight for `e`, `eu` and `eur` when the only
- * answer anybody wanted was the third.
- */
-const DEBOUNCE_MS = 150
+import { inputClass, useListboxKeys, useSymbolResults } from './symbolSearch'
+import { SnapshotFooter, SymbolOptions } from './SymbolOptions'
 
 /**
  * The symbol field: type a prefix, pick from what the broker actually offers.
@@ -33,6 +23,13 @@ const DEBOUNCE_MS = 150
  * * **Where the list came from.** An empty result has two meanings: nothing starts with those
  *   letters, or nobody has ever synced this broker. Only the second one is fixed by the sync
  *   button, so only the second one shows it.
+ *
+ * ## One symbol
+ *
+ * Picking here **replaces**. The collect screen needs picking to **toggle**, and that is
+ * `SymbolMultiCombobox` — a separate component rather than a mode on this one, because the two
+ * differ in what the input means after a pick (it keeps the choice; the other clears to let the
+ * next one be typed) and a single component would branch on that in six places.
  */
 export function SymbolCombobox(props: {
   value: string
@@ -41,20 +38,7 @@ export function SymbolCombobox(props: {
   const { value, onChange } = props
   const [text, setText] = useState(value)
   const [open, setOpen] = useState(false)
-  const [highlighted, setHighlighted] = useState(0)
   const listId = useId()
-
-  // The query runs on the debounced text, the input shows the immediate text. Binding the input
-  // to the debounced value instead would make typing feel like it was fighting back.
-  const [debounced, setDebounced] = useState(value)
-  useEffect(() => {
-    const timer = setTimeout(() => {
-      setDebounced(text)
-    }, DEBOUNCE_MS)
-    return () => {
-      clearTimeout(timer)
-    }
-  }, [text])
 
   // ⚠️ Follows `value` when the form is loaded from elsewhere — opening a saved strategy, say.
   // Without this the input keeps whatever was typed and the form quietly disagrees with itself.
@@ -68,10 +52,7 @@ export function SymbolCombobox(props: {
     setText(value)
   }
 
-  const search = useSymbolSearch(debounced)
-  const sync = useSyncSymbols()
-  const results = search.data?.symbols ?? []
-  const snapshot = search.data?.snapshot ?? null
+  const { debounced, results, snapshot } = useSymbolResults(text)
 
   const choose = (found: BrokerSymbol): void => {
     setText(found.symbol)
@@ -79,29 +60,12 @@ export function SymbolCombobox(props: {
     onChange(found.symbol, found)
   }
 
-  const onKeyDown = (event: React.KeyboardEvent<HTMLInputElement>): void => {
-    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
-      event.preventDefault()
-      setOpen(true)
-      const step = event.key === 'ArrowDown' ? 1 : -1
-      setHighlighted((current) => {
-        if (results.length === 0) return 0
-        return (current + step + results.length) % results.length
-      })
-      return
-    }
-    if (event.key === 'Enter') {
-      const found = results[highlighted]
-      if (open && found !== undefined) {
-        event.preventDefault()
-        choose(found)
-      }
-      return
-    }
-    if (event.key === 'Escape') {
-      setOpen(false)
-    }
-  }
+  const { highlighted, setHighlighted, onKeyDown } = useListboxKeys({
+    results,
+    open,
+    setOpen,
+    onPick: choose,
+  })
 
   return (
     <div className="relative flex flex-col gap-1 text-sm">
@@ -133,68 +97,17 @@ export function SymbolCombobox(props: {
       </label>
 
       {open && (
-        <ul
+        <SymbolOptions
           id={listId}
-          role="listbox"
-          aria-label="broker symbols"
-          className="absolute top-full z-10 mt-1 max-h-64 w-full overflow-y-auto rounded border border-slate-700 bg-slate-900 shadow-lg"
-        >
-          {results.map((found, index) => (
-            <li key={found.symbol}>
-              <button
-                type="button"
-                role="option"
-                aria-selected={index === highlighted}
-                className={`flex w-full items-center justify-between gap-2 px-2 py-1 text-left ${
-                  index === highlighted ? 'bg-slate-700' : ''
-                }`}
-                // `onMouseDown` and not `onClick`: the input's blur fires first otherwise and
-                // closes the list out from under the pointer.
-                onMouseDown={(event) => {
-                  event.preventDefault()
-                  choose(found)
-                }}
-              >
-                <span className="font-mono text-slate-100">{found.symbol}</span>
-                <span className="truncate text-xs text-slate-400">{found.description}</span>
-                {/* Marked when it is *not* runnable, rather than badging the 1 that is. The
-                    exception is what a reader needs to notice. */}
-                {!found.catalogued && (
-                  <span className="shrink-0 rounded bg-amber-900/60 px-1 text-[10px] text-amber-200">
-                    no data
-                  </span>
-                )}
-              </button>
-            </li>
-          ))}
-
-          {results.length === 0 && (
-            <li className="px-2 py-2 text-xs text-slate-400">
-              {snapshot === null
-                ? 'no broker catalogue yet — sync your terminal to see its symbols'
-                : `no symbol starts with “${debounced}”`}
-            </li>
-          )}
-        </ul>
+          results={results}
+          highlighted={highlighted}
+          debounced={debounced}
+          snapshot={snapshot}
+          onPick={choose}
+        />
       )}
 
-      <div className="flex items-center justify-between gap-2 text-xs text-slate-500">
-        <span>
-          {snapshot === null
-            ? 'never synced'
-            : `${snapshot.server ?? 'unnamed server'} · ${new Date(snapshot.synced_at).toLocaleString()}`}
-        </span>
-        <button
-          type="button"
-          className="rounded border border-slate-700 px-2 py-0.5 hover:border-sky-500"
-          disabled={sync.isPending}
-          onClick={() => {
-            sync.mutate()
-          }}
-        >
-          {sync.isPending ? 'syncing…' : 'sync from MT5'}
-        </button>
-      </div>
+      <SnapshotFooter snapshot={snapshot} />
     </div>
   )
 }

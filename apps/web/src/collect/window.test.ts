@@ -1,4 +1,12 @@
-import { asDateInput, asInstant, BAR_BUDGET, suggestedWindow } from './window'
+import {
+  asDateInput,
+  asInstant,
+  BAR_BUDGET,
+  bindingFloor,
+  estimateSlices,
+  suggestedWindow,
+  yearSlices,
+} from './window'
 import type { SymbolHistory } from '../api/types'
 
 const NOW = new Date('2026-08-20T00:00:00Z')
@@ -137,3 +145,117 @@ describe('crossing the wire', () => {
 function years(from: Date, to: Date): number {
   return (to.getTime() - from.getTime()) / (365.25 * 24 * 60 * 60 * 1000)
 }
+
+
+describe('yearSlices', () => {
+  /**
+   * Mirrors `collect.year_slices` on the server, which cuts a window at **calendar year**
+   * boundaries. The count is what the screen multiplies by the number of symbols to say how
+   * much work a batch is, and it is also what each row reports progress in.
+   */
+  it('a window inside one calendar year is a single slice', () => {
+    expect(yearSlices('2024-03-01', '2024-11-30')).toBe(1)
+  })
+
+  it('counts calendar years, not elapsed years', () => {
+    // ⚠️ The separating case. Ten months that straddle new year are **two** slices, and any
+    // implementation that divided elapsed days by 365 would call this one.
+    expect(yearSlices('2024-06-01', '2025-03-01')).toBe(2)
+  })
+
+  it('a window ending on the first instant of a year still costs that year', () => {
+    expect(yearSlices('2020-06-01', '2022-01-01')).toBe(3)
+  })
+
+  it('matches the window the API integration test uses', () => {
+    // The same dates as `a_request()` in test_collections_integration.py, which asserts
+    // years_total == 3. If these two ever disagree the screen is lying about the work.
+    expect(yearSlices('2020-06-01', '2022-03-01')).toBe(3)
+  })
+
+  it('a backwards window is no work rather than negative work', () => {
+    // The API refuses it and the button is disabled, so this is only ever seen mid-edit —
+    // and a negative estimate rendered under the form would be nonsense on screen.
+    expect(yearSlices('2024-01-01', '2020-01-01')).toBe(0)
+  })
+
+  it('an unfinished date is no work rather than NaN', () => {
+    expect(yearSlices('', '2024-01-01')).toBe(0)
+    expect(yearSlices('2024-01-01', '')).toBe(0)
+  })
+})
+
+describe('estimateSlices', () => {
+  it('is one window per symbol', () => {
+    expect(estimateSlices(4, '2022-01-01', '2024-12-31')).toBe(12)
+  })
+
+  it('no symbols is no work, however wide the window', () => {
+    expect(estimateSlices(0, '2009-01-01', '2026-12-31')).toBe(0)
+  })
+
+  it('one symbol costs exactly its own window', () => {
+    expect(estimateSlices(1, '2022-01-01', '2024-12-31')).toBe(3)
+  })
+})
+
+describe('bindingFloor', () => {
+  function measured(symbol: string, usable_from: string | null): SymbolHistory {
+    return {
+      symbol,
+      timeframe: 'H1',
+      oldest: '2000-01-01T00:00:00Z',
+      bar_count: 1000,
+      terminal_maxbars: 100000,
+      bar_count_is_a_ceiling: false,
+      last_fabricated: null,
+      first_measured_cost: null,
+      probed_at: '2026-08-21T00:00:00Z',
+      capped_by_terminal: false,
+      usable_from,
+    }
+  }
+
+  it('nothing measured binds nothing', () => {
+    expect(bindingFloor([])).toBeUndefined()
+  })
+
+  it('the latest floor wins, not the earliest', () => {
+    /**
+     * ⚠️ The separating case, and the whole reason this function exists. EURUSD is usable from
+     * 2009 and BTCUSD only from 2022; opening on 2009 would give BTCUSD thirteen years of
+     * nothing and — worse, for symbols that do return bars that early — years of spread the
+     * broker typed rather than measured.
+     */
+    const bound = bindingFloor([
+      measured('EURUSD', '2009-01-01T00:00:00Z'),
+      measured('BTCUSD', '2022-05-10T00:00:00Z'),
+    ])
+
+    expect(bound?.symbol).toBe('BTCUSD')
+  })
+
+  it('order of the input does not decide the answer', () => {
+    const bound = bindingFloor([
+      measured('BTCUSD', '2022-05-10T00:00:00Z'),
+      measured('EURUSD', '2009-01-01T00:00:00Z'),
+    ])
+
+    expect(bound?.symbol).toBe('BTCUSD')
+  })
+
+  it('a symbol measured with no usable floor does not bind', () => {
+    // `usable_from: null` means the probe could not name a floor, which is not the same as
+    // naming one at the beginning of time — reading it as "binds nothing" is the honest half.
+    const bound = bindingFloor([
+      measured('WEIRD', null),
+      measured('EURUSD', '2009-01-01T00:00:00Z'),
+    ])
+
+    expect(bound?.symbol).toBe('EURUSD')
+  })
+
+  it('every symbol unmeasured leaves the budget to decide', () => {
+    expect(bindingFloor([measured('A', null), measured('B', null)])).toBeUndefined()
+  })
+})

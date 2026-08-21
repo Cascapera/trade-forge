@@ -724,12 +724,23 @@ export interface CollectionItem {
   asset_class?: AssetClass
 }
 
-export interface CreateCollection {
-  /** One to twenty symbols, all sharing the timeframe and window below. */
-  items: CollectionItem[]
+export interface CollectionRow {
   timeframe: string
   date_from: string
   date_to: string
+}
+
+export interface CreateCollection {
+  /** One to twenty symbols. */
+  items: CollectionItem[]
+  /**
+   * One timeframe per row, each with its own window — the batch is the product.
+   *
+   * The window belongs to the row because it is a property of the timeframe: the bar budget
+   * gives about a year for M1 and seventeen for H1, so one window across several timeframes
+   * would be wrong for all but one of them.
+   */
+  rows: CollectionRow[]
 }
 
 export interface Collection {

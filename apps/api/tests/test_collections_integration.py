@@ -83,9 +83,13 @@ def a_request(**fields: object) -> dict[str, object]:
 
     payload: dict[str, object] = {
         "items": [item],
-        "timeframe": "H1",
-        "date_from": "2020-06-01T00:00:00Z",
-        "date_to": "2022-03-01T00:00:00Z",
+        "rows": [
+            {
+                "timeframe": "H1",
+                "date_from": "2020-06-01T00:00:00Z",
+                "date_to": "2022-03-01T00:00:00Z",
+            }
+        ],
     }
     payload.update(fields)
     return payload
@@ -221,7 +225,15 @@ def test_a_backwards_window_is_refused_by_the_schema(
 
     response = client.post(
         "/collections",
-        json=a_request(date_from="2022-01-01T00:00:00Z", date_to="2020-01-01T00:00:00Z"),
+        json=a_request(
+            rows=[
+                {
+                    "timeframe": "H1",
+                    "date_from": "2022-01-01T00:00:00Z",
+                    "date_to": "2020-01-01T00:00:00Z",
+                }
+            ]
+        ),
     )
 
     assert response.status_code == 422
@@ -413,6 +425,123 @@ def test_a_batch_past_the_ceiling_refuses_and_writes_nothing(
         "/collections",
         json=a_request(
             items=[{"symbol": f"SYM{n:02d}"} for n in range(MAX_COLLECTION_SYMBOLS + 1)]
+        ),
+    )
+
+    assert response.status_code == 422
+    assert count_collections(session_factory) == before
+    assert queue.jobs == []
+
+
+# --------------------------------------------------------------------------- #
+# The product: symbols multiplied by timeframe rows                             #
+# --------------------------------------------------------------------------- #
+
+
+def a_row(timeframe: str, date_from: str, date_to: str) -> dict[str, object]:
+    return {"timeframe": timeframe, "date_from": date_from, "date_to": date_to}
+
+
+def test_two_symbols_across_two_timeframes_are_four_collections(
+    client: TestClient, session_factory: Callable[[], Session], queue: _CapturingQueue
+) -> None:
+    """The whole point of a row: one form, one submit, four independent collections.
+
+    ⚠️ **Each row carries its own window, and the rows here differ on purpose.** A year of M1
+    and seventeen of H1 are the same budget of bars over very different spans — a single window
+    across both would be wrong for one of them by construction, which is why the window sits on
+    the row rather than on the request.
+    """
+    snapshot(session_factory, EURUSD="Forex\\Majors\\EURUSD", GBPUSD="Forex\\Majors\\GBPUSD")
+
+    response = client.post(
+        "/collections",
+        json=a_request(
+            items=[{"symbol": "EURUSD"}, {"symbol": "GBPUSD"}],
+            rows=[
+                a_row("M1", "2025-01-01T00:00:00Z", "2025-12-31T00:00:00Z"),
+                a_row("H1", "2020-01-01T00:00:00Z", "2025-12-31T00:00:00Z"),
+            ],
+        ),
+    )
+
+    assert response.status_code == 202
+    body = response.json()
+    # ⚠️ Symbol-major, so the answer reads the way the form does: everything asked for EURUSD,
+    # then everything asked for GBPUSD. Row-major would interleave them and quietly break a
+    # caller zipping its own list against the response.
+    assert [(r["symbol"], r["timeframe"]) for r in body] == [
+        ("EURUSD", "M1"),
+        ("EURUSD", "H1"),
+        ("GBPUSD", "M1"),
+        ("GBPUSD", "H1"),
+    ]
+    assert len(queue.jobs) == 4
+
+
+def test_each_row_records_its_own_years_not_the_batch_s(
+    client: TestClient, session_factory: Callable[[], Session]
+) -> None:
+    """⚠️ `years_total` is the progress denominator the screen renders, and it is per row.
+
+    One year of M1 is one slice; six years of H1 are six. A batch-wide count would make the M1
+    row show "0 of 6 years" and sit at 1/6 forever after finishing — progress that reads as a
+    stall on a run that is already done.
+    """
+    snapshot(session_factory, EURUSD="Forex\\Majors\\EURUSD")
+
+    body = client.post(
+        "/collections",
+        json=a_request(
+            rows=[
+                a_row("M1", "2025-01-01T00:00:00Z", "2025-12-31T00:00:00Z"),
+                a_row("H1", "2020-01-01T00:00:00Z", "2025-12-31T00:00:00Z"),
+            ]
+        ),
+    ).json()
+
+    assert [(r["timeframe"], r["years_total"]) for r in body] == [("M1", 1), ("H1", 6)]
+
+
+def test_one_unclassifiable_symbol_refuses_every_row_of_the_batch(
+    client: TestClient, session_factory: Callable[[], Session], queue: _CapturingQueue
+) -> None:
+    """All-or-nothing now spans the product, not just the symbol list — counted, as ever, on
+    the rows in the table rather than on the status code alone."""
+    snapshot(session_factory, EURUSD="Forex\\Majors\\EURUSD", XAUUSD="CFDs\\Metals\\XAUUSD")
+    before = count_collections(session_factory)
+
+    response = client.post(
+        "/collections",
+        json=a_request(
+            items=[{"symbol": "EURUSD"}, {"symbol": "XAUUSD"}],
+            rows=[
+                a_row("M1", "2025-01-01T00:00:00Z", "2025-12-31T00:00:00Z"),
+                a_row("H1", "2020-01-01T00:00:00Z", "2025-12-31T00:00:00Z"),
+            ],
+        ),
+    )
+
+    assert response.status_code == 409
+    assert count_collections(session_factory) == before, "not one of the four rows may be written"
+    assert queue.jobs == []
+
+
+def test_a_batch_past_the_work_ceiling_writes_nothing(
+    client: TestClient, session_factory: Callable[[], Session], queue: _CapturingQueue
+) -> None:
+    """⚠️ The ceiling the symbol limit cannot express: eleven symbols is legal, four timeframes
+    is legal, and forty-four collections is not."""
+    before = count_collections(session_factory)
+
+    response = client.post(
+        "/collections",
+        json=a_request(
+            items=[{"symbol": f"SYM{n:02d}"} for n in range(11)],
+            rows=[
+                a_row(tf, "2024-01-01T00:00:00Z", "2024-12-31T00:00:00Z")
+                for tf in ("M1", "M5", "M15", "H1")
+            ],
         ),
     )
 

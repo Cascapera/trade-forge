@@ -13,6 +13,7 @@ from pydantic import ValidationError
 
 from tradeforge_api.schemas import (
     MAX_COLLECTION_SYMBOLS,
+    MAX_COLLECTIONS_PER_REQUEST,
     CollectionOut,
     CreateCollectionRequest,
 )
@@ -23,12 +24,21 @@ from tradeforge_engine.domain import AssetClass
 def request(**fields: object) -> CreateCollectionRequest:
     payload: dict[str, object] = {
         "items": [{"symbol": "EURUSD"}],
+        "rows": [row()],
+    }
+    payload.update(fields)
+    return CreateCollectionRequest.model_validate(payload)
+
+
+def row(**fields: object) -> dict[str, object]:
+    """One timeframe over one window — the unit a batch multiplies by."""
+    line: dict[str, object] = {
         "timeframe": "H1",
         "date_from": "2020-01-01T00:00:00Z",
         "date_to": "2021-01-01T00:00:00Z",
     }
-    payload.update(fields)
-    return CreateCollectionRequest.model_validate(payload)
+    line.update(fields)
+    return line
 
 
 def items(*symbols: str) -> list[dict[str, str]]:
@@ -38,20 +48,20 @@ def items(*symbols: str) -> list[dict[str, str]]:
 
 class TestTheWindow:
     def test_an_ordinary_window_is_accepted(self) -> None:
-        assert request().date_from == dt.datetime(2020, 1, 1, tzinfo=dt.UTC)
+        assert request().rows[0].date_from == dt.datetime(2020, 1, 1, tzinfo=dt.UTC)
 
     def test_a_window_that_runs_backwards_is_refused(self) -> None:
         """Refused at the edge rather than by `year_slices` inside the job, because the caller
         who can fix it is the one holding the form."""
         with pytest.raises(ValidationError, match="before"):
-            request(date_from="2021-01-01T00:00:00Z", date_to="2020-01-01T00:00:00Z")
+            request(rows=[row(date_from="2021-01-01T00:00:00Z", date_to="2020-01-01T00:00:00Z")])
 
     def test_a_window_of_a_single_instant_is_legal(self) -> None:
         """⚠️ Not the same as backwards, and a `<=` written as `<` would refuse it. A range of
         one instant is a strange thing to ask for and a perfectly answerable one."""
         moment = "2020-06-01T12:00:00Z"
 
-        assert request(date_from=moment, date_to=moment).date_to.hour == 12
+        assert request(rows=[row(date_from=moment, date_to=moment)]).rows[0].date_to.hour == 12
 
     def test_an_instant_with_no_timezone_is_refused(self) -> None:
         """⚠️ The failure this project has already paid for once.
@@ -62,18 +72,18 @@ class TestTheWindow:
         raised. The first real backfill on this project wrote candles 62 hours displaced.
         """
         with pytest.raises(ValidationError, match="timezone"):
-            request(date_from="2020-01-01T00:00:00")
+            request(rows=[row(date_from="2020-01-01T00:00:00")])
 
     def test_a_non_utc_timezone_is_accepted_and_kept_as_an_instant(self) -> None:
         """An offset is a timezone; the guard is against *absence*, not against non-UTC.
         Refusing `+03:00` would reject a perfectly determined instant for looking unfamiliar."""
-        parsed = request(date_from="2020-01-01T03:00:00+03:00")
+        parsed = request(rows=[row(date_from="2020-01-01T03:00:00+03:00")])
 
-        assert parsed.date_from == dt.datetime(2020, 1, 1, tzinfo=dt.UTC)
+        assert parsed.rows[0].date_from == dt.datetime(2020, 1, 1, tzinfo=dt.UTC)
 
     def test_a_timeframe_the_dsl_does_not_define_is_refused(self) -> None:
         with pytest.raises(ValidationError):
-            request(timeframe="M7")
+            request(rows=[row(timeframe="M7")])
 
 
 class TestTheAssetClass:
@@ -206,3 +216,100 @@ class TestWhatComesBack:
 
         assert out.date_from.year == 2015, "the request, even though the data starts later"
         assert out.candles == 26366
+
+
+class TestTheRows:
+    """A row is one timeframe over one window, and a batch is symbols multiplied by rows.
+
+    ⚠️ **The window belongs to the row, not to the batch.** The bar budget this project measured
+    gives roughly one year for M1 and seventeen for H1 — the same number of bars over wildly
+    different spans. One window across several timeframes would therefore be wrong by
+    construction for all but one of them.
+    """
+
+    def test_one_row_is_the_ordinary_case(self) -> None:
+        assert [line.timeframe for line in request().rows] == ["H1"]
+
+    def test_each_row_keeps_its_own_window(self) -> None:
+        parsed = request(
+            rows=[
+                row(
+                    timeframe="M1", date_from="2025-01-01T00:00:00Z", date_to="2026-01-01T00:00:00Z"
+                ),
+                row(
+                    timeframe="H1", date_from="2009-01-01T00:00:00Z", date_to="2026-01-01T00:00:00Z"
+                ),
+            ]
+        )
+
+        assert [(line.timeframe, line.date_from.year) for line in parsed.rows] == [
+            ("M1", 2025),
+            ("H1", 2009),
+        ]
+
+    def test_no_rows_at_all_is_refused(self) -> None:
+        with pytest.raises(ValidationError):
+            request(rows=[])
+
+    def test_the_same_timeframe_twice_is_refused(self) -> None:
+        """⚠️ Two rows for H1 are the same collection queued twice — the same argument as a
+        repeated symbol, and refused for the same reason: the response would disagree with the
+        list the caller sent. Different windows do not rescue it, because a collection replaces
+        whole year partitions and the second row would overwrite the first."""
+        with pytest.raises(ValidationError, match="H1"):
+            request(rows=[row(timeframe="H1"), row(timeframe="H1", date_to="2022-01-01T00:00:00Z")])
+
+    def test_the_refusal_names_every_repeated_timeframe(self) -> None:
+        with pytest.raises(ValidationError, match="H1, M5"):
+            request(
+                rows=[
+                    row(timeframe="H1"),
+                    row(timeframe="M5"),
+                    row(timeframe="H1"),
+                    row(timeframe="M5"),
+                ]
+            )
+
+
+class TestHowMuchWorkAtOnce:
+    """The product is what reaches the queue, so the product is what is capped.
+
+    ⚠️ **Two ceilings for two different things.** The symbol ceiling is about a list a person
+    reads on one screen; this one is about a queue that drains one job at a time. Eight symbols
+    across five timeframes and twenty across two are both forty collections, and both are the
+    limit.
+    """
+
+    def test_the_product_at_the_ceiling_is_accepted(self) -> None:
+        parsed = request(
+            items=items(*(f"SYM{n:02d}" for n in range(10))),
+            rows=[row(timeframe=tf) for tf in ("M1", "M5", "M15", "H1")],
+        )
+
+        assert len(parsed.items) * len(parsed.rows) == MAX_COLLECTIONS_PER_REQUEST
+
+    def test_one_past_the_product_ceiling_is_refused(self) -> None:
+        """⚠️ Tested on both sides: forty accepted above, forty-four refused here. A single test
+        at the limit cannot tell `>` from `>=`."""
+        with pytest.raises(ValidationError, match="40"):
+            request(
+                items=items(*(f"SYM{n:02d}" for n in range(11))),
+                rows=[row(timeframe=tf) for tf in ("M1", "M5", "M15", "H1")],
+            )
+
+    def test_few_symbols_may_carry_many_timeframes(self) -> None:
+        # Two symbols across eight timeframes is sixteen — well under, and the shape somebody
+        # actually wants when comparing a strategy across timeframes.
+        parsed = request(
+            items=items("EURUSD", "USDJPY"),
+            rows=[row(timeframe=tf) for tf in ("M1", "M5", "M15", "M30", "H1", "H4", "D1", "W1")],
+        )
+
+        assert len(parsed.rows) == 8
+
+    def test_the_symbol_ceiling_still_binds_on_its_own(self) -> None:
+        """⚠️ Twenty-one symbols on a single row is twenty-one collections — under the product
+        ceiling, and still refused. The two limits guard different things and neither subsumes
+        the other."""
+        with pytest.raises(ValidationError):
+            request(items=items(*(f"SYM{n:02d}" for n in range(MAX_COLLECTION_SYMBOLS + 1))))

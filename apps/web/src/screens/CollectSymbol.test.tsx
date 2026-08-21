@@ -113,6 +113,13 @@ function requestSent(): Record<string, string> {
   return first[0] as Record<string, string>
 }
 
+/** The timeframe rows the screen sent. */
+function rowsSent(): Record<string, string>[] {
+  const rows = requestSent().rows as unknown
+  if (!Array.isArray(rows)) throw new Error(`rows is not a list: ${JSON.stringify(rows)}`)
+  return rows as Record<string, string>[]
+}
+
 /** The batch's items, as objects. */
 function itemsSent(): Record<string, string>[] {
   const items = requestSent().items as unknown
@@ -165,9 +172,9 @@ it('sends the window the form is showing, with the end day included', () => {
 
   fireEvent.click(collectButton())
 
-  const sent = requestSent()
-  expect(sent.date_from).toMatch(/T00:00:00Z$/)
-  expect(sent.date_to).toMatch(/T23:59:59Z$/)
+  const sent = rowsSent()[0]
+  expect(sent?.date_from).toMatch(/T00:00:00Z$/)
+  expect(sent?.date_to).toMatch(/T23:59:59Z$/)
 })
 
 it('opens on the floor the probe found rather than on the whole budget', () => {
@@ -182,7 +189,7 @@ it('opens on the floor the probe found rather than on the whole budget', () => {
   render(<CollectSymbol />)
   pick('EURUSD')
 
-  expect(screen.getByLabelText('From')).toHaveValue('2009-01-01')
+  expect(screen.getByLabelText('H1 from')).toHaveValue('2009-01-01')
   expect(screen.getByText(/stops being filler and typed costs/)).toBeInTheDocument()
 })
 
@@ -204,18 +211,20 @@ it('the latest floor among the chosen symbols is the one that binds', () => {
   pick('EURUSD')
   pick('BTCUSD')
 
-  expect(screen.getByLabelText('From')).toHaveValue('2022-05-10')
-  expect(screen.getByText(/BTCUSD's measurement/)).toBeInTheDocument()
+  expect(screen.getByLabelText('H1 from')).toHaveValue('2022-05-10')
+  expect(screen.getByText(/BTCUSD.s measurement/)).toBeInTheDocument()
 })
 
-it('says how many bars the suggested window is, not just its dates', () => {
-  // "17 years" says nothing about how much signal that is; the count is what a run is sized by.
+it('says how many collections the batch is, and how many years that means', () => {
+  // Two numbers for two questions: the count is what the ceiling is about, the slices are
+  // what the wait is about. Forty collections of H1 and forty of M1 are the same count.
   searchAnswer = { symbols: [broker()], snapshot: null }
   known = new Map([['EURUSD', history()]])
   render(<CollectSymbol />)
   pick('EURUSD')
 
-  expect(screen.getByText(/bars per symbol/)).toBeInTheDocument()
+  expect(screen.getByText(/collection/)).toBeInTheDocument()
+  expect(screen.getByText(/of history to fetch/)).toBeInTheDocument()
 })
 
 it('says how many calendar years the batch will fetch', () => {
@@ -230,8 +239,8 @@ it('says how many calendar years the batch will fetch', () => {
   pick('EURUSD')
   pick('GBPUSD')
 
-  fireEvent.change(screen.getByLabelText('From'), { target: { value: '2024-01-01' } })
-  fireEvent.change(screen.getByLabelText('To'), { target: { value: '2025-12-31' } })
+  fireEvent.change(screen.getByLabelText('H1 from'), { target: { value: '2024-01-01' } })
+  fireEvent.change(screen.getByLabelText('H1 to'), { target: { value: '2025-12-31' } })
 
   // Two symbols × two calendar years.
   expect(screen.getByText('4')).toBeInTheDocument()
@@ -248,11 +257,11 @@ it('stops suggesting once the dates are edited by hand', () => {
   render(<CollectSymbol />)
   pick('EURUSD')
 
-  fireEvent.change(screen.getByLabelText('From'), { target: { value: '1999-01-01' } })
+  fireEvent.change(screen.getByLabelText('H1 from'), { target: { value: '1999-01-01' } })
 
-  expect(screen.getByLabelText('From')).toHaveValue('1999-01-01')
+  expect(screen.getByLabelText('H1 from')).toHaveValue('1999-01-01')
   fireEvent.click(collectButton())
-  expect(requestSent().date_from).toBe('1999-01-01T00:00:00Z')
+  expect(rowsSent()[0]?.date_from).toBe('1999-01-01T00:00:00Z')
 })
 
 it('changing the timeframe re-suggests, because the budget is per timeframe', () => {
@@ -271,10 +280,10 @@ it('changing the timeframe re-suggests, because the budget is per timeframe', ()
   render(<CollectSymbol />)
   pick('EURUSD')
 
-  fireEvent.change(screen.getByLabelText('Timeframe'), { target: { value: 'M1' } })
+  fireEvent.change(screen.getByLabelText('Timeframe of row r0'), { target: { value: 'M1' } })
 
   const expected = asDateInput(suggestedWindow('M1', history(), new Date()).from)
-  expect(screen.getByLabelText('From').getAttribute('value')).toBe(expected)
+  expect(screen.getByLabelText('M1 from').getAttribute('value')).toBe(expected)
 })
 
 it('asks the class before sending, not after the API refuses', () => {
@@ -446,7 +455,7 @@ describe('what is still being measured, and what will come back short', () => {
     render(<CollectSymbol />)
     pick('EURUSD')
     pick('BTCUSD')
-    fireEvent.change(screen.getByLabelText('From'), { target: { value: '2015-01-01' } })
+    fireEvent.change(screen.getByLabelText('H1 from'), { target: { value: '2015-01-01' } })
 
     expect(screen.getByText(/come back shorter/i)).toBeInTheDocument()
     expect(screen.getByText(/usable from 2022-05-10/)).toBeInTheDocument()
@@ -457,7 +466,7 @@ describe('what is still being measured, and what will come back short', () => {
     known = new Map([['EURUSD', history()]])
     render(<CollectSymbol />)
     pick('EURUSD')
-    fireEvent.change(screen.getByLabelText('From'), { target: { value: '2015-01-01' } })
+    fireEvent.change(screen.getByLabelText('H1 from'), { target: { value: '2015-01-01' } })
 
     expect(screen.queryByText(/come back shorter/i)).not.toBeInTheDocument()
   })
@@ -474,7 +483,100 @@ describe('what is still being measured, and what will come back short', () => {
     render(<CollectSymbol />)
     pick('BTCUSD')
 
-    expect(screen.getByLabelText('From')).toHaveValue('2022-05-10')
+    expect(screen.getByLabelText('H1 from')).toHaveValue('2022-05-10')
     expect(screen.queryByText(/come back shorter/i)).not.toBeInTheDocument()
+  })
+})
+
+
+describe('timeframe rows', () => {
+  it('opens with a single H1 row', () => {
+    render(<CollectSymbol />)
+
+    expect(screen.getByLabelText('Timeframe of row r0')).toHaveValue('H1')
+  })
+
+  it('adding a timeframe opens another row on the next free one', () => {
+    /**
+     * \u26a0\ufe0f The next **free** timeframe, never a duplicate. The API refuses a repeated
+     * timeframe because two collections of the same series overwrite each other's year
+     * partitions — and the symptom is a *missing* year, not a duplicate one.
+     */
+    render(<CollectSymbol />)
+
+    fireEvent.click(screen.getByRole('button', { name: /add timeframe/i }))
+
+    const chosen = screen
+      .getAllByLabelText(/^Timeframe of row/)
+      .map((node) => (node as HTMLSelectElement).value)
+    expect(chosen).toHaveLength(2)
+    expect(new Set(chosen).size).toBe(2)
+  })
+
+  it('a new row opens on its own budget rather than inheriting the last row dates', () => {
+    // A year of M1 and seventeen of H1 are the same bars. A row inheriting the previous row's
+    // dates would ask for seventeen years of M1, which the terminal will not serve.
+    render(<CollectSymbol />)
+    fireEvent.click(screen.getByRole('button', { name: /add timeframe/i }))
+
+    const rows = screen.getAllByLabelText(/^Timeframe of row/)
+    const second = (rows[1] as HTMLSelectElement | undefined)?.value ?? ''
+    expect(screen.getByLabelText(`${second} from`)).not.toHaveValue('')
+  })
+
+  it('sends one row per timeframe, each with its own window', () => {
+    searchAnswer = { symbols: [broker()], snapshot: null }
+    render(<CollectSymbol />)
+    pick('EURUSD')
+    fireEvent.click(screen.getByRole('button', { name: /add timeframe/i }))
+
+    fireEvent.click(collectButton())
+
+    const sent = rowsSent()
+    expect(sent).toHaveLength(2)
+    expect(new Set(sent.map((line) => line.timeframe)).size).toBe(2)
+  })
+
+  it('each remove button names its own timeframe', () => {
+    // Several rows on screen with a button each, all called "Remove", would be several controls
+    // nobody can tell apart — a defect, not test friction.
+    render(<CollectSymbol />)
+    fireEvent.click(screen.getByRole('button', { name: /add timeframe/i }))
+
+    const names = screen
+      .getAllByRole('button', { name: /^Remove .* row$/ })
+      .map((node) => node.getAttribute('aria-label'))
+
+    expect(new Set(names).size).toBe(2)
+  })
+
+  it('removing a row takes it off the batch', () => {
+    render(<CollectSymbol />)
+    fireEvent.click(screen.getByRole('button', { name: /add timeframe/i }))
+    const before = screen.getAllByLabelText(/^Timeframe of row/).length
+
+    const removals = screen.getAllByRole('button', { name: /^Remove .* row$/ })
+    const second = removals[1]
+    if (second === undefined) throw new Error('expected two remove buttons')
+    fireEvent.click(second)
+
+    expect(screen.getAllByLabelText(/^Timeframe of row/)).toHaveLength(before - 1)
+  })
+
+  it('the last row cannot be removed, because a batch with no timeframe is nothing', () => {
+    render(<CollectSymbol />)
+
+    expect(screen.getByRole('button', { name: /^Remove H1 row$/ })).toBeDisabled()
+  })
+
+  it('the batch counts one collection per symbol per row', () => {
+    searchAnswer = { symbols: [broker(), broker({ symbol: 'GBPUSD' })], snapshot: null }
+    render(<CollectSymbol />)
+    pick('EURUSD')
+    pick('GBPUSD')
+    fireEvent.click(screen.getByRole('button', { name: /add timeframe/i }))
+
+    // Two symbols across two timeframes.
+    expect(screen.getByText('4')).toBeInTheDocument()
   })
 })

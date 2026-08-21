@@ -23,6 +23,9 @@ function symbol(patch: Partial<BrokerSymbol> = {}): BrokerSymbol {
     symbol: 'EURUSD',
     description: 'Euro vs US Dollar',
     path: 'Forex\\Majors\\EURUSD',
+    // Spelled out rather than left off: the API derives it from the path above, so a fixture
+    // that omitted it would describe a response the server cannot produce.
+    asset_class_from_path: 'forex',
     digits: 5,
     visible: true,
     catalogued: true,

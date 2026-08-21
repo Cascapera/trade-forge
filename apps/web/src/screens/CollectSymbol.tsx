@@ -57,13 +57,14 @@ export function CollectSymbol(): React.JSX.Element {
 
   const submit = (): void => {
     create.mutate({
-      symbol,
+      // A batch of one. The endpoint takes up to twenty symbols over a shared window; this
+      // screen still picks one, and the multi-select that fills the list is PR 3.
+      items: [{ symbol, ...(assetClass === '' ? {} : { asset_class: assetClass }) }],
       timeframe,
       date_from: asInstant(from),
       // ⚠️ End of day, because the window is inclusive on both ends. Midnight would drop every
       // bar of the final day — silently, and only on the day somebody chose as the end.
       date_to: asInstant(to, true),
-      ...(assetClass === '' ? {} : { asset_class: assetClass }),
     })
   }
 

@@ -96,8 +96,9 @@ export const api = {
   probeSymbol: (symbol: string, timeframe: string): Promise<{ job: string }> =>
     request('POST', `/symbols/${encodeURIComponent(symbol)}/probe${query({ timeframe })}`),
   // ⚠️ 202 **with a body**, unlike the sync above. A collection takes minutes and can fail with
-  // a reason worth reading, so the row it returns is the only handle anybody has on either.
-  createCollection: (body: CreateCollection): Promise<Collection> =>
+  // a reason worth reading, so the rows it returns are the only handle anybody has on either.
+  // One row per symbol asked for, in the order they were asked for.
+  createCollection: (body: CreateCollection): Promise<Collection[]> =>
     request('POST', '/collections', body),
   getCollection: (id: string): Promise<Collection> => request('GET', `/collections/${id}`),
   listCollections: (): Promise<Collection[]> => request('GET', '/collections'),

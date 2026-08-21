@@ -84,6 +84,19 @@ function requestSent(): Record<string, string> {
   return first[0] as Record<string, string>
 }
 
+/**
+ * The single item of the batch this screen sends. Same argument as `requestSent`: reading it
+ * through a named helper turns "the screen sent no items" into that sentence rather than into
+ * an `undefined` three assertions later.
+ */
+function itemSent(): Record<string, string> {
+  const items = requestSent().items as unknown
+  if (!Array.isArray(items) || items.length !== 1) {
+    throw new Error(`expected a batch of one, got ${JSON.stringify(items)}`)
+  }
+  return items[0] as Record<string, string>
+}
+
 beforeEach(() => {
   historyAnswer = { data: undefined, error: null }
   listed = []
@@ -114,7 +127,7 @@ it('sends the window the form is showing, with the end day included', () => {
   fireEvent.click(screen.getByRole('button', { name: 'Collect' }))
 
   const sent = requestSent()
-  expect(sent.symbol).toBe('EURUSD')
+  expect(itemSent().symbol).toBe('EURUSD')
   expect(sent.date_from).toMatch(/T00:00:00Z$/)
   expect(sent.date_to).toMatch(/T23:59:59Z$/)
 })
@@ -204,8 +217,7 @@ it('sends the class once it is answered', () => {
   fireEvent.change(screen.getByLabelText(/asset class/i), { target: { value: 'future' } })
   fireEvent.click(screen.getByRole('button', { name: 'Collect' }))
 
-  const sent = requestSent()
-  expect(sent.asset_class).toBe('future')
+  expect(itemSent().asset_class).toBe('future')
 })
 
 it('does not send an asset class the API never asked for', () => {
@@ -220,8 +232,7 @@ it('does not send an asset class the API never asked for', () => {
 
   fireEvent.click(screen.getByRole('button', { name: 'Collect' }))
 
-  const sent = requestSent()
-  expect('asset_class' in sent).toBe(false)
+  expect('asset_class' in itemSent()).toBe(false)
 })
 
 it('shows the reason a request was refused, not the status code', () => {

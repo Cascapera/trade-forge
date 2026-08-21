@@ -4,10 +4,10 @@
 
 | | |
 |---|---|
-| **Status** | `em implementação` — PR 3 pronto na branch |
-| **Progresso** | **2/4 PRs mergeados** (#129 `8dac85d`, #130 `1d53d63`) · **10/14 itens** (F-01 a F-10) |
+| **Status** | `em implementação` — PR 4 (último) pronto na branch |
+| **Progresso** | **3/4 PRs mergeados** (#129, #130, #131) · **14/14 itens** |
 | **Suposições** | 6 (§16) |
-| **Questões em aberto** | 1 — **Q-01 resolvida** (§16) |
+| **Questões em aberto** | 1 (Q-02) — **Q-01 e Q-03 resolvidas** (§16) |
 | **Migração de banco** | **nenhuma** — ver §8 |
 | **Data** | 21/08/2026 |
 
@@ -615,31 +615,53 @@ troca de dez linhas — **diga e eu troco**.
 
 ### PR 4 — Sonda automática e aviso de janela curta
 
-- [ ] **F-11** · Sonda enfileirada **só** para par (símbolo, timeframe) ausente de `symbol_history`
-      risco: **médio-alto** — é a mitigação do risco principal · 3h · ~70 linhas
-  - [ ] Testes escritos primeiro · [ ] Implementado · [ ] Cobertura 100% · [ ] eslint · [ ] tsc · [ ] suíte verde
-  - [ ] Critérios cobertos: CA-10
+- [x] **F-11** · Sonda enfileirada **só** para par (símbolo, timeframe) ausente de `symbol_history`
+      risco: **médio-alto** — é a mitigação do risco principal
+  - [x] Testes escritos primeiro (7 para o hook + 6 para o `missing`) · [x] Implementado · [x] Cobertura 100% · [x] eslint · [x] tsc · [x] suíte verde
+  - [x] Critérios cobertos: CA-10
   - [ ] PR aberto · [ ] Mergeado `<hash>` · [ ] Verificado
-  - Status: não iniciado · Notas:
+  - Status: **feito** · Notas: o conjunto `asked` é **`useRef`, não state** — escrever state no
+    efeito re-renderiza, e o re-render roda o efeito de novo. Segunda guarda, mais sutil: só entram
+    na lista os pares cuja consulta **já voltou vazia**; um pendente também não tem dado, e lê-lo
+    como ausente dispararia sonda para par já em sondagem. Ambos os mutantes: mortos.
 
-- [ ] **F-12** · Utilizável-a-partir-de por símbolo e aviso de quem volta curto
-      risco: baixo · 2h · ~60 linhas
-  - [ ] Testes escritos primeiro · [ ] Implementado · [ ] Cobertura 100% · [ ] eslint · [ ] tsc · [ ] suíte verde
-  - [ ] Critérios cobertos: CA-11
+- [x] **F-12** · Utilizável-a-partir-de por símbolo e aviso de quem volta curto
+      risco: baixo
+  - [x] Testes escritos primeiro · [x] Implementado · [x] Cobertura 100% · [x] eslint · [x] tsc · [x] suíte verde
+  - [x] Critérios cobertos: CA-11
   - [ ] PR aberto · [ ] Mergeado `<hash>` · [ ] Verificado
-  - Status: não iniciado · Notas:
+  - Status: **feito** · Notas: ⚠️ a comparação é `>` e **não** `>=`. A janela sugerida abre
+    exatamente no piso vinculante, então `>=` faria a tela avisar sobre a **própria sugestão** toda
+    vez — e aviso sempre ligado é aviso que ninguém lê. Mutante do `>=`: morto. Símbolo não medido
+    **não** é reportado como coberto: silêncio não é atestado de saúde.
 
-- [ ] **F-13** · Profundidade da fila de sondas visível (a espera legível, não travamento aparente)
-      risco: baixo · 2h · ~50 linhas
-  - [ ] Testes escritos primeiro · [ ] Implementado · [ ] Cobertura 100% · [ ] eslint · [ ] tsc · [ ] suíte verde
-  - [ ] Critérios cobertos: — (mitigação DD-04)
+- [x] **F-13** · Profundidade da fila de sondas visível (a espera legível, não travamento aparente)
+      risco: baixo
+  - [x] Testes escritos primeiro · [x] Implementado · [x] Cobertura 100% · [x] eslint · [x] tsc · [x] suíte verde
+  - [x] Critérios cobertos: — (mitigação DD-04)
   - [ ] PR aberto · [ ] Mergeado `<hash>` · [ ] Verificado
-  - Status: não iniciado · Notas:
+  - Status: **feito** · Notas: o silêncio é **ganho** — nada aparece quando não há nada sendo
+    medido. Uma caixa que sempre dissesse "medindo 0 símbolos" treinaria o leitor a pular a única
+    coisa na tela que explica uma espera.
 
-- [ ] **F-14** · Aula do PR em `docs/aulas/` e spec `specs/coleta-pela-tela.md` atualizado
-      risco: baixo · 1h
-  - [ ] Escrito · [ ] Revisado
-  - Status: não iniciado · Notas:
+- [x] **F-14** · Aula do PR em `docs/aulas/` e spec `specs/coleta-pela-tela.md` atualizado
+      risco: baixo
+  - [x] Escrito · [x] Revisado
+  - Status: **feito** · Notas: `docs/aulas/PR-236-a-239-coleta-multi-ativo.md` (gitignorada) e uma
+    seção nova no spec, que agora cobre PR-232 a PR-239.
+
+- [x] **F-15** · *(item novo, fecha a Q-03)* Uma coleta falhando não danifica as outras
+      risco: baixo
+  - [x] Testes escritos primeiro · [x] Implementado (só teste — o comportamento já existia) · [x] ruff · [x] mypy · [x] suíte verde
+  - [x] Critérios cobertos: **CA-07**
+  - [ ] PR aberto · [ ] Mergeado `<hash>` · [ ] Verificado
+  - Status: **feito** · Notas: três coletas em sequência compartilhando um root, a do meio com a
+    conexão caindo. ⚠️ Asserido **no disco**, não nos journals — um journal reporta o que o código
+    acreditou, e as partições são o que um backtest depois realmente lê. Segundo teste: uma série
+    meio escrita **não** vai para o catálogo, porque uma linha em `datasets` alegando um range cuja
+    metade final falta é pior que linha nenhuma. ⚠️ O que isto **não** prova é o agente registrar a
+    falha na linha e seguir para o próximo job — isso mora em `collect_range`, que importa
+    MetaTrader e não roda neste CI.
 
 ### Mapa critério → item
 
@@ -651,7 +673,7 @@ troca de dez linhas — **diga e eu troco**.
 | CA-04 | F-01 |
 | CA-05 | F-03 |
 | CA-06 | F-03, F-09 |
-| CA-07 | F-04 |
+| CA-07 | F-04 (aceitação atômica) + **F-15** (independência em execução) |
 | CA-08 | F-05 |
 | CA-09 | F-06, F-07 ✅ |
 | CA-10 | F-11 |
@@ -667,6 +689,8 @@ Nenhum critério órfão. ✅
 |---|---|---|---|
 | 21/08 | **#129** `8dac85d` — PR 1 (F-01..F-05) | `POST /collections` aceita N símbolos, N linhas, N jobs | O plano deixava a tela quebrada entre o PR 1 e o PR 3; PR 1 teve de levar uma mudança mínima no web. F-01 e F-02 são inseparáveis. 9/9 mutantes mortos. |
 | 21/08 | PR 2 (F-06, F-07) | classe derivada do caminho no `/symbols/search` | F-07 partia de premissa falsa (não há codegen para `api/types.ts`). Um mutante **equivalente**: ler só a primeira palavra do caminho passa, porque o mapa tem `crypto` **e** `crypto currency` — o docstring que eu tinha escrito afirmava separar e não separava. |
+| 21/08 | **#131** `f244468` — PR 3 (F-08..F-10) | seleção múltipla, classe por símbolo, estimativa | ⚠️ **O CI reprovou na primeira tentativa**: rodei `vitest run`, o portão é `vitest run --coverage`, e a branch caiu a 89,68%. A extração do hook de teclado o expôs sozinho a 70%, com o `Escape` nunca alcançado — estava escondido antes, diluído. Consertado cobrindo comportamento (seis testes de teclado), não o número. 12/12 mutantes. |
+| 21/08 | PR 4 (F-11..F-15) | sonda automática com cache, aviso de janela curta, fila visível, independência das coletas | A cobertura caiu de novo (89,8%) e de novo o buraco era real: nada provava que **pendente não é ausente**, que é a guarda que impede a sonda de disparar para par já em sondagem. 7/7 mutantes. |
 
 ---
 
@@ -688,7 +712,7 @@ Nenhum critério órfão. ✅
 | # | Questão | Impacto |
 |---|---|---|
 | ~~**Q-01**~~ | ~~alargar `POST /collections` ou criar `/collections/batch`?~~ **RESOLVIDA em 21/08: alargada**, seguindo a recomendação. O Guilherme aprovou o plano sem se opor à recomendação registrada. Reversível se ele preferir a rota separada — o plano expand-contract está em DD-05. | — |
-| **Q-03** | **CA-07 (uma das N falha, as outras seguem) não está provado.** O comportamento decorre de as linhas serem independentes e da rota não as ligar, mas nada exercita o agente processando uma leva com uma falha no meio. Vale um teste que rode `collect_range` contra uma fonte que falha só num símbolo? | Item novo, provavelmente no PR 4. Não bloqueia o PR 1. |
+| ~~**Q-03**~~ | **RESOLVIDA no PR 4** pelo item F-15. ~~CA-07 (uma das N falha, as outras seguem) não está provado.~~ O comportamento decorre de as linhas serem independentes e da rota não as ligar, mas nada exercita o agente processando uma leva com uma falha no meio. Vale um teste que rode `collect_range` contra uma fonte que falha só num símbolo? | Item novo, provavelmente no PR 4. Não bloqueia o PR 1. |
 | **Q-02** | O teto de 20 vale mesmo para coleta? Um basket de 20 são 20 backtests de segundos; uma leva de 20 em H1 desde 2009 são ~350 fatias de ano, serializadas — possivelmente muitas horas. Manter 20 por consistência, ou baixar? | Muda uma constante e uma mensagem. Pode ser decidido durante o PR 1. |
 
 ---

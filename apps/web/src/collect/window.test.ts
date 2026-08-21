@@ -4,6 +4,7 @@ import {
   BAR_BUDGET,
   bindingFloor,
   estimateSlices,
+  shortWindows,
   suggestedWindow,
   yearSlices,
 } from './window'
@@ -257,5 +258,69 @@ describe('bindingFloor', () => {
 
   it('every symbol unmeasured leaves the budget to decide', () => {
     expect(bindingFloor([measured('A', null), measured('B', null)])).toBeUndefined()
+  })
+})
+
+describe('shortWindows', () => {
+  function measured(symbol: string, usable_from: string | null): SymbolHistory {
+    return {
+      symbol,
+      timeframe: 'H1',
+      oldest: '2000-01-01T00:00:00Z',
+      bar_count: 1000,
+      terminal_maxbars: 100000,
+      bar_count_is_a_ceiling: false,
+      last_fabricated: null,
+      first_measured_cost: null,
+      probed_at: '2026-08-21T00:00:00Z',
+      capped_by_terminal: false,
+      usable_from,
+    }
+  }
+
+  const known = new Map([
+    ['EURUSD', measured('EURUSD', '2009-01-01T00:00:00Z')],
+    ['BTCUSD', measured('BTCUSD', '2022-05-10T00:00:00Z')],
+    ['MYSTERY', measured('MYSTERY', null)],
+  ])
+
+  it('names the symbol that starts after the window does', () => {
+    expect(shortWindows(['EURUSD', 'BTCUSD'], known, '2015-01-01')).toEqual([
+      { symbol: 'BTCUSD', usableFrom: '2022-05-10' },
+    ])
+  })
+
+  it('a symbol that covers the whole window is not short', () => {
+    expect(shortWindows(['EURUSD'], known, '2015-01-01')).toEqual([])
+  })
+
+  it('a window starting exactly on the floor is not short', () => {
+    // ⚠️ The boundary. `>=` here would warn about every symbol whose window opens precisely
+    // where its own measurement says it should — which is the *suggested* window, so the screen
+    // would flag its own default as a problem.
+    expect(shortWindows(['BTCUSD'], known, '2022-05-10')).toEqual([])
+  })
+
+  it('one day earlier than the floor is short', () => {
+    expect(shortWindows(['BTCUSD'], known, '2022-05-09')).toEqual([
+      { symbol: 'BTCUSD', usableFrom: '2022-05-10' },
+    ])
+  })
+
+  it('an unmeasured symbol is not reported as fine', () => {
+    // ⚠️ Silence is not a clean bill of health. A symbol nobody has probed cannot be said to
+    // cover the window, and saying nothing about it is the honest half — the screen says
+    // separately that it is still being measured.
+    expect(shortWindows(['UNKNOWN'], known, '2000-01-01')).toEqual([])
+  })
+
+  it('a measured symbol whose probe found no floor is not reported either', () => {
+    expect(shortWindows(['MYSTERY'], known, '2000-01-01')).toEqual([])
+  })
+
+  it('keeps the order the symbols were chosen in', () => {
+    const short = shortWindows(['BTCUSD', 'EURUSD'], known, '2000-01-01')
+
+    expect(short.map((each) => each.symbol)).toEqual(['BTCUSD', 'EURUSD'])
   })
 })

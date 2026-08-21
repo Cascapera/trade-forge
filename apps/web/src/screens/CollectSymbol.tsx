@@ -1,7 +1,12 @@
 import { useState } from 'react'
 
 import { ApiError } from '../api/client'
-import { useCollections, useCreateCollection, useSymbolHistories } from '../api/hooks'
+import {
+  useAutoProbe,
+  useCollections,
+  useCreateCollection,
+  useSymbolHistories,
+} from '../api/hooks'
 import type { AssetClass, BrokerSymbol, Collection } from '../api/types'
 import { SymbolMultiCombobox } from '../components/SymbolMultiCombobox'
 import {
@@ -10,6 +15,7 @@ import {
   bindingFloor,
   estimateSlices,
   MAX_BATCH_SYMBOLS,
+  shortWindows,
   suggestedWindow,
 } from '../collect/window'
 
@@ -48,6 +54,10 @@ export function CollectSymbol(): React.JSX.Element {
 
   const symbols = chosen.map((found) => found.symbol)
   const histories = useSymbolHistories(symbols, timeframe)
+  // ⚠️ Only the pairs that came back with nothing are measured, and each one only once — see
+  // `useAutoProbe`. A probe shares the collection's single-job queue, so re-measuring on every
+  // render would put hours of work in front of the first candle.
+  const probing = useAutoProbe({ missing: histories.missing, timeframe })
   const create = useCreateCollection()
   const collections = useCollections()
 
@@ -67,6 +77,7 @@ export function CollectSymbol(): React.JSX.Element {
   )
 
   const slices = estimateSlices(chosen.length, from, to)
+  const short = shortWindows(symbols, histories.known, from)
   const blocked = blockedReason({
     chosen: chosen.length,
     unanswered: unanswered.map((found) => found.symbol),
@@ -183,6 +194,40 @@ export function CollectSymbol(): React.JSX.Element {
           </p>
         )}
       </div>
+
+      {probing.queued > 0 && (
+        <p className="text-xs text-slate-400">
+          {/* ⚠️ The wait made legible. Measuring shares the collection's single-job queue and a
+              cold H4 took 207 seconds on this broker, so these run *before* the first candle.
+              Saying how many turns a silent minute into a queue somebody can reason about —
+              the same argument as "3 of 5 years" on a running row. */}
+          Measuring{' '}
+          <strong className="text-slate-200">
+            {probing.queued} symbol{probing.queued === 1 ? '' : 's'}
+          </strong>{' '}
+          nobody has measured yet. That runs on the same queue as the collection, so it goes
+          first — each pair is measured once and never again.
+        </p>
+      )}
+
+      {short.length > 0 && (
+        <div className="rounded border border-slate-700 bg-slate-900/60 p-3 text-xs">
+          {/* Not a warning box: coming back short is an ordinary answer, not a failure. An
+              empty year does not fail a collection — but the row will report fewer candles than
+              the dates imply, and without this the only explanation available is "a bug". */}
+          <p className="text-slate-300">
+            These start after the window does, so they will come back shorter:
+          </p>
+          <ul className="mt-1 space-y-0.5">
+            {short.map((each) => (
+              <li key={each.symbol} className="text-slate-400">
+                <span className="font-mono text-slate-200">{each.symbol}</span> — usable from{' '}
+                {each.usableFrom}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
 
       {unanswered.length > 0 && (
         <div className="space-y-2 rounded border border-amber-700 bg-amber-950/30 p-3 text-xs">

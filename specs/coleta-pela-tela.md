@@ -194,3 +194,41 @@ vez de duplicá-la), e por que o caminho de escrita do Parquet mora no host.
   operação de tela. (Backlog, origem PR-223.)
 - **Supervisão do agente**: ele morre com o terminal que o iniciou, exatamente como o `live`
   (backlog, origem PR-301-A). O mesmo lugar que resolver um resolve o outro.
+
+---
+
+## PR-236 a PR-239 — Coleta multi-ativo (21/08/2026)
+
+A extensão natural do PR-234: a tela passou a coletar **até 20 símbolos** numa leva, com um
+timeframe e uma janela. Plano completo, decisões e checklist em
+`docs/features/FEATURE_COLETA_MULTI_ATIVO.md`.
+
+**Nada de tabela nova e nenhuma migração.** Uma leva de oito são oito linhas em `collections` —
+exatamente o que oito cliques produziriam. `baskets` agrupa porque o produto dele é a *comparação*
+entre mercados, que não existe sem o grupo; o produto de uma coleta é vela no disco, que não tem
+resposta cruzada para calcular.
+
+⚠️ **O pedido de "não sobrecarregar" já estava atendido por construção**, e isso encolheu a
+feature: `WorkerSettings.max_jobs = 1` serializa o agente porque o terminal é um canal IPC
+compartilhado — dois jobs pedindo histórico disputam o mesmo download em vez de dividir a espera.
+A memória já era limitada por `run_collection` andar um ano de calendário por vez. **Vinte símbolos
+deixam a fila mais longa, não o pico mais alto.** Não houve throttle a construir; houve um teste a
+escrever, para ninguém remover o que já existe.
+
+| PR | o que entrou |
+|---|---|
+| **236** (#129) | `POST /collections` aceita `items`, N linhas, N jobs, aceitação atômica |
+| **237** (#130) | `asset_class_from_path` derivado no `/symbols/search` |
+| **238** (#131) | seleção múltipla na tela, classe por símbolo, estimativa em fatias de ano |
+| **239** | sonda automática com cache por par, aviso de janela curta, fila visível |
+
+### As três armadilhas que este trabalho documenta
+
+1. **`items` é lista de objetos, não dois arrays paralelos.** Arrays paralelos saem de sincronia
+   e nenhum schema proíbe; o símbolo catalogado com a classe errada nunca levanta nada.
+2. **O piso mais tardio é o que vincula.** Uma janela cobre a leva, então abrir no piso mais antigo
+   daria a todos os outros anos de barras de preenchimento e spread digitado — o risco que a sonda
+   do PR-233 existe para reportar.
+3. **A sonda compartilha a fila da coleta.** Uma sondagem H4 levou **207 s**. O cache por par
+   `(símbolo, timeframe)` é o que faz o preço ser "uma vez por par" em vez de "uma vez por clique";
+   sem ele, vinte símbolos poriam horas de fila na frente da primeira vela. Ver DD-04.

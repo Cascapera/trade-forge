@@ -13,8 +13,9 @@ from decimal import Decimal
 
 import pytest
 
+from tradeforge_db.base import MONEY
 from tradeforge_db.models import ExitReason, Trade
-from tradeforge_db.results import to_rows
+from tradeforge_db.results import _MONEY_QUANTUM, to_rows
 from tradeforge_engine.domain import (
     Candle,
     ClosedTrade,
@@ -393,3 +394,66 @@ def test_equity_curve_becomes_json_with_iso_time_and_string_equity() -> None:
         {"time": "2024-01-01T00:00:00+00:00", "equity": "10000"},
         {"time": "2024-01-01T01:00:00+00:00", "equity": "10100.50"},
     ]
+
+
+# --------------------------------------------------------------------------- #
+# Rounding to the column's scale                                                #
+# --------------------------------------------------------------------------- #
+#
+# Every number below came out of the engine driven end to end (the MA-cross golden dataset
+# under a `SpreadCostModel`, swept over tick values), not from arithmetic invented to fail.
+# The engine's money carries ten to twelve decimal places; the columns hold eight.
+#
+# These assertions compare the *text*, not the value. `Decimal` compares numerically, so
+# `Decimal("90.98800909880") == Decimal("90.98800909")` is False but the identity
+# `net == gross_profit + gross_loss` holds exactly in unbounded `Decimal` — which means an
+# assertion written that way passes against the defect it is supposed to forbid. Only the
+# scale of the number on the wire separates the two.
+
+
+def test_money_quantum_matches_the_column_it_rounds_to() -> None:
+    """The constant and the column have to agree. If `MONEY` is ever widened and this is left
+    behind, the rounding silently goes back to being Postgres's, one place too early."""
+    scale = MONEY.scale
+    assert scale is not None, "MONEY must declare a scale; without one the column is not exact"
+    assert _MONEY_QUANTUM.as_tuple().exponent == -scale
+
+
+def test_metrics_money_is_rounded_to_the_column_scale() -> None:
+    row, _ = to_rows(
+        trades=[],
+        metrics=a_metrics(
+            gross_profit=Decimal("191.44801914480"),
+            gross_loss=Decimal("-100.46001004600"),
+            net_profit=Decimal("90.98800909880"),
+        ),
+        backtest_id=BACKTEST_ID,
+        instrument_id=INSTRUMENT_ID,
+    )
+    assert str(row.gross_profit) == "191.44801914"
+    assert str(row.gross_loss) == "-100.46001005"
+    # Not "90.98800910", which is what rounding the engine's own total gives. The total is
+    # derived from the two rounded halves, so `net_profit_balances` holds on the stored row.
+    assert str(row.net_profit) == "90.98800909"
+
+
+def test_trade_money_is_rounded_to_the_column_scale() -> None:
+    row = map_one(
+        ClosedTrade(
+            symbol="EURUSD",
+            side=Side.LONG,
+            volume=Decimal("1"),
+            entry_time=START,
+            entry_price=Decimal("1.10000"),
+            exit_time=START + HOUR,
+            exit_price=Decimal("1.10100"),
+            gross_pnl=Decimal("199.0882702401"),
+            costs=Decimal("0.423062575000"),
+            net_pnl=Decimal("198.665207665100"),
+            reason="tp",
+        )
+    )
+    assert str(row.gross_pnl) == "199.08827024"
+    assert str(row.costs) == "0.42306258"
+    # Not "198.66520767" — same reason as above, for `net_pnl_balances`.
+    assert str(row.net_pnl) == "198.66520766"

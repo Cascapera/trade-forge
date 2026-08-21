@@ -696,8 +696,9 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
 - [origem: PR-234] **Nada reconcilia `datasets` quando um arquivo Parquet é apagado à mão.** A
   cobertura é derivada do disco *na coleta*, então apagar um ano depois deixa a linha alegando mais
   do que existe até a próxima recoleta. O mesmo `reconcile` do primeiro item resolve os dois.
-- [origem: aceite do PR-234, **medido em 20/08/2026**] ⚠️ **A invariante `net_profit = gross_profit
-  + gross_loss` é verdadeira quando calculada e falsa depois de gravada, e derruba o backtest.** O
+- ~~[origem: aceite do PR-234, **medido em 20/08/2026**]~~ **FEITO no PR-235.** ⚠️ **A invariante
+  `net_profit = gross_profit + gross_loss` é verdadeira quando calculada e falsa depois de
+  gravada, e derruba o backtest.** O
   CHECK `ck_backtest_metrics_net_profit_balances` recusou uma linha cujos três números fechavam em
   `Decimal`: as parcelas atravessam para `NUMERIC(20,8)` **cada uma por si**, e a soma dos
   arredondados não é o arredondado da soma. Medido no backtest do AUDCAD H1 coletado pela tela:
@@ -717,8 +718,20 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
   tolerância é trocar falha barulhenta por falha silenciosa. Aumentar a escala não resolve: o
   desencontro reaparece na última casa, qualquer que seja ela. O teste precisa **reler do banco**,
   porque `Decimal` compara numericamente e a perda de quantização só aparece no fio.
-  Mesma família, ainda não verificada: `ck_trades_net_pnl_balances` (`net_pnl = gross_pnl - costs`).
+  Mesma família, **verificada e consertada junto no PR-235**: `ck_trades_net_pnl_balances`
+  (`net_pnl = gross_pnl - costs`) tem o mesmo buraco. Não apareceu em 1.200 combinações de
+  `tick_value` × spread varridas com a engine de verdade, mas é alcançável — basta o custo cair na
+  fronteira de arredondamento. É o mesmo bug, só mais raro.
 - [origem: aceite do PR-234] **A metade "rodar um backtest nele" do aceite ficou pendente** por
   causa do item acima, que é anterior ao PR-234 e independe dele. A metade da coleta fechou: AUDCAD
   H1 coletado pela tela em 7 fatias (2020 → 2026), 41.216 candles, 358 gaps, uma linha em
   `datasets` e 7 partições no disco. Refazer o backtest do AUDCAD assim que o CHECK for consertado.
+
+- [origem: PR-235] **Ninguém reconcilia `gross_profit` com a soma dos trades gravados.** Depois do
+  PR-235 cada linha fecha **consigo mesma**, mas `backtest_metrics.gross_profit` é o arredondado da
+  soma dos `net_pnl` **não arredondados**, enquanto a tabela `trades` guarda os arredondados. Somar
+  a coluna `net_pnl` dos vencedores pode dar alguns 1e-8 de diferença do total do sumário. Nenhum
+  CHECK amarra os dois, então isso só morde quem conferir uma tabela contra a outra — provavelmente
+  a tela de resultados da fase 3. Consertar exigiria escolher **qual** das duas é a verdade, e essa
+  escolha é de produto, não de encanamento: o total do sumário é o mais próximo do que a conta
+  realmente fez, e a soma dos trades é a que o usuário consegue conferir na mão.

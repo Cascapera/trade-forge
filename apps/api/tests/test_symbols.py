@@ -12,6 +12,7 @@ from pydantic import TypeAdapter, ValidationError
 
 from tradeforge_api.schemas import SymbolHistoryOut, SymbolSearchOut, Timeframe
 from tradeforge_db.models import BrokerSymbol, SymbolHistory
+from tradeforge_engine.domain import AssetClass
 
 SYNCED_AT = dt.datetime(2026, 8, 19, 12, 0, tzinfo=dt.UTC)
 
@@ -210,3 +211,93 @@ class TestTheTimeframeAtTheEdge:
         # The same guard `?q=` needed, and for the same reason: this reaches a text column.
         with pytest.raises(ValidationError):
             TypeAdapter(Timeframe).validate_python(chr(0))
+
+
+class TestTheClassThePathDecides:
+    """The field that lets the screen ask the right question before anything is sent.
+
+    ⚠️ **The reason it lives on the API rather than in the browser.** The rule that turns a
+    tree path into a class is `classify.asset_class_from_path`, tested in the collector and
+    already imported by the collections route. Reimplementing it in TypeScript would put
+    business logic in two languages, and the copies would diverge on the first symbol the
+    broker files under a new root — the screen would offer to collect it and the API would
+    refuse, with nothing to explain the disagreement.
+    """
+
+    def test_a_path_that_names_the_class_reports_it(self) -> None:
+        built = SymbolSearchOut.build(
+            symbols=[_row("EURUSD", path="Forex\\Majors\\EURUSD")],
+            server=None,
+            synced_at=SYNCED_AT,
+        )
+
+        assert built.symbols[0].asset_class_from_path == AssetClass.FOREX
+
+    def test_a_path_that_names_no_class_reports_none(self) -> None:
+        """⚠️ 24 of this broker's 84 symbols. `None` is the whole point of the field: it is
+        what tells the screen to ask, rather than to send a request the API will refuse."""
+        built = SymbolSearchOut.build(
+            symbols=[_row("XAUUSD", path="CFDs\\Metals\\XAUUSD")],
+            server=None,
+            synced_at=SYNCED_AT,
+        )
+
+        assert built.symbols[0].asset_class_from_path is None
+
+    def test_a_symbol_with_no_path_at_all_reports_none(self) -> None:
+        """MT5 returns the empty string for "not set", which the snapshot stores as NULL. No
+        path is no evidence, which is the same answer as an unrecognised root."""
+        built = SymbolSearchOut.build(symbols=[_row("EURUSD")], server=None, synced_at=SYNCED_AT)
+
+        assert built.symbols[0].asset_class_from_path is None
+
+    def test_crypto_currency_is_read_as_crypto(self) -> None:
+        """Seven of this broker's symbols file under a root that is two words.
+
+        ⚠️ **Documented equivalent mutant.** Reading only the first word —
+        `asset_class_from_path(path.split(" ")[0])` — passes this test, because
+        `PATH_TO_ASSET_CLASS` holds *both* `crypto` and `crypto currency`. No scenario
+        separates the two while that is true, so this asserts the answer the screen depends
+        on rather than pretending to pin the parsing.
+
+        The parsing itself belongs to `test_classify.py`, which already covers this exact
+        path. What is proved here is that the value survives the trip to the response.
+        """
+        built = SymbolSearchOut.build(
+            symbols=[_row("BTCUSD", path="Crypto Currency\\BTCUSD")],
+            server=None,
+            synced_at=SYNCED_AT,
+        )
+
+        assert built.symbols[0].asset_class_from_path == AssetClass.CRYPTO
+
+    def test_it_reaches_the_wire_and_is_not_merely_a_python_attribute(self) -> None:
+        """⚠️ A computed field that is not serialised is invisible to the only caller that
+        wants it. Asserting the attribute alone would pass with `@computed_field` missing —
+        the property would still answer in Python while the JSON carried nothing.
+        """
+        built = SymbolSearchOut.build(
+            symbols=[
+                _row("EURUSD", path="Forex\\Majors\\EURUSD"),
+                _row("XAUUSD", path="CFDs\\Metals\\XAUUSD"),
+            ],
+            server=None,
+            synced_at=SYNCED_AT,
+        )
+
+        on_the_wire = built.model_dump(mode="json")["symbols"]
+
+        assert [row["asset_class_from_path"] for row in on_the_wire] == ["forex", None]
+
+    def test_the_symbol_still_reports_the_path_it_was_derived_from(self) -> None:
+        """Derived, never a replacement. The screen shows the path when it has to ask, because
+        `CFDs\\Metals\\XAUUSD` is what tells a person the answer is `future`."""
+        built = SymbolSearchOut.build(
+            symbols=[_row("XAUUSD", path="CFDs\\Metals\\XAUUSD")],
+            server=None,
+            synced_at=SYNCED_AT,
+        )
+
+        found = built.symbols[0]
+        assert found.path == "CFDs\\Metals\\XAUUSD"
+        assert found.asset_class_from_path is None

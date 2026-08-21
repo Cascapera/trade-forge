@@ -4,8 +4,8 @@
 
 | | |
 |---|---|
-| **Status** | `em implementação` — PR 1 pronto na branch, aguardando merge |
-| **Progresso** | 0/4 PRs mergeados · **5/14 itens** (F-01 a F-05 fechados) |
+| **Status** | `em implementação` — PR 2 pronto na branch |
+| **Progresso** | **1/4 PRs mergeados** (#129 `8dac85d`) · **7/14 itens** (F-01 a F-07) |
 | **Suposições** | 6 (§16) |
 | **Questões em aberto** | 1 — **Q-01 resolvida** (§16) |
 | **Migração de banco** | **nenhuma** — ver §8 |
@@ -21,7 +21,12 @@
    "cada PR deixa o sistema consistente". PR 1 agora atualiza `types.ts`, `client.ts`, `hooks.ts`
    e o `submit` da tela para enviar `items` com **um** símbolo. A UI de seleção múltipla continua
    sendo o PR 3.
-3. **Constante própria em vez do `_MAX_SYMBOLS` do basket.** Reusar a do basket acoplaria dois
+3. **F-07 partia de premissa falsa.** O item dizia "tipo TS **regerado** do schema". Não
+   existe codegen para `api/types.ts` — o header do próprio arquivo diz que ele é espelhado
+   à mão de propósito, e só o tipo da **DSL** vem gerado de `packages/schema`. O item virou
+   "espelhar à mão, seguindo a convenção documentada do arquivo".
+4. **Um `type: ignore` novo, contra o padrão da §14.** Ver a nota abaixo do checklist.
+5. **Constante própria em vez do `_MAX_SYMBOLS` do basket.** Reusar a do basket acoplaria dois
    tetos que a Q-02 prevê que podem divergir — e eles limitam trabalhos de custo muito diferente:
    vinte backtests são segundos, vinte coletas são horas. Nasceu `MAX_COLLECTION_SYMBOLS`, com o
    porquê no docstring.
@@ -527,19 +532,36 @@ Status: em implementação · Progresso: 0/4 PRs mergeados · 5/14 itens · atua
 
 ### PR 2 — A classe derivada vira campo da API
 
-- [ ] **F-06** · `BrokerSymbolOut.asset_class_from_path`, derivado de `path`, nunca gravado
-      risco: baixo · 2h · produção: aditivo · ~50 linhas / 2 arquivos
-  - [ ] Testes escritos primeiro · [ ] Implementado · [ ] Cobertura 100% · [ ] ruff · [ ] mypy · [ ] suíte verde
-  - [ ] Critérios cobertos: CA-09
+- [x] **F-06** · `BrokerSymbolOut.asset_class_from_path`, derivado de `path`, nunca gravado
+      risco: baixo · produção: aditivo
+  - [x] Testes escritos primeiro (6 vermelhos antes) · [x] Implementado · [x] Cobertura **100%** · [x] ruff · [x] mypy · [x] suíte verde
+  - [x] Critérios cobertos: CA-09
   - [ ] PR aberto · [ ] Mergeado `<hash>` · [ ] Verificado
-  - Status: não iniciado · Notas:
+  - Status: **feito** · Notas: `@computed_field` sobre `@property` — derivado na serialização, nunca
+    gravado, porque uma cópia em `broker_symbols` ficaria obsoleta no primeiro sync que refila um
+    símbolo. 5 mutantes: 4 mortos, **1 equivalente documentado** (ver nota abaixo).
 
-- [ ] **F-07** · Tipo TS regerado do schema (não escrito à mão) e `tsc --noEmit` limpo
-      risco: baixo · 30min · ~20 linhas
-  - [ ] Testes escritos primeiro · [ ] Implementado · [ ] Cobertura 100% · [ ] eslint · [ ] tsc · [ ] suíte verde
-  - [ ] Critérios cobertos: CA-09
+- [x] **F-07** · ~~Tipo TS regerado do schema~~ → **espelhado à mão**, e `tsc --noEmit` limpo
+      risco: baixo
+  - [x] Testes escritos primeiro · [x] Implementado · [x] Cobertura 100% · [x] eslint · [x] tsc · [x] suíte verde
+  - [x] Critérios cobertos: CA-09
   - [ ] PR aberto · [ ] Mergeado `<hash>` · [ ] Verificado
-  - Status: não iniciado · Notas:
+  - Status: **feito** · Notas: ⚠️ o item estava errado — não há codegen para `api/types.ts`, e o
+    header do arquivo diz que é espelho manual de propósito (só a **DSL** é gerada). Corrigido.
+    O `tsc` pegou sozinho a fixture de `SymbolCombobox.test.tsx` que descrevia uma resposta que o
+    servidor não consegue mais produzir.
+
+### ⚠️ Nota: um `type: ignore` novo, contra a §14
+
+`@computed_field` empilhado sobre `@property` faz o mypy emitir `prop-decorator` — ele **não
+suporta nenhum decorador sobre `@property`**, e o `# type: ignore[prop-decorator]` é o contorno
+que a documentação do próprio Pydantic prescreve. Não é defeito silenciado: é limitação de
+ferramenta, e está estreitado nesse único código, então um erro de tipagem real no método ainda
+derruba o portão.
+
+Alternativa sem `ignore`: campo comum preenchido no `SymbolSearchOut.build`. Custa mover a
+derivação para longe do campo e torna o valor definível pela entrada. Se você preferir, é uma
+troca de dez linhas — **diga e eu troco**.
 
 ### PR 3 — Tela: seleção múltipla
 
@@ -604,7 +626,7 @@ Status: em implementação · Progresso: 0/4 PRs mergeados · 5/14 itens · atua
 | CA-06 | F-03, F-09 |
 | CA-07 | F-04 |
 | CA-08 | F-05 |
-| CA-09 | F-06, F-07 |
+| CA-09 | F-06, F-07 ✅ |
 | CA-10 | F-11 |
 | CA-11 | F-12 |
 | CA-12 | F-10 |
@@ -616,7 +638,8 @@ Nenhum critério órfão. ✅
 
 | data | PR | o que mudou | surpresas |
 |---|---|---|---|
-| — | — | — | — |
+| 21/08 | **#129** `8dac85d` — PR 1 (F-01..F-05) | `POST /collections` aceita N símbolos, N linhas, N jobs | O plano deixava a tela quebrada entre o PR 1 e o PR 3; PR 1 teve de levar uma mudança mínima no web. F-01 e F-02 são inseparáveis. 9/9 mutantes mortos. |
+| 21/08 | PR 2 (F-06, F-07) | classe derivada do caminho no `/symbols/search` | F-07 partia de premissa falsa (não há codegen para `api/types.ts`). Um mutante **equivalente**: ler só a primeira palavra do caminho passa, porque o mapa tem `crypto` **e** `crypto currency` — o docstring que eu tinha escrito afirmava separar e não separava. |
 
 ---
 

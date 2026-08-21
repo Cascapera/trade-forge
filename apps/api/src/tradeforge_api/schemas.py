@@ -26,11 +26,13 @@ from pydantic import (
     ConfigDict,
     Field,
     PlainSerializer,
+    computed_field,
     field_validator,
     model_validator,
 )
 
 from tradeforge_api.walkforward import MAX_FOLDS, MIN_FOLDS
+from tradeforge_collector.classify import asset_class_from_path
 from tradeforge_db.models import SelectionMetric
 from tradeforge_engine.domain import AssetClass
 from tradeforge_schema.models import TIMEFRAMES
@@ -192,6 +194,36 @@ class BrokerSymbolOut(_Out):
     # would find out which by clicking. Not a claim that candles exist for any particular range
     # — only that the symbol has been catalogued at all.
     catalogued: bool = False
+
+    # ⚠️ `prop-decorator` is a mypy limitation, not a defect being silenced: mypy does not
+    # support any decorator stacked on top of `@property`, and this is the workaround Pydantic's
+    # own documentation prescribes for `computed_field`. Narrowed to that one code so a real
+    # typing error in this method would still fail the gate.
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def asset_class_from_path(self) -> AssetClass | None:
+        """The class the broker's own filing decides, or `None` when it decides nothing.
+
+        ⚠️ **Derived here so the rule lives in one language.** `POST /collections` refuses a
+        symbol it cannot classify, and the screen has to know *which* of the twenty a person
+        must answer for — before sending anything. The alternative was reimplementing
+        `classify.asset_class_from_path` in TypeScript, and the two copies would disagree the
+        first time the broker files something under a new root: the screen would offer the
+        symbol and the API would refuse it, with nothing on either side explaining why.
+
+        ⚠️ **Computed, never stored.** Writing it into `broker_symbols` would duplicate a
+        derivation, and the copy would go stale the moment a sync refiles a symbol — leaving a
+        column that disagrees with the `path` sitting beside it. `Collection.asset_class` stays
+        the place a value is *recorded*, and it means something different there: a person
+        decided it. NULL in that column means the path did; this field is that path speaking.
+
+        The `classify` import reaches into `apps/collector`, which this app already depends on
+        for the Parquet reader and already imports the same way in `routers/collections`. Safe
+        on Linux because `classify` holds no MetaTrader import — which is why it is its own
+        module rather than living beside `MT5Source`, whose first docstring line says it is
+        never imported here.
+        """
+        return asset_class_from_path(self.path or "")
 
 
 class SymbolSnapshotOut(_Out):

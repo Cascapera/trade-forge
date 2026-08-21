@@ -641,6 +641,19 @@ export interface BrokerSymbol {
    *  exactly the same, and 74 of this broker's 84 are hidden. */
   visible: boolean
   /**
+   * The class the broker's own filing decides, or `null` when it decides nothing.
+   *
+   * ⚠️ `null` is the field's whole purpose: it marks the symbols a person has to answer for
+   * before a collection can be sent. Measured on this broker, 24 of its 84 symbols file under
+   * roots that name no class the system has.
+   *
+   * ⚠️ Derived by the API, never re-derived here. The rule that maps a tree path to a class is
+   * `classify.asset_class_from_path`, and a TypeScript copy of it would disagree with the
+   * server the first time the broker files something under a new root — the screen would offer
+   * the symbol and the API would refuse it, with nothing explaining the disagreement.
+   */
+  asset_class_from_path: AssetClass | null
+  /**
    * Whether this system has an instrument row for it, which is what a backtest needs.
    *
    * ⚠️ Without this the screen would offer every symbol the broker has and let the user find

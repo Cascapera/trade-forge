@@ -5,6 +5,7 @@
 
 import { skipToken, useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query'
 import type { Strategy } from '@tradeforge/schema'
+import { useEffect, useRef } from 'react'
 
 import { api } from './client'
 import type {
@@ -495,8 +496,64 @@ export function useSymbolHistories(symbols: readonly string[], timeframe: string
             : []
         }),
       ),
-      /** Symbols whose measurement has come back one way or the other. */
-      settled: results.filter((result) => !result.isPending).length,
+      /**
+       * Symbols whose query has come back with **nothing** — a 404, meaning nobody has probed
+       * this pair yet.
+       *
+       * ⚠️ Deliberately not "symbols without data", which would also include the ones still in
+       * flight. Anything that acts on this list acts once per symbol, and firing while a query
+       * is still pending would fire again the moment it lands.
+       */
+      missing: results.flatMap((result, index) => {
+        const symbol = symbols[index]
+        return !result.isPending && result.data === undefined && symbol !== undefined
+          ? [symbol]
+          : []
+      }),
     }),
   })
+}
+
+/**
+ * Measure the chosen symbols that nobody has measured yet — once each, ever.
+ *
+ * ## Why the "already asked" set is not optional
+ *
+ * ⚠️ A probe is queued on the **same single-job queue the collection will use**, and a cold H4
+ * took 207 seconds on this broker. Without the set below, every invalidation, re-render or
+ * re-pick would queue the same measurement again, and twenty symbols could put hours of work
+ * in front of the first candle. The set is what makes the price "once per pair" rather than
+ * "once per click", and it is the mitigation the feature's DD-04 depends on.
+ *
+ * ⚠️ It also has to be a ref, not state: writing it during the effect would re-render, and the
+ * re-render would run the effect again. This project has already shipped an auto-selection that
+ * kept re-offering what the user had removed, for want of exactly this set.
+ *
+ * `missing` only ever names symbols whose query has already come back empty, so nothing is
+ * probed while its own measurement is still in flight.
+ */
+export function useAutoProbe(args: {
+  missing: readonly string[]
+  timeframe: string
+}): { queued: number } {
+  const { missing, timeframe } = args
+  const { mutate } = useProbeSymbol()
+  const asked = useRef(new Set<string>())
+  // Joined into a string so the effect's dependency is the *content* of the list, not the
+  // identity of an array rebuilt on every render.
+  const key = missing.join(',')
+
+  useEffect(() => {
+    for (const symbol of missing) {
+      const pair = `${symbol}|${timeframe}`
+      if (asked.current.has(pair)) continue
+      asked.current.add(pair)
+      mutate({ symbol, timeframe })
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `key` stands in for `missing`
+  }, [key, timeframe, mutate])
+
+  // What is still ahead of the collection: everything asked for that has not come back. The
+  // screen says this so a wait reads as a queue rather than as nothing happening.
+  return { queued: missing.length }
 }

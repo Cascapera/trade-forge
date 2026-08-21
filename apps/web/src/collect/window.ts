@@ -179,3 +179,36 @@ export function bindingFloor(
  * away, and says so before the request rather than after it.
  */
 export const MAX_BATCH_SYMBOLS = 20
+
+export interface ShortSymbol {
+  symbol: string
+  /** The first instant the measurement says is worth having, as `YYYY-MM-DD`. */
+  usableFrom: string
+}
+
+/**
+ * Which of the chosen symbols will come back with less than the window asks for.
+ *
+ * One window covers the batch, so a symbol listed after `from` simply has nothing to give for
+ * the years before it existed — `run_collection` treats an empty year as ordinary and does not
+ * fail. That is exactly why it has to be **said**: the request succeeds, the row reports fewer
+ * candles than the dates imply, and without this the only explanation available is a bug.
+ *
+ * ⚠️ Only symbols that have actually been measured can appear. An unmeasured one is not "fine",
+ * it is unknown — and reporting silence as a clean bill of health is the failure this project
+ * keeps a memory about.
+ */
+export function shortWindows(
+  symbols: readonly string[],
+  known: ReadonlyMap<string, SymbolHistory>,
+  from: string,
+): ShortSymbol[] {
+  const short: ShortSymbol[] = []
+  for (const symbol of symbols) {
+    const usable = known.get(symbol)?.usable_from
+    if (usable == null) continue
+    const usableFrom = usable.slice(0, 10)
+    if (usableFrom > from) short.push({ symbol, usableFrom })
+  }
+  return short
+}

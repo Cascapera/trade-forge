@@ -357,3 +357,116 @@ def test_a_backwards_range_is_refused_before_anything_is_written(
         collect(SyntheticSource(), journal, tmp_path, date_from=utc(2022), date_to=utc(2021))
 
     assert journal.entries == []
+
+
+class Breaks:
+    """A source whose terminal drops the connection partway through a batch.
+
+    Not a `LookupError`, which `run_collection` treats as an ordinary empty year — this is the
+    class of failure that ends a collection: the terminal went away, the disk filled, the
+    account logged out.
+    """
+
+    def __init__(self, *, after: int = 0) -> None:
+        self._inner = SyntheticSource()
+        self.calls = 0
+        self._after = after
+
+    def instrument(self, symbol: str) -> InstrumentSpec:
+        return self._inner.instrument(symbol)
+
+    def spread_points(self, symbol: str) -> Decimal | None:
+        return self._inner.spread_points(symbol)
+
+    def candles(
+        self, symbol: str, timeframe: str, start: dt.datetime, end: dt.datetime
+    ) -> list[Candle]:
+        self.calls += 1
+        if self.calls > self._after:
+            raise ConnectionError("the terminal went away")
+        return self._inner.candles(symbol, timeframe, start, end)
+
+
+def test_one_collection_failing_leaves_the_others_untouched(tmp_path: Path) -> None:
+    """⚠️ **The independence a batch is built on (CA-07 of the multi-symbol feature).**
+
+    A batch of N symbols is N rows and N jobs sharing one Parquet root and one database. Nothing
+    links them, which is the design — but "nothing links them" is a claim about *shared state*,
+    and shared state is where it would be false. A failure partway through the second symbol must
+    not damage the first symbol's partitions or stop the third from being written.
+
+    ⚠️ What this does **not** prove is that the agent records the failure on the row and moves to
+    the next job — that lives in `collect_range`, which imports MetaTrader and therefore cannot
+    run on this CI. What it proves is the half that could actually go wrong silently: the data.
+    """
+    window = (utc(2021), utc(2021, 12, 31))
+    first, third = SpyJournal(), SpyJournal()
+
+    run_collection(
+        SyntheticSource(),
+        first,
+        root=tmp_path,
+        symbol="EURUSD",
+        timeframe="H1",
+        date_from=window[0],
+        date_to=window[1],
+    )
+    with pytest.raises(ConnectionError):
+        run_collection(
+            Breaks(),
+            SpyJournal(),
+            root=tmp_path,
+            symbol="AAPL",
+            timeframe="H1",
+            date_from=window[0],
+            date_to=window[1],
+        )
+    run_collection(
+        SyntheticSource(),
+        third,
+        root=tmp_path,
+        symbol="GBPUSD",
+        timeframe="H1",
+        date_from=window[0],
+        date_to=window[1],
+    )
+
+    # The two that ran are both finished and both catalogued, and the one in the middle wrote
+    # nothing that either of them can see.
+    assert first.entries[-1] == "finished"
+    assert third.entries[-1] == "finished"
+    assert first.finished_candles is not None
+    assert first.finished_candles > 0
+    assert third.finished_candles is not None
+    assert third.finished_candles > 0
+
+    # ⚠️ Asserted on the **disk**, not on the journals. A journal reports what the code believed;
+    # the partitions are what a later backtest actually reads, and a failure that corrupted them
+    # would leave both journals saying "finished" regardless.
+    written = {path.parent.parent.parent.name for path in tmp_path.rglob("*.parquet")}
+    assert written == {"symbol=EURUSD", "symbol=GBPUSD"}
+
+
+def test_a_source_that_breaks_midway_does_not_catalogue_a_partial_series(tmp_path: Path) -> None:
+    """⚠️ The half-written case, which is the one that would lie.
+
+    The connection survives the first year and dies in the second. Nothing may reach the
+    catalogue: a `datasets` row claiming a range whose later half is missing is worse than no
+    row at all, because the next backtest would read it as coverage and silently test less
+    history than it thinks.
+    """
+    spy = SpyJournal()
+
+    with pytest.raises(ConnectionError):
+        run_collection(
+            Breaks(after=1),
+            spy,
+            root=tmp_path,
+            symbol="EURUSD",
+            timeframe="H1",
+            date_from=utc(2020),
+            date_to=utc(2021, 12, 31),
+        )
+
+    assert "catalogued EURUSD" not in spy.entries
+    assert spy.finished_candles is None

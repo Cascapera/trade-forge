@@ -12,11 +12,16 @@ const createMutation = {
   error: null as unknown,
 }
 let known = new Map<string, SymbolHistory>()
+/** Symbols whose measurement came back empty — what the auto-probe acts on. */
+let missing: string[] = []
 let searchAnswer: SymbolSearch = { symbols: [], snapshot: null }
 let listed: Collection[] = []
 
 vi.mock('../api/hooks', () => ({
-  useSymbolHistories: () => ({ known, settled: known.size }),
+  useSymbolHistories: () => ({ known, missing }),
+  // The real hook fires one probe per unmeasured pair; the screen only reads the count, so the
+  // fake reports what the real one would. `useAutoProbe`'s own behaviour is tested next door.
+  useAutoProbe: (args: { missing: readonly string[] }) => ({ queued: args.missing.length }),
   useCreateCollection: () => createMutation,
   useCollections: () => ({ data: listed }),
   useSymbolSearch: () => ({ data: searchAnswer }),
@@ -117,6 +122,7 @@ function itemsSent(): Record<string, string>[] {
 
 beforeEach(() => {
   known = new Map()
+  missing = []
   searchAnswer = { symbols: [], snapshot: null }
   listed = []
   createMutation.error = null
@@ -393,4 +399,82 @@ it('lists the collections already requested', () => {
 
   expect(screen.getByText('EURUSD')).toBeInTheDocument()
   expect(screen.getByText('GBPUSD')).toBeInTheDocument()
+})
+
+describe('what is still being measured, and what will come back short', () => {
+  it('says how many symbols are being measured ahead of the collection', () => {
+    /**
+     * ⚠️ Measuring shares the collection's single-job queue and a cold H4 took 207 seconds on
+     * this broker, so these run *before* the first candle. Saying how many turns a silent
+     * minute into a queue somebody can reason about.
+     */
+    searchAnswer = { symbols: [broker(), broker({ symbol: 'GBPUSD' })], snapshot: null }
+    missing = ['EURUSD', 'GBPUSD']
+    render(<CollectSymbol />)
+    pick('EURUSD')
+
+    expect(screen.getByText(/2 symbols/)).toBeInTheDocument()
+    expect(screen.getByText(/measured once and never again/i)).toBeInTheDocument()
+  })
+
+  it('says nothing about measuring when everything is already measured', () => {
+    /**
+     * ⚠️ The silence has to be earned. A box that always said "measuring 0 symbols" would train
+     * the reader to skip it, and it is the one thing on the screen explaining a wait.
+     */
+    searchAnswer = { symbols: [broker()], snapshot: null }
+    known = new Map([['EURUSD', history()]])
+    missing = []
+    render(<CollectSymbol />)
+    pick('EURUSD')
+
+    expect(screen.queryByText(/nobody has measured yet/i)).not.toBeInTheDocument()
+  })
+
+  it('names the symbols that start after the window does', () => {
+    /**
+     * ⚠️ Coming back short is an ordinary answer, not a failure — `run_collection` treats an
+     * empty year as ordinary. Which is exactly why it must be said: the request succeeds, the
+     * row reports fewer candles than the dates imply, and without this the only explanation
+     * available to the reader is "a bug".
+     */
+    searchAnswer = { symbols: [broker(), broker({ symbol: 'BTCUSD' })], snapshot: null }
+    known = new Map([
+      ['EURUSD', history()],
+      ['BTCUSD', history({ symbol: 'BTCUSD', usable_from: '2022-05-10T00:00:00Z' })],
+    ])
+    render(<CollectSymbol />)
+    pick('EURUSD')
+    pick('BTCUSD')
+    fireEvent.change(screen.getByLabelText('From'), { target: { value: '2015-01-01' } })
+
+    expect(screen.getByText(/come back shorter/i)).toBeInTheDocument()
+    expect(screen.getByText(/usable from 2022-05-10/)).toBeInTheDocument()
+  })
+
+  it('says nothing when every chosen symbol covers the window', () => {
+    searchAnswer = { symbols: [broker()], snapshot: null }
+    known = new Map([['EURUSD', history()]])
+    render(<CollectSymbol />)
+    pick('EURUSD')
+    fireEvent.change(screen.getByLabelText('From'), { target: { value: '2015-01-01' } })
+
+    expect(screen.queryByText(/come back shorter/i)).not.toBeInTheDocument()
+  })
+
+  it('the suggested window does not flag itself as short', () => {
+    /**
+     * ⚠️ The boundary that matters most, because it is the default. The suggestion opens exactly
+     * on the binding floor, so a `>=` comparison would make the screen warn about its own
+     * pre-filled window every single time — and a warning that is always on is a warning nobody
+     * reads.
+     */
+    searchAnswer = { symbols: [broker({ symbol: 'BTCUSD' })], snapshot: null }
+    known = new Map([['BTCUSD', history({ symbol: 'BTCUSD', usable_from: '2022-05-10T00:00:00Z' })]])
+    render(<CollectSymbol />)
+    pick('BTCUSD')
+
+    expect(screen.getByLabelText('From')).toHaveValue('2022-05-10')
+    expect(screen.queryByText(/come back shorter/i)).not.toBeInTheDocument()
+  })
 })

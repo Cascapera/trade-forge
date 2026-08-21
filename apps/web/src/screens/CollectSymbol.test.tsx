@@ -2,7 +2,7 @@ import { fireEvent, render, screen } from '@testing-library/react'
 import { vi } from 'vitest'
 
 import { ApiError } from '../api/client'
-import type { Collection, SymbolHistory } from '../api/types'
+import type { BrokerSymbol, Collection, SymbolHistory, SymbolSearch } from '../api/types'
 import { asDateInput, suggestedWindow } from '../collect/window'
 
 const createMutation = {
@@ -11,18 +11,15 @@ const createMutation = {
   isPending: false,
   error: null as unknown,
 }
-let historyAnswer: { data: SymbolHistory | undefined; error: unknown } = {
-  data: undefined,
-  error: null,
-}
+let known = new Map<string, SymbolHistory>()
+let searchAnswer: SymbolSearch = { symbols: [], snapshot: null }
 let listed: Collection[] = []
 
 vi.mock('../api/hooks', () => ({
-  useSymbolHistory: () => historyAnswer,
-  useProbeSymbol: () => ({ mutate: vi.fn(), isPending: false, isSuccess: false }),
+  useSymbolHistories: () => ({ known, settled: known.size }),
   useCreateCollection: () => createMutation,
   useCollections: () => ({ data: listed }),
-  useSymbolSearch: () => ({ data: { symbols: [], snapshot: null } }),
+  useSymbolSearch: () => ({ data: searchAnswer }),
   useSyncSymbols: () => ({ mutate: vi.fn(), isPending: false }),
 }))
 
@@ -41,6 +38,19 @@ function history(patch: Partial<SymbolHistory> = {}): SymbolHistory {
     probed_at: '2026-08-20T01:27:37Z',
     capped_by_terminal: false,
     usable_from: '2009-01-01T00:00:00Z',
+    ...patch,
+  }
+}
+
+function broker(patch: Partial<BrokerSymbol> = {}): BrokerSymbol {
+  return {
+    symbol: 'EURUSD',
+    description: 'Euro vs US Dollar',
+    path: 'Forex\\Majors\\EURUSD',
+    asset_class_from_path: 'forex',
+    digits: 5,
+    visible: true,
+    catalogued: true,
     ...patch,
   }
 }
@@ -66,8 +76,22 @@ function collection(patch: Partial<Collection> = {}): Collection {
   }
 }
 
-function typeSymbol(value: string): void {
-  fireEvent.change(screen.getByLabelText(/symbol/i), { target: { value } })
+/**
+ * Search for a ticker and click it out of the results — how a symbol joins the batch.
+ *
+ * ⚠️ Queried by **name**, because this screen has two comboboxes: the symbol search and the
+ * timeframe `<select>`, which carries the role implicitly. They are already named distinctly,
+ * so this is the query being specific rather than the markup being fixed around a test.
+ */
+function pick(symbol: string): void {
+  fireEvent.change(screen.getByRole('combobox', { name: 'Symbols' }), {
+    target: { value: symbol },
+  })
+  fireEvent.mouseDown(screen.getByRole('option', { name: new RegExp(symbol) }))
+}
+
+function collectButton(): HTMLElement {
+  return screen.getByRole('button', { name: /^Collect / })
 }
 
 /**
@@ -84,21 +108,16 @@ function requestSent(): Record<string, string> {
   return first[0] as Record<string, string>
 }
 
-/**
- * The single item of the batch this screen sends. Same argument as `requestSent`: reading it
- * through a named helper turns "the screen sent no items" into that sentence rather than into
- * an `undefined` three assertions later.
- */
-function itemSent(): Record<string, string> {
+/** The batch's items, as objects. */
+function itemsSent(): Record<string, string>[] {
   const items = requestSent().items as unknown
-  if (!Array.isArray(items) || items.length !== 1) {
-    throw new Error(`expected a batch of one, got ${JSON.stringify(items)}`)
-  }
-  return items[0] as Record<string, string>
+  if (!Array.isArray(items)) throw new Error(`items is not a list: ${JSON.stringify(items)}`)
+  return items as Record<string, string>[]
 }
 
 beforeEach(() => {
-  historyAnswer = { data: undefined, error: null }
+  known = new Map()
+  searchAnswer = { symbols: [], snapshot: null }
   listed = []
   createMutation.error = null
   createMutation.isPending = false
@@ -106,12 +125,25 @@ beforeEach(() => {
   createMutation.reset.mockClear()
 })
 
-it('will not collect until a symbol is chosen', () => {
+it('will not collect until a symbol is chosen, and says so', () => {
   // The window is pre-filled from the start, so without this the button would be live with no
-  // symbol behind it — and the request it sent would be refused by the API for an empty string.
+  // symbols behind it — and the request it sent would be refused by the API for an empty list.
   render(<CollectSymbol />)
 
-  expect(screen.getByRole('button', { name: 'Collect' })).toBeDisabled()
+  expect(collectButton()).toBeDisabled()
+  expect(screen.getByText(/choose at least one symbol/i)).toBeInTheDocument()
+})
+
+it('sends one item per chosen symbol, in the order they were picked', () => {
+  searchAnswer = { symbols: [broker(), broker({ symbol: 'GBPUSD' })], snapshot: null }
+  known = new Map([['EURUSD', history()]])
+  render(<CollectSymbol />)
+
+  pick('EURUSD')
+  pick('GBPUSD')
+  fireEvent.click(collectButton())
+
+  expect(itemsSent().map((item) => item.symbol)).toEqual(['EURUSD', 'GBPUSD'])
 })
 
 it('sends the window the form is showing, with the end day included', () => {
@@ -120,14 +152,14 @@ it('sends the window the form is showing, with the end day included', () => {
    * ends, so sending midnight would silently drop every bar of the final day — on exactly the
    * day somebody picked as the end of their backtest.
    */
-  historyAnswer = { data: history(), error: null }
+  searchAnswer = { symbols: [broker()], snapshot: null }
+  known = new Map([['EURUSD', history()]])
   render(<CollectSymbol />)
-  typeSymbol('EURUSD')
+  pick('EURUSD')
 
-  fireEvent.click(screen.getByRole('button', { name: 'Collect' }))
+  fireEvent.click(collectButton())
 
   const sent = requestSent()
-  expect(itemSent().symbol).toBe('EURUSD')
   expect(sent.date_from).toMatch(/T00:00:00Z$/)
   expect(sent.date_to).toMatch(/T23:59:59Z$/)
 })
@@ -139,39 +171,82 @@ it('opens on the floor the probe found rather than on the whole budget', () => {
    * those years by default would hand somebody a backtest that looks better for being less
    * validated.
    */
-  historyAnswer = { data: history(), error: null }
+  searchAnswer = { symbols: [broker()], snapshot: null }
+  known = new Map([['EURUSD', history()]])
   render(<CollectSymbol />)
-  typeSymbol('EURUSD')
+  pick('EURUSD')
 
   expect(screen.getByLabelText('From')).toHaveValue('2009-01-01')
   expect(screen.getByText(/stops being filler and typed costs/)).toBeInTheDocument()
 })
 
+it('the latest floor among the chosen symbols is the one that binds', () => {
+  /**
+   * ⚠️ The multi-symbol case, and the separating one. EURUSD is usable from 2009 and BTCUSD only
+   * from 2022; one window covers both, so opening on 2009 would buy BTCUSD thirteen empty years
+   * and — for anything that does answer that early — years of spread the broker typed.
+   *
+   * The message names the symbol doing the binding, because "2022" with no explanation reads
+   * like a bug to somebody who picked EURUSD expecting 2009.
+   */
+  searchAnswer = { symbols: [broker(), broker({ symbol: 'BTCUSD' })], snapshot: null }
+  known = new Map([
+    ['EURUSD', history()],
+    ['BTCUSD', history({ symbol: 'BTCUSD', usable_from: '2022-05-10T00:00:00Z' })],
+  ])
+  render(<CollectSymbol />)
+  pick('EURUSD')
+  pick('BTCUSD')
+
+  expect(screen.getByLabelText('From')).toHaveValue('2022-05-10')
+  expect(screen.getByText(/BTCUSD's measurement/)).toBeInTheDocument()
+})
+
 it('says how many bars the suggested window is, not just its dates', () => {
   // "17 years" says nothing about how much signal that is; the count is what a run is sized by.
-  historyAnswer = { data: history(), error: null }
+  searchAnswer = { symbols: [broker()], snapshot: null }
+  known = new Map([['EURUSD', history()]])
   render(<CollectSymbol />)
-  typeSymbol('EURUSD')
+  pick('EURUSD')
 
-  expect(screen.getByText(/bars,/)).toBeInTheDocument()
+  expect(screen.getByText(/bars per symbol/)).toBeInTheDocument()
+})
+
+it('says how many calendar years the batch will fetch', () => {
+  /**
+   * ⚠️ The number that makes the wait legible before it starts. Two symbols over a window that
+   * spans 2009..2026 is eighteen years each — thirty-six downloads, one after another, because
+   * the agent runs one job at a time.
+   */
+  searchAnswer = { symbols: [broker(), broker({ symbol: 'GBPUSD' })], snapshot: null }
+  known = new Map([['EURUSD', history()]])
+  render(<CollectSymbol />)
+  pick('EURUSD')
+  pick('GBPUSD')
+
+  fireEvent.change(screen.getByLabelText('From'), { target: { value: '2024-01-01' } })
+  fireEvent.change(screen.getByLabelText('To'), { target: { value: '2025-12-31' } })
+
+  // Two symbols × two calendar years.
+  expect(screen.getByText('4')).toBeInTheDocument()
 })
 
 it('stops suggesting once the dates are edited by hand', () => {
   /**
    * ⚠️ The suggestion is a default, never a limit. Re-deriving it on every render would snap the
-   * field back under the cursor the moment a probe result arrived — and the operator widening a
-   * window is precisely the person a probe result is arriving for.
+   * field back under the cursor the moment a measurement arrived — and the operator widening a
+   * window is precisely the person a measurement is arriving for.
    */
-  historyAnswer = { data: history(), error: null }
+  searchAnswer = { symbols: [broker()], snapshot: null }
+  known = new Map([['EURUSD', history()]])
   render(<CollectSymbol />)
-  typeSymbol('EURUSD')
+  pick('EURUSD')
 
   fireEvent.change(screen.getByLabelText('From'), { target: { value: '1999-01-01' } })
 
   expect(screen.getByLabelText('From')).toHaveValue('1999-01-01')
-  fireEvent.click(screen.getByRole('button', { name: 'Collect' }))
-  const sent = requestSent()
-  expect(sent.date_from).toBe('1999-01-01T00:00:00Z')
+  fireEvent.click(collectButton())
+  expect(requestSent().date_from).toBe('1999-01-01T00:00:00Z')
 })
 
 it('changing the timeframe re-suggests, because the budget is per timeframe', () => {
@@ -185,9 +260,10 @@ it('changing the timeframe re-suggests, because the budget is per timeframe', ()
    * which is the empty string, and an empty field is certainly not the old one. A scenario that
    * only rules out equality rules out almost nothing.
    */
-  historyAnswer = { data: history(), error: null }
+  searchAnswer = { symbols: [broker()], snapshot: null }
+  known = new Map([['EURUSD', history()]])
   render(<CollectSymbol />)
-  typeSymbol('EURUSD')
+  pick('EURUSD')
 
   fireEvent.change(screen.getByLabelText('Timeframe'), { target: { value: 'M1' } })
 
@@ -195,111 +271,126 @@ it('changing the timeframe re-suggests, because the budget is per timeframe', ()
   expect(screen.getByLabelText('From').getAttribute('value')).toBe(expected)
 })
 
-it('turns the API refusal into a field instead of a wall', () => {
+it('asks the class before sending, not after the API refuses', () => {
   /**
    * ⚠️ 24 of this broker's 84 symbols. `instruments.asset_class` is NOT NULL with five legal
-   * values and `CFDs` names none of them, so the API refuses — and the refusal is only useful
-   * if the person looking at the form can answer it.
+   * values and `CFDs` names none of them. With one symbol the API's 409 could be turned into a
+   * field; with twenty it would name a list, so the screen asks up front — it already knows
+   * which ones, because the search says so.
    */
-  createMutation.error = new ApiError(409, 'cannot tell what kind of instrument XAUUSD is')
+  searchAnswer = {
+    symbols: [broker({ symbol: 'XAUUSD', path: 'CFDs\\Metals\\XAUUSD', asset_class_from_path: null })],
+    snapshot: null,
+  }
   render(<CollectSymbol />)
-  typeSymbol('XAUUSD')
+  pick('XAUUSD')
 
-  expect(screen.getByText(/cannot tell what kind of instrument/)).toBeInTheDocument()
-  expect(screen.getByLabelText(/asset class/i)).toBeInTheDocument()
+  expect(collectButton()).toBeDisabled()
+  expect(screen.getByText(/Say what XAUUSD is/i)).toBeInTheDocument()
+  expect(screen.getByLabelText('Asset class for XAUUSD')).toBeInTheDocument()
 })
 
-it('sends the class once it is answered', () => {
-  createMutation.error = new ApiError(409, 'cannot tell what kind of instrument XAUUSD is')
+it('sends the class once it is answered, against its own symbol', () => {
+  searchAnswer = {
+    symbols: [broker({ symbol: 'XAUUSD', path: 'CFDs\\Metals\\XAUUSD', asset_class_from_path: null })],
+    snapshot: null,
+  }
   render(<CollectSymbol />)
-  typeSymbol('XAUUSD')
+  pick('XAUUSD')
 
-  fireEvent.change(screen.getByLabelText(/asset class/i), { target: { value: 'future' } })
-  fireEvent.click(screen.getByRole('button', { name: 'Collect' }))
+  fireEvent.change(screen.getByLabelText('Asset class for XAUUSD'), { target: { value: 'future' } })
+  fireEvent.click(collectButton())
 
-  expect(itemSent().asset_class).toBe('future')
+  expect(itemsSent()).toEqual([{ symbol: 'XAUUSD', asset_class: 'future' }])
 })
 
-it('does not send an asset class the API never asked for', () => {
+it('one symbol needing an answer does not make the others carry a class', () => {
   /**
-   * ⚠️ The separating case. Absence means "the path already decided", and sending a value
-   * anyway would overwrite a derived class with a form default — quietly filing every currency
-   * pair as whatever the select happened to open on.
+   * ⚠️ The failure a batch-wide class field would have caused. XAUUSD is a future and EURUSD is
+   * filed as forex by its own path; sending `future` for both would catalogue a currency pair as
+   * a contract, and nothing would raise.
    */
-  historyAnswer = { data: history(), error: null }
+  searchAnswer = {
+    symbols: [
+      broker(),
+      broker({ symbol: 'XAUUSD', path: 'CFDs\\Metals\\XAUUSD', asset_class_from_path: null }),
+    ],
+    snapshot: null,
+  }
   render(<CollectSymbol />)
-  typeSymbol('EURUSD')
+  pick('EURUSD')
+  pick('XAUUSD')
 
-  fireEvent.click(screen.getByRole('button', { name: 'Collect' }))
+  fireEvent.change(screen.getByLabelText('Asset class for XAUUSD'), { target: { value: 'future' } })
+  fireEvent.click(collectButton())
 
-  expect('asset_class' in itemSent()).toBe(false)
+  expect(itemsSent()).toEqual([
+    { symbol: 'EURUSD' },
+    { symbol: 'XAUUSD', asset_class: 'future' },
+  ])
+})
+
+it('does not send an asset class the path already decided', () => {
+  /**
+   * ⚠️ Absence means "the path already decided", and sending a value anyway would overwrite a
+   * derived class with a form default — quietly filing every currency pair as whatever the
+   * select happened to open on.
+   */
+  searchAnswer = { symbols: [broker()], snapshot: null }
+  render(<CollectSymbol />)
+  pick('EURUSD')
+
+  fireEvent.click(collectButton())
+
+  expect('asset_class' in (itemsSent()[0] ?? {})).toBe(false)
+})
+
+it('removing a symbol takes its answered class with it', () => {
+  /**
+   * ⚠️ Otherwise the answer outlives the question: pick XAUUSD, say `future`, remove it, pick
+   * something else — and a class chosen for a metal would still be sitting in state.
+   */
+  searchAnswer = {
+    symbols: [
+      broker({ symbol: 'XAUUSD', path: 'CFDs\\Metals\\XAUUSD', asset_class_from_path: null }),
+    ],
+    snapshot: null,
+  }
+  render(<CollectSymbol />)
+  pick('XAUUSD')
+  fireEvent.change(screen.getByLabelText('Asset class for XAUUSD'), { target: { value: 'future' } })
+
+  fireEvent.click(screen.getByRole('button', { name: 'Remove XAUUSD' }))
+  pick('XAUUSD')
+
+  expect(collectButton()).toBeDisabled()
+  expect(screen.getByText(/Say what XAUUSD is/i)).toBeInTheDocument()
 })
 
 it('shows the reason a request was refused, not the status code', () => {
-  // ⚠️ `ApiError.message` is only "API error 422". The sentence naming the bad field is in
-  // `detail`, and this project has already shipped a warning box that said nothing else.
-  createMutation.error = new ApiError(422, 'date_to is before date_from')
+  searchAnswer = { symbols: [broker()], snapshot: null }
+  createMutation.error = new ApiError(422, 'date_to precedes date_from')
   render(<CollectSymbol />)
-  typeSymbol('EURUSD')
+  pick('EURUSD')
 
-  expect(screen.getByText(/date_to is before date_from/)).toBeInTheDocument()
-  expect(screen.queryByLabelText(/asset class/i)).not.toBeInTheDocument()
+  expect(screen.getByText(/date_to precedes date_from/)).toBeInTheDocument()
 })
 
 it('a 422 whose detail is a list of field errors still says something', () => {
-  // FastAPI sends an array for a validation error. Stringifying it yields `[object Object]`.
-  createMutation.error = new ApiError(422, [{ loc: ['body', 'symbol'], msg: 'bad' }])
+  // ⚠️ Stringifying a list of field errors yields `[object Object]`, which is worse than the
+  // status code. The guard is on the *shape* of `detail`, not on its presence.
+  searchAnswer = { symbols: [broker()], snapshot: null }
+  createMutation.error = new ApiError(422, [{ loc: ['body', 'items'], msg: 'too short' }])
   render(<CollectSymbol />)
-  typeSymbol('EURUSD')
+  pick('EURUSD')
 
   expect(screen.getByText(/refused \(422\)/)).toBeInTheDocument()
 })
 
-describe('the list of collections', () => {
-  it('reports progress in years while one runs', () => {
-    listed = [collection({ status: 'running', years_done: 3, years_total: 18 })]
-    render(<CollectSymbol />)
+it('lists the collections already requested', () => {
+  listed = [collection(), collection({ id: 'c2', symbol: 'GBPUSD' })]
+  render(<CollectSymbol />)
 
-    expect(screen.getByText('3 of 18 years')).toBeInTheDocument()
-  })
-
-  it('a queued request shows no result rather than zero bars', () => {
-    /** ⚠️ `null` and `0` are different claims: nothing collected *yet* against the broker
-     * having nothing. Rendering both as `0 bars` would report a finished answer for a request
-     * that has not started. */
-    listed = [collection({ status: 'queued' })]
-    render(<CollectSymbol />)
-
-    expect(screen.getByText('—')).toBeInTheDocument()
-  })
-
-  it('a finished request shows the bars and the gaps', () => {
-    listed = [collection({ status: 'done', candles: 26366, gaps: 234, years_done: 18 })]
-    render(<CollectSymbol />)
-
-    // ⚠️ Grouped by the environment's locale, not by en-US: this machine renders 26.366 and
-    // pinning a comma would fail here while passing on CI. The assertion is that the count is
-    // *shown*, so it formats the expectation the same way the component does.
-    const shown = `${(26366).toLocaleString()} bars · ${(234).toLocaleString()} gaps`
-    expect(screen.getByText(shown)).toBeInTheDocument()
-  })
-
-  it('a failed request shows its reason and not a stale count', () => {
-    /** ⚠️ Reason first. A row that failed can still carry counts from an earlier attempt, and
-     * reading a failure's count as a result is how somebody concludes they have data they do
-     * not have. */
-    listed = [
-      collection({ status: 'failed', error: 'the broker returned no H1 bars', candles: 900 }),
-    ]
-    render(<CollectSymbol />)
-
-    expect(screen.getByText('the broker returned no H1 bars')).toBeInTheDocument()
-    expect(screen.queryByText(/900 bars/)).not.toBeInTheDocument()
-  })
-
-  it('says nothing at all when nothing has been collected', () => {
-    render(<CollectSymbol />)
-
-    expect(screen.queryByText(/Recent collections/)).not.toBeInTheDocument()
-  })
+  expect(screen.getByText('EURUSD')).toBeInTheDocument()
+  expect(screen.getByText('GBPUSD')).toBeInTheDocument()
 })

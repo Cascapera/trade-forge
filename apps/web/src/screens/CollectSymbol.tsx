@@ -1,11 +1,17 @@
 import { useState } from 'react'
 
 import { ApiError } from '../api/client'
-import { useCollections, useCreateCollection, useSymbolHistory } from '../api/hooks'
-import type { AssetClass, Collection } from '../api/types'
-import { SymbolCombobox } from '../components/SymbolCombobox'
-import { SymbolHistoryNote } from '../components/SymbolHistoryNote'
-import { asDateInput, asInstant, suggestedWindow } from '../collect/window'
+import { useCollections, useCreateCollection, useSymbolHistories } from '../api/hooks'
+import type { AssetClass, BrokerSymbol, Collection } from '../api/types'
+import { SymbolMultiCombobox } from '../components/SymbolMultiCombobox'
+import {
+  asDateInput,
+  asInstant,
+  bindingFloor,
+  estimateSlices,
+  MAX_BATCH_SYMBOLS,
+  suggestedWindow,
+} from '../collect/window'
 
 const TIMEFRAMES = ['M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1', 'W1'] as const
 
@@ -15,51 +21,79 @@ const fieldClass =
   'rounded border border-slate-700 bg-slate-900 px-2 py-1 text-sm text-slate-100 focus:border-sky-500 focus:outline-none'
 
 /**
- * Fetch a symbol's history without touching the CLI.
+ * Fetch several symbols' history without touching the CLI.
  *
- * ## The three things this screen has to say and a plain form would not
+ * ## The four things this screen has to say and a plain form would not
  *
  * * **What window to open on.** Not "the last five years" — a *budget of bars*, floored by what
  *   the probe found (`collect/window.ts`). More history is not more validation, and this is the
  *   only place the two get reconciled before somebody presses a button.
- * * **Who decides the asset class.** For 24 of this broker's 84 symbols the tree path names no
- *   class the system has, and `instruments.asset_class` cannot hold "unknown". The API answers
- *   409 and this screen turns that into a field, which is the difference between a question and
- *   a wall.
- * * **Where the work is.** The row advances a year at a time on a machine this browser cannot
- *   see, and a cold year takes minutes. "3 of 5 years" is what makes the wait legible.
+ * * **Whose floor is binding.** One window covers the batch, so the **latest** floor among the
+ *   chosen symbols decides it. Opening on the earliest would buy every other symbol a stretch of
+ *   filler bars and typed spread — see `bindingFloor`.
+ * * **Who decides the asset class, per symbol.** For 24 of this broker's 84 the tree path names
+ *   no class the system has, and `instruments.asset_class` cannot hold "unknown". The API answers
+ *   409; this screen asks *before* sending, and asks per symbol — XAUUSD is a future and BTCUSD
+ *   is crypto, and one answer for the batch would have to be wrong about one of them.
+ * * **How much work this is.** Each symbol walks its own calendar years, so a batch is symbols ×
+ *   years of slices, each cold one minutes of a terminal downloading. That number belongs before
+ *   the button, not after.
  */
 export function CollectSymbol(): React.JSX.Element {
-  const [symbol, setSymbol] = useState('')
+  const [chosen, setChosen] = useState<BrokerSymbol[]>([])
+  const [classes, setClasses] = useState<Record<string, AssetClass>>({})
   const [timeframe, setTimeframe] = useState<string>('H1')
-  const [assetClass, setAssetClass] = useState<AssetClass | ''>('')
   const [touched, setTouched] = useState(false)
   const [window, setWindow] = useState({ from: '', to: '' })
 
-  const history = useSymbolHistory(symbol, timeframe)
+  const symbols = chosen.map((found) => found.symbol)
+  const histories = useSymbolHistories(symbols, timeframe)
   const create = useCreateCollection()
   const collections = useCollections()
 
   // ⚠️ The suggestion is recomputed on every render and only *adopted* while the operator has
   // not touched the dates. Writing it into state on every change would fight a person mid-edit:
-  // they widen the start, the probe result arrives, and the field snaps back under the cursor.
-  const suggested = suggestedWindow(timeframe, history.data, new Date())
+  // they widen the start, a measurement arrives, and the field snaps back under the cursor.
+  const floor = bindingFloor(histories.known.values())
+  const suggested = suggestedWindow(timeframe, floor, new Date())
   const from = touched ? window.from : asDateInput(suggested.from)
   const to = touched ? window.to : asDateInput(suggested.to)
 
-  // ⚠️ Kept as the error object rather than a boolean, so the message below can be narrowed to
-  // it. And the message read is `detail`, not `message`: `ApiError.message` is only the status
-  // code — the sentence explaining what went wrong lives in `detail`, which this project has
-  // already shipped an empty warning box over once.
-  const conflict =
-    create.error instanceof ApiError && create.error.status === CONFLICT ? create.error : null
-  const needsClass = conflict !== null && assetClass === ''
+  // Symbols the broker's filing cannot classify and nobody has answered for yet. Asked here
+  // rather than discovered from a 409, because the person who can answer is the one holding the
+  // form — and with twenty symbols the API's refusal would name a list, not a field.
+  const unanswered = chosen.filter(
+    (found) => found.asset_class_from_path === null && classes[found.symbol] === undefined,
+  )
+
+  const slices = estimateSlices(chosen.length, from, to)
+  const blocked = blockedReason({
+    chosen: chosen.length,
+    unanswered: unanswered.map((found) => found.symbol),
+    from,
+    to,
+  })
+
+  const toggle = (found: BrokerSymbol): void => {
+    create.reset()
+    setChosen((current) =>
+      current.some((each) => each.symbol === found.symbol)
+        ? current.filter((each) => each.symbol !== found.symbol)
+        : [...current, found],
+    )
+    // ⚠️ The answer goes with the symbol. Keeping it after a removal would re-apply a class
+    // somebody chose for a metal to whatever symbol next occupied that slot.
+    setClasses((current) =>
+      Object.fromEntries(Object.entries(current).filter(([symbol]) => symbol !== found.symbol)),
+    )
+  }
 
   const submit = (): void => {
     create.mutate({
-      // A batch of one. The endpoint takes up to twenty symbols over a shared window; this
-      // screen still picks one, and the multi-select that fills the list is PR 3.
-      items: [{ symbol, ...(assetClass === '' ? {} : { asset_class: assetClass }) }],
+      items: chosen.map((found) => {
+        const answered = classes[found.symbol]
+        return { symbol: found.symbol, ...(answered === undefined ? {} : { asset_class: answered }) }
+      }),
       timeframe,
       date_from: asInstant(from),
       // ⚠️ End of day, because the window is inclusive on both ends. Midnight would drop every
@@ -78,27 +112,14 @@ export function CollectSymbol(): React.JSX.Element {
       <div>
         <h2 className="text-base font-semibold">Collect history</h2>
         <p className="mt-1 text-xs text-slate-400">
-          Fetch a symbol from the broker so it can be backtested. The work runs on the machine
-          beside the terminal, one calendar year at a time.
+          Fetch symbols from the broker so they can be backtested. The work runs on the machine
+          beside the terminal, one symbol and one calendar year at a time.
         </p>
       </div>
 
-      <div className="grid grid-cols-2 gap-4 md:grid-cols-4">
-        <label className="flex flex-col gap-1 text-xs text-slate-400">
-          Symbol
-          <SymbolCombobox
-            value={symbol}
-            onChange={(next) => {
-              setSymbol(next)
-              // A different symbol is a different question: whatever class was answered for the
-              // last one says nothing about this one, and carrying it over would file a metal
-              // as whatever the currency pair before it was.
-              setAssetClass('')
-              create.reset()
-            }}
-          />
-        </label>
+      <SymbolMultiCombobox chosen={chosen} onToggle={toggle} max={MAX_BATCH_SYMBOLS} />
 
+      <div className="grid grid-cols-2 gap-4 md:grid-cols-3">
         <label className="flex flex-col gap-1 text-xs text-slate-400">
           Timeframe
           <select
@@ -143,70 +164,116 @@ export function CollectSymbol(): React.JSX.Element {
           />
         </label>
 
-        <SymbolHistoryNote symbol={symbol} timeframe={timeframe} />
-
-        {!touched && symbol !== '' && (
+        {!touched && chosen.length > 0 && (
           <p className="col-span-full text-xs text-slate-400">
-            Suggested: {suggested.bars.toLocaleString()} bars,{' '}
-            {suggested.bound === 'probe'
-              ? 'starting where the measurement says the series stops being filler and typed costs'
+            Suggested: {suggested.bars.toLocaleString()} bars per symbol,{' '}
+            {suggested.bound === 'probe' && floor !== undefined
+              ? `starting where ${floor.symbol}'s measurement says the series stops being filler and typed costs — the latest floor among the chosen symbols, so it is the one that binds`
               : 'as much as one run should carry — widen it if you want more'}
+          </p>
+        )}
+
+        {chosen.length > 0 && (
+          <p className="col-span-full text-xs text-slate-400">
+            {/* ⚠️ Slices, not a duration. The screen cannot know how long a cold year takes on
+                this broker — it varies by symbol and by how much the terminal already holds —
+                but it knows exactly how many of them are being asked for. */}
+            That is <strong className="text-slate-200">{slices.toLocaleString()}</strong> year
+            {slices === 1 ? '' : 's'} of history to fetch, one after another.
           </p>
         )}
       </div>
 
-      {needsClass && (
+      {unanswered.length > 0 && (
         <div className="space-y-2 rounded border border-amber-700 bg-amber-950/30 p-3 text-xs">
-          <p className="text-amber-300">⚠️ {reason(conflict)}</p>
-          <p className="text-slate-400">
-            The broker files this one where nothing says what it is. Pick the arithmetic it should
-            be priced with — nothing in the engine branches on this, but the catalogue cannot hold
-            &quot;unknown&quot;.
+          <p className="text-amber-300">
+            ⚠️ The broker files {unanswered.length === 1 ? 'this one' : 'these'} where nothing says
+            what {unanswered.length === 1 ? 'it is' : 'they are'}.
           </p>
-          <label className="flex items-center gap-2 text-slate-400">
-            Asset class
-            <select
-              className={fieldClass}
-              value={assetClass}
-              onChange={(event) => {
-                setAssetClass(event.target.value as AssetClass)
-              }}
+          <p className="text-slate-400">
+            Pick the arithmetic each should be priced with — nothing in the engine branches on
+            this, but the catalogue cannot hold &quot;unknown&quot;.
+          </p>
+          {unanswered.map((found) => (
+            <label
+              key={found.symbol}
+              className="flex flex-wrap items-center gap-2 text-slate-400"
+              htmlFor={`class-${found.symbol}`}
             >
-              <option value="">choose…</option>
-              {ASSET_CLASSES.map((option) => (
-                <option key={option} value={option}>
-                  {option}
-                </option>
-              ))}
-            </select>
-          </label>
+              <span className="font-mono text-slate-200">{found.symbol}</span>
+              <span className="text-slate-500">{found.path}</span>
+              <select
+                id={`class-${found.symbol}`}
+                // ⚠️ Named explicitly rather than inheriting the label's text. The label reads
+                // "XAUUSD CFDs\Metals\XAUUSD", which a screen reader would announce as the name
+                // of the control — a path, where the question is what kind of thing it is. With
+                // several of these on screen the names also have to differ from one another.
+                aria-label={`Asset class for ${found.symbol}`}
+                className={fieldClass}
+                value={classes[found.symbol] ?? ''}
+                onChange={(event) => {
+                  setClasses((current) => ({
+                    ...current,
+                    [found.symbol]: event.target.value as AssetClass,
+                  }))
+                }}
+              >
+                <option value="">choose…</option>
+                {ASSET_CLASSES.map((option) => (
+                  <option key={option} value={option}>
+                    {option}
+                  </option>
+                ))}
+              </select>
+            </label>
+          ))}
         </div>
       )}
 
-      {create.error !== null && conflict === null && (
+      {create.error !== null && (
         <p className="text-xs text-amber-300">
-          {/* Everything that is not the classification question: a 422 from a window the schema
-              refused, a 500, a network failure. `detail` when the API sent one, the message
-              otherwise — a bare "API error 422" tells nobody which field. */}
+          {/* `detail` when the API sent one, the message otherwise — a bare "API error 422"
+              tells nobody which field. */}
           ⚠️ {reason(create.error)}
         </p>
       )}
 
-      <button
-        type="button"
-        className="rounded bg-sky-600 px-3 py-1.5 text-sm font-semibold text-white disabled:bg-slate-700 disabled:text-slate-400"
-        disabled={symbol === '' || from === '' || to === '' || create.isPending}
-        onClick={submit}
-      >
-        {create.isPending ? 'Requesting…' : 'Collect'}
-      </button>
+      <div className="flex items-center gap-3">
+        <button
+          type="button"
+          className="rounded bg-sky-600 px-3 py-1.5 text-sm font-semibold text-white disabled:bg-slate-700 disabled:text-slate-400"
+          disabled={blocked !== null || create.isPending}
+          onClick={submit}
+        >
+          {create.isPending
+            ? 'Requesting…'
+            : `Collect ${String(chosen.length)} symbol${chosen.length === 1 ? '' : 's'}`}
+        </button>
+        {/* ⚠️ The reason beside the button, not instead of it. A disabled control with no
+            explanation is a dead end — the reader can see it is off and not why. */}
+        {blocked !== null && <span className="text-xs text-slate-400">{blocked}</span>}
+      </div>
 
       <CollectionList rows={collections.data ?? []} />
     </div>
   )
 }
 
-const CONFLICT = 409
+/** Why the button is off, or `null` when it is not. */
+function blockedReason(args: {
+  chosen: number
+  unanswered: readonly string[]
+  from: string
+  to: string
+}): string | null {
+  if (args.chosen === 0) return 'Choose at least one symbol.'
+  if (args.from === '' || args.to === '') return 'Set both ends of the window.'
+  if (args.to < args.from) return 'The window runs backwards.'
+  if (args.unanswered.length > 0) {
+    return `Say what ${args.unanswered.join(', ')} ${args.unanswered.length === 1 ? 'is' : 'are'}.`
+  }
+  return null
+}
 
 /**
  * What to put on screen when a request was refused.

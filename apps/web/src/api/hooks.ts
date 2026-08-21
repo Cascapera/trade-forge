@@ -464,3 +464,39 @@ export function useStudy(id: string | undefined) {
     refetchInterval: (query) => (isStudySettled(query.state.data) ? false : STUDY_POLL_MS),
   })
 }
+
+/**
+ * What has already been measured about each chosen symbol, fetched in parallel.
+ *
+ * `useQueries` for the same reason `useEquityCurves` uses it: the number of chosen symbols
+ * changes as the user picks, and hooks cannot be called conditionally. Each answer gets its own
+ * cache entry keyed by (symbol, timeframe), so re-picking a symbol is free.
+ *
+ * ⚠️ **Read-only, and a missing entry is not an error.** A symbol nobody has probed answers 404
+ * and lands here as absent — which is a fact the screen has to show ("nobody has measured this
+ * one") rather than a failure. `retry: false` keeps a 404 from being asked four times.
+ */
+export function useSymbolHistories(symbols: readonly string[], timeframe: string) {
+  return useQueries({
+    queries: symbols.map((symbol) => ({
+      queryKey: ['symbol-history', symbol, timeframe],
+      queryFn: () => api.getSymbolHistory(symbol, timeframe),
+      retry: false,
+    })),
+    combine: (results) => ({
+      // A Map rather than an array: the caller asks "what do we know about EURUSD", never
+      // "what is the third answer", and an index-keyed answer would silently shift when a
+      // symbol is removed from the middle of the list.
+      known: new Map(
+        results.flatMap((result, index) => {
+          const symbol = symbols[index]
+          return result.data !== undefined && symbol !== undefined
+            ? ([[symbol, result.data]] as [string, SymbolHistory][])
+            : []
+        }),
+      ),
+      /** Symbols whose measurement has come back one way or the other. */
+      settled: results.filter((result) => !result.isPending).length,
+    }),
+  })
+}

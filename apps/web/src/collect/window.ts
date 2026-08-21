@@ -118,3 +118,64 @@ export function asDateInput(when: Date): string {
 export function asInstant(dateInput: string, endOfDay = false): string {
   return `${dateInput}T${endOfDay ? '23:59:59' : '00:00:00'}Z`
 }
+
+/**
+ * How many calendar-year slices a window is cut into — the unit the work is actually done in.
+ *
+ * ⚠️ **Calendar years, not elapsed years.** This mirrors `collect.year_slices` on the server,
+ * which cuts at year boundaries because that is how the Parquet is partitioned. Ten months that
+ * straddle new year are two slices, not one; dividing elapsed days by 365 would say one and be
+ * wrong by a whole download.
+ *
+ * A backwards or unfinished window is **no** work rather than negative or `NaN` work. The API
+ * refuses both and the button is disabled for both, so this is only ever read mid-edit — and a
+ * negative count rendered under the form is nonsense on screen.
+ */
+export function yearSlices(from: string, to: string): number {
+  const start = Number(from.slice(0, 4))
+  const end = Number(to.slice(0, 4))
+  if (!Number.isFinite(start) || !Number.isFinite(end) || from === '' || to === '') return 0
+  return Math.max(0, end - start + 1)
+}
+
+/**
+ * The whole batch's work: one window per symbol, because each symbol is its own collection
+ * walking its own years. Twenty symbols over seventeen years is 340 slices, and each cold one
+ * is minutes of a terminal downloading — which is the number worth seeing before pressing a
+ * button, rather than after.
+ */
+export function estimateSlices(symbols: number, from: string, to: string): number {
+  return symbols * yearSlices(from, to)
+}
+
+/**
+ * Of everything measured about the chosen symbols, the one whose floor binds the batch.
+ *
+ * ⚠️ **The latest floor wins, which is the same rule `suggestedWindow` already applies between
+ * the budget and one probe.** Opening on the earliest floor would hand the batch exactly the
+ * years the probe just finished arguing are worthless — for every symbol that starts later, a
+ * stretch of invented spread and filler bars, and a set of backtests that look better for being
+ * less validated. One window for all means the weakest half decides.
+ *
+ * `undefined` when nothing has been measured yet, which `suggestedWindow` reads as "the budget
+ * is all there is to go on" and says so on screen.
+ */
+export function bindingFloor(
+  histories: Iterable<SymbolHistory>,
+): SymbolHistory | undefined {
+  let binding: SymbolHistory | undefined
+  for (const history of histories) {
+    if (history.usable_from === null) continue
+    if (binding?.usable_from == null || history.usable_from > binding.usable_from) {
+      binding = history
+    }
+  }
+  return binding
+}
+
+/**
+ * How many symbols one batch may carry. Mirrors `MAX_COLLECTION_SYMBOLS` on the API, which is
+ * the one that actually refuses — this only keeps the screen from offering what would be turned
+ * away, and says so before the request rather than after it.
+ */
+export const MAX_BATCH_SYMBOLS = 20

@@ -699,16 +699,24 @@ export interface SymbolHistory {
 /** The five classes the system has a member for. `metal` is deliberately not among them. */
 export type AssetClass = 'forex' | 'stock' | 'index' | 'future' | 'crypto'
 
-export interface CreateCollection {
+export interface CollectionItem {
   symbol: string
-  timeframe: string
-  date_from: string
-  date_to: string
   /**
    * Left out when the symbol's tree path already names the class, which it does for 60 of this
    * broker's 84 symbols. Sent only when the API asked — its absence is not a default.
+   *
+   * ⚠️ Per symbol, not per request: XAUUSD is a future and BTCUSD is crypto, and one field for
+   * the whole batch would have to file one of them as the other.
    */
   asset_class?: AssetClass
+}
+
+export interface CreateCollection {
+  /** One to twenty symbols, all sharing the timeframe and window below. */
+  items: CollectionItem[]
+  timeframe: string
+  date_from: string
+  date_to: string
 }
 
 export interface Collection {

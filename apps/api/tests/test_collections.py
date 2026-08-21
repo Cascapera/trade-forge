@@ -11,19 +11,29 @@ import uuid
 import pytest
 from pydantic import ValidationError
 
-from tradeforge_api.schemas import CollectionOut, CreateCollectionRequest
+from tradeforge_api.schemas import (
+    MAX_COLLECTION_SYMBOLS,
+    CollectionOut,
+    CreateCollectionRequest,
+)
 from tradeforge_db.models import BacktestStatus, Collection
+from tradeforge_engine.domain import AssetClass
 
 
 def request(**fields: object) -> CreateCollectionRequest:
     payload: dict[str, object] = {
-        "symbol": "EURUSD",
+        "items": [{"symbol": "EURUSD"}],
         "timeframe": "H1",
         "date_from": "2020-01-01T00:00:00Z",
         "date_to": "2021-01-01T00:00:00Z",
     }
     payload.update(fields)
     return CreateCollectionRequest.model_validate(payload)
+
+
+def items(*symbols: str) -> list[dict[str, str]]:
+    """`items` for a batch of plain symbols, none of them carrying a class."""
+    return [{"symbol": symbol} for symbol in symbols]
 
 
 class TestTheWindow:
@@ -70,16 +80,80 @@ class TestTheAssetClass:
     def test_it_is_absent_by_default_rather_than_defaulted(self) -> None:
         """⚠️ `None` means *the path already says*, and the router reads it that way. A default
         of `forex` here would file every unclassifiable CFD as a currency pair, silently."""
-        assert request().asset_class is None
+        assert request().items[0].asset_class is None
 
     def test_a_supplied_class_is_kept(self) -> None:
-        assert request(asset_class="crypto").asset_class is not None
+        parsed = request(items=[{"symbol": "BTCUSD", "asset_class": "crypto"}])
+
+        assert parsed.items[0].asset_class is not None
 
     def test_a_class_the_system_has_no_member_for_is_refused(self) -> None:
         """`metal` is what XAUUSD honestly is, and there is no such member. Refusing here is
         better than storing a string the engine's enum cannot round-trip."""
         with pytest.raises(ValidationError):
-            request(asset_class="metal")
+            request(items=[{"symbol": "XAUUSD", "asset_class": "metal"}])
+
+    def test_the_class_belongs_to_its_own_symbol_and_not_to_the_batch(self) -> None:
+        """⚠️ The reason `items` is a list of objects rather than a `symbols` list beside an
+        `asset_classes` list: two parallel arrays can fall out of step and no schema can forbid
+        it, and the symbol that then gets catalogued as the wrong kind fails silently.
+
+        XAUUSD is a future and BTCUSD is crypto; a batch-wide field would have to lie about one.
+        """
+        parsed = request(
+            items=[
+                {"symbol": "XAUUSD", "asset_class": "future"},
+                {"symbol": "BTCUSD", "asset_class": "crypto"},
+                {"symbol": "EURUSD"},
+            ]
+        )
+
+        assert [(item.symbol, item.asset_class) for item in parsed.items] == [
+            ("XAUUSD", AssetClass.FUTURE),
+            ("BTCUSD", AssetClass.CRYPTO),
+            ("EURUSD", None),
+        ]
+
+
+class TestHowManySymbols:
+    """The ceiling and the floor, each tested on both sides of the line.
+
+    ⚠️ Twenty accepted **and** twenty-one refused, one accepted **and** none refused. A test
+    that only proves the refusal cannot tell `>` from `>=`, and the off-by-one it misses is the
+    one that makes the documented limit a lie.
+    """
+
+    def test_one_symbol_is_a_batch_of_one(self) -> None:
+        """The single-symbol collection did not go away; it is the degenerate batch."""
+        assert [item.symbol for item in request().items] == ["EURUSD"]
+
+    def test_no_symbols_at_all_is_refused(self) -> None:
+        with pytest.raises(ValidationError):
+            request(items=[])
+
+    def test_the_ceiling_itself_is_accepted(self) -> None:
+        assert (
+            len(request(items=items(*(f"SYM{n:02d}" for n in range(MAX_COLLECTION_SYMBOLS)))).items)
+            == 20
+        )
+
+    def test_one_past_the_ceiling_is_refused(self) -> None:
+        """A list the client controls needs a ceiling for the same reason every numeric query
+        parameter does: without one, a single POST enqueues as many jobs as the caller likes."""
+        with pytest.raises(ValidationError):
+            request(items=items(*(f"SYM{n:02d}" for n in range(MAX_COLLECTION_SYMBOLS + 1))))
+
+    def test_the_same_symbol_twice_is_refused_rather_than_deduplicated(self) -> None:
+        """⚠️ Refused, not quietly collapsed. Two collections of EURUSD H1 over the same window
+        are the same work done twice, and a caller who sent the duplicate by accident learns
+        nothing from being silently corrected — the response would simply disagree with the
+        list they sent."""
+        with pytest.raises(ValidationError, match="EURUSD"):
+            request(items=items("EURUSD", "GBPUSD", "EURUSD"))
+
+    def test_the_refusal_names_every_repeated_symbol_not_just_the_first(self) -> None:
+        with pytest.raises(ValidationError, match="EURUSD, GBPUSD"):
+            request(items=items("EURUSD", "GBPUSD", "EURUSD", "GBPUSD"))
 
 
 class TestWhatComesBack:

@@ -1086,22 +1086,77 @@ class WalkForwardOut(_Out):
     verdict: WalkForwardVerdict
 
 
-class CreateCollectionRequest(BaseModel):
-    """Go and fetch this symbol's history for this window.
+MAX_COLLECTION_SYMBOLS = 20
+"""How many symbols one collection request may ask for.
 
-    ⚠️ **`asset_class` is optional and its absence is not a default.** It means "the symbol's
-    tree path already says", which is true for 60 of this broker's 84 symbols. For the other 24
-    — filed under `CFDs`, `Crypto Currency` or `Metals` — the path names no class among the five
-    the system has, so `POST /collections` refuses and the screen asks. Sending a class the path
-    would have decided anyway is allowed and overrides it, which is what makes a mis-filed
-    symbol fixable without a migration.
+Deliberately **not** `_MAX_SYMBOLS`, the basket's ceiling, even though both are twenty today.
+The two limits bound work of wildly different cost: twenty backtests are twenty runs of
+seconds over candles already on disk, while twenty collections of H1 since 2009 are some 350
+year slices fetched one at a time from a terminal that downloads as it answers — hours, not
+seconds. Sharing the constant would mean tuning one of them silently retunes the other.
+"""
+
+
+class CollectionItem(BaseModel):
+    """One symbol in a collection request, carrying its own class when the path cannot say.
+
+    ⚠️ **A list of these, rather than a `symbols` list beside a parallel `asset_classes` list.**
+    Parallel arrays can fall out of step — a caller removes one symbol and forgets the class at
+    the same index — and no schema can forbid it. The symbol that then gets catalogued as the
+    wrong kind of instrument fails silently, and the row looks perfectly well-formed forever.
+    A symbol and the class somebody decided for it are one fact, so they are one object.
     """
 
     symbol: Symbol
+    asset_class: AssetClass | None = None
+    """⚠️ Optional, and its absence is **not** a default. It means "the symbol's tree path
+    already says", which is true for 60 of this broker's 84 symbols. For the other 24 — filed
+    under `CFDs`, `Crypto Currency` or `Metals` — the path names no class among the five the
+    system has, so `POST /collections` refuses and the screen asks. Sending a class the path
+    would have decided anyway is allowed and overrides it, which is what makes a mis-filed
+    symbol fixable without a migration."""
+
+
+class CreateCollectionRequest(BaseModel):
+    """Go and fetch these symbols' history, all over the same window.
+
+    One timeframe and one window for the whole batch; the class is per symbol, because it is a
+    property of the symbol and not of the request (see `CollectionItem`).
+
+    ⚠️ **A batch is N independent requests, not one grouped request.** Each item becomes its own
+    `collections` row and its own queued job, exactly as N separate calls would have produced —
+    there is no parent row and no aggregate state. `baskets` groups its runs because the product
+    of a basket is the *comparison* across markets, which does not exist without the group; the
+    product of a collection is candles on disk, which has no cross-symbol answer to compute.
+
+    ⚠️ Acceptance, however, is all-or-nothing: if any item is unusable, nothing is written and
+    nothing is queued. A half-accepted batch would leave the operator reconciling which of the
+    twenty went through against a list they can no longer see.
+    """
+
+    items: list[CollectionItem] = Field(min_length=1, max_length=MAX_COLLECTION_SYMBOLS)
     timeframe: Timeframe
     date_from: dt.datetime
     date_to: dt.datetime
-    asset_class: AssetClass | None = None
+
+    @field_validator("items")
+    @classmethod
+    def _distinct(cls, items: list[CollectionItem]) -> list[CollectionItem]:
+        """The same symbol twice in one batch is the same work queued twice.
+
+        Refused rather than de-duplicated, for the same reason `CreateBasketRequest` refuses it:
+        silently returning nineteen rows for twenty requested symbols leaves the caller's own
+        list disagreeing with the response, and a client that sent a duplicate by accident
+        learns nothing from being quietly corrected.
+
+        Every repeat is named, not just the first — a caller fixing a twenty-symbol list one
+        rejection at a time is a caller the endpoint is fighting.
+        """
+        symbols = [item.symbol for item in items]
+        repeated = sorted({symbol for symbol in symbols if symbols.count(symbol) > 1})
+        if repeated:
+            raise ValueError(f"symbols must be distinct; repeated: {', '.join(repeated)}")
+        return items
 
     @field_validator("date_from", "date_to")
     @classmethod

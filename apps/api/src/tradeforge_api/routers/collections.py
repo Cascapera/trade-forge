@@ -37,51 +37,75 @@ from tradeforge_db.collections import create_collection, read_collection, recent
 router = APIRouter(tags=["collections"])
 
 
-@router.post("/collections", response_model=CollectionOut, status_code=status.HTTP_202_ACCEPTED)
+@router.post(
+    "/collections", response_model=list[CollectionOut], status_code=status.HTTP_202_ACCEPTED
+)
 async def create(
     session: SessionDep, queue: QueueDep, request: CreateCollectionRequest
-) -> CollectionOut:
-    """Accept a collection and hand back the row to watch it with.
+) -> list[CollectionOut]:
+    """Accept a batch of collections and hand back the rows to watch them with.
 
     ⚠️ **202 with a body, where the other queued endpoints answer with a job name.** `EnqueuedOut`
     carries no id because a sync's only observable result is the data it replaces, so there is
     nothing to poll. A collection is the opposite: it takes minutes, it can fail with a reason
-    worth reading, and the id below is the only way anybody finds out either.
+    worth reading, and the ids below are the only way anybody finds out either.
 
-    ⚠️ **The row is written before the job is queued, and the order is load-bearing.** Queue
+    ⚠️ **The rows are written before any job is queued, and the order is load-bearing.** Queue
     first and the agent can pick up an id that does not exist yet; a job that raced ahead of its
     own row would log "collection no longer exists" and vanish, and nothing would ever explain
-    why the screen showed nothing.
+    why the screen showed nothing. With a batch the same argument applies across the whole set,
+    so *all* the rows are committed before the *first* job goes on the queue.
+
+    ⚠️ **The batch is refused whole or accepted whole.** One unclassifiable symbol among twenty
+    rejects the request without writing anything, rather than queueing nineteen and reporting a
+    problem with the twentieth — a partially accepted batch leaves the operator reconciling what
+    went through against a list the form no longer shows.
+
+    The response keeps the order of `items`, so a caller can zip its own list against it.
     """
-    # `or ""` collapses two situations the caller cannot act on differently: the symbol is not
-    # in the snapshot at all, or it is there with no path. Neither one decides a class.
-    from_path = asset_class_from_path(symbol_path(session, request.symbol) or "")
-    if request.asset_class is None and from_path is None:
+    unclassifiable = [
+        item.symbol
+        for item in request.items
+        # `or ""` collapses two situations the caller cannot act on differently: the symbol is
+        # not in the snapshot at all, or it is there with no path. Neither one decides a class.
+        if item.asset_class is None
+        and asset_class_from_path(symbol_path(session, item.symbol) or "") is None
+    ]
+    if unclassifiable:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=(
-                f"cannot tell what kind of instrument {request.symbol} is from where the broker "
-                f"files it, so it cannot be catalogued — say which asset class it is"
+                f"cannot tell what kind of instrument {', '.join(unclassifiable)} "
+                f"{'is' if len(unclassifiable) == 1 else 'are'} from where the broker files "
+                f"{'it' if len(unclassifiable) == 1 else 'them'}, so "
+                f"{'it' if len(unclassifiable) == 1 else 'they'} cannot be catalogued — say "
+                f"which asset class {'it is' if len(unclassifiable) == 1 else 'they are'}"
             ),
         )
 
-    collection = create_collection(
-        session,
-        symbol=request.symbol,
-        timeframe=request.timeframe,
-        date_from=request.date_from,
-        date_to=request.date_to,
-        # Stored only when a person supplied it, so the row records who decided. NULL means the
-        # path did — which is the difference between provenance and a duplicated derivation.
-        asset_class=request.asset_class,
-        # Counted here rather than left to the agent: the screen renders "0 of 5 years" the
-        # instant the request lands, and "0 of 0" reads as finished.
-        years_total=len(year_slices(request.date_from, request.date_to)),
-    )
+    # Counted once for the batch: every item shares the window, so every item has the same
+    # number of year slices. Computed here rather than left to the agent so the screen renders
+    # "0 of 5 years" the instant the request lands, and "0 of 0" reads as finished.
+    years_total = len(year_slices(request.date_from, request.date_to))
+    collections = [
+        create_collection(
+            session,
+            symbol=item.symbol,
+            timeframe=request.timeframe,
+            date_from=request.date_from,
+            date_to=request.date_to,
+            # Stored only when a person supplied it, so the row records who decided. NULL means
+            # the path did — the difference between provenance and a duplicated derivation.
+            asset_class=item.asset_class,
+            years_total=years_total,
+        )
+        for item in request.items
+    ]
     session.commit()
 
-    await queue.enqueue_job(COLLECT_RANGE, str(collection.id), _queue_name=COLLECT_QUEUE)
-    return CollectionOut.model_validate(collection)
+    for collection in collections:
+        await queue.enqueue_job(COLLECT_RANGE, str(collection.id), _queue_name=COLLECT_QUEUE)
+    return [CollectionOut.model_validate(collection) for collection in collections]
 
 
 @router.get("/collections", response_model=list[CollectionOut])

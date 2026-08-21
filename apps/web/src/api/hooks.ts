@@ -123,7 +123,7 @@ export function useProbeSymbol() {
  */
 export function useCreateCollection() {
   const client = useQueryClient()
-  return useMutation<Collection, Error, CreateCollection>({
+  return useMutation<Collection[], Error, CreateCollection>({
     mutationFn: (body) => api.createCollection(body),
     onSuccess: () => {
       void client.invalidateQueries({ queryKey: ['collections'] })

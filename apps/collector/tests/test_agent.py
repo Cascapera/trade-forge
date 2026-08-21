@@ -105,6 +105,23 @@ class TestTheWorkerSettings:
     def test_it_drains_its_own_queue(self) -> None:
         assert agent.WorkerSettings.queue_name == agent.COLLECT_QUEUE
 
+    def test_it_runs_exactly_one_job_at_a_time(self) -> None:
+        """⚠️ **This is the whole answer to "do not overload the machine".**
+
+        A batch collection queues one job per symbol (PR-236), so twenty symbols is twenty jobs
+        sitting on this queue at once. Nothing throttles them anywhere else, and nothing needs
+        to: this number is what makes twenty jobs run one after another instead of together.
+
+        Raising it would not make the work faster. The terminal is a single shared IPC channel
+        and the measured cost of a cold history request is the terminal *downloading* — two
+        jobs asking at once contend for the same download. It would, however, multiply the peak
+        memory by the number of concurrent jobs, since each one holds a calendar year of bars
+        (368 000 of them at M1), and let a sync observe a half-written snapshot.
+
+        Asserted rather than trusted to the comment beside it, because a comment does not fail.
+        """
+        assert agent.WorkerSettings.max_jobs == 1
+
     def test_redis_is_a_value_and_not_something_to_call(self) -> None:
         """⚠️ **The bug this test exists for, found by starting the worker for real.**
 

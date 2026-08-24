@@ -15,8 +15,9 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from tradeforge_engine.backtest_broker import BacktestBroker
-from tradeforge_engine.costs import SpreadCostModel
+from tradeforge_engine.costs import BarSpreadCostModel, SpreadCostModel
 from tradeforge_engine.domain import (
+    Candle,
     Context,
     OrderRequest,
     OrderResult,
@@ -756,12 +757,16 @@ def test_a_limit_fills_when_a_market_entry_gapped_straight_through_its_stop() ->
     The pair below is the whole argument — identical candle, identical economics, and the only
     difference is which bar the position was born on. Blocking one and not the other would
     make the answer depend on a fact the market cannot see."""
-    gap_bar = {"open_": "1.09500", "close": "1.09150", "high": "1.09550", "low": "1.09100"}
+
+    # A function rather than a `**kwargs` dict: the dict types as `dict[str, str]`, and
+    # `Candle` has an `int` field now, so unpacking it stopped type-checking.
+    def gap_bar(index: int) -> Candle:
+        return bar(index, open_="1.09500", close="1.09150", high="1.09550", low="1.09100")
 
     born_here = _broker()
     _entry(born_here, side=Side.LONG, stop="1.09800")  # decided when price was up at 1.10000
     _limit(born_here, limit="1.09200")
-    fills = born_here.on_bar(bar(1, **gap_bar))
+    fills = born_here.on_bar(gap_bar(1))
     # the market entry and its stop both land on the open, and then the limit is free to fill
     assert [(fill.order.reason, fill.price) for fill in fills] == [
         ("sl", Decimal("1.09500")),
@@ -774,7 +779,7 @@ def test_a_limit_fills_when_a_market_entry_gapped_straight_through_its_stop() ->
     _entry(born_earlier, side=Side.LONG, stop="1.09800")
     born_earlier.on_bar(bar(1, open_="1.10000", close="1.10000", high="1.10050", low="1.09950"))
     _limit(born_earlier, limit="1.09200")
-    later = born_earlier.on_bar(bar(2, **gap_bar))
+    later = born_earlier.on_bar(gap_bar(2))
     # same candle, same answer — the limit fills at the same price either way
     assert [(fill.order.reason, fill.price) for fill in later] == [
         ("sl", Decimal("1.09500")),
@@ -2104,3 +2109,86 @@ def test_a_stop_trailed_past_the_target_leaves_the_target_in_charge() -> None:
     assert fill.order.decided_at == DECIDED  # the entry's — the target never moved
     [trade] = broker.trades()
     assert trade.r_multiple == Decimal("2.6")
+
+
+# --------------------------------------------------------------------------- #
+# ADR-0022: which bar a fill is charged against                                 #
+# --------------------------------------------------------------------------- #
+
+# A bar that fills nothing, quoting a spread nothing else in these scenarios quotes.
+#
+# ⚠️ It is load-bearing, not scenery. Without it the *first* bar the broker sees is also the bar
+# the entry fills on, so `self._seen[0]` — the oldest bar the broker still holds, and the shape
+# of every plausible "charged the wrong bar" bug — happens to be the right answer. Three of the
+# four mutants below survived until this bar existed. A scenario in which the wrong answer and
+# the right one coincide cannot separate them.
+_QUIET = {"open_": "1.10000", "close": "1.10000", "high": "1.10010", "low": "1.09990", "spread": 1}
+
+
+def _charging_broker() -> BacktestBroker:
+    """A broker that prices its fills from the bar they land on, warmed up by one quiet bar."""
+    broker = _broker(cost_model=BarSpreadCostModel(), slippage_ticks=Decimal(0))
+    broker.on_bar(bar(0, **_QUIET))  # type: ignore[arg-type]
+    return broker
+
+
+def test_a_market_entry_and_its_stop_are_charged_by_their_own_bars() -> None:
+    """ADR-0022's whole point, proved by making the two bars disagree by a factor of ten.
+
+    Nothing in the type system says *which* candle the broker hands the cost model, and every
+    wrong answer produces a believable number. Measured: this scenario reports 10 and 100, and a
+    broker charging the oldest bar it holds reports 0.50 twice — while the other 769 tests stay
+    green.
+
+    The exit's spread is the larger on purpose. A news spike on the bar that stops you out is
+    not hypothetical, and it is precisely where charging the wrong bar flatters the result.
+    """
+    broker = _charging_broker()
+    _entry(broker, side=Side.LONG, stop="1.09800")
+
+    entered = broker.on_bar(
+        bar(1, open_="1.10000", close="1.10100", high="1.10150", low="1.09950", spread=20)
+    )
+    stopped = broker.on_bar(
+        bar(2, open_="1.10100", close="1.09700", high="1.10120", low="1.09650", spread=200)
+    )
+
+    assert [fill.costs for fill in entered] == [Decimal(10)]  # half of 20, one lot, tick value 1
+    assert [(fill.order.reason, fill.costs) for fill in stopped] == [("sl", Decimal(100))]
+
+    trade = broker.trades()[0]
+    assert trade.costs == Decimal(110), "both legs were charged from one bar"
+    assert trade.net_pnl == Decimal(-310)
+    assert broker.account().equity == Decimal(9_690)
+
+
+def test_a_strategy_exit_at_the_open_is_charged_by_the_bar_it_opens_on() -> None:
+    """The other exit path: the strategy closing out, rather than a stop firing. It fills at the
+    *next* bar's open, so the bar it is charged against is not the one the decision was made
+    on — and `_check_protective`'s site being right says nothing about this one."""
+    broker = _charging_broker()
+    _entry(broker, side=Side.LONG)
+    broker.on_bar(
+        bar(1, open_="1.10000", close="1.10100", high="1.10150", low="1.09950", spread=20)
+    )
+
+    _exit(broker, side=Side.LONG)
+    closed = broker.on_bar(
+        bar(2, open_="1.10100", close="1.10200", high="1.10250", low="1.10050", spread=300)
+    )
+
+    assert [(fill.order.reason, fill.costs) for fill in closed] == [("", Decimal(150))]
+
+
+def test_a_resting_limit_is_charged_by_the_bar_it_was_reached_on() -> None:
+    """The fourth site, and the one whose bar is least obvious: a limit order outlives the bar
+    that placed it and fills *inside* a later one. The bar it is charged against is the bar the
+    market reached the level on — which may be several bars after the order was submitted."""
+    broker = _charging_broker()
+    _limit(broker, limit="1.09900")
+
+    filled = broker.on_bar(
+        bar(1, open_="1.10000", close="1.10050", high="1.10100", low="1.09850", spread=60)
+    )
+
+    assert [(fill.price, fill.costs) for fill in filled] == [(Decimal("1.09900"), Decimal(30))]

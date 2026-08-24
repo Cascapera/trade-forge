@@ -548,7 +548,7 @@ class BacktestBroker:
             # only enters while flat. Refuse rather than let the ledger raise mid-bar.
             return None
         price = self._entry_price(order.side, candle)
-        cost = self._cost_model.entry_cost(order, self._instrument, price)
+        cost = self._cost_model.entry_cost(order, self._instrument, price, candle)
         fill = Fill(order=order, time=candle.time, price=price, volume=order.volume, costs=cost)
         self._portfolio.apply(fill, snapshot=self._snapshot_through(order, candle))
         self._arm_protection(order, price)
@@ -560,7 +560,7 @@ class BacktestBroker:
             # Already stopped out this bar (step 1), so the strategy's exit has nothing to do.
             return None
         price = self._exit_price(position.side, candle)
-        cost = self._cost_model.exit_cost(order, self._instrument, price)
+        cost = self._cost_model.exit_cost(order, self._instrument, price, candle)
         fill = Fill(order=order, time=candle.time, price=price, volume=position.volume, costs=cost)
         self._portfolio.apply(fill)
         self._disarm_protection()
@@ -627,7 +627,7 @@ class BacktestBroker:
             self._resting.remove(resting)
             order = resting.order
             self._consumed.add(resting.name)
-            cost = self._cost_model.entry_cost(order, self._instrument, price)
+            cost = self._cost_model.entry_cost(order, self._instrument, price, candle)
             fill = Fill(order=order, time=candle.time, price=price, volume=order.volume, costs=cost)
             self._portfolio.apply(fill, snapshot=self._snapshot_through(order, candle))
             self._arm_protection(order, price)
@@ -710,7 +710,7 @@ class BacktestBroker:
             decided_at=(protection.stop_decided_at if reason == "sl" else protection.decided_at),
             reason=reason,
         )
-        cost = self._cost_model.exit_cost(exit_order, self._instrument, price)
+        cost = self._cost_model.exit_cost(exit_order, self._instrument, price, candle)
         fill = Fill(
             order=exit_order, time=candle.time, price=price, volume=position.volume, costs=cost
         )

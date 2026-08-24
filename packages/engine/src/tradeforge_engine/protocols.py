@@ -323,13 +323,32 @@ class CostModel(Protocol):
     `if asset_class == ...` inside the engine would spread that difference across every fill
     site in the codebase. A cost model is one object, and adding a new asset class is a new
     implementation of this protocol — not an edit to the core.
+
+    **`candle` is the bar the fill is being born on, and it is a parameter for a reason.**
+    A backtest charges a spread chosen once, in a configuration; a paper session charges the
+    spread the venue was actually quoting, which arrives on every bar (`Candle.spread`, in
+    points). That is one number that changes per fill, and there are exactly two shapes it
+    could have taken: an argument, or a field on the model that somebody updates before each
+    bar. The field is the cheaper diff and the worse design — nothing in the type system says
+    who updates it or when, and a model holding the *previous* bar's spread charges a
+    plausible number, silently, for ever. As an argument it cannot be stale: the only place a
+    `Fill` is born is inside `Broker.on_bar`, which was handed this very candle.
+
+    ⚠️ The whole candle, not `spread_points`. Naming the spread here would put "cost means
+    spread" back into the seam that exists precisely to not know that — a commission model
+    ignores it, and a model that one day charges by traded range needs the bar, not a number
+    somebody picked out of it for them.
     """
 
-    def entry_cost(self, order: OrderRequest, instrument: InstrumentSpec, price: Money) -> Money:
+    def entry_cost(
+        self, order: OrderRequest, instrument: InstrumentSpec, price: Money, candle: Candle
+    ) -> Money:
         """What it costs to open. A magnitude, never negative — the domain refuses one."""
         ...
 
-    def exit_cost(self, order: OrderRequest, instrument: InstrumentSpec, price: Money) -> Money:
+    def exit_cost(
+        self, order: OrderRequest, instrument: InstrumentSpec, price: Money, candle: Candle
+    ) -> Money:
         """What it costs to close."""
         ...
 

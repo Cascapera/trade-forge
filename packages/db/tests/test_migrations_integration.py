@@ -13,7 +13,7 @@ from collections.abc import Iterator
 import pytest
 from alembic.autogenerate import compare_metadata
 from alembic.migration import MigrationContext
-from sqlalchemy import CheckConstraint, Engine, create_engine, inspect, text
+from sqlalchemy import CheckConstraint, Engine, Enum, create_engine, inspect, text
 
 from tradeforge_db.base import Base
 from tradeforge_db.migrate import downgrade, upgrade
@@ -39,6 +39,22 @@ def test_upgrade_creates_every_table(migrated_engine: Engine) -> None:
     assert "alembic_version" in tables
 
 
+def enum_check_names() -> set[str]:
+    """The CHECK constraints Postgres holds only because a non-native `Enum` asked for it.
+
+    `models._enum` builds every enum column with `native_enum=False, create_constraint=True`,
+    so each one becomes an ordinary `CHECK (col IN (...))` named `ck_<table>_<enum name>`.
+    Derived from the metadata rather than listed, so an enum added tomorrow is covered and a
+    hand-written rule never is.
+    """
+    return {
+        f"ck_{table.name}_{column.type.name}"
+        for table in Base.metadata.tables.values()
+        for column in table.columns
+        if isinstance(column.type, Enum) and not column.type.native_enum and column.type.name
+    }
+
+
 def test_the_models_are_exactly_what_the_migration_built(migrated_engine: Engine) -> None:
     """The drift test — the strongest assertion in this package.
 
@@ -47,12 +63,59 @@ def test_the_models_are_exactly_what_the_migration_built(migrated_engine: Engine
     still passes, because the unit tests read the models; the constraint simply is not
     there in production. Here Alembic diffs the live database against the metadata, and
     an empty diff is the only acceptable answer.
+
+    ⚠️ **Enum-generated CHECKs are excluded, and only those.** Alembic 1.19 began comparing
+    CHECK constraints — which is how it found the thirty-one doubled names `rev_0013` fixed —
+    but it cannot match the constraint a non-native `Enum` produces back to the `Enum` in the
+    metadata, so it reports all ten as constraints to remove. The schema is right and the tool
+    cannot see it. The exclusion is computed from the metadata, not spelled out, so it covers
+    exactly the constraints nobody wrote by hand and stays sharp on every rule somebody did.
     """
+    ignored = enum_check_names()
+
+    def include_object(
+        obj: object, name: str | None, type_: str, reflected: bool, compare_to: object
+    ) -> bool:
+        return not (type_ == "check_constraint" and name in ignored)
+
     with migrated_engine.connect() as connection:
-        context = MigrationContext.configure(connection, opts={"compare_type": True})
+        context = MigrationContext.configure(
+            connection, opts={"compare_type": True, "include_object": include_object}
+        )
         differences = compare_metadata(context, Base.metadata)
 
     assert differences == []
+
+
+def test_the_enum_exclusion_covers_exactly_the_generated_checks(migrated_engine: Engine) -> None:
+    """A filter that silenced more than it claimed would make the drift test decorative.
+
+    So the excluded names are checked against the database twice over: every one of them is
+    really there, and none of them is a rule anybody wrote — a hand-written check would have a
+    name the metadata does not derive from an enum type.
+    """
+    ignored = enum_check_names()
+    assert ignored, "no enum checks derived at all: the derivation is wrong, not the schema"
+
+    with migrated_engine.connect() as connection:
+        present = {
+            row[0]
+            for row in connection.execute(
+                text(
+                    "SELECT c.conname FROM pg_constraint c "
+                    "JOIN pg_class t ON t.oid = c.conrelid "
+                    "JOIN pg_namespace n ON n.oid = t.relnamespace "
+                    "WHERE n.nspname = current_schema() AND c.contype = 'c'"
+                )
+            )
+        }
+
+    assert ignored <= present, f"excluded a check the database does not have: {ignored - present}"
+    hand_written = {name for name in present if name.startswith("ck_")} - ignored
+    assert len(hand_written) > 40, (
+        f"only {len(hand_written)} hand-written checks left under scrutiny; the filter is "
+        "swallowing rules it was not meant to"
+    )
 
 
 def test_the_append_only_trigger_is_installed(migrated_engine: Engine) -> None:

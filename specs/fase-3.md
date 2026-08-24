@@ -40,12 +40,27 @@ indistinguível de uma sessão que não operou. O preço aceito: a linha vira mu
 que morre deixa um trade aberto que ninguém fecha — **a reconciliação disso é do 302-C**, junto
 com a re-entrega de barras não confirmadas.
 
-⚠️ **Decisão de aquecimento (24/08, Guilherme): semear do banco.** Na subida, a sessão lê N barras
-históricas do Parquet, alimenta a estratégia com elas **sem permitir ordem**, e só então liga o
-stream em `$`. As alternativas foram recusadas: começar em `0` faz a sessão "operar" barras que já
-são história e reportar isso como live; aceitar a sessão fria cega uma EMA-20 em H4 por três dias,
-e o sintoma é indistinguível de "não achou setup". **Medir antes de escolher o N** — quantas barras
-cada setup dele realmente precisa, por indicador, não um número redondo.
+⚠️ **Decisão de aquecimento (24/08, Guilherme): semear do banco.** Na subida, a sessão lê barras
+históricas do Parquet, alimenta a estratégia com elas, e só então liga o stream em `$`. As
+alternativas foram recusadas: começar em `0` faz a sessão "operar" barras que já são história e
+reportar isso como live; aceitar a sessão fria cega uma EMA-20 em H4 por três dias, e o sintoma é
+indistinguível de "não achou setup".
+
+⚠️ **Corrigido em 24/08 pelo PR-302-C-A, e vale ler o porquê — ver `docs/adr/0023`.** A frase
+original desta decisão dizia *"alimenta a estratégia com elas **sem permitir ordem**"*. Medido, esse
+desenho **quebra a estratégia**: um setup marca a ordem armada como colocada quando *emite* o sinal,
+e o laço nunca devolve `OrderResult` — então um veto a mata depois disso e a estratégia atravessa
+acreditando ter uma limite num broker que nunca a viu. Sondado com o setup real sobre EURUSD H1
+real: **4 de 5 viradas produziram esse fantasma**, e a região nunca é operada.
+
+O aquecimento passou a ser **um backtest de verdade cujo ledger é descartado**: a sessão abre com um
+broker novo (dinheiro intocado por construção) e as ordens em repouso são re-submetidas,
+re-dimensionadas contra a conta da sessão.
+
+⚠️ **E o `N` não existe.** Medido: o aquecimento dos indicadores é calculável (com o ADX valendo
+`2 × período`, não `período`), mas o da **estrutura não tem fórmula** — a primeira CHoCH chega em 38
+barras no AUDCAD H1 e em **730** no BTCUSD H1. A sessão registra quantas barras **usou**, não
+quantas precisaria, porque a segunda não é conhecível.
 
 ## PR-303 — Execution Service + salvaguardas
 **Escopo:** `apps/executor`: consome `orders.outbound`, executa `mt5.order_send` (conta DEMO), publica `fills.inbound`; kill switch em 3 camadas (flag Redis + arquivo local + endpoint); limites locais (perda diária, volume máx., posições máx., janela de horário); `order_audit` append-only; heartbeat com política configurável.

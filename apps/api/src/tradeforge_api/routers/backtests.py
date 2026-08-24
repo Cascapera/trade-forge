@@ -253,6 +253,10 @@ async def create_backtest(
 @router.get("/backtests", response_model=BacktestsPage)
 def list_backtests(  # noqa: PLR0913 — one filter per column a run is chosen by
     session: SessionDep,
+    # Keyword-only from here. FastAPI fills these by name and nothing else calls the
+    # endpoint at all, so the `*` costs nothing and removes the question a reader would
+    # otherwise have to ask about argument order.
+    *,
     # `Annotated` rather than a `Query(...)` default: the call then lives in the annotation
     # instead of the default value, which is what FastAPI now recommends and what keeps the
     # status filter out of B008. It has to be spelled `status` on the wire and cannot be named

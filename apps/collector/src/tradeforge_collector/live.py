@@ -464,7 +464,7 @@ def _reconnect(source: LiveSource, subscriptions: Iterable[Subscription]) -> boo
     try:
         source.reconnect()
         _subscribe(source, subscriptions)
-    except Exception:  # noqa: BLE001 — anything at all here must cost a retry, never the loop
+    except Exception:  # anything at all here must cost a retry, never the loop
         logger.warning("reconnecting failed; will try again", exc_info=True)
         return False
     logger.info("reconnected")

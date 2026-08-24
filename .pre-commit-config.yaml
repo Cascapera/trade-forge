@@ -30,8 +30,13 @@ repos:
     hooks:
       - id: gitleaks
 
+  # ⚠️ Keep this in step with the `ruff` pinned in `uv.lock`. They are two installs of the same
+  # tool and they can disagree in ways no file satisfies: on the 0.15 -> 0.16 bump, 0.16 reported
+  # `RUF100` (the `noqa: BLE001` is unused) on the very lines 0.15 reported `BLE001` on. There was
+  # no version of the source that passed both. `.github/dependabot.yml` now watches this file for
+  # that reason.
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.15.21
+    rev: v0.16.4
     hooks:
       - id: ruff-check
         args: [--fix]

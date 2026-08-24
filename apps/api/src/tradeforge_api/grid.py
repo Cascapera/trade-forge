@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from itertools import product
 from typing import Any
 
-type Json = str | int | float | bool | None | list["Json"] | dict[str, "Json"]
+type Json = str | int | float | bool | list["Json"] | dict[str, "Json"] | None
 """What a strategy document is made of, spelled out.
 
 Named rather than left as `Any` because every function here *walks* a document — descending

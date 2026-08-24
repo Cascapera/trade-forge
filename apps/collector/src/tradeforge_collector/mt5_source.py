@@ -186,7 +186,7 @@ class MT5Source:
         """
         try:
             self.close()
-        except Exception:  # noqa: BLE001 — a dead terminal is precisely what this survives
+        except Exception:  # a dead terminal is precisely what this survives
             logger.debug("shutting the old connection down failed", exc_info=True)
         self.connect()
 

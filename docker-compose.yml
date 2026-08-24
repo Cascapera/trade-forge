@@ -36,7 +36,16 @@ services:
     volumes:
       # A named volume, not a bind mount: the database owns its own storage, with
       # its own uid/permissions, and does not leak files into the repo.
-      - postgres-data:/var/lib/postgresql/data
+      #
+      # ⚠️ `/var/lib/postgresql`, NOT `/var/lib/postgresql/data`. From 18 the official image
+      # stores the cluster in a major-version subdirectory (`.../18/docker`) so that
+      # `pg_upgrade --link` can work without crossing a mount boundary, and it *refuses to
+      # start* when it finds a mount at the old path — the container crash-loops with an
+      # explanation nobody reads until they look at the logs.
+      #
+      # This is the half of the 16 -> 18 upgrade that no CI run could have caught: the workflow's
+      # service container mounts no volume at all, so it never meets the question.
+      - postgres-data:/var/lib/postgresql
     healthcheck:
       # Postgres accepts TCP connections seconds before it will answer a query.
       # `pg_isready` is the difference between "the process started" and "the

@@ -59,6 +59,7 @@ from tradeforge_engine.protocols import (
 )
 from tradeforge_engine.risk import PercentRiskManager
 from tradeforge_engine.strategy import CompiledStrategy, compile_strategy
+from tradeforge_engine.warmup import HandOver, hand_over, unwarmed_indicators
 
 __all__ = [
     "EMA",
@@ -81,6 +82,7 @@ __all__ = [
     "EquityPoint",
     "EvalContext",
     "Fill",
+    "HandOver",
     "Indicator",
     "InstrumentSpec",
     "LookaheadError",
@@ -103,8 +105,10 @@ __all__ = [
     "build_indicator",
     "compile_strategy",
     "compute_metrics",
+    "hand_over",
     "iter_run",
     "run",
+    "unwarmed_indicators",
 ]
 
 __version__ = "0.1.0"

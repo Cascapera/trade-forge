@@ -70,7 +70,10 @@ jobs:
 
     services:
       postgres:
-        image: postgres:16.14-alpine
+        # ⚠️ Must match `docker-compose.yml`. Dependabot's docker-compose ecosystem does not
+        # watch this file, so a bump lands there and not here — `tests/test_service_image_pins.py`
+        # is what turns that into a red build instead of a green one that tested nothing.
+        image: postgres:18.6-alpine
         env:
           POSTGRES_DB: tradeforge
           POSTGRES_USER: tradeforge

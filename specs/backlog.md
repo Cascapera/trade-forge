@@ -777,3 +777,36 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
 
   Descoberto porque havia **dois MT5 abertos** e o agente anexou ao errado — ver o item do
   `--terminal-path`, que agora tem uma ocorrência real a favor.
+
+- [origem: subir o agente após o upgrade de Redis 8 / Postgres 18, **medido em 24/08/2026**]
+  ⚠️ **O heartbeat do agente é reescrito uma vez por hora, então não distingue "vivo" de
+  "travado" dentro dessa hora.** Irmão do item do `job_timeout` acima, e o conserto cabe na
+  mesma passada.
+
+  `WorkerSettings` não declara `health_check_interval`, então vale o default do arq: **3600 s**.
+  Medido logo após subir o agente — a chave `collect:health-check` ficou com o mesmo carimbo em
+  três amostras a 12 s de intervalo, e o `TTL` estava em 3546 contando de 3600:
+
+  ```
+  [1] Aug-24 17:09:55 j_complete=0 j_failed=0 j_retried=0 j_ongoing=0 queued=0
+  [2] Aug-24 17:09:55 ...   (12 s depois)
+  [3] Aug-24 17:09:55 ...   (24 s depois)
+  ```
+
+  **Por que isso importa mais do que parece.** O docstring de `Collection` diz que a linha existe
+  para separar "enfileirado atrás de outro job" de "ninguém está drenando". O heartbeat é o sinal
+  que deveria responder isso, e com uma hora de granularidade ele responde tarde demais para ser
+  útil: um agente que morreu às 14h05 continua com um carimbo plausível até as 15h.
+
+  ⚠️ E ele engana ativamente. Amostrando por 24 s eu li "o horário não anda" e quase declarei
+  travamento num agente perfeitamente saudável — que é o falso positivo exato que o item do
+  `job_timeout` pede para a tela evitar. Um sinal de vida que só é verdadeiro na escala de horas
+  é pior do que nenhum, porque parece um sinal de vida.
+
+  **Conserto:** declarar `health_check_interval` de propósito no `WorkerSettings` — algo na
+  ordem de 15-30 s, que é barato (uma escrita de chave) e torna o carimbo legível como
+  liveness. Fazer junto de (a) `await asyncio.to_thread(run_collection, ...)` e (b) a escolha
+  deliberada do `job_timeout`: os três são a mesma pergunta — *como alguém sabe que o agente
+  está vivo e trabalhando?* — e consertar um sem os outros deixa a resposta pela metade.
+
+  Não é regressão do upgrade: o default sempre foi 3600. Só ninguém tinha olhado.

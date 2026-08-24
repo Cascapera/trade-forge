@@ -15,6 +15,23 @@
 **Aceite:** estratégia da fase 1 roda em paper com dados ao vivo; trades persistidos idênticos em formato aos de backtest.
 **Você vai aprender:** a prova viva do ADR-01 — a MESMA classe de estratégia rodando contra outro broker; gestão de processos de longa duração.
 
+**Fatiado em A e B** (24/08/2026), como o PR-301:
+
+- **302-A — o laço que não termina** *(feito)*. `loop.iter_run()` (o laço como gerador, uma
+  `BarOutcome` por barra) + `run()` reescrito como acumulador sobre ele; `CostModel` recebendo a
+  barra do fill (ADR-0022) e o `BarSpreadCostModel`; `CandleStream`, o consumidor do stream do
+  PR-301 com ack preguiçoso. **Não existe classe `PaperBroker`**: a única diferença entre
+  backtest e paper é o custo plugado.
+- **302-B — a sessão que sobrevive**. Migration `live_sessions` (mode=paper), persistência
+  incremental dos trades com `context`, processo de sessão com start/stop, e o **aquecimento**.
+
+⚠️ **Decisão de aquecimento (24/08, Guilherme): semear do banco.** Na subida, a sessão lê N barras
+históricas do Parquet, alimenta a estratégia com elas **sem permitir ordem**, e só então liga o
+stream em `$`. As alternativas foram recusadas: começar em `0` faz a sessão "operar" barras que já
+são história e reportar isso como live; aceitar a sessão fria cega uma EMA-20 em H4 por três dias,
+e o sintoma é indistinguível de "não achou setup". **Medir antes de escolher o N** — quantas barras
+cada setup dele realmente precisa, por indicador, não um número redondo.
+
 ## PR-303 — Execution Service + salvaguardas
 **Escopo:** `apps/executor`: consome `orders.outbound`, executa `mt5.order_send` (conta DEMO), publica `fills.inbound`; kill switch em 3 camadas (flag Redis + arquivo local + endpoint); limites locais (perda diária, volume máx., posições máx., janela de horário); `order_audit` append-only; heartbeat com política configurável.
 **Aceite:** suíte com MT5 mockado cobrindo: rejeição, fill parcial, desconexão, kill switch em cada camada, limite estourado; execução real em CONTA DEMO.

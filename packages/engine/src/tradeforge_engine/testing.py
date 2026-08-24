@@ -63,15 +63,21 @@ START = dt.datetime(2024, 1, 1, tzinfo=dt.UTC)
 HOUR = dt.timedelta(hours=1)
 
 
-def bar(
+def bar(  # noqa: PLR0913 — not parameters, fields: this builds a `Candle`, which has six
     index: int,
     *,
     open_: str,
     close: str,
     high: str | None = None,
     low: str | None = None,
+    spread: int = 0,
 ) -> Candle:
-    """One candle, `index` hours after the start."""
+    """One candle, `index` hours after the start.
+
+    `spread` defaults to `0`, the same default `Candle` itself carries — a hand-built bar
+    makes no claim about what it cost to trade. `BarSpreadCostModel` refuses such a bar
+    rather than pricing it as free, so a scenario that means to charge one has to say so.
+    """
     body = [Decimal(open_), Decimal(close)]
     return Candle(
         time=START + index * HOUR,
@@ -79,6 +85,7 @@ def bar(
         high=Decimal(high) if high else max(body),
         low=Decimal(low) if low else min(body),
         close=Decimal(close),
+        spread=spread,
     )
 
 

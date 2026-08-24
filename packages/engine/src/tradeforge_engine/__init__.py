@@ -19,7 +19,12 @@ Three invariants hold here and are enforced by tests (AGENTS.md §5):
 """
 
 from tradeforge_engine.backtest_broker import BacktestBroker
-from tradeforge_engine.costs import CommissionCostModel, NoCostModel, SpreadCostModel
+from tradeforge_engine.costs import (
+    BarSpreadCostModel,
+    CommissionCostModel,
+    NoCostModel,
+    SpreadCostModel,
+)
 from tradeforge_engine.domain import (
     AccountState,
     AssetClass,
@@ -41,7 +46,7 @@ from tradeforge_engine.domain import (
 )
 from tradeforge_engine.errors import EngineError, LookaheadError
 from tradeforge_engine.indicators import EMA, SMA, build_indicator
-from tradeforge_engine.loop import RunResult, run
+from tradeforge_engine.loop import BarOutcome, RunResult, iter_run, run
 from tradeforge_engine.metrics import BacktestMetrics, compute_metrics
 from tradeforge_engine.portfolio import Portfolio
 from tradeforge_engine.protocols import (
@@ -62,6 +67,8 @@ __all__ = [
     "AssetClass",
     "BacktestBroker",
     "BacktestMetrics",
+    "BarOutcome",
+    "BarSpreadCostModel",
     "Broker",
     "Candle",
     "ClosedTrade",
@@ -96,6 +103,7 @@ __all__ = [
     "build_indicator",
     "compile_strategy",
     "compute_metrics",
+    "iter_run",
     "run",
 ]
 

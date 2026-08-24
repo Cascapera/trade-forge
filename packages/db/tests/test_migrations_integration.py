@@ -7,12 +7,13 @@ been run. In particular, `downgrade` is the half nobody exercises until the nigh
 they need it — so it is exercised here, on every push.
 """
 
+import re
 from collections.abc import Iterator
 
 import pytest
 from alembic.autogenerate import compare_metadata
 from alembic.migration import MigrationContext
-from sqlalchemy import Engine, create_engine, inspect
+from sqlalchemy import CheckConstraint, Engine, create_engine, inspect, text
 
 from tradeforge_db.base import Base
 from tradeforge_db.migrate import downgrade, upgrade
@@ -103,3 +104,76 @@ def test_downgrade_unwinds_to_nothing_and_upgrade_rebuilds_it(dsn: str) -> None:
         assert set(inspect(engine).get_table_names()) >= EXPECTED_TABLES
     finally:
         engine.dispose()
+
+
+# --------------------------------------------------------------------------- #
+# Constraint names, and the prefix that was written twice (rev_0013)            #
+# --------------------------------------------------------------------------- #
+
+# `ck_%(table_name)s_%(constraint_name)s` interpolates the name it is handed, so a migration
+# that writes the prefix itself gets it twice. This is the pattern that catches it:
+# `ck_backtests_ck_backtests_...`.
+_DOUBLED_PREFIX = re.compile(r"^(ck|uq|ix|fk)_(?P<table>\w+?)_(ck|uq|ix|fk)_(?P=table)_")
+
+
+def test_no_constraint_in_the_database_carries_its_prefix_twice(migrated_engine: Engine) -> None:
+    """The regression guard for rev_0013, stated against the database rather than the models.
+
+    ⚠️ The models could never have caught this. They declare `ck_backtests_failed_needs_error`
+    and always did; it was `rev_0001` that handed the convention a name with the prefix already
+    in it, and the database that ended up with `ck_backtests_ck_backtests_failed_needs_error`.
+    Thirty-one of them, in every database this project has ever built, invisible for a year
+    because Alembic 1.18 does not compare CHECK constraints and 1.19 does.
+    """
+    with migrated_engine.connect() as connection:
+        names = [
+            row[0]
+            for row in connection.execute(
+                text(
+                    "SELECT c.conname FROM pg_constraint c "
+                    "JOIN pg_class t ON t.oid = c.conrelid "
+                    "JOIN pg_namespace n ON n.oid = t.relnamespace "
+                    "WHERE n.nspname = current_schema() ORDER BY 1"
+                )
+            )
+        ]
+
+    assert names, "no constraints at all: the query is wrong, not the schema"
+    doubled = [name for name in names if _DOUBLED_PREFIX.match(name)]
+    assert doubled == [], f"{len(doubled)} constraint(s) carry their prefix twice: {doubled[:5]}"
+
+
+def test_the_database_and_the_models_agree_on_every_check_name(migrated_engine: Engine) -> None:
+    """The sharper half: absence of doubling is not the same as agreement.
+
+    A name could be free of the doubled pattern and still not be the one the models declare —
+    a migration that invented its own spelling, say. This compares the two sets outright, which
+    is the property `drop_constraint` depends on: the ORM's name has to be the name that is
+    actually there.
+    """
+    with migrated_engine.connect() as connection:
+        in_database = {
+            row[0]
+            for row in connection.execute(
+                text(
+                    "SELECT c.conname FROM pg_constraint c "
+                    "JOIN pg_class t ON t.oid = c.conrelid "
+                    "JOIN pg_namespace n ON n.oid = t.relnamespace "
+                    "WHERE n.nspname = current_schema() AND c.contype = 'c'"
+                )
+            )
+        }
+    # `str(...)` because SQLAlchemy types an unnamed constraint's `.name` as a sentinel, not
+    # as `str` — the `if` already excluded those, and this tells mypy so.
+    in_models = {
+        str(constraint.name)
+        for table in Base.metadata.tables.values()
+        for constraint in table.constraints
+        if isinstance(constraint, CheckConstraint) and constraint.name
+    }
+
+    # ⚠️ Only one direction is asserted. Postgres materialises a CHECK for every NOT NULL and
+    # for every non-native enum, so the database legitimately holds names the models never
+    # declared; the models holding a name the database does not is the failure.
+    missing = in_models - in_database
+    assert missing == set(), f"the models name checks the database does not have: {sorted(missing)}"

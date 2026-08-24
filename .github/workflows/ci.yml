@@ -84,7 +84,10 @@ jobs:
           --health-timeout 3s
           --health-retries 10
       redis:
-        image: redis:7.4.9-alpine
+        # ⚠️ Must match `docker-compose.yml`. Dependabot's docker-compose ecosystem does not
+        # watch this file, so a bump lands there and not here — `tests/test_service_image_pins.py`
+        # is what turns that into a red build instead of a green one that tested nothing.
+        image: redis:8.10.1-alpine
         ports: ['6379:6379']
         options: >-
           --health-cmd "redis-cli ping"

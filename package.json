@@ -17,9 +17,24 @@
     "build": "npm run build --workspaces --if-present",
     "dev": "npm run dev -w @tradeforge/web"
   },
+  "devDependenciesComment": [
+    "`vitest` and `@vitest/coverage-v8` are here, at the root, and the root runs no tests of",
+    "its own. They are hoisted on purpose, and it took two rounds to land:",
+    "1. `@testing-library/jest-dom` 7.0.1 declares vitest as an OPTIONAL peer and ships a",
+    "   `dist/vitest.mjs` that imports it at runtime. npm hoists jest-dom to the root but nests",
+    "   vitest under each workspace, because `@vitest/coverage-v8` peers on an EXACT vitest",
+    "   version — so the import resolved from the root, found nothing, and all 51 suites failed",
+    "   to load with `Cannot find package 'vitest'`.",
+    "2. Declaring vitest alone moved the failure one level down: the root vitest then could not",
+    "   find `@vitest/coverage-v8`, still nested. A shared runner needs its plugin beside it.",
+    "Keep both in step with the workspaces. The day jest-dom stops shipping that entry point,",
+    "both can go."
+  ],
   "devDependencies": {
     "@commitlint/cli": "^21.2.2",
-    "@commitlint/config-conventional": "^21.2.0"
+    "@commitlint/config-conventional": "^21.2.0",
+    "@vitest/coverage-v8": "^4.1.11",
+    "vitest": "^4.1.11"
   },
   "overridesComment": [
     "Transitive pins held ahead of what our direct dependencies ask for. Every key under",

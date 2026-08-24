@@ -10,17 +10,24 @@ import datetime as dt
 import json
 import uuid
 from decimal import Decimal
+from typing import Any
 
 import pytest
 
 from tradeforge_db.base import MONEY
 from tradeforge_db.models import ExitReason, Trade
-from tradeforge_db.results import _MONEY_QUANTUM, to_rows
+from tradeforge_db.results import (
+    _MONEY_QUANTUM,
+    close_trade_values,
+    open_trade_row,
+    to_rows,
+)
 from tradeforge_engine.domain import (
     Candle,
     ClosedTrade,
     EntrySnapshot,
     EquityPoint,
+    Position,
     Side,
     SnapshotPoint,
     SnapshotRegion,
@@ -457,3 +464,135 @@ def test_trade_money_is_rounded_to_the_column_scale() -> None:
     assert str(row.costs) == "0.42306258"
     # Not "198.66520767" — same reason as above, for `net_pnl_balances`.
     assert str(row.net_pnl) == "198.66520766"
+
+
+# --------------------------------------------------------------------------- #
+# A session that has not finished (rev_0012)                                    #
+# --------------------------------------------------------------------------- #
+
+SESSION_ID = uuid.UUID("11111111-2222-3333-4444-555555555555")
+
+
+def a_position(**overrides: object) -> Position:
+    values: dict[str, Any] = {
+        "symbol": "EURUSD",
+        "side": Side.LONG,
+        "volume": Decimal("0.5"),
+        "entry_price": Decimal("1.10000"),
+        "entry_time": START,
+        "entry_costs": Decimal("5"),
+        "stop_loss": Decimal("1.09500"),
+        "initial_stop_loss": Decimal("1.09000"),
+        "take_profit": Decimal("1.12000"),
+    }
+    values.update(overrides)
+    return Position(**values)
+
+
+def test_an_open_trade_carries_no_exit_at_all() -> None:
+    """The four exit columns arrive together or not at all. A row with, say, an `exit_time` and
+    no `net_pnl` is refused by the database — so an open position has to be all four absent,
+    not "the ones we happen to know"."""
+    row = open_trade_row(a_position(), SESSION_ID, INSTRUMENT_ID)
+
+    assert (row.exit_time, row.exit_price, row.exit_reason, row.net_pnl) == (None, None, None, None)
+    assert row.live_session_id == SESSION_ID
+    assert row.backtest_id is None
+
+
+def test_an_open_trade_records_the_stop_it_was_sized_against() -> None:
+    """⚠️ The separating test: the position's two stops differ, and only one is correct.
+
+    `Position.stop_loss` is where the stop is *now* — a trailing strategy moves it every bar
+    (ADR-0018). `initial_stop_loss` is what the lot was sized against, and it is the
+    denominator `r_multiple` divides by. Recording the moved one would make the stored risk
+    drift with the trailing, and every R afterwards would be measured against a number the
+    trade never risked. A fixture whose two stops were equal could not tell these apart.
+    """
+    row = open_trade_row(
+        a_position(stop_loss=Decimal("1.09500"), initial_stop_loss=Decimal("1.09000")),
+        SESSION_ID,
+        INSTRUMENT_ID,
+    )
+
+    assert row.stop_loss == Decimal("1.09000")
+
+
+def test_an_open_trade_keeps_the_entry_context_exactly() -> None:
+    """Same treatment as a backtest's: stringified so no `Decimal` becomes a float, and `None`
+    surviving as `None` because a warming-up indicator read nothing, which is not a zero."""
+    row = open_trade_row(
+        a_position(context={"ema9": Decimal("1.10500"), "adx": None}), SESSION_ID, INSTRUMENT_ID
+    )
+
+    assert row.context == {"ema9": "1.10500", "adx": None}
+
+
+def test_closing_sets_the_exit_and_leaves_the_entry_alone() -> None:
+    """The UPDATE payload. Anything settled at the fill must be absent from it — a close that
+    could rewrite the entry price, the volume or the stop is a close that rewrites history, and
+    the R multiple would then be reported against a stop the row no longer shows."""
+    values = close_trade_values(a_trade(reason="tp"))
+
+    assert set(values) == {
+        "exit_time",
+        "exit_price",
+        "exit_reason",
+        "take_profit",
+        "gross_pnl",
+        "costs",
+        "net_pnl",
+        "r_multiple",
+    }
+    assert "entry_price" not in values
+    assert "volume" not in values
+    assert "stop_loss" not in values
+
+
+def test_a_closed_live_trade_says_what_a_backtest_trade_would() -> None:
+    """The acceptance of PR-302-B, stated as an equality rather than as a description.
+
+    "Trades persisted identically in format to a backtest's" is not something a docstring can
+    promise. The same `ClosedTrade` goes through both translators here, and every column they
+    both write has to match — otherwise a paper session and the backtest it is supposed to
+    reproduce would disagree in the database while agreeing in the engine.
+    """
+    closed = a_trade(reason="sl")
+
+    backtest_row = map_one(closed)
+    live_values = close_trade_values(closed)
+
+    for column, value in live_values.items():
+        assert getattr(backtest_row, column) == value, f"{column} disagrees with the backtest"
+
+
+def test_the_net_of_a_live_close_balances_the_way_the_check_demands() -> None:
+    """`net_pnl = gross_pnl - costs`, derived from the two **rounded** legs rather than rounded
+    itself. Rounding the net independently is how the CHECK gets violated by a value that looks
+    right to the cent — the bug PR-235 chased into the database's edge."""
+    # ⚠️ These digits are chosen, not decorative. Measured: with `gross=100.005, costs=3.335`
+    # both readings print 96.67000000 — so a translator that simply copied the engine's net
+    # would pass, and `Decimal` equality could not see the difference anyway. The pair below is
+    # one where the two roundings genuinely disagree at the MONEY quantum (1E-8): rounding the
+    # legs gives ...02, rounding the net gives ...01. That is the whole gap the CHECK lives in.
+    #
+    # Built by hand rather than through `a_trade`, which pins costs at zero — and a trade with
+    # no costs cannot separate "derived" from "copied" at all.
+    awkward = ClosedTrade(
+        symbol="EURUSD",
+        side=Side.LONG,
+        volume=Decimal("1"),
+        entry_time=START,
+        entry_price=Decimal("1.10000"),
+        exit_time=START + HOUR,
+        exit_price=Decimal("1.10100"),
+        gross_pnl=Decimal("100.000000015"),
+        costs=Decimal("3.000000005"),
+        net_pnl=Decimal("100.000000015") - Decimal("3.000000005"),
+        reason="tp",
+    )
+    values = close_trade_values(awkward)
+
+    assert values["net_pnl"] == Decimal("97.00000002"), "the net was copied, not derived"
+
+    assert values["net_pnl"] == values["gross_pnl"] - values["costs"]

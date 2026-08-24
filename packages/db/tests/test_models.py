@@ -45,6 +45,10 @@ EXPECTED_TABLES = {
     "walk_forward_folds",
     "backtests",
     "backtest_metrics",
+    # A run that has not ended: no `date_to`, a `last_bar_time` that advances, and a status
+    # that stays `running` for days. Beside `backtests` rather than a flag on it, because the
+    # two answer different questions and a nullable half of each would answer neither.
+    "live_sessions",
     "trades",
 }
 
@@ -164,15 +168,44 @@ def test_enums_are_check_constraints_not_native_types() -> None:
     assert "'forex'" in instruments
 
 
-def test_trades_cascade_from_their_backtest_and_restrict_their_instrument() -> None:
+def test_trades_cascade_from_their_parent_and_restrict_their_instrument() -> None:
     """Delete a run and its trades go with it. Delete a symbol and the database says no.
 
     Derived data cascades; referenced history does not. Getting these two backwards is
     how a cleanup script silently deletes six months of results.
+
+    Since rev_0012 there are **two** parents a trade can have, and both cascade on the same
+    argument: the trades of a run are part of the run, whether that run finished or is still
+    going. The instrument is neither's — it is referenced history, and it restricts.
     """
     foreign_keys = {fk.column.table.name: fk.ondelete for fk in table("trades").foreign_keys}
 
-    assert foreign_keys == {"backtests": "CASCADE", "instruments": "RESTRICT"}
+    assert foreign_keys == {
+        "backtests": "CASCADE",
+        "live_sessions": "CASCADE",
+        "instruments": "RESTRICT",
+    }
+
+
+def test_a_trade_has_exactly_one_parent() -> None:
+    """Both parent columns are nullable now, so the rule that stops an orphan — or a trade
+    claiming two runs — is a CHECK and not a NOT NULL. Asserted here as well as against a real
+    Postgres, because the models are what every unit test in this package reads."""
+    trades = table("trades")
+    checks = {constraint.name for constraint in trades.constraints if constraint.name}
+
+    assert "ck_trades_exactly_one_parent" in checks
+    assert trades.c.backtest_id.nullable
+    assert trades.c.live_session_id.nullable
+
+
+def test_a_live_session_restricts_the_strategy_and_the_instrument_it_ran() -> None:
+    """Neither RESTRICT is decoration: deleting a strategy must not erase the record of it
+    having traded, which is exactly what PR-304's promotion gate reads to decide whether a
+    strategy has enough paper behind it to go real."""
+    foreign_keys = {fk.column.table.name: fk.ondelete for fk in table("live_sessions").foreign_keys}
+
+    assert foreign_keys == {"strategies": "RESTRICT", "instruments": "RESTRICT"}
 
 
 def test_metrics_are_keyed_by_their_backtest() -> None:

@@ -26,6 +26,9 @@ from tradeforge_db.models import (
     Dataset,
     ExitReason,
     Instrument,
+    LiveSession,
+    LiveSessionStatus,
+    SessionMode,
     Strategy,
     Trade,
 )
@@ -607,3 +610,197 @@ def test_re_cataloguing_a_symbol_moves_its_updated_at(session: Session) -> None:
     assert first is not None
     assert second is not None
     assert second > first, f"updated_at did not move: {first} -> {second}"
+
+
+# --------------------------------------------------------------------------- #
+# Live sessions, and a trade with exactly one parent (rev_0012)                 #
+# --------------------------------------------------------------------------- #
+
+
+def a_live_session(session: Session, **overrides: object) -> LiveSession:
+    """⚠️ The two parents are built **lazily**, only when the caller did not supply them.
+
+    Eager defaults would insert a strategy and an instrument even when the override replaced
+    them, and `uq_strategies_name_version` refuses the second "MA Cross" v1 — so a test that
+    correctly passed its own `strategy_id` still failed, on a row it never asked for.
+    """
+    values: dict[str, Any] = {
+        "strategy_id": overrides.pop("strategy_id", None) or a_strategy(session).id,
+        "instrument_id": overrides.pop("instrument_id", None) or an_instrument(session).id,
+        "timeframe": "H1",
+        "mode": SessionMode.PAPER,
+        "status": LiveSessionStatus.RUNNING,
+        "initial_capital": Decimal("10000"),
+        "cost_model": {"type": "bar_spread"},
+        "engine_version": "0.1.0",
+    }
+    values.update(overrides)
+    live = LiveSession(**values)
+    session.add(live)
+    session.flush()
+    return live
+
+
+def an_open_trade(**overrides: object) -> Trade:
+    """A live trade as it is written at the FILL: no exit yet, and that is legal.
+
+    The four exit columns arrive together or not at all (`exit_is_all_or_nothing`), so an
+    open position is *all* of them absent — which is the shape a live session persists first
+    and updates later.
+    """
+    values: dict[str, Any] = {
+        "direction": Side.LONG,
+        "entry_time": JAN,
+        "entry_price": Decimal("1.10000"),
+        "volume": Decimal("0.1"),
+    }
+    values.update(overrides)
+    return Trade(**values)
+
+
+def test_a_paper_session_records_what_it_is_running(session: Session) -> None:
+    live = a_live_session(session)
+    session.commit()
+
+    assert live.mode is SessionMode.PAPER
+    assert live.status is LiveSessionStatus.RUNNING
+    # ⚠️ NULL, not the first bar's time. A session that has completed no bar has not completed
+    # a bar, and a zero-ish default here would make a restart believe it had.
+    assert live.last_bar_time is None
+    assert live.stopped_at is None
+
+
+def test_a_real_session_is_refused_until_the_safeguards_exist(session: Session) -> None:
+    """AGENTS.md §5.7 and sdd.md §11, enforced by the database rather than by a service.
+
+    There is no kill switch, no executor and no paper-first gate yet. Until there is, turning
+    on real trading has to be a **migration** — visible, reviewed, dated — and not a value
+    somebody sets. PR-303/304 drop this constraint, and dropping it is the moment to check
+    that the safeguards are actually there.
+    """
+    with pytest.raises(IntegrityError, match="only_paper_until_safeguards_exist"):
+        # `a_live_session` flushes, so the database refuses the row inside this call.
+        a_live_session(session, mode=SessionMode.LIVE)
+
+
+def test_a_failed_session_must_say_why(session: Session) -> None:
+    with pytest.raises(IntegrityError, match="error_iff_failed"):
+        a_live_session(session, status=LiveSessionStatus.FAILED)
+
+
+def test_a_running_session_may_not_carry_an_error(session: Session) -> None:
+    """The other direction of the same `=`. Without it a session that recovered could keep the
+    message explaining why it had not, and the panel would show a healthy session reporting a
+    failure."""
+    with pytest.raises(IntegrityError, match="error_iff_failed"):
+        a_live_session(session, error="something went wrong")
+
+
+def test_a_trade_with_two_parents_is_refused(session: Session) -> None:
+    """The whole point of rev_0012. A trade attributable to a backtest *and* a live session is
+    a row nobody can attribute — and every metric that reads this table would still count it."""
+    backtest = a_backtest(session)
+    # A different strategy name: `a_strategy` defaults to "MA Cross" v1 and the table refuses
+    # a second row with that pair, so two helpers that each make their own would collide.
+    live = a_live_session(
+        session,
+        strategy_id=a_strategy(session, name="Live one").id,
+        instrument_id=backtest.instrument_id,
+    )
+
+    session.add(
+        an_open_trade(
+            backtest_id=backtest.id,
+            live_session_id=live.id,
+            instrument_id=backtest.instrument_id,
+        )
+    )
+
+    with pytest.raises(IntegrityError, match="exactly_one_parent"):
+        session.flush()
+
+
+def test_a_trade_with_no_parent_is_refused(session: Session) -> None:
+    """The half a plain nullable column would have allowed. `backtest_id` stopped being NOT
+    NULL in rev_0012, so without this CHECK an orphan trade became legal the same day."""
+    instrument = an_instrument(session)
+
+    session.add(an_open_trade(instrument_id=instrument.id))
+
+    with pytest.raises(IntegrityError, match="exactly_one_parent"):
+        session.flush()
+
+
+def test_a_live_trade_may_be_open(session: Session) -> None:
+    """The row a session writes at the FILL, before it knows how the trade ends."""
+    live = a_live_session(session)
+    session.add(an_open_trade(live_session_id=live.id, instrument_id=live.instrument_id))
+    session.commit()
+
+    trade = session.query(Trade).one()
+    assert trade.backtest_id is None
+    assert trade.live_session_id == live.id
+    assert trade.exit_time is None
+    assert trade.net_pnl is None
+
+
+def test_two_open_trades_cannot_share_a_session_and_an_entry_time(session: Session) -> None:
+    """The correlation key, enforced.
+
+    A live trade is found again by `(live_session_id, entry_time)` when it closes. The ledger
+    already refuses a second position and a bar admits one entry, so a duplicate should be
+    impossible — but *should be impossible* and *is refused* are different claims, and an
+    UPDATE matching two rows would corrupt two trades instead of failing.
+    """
+    live = a_live_session(session)
+    session.add(an_open_trade(live_session_id=live.id, instrument_id=live.instrument_id))
+    session.commit()
+
+    session.add(
+        an_open_trade(
+            live_session_id=live.id,
+            instrument_id=live.instrument_id,
+            entry_price=Decimal("1.20000"),
+        )
+    )
+
+    with pytest.raises(IntegrityError, match="uq_trades_live_session_entry"):
+        session.flush()
+
+
+def test_the_uniqueness_says_nothing_about_backtest_trades(session: Session) -> None:
+    """⚠️ The index is **partial**, and this is why it has to be.
+
+    Two backtest trades sharing an entry time is not something this PR measured or has any
+    business forbidding, and a full unique index would have made every run already on disk a
+    migration risk. Asserting the absence keeps somebody from tidying the `WHERE` away.
+    """
+    backtest = a_backtest(session)
+    for price in ("1.10000", "1.20000"):
+        session.add(
+            an_open_trade(
+                backtest_id=backtest.id,
+                instrument_id=backtest.instrument_id,
+                entry_price=Decimal(price),
+            )
+        )
+    session.commit()
+
+    assert session.query(Trade).count() == 2
+
+
+def test_deleting_a_session_takes_its_trades_with_it(session: Session) -> None:
+    """CASCADE, matching `backtest_id`: the trades of a session are part of it."""
+    live = a_live_session(session)
+    session.add(an_open_trade(live_session_id=live.id, instrument_id=live.instrument_id))
+    session.commit()
+
+    session.execute(text("DELETE FROM live_sessions WHERE id = :id"), {"id": live.id})
+    session.commit()
+
+    assert session.query(Trade).count() == 0
+
+
+def test_a_session_cannot_stop_before_it_started(session: Session) -> None:
+    with pytest.raises(IntegrityError, match="stopped_after_started"):
+        a_live_session(session, started_at=FEB, stopped_at=JAN)

@@ -98,6 +98,10 @@ _MAX_OFFSET = 9_223_372_036_854_775_807
 @router.get("/strategies", response_model=StrategiesPage)
 def list_strategies(  # noqa: PLR0913 — one query parameter per question a picker asks
     session: SessionDep,
+    # Keyword-only from here. FastAPI fills these by name and nothing else calls the
+    # endpoint at all, so the `*` costs nothing and removes the question a reader would
+    # otherwise have to ask about argument order.
+    *,
     q: Annotated[
         StorableText | None, Query(description="case-insensitive substring of the name")
     ] = None,

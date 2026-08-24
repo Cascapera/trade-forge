@@ -23,6 +23,16 @@ updates:
         patterns: ['*']
         update-types: [minor, patch]
 
+  # The hooks run ruff from their own isolated install, so a bump to `uv.lock` alone leaves two
+  # versions of the same linter in one repository. They drifted five minor releases before anyone
+  # noticed, and the notice was a contradiction: 0.16 called a `noqa` unused that 0.15 required.
+  - package-ecosystem: pre-commit
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: 'chore(deps)'
+
   - package-ecosystem: uv
     directory: /
     schedule:

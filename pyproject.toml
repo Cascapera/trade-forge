@@ -126,6 +126,15 @@ known-first-party = [
 [tool.ruff.format]
 docstring-code-format = true
 
+# ⚠️ Markdown is prose, and ruff 0.16 started formatting the Python fences inside it. Four files
+# changed on the bump that introduced it — including `sdd.md`, which AGENTS.md names as the source
+# of truth for the design, and `.claude/agents/engine-guardian.md`, which is an agent's prompt.
+# Their code blocks are illustrations: deliberately compact, sometimes not even valid Python
+# (`<arquivo>` placeholders). A formatter rewriting them is a dependency upgrade editing the
+# architecture document as a side effect, which is not a trade anybody made. Docstrings are still
+# formatted — those are code.
+exclude = ["*.md"]
+
 # --------------------------------------------------------------------------- #
 # Mypy — static types                                                           #
 # --------------------------------------------------------------------------- #

@@ -18,6 +18,10 @@ from tradeforge_db.session import create_db_engine, create_session_factory
 # makes the dependency between the tables visible where someone will read it.
 TABLES_CHILD_FIRST = (
     "trades",
+    # Before `strategies` and `instruments`, which it points at, and after `trades`, which
+    # points at it. Listed for the same reason `symbol_history` is: a session row left
+    # behind is not inert, it is a parent the next test's trades could attach to.
+    "live_sessions",
     "backtest_metrics",
     "backtests",
     "baskets",

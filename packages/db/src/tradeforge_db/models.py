@@ -86,6 +86,29 @@ class SelectionMetric(StrEnum):
     EXPECTANCY = "expectancy"
 
 
+class SessionMode(StrEnum):
+    """Paper or real, and the distinction the whole of sdd.md §11 hangs on.
+
+    ⚠️ `LIVE` exists in the enum and is **refused by a CHECK** until the safeguards do (see
+    rev_0012). The value belongs here because the domain has two modes; the constraint exists
+    because today there is no kill switch, no executor and no paper-first gate. Enabling real
+    trading is therefore a migration — visible, reviewed, dated — and not a config value.
+    """
+
+    PAPER = "paper"
+    LIVE = "live"
+
+
+class LiveSessionStatus(StrEnum):
+    """No `queued`, unlike `BacktestStatus`, and the absence is the point: a session is not
+    work handed to a queue, it is a process that either exists or does not. A row appears
+    when something is already running."""
+
+    RUNNING = "running"
+    STOPPED = "stopped"
+    FAILED = "failed"
+
+
 class ExitReason(StrEnum):
     STOP_LOSS = "sl"
     TAKE_PROFIT = "tp"
@@ -911,8 +934,15 @@ class Trade(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
 
-    backtest_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("backtests.id", ondelete="CASCADE"), nullable=False
+    # ⚠️ **Exactly one of these two is set** — the CHECK below, not a convention. Both were once
+    # one NOT NULL column; rev_0012 relaxed it, which is the migration this docstring predicted
+    # in phase 0. A trade with two parents or none is a row nobody can attribute, and every
+    # metric that reads this table would still count it.
+    backtest_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("backtests.id", ondelete="CASCADE")
+    )
+    live_session_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("live_sessions.id", ondelete="CASCADE")
     )
     instrument_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("instruments.id", ondelete="RESTRICT"), nullable=False
@@ -961,7 +991,8 @@ class Trade(Base):
         JSONB, nullable=False, server_default=text("'{}'::jsonb")
     )
 
-    backtest: Mapped[Backtest] = relationship(back_populates="trades")
+    backtest: Mapped[Backtest | None] = relationship(back_populates="trades")
+    live_session: Mapped[LiveSession | None] = relationship(back_populates="trades")
 
     __table_args__ = (
         CheckConstraint("entry_price > 0", name="entry_price_positive"),
@@ -980,6 +1011,116 @@ class Trade(Base):
         CheckConstraint("costs IS NULL OR costs >= 0", name="costs_non_negative"),
         CheckConstraint("net_pnl IS NULL OR net_pnl = gross_pnl - costs", name="net_pnl_balances"),
         Index("ix_trades_backtest_id_entry_time", "backtest_id", "entry_time"),
+        # `<>` on two booleans is XOR: exactly one parent, never both, never neither.
+        CheckConstraint(
+            "(backtest_id IS NULL) <> (live_session_id IS NULL)", name="exactly_one_parent"
+        ),
+        Index("ix_trades_live_session_id_entry_time", "live_session_id", "entry_time"),
+        # The correlation key a live writer updates by: the row is written when the trade opens
+        # and found again when it closes. The pair is unique because the ledger refuses a second
+        # position and a bar admits one entry — but "is unique" and "cannot be otherwise" are
+        # different claims, and an UPDATE that silently touched two rows would corrupt two trades
+        # instead of failing. Partial, so it asserts nothing about the backtest rows already there.
+        Index(
+            "uq_trades_live_session_entry",
+            "live_session_id",
+            "entry_time",
+            unique=True,
+            postgresql_where=text("live_session_id IS NOT NULL"),
+        ),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Live sessions — a run that has not ended                                      #
+# --------------------------------------------------------------------------- #
+
+
+class LiveSession(Base):
+    """One strategy trading forward, on live candles, in paper or (one day) for real.
+
+    **The shape differs from `Backtest` in ways that are not cosmetic.** A backtest has a
+    `date_to`: it ran over a window somebody chose, and the window is part of what the result
+    means. A session has `started_at` and a `last_bar_time` that advances — it has not ended,
+    and "how much has it seen" is a question only it can answer. A backtest's status reaches
+    `done`; a session's reaches `stopped`, which is somebody's decision rather than the data
+    running out.
+
+    ⚠️ **There is no `queued`.** A `Backtest` row exists before the work does, because the work
+    is a job handed to a queue. A session is a *process*: the row appears when something is
+    already running, and a row with nothing behind it would be a lie the panel repeats. That
+    also means a session that dies leaves a `running` row nobody updated — reconciling that is
+    PR-302-C's, and it is why `last_bar_time` exists.
+
+    **`mode` can say `live`, and the database refuses it.** See `SessionMode` and rev_0012: the
+    safeguards of sdd.md §11 do not exist yet, so real trading is gated by a CHECK rather than
+    by a service, and lifting the gate is a migration somebody has to write.
+    """
+
+    __tablename__ = "live_sessions"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+
+    strategy_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("strategies.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    instrument_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("instruments.id", ondelete="RESTRICT"), nullable=False
+    )
+    timeframe: Mapped[str] = mapped_column(TIMEFRAME, nullable=False)
+
+    mode: Mapped[SessionMode] = mapped_column(
+        _enum(SessionMode, "session_mode"), nullable=False, server_default=SessionMode.PAPER
+    )
+    status: Mapped[LiveSessionStatus] = mapped_column(
+        _enum(LiveSessionStatus, "live_session_status"),
+        nullable=False,
+        server_default=LiveSessionStatus.RUNNING,
+    )
+
+    initial_capital: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+
+    cost_model: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    """Which model priced the fills, for the reason `Backtest.cost_model` stores it.
+
+    ⚠️ A paper session runs `BarSpreadCostModel`, whose number comes from **each bar**
+    (ADR-0022) — so this records *which model was plugged in*, and the amounts it charged live
+    in the trades. A session cannot be re-explained from a single spread here, and pretending
+    otherwise is exactly the flattening this column exists to avoid.
+    """
+
+    engine_version: Mapped[str] = mapped_column(String(32), nullable=False)
+
+    last_bar_time: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    """The opening instant of the last bar the session **finished**, or NULL before the first.
+
+    ⚠️ Finished, not received. It advances after the engine has processed a bar, so a session
+    killed mid-bar leaves this pointing at the last one it completed — which is precisely what
+    a restart has to compare against the bar Redis re-delivers (`CandleStream` acknowledges
+    lazily, so an interrupted bar comes back). Recording receipt instead would make a bar that
+    was never processed look processed, and the hole would be silent.
+    """
+
+    started_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    stopped_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    error: Mapped[str | None] = mapped_column(Text)
+
+    trades: Mapped[list[Trade]] = relationship(
+        back_populates="live_session", cascade="all, delete-orphan", passive_deletes=True
+    )
+
+    __table_args__ = (
+        _timeframe_check(),
+        CheckConstraint("initial_capital > 0", name="initial_capital_positive"),
+        CheckConstraint("mode = 'paper'", name="only_paper_until_safeguards_exist"),
+        CheckConstraint(
+            "stopped_at IS NULL OR stopped_at >= started_at", name="stopped_after_started"
+        ),
+        # A session that failed says why; one that did not, does not claim to have.
+        CheckConstraint("(status = 'failed') = (error IS NOT NULL)", name="error_iff_failed"),
+        Index("ix_live_sessions_started_at", "started_at"),
     )
 
 

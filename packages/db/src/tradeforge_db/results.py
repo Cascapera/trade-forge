@@ -1,4 +1,4 @@
-"""Translate a finished engine run into the rows that persist it (sdd.md §5).
+"""Translate an engine run into the rows that persist it (sdd.md §5).
 
 The engine speaks in its own frozen dataclasses — `ClosedTrade`, `BacktestMetrics`,
 `EquityPoint` — and knows nothing about SQLAlchemy (invariant §5.4: the core is agnostic
@@ -15,6 +15,15 @@ Two properties are deliberate:
 * **Precision-preserving.** Every `Decimal` that lands in JSONB is stringified, never written
   as a JSON number. A JSON number is a float, and the exact-decimal discipline the whole
   engine runs in would be lost the instant a value round-tripped through the database as one.
+
+**A backtest reports at the end; a live session reports as it goes.** `to_rows` translates a
+finished run in one call. `open_trade_row` and `close_trade_values` translate the same domain
+objects one trade at a time, because a session that has been holding a position for three days
+has something true to say and no ending in which to say it. They live in this module rather
+than beside the session so that `_money`, `_context`, `_snapshot` and `_exit_reason` have one
+implementation — a rounding rule or an enum mapping that existed twice would agree until the
+day one of them was fixed, and the divergence would arrive as a paper trade that does not match
+the backtest it was supposed to reproduce.
 """
 
 from __future__ import annotations
@@ -25,7 +34,7 @@ from decimal import Decimal
 from typing import Any
 
 from tradeforge_db.models import BacktestMetrics, ExitReason, Trade
-from tradeforge_engine.domain import ClosedTrade, EntrySnapshot, EquityPoint
+from tradeforge_engine.domain import ClosedTrade, EntrySnapshot, EquityPoint, Position
 from tradeforge_engine.metrics import BacktestMetrics as RunMetrics
 
 # Every `ClosedTrade` carries the reason of its *exit* fill, and the engine emits exactly
@@ -249,4 +258,74 @@ def _equity_curve(curve: Sequence[EquityPoint]) -> list[dict[str, str]]:
     return [{"time": point.time.isoformat(), "equity": str(point.equity)} for point in curve]
 
 
-__all__ = ["to_rows"]
+# --------------------------------------------------------------------------- #
+# A session that has not finished: rows written as it goes                      #
+# --------------------------------------------------------------------------- #
+
+
+def open_trade_row(
+    position: Position, live_session_id: uuid.UUID, instrument_id: uuid.UUID
+) -> Trade:
+    """The row a live session writes the moment a trade **opens**.
+
+    All four exit columns are absent, which is what `exit_is_all_or_nothing` means by an open
+    position — and `close_trade_values` below is what fills them in later. The alternative,
+    writing nothing until the trade closes, would leave a session holding a position for three
+    days indistinguishable from one that never traded (`specs/fase-3.md`).
+
+    ⚠️ **`initial_stop_loss`, not `stop_loss`.** The column means *the level the position was
+    sized against*, which is what `r_multiple` divides by. A strategy that trails its stop
+    (ADR-0018) changes `Position.stop_loss` while the trade runs, so writing that one would
+    make the recorded risk drift with the trailing — and every R multiple computed afterwards
+    would be measured against a denominator the trade never risked. `ClosedTrade.stop_loss` is
+    already the initial one, so the two writes agree by construction.
+
+    ⚠️ **`context` and `snapshot` are written here and never rewritten.** They describe what the
+    strategy read *at the entry*; re-deriving them at the exit would mean asking a warmed-up
+    indicator what it thought three days ago, and it would answer with today's number.
+    """
+    return Trade(
+        live_session_id=live_session_id,
+        instrument_id=instrument_id,
+        direction=position.side,
+        entry_time=position.entry_time,
+        entry_price=position.entry_price,
+        volume=position.volume,
+        stop_loss=position.initial_stop_loss,
+        take_profit=position.take_profit,
+        context=_context(position.context),
+        snapshot=_snapshot(position.snapshot),
+    )
+
+
+def close_trade_values(trade: ClosedTrade) -> dict[str, Any]:
+    """The columns an UPDATE sets when a live trade closes, found by `(session, entry_time)`.
+
+    A mapping rather than a `Trade`, because this is the half of a row that arrives later: the
+    caller has an open row and needs the fields to overwrite, not a second object claiming to
+    be the same trade. Returning a `Trade` here would invite `session.merge`, and a merge that
+    missed the correlation would insert a duplicate instead of failing.
+
+    ⚠️ **`entry_price`, `volume` and `stop_loss` are deliberately absent.** They were settled at
+    the fill and this function must not be able to move them. A close that could rewrite the
+    entry is a close that can rewrite history — and the R multiple that `r_multiple` reports
+    would then have been computed against a stop the row no longer shows.
+
+    `net_pnl` is derived from the two **rounded** legs rather than rounded itself, so the row
+    satisfies `net_pnl_balances` by construction — the same reason `_trade_row` does it.
+    """
+    gross_pnl = _money(trade.gross_pnl)
+    costs = _money(trade.costs)
+    return {
+        "exit_time": trade.exit_time,
+        "exit_price": trade.exit_price,
+        "exit_reason": _exit_reason(trade.reason),
+        "take_profit": trade.take_profit,
+        "gross_pnl": gross_pnl,
+        "costs": costs,
+        "net_pnl": gross_pnl - costs,
+        "r_multiple": trade.r_multiple,
+    }
+
+
+__all__ = ["close_trade_values", "open_trade_row", "to_rows"]

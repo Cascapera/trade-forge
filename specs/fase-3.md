@@ -22,8 +22,23 @@
   barra do fill (ADR-0022) e o `BarSpreadCostModel`; `CandleStream`, o consumidor do stream do
   PR-301 com ack preguiçoso. **Não existe classe `PaperBroker`**: a única diferença entre
   backtest e paper é o custo plugado.
-- **302-B — a sessão que sobrevive**. Migration `live_sessions` (mode=paper), persistência
-  incremental dos trades com `context`, processo de sessão com start/stop, e o **aquecimento**.
+- **302-B — o registro** *(a fazer)*. Migration `live_sessions` (mode=paper); `trades` relaxa
+  `backtest_id` para **exatamente um de `backtest_id` / `live_session_id`** — a migration que o
+  docstring do modelo `Trade` já previa por escrito desde a fase 0; e a tradução de `BarOutcome`
+  para linha. Testável sem processo nenhum.
+- **302-C — a vida** *(a fazer)*. Processo de sessão com start/stop e o **aquecimento**.
+  ⚠️ **Não pode ser um job do arq**: o `job_timeout` é aplicado com `asyncio.wait_for`, uma sessão
+  roda por dias, e um job que bloqueia o event loop congela a fila inteira — exatamente o que a
+  PR #133 documentou. Sessão é processo próprio; a linha no banco é o registro, não o agendador.
+
+⚠️ **Decisão de persistência (24/08, Guilherme): a linha nasce na entrada.** O trade é gravado no
+FILL com as quatro colunas de saída `NULL` — o CHECK `exit_is_all_or_nothing` já permite, e o
+docstring da coluna já diz *"An open position has no exit yet"* — e é **atualizada** quando fecha.
+A alternativa (gravar só no fechamento) daria formato idêntico ao backtest por construção e linha
+imutável, mas uma sessão com posição aberta há três dias não mostraria nada, o que é
+indistinguível de uma sessão que não operou. O preço aceito: a linha vira mutável, e uma sessão
+que morre deixa um trade aberto que ninguém fecha — **a reconciliação disso é do 302-C**, junto
+com a re-entrega de barras não confirmadas.
 
 ⚠️ **Decisão de aquecimento (24/08, Guilherme): semear do banco.** Na subida, a sessão lê N barras
 históricas do Parquet, alimenta a estratégia com elas **sem permitir ordem**, e só então liga o

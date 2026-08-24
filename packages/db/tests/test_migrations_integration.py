@@ -26,6 +26,7 @@ EXPECTED_TABLES = {
     "backtests",
     "backtest_metrics",
     "trades",
+    "live_sessions",
 }
 
 

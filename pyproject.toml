@@ -202,7 +202,10 @@ addopts = [
     "--cov",
     "--cov-report=term-missing",
     "--cov-report=xml",
-    "--cov-fail-under=90",
+    # ⚠️ No floor here. Since PR-148 the 90% gate is measured over the WHOLE suite, in the
+    # only CI job that has Postgres and Redis — a live session cannot be driven without a
+    # database, and a floor applied to a bare `pytest` would fail locally while CI passed.
+    # The gate lives in `ci.yml`, spelled out where it is enforced.
     # Integration tests need real containers, so they are deselected by default:
     # `uv run pytest` must stay runnable without Docker. CI opts in explicitly
     # with `-m integration`, where a failure to reach Postgres is a red build —

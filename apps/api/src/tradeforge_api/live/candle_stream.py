@@ -164,6 +164,53 @@ class CandleStream:
             raise
         return True
 
+    def backlog(self) -> Generator[Candle, None, None]:
+        """Every bar already waiting for this consumer, oldest first, and then **stop**.
+
+        The difference from `candles()` is the ending. This one has one: it reads without
+        blocking and returns the moment a read comes back empty, so a caller can ask "what have
+        I missed?" and get an answer now rather than at the next bar.
+
+        **That question is what a session start-up is made of.** A group created at `0` is
+        offered the whole stream, and the bars in it that closed before the session opened are
+        history — they belong to the warm-up, not to the session's ledger. Telling the two apart
+        means reading them, and reading them must not stall: on H4, a blocking read with nothing
+        left to hand over would keep a session in warm-up for four hours before it ever wrote a
+        row saying it existed.
+
+        Measured against a real server rather than assumed, because the two halves of that are
+        not obvious from the docs: a group created at `0` hands back the *entire* backlog in a
+        single read and does not block while it has one (5000 entries came back in one answer,
+        in 0 ms, even with `BLOCK 60000`), and a read with no `BLOCK` on a drained stream returns
+        empty immediately.
+
+        Acknowledgement is lazy in exactly the sense `candles()` means it: a bar is confirmed
+        when the consumer comes back for the next one. Driving this to exhaustion *is* coming
+        back for a next one — the generator resumes, acks, and only then finds nothing left — so
+        a fully drained backlog leaves nothing pending. A consumer that **abandons** the drain
+        part way leaves the bar it was holding unconfirmed, which is the point: it may have died
+        holding it, and Redis must offer it again.
+        """
+        # Called here as well as in `candles()`, so the method stands on its own. A session
+        # start-up creates the group *earlier* still — before it reads history off disk — and
+        # that ordering is the splice's to own, not this method's. See `live.splice`.
+        self.ensure_group()
+
+        cursor = _PENDING
+        while True:
+            entries = self._read(cursor, blocking=False)
+
+            if not entries:
+                if cursor == _PENDING:
+                    # The pending list is drained; there may still be new bars behind it.
+                    cursor = _NEW
+                    continue
+                return
+
+            for entry_id, fields in entries:
+                yield candle_from_fields(fields)
+                self._client.xack(self._stream, self._group, entry_id)
+
     def candles(self) -> Generator[Candle, None, None]:
         """Every closed candle for this subscription, oldest first, for ever.
 
@@ -213,21 +260,26 @@ class CandleStream:
                 # design — see the docstring.
                 self._client.xack(self._stream, self._group, entry_id)
 
-    def _read(self, cursor: str) -> Sequence[tuple[str, dict[str, str]]]:
+    def _read(self, cursor: str, *, blocking: bool = True) -> Sequence[tuple[str, dict[str, str]]]:
         """One `XREADGROUP`, flattened to the entries of the single stream we asked about.
 
         redis-py answers a multi-stream question even when one stream was asked, so the shape
         is `[(stream, [(id, fields), ...])]`. Flattened here rather than at the call site so
         the loop above reads as candles instead of as a wire format.
+
+        `blocking=False` is `backlog()` asking for whatever is there right now. ⚠️ It sends **no
+        `BLOCK` clause at all**, which returns at once — not `BLOCK 0`, which in Redis means
+        *wait for ever*. The two read alike and are opposites.
         """
+        # Blocking only for new bars, and only when the caller wants to wait. Draining the
+        # pending list must not wait either way: an empty pending list is the normal case, and
+        # blocking on it would stall every clean start-up for the whole timeout.
+        block = self._block_ms if (blocking and cursor == _NEW) else None
         response = self._client.xreadgroup(
             groupname=self._group,
             consumername=self._consumer,
             streams={self._stream: cursor},
-            # Blocking only for new bars. Draining the pending list must not wait: an empty
-            # pending list is the normal case, and blocking on it would stall every clean
-            # start-up for the whole timeout.
-            block=self._block_ms if cursor == _NEW else None,
+            block=block,
         )
         if not response:
             return []

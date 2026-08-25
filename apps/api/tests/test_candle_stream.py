@@ -208,3 +208,97 @@ def test_a_session_started_now_does_not_replay_what_is_already_on_the_stream() -
     candles = stream.candles()
 
     assert next(candles) == a_candle(2), "a session started at $ was handed the backlog"
+
+
+def test_the_backlog_hands_back_what_is_waiting_and_then_ends() -> None:
+    """⚠️ **The ending is the whole difference from `candles()`.** A session start-up has to ask
+    "what have I missed?" and get an answer *now*: the bars already on the stream have to be
+    sorted into history and live before the session opens, and a read that waited would keep a
+    session in warm-up until the next bar closed — four hours, on H4, with no row anywhere
+    saying the session exists.
+    """
+    client = FakeRedisStreams(EURUSD_H1, published(EURUSD_H1, a_candle(0), a_candle(1)))
+
+    drained = list(a_stream(client).backlog())
+
+    assert [candle.time for candle in drained] == [a_candle(0).time, a_candle(1).time]
+
+
+def test_the_backlog_never_blocks() -> None:
+    """⚠️ Separating on the *fake's own record* rather than on a stopwatch. `blocked_on` is the
+    set of cursors read with a `BLOCK` clause, so this fails against an implementation that
+    drains correctly and waits while doing it — which a timing assertion on a fast double would
+    not catch.
+    """
+    client = FakeRedisStreams(EURUSD_H1, published(EURUSD_H1, a_candle(0)))
+
+    list(a_stream(client).backlog())
+
+    assert client.blocked_on == set(), "the backlog read sent a BLOCK clause"
+
+
+def test_an_empty_backlog_ends_immediately_rather_than_waiting_for_a_bar() -> None:
+    """The healthy start-up: Parquet is current and nothing is on the wire yet."""
+    client = FakeRedisStreams(EURUSD_H1, [])
+
+    assert list(a_stream(client).backlog()) == []
+    assert client.blocked_on == set()
+
+
+def test_a_fully_drained_backlog_leaves_nothing_pending() -> None:
+    """The lazy ack of `candles()`, and what it works out to when the generator has an ending.
+
+    Driving this to exhaustion *is* coming back for a next bar: the generator resumes past the
+    last `yield`, acks, and only then finds nothing left. So a completed drain confirms
+    everything — which is what makes the splice's later `candles()` start clean.
+    """
+    entries = published(EURUSD_H1, a_candle(0), a_candle(1), a_candle(2))
+    client = FakeRedisStreams(EURUSD_H1, entries)
+
+    list(a_stream(client).backlog())
+
+    assert client.acked == [entry for entry, _fields in entries]
+    assert client.pending["session"] == []
+
+
+def test_a_backlog_abandoned_part_way_leaves_the_held_bar_unconfirmed() -> None:
+    """⚠️ The separating half, and the crash-safety. A consumer that stops mid-drain may have
+    died holding that bar; confirming it would tell Redis the bar was handled and never offer
+    it again, leaving a hole nothing could notice. At least once, never at most once."""
+    entries = published(EURUSD_H1, a_candle(0), a_candle(1), a_candle(2))
+    client = FakeRedisStreams(EURUSD_H1, entries)
+
+    draining = a_stream(client).backlog()
+    next(draining)
+    next(draining)
+    draining.close()
+
+    assert client.acked == [entries[0][0]], "more than the finished bar was confirmed"
+    assert entries[1][0] in client.pending["session"], "the bar being held was confirmed"
+
+
+def test_the_backlog_offers_the_unconfirmed_bars_of_a_previous_run_first() -> None:
+    """A restarted session's pending list is history too, and it is older than anything new."""
+    entries = published(EURUSD_H1, a_candle(0), a_candle(1))
+    client = FakeRedisStreams(EURUSD_H1, entries)
+    stream = a_stream(client)
+
+    first = stream.backlog()
+    assert next(first) is not None
+    first.close()
+
+    # Nothing was acknowledged, because the consumer never asked for a second bar.
+    assert client.acked == []
+
+    assert len(list(a_stream(client).backlog())) == 2, "the unconfirmed bar was not re-offered"
+
+
+def test_the_backlog_creates_the_group_it_reads_from() -> None:
+    """It stands on its own. A session start-up creates the group earlier still — before it
+    reads history off disk — but a method that only works when something else went first is a
+    method with an undocumented prerequisite."""
+    client = FakeRedisStreams(EURUSD_H1, published(EURUSD_H1, a_candle(0)))
+    stream = CandleStream(client, EURUSD_H1, group="never-created", block_ms=10, start_id="0")
+
+    assert len(list(stream.backlog())) == 1
+    assert "never-created" in client.groups

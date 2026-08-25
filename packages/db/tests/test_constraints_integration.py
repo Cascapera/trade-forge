@@ -19,6 +19,15 @@ from sqlalchemy.exc import IntegrityError, ProgrammingError
 from sqlalchemy.orm import Session
 
 from tradeforge_db.instruments import CatalogueEntry, upsert_instruments
+from tradeforge_db.live_sessions import (
+    BEAT_EVERY,
+    STALE_AFTER,
+    beat,
+    finish_session,
+    open_session,
+    reconcile_stale,
+    running_sessions,
+)
 from tradeforge_db.models import (
     Backtest,
     BacktestMetrics,
@@ -804,3 +813,195 @@ def test_deleting_a_session_takes_its_trades_with_it(session: Session) -> None:
 def test_a_session_cannot_stop_before_it_started(session: Session) -> None:
     with pytest.raises(IntegrityError, match="stopped_after_started"):
         a_live_session(session, started_at=FEB, stopped_at=JAN)
+
+
+# --------------------------------------------------------------------------- #
+# Live sessions: liveness, and the rows nobody is writing any more (rev_0014)   #
+# --------------------------------------------------------------------------- #
+
+NOON = dt.datetime(2026, 8, 24, 12, tzinfo=dt.UTC)
+
+
+def a_session(session: Session, **overrides: Any) -> LiveSession:
+    values: dict[str, Any] = {
+        "strategy_id": overrides.pop("strategy_id", None) or a_strategy(session).id,
+        "instrument_id": overrides.pop("instrument_id", None) or an_instrument(session).id,
+        "timeframe": "H1",
+        "initial_capital": Decimal("10000"),
+        "cost_model": {"type": "bar_spread"},
+        "engine_version": "0.1.0",
+        "warmup_bars": 9804,
+        "at": NOON,
+    }
+    values.update(overrides)
+    return open_session(session, **values)
+
+
+def test_a_session_records_the_history_it_was_warmed_with(session: Session) -> None:
+    """A fact, not a plan. What is available can come back short — a gap in the series, a symbol
+    collected late — and the number worth keeping is the one the seed actually used."""
+    live = a_session(session)
+    session.commit()
+
+    assert live.warmup_bars == 9804
+    assert live.status is LiveSessionStatus.RUNNING
+    # ⚠️ NULL until the loop's first beat. A `running` row with no heartbeat is a session that
+    # died between opening and its first bar — a state to recognise, not to guess at.
+    assert live.heartbeat_at is None
+
+
+def test_a_negative_warm_up_is_refused_by_the_database(session: Session) -> None:
+    with pytest.raises(IntegrityError, match="warmup_bars_non_negative"):
+        a_session(session, warmup_bars=-1)
+
+
+def test_a_beat_moves_only_the_heartbeat(session: Session) -> None:
+    """⚠️ Deliberately not `last_bar_time`. One says the engine finished a bar, the other says
+    the process exists — and on H4 a healthy session's bar stamp is four hours old, which reads
+    exactly like a dead one."""
+    live = a_session(session)
+    live.last_bar_time = NOON - dt.timedelta(hours=4)
+    session.commit()
+
+    beat(session, live.id, at=NOON + dt.timedelta(seconds=30))
+    session.commit()
+    session.refresh(live)
+
+    assert live.heartbeat_at == NOON + dt.timedelta(seconds=30)
+    assert live.last_bar_time == NOON - dt.timedelta(hours=4), "the bar stamp moved"
+
+
+def test_a_session_that_stopped_beating_is_marked_failed(session: Session) -> None:
+    """The whole point of the module. The thing that would have marked it stopped is the thing
+    that died, so a panel reading `status` reports a session that has not existed since Tuesday.
+    """
+    live = a_session(session)
+    beat(session, live.id, at=NOON)
+    session.commit()
+
+    marked = reconcile_stale(session, now=NOON + STALE_AFTER + dt.timedelta(seconds=1))
+    session.commit()
+    session.refresh(live)
+
+    assert [row.id for row in marked] == [live.id]
+    assert live.status is LiveSessionStatus.FAILED
+    assert live.stopped_at is not None
+    assert live.error is not None
+    assert "no heartbeat since" in live.error
+
+
+def test_a_session_still_beating_is_left_alone(session: Session) -> None:
+    """⚠️ The separating half, and the boundary is one second on the safe side. Without it the
+    test above passes against a reconciliation that fails *every* running session — which would
+    kill healthy sessions on every start-up."""
+    live = a_session(session)
+    beat(session, live.id, at=NOON)
+    session.commit()
+
+    marked = reconcile_stale(session, now=NOON + STALE_AFTER - dt.timedelta(seconds=1))
+    session.commit()
+    session.refresh(live)
+
+    assert marked == []
+    assert live.status is LiveSessionStatus.RUNNING
+    assert live.error is None
+
+
+def test_a_session_that_never_beat_is_measured_from_its_start(session: Session) -> None:
+    """The state a crash at start-up leaves: `running`, no heartbeat, ever. Treating a missing
+    beat as *fresh* would leave exactly those rows marked running for ever — the sessions that
+    failed hardest would be the ones that looked healthiest."""
+    live = a_session(session)
+    session.commit()
+    assert live.heartbeat_at is None
+
+    marked = reconcile_stale(session, now=NOON + STALE_AFTER + dt.timedelta(seconds=1))
+    session.commit()
+    session.refresh(live)
+
+    assert [row.id for row in marked] == [live.id]
+    assert live.status is LiveSessionStatus.FAILED
+    assert live.error is not None
+    assert live.error.startswith("no heartbeat since")
+
+
+def test_a_session_that_never_beat_but_only_just_started_is_left_alone(session: Session) -> None:
+    """The other side of that: a session opened a second ago has not failed, it has not begun.
+    Without this, `reconcile_stale` run at start-up would kill the session that just started it."""
+    live = a_session(session)
+    session.commit()
+
+    marked = reconcile_stale(session, now=NOON + dt.timedelta(seconds=1))
+    session.commit()
+    session.refresh(live)
+
+    assert marked == []
+    assert live.status is LiveSessionStatus.RUNNING
+
+
+def test_reconciling_does_not_touch_a_session_somebody_stopped(session: Session) -> None:
+    """A stopped session has an ancient heartbeat by definition. It is not running, so it is not
+    the reconciliation's business — and re-marking it `failed` would erase the fact that somebody
+    ended it on purpose."""
+    live = a_session(session)
+    beat(session, live.id, at=NOON)
+    finish_session(session, live.id, at=NOON + dt.timedelta(minutes=1))
+    session.commit()
+
+    marked = reconcile_stale(session, now=NOON + dt.timedelta(days=7))
+    session.commit()
+    session.refresh(live)
+
+    assert marked == []
+    assert live.status is LiveSessionStatus.STOPPED
+    assert live.error is None
+
+
+def test_a_clean_stop_and_a_failure_are_different_rows(session: Session) -> None:
+    """The `error_iff_failed` CHECK makes the two inseparable at the database, so this cannot
+    record a failure with no reason or a clean stop that carries one."""
+    clean = a_session(session)
+    finish_session(session, clean.id, at=NOON + dt.timedelta(minutes=1))
+
+    # ⚠️ Same instrument. `a_session` builds one lazily and `instruments.symbol` is unique, so
+    # two sessions in one test have to be told to share — otherwise the failure is a duplicate
+    # EURUSD, which says nothing about sessions.
+    broken = a_session(
+        session,
+        strategy_id=a_strategy(session, name="Other").id,
+        instrument_id=clean.instrument_id,
+    )
+    finish_session(session, broken.id, at=NOON + dt.timedelta(minutes=1), error="MT5 went away")
+    session.commit()
+
+    assert clean.status is LiveSessionStatus.STOPPED
+    assert clean.error is None
+    assert broken.status is LiveSessionStatus.FAILED
+    assert broken.error == "MT5 went away"
+
+
+def test_reconciling_marks_every_stale_session_not_just_the_first(session: Session) -> None:
+    """⚠️ A loop with no more than one row to walk is a loop with no proof. Two sessions, both
+    silent, and a reconciliation that returned after the first would leave the second `running`
+    for ever."""
+    first = a_session(session)
+    second = a_session(
+        session,
+        strategy_id=a_strategy(session, name="Second").id,
+        instrument_id=first.instrument_id,
+    )
+    session.commit()
+
+    marked = reconcile_stale(session, now=NOON + dt.timedelta(days=1))
+    session.commit()
+
+    assert {row.id for row in marked} == {first.id, second.id}
+    assert running_sessions(session) == []
+
+
+def test_the_stale_window_is_a_multiple_of_the_beat() -> None:
+    """The two numbers are one decision. A `STALE_AFTER` that stopped being a multiple of
+    `BEAT_EVERY` would mean a session declared dead after fewer missed beats than anyone
+    intended — and the change would be invisible, because both are plain constants."""
+    assert STALE_AFTER == BEAT_EVERY * 4
+    assert BEAT_EVERY < STALE_AFTER

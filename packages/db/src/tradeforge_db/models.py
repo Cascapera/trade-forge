@@ -1101,10 +1101,36 @@ class LiveSession(Base):
     was never processed look processed, and the hole would be silent.
     """
 
+    warmup_bars: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    """How much history the session was driven over before it opened. A fact, not a plan.
+
+    ⚠️ **Not "was it ready".** Indicator warm-up is calculable — with `ADX` needing twice its
+    period, not once — but structure warm-up has no formula at all: measured on this project's
+    own data, the first CHoCH arrives after 38 bars on AUDCAD H1 and after **730** on BTCUSD H1.
+    There is no `N`, so there is no "enough" to store. Seeding takes everything available, which
+    measured at 38 s for a year of M1 and under a second for H1 — cheap enough that no cap earns
+    its complexity, and cheap enough that this number is simply "what there was".
+    """
+
     started_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
     stopped_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+
+    heartbeat_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    """The last time the process said it was alive. NULL before the loop starts.
+
+    ⚠️ **`last_bar_time` cannot answer this**, which is the whole reason the column exists. A
+    session on H4 finishes a bar every four hours, so a four-hour-old stamp is indistinguishable
+    from a dead process — and `status` stays `running` for ever, because the thing that would
+    change it is the thing that died.
+
+    The collector agent already has that failure: arq's health check defaults to 3600 s and does
+    not move when a job completes, so a frozen reading means nothing within the hour
+    (`specs/backlog.md`). A liveness signal that is only true on the scale of hours is worse than
+    none, because it *looks* like a liveness signal.
+    """
+
     error: Mapped[str | None] = mapped_column(Text)
 
     trades: Mapped[list[Trade]] = relationship(
@@ -1120,6 +1146,7 @@ class LiveSession(Base):
         ),
         # A session that failed says why; one that did not, does not claim to have.
         CheckConstraint("(status = 'failed') = (error IS NOT NULL)", name="error_iff_failed"),
+        CheckConstraint("warmup_bars >= 0", name="warmup_bars_non_negative"),
         Index("ix_live_sessions_started_at", "started_at"),
     )
 

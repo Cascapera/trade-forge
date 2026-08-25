@@ -8,14 +8,19 @@ session, truncated to a known state before each test.
 from collections.abc import Callable, Iterator
 
 import pytest
-from sqlalchemy import Engine, text
+from sqlalchemy import Engine
 from sqlalchemy.orm import Session
 
 from tradeforge_api.config import Settings
 from tradeforge_db.migrate import upgrade
 from tradeforge_db.session import create_db_engine, create_session_factory
+from tradeforge_db.testing import truncate
 
 TABLES_CHILD_FIRST = (
+    # ⚠️ Append-only, and the only table here whose trigger has to be lifted to empty it
+    # at all — see `tradeforge_db.testing.truncate`. Listed because a row left behind is
+    # a parent the next test could attach to, exactly like `live_sessions`.
+    "order_audit",
     "trades",
     # ⚠️ Before `strategies` and `instruments`, which it points at, and after `trades`, which
     # points at it. Missing here until the first API test wrote one — `packages/db`'s copy has
@@ -66,9 +71,7 @@ def session_factory(migrated_engine: Engine) -> Callable[[], Session]:
     """A session factory over an emptied database. Truncating before the test means a failure
     leaves its rows behind to inspect, and the next test still starts from nothing."""
     with migrated_engine.begin() as connection:
-        connection.execute(
-            text(f"TRUNCATE {', '.join(TABLES_CHILD_FIRST)} RESTART IDENTITY CASCADE")
-        )
+        truncate(connection, TABLES_CHILD_FIRST)
     return create_session_factory(migrated_engine)
 
 

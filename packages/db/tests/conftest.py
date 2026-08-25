@@ -7,16 +7,21 @@ for them, so `uv run pytest` still runs with no Docker anywhere.
 from collections.abc import Iterator
 
 import pytest
-from sqlalchemy import Engine, text
+from sqlalchemy import Engine
 from sqlalchemy.orm import Session
 
 from tradeforge_db.config import PostgresSettings
 from tradeforge_db.migrate import upgrade
 from tradeforge_db.session import create_db_engine, create_session_factory
+from tradeforge_db.testing import truncate
 
 # Children first: TRUNCATE ... CASCADE would do this for us, but naming the order
 # makes the dependency between the tables visible where someone will read it.
 TABLES_CHILD_FIRST = (
+    # ⚠️ Append-only, and the only table here whose trigger has to be lifted to empty it
+    # at all — see `tradeforge_db.testing.truncate`. Listed because a row left behind is
+    # a parent the next test could attach to, exactly like `live_sessions`.
+    "order_audit",
     "trades",
     # Before `strategies` and `instruments`, which it points at, and after `trades`, which
     # points at it. Listed for the same reason `symbol_history` is: a session row left
@@ -65,9 +70,7 @@ def session(migrated_engine: Engine) -> Iterator[Session]:
     be inspected — and the next test still starts from a known state.
     """
     with migrated_engine.begin() as connection:
-        connection.execute(
-            text(f"TRUNCATE {', '.join(TABLES_CHILD_FIRST)} RESTART IDENTITY CASCADE")
-        )
+        truncate(connection, TABLES_CHILD_FIRST)
 
     db = create_session_factory(migrated_engine)()
     try:

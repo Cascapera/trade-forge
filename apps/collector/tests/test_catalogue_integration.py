@@ -14,7 +14,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
-from sqlalchemy import Engine, select, text
+from sqlalchemy import Engine, select
 from sqlalchemy.orm import Session
 
 from tradeforge_collector.backfill import backfill
@@ -23,6 +23,7 @@ from tradeforge_db.config import PostgresSettings
 from tradeforge_db.migrate import upgrade
 from tradeforge_db.models import Dataset, Instrument
 from tradeforge_db.session import create_db_engine, create_session_factory
+from tradeforge_db.testing import truncate
 
 pytestmark = pytest.mark.integration
 
@@ -45,7 +46,10 @@ def engine() -> Iterator[Engine]:
 @pytest.fixture
 def session(engine: Engine) -> Iterator[Session]:
     with engine.begin() as connection:
-        connection.execute(text("TRUNCATE datasets, instruments RESTART IDENTITY CASCADE"))
+        # ⚠️ Through the shared helper, not a bare statement. `CASCADE` from `instruments`
+        # reaches `order_audit`, whose trigger refuses TRUNCATE and aborts the whole thing —
+        # measured, after this file started failing in its fixture.
+        truncate(connection, ("datasets", "instruments"))
 
     db = create_session_factory(engine)()
     try:

@@ -99,6 +99,38 @@ class SessionMode(StrEnum):
     LIVE = "live"
 
 
+class OrderAuditStatus(StrEnum):
+    """What became of one order. Every value is an **outcome**, never a stage.
+
+    ⚠️ There is no `requested`. `sdd.md` §5 sketched one, and a row saying "I picked this up"
+    would have to be *updated* when the outcome arrived — which the append-only trigger forbids,
+    and rightly: a mutable audit row is one somebody can quietly correct. So a row is written
+    once, when its outcome is known, and the picking-up is recorded as `requested_at` on that
+    same row.
+
+    ⚠️ `REFUSED` and `ERROR` are kept apart because their remedies are opposites. Refused is this
+    machine's own safeguards working — the switch, a cap, the window — and the response is to
+    look at the rule. Error is the venue or the terminal failing, and the response is to look at
+    MT5. A single "did not happen" would send every investigation to the wrong place half the
+    time.
+    """
+
+    SENT = "sent"
+    """Accepted by MT5. What it does next arrives as a fill, not here."""
+
+    FILLED = "filled"
+    PARTIAL = "partial"
+    """⚠️ Its own value, not a `filled` with a smaller number. A partial fill leaves the rest of
+    the order somewhere, and reading it as filled is how a position ends up half the size a
+    strategy believes it has."""
+
+    REFUSED = "refused"
+    """Stopped here, by this machine's own rules. `reason` names which."""
+
+    ERROR = "error"
+    """MT5 refused it, or could not be reached. `response` carries what it said."""
+
+
 class LiveSessionStatus(StrEnum):
     """No `queued`, unlike `BacktestStatus`, and the absence is the point: a session is not
     work handed to a queue, it is a process that either exists or does not. A row appears
@@ -1384,4 +1416,83 @@ class WalkForwardFold(Base):
             "test_backtest_id IS NULL OR chosen_strategy_id IS NOT NULL",
             name="test_run_implies_a_choice",
         ),
+    )
+
+
+class OrderAudit(Base):
+    """Every order the executor was asked to send, and what became of it. **Append-only.**
+
+    The one table in this schema that exists for a reader who does not trust the others. When a
+    real account loses money the questions are "what was asked for", "what was actually sent",
+    "what did the venue say" and "when" — and every one of them is unanswerable from `trades`,
+    which records the round trips that *worked*. A refused order leaves no trade at all, and a
+    refusal is exactly what somebody investigating needs to see.
+
+    ⚠️ **Append-only is enforced by the database, not by discipline** (rev_0015). A trigger
+    refuses `UPDATE` and `DELETE` outright. An audit trail that depends on nobody making a
+    mistake is not an audit trail: the value of this table is precisely that it cannot be tidied
+    up afterwards, including by the person who has the most reason to want to.
+
+    ⚠️ **The session may be NULL.** An order refused before a session existed — a kill switch
+    engaged at start-up — still has to be recorded, and a foreign key that forced a parent would
+    make the executor choose between writing a false one and writing nothing.
+    """
+
+    __tablename__ = "order_audit"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+
+    live_session_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("live_sessions.id", ondelete="RESTRICT"), index=True
+    )
+    """⚠️ `RESTRICT`, not `CASCADE`. Deleting a session must not take its audit trail with it —
+    that is the one deletion an audit trail exists to survive."""
+
+    client_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    """The name the strategy gave the order (ADR-0014). What correlates a request to a fill
+    across three processes, and the only handle an investigator has that spans them."""
+
+    status: Mapped[OrderAuditStatus] = mapped_column(
+        _enum(OrderAuditStatus, "order_audit_status"), nullable=False
+    )
+
+    request: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    """What was asked for, verbatim, as it arrived off the queue.
+
+    ⚠️ Stored whole rather than projected into columns. A projection records the fields somebody
+    thought of; the question an incident asks is almost always about a field nobody thought of.
+    """
+
+    response: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    """What MT5 answered, verbatim. NULL when nothing was sent — a refusal never reached it."""
+
+    reason: Mapped[str | None] = mapped_column(Text)
+    """Why, when the answer is a refusal. Names the rule (`safety.Verdict.reason`).
+
+    ⚠️ NULL and empty are different statements here. NULL is "no refusal happened"; a string is
+    the rule that refused. Collapsing them would make a successful order and an unexplained
+    refusal read the same.
+    """
+
+    requested_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    """When the executor took the order off the queue. Its own clock, not the core's."""
+
+    resolved_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    """When it stopped being in flight — sent, filled, refused or errored.
+
+    NULL means a row written the instant the order was picked up and never updated, which
+    **cannot happen** while the trigger stands: this table has no updates. A row is written once,
+    when its outcome is already known, and a second row is written for a second outcome.
+    """
+
+    __table_args__ = (
+        CheckConstraint(
+            "(reason IS NULL) <> (status IN ('refused', 'error'))",
+            name="a_refusal_says_why",
+        ),
+        CheckConstraint(
+            "resolved_at IS NULL OR resolved_at >= requested_at",
+            name="audit_resolves_after_it_is_requested",
+        ),
+        Index("ix_order_audit_requested_at", "requested_at"),
     )

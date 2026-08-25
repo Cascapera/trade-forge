@@ -35,6 +35,7 @@ __all__ = [
     "STALE_AFTER",
     "beat",
     "finish_session",
+    "is_stale",
     "open_session",
     "reconcile_stale",
     "running_sessions",
@@ -153,12 +154,34 @@ def silence(
     heartbeat as *fresh* would leave exactly the sessions that died at start-up marked `running`
     for ever: the ones that failed hardest would look the healthiest.
 
-    Pure, and separate from `reconcile_stale`, for two reasons. It is where the off-by-one
-    lives, so it deserves tests that run in milliseconds and do not need a database. And the
-    coverage gate does not count integration tests (`ci.yml`), so a decision reachable only
-    through Postgres reads as uncovered — which is how a rule this small ends up unmeasured.
+    A duration, and nothing more — the *decision* about that duration is `is_stale`. Keeping
+    them apart means the number can be reported ("silent for 3m20s") by callers that are not
+    asking whether to kill anything.
     """
     return now - (heartbeat_at or started_at)
+
+
+def is_stale(
+    *,
+    heartbeat_at: dt.datetime | None,
+    started_at: dt.datetime,
+    now: dt.datetime,
+    stale_after: dt.timedelta = STALE_AFTER,
+) -> bool:
+    """Whether a session has been silent long enough to be called dead. **The boundary is here.**
+
+    Silent for *exactly* `stale_after` is stale: the comparison is `>=`. Neither reading is
+    obviously right from the name, which is why it is one function with one test rather than a
+    `<` inlined in a loop.
+
+    ⚠️ Pure, and separate from `reconcile_stale`, which is the whole point. This is where the
+    off-by-one lives, and `reconcile_stale` needs Postgres to run — so a boundary left inline
+    there can only be tested through a database, and the coverage gate deselects integration
+    tests (`ci.yml` runs plain `pytest` with a 90% floor). That is not hypothetical: the test
+    that was meant to pin this boundary had nothing to call, so it wrote the comparison out in
+    its own body and pinned itself instead. A `<` → `<=` mutant survived both suites.
+    """
+    return silence(heartbeat_at=heartbeat_at, started_at=started_at, now=now) >= stale_after
 
 
 def reconcile_stale(
@@ -181,7 +204,12 @@ def reconcile_stale(
     marked: list[LiveSession] = []
     for row in running_sessions(session):
         heard = row.heartbeat_at or row.started_at
-        if silence(heartbeat_at=row.heartbeat_at, started_at=row.started_at, now=now) < stale_after:
+        if not is_stale(
+            heartbeat_at=row.heartbeat_at,
+            started_at=row.started_at,
+            now=now,
+            stale_after=stale_after,
+        ):
             continue
         row.status = LiveSessionStatus.FAILED
         row.stopped_at = now

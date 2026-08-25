@@ -907,6 +907,45 @@ def test_a_session_still_beating_is_left_alone(session: Session) -> None:
     assert live.error is None
 
 
+def test_a_session_silent_for_exactly_the_window_is_already_stale(session: Session) -> None:
+    """⚠️ The boundary itself, walked by the real reconciliation. The tests either side of this
+    one use `STALE_AFTER ± 1s`, where `<` and `<=` give the same answer — so the exact frontier
+    never reached `reconcile_stale`, and a `<` → `<=` mutant survived every suite in the repo.
+
+    `is_stale` now pins the comparison without a database (`test_live_sessions.py`). This proves
+    the walk actually asks it, at the one input where the two readings disagree.
+    """
+    live = a_session(session)
+    beat(session, live.id, at=NOON)
+    session.commit()
+
+    marked = reconcile_stale(session, now=NOON + STALE_AFTER)
+    session.commit()
+    session.refresh(live)
+
+    assert [row.id for row in marked] == [live.id]
+    assert live.status is LiveSessionStatus.FAILED
+
+
+def test_the_window_the_caller_passes_is_the_window_that_is_used(session: Session) -> None:
+    """⚠️ Nothing in the codebase passes `stale_after`, so the argument reached the comparison
+    only by inspection. Thirty seconds of silence is *fresh* under the default and stale under a
+    ten-second window: an implementation that dropped the argument would leave this row running.
+    """
+    live = a_session(session)
+    beat(session, live.id, at=NOON)
+    session.commit()
+    silent_for = dt.timedelta(seconds=30)
+    assert silent_for < STALE_AFTER, "the fixture stopped separating; pick a gap under the default"
+
+    marked = reconcile_stale(session, now=NOON + silent_for, stale_after=dt.timedelta(seconds=10))
+    session.commit()
+    session.refresh(live)
+
+    assert [row.id for row in marked] == [live.id]
+    assert live.status is LiveSessionStatus.FAILED
+
+
 def test_a_session_that_never_beat_is_measured_from_its_start(session: Session) -> None:
     """The state a crash at start-up leaves: `running`, no heartbeat, ever. Treating a missing
     beat as *fresh* would leave exactly those rows marked running for ever — the sessions that

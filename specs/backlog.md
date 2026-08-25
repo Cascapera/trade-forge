@@ -810,3 +810,61 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
   está vivo e trabalhando?* — e consertar um sem os outros deixa a resposta pela metade.
 
   Não é regressão do upgrade: o default sempre foi 3600. Só ninguém tinha olhado.
+
+---
+
+## `ix_live_sessions_heartbeat_at` não é usado por consulta nenhuma
+
+Achado ao consertar o buraco de teste do `reconcile_stale` (fix do PR-302-C-B). O comentário da
+migration que cria o índice diz que a reconciliação lê essa coluna. Ela não lê — não em SQL.
+
+`running_sessions` emite exatamente:
+
+```sql
+SELECT ... FROM live_sessions WHERE status = 'running' ORDER BY started_at
+```
+
+e o predicado de silêncio (`is_stale`) roda **em Python**, sobre as linhas já trazidas. Nenhum
+plano de consulta no repo toca `heartbeat_at` num `WHERE` ou num `ORDER BY`. O índice é peso morto:
+custa uma escrita a cada batida — que é o caminho mais quente do módulo, uma vez a cada
+`BEAT_EVERY` por sessão viva — e não acelera leitura nenhuma.
+
+**Duas saídas, e elas discordam de verdade:**
+
+1. **Apagar o índice** e corrigir o comentário da migration. A reconciliação continua em Python,
+   onde a decisão é testável sem banco (foi exatamente esse o argumento do `is_stale`).
+2. **Descer o filtro para o SQL**: `running_sessions` passa a receber o corte e emite
+   `AND COALESCE(heartbeat_at, started_at) < :cutoff`. O índice passa a ser usado e o banco
+   devolve só as linhas mortas.
+
+⚠️ O (2) tem um custo que não é óbvio: move a fronteira do off-by-one para dentro de uma string
+SQL, onde o teste de milissegundos não alcança — e o portão de cobertura deselecciona integração.
+Foi essa exata configuração que deixou o mutante `<` → `<=` vivo. O (2) só vale se a tabela crescer
+a ponto de trazer todas as `running` para o Python ficar caro, e hoje ela tem unidades de linhas.
+
+**Inclinação: (1).** Mas é decisão dele, não minha.
+
+---
+
+## A suíte de integração não precisa apagar o banco de trabalho
+
+`packages/db/tests/conftest.py` faz `TRUNCATE ... RESTART IDENTITY CASCADE` em **11 tabelas** do
+banco que o `PostgresSettings` apontar, e o default é `tradeforge` — o de trabalho. Isso já apagou
+os backtests dele uma vez (04/08).
+
+Não precisa ser assim. O `postgres_db` é override por ambiente, então:
+
+```bash
+POSTGRES_DB=tradeforge_test uv run pytest -m integration --no-cov
+```
+
+roda a suíte inteira contra um banco descartável. O fixture `migrated_engine` já chama
+`upgrade("head")`, então o schema se cria sozinho; só o `CREATE DATABASE` precisa existir. Provado
+em 25/08: 206 de integração verdes contra `tradeforge_test`, com os 24.001 trades do `tradeforge`
+conferidos intactos antes e depois.
+
+**Conserto:** fazer disso o caminho padrão em vez de uma coisa que se lembra na hora. Opções — um
+default de `tradeforge_test` no fixture `dsn` (com o `TRUNCATE` recusando-se a rodar contra um
+banco cujo nome não termine em `_test`), ou um serviço postgres separado no compose. A guarda
+importa mais que o default: um default é uma sugestão, e o modo de falha aqui é perda de dados
+silenciosa.

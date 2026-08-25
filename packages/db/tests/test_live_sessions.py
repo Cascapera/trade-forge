@@ -13,7 +13,7 @@ import datetime as dt
 
 import pytest
 
-from tradeforge_db.live_sessions import BEAT_EVERY, STALE_AFTER, silence
+from tradeforge_db.live_sessions import BEAT_EVERY, STALE_AFTER, is_stale, silence
 
 NOON = dt.datetime(2026, 8, 24, 12, tzinfo=dt.UTC)
 
@@ -63,14 +63,17 @@ def test_a_beat_wins_over_the_start_even_when_it_is_older() -> None:
 def test_the_boundary_is_where_it_says_it_is(gap: dt.timedelta, stale: bool) -> None:
     """One second either side of the line, and the line itself.
 
-    ⚠️ The middle case is the one that matters. `reconcile_stale` compares with `<`, so a session
-    silent for exactly `STALE_AFTER` is stale — and a `<=` would keep it alive for one more beat.
-    Neither reading is obviously right from the name, which is why it is pinned rather than
-    assumed.
+    ⚠️ The middle case is the one that matters: silent for *exactly* `STALE_AFTER` is stale, and
+    a `<=` on the other side of the comparison would keep it alive for one more beat. Neither
+    reading is obviously right from the name, which is why it is pinned rather than assumed.
+
+    ⚠️ **This calls `is_stale`; it does not re-derive it.** The version before this one asserted
+    `silence(...) >= STALE_AFTER`, which pins the `>=` written *in the test* and says nothing
+    about the module — a `<` → `<=` mutant in `reconcile_stale` survived this file and all 76
+    integration tests. Writing the rule out in the assertion is how a test comes to agree with
+    itself.
     """
-    assert (silence(heartbeat_at=NOON - gap, started_at=NOON - gap, now=NOON) >= STALE_AFTER) is (
-        stale
-    )
+    assert is_stale(heartbeat_at=NOON - gap, started_at=NOON - gap, now=NOON) is stale
 
 
 def test_a_session_heard_from_just_now_is_not_silent_at_all() -> None:
@@ -87,3 +90,24 @@ def test_the_stale_window_is_a_multiple_of_the_beat() -> None:
     """
     assert STALE_AFTER == BEAT_EVERY * 4
     assert dt.timedelta(0) < BEAT_EVERY, "a beat of zero makes every session instantly stale"
+
+
+def test_a_caller_can_narrow_the_window_and_the_argument_is_the_one_used() -> None:
+    """⚠️ Separating on purpose: thirty seconds is *fresh* under the default `STALE_AFTER` and
+    stale under a ten-second window. A probe that used the default value would agree with an
+    implementation that ignored the argument entirely — and nothing in the codebase passes
+    `stale_after`, so this parameter had no proof at all until here.
+    """
+    gap = dt.timedelta(seconds=30)
+    assert gap < STALE_AFTER, "the fixture stopped separating; pick a gap under the default"
+
+    assert is_stale(heartbeat_at=NOON - gap, started_at=NOON - gap, now=NOON) is False
+    assert (
+        is_stale(
+            heartbeat_at=NOON - gap,
+            started_at=NOON - gap,
+            now=NOON,
+            stale_after=dt.timedelta(seconds=10),
+        )
+        is True
+    )

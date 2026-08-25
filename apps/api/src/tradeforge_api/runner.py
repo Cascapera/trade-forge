@@ -62,10 +62,14 @@ def instrument_spec(instrument: Instrument) -> InstrumentSpec:
     )
 
 
-def _cost_model(spec: Mapping[str, Any]) -> CostModel:
-    """Build the plugged-in cost model from its stored document (ADR-07). An unknown type
-    raises rather than silently running costless — the same loud-failure doctrine as the
-    exit-reason mapper and `build_indicator`."""
+def build_cost_model(spec: Mapping[str, Any]) -> CostModel:
+    """Build the plugged-in cost model from its stored document (ADR-07).
+
+       Public because a live session assembles the same object graph: the DSL-to-engine
+       translation is the boundary, not the backtest.
+    An unknown type
+       raises rather than silently running costless — the same loud-failure doctrine as the
+       exit-reason mapper and `build_indicator`."""
     kind = spec.get("type")
     if kind == "none":
         return NoCostModel()
@@ -76,7 +80,7 @@ def _cost_model(spec: Mapping[str, Any]) -> CostModel:
     raise ValueError(f"unknown cost model type {kind!r}; expected 'none', 'spread' or 'commission'")
 
 
-def _take_profit_rr(definition: Mapping[str, Any]) -> Decimal | None:
+def take_profit_rr(definition: Mapping[str, Any]) -> Decimal | None:
     take_profit = (definition.get("exit") or {}).get("take_profit")
     if not take_profit:
         return None
@@ -84,7 +88,7 @@ def _take_profit_rr(definition: Mapping[str, Any]) -> Decimal | None:
     return _decimal(rr) if rr is not None else None
 
 
-def _risk_percent(definition: Mapping[str, Any]) -> Decimal:
+def risk_percent(definition: Mapping[str, Any]) -> Decimal:
     sizing = (definition.get("risk") or {}).get("sizing") or {}
     percent = (sizing.get("params") or {}).get("percent")
     if percent is None:
@@ -168,9 +172,9 @@ def execute_backtest(  # noqa: PLR0913 — keyword-only; each names one axis of 
     broker = BacktestBroker(
         instrument=spec,
         initial_capital=initial_capital,
-        cost_model=_cost_model(cost_model),
+        cost_model=build_cost_model(cost_model),
         slippage_ticks=slippage_ticks,
-        take_profit_rr=_take_profit_rr(definition),
+        take_profit_rr=take_profit_rr(definition),
     )
     result = run(
         candles=windowed,
@@ -178,7 +182,7 @@ def execute_backtest(  # noqa: PLR0913 — keyword-only; each names one axis of 
         instrument=spec,
         strategy=compile_strategy(definition),
         broker=broker,
-        risk=PercentRiskManager(percent=_risk_percent(definition)),
+        risk=PercentRiskManager(percent=risk_percent(definition)),
     )
     metrics = compute_metrics(
         trades=result.trades,
@@ -189,4 +193,12 @@ def execute_backtest(  # noqa: PLR0913 — keyword-only; each names one axis of 
     return list(result.trades), metrics, window
 
 
-__all__ = ["ENGINE_VERSION", "CandleWindow", "execute_backtest", "instrument_spec"]
+__all__ = [
+    "ENGINE_VERSION",
+    "CandleWindow",
+    "build_cost_model",
+    "execute_backtest",
+    "instrument_spec",
+    "risk_percent",
+    "take_profit_rr",
+]

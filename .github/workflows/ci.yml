@@ -49,16 +49,13 @@ jobs:
       - name: Mypy (strict)
         run: uv run mypy
 
-      - name: 'Pytest (coverage gate: 90%)'
-        run: uv run pytest
-
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
-        with:
-          files: coverage.xml
-          flags: python
-          fail_ci_if_error: true
-          token: ${{ secrets.CODECOV_TOKEN }}
+      # No coverage gate here, and that is deliberate. This job has no Postgres and no Redis,
+      # so it cannot run the tests that cover a live session at all — and a gate measured over
+      # this suite alone counted those modules as uncovered, which is how it came to demand
+      # unit tests for code that has no honest unit test. The authoritative number is measured
+      # over the WHOLE suite in the integration job below.
+      - name: Pytest (unit — the fast loop)
+        run: uv run pytest --cov-fail-under=0
 
   # The unit suite proves the health-check logic against fakes. This job proves the
   # wiring: that psycopg and redis-py actually reach the images we pin. Nothing here
@@ -119,10 +116,21 @@ jobs:
       - name: Install workspace
         run: uv sync --locked
 
-      # --no-cov: this run exercises a couple of connection paths, so its coverage
-      # number would be meaningless. The 90% gate lives in the unit job.
-      - name: Pytest (integration only)
-        run: uv run pytest -m integration --no-cov
+      # ⚠️ The whole suite, not `-m integration`, and this is where the 90% gate lives now.
+      # The old comment here said integration "exercises a couple of connection paths, so its
+      # coverage number would be meaningless" — true when it was a handful of tests, and no
+      # longer: it is now 233 of them covering whole modules. A live session cannot be driven
+      # without a database, so measuring coverage without one measures the wrong thing.
+      - name: 'Pytest (whole suite, coverage gate: 90%)'
+        run: uv run pytest -m ""
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        with:
+          files: coverage.xml
+          flags: python
+          fail_ci_if_error: true
+          token: ${{ secrets.CODECOV_TOKEN }}
 
   web:
     name: Web — lint, types, tests, build

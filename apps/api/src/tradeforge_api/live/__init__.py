@@ -6,5 +6,6 @@ entirely in what that iterable is. This package is that iterable, and nothing el
 """
 
 from tradeforge_api.live.candle_stream import CandleStream, StreamReader
+from tradeforge_api.live.heartbeat import Heartbeat, session_heartbeat
 
-__all__ = ["CandleStream", "StreamReader"]
+__all__ = ["CandleStream", "Heartbeat", "StreamReader", "session_heartbeat"]

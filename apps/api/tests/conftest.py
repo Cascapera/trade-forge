@@ -17,6 +17,11 @@ from tradeforge_db.session import create_db_engine, create_session_factory
 
 TABLES_CHILD_FIRST = (
     "trades",
+    # ⚠️ Before `strategies` and `instruments`, which it points at, and after `trades`, which
+    # points at it. Missing here until the first API test wrote one — `packages/db`'s copy has
+    # had it since the table existed, and the two lists drifted. A session row left behind is
+    # not inert: it is a parent the next test's trades could attach to.
+    "live_sessions",
     "backtest_metrics",
     "backtests",
     "baskets",

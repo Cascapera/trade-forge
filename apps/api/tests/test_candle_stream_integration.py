@@ -96,7 +96,7 @@ def publish(client: Redis, subscription: Subscription, *candles: Candle) -> None
         assert publisher.publish(subscription, candle), "the publisher refused its own candle"
 
 
-def a_stream(client: Redis, subscription: Subscription, **kwargs: str) -> CandleStream:
+def a_stream(client: Redis, subscription: Subscription, **kwargs: Any) -> CandleStream:
     return CandleStream(
         client,
         subscription,

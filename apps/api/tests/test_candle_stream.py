@@ -302,3 +302,75 @@ def test_the_backlog_creates_the_group_it_reads_from() -> None:
 
     assert len(list(stream.backlog())) == 1
     assert "never-created" in client.groups
+
+
+def test_a_stopped_stream_ends_instead_of_waiting_for_the_next_bar() -> None:
+    """⚠️ **`DEFAULT_BLOCK_MS` was chosen for this, and nothing implemented it.** Its comment has
+    said since PR-302-A that the timeout exists so a stopped session notices within a minute
+    rather than at the next bar — and the loop `continue`d for ever. A `SIGTERM` to an H4 session
+    would have waited up to four hours to be acted on.
+
+    Here the stream has nothing to deliver, which is the state a quiet market leaves it in.
+    """
+    client = FakeRedisStreams(EURUSD_H1, [])
+    stream = CandleStream(
+        client, EURUSD_H1, group="session-1", block_ms=10, start_id="0", stopping=lambda: True
+    )
+
+    assert list(stream.candles()) == []
+
+
+def test_a_stop_is_noticed_between_bars_of_one_batch() -> None:
+    """⚠️ The separating half, and it is not theoretical. A busy market hands back several bars
+    in a single read; a stop noticed only between *reads* would keep the session trading through
+    the rest of the batch — on M1 during a news release that is minutes of work after somebody
+    asked it to stop.
+    """
+    client = FakeRedisStreams(
+        EURUSD_H1, published(EURUSD_H1, a_candle(0), a_candle(1), a_candle(2))
+    )
+    stop_after_first = [False]
+    stream = CandleStream(
+        client,
+        EURUSD_H1,
+        group="session-1",
+        block_ms=10,
+        start_id="0",
+        stopping=lambda: stop_after_first[0],
+    )
+
+    delivered = []
+    for candle in stream.candles():
+        delivered.append(candle)
+        stop_after_first[0] = True
+
+    assert len(delivered) == 1, f"{len(delivered)} bars were handed over after the stop"
+
+
+def test_a_stream_with_no_stop_predicate_keeps_going() -> None:
+    """The default, and what a test driving a fixed list wants. `None` is a stream nobody can
+    stop — separated from `lambda: False` so a mutant that treated the two differently fails."""
+    client = FakeRedisStreams(EURUSD_H1, published(EURUSD_H1, a_candle(0), a_candle(1)))
+    stream = a_stream(client)
+
+    candles = stream.candles()
+
+    assert [next(candles), next(candles)] == [a_candle(0), a_candle(1)]
+
+
+def test_the_stop_is_asked_again_each_time_rather_than_read_once() -> None:
+    """⚠️ A predicate captured at construction would answer whatever was true before the session
+    started — which is always "keep going". Separated by flipping it after the stream is built."""
+    client = FakeRedisStreams(EURUSD_H1, published(EURUSD_H1, a_candle(0)))
+    stopped = [False]
+    stream = CandleStream(
+        client,
+        EURUSD_H1,
+        group="session-1",
+        block_ms=10,
+        start_id="0",
+        stopping=lambda: stopped[0],
+    )
+    stopped[0] = True
+
+    assert list(stream.candles()) == []

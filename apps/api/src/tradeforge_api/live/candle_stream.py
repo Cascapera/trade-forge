@@ -20,7 +20,7 @@ market. So the group name is the session's, and a session is alone in its own gr
 """
 
 import logging
-from collections.abc import Generator, Sequence
+from collections.abc import Callable, Generator, Sequence
 from typing import Protocol, cast
 
 from redis.exceptions import ResponseError
@@ -113,6 +113,7 @@ class CandleStream:
         consumer: str = "session",
         block_ms: int = DEFAULT_BLOCK_MS,
         start_id: str = "$",
+        stopping: Callable[[], bool] | None = None,
     ) -> None:
         """`start_id` is where a *brand new* group begins reading, and `$` means "from now".
 
@@ -138,6 +139,22 @@ class CandleStream:
         self._consumer = consumer
         self._block_ms = block_ms
         self._start_id = start_id
+        self._stopping = stopping
+
+    def _stopped(self) -> bool:
+        """Has somebody asked this session to stop?
+
+        ⚠️ **`DEFAULT_BLOCK_MS` was chosen for this and nothing implemented it.** Its comment
+        has said since PR-302-A that the timeout exists "so that a stopped session notices it
+        was stopped within a minute rather than at the next bar, which on H4 would be four
+        hours away" — and the loop below simply `continue`d, for ever. A `SIGTERM` to an H4
+        session would have waited for the next bar.
+
+        A predicate rather than a `threading.Event`, so the caller owns what stopping *means*
+        and this stays testable without a thread. `None` is a stream nobody can stop, which is
+        what a test driving a fixed list wants.
+        """
+        return self._stopping is not None and self._stopping()
 
     def ensure_group(self) -> bool:
         """Create the consumer group if it is not there. `True` if this call created it.
@@ -240,7 +257,7 @@ class CandleStream:
         # list", which after a clean start is nothing and after a crash is the work in flight.
         cursor = _PENDING
 
-        while True:
+        while not self._stopped():
             entries = self._read(cursor)
 
             if not entries:
@@ -249,7 +266,9 @@ class CandleStream:
                 if cursor == _PENDING:
                     cursor = _NEW
                     continue
-                # No bar closed within the block. Not an error, and not the end of anything.
+                # No bar closed within the block. Not an error, and not the end of anything —
+                # but it *is* the moment a shutdown gets noticed, which is what bounds it at
+                # `block_ms` instead of at the next bar.
                 continue
 
             for entry_id, fields in entries:
@@ -259,6 +278,13 @@ class CandleStream:
                 # Reached only once the consumer has asked for the next bar, which is the whole
                 # design — see the docstring.
                 self._client.xack(self._stream, self._group, entry_id)
+
+                # ⚠️ Checked here as well as at the top, and not for tidiness. A busy market
+                # hands back a batch of bars in one read, and a stop noticed only between reads
+                # would keep the session working through all of them — on M1 during a news
+                # release that is minutes of trading after somebody asked it to stop.
+                if self._stopped():
+                    return
 
     def _read(self, cursor: str, *, blocking: bool = True) -> Sequence[tuple[str, dict[str, str]]]:
         """One `XREADGROUP`, flattened to the entries of the single stream we asked about.

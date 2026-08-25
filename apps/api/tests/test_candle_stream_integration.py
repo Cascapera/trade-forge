@@ -30,6 +30,7 @@ import datetime as dt
 import uuid
 from collections.abc import Iterator
 from decimal import Decimal
+from itertools import islice
 from typing import Any, cast
 
 import pytest
@@ -38,6 +39,7 @@ from redis.exceptions import ResponseError
 
 from tradeforge_api.config import Settings
 from tradeforge_api.live import CandleStream
+from tradeforge_api.live.splice import splice
 from tradeforge_collector.live import Subscription, stream_name
 from tradeforge_collector.publisher import RedisCandlePublisher
 from tradeforge_engine.domain import Candle
@@ -228,3 +230,107 @@ def test_two_sessions_on_the_same_symbol_each_see_every_bar(
 
     first.close()
     second.close()
+
+
+def test_the_backlog_drains_what_is_there_and_ends(
+    client: Redis, subscription: Subscription
+) -> None:
+    """⚠️ The claim the double cannot make. `backlog()` reads with **no `BLOCK` clause**, and
+    the whole design rests on two behaviours of the server: a group created at `0` hands back
+    the entire backlog rather than a page of it, and a read on a drained stream returns at once
+    instead of waiting. Both were measured before the code was written; this is what keeps them
+    measured.
+    """
+    publish(client, subscription, a_candle(0), a_candle(1), a_candle(2))
+    stream = a_stream(client, subscription, start_id="0")
+
+    started = dt.datetime.now(dt.UTC)
+    drained = list(stream.backlog())
+    elapsed = dt.datetime.now(dt.UTC) - started
+
+    assert [candle.time for candle in drained] == [a_candle(i).time for i in range(3)]
+    assert elapsed < dt.timedelta(seconds=1), f"the drain waited {elapsed}; it sent a BLOCK"
+
+
+def test_a_backlog_of_a_thousand_bars_comes_back_in_full(
+    client: Redis, subscription: Subscription
+) -> None:
+    """⚠️ Separating "the server returned everything" from "the server returned a page".
+
+    Nothing in `backlog()` passes `COUNT`, and the loop would keep reading until empty either
+    way — so a page limit would not break it. What it *would* break is the reasoning above it:
+    a session whose Parquet is a week behind has thousands of bars waiting, and the drain has
+    to finish before the cut can be applied.
+    """
+    bars = [a_candle(index) for index in range(1_000)]
+    publish(client, subscription, *bars)
+
+    drained = list(a_stream(client, subscription, start_id="0").backlog())
+
+    assert len(drained) == 1_000
+    assert [candle.time for candle in drained] == [candle.time for candle in bars]
+
+
+def test_a_drained_backlog_leaves_a_real_pending_list_empty(
+    client: Redis, subscription: Subscription
+) -> None:
+    """The ack bookkeeping, against the server's own pending list rather than the double's."""
+    publish(client, subscription, a_candle(0), a_candle(1))
+    stream = a_stream(client, subscription, start_id="0")
+    group = stream._group
+
+    list(stream.backlog())
+
+    summary = cast("dict[str, Any]", client.xpending(stream_name(subscription), group))
+    assert summary["pending"] == 0
+
+
+def test_a_backlog_abandoned_part_way_leaves_a_real_pending_entry(
+    client: Redis, subscription: Subscription
+) -> None:
+    """⚠️ The separating half, and the one that matters if the process dies. Redis must still
+    be holding that bar for this consumer — a confirmed bar is one the server will never offer
+    again, and the hole it leaves is invisible from every side."""
+    publish(client, subscription, a_candle(0), a_candle(1), a_candle(2))
+    stream = a_stream(client, subscription, start_id="0")
+    group = stream._group
+
+    draining = stream.backlog()
+    next(draining)
+    next(draining)
+    draining.close()
+
+    summary = cast("dict[str, Any]", client.xpending(stream_name(subscription), group))
+    assert summary["pending"] == 2, "the held bar, and the two behind it, were miscounted"
+
+
+def test_the_splice_sorts_a_real_stream_into_warm_up_and_live(
+    client: Redis, subscription: Subscription
+) -> None:
+    """The seam end to end, against a server: history on 'disk' overlapping a real backlog, cut
+    by time, with the boundary bar surviving the hand-over.
+
+    Bars 0-2 are the Parquet. The stream carries 1-4, so it overlaps by two and extends by two.
+    The session opens once bar 3 has closed, so 0-3 are the warm-up and 4 is its first live bar.
+    """
+    on_the_wire = [a_candle(1), a_candle(2), a_candle(3), a_candle(4)]
+    publish(client, subscription, *on_the_wire)
+    on_disk = [a_candle(0), a_candle(1), a_candle(2)]
+
+    candles = splice(
+        a_stream(client, subscription, start_id="0"),
+        history=lambda: on_disk,
+        timeframe=HOUR,
+        opened_at=a_candle(3).time + HOUR,
+    )
+
+    warmed = [candle.time for candle in candles.warmup()]
+    # ⚠️ `islice`, not `list`. `live()` chains into `candles()`, which has no ending by design —
+    # it is what `iter_run` consumes for the life of the session. Draining it here would block
+    # until somebody killed the test.
+    lived = [candle.time for candle in islice(candles.live(), 1)]
+
+    assert warmed == [a_candle(index).time for index in range(4)]
+    assert lived == [a_candle(4).time]
+    assert candles.warmed == 4
+    assert candles.dropped == 2, "the stream's overlap with the disk was not de-duplicated"

@@ -7,5 +7,14 @@ entirely in what that iterable is. This package is that iterable, and nothing el
 
 from tradeforge_api.live.candle_stream import CandleStream, StreamReader
 from tradeforge_api.live.heartbeat import Heartbeat, session_heartbeat
+from tradeforge_api.live.splice import BarSource, SplicedCandles, splice
 
-__all__ = ["CandleStream", "Heartbeat", "StreamReader", "session_heartbeat"]
+__all__ = [
+    "BarSource",
+    "CandleStream",
+    "Heartbeat",
+    "SplicedCandles",
+    "StreamReader",
+    "session_heartbeat",
+    "splice",
+]

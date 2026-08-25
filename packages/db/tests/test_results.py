@@ -18,7 +18,9 @@ from tradeforge_db.base import MONEY
 from tradeforge_db.models import ExitReason, Trade
 from tradeforge_db.results import (
     _MONEY_QUANTUM,
+    _trade_row,
     close_trade_values,
+    closed_trade_row,
     open_trade_row,
     to_rows,
 )
@@ -596,3 +598,36 @@ def test_the_net_of_a_live_close_balances_the_way_the_check_demands() -> None:
     assert values["net_pnl"] == Decimal("97.00000002"), "the net was copied, not derived"
 
     assert values["net_pnl"] == values["gross_pnl"] - values["costs"]
+
+
+def test_a_live_round_trip_that_never_had_an_open_row_maps_to_a_finished_one() -> None:
+    """A trade that opened and closed inside one bar. The ordinary live path writes twice — at
+    the fill and at the close — but a round trip with no bar in between never had a moment
+    anybody could have observed it open, so there is nothing for the first write to say."""
+    session_id = uuid.uuid4()
+    instrument_id = uuid.uuid4()
+
+    row = closed_trade_row(a_trade(net="120"), session_id, instrument_id)
+
+    assert row.live_session_id == session_id
+    assert row.backtest_id is None, "a live trade must not claim a backtest parent"
+    assert row.instrument_id == instrument_id
+    assert row.exit_time is not None
+    assert row.net_pnl == Decimal("120")
+
+
+def test_a_trade_row_refuses_to_belong_to_both_parents_or_neither() -> None:
+    """⚠️ `trade_has_one_parent` on the table would catch this, but only at flush — by then the
+    caller is a bar into a live session and the error names a constraint rather than the call
+    that built the row. Both halves are here because a guard written as `or` instead of the
+    equality of two `is None` checks passes one of them and not the other."""
+    with pytest.raises(ValueError, match="exactly one"):
+        _trade_row(a_trade(), uuid.uuid4())
+
+    with pytest.raises(ValueError, match="exactly one"):
+        _trade_row(
+            a_trade(),
+            uuid.uuid4(),
+            backtest_id=uuid.uuid4(),
+            live_session_id=uuid.uuid4(),
+        )

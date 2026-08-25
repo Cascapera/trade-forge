@@ -97,11 +97,40 @@ def to_rows(
     the instrument's UUID, which only the caller knows.
     """
     metrics_row = _metrics_row(metrics, backtest_id)
-    trade_rows = [_trade_row(trade, backtest_id, instrument_id) for trade in trades]
+    trade_rows = [_trade_row(trade, instrument_id, backtest_id=backtest_id) for trade in trades]
     return metrics_row, trade_rows
 
 
-def _trade_row(trade: ClosedTrade, backtest_id: uuid.UUID, instrument_id: uuid.UUID) -> Trade:
+def closed_trade_row(
+    trade: ClosedTrade, live_session_id: uuid.UUID, instrument_id: uuid.UUID
+) -> Trade:
+    """A live trade that **opened and closed without a bar in between**, as one finished row.
+
+    The ordinary live path is two writes: `open_trade_row` at the fill and `close_trade_values`
+    when it ends. A round trip that both starts and finishes inside a single bar never has a
+    moment where anybody could have observed it open, so there is nothing for the first write to
+    say — and inserting an open row only to update it in the same transaction would be inventing
+    a state the market never had.
+
+    ⚠️ Not a shortcut worth taking for *every* live trade. Writing only at the close is exactly
+    the design `specs/fase-3.md` rejected: a session holding a position for three days would
+    show nothing, which is indistinguishable from a session that never traded.
+    """
+    return _trade_row(trade, instrument_id, live_session_id=live_session_id)
+
+
+def _trade_row(
+    trade: ClosedTrade,
+    instrument_id: uuid.UUID,
+    *,
+    backtest_id: uuid.UUID | None = None,
+    live_session_id: uuid.UUID | None = None,
+) -> Trade:
+    # ⚠️ Exactly one parent, checked here as well as by `trade_has_one_parent` on the table. The
+    # database would catch it, but only at flush — by then the caller is a bar into a live
+    # session and the error names a constraint rather than the call that built the row.
+    if (backtest_id is None) == (live_session_id is None):
+        raise ValueError("a trade belongs to exactly one of a backtest or a live session")
     # Every trade here is a *closed* round trip — an open position at the end of a run never
     # enters `RunResult.trades` — so all four exit columns are always present, which is what
     # the `exit_is_all_or_nothing` CHECK on the table demands.
@@ -112,6 +141,7 @@ def _trade_row(trade: ClosedTrade, backtest_id: uuid.UUID, instrument_id: uuid.U
     costs = _money(trade.costs)
     return Trade(
         backtest_id=backtest_id,
+        live_session_id=live_session_id,
         instrument_id=instrument_id,
         direction=trade.side,
         entry_time=trade.entry_time,
@@ -328,4 +358,4 @@ def close_trade_values(trade: ClosedTrade) -> dict[str, Any]:
     }
 
 
-__all__ = ["close_trade_values", "open_trade_row", "to_rows"]
+__all__ = ["close_trade_values", "closed_trade_row", "open_trade_row", "to_rows"]

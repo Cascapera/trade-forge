@@ -50,6 +50,10 @@ EXPECTED_TABLES = {
     # two answer different questions and a nullable half of each would answer neither.
     "live_sessions",
     "trades",
+    # Every order the executor was asked to send, and what became of it. Append-only, enforced
+    # by a trigger (rev_0015) — the one table here that exists for a reader who does not trust
+    # the others, and the only one whose contents survive a `TRUNCATE` aimed at the schema.
+    "order_audit",
 }
 
 # Anything holding a price, a quantity or an amount of money. If a column below ever

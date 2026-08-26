@@ -30,6 +30,7 @@ from typing import Any
 from sqlalchemy.orm import Session, sessionmaker
 
 from tradeforge_api.live.heartbeat import session_heartbeat
+from tradeforge_api.live.promotion import promotion_for
 from tradeforge_api.live.recorder import LedgerWatch, TradeRecorder, record_bar
 from tradeforge_api.live.splice import BarSource, splice
 from tradeforge_api.runner import (
@@ -41,9 +42,10 @@ from tradeforge_api.runner import (
 )
 from tradeforge_collector import read_candles, step
 from tradeforge_db.live_sessions import finish_session, open_session, reconcile_stale
-from tradeforge_db.models import Instrument, LiveSession, Strategy
+from tradeforge_db.models import Instrument, LiveSession, SessionMode, Strategy
 from tradeforge_db.session import session_scope
 from tradeforge_engine import BacktestBroker, PercentRiskManager, compile_strategy
+from tradeforge_engine.errors import EngineError
 from tradeforge_engine.loop import iter_run
 from tradeforge_engine.warmup import hand_over
 
@@ -65,6 +67,12 @@ class SessionPlan:
     timeframe: str
     initial_capital: Decimal
     cost_model: Mapping[str, Any]
+    mode: SessionMode = SessionMode.PAPER
+    """Paper, unless somebody says otherwise in as many words.
+
+    ⚠️ A default that fails **safe**. Every caller today means paper, and making it required
+    would have each of them say so — which reads as tidier right up to the day a new caller is
+    added and the value they have to remember is the dangerous one."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,6 +108,7 @@ def run_session(  # noqa: PLR0913 — keyword-only; each names one seam of a ses
     plan: SessionPlan,
     parquet_root: Path,
     stopping: Callable[[], bool],
+    promotion_days: int = 5,
     now: Callable[[], dt.datetime] = _utcnow,
 ) -> SessionOutcome:
     """Run one session until `stopping` says otherwise, and record everything it did.
@@ -113,6 +122,15 @@ def run_session(  # noqa: PLR0913 — keyword-only; each names one seam of a ses
     a row to mark. `open_session`'s docstring says the same thing from the other side.
     """
     opened_at = now()
+
+    with session_scope(factory) as db:
+        # ⚠️ **Before the warm-up, not after.** Warming a live session takes minutes — 38 987 bars
+        # on the last real run — and refusing it at the end would spend all of that to say a thing
+        # that was knowable at the start. It is also the honest place: nothing has happened yet,
+        # so there is no session to mark and nothing to unwind.
+        verdict = promotion_for(db, plan.strategy_id, mode=plan.mode, required_days=promotion_days)
+        if not verdict:
+            raise EngineError(f"refusing to start a {plan.mode.value} session: {verdict.reason}")
 
     with session_scope(factory) as db:
         strategy, instrument = _load(db, plan)
@@ -171,6 +189,7 @@ def run_session(  # noqa: PLR0913 — keyword-only; each names one seam of a ses
             initial_capital=plan.initial_capital,
             cost_model=dict(plan.cost_model),
             engine_version=ENGINE_VERSION,
+            mode=plan.mode,
             warmup_bars=handover.bars,
             at=opened_at,
         )

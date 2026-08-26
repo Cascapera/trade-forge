@@ -15,7 +15,7 @@ from typing import Any
 
 import pytest
 from sqlalchemy import text
-from sqlalchemy.exc import IntegrityError, ProgrammingError
+from sqlalchemy.exc import IntegrityError, InternalError, ProgrammingError
 from sqlalchemy.orm import Session
 
 from tradeforge_db.instruments import CatalogueEntry, upsert_instruments
@@ -679,17 +679,46 @@ def test_a_paper_session_records_what_it_is_running(session: Session) -> None:
     assert live.stopped_at is None
 
 
-def test_a_real_session_is_refused_until_the_safeguards_exist(session: Session) -> None:
-    """AGENTS.md §5.7 and sdd.md §11, enforced by the database rather than by a service.
+def test_a_real_session_is_refused_until_the_strategy_has_been_watched(session: Session) -> None:
+    """AGENTS.md §5.7 and sdd.md §11, still enforced by the database rather than by a service.
 
-    There is no kill switch, no executor and no paper-first gate yet. Until there is, turning
-    on real trading has to be a **migration** — visible, reviewed, dated — and not a value
-    somebody sets. PR-303/304 drop this constraint, and dropping it is the moment to check
-    that the safeguards are actually there.
+    ⚠️ **This test used to assert something stronger and less useful.** Until `rev_0016` the
+    constraint was a flat `mode = 'paper'`, and its own comment said PR-303/304 would drop it
+    "once the kill switch, the executor limits and the paper-first gate exist" — adding that
+    dropping it was the moment to check the safeguards are actually there. They are, so the
+    blanket refusal became an **earned** one.
+
+    What the database still guarantees is the part nobody should be able to argue with: real
+    money is never risked by a strategy that has never completed a bar in paper. *How many* days
+    is policy, it is configurable, and it lives in the application (`live.promotion`) — a number
+    that needs a migration to change is not a configuration value.
     """
-    with pytest.raises(IntegrityError, match="only_paper_until_safeguards_exist"):
+    with pytest.raises((IntegrityError, InternalError), match="never completed a bar in paper"):
         # `a_live_session` flushes, so the database refuses the row inside this call.
         a_live_session(session, mode=SessionMode.LIVE)
+
+
+def test_a_real_session_is_allowed_once_paper_has_completed_a_bar(session: Session) -> None:
+    """The separating half, and without it the test above passes against a database that simply
+    refuses every live session — which is what the old constraint did, and what this revision
+    exists to stop doing."""
+    # ⚠️ **The same strategy for both**, passed explicitly. The gate counts per strategy, so two
+    # sessions from the helper's own lazily-built defaults would be two strategies — and the live
+    # one would be refused for the right reason by accident, proving nothing.
+    # ⚠️ **Both parents passed explicitly, and for two different reasons.** The strategy because
+    # the gate counts per strategy, so two lazily-built defaults would be two strategies and the
+    # live session would be refused for the right reason by accident. The instrument because
+    # `uq_instruments_symbol` refuses a second EURUSD — the helper's own docstring records that
+    # trap from the other side.
+    strategy, instrument = a_strategy(session), an_instrument(session)
+    parents = {"strategy_id": strategy.id, "instrument_id": instrument.id}
+    paper = a_live_session(session, **parents, mode=SessionMode.PAPER)
+    paper.last_bar_time = paper.started_at
+    session.flush()
+
+    live = a_live_session(session, **parents, mode=SessionMode.LIVE)
+
+    assert live.mode is SessionMode.LIVE
 
 
 def test_a_failed_session_must_say_why(session: Session) -> None:

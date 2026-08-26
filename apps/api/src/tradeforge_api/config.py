@@ -50,3 +50,14 @@ class Settings(PostgresSettings, RedisConfig):
     # `--data-dir` (`data/ohlcv`) so a fresh clone's backfill and backtest line up with no
     # configuration. Env-driven (`PARQUET_ROOT`) so dev, CI and prod each point their own.
     parquet_root: Path = Path("data/ohlcv")
+
+    # How many distinct days of paper trading a strategy must have on record before a live
+    # session is allowed. **Policy, not invariant** — the database refuses a strategy that has
+    # never completed a bar in paper at all (rev_0016), and that floor is not negotiable; this
+    # number is, and `specs/fase-3.md` calls it configurable for exactly that reason.
+    #
+    # ⚠️ Five *trading* days, counted as distinct UTC dates on which a paper session processed a
+    # bar — not five sessions and not a hundred and twenty hours. A strategy restarted six times
+    # on a Tuesday has one day of evidence, and a calendar week that included a bank holiday is
+    # not four days of market.
+    live_promotion_days: int = 5

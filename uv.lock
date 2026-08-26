@@ -1110,10 +1110,18 @@ version = "0.1.0"
 source = { editable = "apps/executor" }
 dependencies = [
     { name = "metatrader5", marker = "sys_platform == 'win32'" },
+    { name = "redis" },
+    { name = "tradeforge-db" },
+    { name = "tradeforge-engine" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "metatrader5", marker = "sys_platform == 'win32'", specifier = ">=5.0.45" }]
+requires-dist = [
+    { name = "metatrader5", marker = "sys_platform == 'win32'", specifier = ">=5.0.45" },
+    { name = "redis", specifier = ">=5.2" },
+    { name = "tradeforge-db", editable = "packages/db" },
+    { name = "tradeforge-engine", editable = "packages/engine" },
+]
 
 [[package]]
 name = "tradeforge-schema"

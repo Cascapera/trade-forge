@@ -80,6 +80,10 @@ class Router:
             return self._refused(order, f"the terminal could not be read: {error}")
 
         verdict = admits(
+            # ⚠️ **The intent, not just the size.** Without it every gate reads an exit as though
+            # it were an entry — and with the default `max_positions=1` that meant a session
+            # could open a position and never close it. See `safety.admits`.
+            intent=order.request.intent,
             volume=order.request.volume,
             account=account,
             limits=self.limits,

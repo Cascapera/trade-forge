@@ -947,3 +947,23 @@ uma parada dura numa situação recuperável.
 **Conserto (PR-304-A4, junto da reconciliação):** as ordens já estão em `order_audit`, indexadas por
 `client_id`. Uma sessão subindo pode reconstruir o `_sent` de lá — e a mesma leitura serve para
 comparar o que o ledger acha que tem com o que o venue diz que tem.
+
+---
+
+## O executor precisa conferir sozinho que um stop está apertando
+
+Ficou de fora do conserto de `reduces_risk` (`fix/pr-303-a2`), de propósito. Um stop que **aperta**
+reduz risco e deveria passar pelos portões como a saída e o cancelamento passam. Só que quem afirma
+que ele aperta é a sessão, três processos longe — e um erro de sinal lá chegaria aqui com a cara
+exata de um aperto, e seria passado por cima de todos os limites.
+
+A engine já garante isso do lado dela (`Broker.modify_stop` levanta num afrouxamento), mas
+**esta máquina não pode aceitar a palavra da sessão** — é o mesmo princípio que faz os limites
+viverem no executor e não no core.
+
+**Conserto (PR-304-A3, junto do fio):** antes de admitir um `MODIFY_STOP`, o executor lê a posição
+no venue (`positions_get` filtrado por magic) e compara a direção ele mesmo: para um long o nível
+novo tem que ser >= o atual, para um short <=. Aí `MODIFY_STOP` entra no `reduces_risk`.
+
+⚠️ Enquanto isso, um aperto de stop está sujeito a todos os limites — inclusive ao kill switch, o
+que é conservador na direção errada, mas é a direção segura enquanto não dá para verificar.

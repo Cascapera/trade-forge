@@ -38,15 +38,25 @@ def an_order(**overrides: Any) -> WireOrder:
     return WireOrder(client_id="zone-42", session_id="s-1", request=OrderRequest(**values))
 
 
-def a_placement(*, accepted: bool = True, volume: str = "0.10") -> Placement:
+def a_placement(
+    *, accepted: bool = True, volume: str = "0.10", deal: int | None = 555
+) -> Placement:
+    """A venue answer. ``deal=None`` is the *resting* shape -- accepted, nothing executed.
+
+    ⚠️ The two are not interchangeable, and `Placement.__post_init__` now refuses to let this
+    helper pretend otherwise: a filled volume without a deal ticket is an answer no terminal
+    gives. Measured -- a resting buy limit comes back `retcode=10009`, `volume` echoed, `deal=0`.
+    """
+    executed = accepted and deal is not None
     return Placement(
         accepted=accepted,
         ticket=99 if accepted else None,
-        filled_volume=Decimal(volume),
-        price=Decimal("1.10000") if accepted else None,
+        filled_volume=Decimal(volume) if executed else Decimal(0),
+        price=Decimal("1.10000") if executed else None,
         retcode=10009 if accepted else 10013,
         comment="done" if accepted else "invalid request",
         raw={"retcode": 10009 if accepted else 10013},
+        deal=deal if executed else None,
     )
 
 

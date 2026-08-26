@@ -40,6 +40,17 @@ class Placement:
     `raw` is the terminal's answer verbatim, and it goes into `order_audit.response` unchanged.
     A projection records the fields somebody thought of; an incident asks about a field nobody
     thought of.
+
+    ⚠️ **Accepted is not filled, and the terminal says so in the same breath as both.** Measured
+    against a live terminal: a buy limit resting 200 points away comes back `retcode=10009`
+    (*DONE*, not even *PLACED*), `volume='0.01'` — the volume that was *asked for*, echoed — and
+    `deal=0`. The account held one pending order, zero positions and **zero deals**. Reading
+    `volume` as "what filled" therefore reports a fill for an order still sitting in the book:
+    the strategy's own "decide on the breakout, fill on the breakout" fantasy, arriving through
+    the venue instead of through the broker, where no engine guard is watching for it.
+
+    **`deal` is the only field that distinguishes the two**, so it is the field the others are
+    derived from. See `__post_init__`.
     """
 
     accepted: bool
@@ -49,6 +60,31 @@ class Placement:
     retcode: int
     comment: str
     raw: dict[str, Any]
+    deal: int | None = None
+    """The venue's deal ticket, or `None` when nothing executed.
+
+    **A fill happened if and only if this is set.**
+
+    Not the same as `ticket`, and the difference is the whole point: `ticket` is the *order*, which
+    exists as soon as the venue accepts it, filled or resting. A deal is the execution.
+    """
+
+    def __post_init__(self) -> None:
+        # The constructor refuses the exact lie the terminal tells, so that a hand-built
+        # `Placement` in a test cannot tell it either. `_placement` derives both fields from the
+        # same answer and never builds an inconsistent one, so this can only ever fire on a fake
+        # — which is precisely where a divergence from the real terminal goes unnoticed.
+        if self.filled_volume > 0 and self.deal is None:
+            raise ValueError(
+                f"a filled volume of {self.filled_volume} with no deal ticket: an order that "
+                f"executed has a deal, and one that is merely resting has a volume the venue "
+                f"echoed back from the request"
+            )
+
+    @property
+    def resting(self) -> bool:
+        """Accepted by the venue and waiting for the market. Not a fill, and not a refusal."""
+        return self.accepted and self.deal is None
 
     @property
     def partial(self) -> bool:
@@ -208,14 +244,30 @@ class MT5Gateway:
             )
         raw = answer._asdict() if hasattr(answer, "_asdict") else dict(answer)
         accepted = int(answer.retcode) in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED)
+        # ⚠️ **Both of these are read through `deal`, not from the fields that name them.** The
+        # terminal echoes the requested `volume` and a `price` of `0.0` on a placement that has
+        # not executed, and a reader taking those at face value manufactures a fill. `raw` keeps
+        # the answer verbatim either way, so nothing is lost to the audit trail by not trusting
+        # it here.
+        deal = int(getattr(answer, "deal", 0) or 0) or None
+        # ⚠️ **One gate, not one per field.** Written as two conditions — `... if executed else`
+        # on the volume and `... if executed and price` on the price — the second `executed` is
+        # dead logic: the terminal answers a resting order with `price=0.0`, which the falsiness
+        # test already catches, so a mutant deleting it survives every test that can be written
+        # against a real recording. A guard nothing can observe is a guard that is not there.
+        volume, price = Decimal(0), None
+        if accepted and deal is not None:
+            volume = Decimal(str(getattr(answer, "volume", 0) or 0))
+            price = Decimal(str(answer.price)) if getattr(answer, "price", None) else None
         return Placement(
             accepted=accepted,
             ticket=int(getattr(answer, "order", 0)) or None,
-            filled_volume=Decimal(str(getattr(answer, "volume", 0) or 0)),
-            price=Decimal(str(answer.price)) if getattr(answer, "price", None) else None,
+            filled_volume=volume,
+            price=price,
             retcode=int(answer.retcode),
             comment=str(getattr(answer, "comment", "")),
             raw=_jsonable(raw),
+            deal=deal,
         )
 
 

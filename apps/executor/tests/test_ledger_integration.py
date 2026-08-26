@@ -46,15 +46,24 @@ def an_order(session_id: str = "", **overrides: Any) -> WireOrder:
     )
 
 
-def a_placement(*, accepted: bool = True, volume: str = "0.10", retcode: int = 10009) -> Placement:
+def a_placement(
+    *,
+    accepted: bool = True,
+    volume: str = "0.10",
+    retcode: int = 10009,
+    deal: int | None = 555,
+) -> Placement:
+    """``deal=None`` is the resting shape: accepted by the venue, nothing executed."""
+    executed = accepted and deal is not None
     return Placement(
         accepted=accepted,
         ticket=99 if accepted else None,
-        filled_volume=Decimal(volume),
-        price=Decimal("1.10000") if accepted else None,
+        filled_volume=Decimal(volume) if executed else Decimal(0),
+        price=Decimal("1.10000") if executed else None,
         retcode=retcode,
         comment="done" if accepted else "no money",
         raw={"retcode": retcode, "comment": "done" if accepted else "no money"},
+        deal=deal if executed else None,
     )
 
 

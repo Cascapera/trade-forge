@@ -236,9 +236,29 @@ class Service:
         venue, and a refusal never reached one; a "fill" of zero would be a session waiting for
         a position it will never get told about. The refusal already went to `order_audit`, which
         is where an operator asks why.
+
+        ⚠️ **Nothing is published for a *resting* order either**, which is the same rule and used
+        not to be the same code. A limit order accepted by the venue is a live order, not a
+        trade: `Placement.filled_volume` is zero until a deal exists (see its docstring), so an
+        order waiting in the book falls out here alongside the refusals. Whoever tells the
+        session that the limit finally filled, later, is not this method — a deal that happens
+        minutes after the entry was acknowledged has nobody in this loop watching for it.
         """
         placement = outcome.placement
         if not outcome.sent or placement is None or placement.filled_volume <= 0:
+            return
+        if placement.price is None:
+            # A deal with a volume and no price is a contradiction, and there is no honest
+            # `WireFill` to build from it — `Fill` refuses a price of zero, so publishing one
+            # would kill the session with an error about the wrong thing entirely. Refuse loudly
+            # instead: `order_audit` already holds the terminal's answer verbatim.
+            logger.error(
+                "deal %s filled %s of %s with no price; nothing published to %s",
+                placement.deal,
+                placement.filled_volume,
+                order.client_id,
+                FILLS_STREAM,
+            )
             return
         self.queue.publish_fill(
             WireFill(
@@ -246,7 +266,7 @@ class Service:
                 session_id=order.session_id,
                 symbol=order.request.symbol,
                 at=at,
-                price=placement.price if placement.price is not None else order.request.volume * 0,
+                price=placement.price,
                 volume=placement.filled_volume,
                 ticket=placement.ticket,
             )

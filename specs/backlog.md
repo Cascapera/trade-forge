@@ -937,16 +937,26 @@ sessão pode usar o venue" ganha dono.
 
 ---
 
-## O `_sent` do `MT5Broker` vive em memória
+## ~~Uma sessão nova não sabe da posição que a anterior deixou aberta~~ — FECHADO (PR-304-A4)
 
-Um `dict[client_id, OrderRequest]`, e é a outra metade de todo fill. Uma sessão que morre segurando
-uma ordem volta sem saber dela: o fill chega, o `_request_for` não acha o pedido e **levanta** — que
-é o certo (um fill que não se consegue atribuir é uma posição real que o ledger vai errar), mas é
-uma parada dura numa situação recuperável.
+Fechado. O executor publica um retrato do que segura (por magic) na chave Redis `venue.positions`,
+numa **thread própria** a cada 15 s, e o `MT5Broker.start()` recusa começar se o retrato mostrar
+posição — ou se estiver **ausente, velho ou ilegível**.
 
-**Conserto (PR-304-A4, junto da reconciliação):** as ordens já estão em `order_audit`, indexadas por
-`client_id`. Uma sessão subindo pode reconstruir o `_sent` de lá — e a mesma leitura serve para
-comparar o que o ledger acha que tem com o que o venue diz que tem.
+⚠️ A entrada anterior descrevia o sintoma errado (dizia que o `_request_for` levantaria). Não
+levanta: cada processo cria uma `LiveSession` nova, e o broker descarta em silêncio os fills que
+não são da sua sessão. O problema real era a posição órfã viva no venue com o ledger novo zerado.
+
+Duas regras que saíram disso e valem além deste PR:
+
+* **"Não sei" não é "não tem nada".** Ausente e velho recusam igual a posição encontrada.
+* **Uma leitura que falhou não publica retrato vazio.** O executor deixa a chave velha envelhecer
+  em vez de escrever `positions: []`, senão "não consegui perguntar" viraria "a conta está limpa"
+  exatamente no instante em que a resposta decide se uma sessão pode operar.
+
+**Ainda em aberto (PR-304-A5):** *adotar* a posição órfã em vez de só recusar. Precisa recuperar do
+`order_audit` o custo de entrada, o `decided_at` e o `initial_stop_loss` — que é o denominador de
+todo R e não está no que o venue reporta.
 
 ---
 

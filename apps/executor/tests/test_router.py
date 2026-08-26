@@ -17,10 +17,11 @@ from typing import Any
 import pytest
 
 from tradeforge_engine.domain import OrderRequest, Side, SignalKind
-from tradeforge_executor.gateway import HeldPosition, Placement
+from tradeforge_executor.gateway import Placement
 from tradeforge_executor.router import Outcome, Router, start_of_day
 from tradeforge_executor.safety import KillSwitch, Limits
 from tradeforge_executor.wire import (
+    HeldPosition,
     Instruction,
     WireCancel,
     WireModifyStop,
@@ -119,6 +120,10 @@ class FakeGateway:
             comment="removed" if self._withdraws else "no such order",
             raw={"withdrew": 1 if self._withdraws else 0},
         )
+
+    def holdings(self) -> tuple[HeldPosition, ...]:
+        """Everything the double was told this executor is holding, across every symbol."""
+        return () if self.holding is None else (self.holding,)
 
     def held(self, symbol: str) -> HeldPosition | None:
         """What the double was told this executor is holding.
@@ -480,7 +485,10 @@ def test_a_cancel_that_found_nothing_is_still_an_accepted_instruction() -> None:
 def a_long(*, stop_loss: str | None = "1.16000", ticket: int = 47_096_513) -> HeldPosition:
     return HeldPosition(
         ticket=ticket,
+        symbol="EURUSD",
         side=Side.LONG,
+        volume=Decimal("0.01"),
+        price_open=Decimal("1.16524"),
         stop_loss=Decimal(stop_loss) if stop_loss is not None else None,
     )
 
@@ -524,7 +532,14 @@ def test_a_short_tightens_downwards() -> None:
     """The mirror, and the one a sign error produces: for a short, *lower* is tighter. A check
     written for one side only passes every long test in this file and inverts the rule for half
     the trades the strategy takes."""
-    holding = HeldPosition(ticket=1, side=Side.SHORT, stop_loss=Decimal("1.17000"))
+    holding = HeldPosition(
+        ticket=1,
+        symbol="EURUSD",
+        side=Side.SHORT,
+        volume=Decimal("0.01"),
+        price_open=Decimal("1.16524"),
+        stop_loss=Decimal("1.17000"),
+    )
 
     tighter = route(FakeGateway(holding=holding), order=a_stop_move(stop_loss="1.16800"))
     looser = route(FakeGateway(holding=holding), order=a_stop_move(stop_loss="1.17200"))

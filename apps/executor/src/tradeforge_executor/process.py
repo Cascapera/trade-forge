@@ -23,11 +23,13 @@ from redis import Redis
 from tradeforge_db.session import create_db_engine, create_session_factory
 from tradeforge_engine.domain import OrderRequest
 from tradeforge_executor.config import ExecutorSettings
-from tradeforge_executor.gateway import HeldPosition, MT5Gateway, OrderGateway, Placement
+from tradeforge_executor.gateway import MT5Gateway, OrderGateway, Placement
 from tradeforge_executor.kill_switch import EndpointFlag, FileFlag, RedisFlag
 from tradeforge_executor.router import Router
 from tradeforge_executor.safety import KillSwitch
 from tradeforge_executor.service import GROUP, OrderQueue, Service
+from tradeforge_executor.snapshot import VenueSnapshot
+from tradeforge_executor.wire import HeldPosition
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +92,12 @@ class RefusingGateway:
             comment="dry run: the executor is not armed",
             raw={"dry_run": True, "withdraw": client_id},
         )
+
+    def holdings(self) -> tuple[HeldPosition, ...]:
+        """A **read**, so it passes through. The venue snapshot must be true even when this
+        executor is unarmed — a session refusing to start over an orphaned position needs the
+        real answer, and a dry run that reported an empty account would wave it through."""
+        return self._inner.holdings()
 
     def held(self, symbol: str) -> HeldPosition | None:
         """⚠️ A **read**, so it passes through like the others. An unarmed executor must still be
@@ -205,8 +213,18 @@ def main(argv: list[str] | None = None) -> int:
     )
     logger.info("consuming as %s in group %s", args.consumer, GROUP)
 
+    # ⚠️ **The snapshot runs whether or not this executor is armed**, because it publishes a fact
+    # about the *venue*, not about this process's willingness to act on it. A dry run that stopped
+    # publishing would leave every session refusing to start — correctly, since absent means "I do
+    # not know" — for a reason that has nothing to do with the account.
+    #
+    # ⚠️ And it is `gateway`, the outer one: `RefusingGateway` passes reads straight through, so a
+    # dry run still reports what is really out there rather than an empty account it invented.
+    snapshot = VenueSnapshot(redis, gateway)
+
     try:
-        handled = service.run()
+        with snapshot:
+            handled = service.run()
     finally:
         terminal.close()
         redis.close()

@@ -18,13 +18,14 @@ from sqlalchemy.orm import Session, sessionmaker
 from tradeforge_db.live_sessions import STALE_AFTER, beat, open_session
 from tradeforge_db.models import Instrument, LiveSession, OrderAudit, OrderAuditStatus, Strategy
 from tradeforge_engine.domain import AssetClass, OrderRequest, Side, SignalKind
-from tradeforge_executor.gateway import HeldPosition, Placement
+from tradeforge_executor.gateway import Placement
 from tradeforge_executor.router import Router
 from tradeforge_executor.safety import Limits
 from tradeforge_executor.service import GROUP, OrderQueue, Service
 from tradeforge_executor.wire import (
     FILLS_STREAM,
     ORDERS_STREAM,
+    HeldPosition,
     cancel_fields,
     fill_from_fields,
     instruction_from_fields,
@@ -145,6 +146,10 @@ class FakeGateway:
             comment="removed" if self._withdraws else "no such order",
             raw={"withdrew": 1 if self._withdraws else 0},
         )
+
+    def holdings(self) -> tuple[HeldPosition, ...]:
+        """Everything the double was told this executor is holding, across every symbol."""
+        return () if self.holding is None else (self.holding,)
 
     def held(self, symbol: str) -> HeldPosition | None:
         """What the double was told this executor is holding.
@@ -646,7 +651,14 @@ def test_a_verified_stop_move_is_executed_recorded_and_acknowledged(
     )
     queue = FakeQueue([(entry_id, fields)])
     gateway = FakeGateway(
-        holding=HeldPosition(ticket=47_096_513, side=Side.LONG, stop_loss=Decimal("1.16000"))
+        holding=HeldPosition(
+            ticket=47_096_513,
+            symbol="EURUSD",
+            side=Side.LONG,
+            volume=Decimal("0.01"),
+            price_open=Decimal("1.16524"),
+            stop_loss=Decimal("1.16000"),
+        )
     )
 
     a_service(session_factory, queue, gateway).handle(entry_id, instruction_from_fields(fields))
@@ -677,7 +689,14 @@ def test_a_loosening_stop_move_is_recorded_as_a_refusal_with_its_reason(
     )
     queue = FakeQueue([(entry_id, fields)])
     gateway = FakeGateway(
-        holding=HeldPosition(ticket=47_096_513, side=Side.LONG, stop_loss=Decimal("1.16000"))
+        holding=HeldPosition(
+            ticket=47_096_513,
+            symbol="EURUSD",
+            side=Side.LONG,
+            volume=Decimal("0.01"),
+            price_open=Decimal("1.16524"),
+            stop_loss=Decimal("1.16000"),
+        )
     )
 
     a_service(session_factory, queue, gateway).handle(entry_id, instruction_from_fields(fields))

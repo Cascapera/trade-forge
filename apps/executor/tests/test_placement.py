@@ -27,6 +27,7 @@ from typing import Any
 import pytest
 
 from tradeforge_executor.gateway import MT5Gateway, Placement
+from tradeforge_executor.wire import MAX_CLIENT_ID
 
 
 class _Retcodes:
@@ -233,3 +234,41 @@ def test_a_filled_volume_with_no_deal_cannot_be_constructed() -> None:
             comment="done",
             raw={},
         )
+
+
+# --- the name, on its way to the venue -------------------------------------------------
+
+
+def test_a_name_longer_than_the_venue_keeps_is_cut_to_what_it_keeps() -> None:
+    """⚠️ **Inside `MT5Gateway`, and tested anyway** — which is not a breach of that class's
+    doctrine. The rule there is that mocking `order_send` proves only that the gateway calls a
+    function the gateway also describes. `_comment` never reaches the terminal: it is arithmetic
+    on a string, and arithmetic on a string is exactly the kind of thing a Linux CI box can ask
+    about with no MetaTrader in sight.
+
+    The cut is real: MT5 keeps 31 characters of an order comment and drops the rest without a
+    word. Every name in this system ends in the part that distinguishes it, so the drop does not
+    shorten a name — it **merges** names.
+    """
+    name = "z" * 40
+    assert MT5Gateway()._comment(name) == "z" * MAX_CLIENT_ID
+
+
+def test_a_name_that_fits_is_handed_over_whole() -> None:
+    """The separating half, and a realistic name rather than `"z" * 40` on purpose.
+
+    What it catches that the length assertions cannot is a comment that comes out the **same
+    length and a different name** — a normalisation, a case fold, a character the venue dislikes
+    being swapped. Verified by mutation: replacing `-` with `_` inside the cut fails this test
+    and only this test.
+
+    ⚠️ It does *not* catch a cut that is merely too short by a little (`[:30]`), which a 22
+    character name passes through unchanged. That mutant dies on the tests above instead.
+    """
+    assert MT5Gateway()._comment("demand-20260826T1215-7") == "demand-20260826T1215-7"
+
+
+def test_the_venue_s_limit_is_read_from_the_wire_not_from_a_number_here() -> None:
+    """Both ends need it — the venue's limit is what makes a name valid, and the side that
+    *chooses* names is three processes away and must not learn MetaTrader to find out."""
+    assert len(MT5Gateway()._comment("z" * 40)) == MAX_CLIENT_ID

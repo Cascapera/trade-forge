@@ -17,6 +17,7 @@ from decimal import Decimal
 from typing import Any, Protocol, Self
 
 from tradeforge_engine.domain import OrderRequest, Side, SignalKind
+from tradeforge_executor.wire import MAX_CLIENT_ID
 
 logger = logging.getLogger(__name__)
 
@@ -244,7 +245,12 @@ class MT5Gateway:
             "volume": float(order.volume),
             "type": self._order_type(mt5, order),
             "magic": MAGIC,
-            "comment": client_id[:31],
+            # ⚠️ Still sliced, and still logged when the slice bites. `MT5Broker.submit` refuses
+            # an over-long name before it ever reaches here, so this cannot normally fire — but
+            # this is the last place before the venue, and the failure it guards is a *silent*
+            # merge of two names into one. A guard that costs a comparison and turns a silent
+            # loss into a line in the log is worth keeping even where it should be unreachable.
+            "comment": self._comment(client_id),
             "type_time": mt5.ORDER_TIME_GTC,
             "type_filling": mt5.ORDER_FILLING_IOC,
         }
@@ -257,6 +263,20 @@ class MT5Gateway:
         if order.take_profit is not None:
             request["tp"] = float(order.take_profit)
         return request
+
+    def _comment(self, client_id: str) -> str:
+        """As much of the name as the venue will keep, and a complaint if that is not all of it."""
+        if len(client_id) > MAX_CLIENT_ID:
+            logger.error(
+                "client_id %r is %d characters; the venue keeps %d, so it will reach the "
+                "account as %r and be indistinguishable from every other name sharing that "
+                "prefix",
+                client_id,
+                len(client_id),
+                MAX_CLIENT_ID,
+                client_id[:MAX_CLIENT_ID],
+            )
+        return client_id[:MAX_CLIENT_ID]
 
     def _order_type(self, mt5: Any, order: OrderRequest) -> int:  # noqa: ANN401
         long = order.side is Side.LONG

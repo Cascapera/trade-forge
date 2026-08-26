@@ -59,6 +59,7 @@ from tradeforge_engine.errors import EngineError
 from tradeforge_engine.portfolio import Portfolio
 from tradeforge_executor.wire import (
     FILLS_STREAM,
+    MAX_CLIENT_ID,
     WireFill,
     fill_from_fields,
     order_fields,
@@ -193,6 +194,22 @@ class MT5Broker:
             )
 
         client_id = order.client_id or self._mint()
+        if len(client_id) > MAX_CLIENT_ID:
+            # ⚠️ Refused rather than truncated, and the difference is not cosmetic. Every name in
+            # this system ends in the part that distinguishes it — a counter, a bar's minute — so
+            # the venue dropping the tail does not shorten a name, it **merges** names: two orders
+            # arrive at the account with the same comment and nobody looking at that screen can
+            # tell which is which. A refusal is loud, recorded, and fixable; a merge is silent.
+            return OrderResult(
+                order=order,
+                accepted=False,
+                reason=(
+                    f"the name {client_id!r} is {len(client_id)} characters and the venue keeps "
+                    f"{MAX_CLIENT_ID}: it would reach the account merged with every other name "
+                    f"sharing that prefix"
+                ),
+            )
+
         try:
             self._client.xadd(
                 stream_for(self._session_id),
@@ -219,9 +236,19 @@ class MT5Broker:
         `client_id` and the audit trail is indexed by it, so every order gets one. Derived from
         the session and a counter rather than random: two identical entries on the same session
         are then distinguishable in `order_audit` by something an operator can put in order.
+
+        ⚠️ **The session id is abbreviated, and it has to be.** A full uuid is 36 characters, so
+        `f"{session_id}:{n}"` is 38 and the venue keeps 31 — which cuts off the counter, the only
+        part that distinguishes one minted name from the next, and lands every order of a session
+        at the account under one identical comment. Measured, on names this method produced.
+
+        Eight hex characters are not a guarantee against two sessions colliding, and they do not
+        need to be: `session_id` travels beside the name on the wire and sits in its own column in
+        `order_audit`. What this prefix is for is the one place the full id cannot go — a human
+        reading the account, wanting to know which session put that order there.
         """
         self._minted += 1
-        return f"{self._session_id}:{self._minted}"
+        return f"s{self._session_id.replace('-', '')[:8]}-{self._minted}"
 
     def cancel(self, client_id: str) -> bool:
         """Not yet reachable — see the module docstring of `tradeforge_executor.wire`.

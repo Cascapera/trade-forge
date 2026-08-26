@@ -25,6 +25,8 @@ import threading
 from pathlib import Path
 from typing import Protocol
 
+from redis.typing import KeyT, ResponseT
+
 logger = logging.getLogger(__name__)
 
 __all__ = ["ENGAGED_VALUE", "SWITCH_KEY", "EndpointFlag", "FileFlag", "FlagStore", "RedisFlag"]
@@ -39,9 +41,20 @@ ENGAGED_VALUE = "engaged"
 
 
 class FlagStore(Protocol):
-    """The one Redis call this module makes."""
+    """The one Redis call this module makes, in redis-py's own vocabulary.
 
-    def exists(self, *names: str) -> int: ...
+    ⚠️ **Wrong in both directions on the first try, and they are opposite rules.** A protocol is
+    satisfied by a *wider* parameter and a *narrower* return — so `names: str` was too narrow
+    (the real client takes `KeyT`) and `-> int` was too narrow as well, because `Redis.exists`
+    is declared `ResponseT`, which covers the async client too.
+
+    Get either wrong and the protocol describes a client that does not exist: every double
+    written against it type-checks while the real `Redis` does not. `CandleStream`'s protocol
+    had to learn the same thing from a test; here mypy said it the moment the real client was
+    passed in, which is why `process.py` passing it is worth more than any assertion.
+    """
+
+    def exists(self, *names: KeyT) -> ResponseT: ...
 
 
 class RedisFlag:
@@ -57,6 +70,8 @@ class RedisFlag:
 
     def engaged(self) -> bool:
         try:
+            # `bool` of whatever the client answered: 1 or 0 from the sync client, and the
+            # protocol admits `ResponseT` so this is the one place that narrows it.
             return bool(self._store.exists(self._key))
         except Exception:
             # ⚠️ Not "assume it is fine". An unreachable Redis is exactly the situation in which

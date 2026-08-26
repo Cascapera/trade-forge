@@ -12,7 +12,7 @@ from collections.abc import Iterator
 
 import pytest
 from sqlalchemy import Engine
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from tradeforge_db.config import PostgresSettings
 from tradeforge_db.migrate import upgrade
@@ -45,6 +45,19 @@ def migrated_engine(dsn: str) -> Iterator[Engine]:
         yield engine
     finally:
         engine.dispose()
+
+
+@pytest.fixture
+def session_factory(migrated_engine: Engine) -> sessionmaker[Session]:
+    """A factory over an emptied database, for the code that opens its own short transactions.
+
+    ⚠️ The real `sessionmaker`, not the `Callable[[], Session]` the other conftests annotate —
+    `session_scope` needs the type it actually got, and spelling it honestly here saves every
+    caller a cast.
+    """
+    with migrated_engine.begin() as connection:
+        truncate(connection, TABLES_CHILD_FIRST)
+    return create_session_factory(migrated_engine)
 
 
 @pytest.fixture

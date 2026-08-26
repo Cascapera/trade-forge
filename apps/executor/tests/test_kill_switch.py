@@ -8,11 +8,14 @@ layer that answers "not engaged" because it could not tell is a comment, not a s
 from pathlib import Path
 
 import pytest
+from redis import Redis
+from redis.typing import KeyT
 
 from tradeforge_executor.kill_switch import (
     SWITCH_KEY,
     EndpointFlag,
     FileFlag,
+    FlagStore,
     RedisFlag,
 )
 
@@ -25,7 +28,7 @@ class FakeStore:
         self.broken = broken
         self.asked = 0
 
-    def exists(self, *names: str) -> int:
+    def exists(self, *names: KeyT) -> int:
         self.asked += 1
         if self.broken:
             raise ConnectionError("redis is not answering")
@@ -119,3 +122,20 @@ def test_each_layer_names_itself(tmp_path: Path) -> None:
     assert "redis" in RedisFlag(FakeStore()).name
     assert "KILL" in FileFlag(tmp_path / "KILL").name
     assert EndpointFlag().name == "endpoint"
+
+
+def test_the_real_redis_client_satisfies_the_flag_store() -> None:
+    """⚠️ **Proved by assignment, so mypy checks it.** A `Protocol` nothing real is ever assigned
+    to describes an imaginary client, and this one got it wrong in *both* directions on the first
+    try — `names: str` was too narrow (a protocol is satisfied by a **wider** parameter) and
+    `-> int` was too narrow as well (satisfied by a **narrower** return, and `Redis.exists` is
+    declared `ResponseT`).
+
+    Neither showed up until the real client was passed in. No connection is opened: constructing
+    a `Redis` does not dial anything, and the assignment is a type-level statement.
+    """
+    client = Redis(host="localhost", port=6379)
+
+    store: FlagStore = client
+
+    assert store is client

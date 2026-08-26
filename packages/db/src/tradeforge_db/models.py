@@ -89,10 +89,19 @@ class SelectionMetric(StrEnum):
 class SessionMode(StrEnum):
     """Paper or real, and the distinction the whole of sdd.md §11 hangs on.
 
-    ⚠️ `LIVE` exists in the enum and is **refused by a CHECK** until the safeguards do (see
-    rev_0012). The value belongs here because the domain has two modes; the constraint exists
-    because today there is no kill switch, no executor and no paper-first gate. Enabling real
-    trading is therefore a migration — visible, reviewed, dated — and not a config value.
+    ⚠️ `LIVE` was **refused outright by a CHECK** until `rev_0016`, because there was no kill
+    switch, no executor and no paper-first gate. All three exist now, so the blanket refusal is
+    gone and an *earned* one took its place: a trigger refuses a live session for a strategy that
+    has never completed a bar in paper.
+
+    The database enforces the **invariant** — never with a strategy nobody has watched — and the
+    application enforces the **policy**, which is how many days (`live_promotion_days`). A number
+    that needs a migration to change is not a configuration value, and a rule that lives only in
+    the code that writes the row is not an invariant. Each belongs where it can do its job.
+
+    ⚠️ The count is per **strategy**, not per strategy-and-instrument: see `rev_0016`. Paper on
+    EURUSD M15 unlocks this strategy anywhere. That is the operator's choice, and it means a live
+    session is evidence that the *strategy* has been watched — never that this *plan* has.
     """
 
     PAPER = "paper"
@@ -1172,7 +1181,6 @@ class LiveSession(Base):
     __table_args__ = (
         _timeframe_check(),
         CheckConstraint("initial_capital > 0", name="initial_capital_positive"),
-        CheckConstraint("mode = 'paper'", name="only_paper_until_safeguards_exist"),
         CheckConstraint(
             "stopped_at IS NULL OR stopped_at >= started_at", name="stopped_after_started"
         ),

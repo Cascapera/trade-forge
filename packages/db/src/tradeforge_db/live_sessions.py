@@ -62,6 +62,7 @@ def open_session(  # noqa: PLR0913 — keyword-only; each names one column of th
     initial_capital: Decimal,
     cost_model: dict[str, Any],
     engine_version: str,
+    mode: SessionMode = SessionMode.PAPER,
     warmup_bars: int,
     at: dt.datetime,
 ) -> LiveSession:
@@ -75,12 +76,21 @@ def open_session(  # noqa: PLR0913 — keyword-only; each names one column of th
     `heartbeat_at` is left NULL. The loop sets it on its first beat, so a row with a status of
     `running` and no heartbeat means the process died between opening and its first bar — a
     state `reconcile_stale` recognises rather than one it has to guess at.
+
+    ⚠️ **`mode` defaults to paper, and the default is load-bearing.** Every existing caller means
+    paper, and a required argument would have made each of them state it — which sounds tidier
+    until you notice that the day somebody adds a caller, the safe value is the one they have to
+    remember. A default that fails safe costs nothing; one that fails open costs an account.
+
+    ⚠️ A `live` row is refused by the database itself unless the strategy has completed a bar in
+    paper (rev_0016). That refusal is an invariant, not this function's policy: how *many* days
+    are required is the application's to decide, and it decides before calling this.
     """
     row = LiveSession(
         strategy_id=strategy_id,
         instrument_id=instrument_id,
         timeframe=timeframe,
-        mode=SessionMode.PAPER,
+        mode=mode,
         status=LiveSessionStatus.RUNNING,
         initial_capital=initial_capital,
         cost_model=cost_model,

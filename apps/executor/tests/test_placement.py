@@ -98,8 +98,15 @@ happened. Same retcode as `RESTING`, same echoed volume: `deal` is the only fiel
 which is exactly why it is the one both readings are derived from."""
 
 
-def placement_of(answer: _Answer) -> Placement:
-    return MT5Gateway()._placement(_Retcodes(), answer)
+QUOTED_SPREAD = Decimal("1.16667") - Decimal("1.16660")
+"""**RECORDED.** The quote standing when the probe order went out: bid 1.16660, ask 1.16667.
+
+`MT5Gateway.send` reads this *before* `order_send` and hands it down, because `order_send`
+answers with the price that traded and the quote either side of it is gone a second later."""
+
+
+def placement_of(answer: _Answer, *, spread: Decimal | None = QUOTED_SPREAD) -> Placement:
+    return MT5Gateway()._placement(_Retcodes(), answer, spread=spread)
 
 
 def test_a_resting_limit_order_did_not_fill_anything() -> None:
@@ -155,6 +162,36 @@ def test_a_real_deal_is_still_read_as_a_fill() -> None:
 def test_the_price_goes_home_as_decimal_text_not_a_float() -> None:
     """`Decimal(1.16667)` is not 1.16667, and a tick that survives the venue must survive us."""
     assert str(placement_of(FILLED).price) == "1.16667"
+
+
+def test_a_fill_carries_the_quote_it_crossed() -> None:
+    """The session cannot recover this later, and it cannot price the fill without it: MT5's
+    bars are bid-based, so a buy's fill price sits above the bar it happened in."""
+    assert placement_of(FILLED).spread == Decimal("0.00007")
+
+
+def test_a_resting_order_crossed_nothing_so_it_carries_no_spread() -> None:
+    """Same gate as the volume and the price: nothing executed, so there is nothing to price.
+
+    ⚠️ `None`, not zero. Zero is a real quote at a quiet hour on this venue — measured — so it
+    cannot double as "there was no fill", or the two become the same word for "charge nothing"
+    and only one of them means it.
+    """
+    assert placement_of(RESTING).spread is None
+
+
+def test_a_fill_that_cannot_say_what_it_crossed_cannot_be_constructed() -> None:
+    """The mirror of the deal guard: an execution nobody can price would be recorded at a
+    made-up cost, and zero is the made-up cost that looks most like a measurement."""
+    with pytest.raises(ValueError, match="no quote"):
+        placement_of(FILLED, spread=None)
+
+
+def test_a_negative_spread_is_refused() -> None:
+    """A spread is a magnitude. A negative one is the ask below the bid, which is either a
+    crossed book or a sign error — and as a cost it would be money appearing from nowhere."""
+    with pytest.raises(ValueError, match="magnitude"):
+        placement_of(FILLED, spread=Decimal("-0.00001"))
 
 
 def test_a_refusal_carries_no_deal_and_no_volume() -> None:

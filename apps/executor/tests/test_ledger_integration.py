@@ -52,6 +52,7 @@ def a_placement(
     volume: str = "0.10",
     retcode: int = 10009,
     deal: int | None = 555,
+    spread: str = "0.00002",
 ) -> Placement:
     """``deal=None`` is the resting shape: accepted by the venue, nothing executed."""
     executed = accepted and deal is not None
@@ -64,6 +65,7 @@ def a_placement(
         comment="done" if accepted else "no money",
         raw={"retcode": retcode, "comment": "done" if accepted else "no money"},
         deal=deal if executed else None,
+        spread=Decimal(spread) if executed else None,
     )
 
 

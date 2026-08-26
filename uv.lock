@@ -1033,6 +1033,7 @@ dependencies = [
     { name = "tradeforge-collector" },
     { name = "tradeforge-db" },
     { name = "tradeforge-engine" },
+    { name = "tradeforge-executor" },
     { name = "tradeforge-schema" },
     { name = "uvicorn", extra = ["standard"] },
 ]
@@ -1047,6 +1048,7 @@ requires-dist = [
     { name = "tradeforge-collector", editable = "apps/collector" },
     { name = "tradeforge-db", editable = "packages/db" },
     { name = "tradeforge-engine", editable = "packages/engine" },
+    { name = "tradeforge-executor", editable = "apps/executor" },
     { name = "tradeforge-schema", editable = "packages/schema" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.51.0" },
 ]

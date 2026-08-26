@@ -23,6 +23,7 @@ import datetime as dt
 import logging
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Protocol, cast
 
 from redis.exceptions import ResponseError
@@ -260,6 +261,8 @@ class Service:
                 FILLS_STREAM,
             )
             return
+        # `Placement.__post_init__` has already refused a filled volume with no quote, so this
+        # is a `Decimal`. Narrowing it again would add a branch no test could enter.
         self.queue.publish_fill(
             WireFill(
                 client_id=order.client_id,
@@ -268,6 +271,7 @@ class Service:
                 at=at,
                 price=placement.price,
                 volume=placement.filled_volume,
+                spread=cast("Decimal", placement.spread),
                 ticket=placement.ticket,
             )
         )

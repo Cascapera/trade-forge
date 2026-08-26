@@ -12,6 +12,19 @@ dependencies = [
     # than duplicating pyarrow. Safe on Linux: the collector imports `MetaTrader5` lazily,
     # only inside `connect()`, so depending on the package never pulls the Windows-only wheel.
     "tradeforge-collector",
+    # The executor owns the order/fill wire format (`tradeforge_executor.wire`), and a live
+    # session's `MT5Broker` produces one half of it and consumes the other. The format lives
+    # with the executor and is imported here rather than copied for the same reason the candle
+    # format lives with the collector: two copies agree on the day they are written and
+    # disagree on the day one of them changes, and the disagreement arrives as an order sent at
+    # the wrong size, not as an error.
+    #
+    # Safe on Linux for the same reason the collector is — `MetaTrader5` is guarded by
+    # `sys_platform == 'win32'` there and imported only inside `MT5Gateway.connect()`, so
+    # nothing at this package's import time reaches for a Windows wheel. Declared rather than
+    # borrowed from the workspace: a dependency that resolves only because everything happens
+    # to be installed together is a dependency that breaks the first time it is not.
+    "tradeforge-executor",
     "fastapi>=0.115",
     # `[standard]` brings the websockets and httptools that the WS endpoint and a production
     # server need; without it uvicorn runs but cannot speak WebSocket.

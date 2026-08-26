@@ -130,6 +130,17 @@ class OrderGateway(Protocol):
 
     def send(self, order: OrderRequest, *, client_id: str) -> Placement: ...
 
+    def withdraw(self, client_id: str) -> Placement:
+        """Remove the resting order named `client_id`, if the venue still has it.
+
+        ⚠️ **Nothing found is not an error.** The order may have filled while the cancel was in
+        flight, been cancelled already, or never have reached the venue at all. In live that is a
+        race, not a fault — `Broker.cancel` says the same from the other end — so it comes back
+        as an accepted instruction that withdrew nothing, and the trail records that it withdrew
+        nothing. A raised exception would turn a normal execution into a dead session.
+        """
+        ...
+
     def balance(self) -> Decimal: ...
 
     def open_positions(self) -> int:
@@ -210,6 +221,76 @@ class MT5Gateway:
         )
         answer = mt5.order_send(request)
         return self._placement(mt5, answer, spread=spread)
+
+    def withdraw(self, client_id: str) -> Placement:
+        """Find the resting order by the name the strategy gave it, and remove it.
+
+        ⚠️ **Found by the comment, at the venue, rather than by a ticket from `order_audit`.**
+        The venue is the authority on what it is still holding: an order the trail says exists
+        may have filled a second ago, and acting on the trail's ticket would be acting on a
+        memory. Asking the terminal makes "already filled", "already cancelled" and "never got
+        there" the same answer — nothing found — which is exactly the answer `Broker.cancel`
+        needs.
+
+        Safe to match on the comment only because a name is now guaranteed to survive it whole:
+        `MT5Broker.submit` refuses a `client_id` longer than `MAX_CLIENT_ID`. Before that, two
+        names could reach the account truncated to the same 31 characters, and this method would
+        have cancelled whichever it found first.
+        """
+        mt5 = self._require()
+        resting = mt5.orders_get() or ()
+        mine = [
+            order
+            for order in resting
+            if getattr(order, "magic", None) == MAGIC
+            and str(getattr(order, "comment", "")) == client_id[:MAX_CLIENT_ID]
+        ]
+        if not mine:
+            logger.info("nothing to withdraw for %s; it filled, or was never placed", client_id)
+            return Placement(
+                accepted=True,
+                ticket=None,
+                filled_volume=Decimal(0),
+                price=None,
+                retcode=0,
+                comment="nothing was waiting under that name",
+                raw={"withdrew": 0, "client_id": client_id},
+            )
+        answers = [
+            mt5.order_send({"action": mt5.TRADE_ACTION_REMOVE, "order": int(order.ticket)})
+            for order in mine
+        ]
+        return self._withdrawal(mt5, client_id, mine, answers)
+
+    def _withdrawal(
+        self,
+        mt5: Any,  # noqa: ANN401
+        client_id: str,
+        removed: list[Any],
+        answers: list[Any],
+    ) -> Placement:
+        """⚠️ **Every answer has to be `DONE`, not just the first.** One name should match one
+        order, but "should" is a fact about the strategy, not about the account — and a partial
+        withdrawal reported as a success leaves an order live at the venue that the session has
+        already written off."""
+        codes = [int(getattr(answer, "retcode", 0) or 0) for answer in answers]
+        done = all(code == mt5.TRADE_RETCODE_DONE for code in codes)
+        raw = {
+            "withdrew": len(removed) if done else 0,
+            "client_id": client_id,
+            "tickets": [int(order.ticket) for order in removed],
+            "retcodes": codes,
+            "comments": [str(getattr(answer, "comment", "")) for answer in answers],
+        }
+        return Placement(
+            accepted=done,
+            ticket=int(removed[0].ticket),
+            filled_volume=Decimal(0),
+            price=None,
+            retcode=codes[0] if codes else 0,
+            comment=str(getattr(answers[0], "comment", "")) if answers else "",
+            raw=_jsonable(raw),
+        )
 
     def balance(self) -> Decimal:
         info = self._require().account_info()
@@ -341,7 +422,19 @@ def _jsonable(payload: dict[str, Any]) -> dict[str, Any]:
 
     ⚠️ Stringified rather than coerced to `float`. This document is evidence, and a price that
     passed through a float on the way into the audit trail is evidence about a different number.
+
+    ⚠️ **Lists keep their shape.** A withdrawal touches one order per name in the ordinary case
+    and more than one when something has gone wrong, so its evidence is a list of tickets and a
+    list of retcodes — and those are exactly the rows an incident filters on. Flattened to
+    `"[10009, 10013]"` they are still readable and no longer queryable, which is the half of
+    "evidence" that only matters once somebody needs it.
     """
-    return {
-        key: value if isinstance(value, int | str) else str(value) for key, value in payload.items()
-    }
+    return {key: _value(value) for key, value in payload.items()}
+
+
+def _value(value: Any) -> Any:  # noqa: ANN401 — whatever the terminal put in the answer
+    if isinstance(value, int | str):
+        return value
+    if isinstance(value, list | tuple):
+        return [_value(item) for item in value]
+    return str(value)

@@ -31,10 +31,16 @@ __all__ = [
     "FILLS_STREAM",
     "MAX_CLIENT_ID",
     "ORDERS_STREAM",
+    "Instruction",
+    "WireCancel",
     "WireFill",
+    "WireModifyStop",
     "WireOrder",
+    "cancel_fields",
     "fill_fields",
     "fill_from_fields",
+    "instruction_from_fields",
+    "modify_stop_fields",
     "order_fields",
     "order_from_fields",
     "stream_for",
@@ -93,6 +99,68 @@ def stream_for(_session_id: str) -> str:
     return ORDERS_STREAM
 
 
+KIND = "kind"
+"""The one field every entry on `orders.outbound` carries, and the first one read.
+
+⚠️ **One stream for all three instructions, not one stream each.** A second stream for cancels
+would be tidier to read and wrong for a reason that only shows up under load: a session arms a
+limit order and cancels it two bars later, and across two streams the executor is free to process
+the cancel *before* the placement. The cancel finds nothing, answers "nothing to withdraw", and
+the order it was meant to withdraw is placed a moment later and lives at the venue for ever.
+
+One stream is one order of arrival. That is the whole argument — not elegance, not fewer keys.
+
+⚠️ **Required, never defaulted.** An entry with no `kind` is not "probably an order": it is an
+entry this format cannot read, and it goes down the dead-letter path with the malformed ones.
+Same doctrine as `order_from_fields` refusing to default a missing `volume` to zero — a guess
+that usually works is the kind that fails silently the once it does not.
+"""
+
+KIND_ORDER = "order"
+KIND_CANCEL = "cancel"
+KIND_MODIFY_STOP = "modify_stop"
+
+
+@dataclass(frozen=True, slots=True)
+class WireCancel:
+    """Withdraw the order named `client_id`, if it is still waiting.
+
+    Not an `OrderRequest` with a different intent, and `OrderRequest.__post_init__` refuses to be
+    one — rightly: a cancel put in the queue the broker fills is in the queue it exists to empty.
+    A separate type is what keeps that impossible rather than merely discouraged.
+    """
+
+    client_id: str
+    session_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class WireModifyStop:
+    """Move the protective stop of the open position in `symbol` (ADR-0018).
+
+    ⚠️ **Its own `client_id`, minted for the instruction** rather than borrowed from the entry
+    that opened the position. `order_audit.client_id` is not nullable and the trail is indexed by
+    it, and this *is* a separate instruction with its own outcome: it can be refused while the
+    entry that opened the position succeeded, and reusing that entry's name would file two
+    unrelated verdicts under one heading.
+
+    `decided_at` travels because it is the anti-lookahead stamp — the opening instant of the bar
+    whose close decided the new level. It is not the executor's to use, and it is not dropped
+    either: `order_audit.request` is evidence, and the instant a level was decided is exactly
+    what an incident asks about.
+    """
+
+    client_id: str
+    session_id: str
+    symbol: str
+    stop_loss: Decimal
+    decided_at: dt.datetime
+
+
+type Instruction = WireOrder | WireCancel | WireModifyStop
+"""What comes off `orders.outbound`. Three shapes, one stream, one order of arrival."""
+
+
 @dataclass(frozen=True, slots=True)
 class WireOrder:
     """An order as it arrived off the queue: the request, and who it belongs to.
@@ -116,6 +184,7 @@ def order_fields(order: OrderRequest, *, session_id: str, client_id: str) -> dic
     raises where `None` reads.
     """
     fields = {
+        KIND: KIND_ORDER,
         "client_id": client_id,
         "session_id": session_id,
         "symbol": order.symbol,
@@ -134,6 +203,55 @@ def order_fields(order: OrderRequest, *, session_id: str, client_id: str) -> dic
     if order.reason:
         fields["reason"] = order.reason
     return fields
+
+
+def cancel_fields(*, session_id: str, client_id: str) -> dict[str, str]:
+    """Withdraw one order, by the name its strategy gave it (ADR-0014).
+
+    Three fields, and that is the whole instruction. The *reason* an order should stop existing
+    is never the executor's to know — a limit order here is alive because a zone is alive, and
+    zones are the strategy's vocabulary. `Broker.cancel`'s docstring says the same from the
+    other side.
+    """
+    return {KIND: KIND_CANCEL, "client_id": client_id, "session_id": session_id}
+
+
+def modify_stop_fields(
+    *, session_id: str, client_id: str, symbol: str, stop_loss: Decimal, decided_at: dt.datetime
+) -> dict[str, str]:
+    """Move the stop of the open position in `symbol`. See `WireModifyStop`."""
+    return {
+        KIND: KIND_MODIFY_STOP,
+        "client_id": client_id,
+        "session_id": session_id,
+        "symbol": symbol,
+        "stop_loss": str(stop_loss),
+        "decided_at": decided_at.isoformat(),
+    }
+
+
+def instruction_from_fields(fields: dict[str, str]) -> Instruction:
+    """One entry off `orders.outbound`, whichever of the three it is.
+
+    ⚠️ **The `kind` is read first and never guessed.** A `fields.get(KIND, KIND_ORDER)` would turn
+    an entry this format cannot read into an order — sent, filled, and recorded as fine. The
+    `KeyError` and the `ValueError` here are both messages on a dead-letter path, which the
+    service already knows how to walk; a guess is a position nobody asked for.
+    """
+    kind = fields[KIND]
+    if kind == KIND_ORDER:
+        return order_from_fields(fields)
+    if kind == KIND_CANCEL:
+        return WireCancel(client_id=fields["client_id"], session_id=fields["session_id"])
+    if kind == KIND_MODIFY_STOP:
+        return WireModifyStop(
+            client_id=fields["client_id"],
+            session_id=fields["session_id"],
+            symbol=fields["symbol"],
+            stop_loss=Decimal(fields["stop_loss"]),
+            decided_at=dt.datetime.fromisoformat(fields["decided_at"]),
+        )
+    raise ValueError(f"unknown instruction kind {kind!r} on {ORDERS_STREAM}")
 
 
 def order_from_fields(fields: dict[str, str]) -> WireOrder:

@@ -22,11 +22,18 @@ from sqlalchemy.orm import Session
 from tradeforge_db.live_sessions import is_stale
 from tradeforge_db.models import LiveSession, LiveSessionStatus, OrderAudit, OrderAuditStatus
 from tradeforge_executor.router import Outcome
-from tradeforge_executor.wire import WireOrder, order_fields
+from tradeforge_executor.wire import (
+    Instruction,
+    WireCancel,
+    WireOrder,
+    cancel_fields,
+    modify_stop_fields,
+    order_fields,
+)
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["record", "session_is_alive"]
+__all__ = ["record", "request_fields", "session_is_alive"]
 
 
 def session_is_alive(db: Session, session_id: str, *, now: dt.datetime) -> bool:
@@ -53,7 +60,32 @@ def session_is_alive(db: Session, session_id: str, *, now: dt.datetime) -> bool:
     return not is_stale(heartbeat_at=row.heartbeat_at, started_at=row.started_at, now=now)
 
 
-def record(db: Session, order: WireOrder, outcome: Outcome, *, now: dt.datetime) -> OrderAudit:
+def request_fields(instruction: Instruction) -> dict[str, str]:
+    """The instruction as the trail stores it, whichever of the three it is.
+
+    ⚠️ **Re-encoded from what was parsed, not copied from what arrived.** The two differ exactly
+    when the entry carried a field this format does not read — and the trail should say what this
+    machine acted on, because that is the thing an incident is asking about. What the venue said
+    lands in `response`, verbatim, on the same row.
+    """
+    if isinstance(instruction, WireOrder):
+        return order_fields(
+            instruction.request,
+            session_id=instruction.session_id,
+            client_id=instruction.client_id,
+        )
+    if isinstance(instruction, WireCancel):
+        return cancel_fields(session_id=instruction.session_id, client_id=instruction.client_id)
+    return modify_stop_fields(
+        session_id=instruction.session_id,
+        client_id=instruction.client_id,
+        symbol=instruction.symbol,
+        stop_loss=instruction.stop_loss,
+        decided_at=instruction.decided_at,
+    )
+
+
+def record(db: Session, order: Instruction, outcome: Outcome, *, now: dt.datetime) -> OrderAudit:
     """One row for one outcome. Added to the caller's session; never committed here.
 
     ⚠️ **The row is written once, with the outcome already known**, which is why there is no
@@ -69,7 +101,7 @@ def record(db: Session, order: WireOrder, outcome: Outcome, *, now: dt.datetime)
         live_session_id=_known_session(db, order.session_id),
         client_id=order.client_id,
         status=status,
-        request=order_fields(order.request, session_id=order.session_id, client_id=order.client_id),
+        request=request_fields(order),
         response=outcome.placement.raw if outcome.placement is not None else None,
         reason=reason,
         requested_at=now,
@@ -79,7 +111,7 @@ def record(db: Session, order: WireOrder, outcome: Outcome, *, now: dt.datetime)
     return row
 
 
-def _verdict(outcome: Outcome, order: WireOrder) -> tuple[OrderAuditStatus, str | None]:
+def _verdict(outcome: Outcome, order: Instruction) -> tuple[OrderAuditStatus, str | None]:
     """The status and the reason, decided **together**, because the database ties them.
 
     ⚠️ `a_refusal_says_why` is `(reason IS NULL) <> (status IN ('refused', 'error'))` — an
@@ -106,7 +138,10 @@ def _verdict(outcome: Outcome, order: WireOrder) -> tuple[OrderAuditStatus, str 
             OrderAuditStatus.ERROR,
             f"the venue rejected it: retcode {placement.retcode} ({placement.comment})",
         )
-    if placement.is_short_of(order.request.volume):
+    # ⚠️ Only an order can be *partially* done. A cancel either withdrew something or did not,
+    # and asking `is_short_of` about an instruction with no volume would be asking a question the
+    # instruction has no answer to.
+    if isinstance(order, WireOrder) and placement.is_short_of(order.request.volume):
         # Its own value, not a `filled` with a smaller number: the rest of the order is still
         # somewhere, and reading it as filled is how a position ends up half the size a strategy
         # believes it has.

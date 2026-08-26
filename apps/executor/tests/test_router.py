@@ -20,7 +20,14 @@ from tradeforge_engine.domain import OrderRequest, Side, SignalKind
 from tradeforge_executor.gateway import Placement
 from tradeforge_executor.router import Outcome, Router, start_of_day
 from tradeforge_executor.safety import KillSwitch, Limits
-from tradeforge_executor.wire import WireOrder, order_fields, order_from_fields
+from tradeforge_executor.wire import (
+    Instruction,
+    WireCancel,
+    WireModifyStop,
+    WireOrder,
+    order_fields,
+    order_from_fields,
+)
 
 NOON = dt.datetime(2026, 8, 25, 12, tzinfo=dt.UTC)
 
@@ -68,7 +75,7 @@ def a_placement(
 class FakeGateway:
     """The four questions `OrderGateway` asks, and a record of what it was told to send."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 — keyword-only knobs on a double, not a real signature
         self,
         *,
         balance: str = "10000",
@@ -76,6 +83,7 @@ class FakeGateway:
         positions: int = 0,
         placement: Placement | None = None,
         broken: str | None = None,
+        withdraws: bool = True,
     ) -> None:
         self._balance = Decimal(balance)
         self._realised = Decimal(realised)
@@ -83,6 +91,8 @@ class FakeGateway:
         self._placement = placement or a_placement()
         self._broken = broken
         self.sent: list[tuple[OrderRequest, str]] = []
+        self.withdrawn: list[str] = []
+        self._withdraws = withdraws
         self.asked_since: dt.datetime | None = None
 
     def send(self, order: OrderRequest, *, client_id: str) -> Placement:
@@ -90,6 +100,19 @@ class FakeGateway:
             raise ConnectionError("the terminal went away mid-order")
         self.sent.append((order, client_id))
         return self._placement
+
+    def withdraw(self, client_id: str) -> Placement:
+        """Whatever the double was told to answer, plus a record that it was asked."""
+        self.withdrawn.append(client_id)
+        return Placement(
+            accepted=self._withdraws,
+            ticket=77 if self._withdraws else None,
+            filled_volume=Decimal(0),
+            price=None,
+            retcode=10009 if self._withdraws else 10013,
+            comment="removed" if self._withdraws else "no such order",
+            raw={"withdrew": 1 if self._withdraws else 0},
+        )
 
     def balance(self) -> Decimal:
         if self._broken == "account":
@@ -120,7 +143,7 @@ class Switch:
 def route(  # noqa: PLR0913 — the router's inputs, with defaults
     gateway: FakeGateway,
     *,
-    order: WireOrder | None = None,
+    order: Instruction | None = None,
     limits: Limits | None = None,
     switches: Sequence[KillSwitch] = (),
     now: dt.datetime = NOON,
@@ -365,3 +388,85 @@ def test_an_entry_with_the_same_switch_still_never_reaches_the_venue() -> None:
 
     assert outcome.allowed is False
     assert gateway.sent == [], "the switch stopped guarding entries"
+
+
+# --------------------------------------------------------------------------------------------
+# The other two instructions on the same stream
+# --------------------------------------------------------------------------------------------
+
+
+def a_cancel(*, client_id: str = "zone-42", session_id: str = "s-1") -> WireCancel:
+    return WireCancel(client_id=client_id, session_id=session_id)
+
+
+def a_stop_move(*, symbol: str = "EURUSD", stop_loss: str = "1.16500") -> WireModifyStop:
+    return WireModifyStop(
+        client_id="s-1-4",
+        session_id="s-1",
+        symbol=symbol,
+        stop_loss=Decimal(stop_loss),
+        decided_at=NOON,
+    )
+
+
+def test_a_cancel_reaches_the_venue_and_is_reported_as_withdrawn() -> None:
+    gateway = FakeGateway()
+
+    outcome = route(gateway, order=a_cancel())
+
+    assert outcome.allowed is True
+    assert gateway.withdrawn == ["zone-42"]
+    assert gateway.sent == [], "a cancel was sent as an order"
+
+
+def test_a_cancel_passes_a_raised_kill_switch() -> None:
+    """It withdraws an order that has not become a position. It cannot open anything, and a
+    switch that refuses it leaves the order armed at the venue after the handle was pulled."""
+    gateway = FakeGateway()
+
+    outcome = route(gateway, order=a_cancel(), switches=[Switch(True, name="the-handle")])
+
+    assert outcome.allowed is True
+    assert gateway.withdrawn == ["zone-42"], "the handle left the order armed"
+
+
+def test_a_cancel_that_found_nothing_is_still_an_accepted_instruction() -> None:
+    """⚠️ The order may have filled while the cancel was in flight, been cancelled already, or
+    never have reached the venue. In live that is a race, not a fault — and the trail records
+    that it withdrew nothing rather than that something failed."""
+    gateway = FakeGateway(withdraws=False)
+
+    outcome = route(gateway, order=a_cancel())
+
+    assert gateway.withdrawn == ["zone-42"]
+    assert outcome.allowed is True, "this machine refused it; it did not"
+    assert outcome.placement is not None
+    assert outcome.placement.accepted is False, "the venue's answer was overwritten"
+
+
+def test_a_stop_move_is_refused_with_the_rule_that_refused_it() -> None:
+    """⚠️ A tightening stop reduces risk and belongs with the exits — but the only thing
+    asserting it tightens is the session, three processes away, and a sign error there would
+    arrive looking exactly like a tightening. Refused with a stated rule rather than dropped,
+    and rather than waved through."""
+    gateway = FakeGateway()
+
+    outcome = route(gateway, order=a_stop_move())
+
+    assert outcome.allowed is False
+    assert outcome.reason is not None
+    assert "verify the move tightens" in outcome.reason
+    assert gateway.sent == [], "it was sent to the venue as an order"
+    assert gateway.withdrawn == [], "it was sent to the venue as a withdrawal"
+
+
+def test_a_stop_move_is_refused_before_the_terminal_is_even_asked() -> None:
+    """The separating half: refused on its own kind, not because the account happened to be
+    unreadable. A broken terminal would refuse everything and hide which rule was speaking."""
+    gateway = FakeGateway()
+
+    outcome = route(gateway, order=a_stop_move())
+
+    assert gateway.asked_since is None, "the account was read for an instruction never sent"
+    assert outcome.reason is not None
+    assert "terminal" not in outcome.reason

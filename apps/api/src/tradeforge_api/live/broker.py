@@ -61,7 +61,9 @@ from tradeforge_executor.wire import (
     FILLS_STREAM,
     MAX_CLIENT_ID,
     WireFill,
+    cancel_fields,
     fill_from_fields,
+    modify_stop_fields,
     order_fields,
     stream_for,
 )
@@ -251,32 +253,69 @@ class MT5Broker:
         return f"s{self._session_id.replace('-', '')[:8]}-{self._minted}"
 
     def cancel(self, client_id: str) -> bool:
-        """Not yet reachable — see the module docstring of `tradeforge_executor.wire`.
+        """Withdraw a resting order by the name its strategy gave it (ADR-0014).
 
-        ⚠️ **Raises rather than returning `False`.** `False` means "there was nothing to
-        withdraw", and a strategy hearing that believes its resting order is gone while it is
-        very much alive at the venue, waiting to fill into a setup that has been invalidated.
-        The protocol's `False` is for a race with the venue; this is not a race, it is a missing
-        wire, and the safe answer to "I cannot do that" is to stop.
+        ⚠️ **`True` means the instruction is on its way, not that anything was withdrawn.** The
+        same asymmetry `submit` has, and for the same reason: the venue is another process, and
+        what it finds when it looks is not knowable here. The protocol's `False` is reserved for
+        the one thing this end *can* answer — an order this broker never sent.
+
+        That is a narrower `False` than `BacktestBroker`'s, which really does know whether it was
+        holding the order. The difference is honest: in live, "the venue had nothing under that
+        name" is a race with a fill, and a broker that reported it as a failed cancel would have
+        a strategy re-arming a zone that had just been entered.
         """
-        raise EngineError(
-            f"cannot cancel {client_id}: `orders.outbound` carries `OrderRequest`, which refuses "
-            f"a CANCEL intent by construction. A session that arms resting orders must not run "
-            f"live until that wire exists (PR-304-A3)"
+        if client_id not in self._sent:
+            logger.info("nothing to cancel under %s; this session never sent it", client_id)
+            return False
+        return self._publish(
+            cancel_fields(session_id=self._session_id, client_id=client_id),
+            what=f"cancel {client_id}",
         )
 
     def modify_stop(self, symbol: str, stop_loss: Money, decided_at: dt.datetime) -> bool:
-        """Not yet reachable, and raising for the same reason `cancel` does.
+        """Move the protective stop of the open position in `symbol` (ADR-0018).
 
-        Returning `False` here would tell a trailing strategy that there is no position to
-        protect. It would then keep trading, with a stop still sitting where the entry left it,
-        which is the one outcome ADR-0018 exists to prevent.
+        ⚠️ **The executor refuses this today**, with a stated rule in `order_audit`: it cannot yet
+        read the position and check for itself that the move *tightens*, and it does not take
+        this process's word for that. A sign error here would arrive there looking exactly like a
+        tightening and be waved past every limit (PR-304-A3-B).
+
+        It is published anyway rather than raised on, and the difference matters. Raising kills
+        the session; publishing puts the instruction, the level and the instant it was decided
+        into the trail, where the refusal is visible and countable. A strategy conducting a trade
+        still must not run live until the far end can act on it — but that is a decision for
+        whoever starts the session, made from evidence, not a crash.
+
+        `decided_at` travels because it is the anti-lookahead stamp. It is not the executor's to
+        use, and it is not the executor's to lose either.
         """
-        raise EngineError(
-            f"cannot move the stop of {symbol} to {stop_loss} (decided {decided_at.isoformat()}): "
-            f"`orders.outbound` refuses a MODIFY_STOP intent by construction. A session that "
-            f"conducts a trade must not run live until that wire exists (PR-304-A3)"
+        if self._portfolio.position is None:
+            # The protocol's own `False`: nothing to protect. Answered here rather than three
+            # processes away because this ledger is the thing that knows.
+            return False
+        return self._publish(
+            modify_stop_fields(
+                session_id=self._session_id,
+                client_id=self._mint(),
+                symbol=symbol,
+                stop_loss=stop_loss,
+                decided_at=decided_at,
+            ),
+            what=f"move the stop of {symbol} to {stop_loss}",
         )
+
+    def _publish(self, fields: dict[str, str], *, what: str) -> bool:
+        """One instruction onto `orders.outbound`. `False` if the wire would not take it."""
+        try:
+            self._client.xadd(
+                stream_for(self._session_id), cast("dict[FieldT, EncodableT]", fields)
+            )
+        except Exception:  # an unsendable instruction is a refusal, not a crash
+            logger.exception("could not queue %s", what)
+            return False
+        logger.info("queued %s", what)
+        return True
 
     # ------------------------------------------------------------------ receiving
 

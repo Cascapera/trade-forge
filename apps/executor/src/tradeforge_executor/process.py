@@ -72,6 +72,25 @@ class RefusingGateway:
             raw={"dry_run": True},
         )
 
+    def withdraw(self, client_id: str) -> Placement:
+        """⚠️ Refused, like `send`, and for the same reason — but the reason deserves a sentence,
+        because a cancel *reduces* risk and the rest of this system waves those through.
+
+        A dry run has placed nothing. There is therefore nothing of this executor's at the venue
+        to withdraw, and a `TRADE_ACTION_REMOVE` from an unarmed process could only reach an
+        order somebody else put there. "Touch nothing" is the whole promise of the flag.
+        """
+        logger.warning("DRY RUN: would withdraw %s — pass --arm to act for real", client_id)
+        return Placement(
+            accepted=False,
+            ticket=None,
+            filled_volume=Decimal(0),
+            price=None,
+            retcode=0,
+            comment="dry run: the executor is not armed",
+            raw={"dry_run": True, "withdraw": client_id},
+        )
+
     # ⚠️ The reads pass straight through, and they must. The safeguards judge a real account —
     # a dry run against invented numbers would exercise the limits against a fiction and prove
     # nothing about the day this is armed.

@@ -5,6 +5,13 @@ description = "MetaTrader 5 execution service (Windows-only): order routing, fil
 requires-python = ">=3.12,<3.13"
 license = "Apache-2.0"
 dependencies = [
+    # The audit trail and the session rows this service reads liveness from.
+    "tradeforge-db",
+    # `OrderRequest` and `Side` are the engine's types. The executor carries them across a
+    # wire and hands them to a venue; it does not get to define what an order is.
+    "tradeforge-engine",
+    # The orders arrive on a Redis stream and the kill switch's first layer is a Redis key.
+    "redis>=5.2",
     # See collector: Windows-only wheel, and that is the point (ADR-02).
     "MetaTrader5>=5.0.45; sys_platform == 'win32'",
 ]

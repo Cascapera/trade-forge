@@ -14,10 +14,11 @@ the market: `retcode=10009`, `deal=0`, `volume='0.01'`, `price='0.0'`. The accou
 pending order, **zero positions and zero deals**. That is `RESTING`, and it is the answer the fix
 in `_placement` exists for.
 
-⚠️ **`FILLED` is constructed.** No market order was sent — only the resting one was, and only
-that one is evidence. What `FILLED` asserts is not in doubt (a deal that happened has a deal
-ticket) but it is asserted, not observed, and the day somebody sends a market order to the demo
-this fixture should be replaced by what came back.
+`FILLED` was constructed at first — no market order had been sent — and was replaced the same day
+by the real answer, from a 0.01 EURUSD position opened and closed on the demo. Its `bid` and `ask`
+came back **`'0.0'` on an executed deal**, which is the measurement that justifies reading the
+quote *before* sending: after the fact it does not exist anywhere. Only
+`RESTING_ECHOING_ITS_PRICE` is still a construction, and it says so.
 """
 
 from dataclasses import dataclass
@@ -26,7 +27,8 @@ from typing import Any
 
 import pytest
 
-from tradeforge_executor.gateway import MT5Gateway, Placement
+from tradeforge_engine.domain import Side
+from tradeforge_executor.gateway import MAGIC, MT5Gateway, Placement
 from tradeforge_executor.wire import MAX_CLIENT_ID
 
 
@@ -64,6 +66,22 @@ RESTING = _Answer(
 """**RECORDED.** A limit order the venue accepted and parked. `volume` is the request, echoed
 back, and it is the field that used to be read as a fill."""
 
+FILLED = _Answer(
+    retcode=10009,
+    deal=35_176_079,
+    order=47_096_513,
+    volume=0.01,
+    price=1.16524,
+    comment="Request executed",
+)
+"""**RECORDED.** A market buy that actually traded: 0.01 EURUSD on the demo, 26/08.
+
+Same retcode as `RESTING`, same echoed volume — `deal` is the only field that differs, which is
+exactly why it is the one both readings are derived from.
+
+⚠️ The answer also carried `bid='0.0'` and `ask='0.0'` on a deal that plainly had both. That is
+why `send` reads the quote before the order goes out: afterwards there is nowhere to get it."""
+
 
 # --- CONSTRUCTED ----------------------------------------------------------------------
 
@@ -86,21 +104,9 @@ not have. A venue echoing the requested price back is the shape that would turn 
 `Placement` claiming 1.16460 was paid for a position nobody holds — read later by the panel, by
 reconciliation, by anything that trusts the field's name."""
 
-FILLED = _Answer(
-    retcode=10009,
-    deal=91_237_004,
-    order=47_084_650,
-    volume=0.01,
-    price=1.16667,
-    comment="Request executed",
-)
-"""**CONSTRUCTED** — see the module docstring; no market order was ever sent. A deal that
-happened. Same retcode as `RESTING`, same echoed volume: `deal` is the only field that differs,
-which is exactly why it is the one both readings are derived from."""
 
-
-QUOTED_SPREAD = Decimal("1.16667") - Decimal("1.16660")
-"""**RECORDED.** The quote standing when the probe order went out: bid 1.16660, ask 1.16667.
+QUOTED_SPREAD = Decimal("1.16521") - Decimal("1.16514")
+"""**RECORDED.** The quote standing when the market order went out: bid 1.16514, ask 1.16521.
 
 `MT5Gateway.send` reads this *before* `order_send` and hands it down, because `order_send`
 answers with the price that traded and the quote either side of it is gone a second later."""
@@ -147,22 +153,21 @@ def test_a_real_deal_is_still_read_as_a_fill() -> None:
     """The separating half. Same retcode, same echoed volume, different `deal` — and the two
     must not come out alike, or the fix above would just be "never fill anything".
 
-    ⚠️ Rests on a **constructed** answer, so it is weaker evidence than the test above it: it
-    says what this code does with a deal, not what the venue sends when one happens.
+    Both halves are recordings, from the same terminal on the same day.
     """
     placement = placement_of(FILLED)
 
     assert placement.accepted
     assert not placement.resting
     assert placement.filled_volume == Decimal("0.01")
-    assert placement.price == Decimal("1.16667")
-    assert placement.deal == 91_237_004
+    assert placement.price == Decimal("1.16524")
+    assert placement.deal == 35_176_079
     assert placement.partial
 
 
 def test_the_price_goes_home_as_decimal_text_not_a_float() -> None:
-    """`Decimal(1.16667)` is not 1.16667, and a tick that survives the venue must survive us."""
-    assert str(placement_of(FILLED).price) == "1.16667"
+    """`Decimal(1.16524)` is not 1.16524, and a tick that survives the venue must survive us."""
+    assert str(placement_of(FILLED).price) == "1.16524"
 
 
 def test_a_fill_carries_the_quote_it_crossed() -> None:
@@ -325,3 +330,95 @@ def test_every_ticket_touched_is_in_the_evidence() -> None:
 
     assert placement.raw["tickets"] == [47_084_649, 47_084_650]
     assert placement.raw["withdrew"] == 2
+
+
+# --- whose position is it, anyway ------------------------------------------------------
+
+
+class _Position:
+    """A position as `positions_get` reports one. Fields recorded 26/08 from the real thing:
+    `ticket=47096513 type=0 volume=0.01 price_open=1.16524 sl=1.16014 comment='probe-a3b-sltp'`.
+    """
+
+    def __init__(self, ticket: int, *, magic: int, kind: int = 0, sl: float = 1.16014) -> None:
+        self.ticket = ticket
+        self.magic = magic
+        self.type = kind
+        self.sl = sl
+
+
+class _Terminal:
+    """A terminal that holds a fixed list of positions and answers nothing else.
+
+    ⚠️ **Admissible where a mock of `order_send` would not be.** `MT5Gateway`'s doctrine is that
+    mocking the venue proves only that this file calls a function it also describes. What is
+    exercised here is not a call — it is a **decision**, the filter that establishes a position
+    belongs to this executor, and the decision is the entire safety story of `tighten`: the
+    `TRADE_ACTION_SLTP` request carries no magic, so a ticket that escaped this filter is acted
+    on with no further question asked. The position shape is a recording; the filtering is ours.
+    """
+
+    def __init__(self, *positions: _Position) -> None:
+        self._positions = positions
+        self.asked: list[str] = []
+
+    def positions_get(self, *, symbol: str) -> tuple[_Position, ...]:
+        self.asked.append(symbol)
+        return self._positions
+
+
+def test_only_positions_carrying_our_magic_are_ours() -> None:
+    """⚠️ The account holds a manual trade and another advisor's. Neither is this executor's to
+    move, and `TRADE_ACTION_SLTP` will not ask: it carries no magic and no symbol, so whatever
+    ticket comes out of here is what gets modified."""
+    terminal = _Terminal(
+        _Position(11, magic=0),  # opened by hand
+        _Position(22, magic=999_999),  # another expert advisor
+        _Position(33, magic=MAGIC),  # ours
+    )
+
+    held = MT5Gateway(terminal=terminal).connect().held("EURUSD")
+
+    assert held is not None
+    assert held.ticket == 33, "a position belonging to somebody else was reported as ours"
+
+
+def test_an_account_holding_only_other_peoples_positions_reports_nothing() -> None:
+    """The separating half: without it, a filter that simply took the first position would pass
+    the test above whenever ours happens to be listed first."""
+    terminal = _Terminal(_Position(11, magic=0), _Position(22, magic=999_999))
+
+    assert MT5Gateway(terminal=terminal).connect().held("EURUSD") is None
+
+
+def test_a_position_with_no_stop_reports_none_not_zero() -> None:
+    """MT5 reports an absent stop as `0.0`, and a stop *at* zero is not a level anybody set.
+    Collapsed, "unprotected" and "protected at nothing" become the same answer — and only one of
+    them makes arming a stop a tightening."""
+    terminal = _Terminal(_Position(33, magic=MAGIC, sl=0.0))
+
+    held = MT5Gateway(terminal=terminal).connect().held("EURUSD")
+
+    assert held is not None
+    assert held.stop_loss is None
+
+
+def test_a_short_is_read_as_a_short() -> None:
+    """`type=1` is a sell. Read as a long, every direction check downstream inverts — and the
+    inversion is silent, because a loosening looks like a tightening from the wrong side."""
+    terminal = _Terminal(_Position(33, magic=MAGIC, kind=1))
+
+    held = MT5Gateway(terminal=terminal).connect().held("EURUSD")
+
+    assert held is not None
+    assert held.side is Side.SHORT
+
+
+def test_two_of_our_positions_is_an_error_rather_than_a_guess() -> None:
+    """Phase 1 holds one at a time by construction, so two under this magic means something went
+    wrong upstream. Picking the first would move the stop of whichever the terminal happened to
+    list first, silently, on the one instruction whose whole job is to reduce risk."""
+    terminal = _Terminal(_Position(33, magic=MAGIC), _Position(34, magic=MAGIC))
+
+    with pytest.raises(ConnectionError, match="will not guess"):
+        MT5Gateway(terminal=terminal).connect().held("EURUSD")

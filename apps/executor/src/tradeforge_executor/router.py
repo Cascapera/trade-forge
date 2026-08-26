@@ -20,8 +20,8 @@ import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from tradeforge_engine.domain import ZERO, SignalKind
-from tradeforge_executor.gateway import OrderGateway, Placement
+from tradeforge_engine.domain import ZERO, Side, SignalKind
+from tradeforge_executor.gateway import HeldPosition, OrderGateway, Placement
 from tradeforge_executor.safety import AccountSnapshot, KillSwitch, Limits, admits
 from tradeforge_executor.wire import Instruction, WireCancel, WireModifyStop
 
@@ -80,18 +80,12 @@ class Router:
         leave the entry unacknowledged, so the same order would be retried against the same dead
         terminal, for ever.
         """
+        held: HeldPosition | None = None
         if isinstance(order, WireModifyStop):
-            # ⚠️ Refused with a stated rule, not silently dropped and not waved through. A stop
-            # that *tightens* reduces risk and belongs with the exits — but the only thing
-            # asserting that it tightens is the session, three processes away, and a sign error
-            # there would arrive looking exactly like a tightening. Admitting it needs this
-            # machine to read the position's current stop and check the direction itself.
-            return self._refused(
-                order,
-                f"cannot move the stop of {order.symbol} to {order.stop_loss}: this executor "
-                f"cannot yet read the position and verify the move tightens, and it does not "
-                f"take the session's word for that (PR-304-A3-B)",
-            )
+            checked = self._verified(order)
+            if isinstance(checked, Outcome):
+                return checked
+            held = checked
 
         try:
             account = self._snapshot(now)
@@ -103,6 +97,8 @@ class Router:
         # narrow a union: mypy reads `order.request` on the cancel arm and is right to.
         if isinstance(order, WireCancel):
             intent, volume = SignalKind.CANCEL, ZERO
+        elif isinstance(order, WireModifyStop):
+            intent, volume = SignalKind.MODIFY_STOP, ZERO
         else:
             intent, volume = order.request.intent, order.request.volume
 
@@ -123,11 +119,7 @@ class Router:
             return self._refused(order, verdict.reason)
 
         try:
-            placement = (
-                self.gateway.withdraw(order.client_id)
-                if isinstance(order, WireCancel)
-                else self.gateway.send(order.request, client_id=order.client_id)
-            )
+            placement = self._act(order, held)
         except Exception as error:
             # ⚠️ An exception from the venue is an *outcome*, recorded as one. The alternative is
             # a loop that dies on the first timeout, and an order whose fate nobody wrote down.
@@ -141,6 +133,70 @@ class Router:
             reason=None,
             placement=placement,
         )
+
+    def _act(self, order: Instruction, held: HeldPosition | None) -> Placement:
+        """Do the one thing this instruction asks for. Nothing here decides anything."""
+        if isinstance(order, WireCancel):
+            return self.gateway.withdraw(order.client_id)
+        if isinstance(order, WireModifyStop):
+            # `held` is not None here: `_verified` returned one, and an `Outcome` on every path
+            # where it could not. Asserted rather than branched on, because a branch no test can
+            # enter is a branch nothing keeps honest.
+            assert held is not None, "a verified stop move arrived without a position"  # noqa: S101
+            return self.gateway.tighten(held.ticket, order.stop_loss)
+        return self.gateway.send(order.request, client_id=order.client_id)
+
+    def _verified(self, order: WireModifyStop) -> HeldPosition | Outcome:
+        """The position this move acts on, or the refusal that stops it here.
+
+        ⚠️ **This check is the only one there is.** Measured against a live terminal on 26/08: MT5
+        accepts a stop moved *further* from price — `retcode=10009`, and the position comes back
+        loosened. The venue has no opinion about the direction; the engine's rule lives three
+        processes away in a component this machine does not trust on principle; and the position
+        was sized against the stop it already has (`RiskManager`). A sign error upstream is
+        therefore one accepted instruction away from risk nobody authorised.
+
+        ⚠️ **The identity is established here, by magic, before anything is sent.** The
+        `TRADE_ACTION_SLTP` request carries no magic and no symbol — measured, the terminal echoes
+        `magic=0, symbol=''` — so the position ticket is the entire identity of the instruction.
+        A ticket that did not come from this filter could belong to a manual trade or to another
+        expert advisor.
+        """
+        try:
+            held = self.gateway.held(order.symbol)
+        except Exception as error:
+            logger.exception("could not read the position for %s", order.client_id)
+            return self._refused(order, f"the position could not be read: {error}")
+
+        if held is None:
+            return self._refused(order, f"no position of ours in {order.symbol} to protect")
+
+        # A position carrying no stop at all is modifiable in one direction only, and this is it:
+        # arming protection where there was none can only reduce risk. `Broker.modify_stop` says
+        # the same thing from the other end.
+        if held.stop_loss is None:
+            return held
+
+        tightens = (
+            order.stop_loss >= held.stop_loss
+            if held.side is Side.LONG
+            else order.stop_loss <= held.stop_loss
+        )
+        if not tightens:
+            logger.error(
+                "refusing to loosen the stop of %s %s from %s to %s",
+                held.side.value,
+                order.symbol,
+                held.stop_loss,
+                order.stop_loss,
+            )
+            return self._refused(
+                order,
+                f"moving the stop of a {held.side.value} {order.symbol} from {held.stop_loss} "
+                f"to {order.stop_loss} loosens it: the position was sized against the level it "
+                f"already has, and the venue accepts this without objecting",
+            )
+        return held
 
     def _snapshot(self, now: dt.datetime) -> AccountSnapshot:
         return AccountSnapshot(

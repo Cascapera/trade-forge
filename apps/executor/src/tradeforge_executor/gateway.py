@@ -120,6 +120,22 @@ class Placement:
         return self.accepted and 0 < self.filled_volume < asked
 
 
+@dataclass(frozen=True, slots=True)
+class HeldPosition:
+    """A position **this executor** holds, as the venue reports it right now.
+
+    ⚠️ Its own type rather than the engine's `Position`, and the difference is the point: this is
+    what MT5 says, not what the session's ledger believes. Reconciling the two is a separate piece
+    of work, and giving them one type would quietly assume the answer.
+    """
+
+    ticket: int
+    side: Side
+    stop_loss: Decimal | None
+    """`None` when the position carries no stop at all. Not zero — MT5 reports an absent stop as
+    `0.0`, and a stop *at* zero is not a level anybody set."""
+
+
 class OrderGateway(Protocol):
     """Send one order, and say what the venue answered. Nothing else.
 
@@ -138,6 +154,26 @@ class OrderGateway(Protocol):
         race, not a fault — `Broker.cancel` says the same from the other end — so it comes back
         as an accepted instruction that withdrew nothing, and the trail records that it withdrew
         nothing. A raised exception would turn a normal execution into a dead session.
+        """
+        ...
+
+    def held(self, symbol: str) -> HeldPosition | None:
+        """The position **this executor** holds in `symbol`, by its own magic number.
+
+        ⚠️ The filter is not decoration. A live account reports a manual trade, another expert
+        advisor's position, an entirely different instrument — and the one instruction that acts
+        on a position by ticket is the one below.
+        """
+        ...
+
+    def tighten(self, ticket: int, stop_loss: Decimal) -> Placement:
+        """Move the protective stop of position `ticket`.
+
+        ⚠️ **Named for what the caller is allowed to ask for, not for what the venue will do.**
+        Measured on 26/08: MT5 accepts a stop moved *further* from price — `retcode=10009`, and
+        the position comes back loosened. The venue has no opinion on the direction, so the only
+        thing enforcing "a stop may only tighten" (ADR-0018) is the code that calls this. The name
+        is a reminder that the check has already happened by the time this runs.
         """
         ...
 
@@ -291,6 +327,53 @@ class MT5Gateway:
             comment=str(getattr(answers[0], "comment", "")) if answers else "",
             raw=_jsonable(raw),
         )
+
+    def held(self, symbol: str) -> HeldPosition | None:
+        """The one position this executor holds in `symbol`, or `None`.
+
+        ⚠️ **More than one is an error, not a choice.** Phase 1 holds a single position at a time
+        by construction, so two under this magic number means something has gone wrong upstream —
+        and picking the first would move the stop of whichever the terminal happened to list
+        first, silently, on the one instruction whose whole job is to reduce risk.
+        """
+        held = [
+            position
+            for position in (self._require().positions_get(symbol=symbol) or ())
+            if getattr(position, "magic", None) == MAGIC
+        ]
+        if not held:
+            return None
+        if len(held) > 1:
+            raise ConnectionError(
+                f"{len(held)} positions in {symbol} under magic {MAGIC}; this executor holds one "
+                f"at a time and will not guess which stop to move"
+            )
+        position = held[0]
+        # MT5 reports an absent stop as 0.0, and a stop at zero is not a level anybody set.
+        level = Decimal(str(position.sl))
+        return HeldPosition(
+            ticket=int(position.ticket),
+            side=Side.LONG if int(position.type) == 0 else Side.SHORT,
+            stop_loss=level if level > 0 else None,
+        )
+
+    def tighten(self, ticket: int, stop_loss: Decimal) -> Placement:
+        """Send the stop move. The direction was checked by the caller — see the protocol.
+
+        ⚠️ The request carries **no magic and no symbol**; measured on 26/08, the terminal echoes
+        `magic=0, symbol=''` back. The position ticket is the entire identity, which is why
+        `held()` above is the thing that establishes the position is ours, and why this method
+        takes a ticket that came from it rather than a symbol it would look up again.
+        """
+        mt5 = self._require()
+        answer = mt5.order_send(
+            {
+                "action": mt5.TRADE_ACTION_SLTP,
+                "position": ticket,
+                "sl": float(stop_loss),
+            }
+        )
+        return self._placement(mt5, answer)
 
     def balance(self) -> Decimal:
         info = self._require().account_info()

@@ -407,13 +407,28 @@ def test_a_naive_clock_is_still_refused_even_for_an_exit() -> None:
         ask(intent=SignalKind.EXIT, now=dt.datetime(2026, 8, 26, 12))  # noqa: DTZ001
 
 
-def test_a_stop_modification_is_not_yet_exempt() -> None:
-    """⚠️ Not an oversight. A *tightening* stop plainly reduces risk, and the engine only ever
-    tightens — but this machine must not take the session's word for that. A sign error three
-    processes away would arrive looking exactly like a tightening and be waved past every limit.
-    Admitting it needs the executor to read the position's current stop itself (PR-304-A3).
+def test_a_stop_modification_is_exempt_because_something_else_checks_the_direction() -> None:
+    """⚠️ **The exemption is only sound because `Router._verified` exists.**
+
+    A tightening stop reduces risk; a loosening one adds risk the position was never sized for,
+    and the two arrive on this wire looking identical. What separates them is the router reading
+    the position from the venue and comparing the levels *before* this function is consulted.
+
+    Deciding it needs the venue's current stop, and this module is deliberately unable to reach a
+    terminal — it takes an `AccountSnapshot` so the decision stays testable without one. The rule
+    is safe to state here; the fact has to be established where the venue can be asked.
+
+    ⚠️ And it cannot be assumed from the far side: MT5 accepts a stop moved further from price
+    without objecting (measured 26/08), so that check is the only thing there is.
     """
-    assert not reduces_risk(SignalKind.MODIFY_STOP)
+    assert reduces_risk(SignalKind.MODIFY_STOP)
     assert reduces_risk(SignalKind.EXIT)
     assert reduces_risk(SignalKind.CANCEL)
-    assert not reduces_risk(SignalKind.ENTRY)
+    assert not reduces_risk(SignalKind.ENTRY), "an entry is not a risk reduction"
+
+
+def test_a_verified_stop_move_passes_a_raised_kill_switch() -> None:
+    """An operator pulls the handle to stop; a switch that refuses to let the stop be pulled
+    tighter leaves the open trade less protected than it could be."""
+    assert ask(intent=SignalKind.MODIFY_STOP, switches=[Switch(True, name="the-handle")])
+    assert not ask(intent=SignalKind.ENTRY, switches=[Switch(True, name="the-handle")])

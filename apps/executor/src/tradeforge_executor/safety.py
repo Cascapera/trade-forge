@@ -160,14 +160,22 @@ def reduces_risk(intent: SignalKind) -> bool:
     anything, and refusing either is the safeguard working against the thing it protects: it
     leaves you holding the position you were trying to be rid of.
 
-    ⚠️ **`MODIFY_STOP` is deliberately not here yet**, though a *tightening* stop plainly reduces
-    risk. The engine only ever tightens (`Broker.modify_stop` raises on a loosening), but this
-    machine must not take the session's word for that — a sign error three processes away would
-    arrive here looking exactly like a tightening, and be waved past every limit. Admitting it
-    needs the executor to read the position's current stop and check the direction itself, which
-    is PR-304-A3's work and not a line to sneak in with this one.
+    ⚠️ **`MODIFY_STOP` is here only because something else checks the direction.** A *tightening*
+    stop reduces risk; a loosening one adds risk the position was never sized for, and the two
+    arrive on this wire looking identical. What separates them is `Router._verified`, which reads
+    the position from the venue and compares the levels before this function is ever consulted —
+    so a loosening is refused before it can benefit from the exemption below.
+
+    That the check lives there and not here is not tidiness. Deciding it needs the venue's current
+    stop, and this module is deliberately unable to reach a terminal: it takes an
+    `AccountSnapshot` precisely so the decision stays testable without one. What is safe to say
+    *here* is the rule; what has to be established elsewhere is the fact.
+
+    ⚠️ And the fact cannot be assumed from the far side. Measured on 26/08: MT5 accepts a stop
+    moved further from price without objecting, so nothing between a sign error in a strategy and
+    an account carrying unauthorised risk exists except that check.
     """
-    return intent in (SignalKind.EXIT, SignalKind.CANCEL)
+    return intent in (SignalKind.EXIT, SignalKind.CANCEL, SignalKind.MODIFY_STOP)
 
 
 def admits(  # noqa: PLR0913, PLR0911 — one guard per rule; each returns the reason it refused

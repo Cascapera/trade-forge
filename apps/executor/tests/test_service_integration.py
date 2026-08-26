@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from tradeforge_db.live_sessions import STALE_AFTER, beat, open_session
 from tradeforge_db.models import Instrument, LiveSession, OrderAudit, OrderAuditStatus, Strategy
 from tradeforge_engine.domain import AssetClass, OrderRequest, Side, SignalKind
-from tradeforge_executor.gateway import Placement
+from tradeforge_executor.gateway import HeldPosition, Placement
 from tradeforge_executor.router import Router
 from tradeforge_executor.safety import Limits
 from tradeforge_executor.service import GROUP, OrderQueue, Service
@@ -87,6 +87,8 @@ class FakeGateway:
         price: str | None = "1.10000",
         spread: str = "0.00002",
         withdraws: bool = True,
+        holding: HeldPosition | None = None,
+        holding_readable: bool = True,
     ) -> None:
         self._accepted = accepted
         self._broken = broken
@@ -98,6 +100,10 @@ class FakeGateway:
         self.withdrawn: list[str] = []
         self._withdraws = withdraws
         self.withdrawal: Placement | None = None
+        self.holding = holding
+        self._holding_readable = holding_readable
+        self.asked_held: list[str] = []
+        self.tightened: list[tuple[int, Decimal]] = []
 
     def send(self, order: OrderRequest, *, client_id: str) -> Placement:
         """⚠️ ``deal=None`` is a **resting** order: the venue accepted it and nothing executed.
@@ -138,6 +144,30 @@ class FakeGateway:
             retcode=10009 if self._withdraws else 10013,
             comment="removed" if self._withdraws else "no such order",
             raw={"withdrew": 1 if self._withdraws else 0},
+        )
+
+    def held(self, symbol: str) -> HeldPosition | None:
+        """What the double was told this executor is holding.
+
+        ⚠️ `None` is "nothing of ours is open" and `holding_readable=False` is "the terminal could
+        not be asked". Two different answers with two different remedies, so two different knobs —
+        collapsing them would make a broken terminal indistinguishable from a flat account, which
+        is exactly the confusion `NULL e zero são afirmações diferentes` records."""
+        self.asked_held.append(symbol)
+        if not self._holding_readable:
+            raise ConnectionError("the terminal went away mid-read")
+        return self.holding
+
+    def tighten(self, ticket: int, stop_loss: Decimal) -> Placement:
+        self.tightened.append((ticket, stop_loss))
+        return Placement(
+            accepted=True,
+            ticket=ticket,
+            filled_volume=Decimal(0),
+            price=None,
+            retcode=10009,
+            comment="Request executed",
+            raw={"retcode": 10009, "deal": 0, "order": 0},
         )
 
     def balance(self) -> Decimal:
@@ -600,12 +630,11 @@ def test_a_cancel_publishes_no_fill(
     assert rows(session)[0].status is OrderAuditStatus.SENT, "the withdrawal went unrecorded"
 
 
-def test_a_refused_stop_move_is_still_recorded_and_acknowledged(
+def test_a_verified_stop_move_is_executed_recorded_and_acknowledged(
     session: Session, session_factory: sessionmaker[Session]
 ) -> None:
-    """The refusal is the interesting row. An operator asking "why is my stop still where the
-    entry left it" needs the instruction, the level, the instant it was decided, and the rule —
-    and `order_audit` is where that question is asked."""
+    """The whole path, joined: the instruction crosses, the position is established as ours, the
+    direction is checked, the venue is told, and the trail carries the level and the instant."""
     live = a_live_session(session)
     entry_id = "1-0"
     fields = modify_stop_fields(
@@ -616,19 +645,50 @@ def test_a_refused_stop_move_is_still_recorded_and_acknowledged(
         decided_at=NOON,
     )
     queue = FakeQueue([(entry_id, fields)])
-
-    a_service(session_factory, queue, FakeGateway()).handle(
-        entry_id, instruction_from_fields(fields)
+    gateway = FakeGateway(
+        holding=HeldPosition(ticket=47_096_513, side=Side.LONG, stop_loss=Decimal("1.16000"))
     )
 
+    a_service(session_factory, queue, gateway).handle(entry_id, instruction_from_fields(fields))
+
+    assert gateway.tightened == [(47_096_513, Decimal("1.16500"))]
+    (row,) = rows(session)
+    assert row.status is OrderAuditStatus.SENT
+    assert row.request["stop_loss"] == "1.16500", "the level was lost from the evidence"
+    assert row.request["decided_at"] == NOON.isoformat(), "the anti-lookahead stamp was lost"
+    assert queue.acked == [entry_id]
+    assert queue.published == [], "a stop move was published as a fill"
+
+
+def test_a_loosening_stop_move_is_recorded_as_a_refusal_with_its_reason(
+    session: Session, session_factory: sessionmaker[Session]
+) -> None:
+    """⚠️ The refusal is the interesting row. An operator asking "why is my stop still where it
+    was" needs the level asked for, the instant it was decided, and the rule that stopped it —
+    and `order_audit` is where that question is asked."""
+    live = a_live_session(session)
+    entry_id = "1-0"
+    fields = modify_stop_fields(
+        session_id=str(live.id),
+        client_id="zone-42-sl",
+        symbol="EURUSD",
+        stop_loss=Decimal("1.15500"),
+        decided_at=NOON,
+    )
+    queue = FakeQueue([(entry_id, fields)])
+    gateway = FakeGateway(
+        holding=HeldPosition(ticket=47_096_513, side=Side.LONG, stop_loss=Decimal("1.16000"))
+    )
+
+    a_service(session_factory, queue, gateway).handle(entry_id, instruction_from_fields(fields))
+
+    assert gateway.tightened == [], "the loosening reached the venue"
     (row,) = rows(session)
     assert row.status is OrderAuditStatus.REFUSED
     assert row.reason is not None
-    assert "verify the move tightens" in row.reason
-    assert row.request["stop_loss"] == "1.16500", "the level was lost from the evidence"
-    assert row.request["decided_at"] == NOON.isoformat(), "the anti-lookahead stamp was lost"
+    assert "loosens it" in row.reason
+    assert row.request["stop_loss"] == "1.15500"
     assert queue.acked == [entry_id], "a refused instruction would be redelivered for ever"
-    assert queue.published == []
 
 
 def test_the_kind_decides_whether_a_fill_is_published_not_the_volume(

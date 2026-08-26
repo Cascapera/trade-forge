@@ -39,7 +39,11 @@ def an_order(**overrides: Any) -> WireOrder:
 
 
 def a_placement(
-    *, accepted: bool = True, volume: str = "0.10", deal: int | None = 555
+    *,
+    accepted: bool = True,
+    volume: str = "0.10",
+    deal: int | None = 555,
+    spread: str = "0.00002",
 ) -> Placement:
     """A venue answer. ``deal=None`` is the *resting* shape -- accepted, nothing executed.
 
@@ -57,6 +61,7 @@ def a_placement(
         comment="done" if accepted else "invalid request",
         raw={"retcode": 10009 if accepted else 10013},
         deal=deal if executed else None,
+        spread=Decimal(spread) if executed else None,
     )
 
 

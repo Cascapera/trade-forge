@@ -161,7 +161,29 @@ class WireFill:
     symbol: str
     at: dt.datetime
     price: Decimal
+    """**The venue's own price, untouched.** A buy fills at the ask, a sell at the bid, and this
+    is whichever one happened. Converting it here would put a piece of engine accounting in the
+    transport; the broker does that on arrival, with the instrument in hand."""
+
     volume: Decimal
+    spread: Decimal
+    """Ask minus bid at the instant of the deal, **in price units**, as the venue quoted it.
+
+    ⚠️ **Measured, not configured, and it has to cross the wire because it cannot be recovered
+    later.** `order_send` answers with the price that traded and nothing else; the quote either
+    side of it is gone a second afterwards. Without this the session cannot tell an ask from a
+    bid, and MT5's own bars are bid-based — measured on EURUSD M15, an ask lands outside the
+    bar's high in 7.5% of bars, which the engine's lookahead guard correctly refuses. See
+    `SpreadCostModel`: crossing the spread is a **cost**, never a worse price.
+
+    In price units rather than points on purpose: points need the venue's `point`, which is not
+    always the instrument's `tick_size`, and a conversion that is usually right is the worst
+    kind. A price delta needs nothing to be understood.
+
+    ⚠️ Zero is a real answer here, not a missing one — this venue quotes bid == ask at quiet
+    hours, measured. It is charged as free execution because that is what it was.
+    """
+
     ticket: int | None
 
 
@@ -179,6 +201,7 @@ def fill_fields(fill: WireFill) -> dict[str, str]:
         "at": fill.at.isoformat(),
         "price": str(fill.price),
         "volume": str(fill.volume),
+        "spread": str(fill.spread),
     }
     if fill.ticket is not None:
         fields["ticket"] = str(fill.ticket)
@@ -186,7 +209,13 @@ def fill_fields(fill: WireFill) -> dict[str, str]:
 
 
 def fill_from_fields(fields: dict[str, str]) -> WireFill:
-    """The inverse. Raises on anything missing, for the same reason `order_from_fields` does."""
+    """The inverse. Raises on anything missing, for the same reason `order_from_fields` does.
+
+    ⚠️ **`spread` is required, and a missing one raises rather than defaulting to zero.** Zero
+    is a legitimate quote at a quiet hour, so it cannot double as "the field went missing" — the
+    two would then be the same word for "charge nothing", and only one of them means it. The
+    same argument `BarSpreadCostModel` makes about a bar that cannot say what it cost.
+    """
     ticket = fields.get("ticket")
     return WireFill(
         client_id=fields["client_id"],
@@ -195,5 +224,6 @@ def fill_from_fields(fields: dict[str, str]) -> WireFill:
         at=dt.datetime.fromisoformat(fields["at"]),
         price=Decimal(fields["price"]),
         volume=Decimal(fields["volume"]),
+        spread=Decimal(fields["spread"]),
         ticket=int(ticket) if ticket is not None else None,
     )

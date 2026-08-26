@@ -916,3 +916,34 @@ sessão roda o dia inteiro recusando ordens com uma mensagem plausível, e nenhu
 contra o venue prova coisa nenhuma. `account_info().trade_allowed` continua `True` e engana.
 
 **Conserto:** o executor confere na subida e recusa subir armado com o botão desligado.
+
+---
+
+## O `MT5Broker` existe e ainda não está ligado em lugar nenhum
+
+Deliberado, e a razão é o item de cima. `session.py` continua construindo dois `BacktestBroker`
+(aquecimento e sessão), que é o modo paper. Ligar o `MT5Broker` numa sessão de verdade hoje seria
+irresponsável enquanto:
+
+1. **`cancel` e `modify_stop` não têm fio** — o broker levanta `EngineError` nos dois em vez de
+   devolver `False`, então uma estratégia que arma limite ou conduz stop **para a sessão** em vez
+   de mentir. Isso é o comportamento certo, e também significa que só uma estratégia puramente a
+   mercado roda ponta a ponta.
+2. **Uma limite que preenche depois não tem produtor** (item acima).
+3. **Não existe reconciliação** entre o ledger do broker e a conta no venue.
+
+Ligar é trabalho do **PR-304-B** (a trava de promoção paper→real), que é onde a decisão "esta
+sessão pode usar o venue" ganha dono.
+
+---
+
+## O `_sent` do `MT5Broker` vive em memória
+
+Um `dict[client_id, OrderRequest]`, e é a outra metade de todo fill. Uma sessão que morre segurando
+uma ordem volta sem saber dela: o fill chega, o `_request_for` não acha o pedido e **levanta** — que
+é o certo (um fill que não se consegue atribuir é uma posição real que o ledger vai errar), mas é
+uma parada dura numa situação recuperável.
+
+**Conserto (PR-304-A4, junto da reconciliação):** as ordens já estão em `order_audit`, indexadas por
+`client_id`. Uma sessão subindo pode reconstruir o `_sent` de lá — e a mesma leitura serve para
+comparar o que o ledger acha que tem com o que o venue diz que tem.

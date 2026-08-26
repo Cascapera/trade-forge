@@ -69,6 +69,17 @@ class Placement:
     exists as soon as the venue accepts it, filled or resting. A deal is the execution.
     """
 
+    spread: Decimal | None = None
+    """Ask minus bid at the instant of the send, in price units, or `None` if nothing executed.
+
+    ⚠️ **The one number the venue will not tell you afterwards.** `order_send` answers with the
+    price that traded; the quote either side of it is gone. The session needs it because MT5's
+    bars are bid-based and a buy fills at the ask — see `WireFill.spread`.
+
+    Zero is a real quote at a quiet hour, so it does not double as "missing": missing is `None`,
+    and a fill that executed always carries a number, because `send` reads the quote before the
+    order goes out and refuses the send if the terminal cannot answer."""
+
     def __post_init__(self) -> None:
         # The constructor refuses the exact lie the terminal tells, so that a hand-built
         # `Placement` in a test cannot tell it either. `_placement` derives both fields from the
@@ -80,6 +91,17 @@ class Placement:
                 f"executed has a deal, and one that is merely resting has a volume the venue "
                 f"echoed back from the request"
             )
+        # Same argument one field over: an execution nobody can price is an execution the
+        # session would have to record at a made-up cost, and zero is the made-up cost that
+        # looks most like a measurement.
+        if self.filled_volume > 0 and self.spread is None:
+            raise ValueError(
+                f"deal {self.deal} filled {self.filled_volume} with no quote: a fill that "
+                f"cannot say what crossing cost is a fill priced against a bid-based bar as "
+                f"though it were free"
+            )
+        if self.spread is not None and self.spread < 0:
+            raise ValueError(f"a spread is a magnitude, got {self.spread}")
 
     @property
     def resting(self) -> bool:
@@ -164,14 +186,29 @@ class MT5Gateway:
         ⚠️ `client_id` goes in the comment, not only in our own records. It is what makes a
         position on somebody else's screen traceable back to the zone that armed it — and the
         only thing that survives this process dying mid-flight.
+
+        ⚠️ **The quote is read before the order goes, and an unreadable one refuses the send.**
+        The spread cannot be recovered afterwards — `order_send` answers with the price that
+        traded and nothing else, and the quote either side of it is gone a second later — but
+        the session needs it, because MT5's bars are bid-based and a buy fills at the ask. Read
+        it *after* the deal instead and there is a failure with no honest answer: a fill that
+        happened, that nobody can price. Reading it first turns that into a refusal, which the
+        router already knows how to record, and a terminal that cannot quote a symbol is exactly
+        a terminal that should not be trading it.
         """
         mt5 = self._require()
+        quote = mt5.symbol_info_tick(order.symbol)
+        if quote is None:
+            raise ConnectionError(f"the terminal did not quote {order.symbol}")
+        # Through `str`, never `Decimal(float)`: the venue quotes 1.16667 and the binary double
+        # nearest it is not that number. The engine prices in `Decimal` for exactly this reason.
+        spread = Decimal(str(quote.ask)) - Decimal(str(quote.bid))
         request = self._request(mt5, order, client_id=client_id)
         logger.info(
             "sending %s %s %s (%s)", order.side.value, order.volume, order.symbol, client_id
         )
         answer = mt5.order_send(request)
-        return self._placement(mt5, answer)
+        return self._placement(mt5, answer, spread=spread)
 
     def balance(self) -> Decimal:
         info = self._require().account_info()
@@ -230,7 +267,13 @@ class MT5Gateway:
             return int(mt5.ORDER_TYPE_SELL if long else mt5.ORDER_TYPE_BUY)
         return int(mt5.ORDER_TYPE_BUY if long else mt5.ORDER_TYPE_SELL)
 
-    def _placement(self, mt5: Any, answer: Any) -> Placement:  # noqa: ANN401
+    def _placement(
+        self,
+        mt5: Any,  # noqa: ANN401
+        answer: Any,  # noqa: ANN401
+        *,
+        spread: Decimal | None = None,
+    ) -> Placement:
         if answer is None:
             code, message = mt5.last_error()
             return Placement(
@@ -255,10 +298,11 @@ class MT5Gateway:
         # dead logic: the terminal answers a resting order with `price=0.0`, which the falsiness
         # test already catches, so a mutant deleting it survives every test that can be written
         # against a real recording. A guard nothing can observe is a guard that is not there.
-        volume, price = Decimal(0), None
+        volume, price, crossed = Decimal(0), None, None
         if accepted and deal is not None:
             volume = Decimal(str(getattr(answer, "volume", 0) or 0))
             price = Decimal(str(answer.price)) if getattr(answer, "price", None) else None
+            crossed = spread
         return Placement(
             accepted=accepted,
             ticket=int(getattr(answer, "order", 0)) or None,
@@ -268,6 +312,7 @@ class MT5Gateway:
             comment=str(getattr(answer, "comment", "")),
             raw=_jsonable(raw),
             deal=deal,
+            spread=crossed,
         )
 
 

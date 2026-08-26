@@ -74,7 +74,7 @@ class FakeQueue:
 
 
 class FakeGateway:
-    def __init__(
+    def __init__(  # noqa: PLR0913 — keyword-only knobs on a double, not a real signature
         self,
         *,
         accepted: bool = True,
@@ -82,12 +82,14 @@ class FakeGateway:
         fills: str = "0.10",
         deal: int | None = 1_234,
         price: str | None = "1.10000",
+        spread: str = "0.00002",
     ) -> None:
         self._accepted = accepted
         self._broken = broken
         self._fills = Decimal(fills)
         self._deal = deal
         self._price = Decimal(price) if price is not None else None
+        self._spread = Decimal(spread)
         self.sent: list[str] = []
 
     def send(self, order: OrderRequest, *, client_id: str) -> Placement:
@@ -109,6 +111,7 @@ class FakeGateway:
             comment="done" if self._accepted else "no money",
             raw={"retcode": 10009 if self._accepted else 10019},
             deal=self._deal if executed else None,
+            spread=self._spread if executed else None,
         )
 
     def balance(self) -> Decimal:

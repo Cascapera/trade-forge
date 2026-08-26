@@ -490,19 +490,102 @@ def test_the_group_already_existing_is_not_an_error() -> None:
 # --------------------------------------------------------------------------- refusing
 
 
-def test_cancel_raises_rather_than_reporting_nothing_to_cancel() -> None:
-    """⚠️ `False` means "there was nothing to withdraw", and a strategy hearing that believes
-    its resting order is gone while it is very much alive at the venue, waiting to fill into a
-    setup that has since been invalidated."""
-    with pytest.raises(EngineError, match="PR-304-A3"):
-        a_broker(FakeStreams()).cancel("zone-42")
+def test_a_cancel_reaches_the_wire_under_the_name_the_strategy_gave_it() -> None:
+    """⚠️ `True` means the instruction is on its way, not that anything was withdrawn.
+
+    Same asymmetry `submit` has, for the same reason: the venue is another process, and what it
+    finds when it looks is not knowable here.
+    """
+    client = FakeStreams()
+    broker = a_broker(client)
+    broker.submit(an_order(client_id="zone-42"))
+
+    assert broker.cancel("zone-42") is True
+
+    (_id, fields) = client.entries[ORDERS_STREAM][-1]
+    assert fields["kind"] == "cancel"
+    assert fields["client_id"] == "zone-42"
+    assert fields["session_id"] == SESSION
 
 
-def test_modify_stop_raises_rather_than_reporting_no_position() -> None:
-    """`False` would tell a trailing strategy there is nothing to protect. It would keep
-    trading, with the stop still where the entry left it — the one outcome ADR-0018 prevents."""
-    with pytest.raises(EngineError, match="PR-304-A3"):
-        a_broker(FakeStreams()).modify_stop("EURUSD", Decimal("1.16000"), NOON)
+def test_cancelling_an_order_this_session_never_sent_is_false() -> None:
+    """The one thing this end *can* answer. Narrower than `BacktestBroker`'s `False`, which
+    really does know whether it held the order — and honest about the difference: in live, "the
+    venue had nothing under that name" is a race with a fill, and reporting that as a failed
+    cancel would have a strategy re-arming a zone that had just been entered."""
+    client = FakeStreams()
+
+    assert a_broker(client).cancel("a-zone-from-a-previous-life") is False
+    assert client.entries[ORDERS_STREAM] == [], "an instruction went out for an unknown order"
+
+
+def test_a_cancel_and_the_order_it_withdraws_share_one_stream() -> None:
+    """⚠️ **The reason the envelope is tagged rather than the streams split.**
+
+    Order of arrival is the whole argument. A limit armed and cancelled two bars later must be
+    placed before it is withdrawn; across two streams the executor is free to do it the other way
+    round, find nothing to cancel, and leave the order alive at the venue for ever.
+    """
+    client = FakeStreams()
+    broker = a_broker(client)
+    broker.submit(an_order(client_id="zone-42"))
+    broker.cancel("zone-42")
+
+    kinds = [fields["kind"] for _id, fields in client.entries[ORDERS_STREAM]]
+    assert kinds == ["order", "cancel"], "the two instructions can be reordered"
+
+
+def test_a_stop_move_reaches_the_wire_with_the_instant_it_was_decided() -> None:
+    """`decided_at` is the anti-lookahead stamp. It is not the executor's to use, and it is not
+    the executor's to lose either — `order_audit.request` is evidence."""
+    client = FakeStreams()
+    broker = a_broker(client)
+    broker.submit(an_order())
+    publish_fill(client)
+    broker.on_bar(a_candle())
+
+    assert broker.modify_stop("EURUSD", Decimal("1.16500"), NOON + HOUR) is True
+
+    (_id, fields) = client.entries[ORDERS_STREAM][-1]
+    assert fields["kind"] == "modify_stop"
+    assert fields["symbol"] == "EURUSD"
+    assert fields["stop_loss"] == "1.16500", "the level went through a float"
+    assert fields["decided_at"] == (NOON + HOUR).isoformat()
+
+
+def test_a_stop_move_carries_its_own_name_not_the_entry_s() -> None:
+    """`order_audit.client_id` is not nullable and the trail is indexed by it. A stop move is a
+    separate instruction with its own outcome — it can be refused while the entry that opened
+    the position succeeded — so filing both under one heading would file two unrelated verdicts
+    in one place."""
+    client = FakeStreams()
+    broker = a_broker(client)
+    broker.submit(an_order(client_id="zone-42"))
+    publish_fill(client)
+    broker.on_bar(a_candle())
+    broker.modify_stop("EURUSD", Decimal("1.16500"), NOON + HOUR)
+
+    (_id, fields) = client.entries[ORDERS_STREAM][-1]
+    assert fields["client_id"] != "zone-42"
+    assert len(fields["client_id"]) <= MAX_CLIENT_ID
+
+
+def test_moving_a_stop_with_no_position_is_false_and_reaches_nothing() -> None:
+    """The protocol's own `False`: nothing to protect. Answered here rather than three processes
+    away, because this ledger is the thing that knows."""
+    client = FakeStreams()
+
+    assert a_broker(client).modify_stop("EURUSD", Decimal("1.16500"), NOON) is False
+    assert client.entries[ORDERS_STREAM] == []
+
+
+def test_an_instruction_the_wire_refuses_is_false_not_a_crash() -> None:
+    client = FakeStreams()
+    broker = a_broker(client)
+    broker.submit(an_order(client_id="zone-42"))
+    client.refuse_xadd = True
+
+    assert broker.cancel("zone-42") is False
 
 
 def test_positions_answers_for_the_symbol_it_was_asked_about() -> None:

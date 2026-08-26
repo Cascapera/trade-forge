@@ -25,7 +25,10 @@ from tradeforge_executor.service import GROUP, OrderQueue, Service
 from tradeforge_executor.wire import (
     FILLS_STREAM,
     ORDERS_STREAM,
+    cancel_fields,
     fill_from_fields,
+    instruction_from_fields,
+    modify_stop_fields,
     order_fields,
     order_from_fields,
 )
@@ -83,6 +86,7 @@ class FakeGateway:
         deal: int | None = 1_234,
         price: str | None = "1.10000",
         spread: str = "0.00002",
+        withdraws: bool = True,
     ) -> None:
         self._accepted = accepted
         self._broken = broken
@@ -91,6 +95,9 @@ class FakeGateway:
         self._price = Decimal(price) if price is not None else None
         self._spread = Decimal(spread)
         self.sent: list[str] = []
+        self.withdrawn: list[str] = []
+        self._withdraws = withdraws
+        self.withdrawal: Placement | None = None
 
     def send(self, order: OrderRequest, *, client_id: str) -> Placement:
         """⚠️ ``deal=None`` is a **resting** order: the venue accepted it and nothing executed.
@@ -112,6 +119,25 @@ class FakeGateway:
             raw={"retcode": 10009 if self._accepted else 10019},
             deal=self._deal if executed else None,
             spread=self._spread if executed else None,
+        )
+
+    def withdraw(self, client_id: str) -> Placement:
+        """Whatever the double was told to answer, plus a record that it was asked.
+
+        `withdrawal` can be set to an answer this gateway cannot actually produce — see
+        `test_the_kind_decides_whether_a_fill_is_published_not_the_volume`.
+        """
+        self.withdrawn.append(client_id)
+        if self.withdrawal is not None:
+            return self.withdrawal
+        return Placement(
+            accepted=self._withdraws,
+            ticket=77 if self._withdraws else None,
+            filled_volume=Decimal(0),
+            price=None,
+            retcode=10009 if self._withdraws else 10013,
+            comment="removed" if self._withdraws else "no such order",
+            raw={"withdrew": 1 if self._withdraws else 0},
         )
 
     def balance(self) -> Decimal:
@@ -547,3 +573,94 @@ def test_a_partial_fill_travels_home_as_what_was_filled_not_what_was_asked(
     (published,) = queue.published
     assert published["volume"] == "0.04", "the session was told it got the whole order"
     assert rows(session)[0].status is OrderAuditStatus.PARTIAL
+
+
+def test_a_cancel_publishes_no_fill(
+    session: Session, session_factory: sessionmaker[Session]
+) -> None:
+    """⚠️ Only an order can produce a fill.
+
+    A withdrawn cancel happened *at* the venue and is not a trade. Published as a fill it would
+    have the session opening a position because it asked for an order to be taken away — and the
+    `Fill` it built would carry the cancel's own `client_id`, so the ledger would attribute it to
+    an order that no longer exists.
+    """
+    live = a_live_session(session)
+    entry_id = "1-0"
+    fields = cancel_fields(session_id=str(live.id), client_id="zone-42")
+    queue, gateway = FakeQueue([(entry_id, fields)]), FakeGateway()
+
+    outcome = a_service(session_factory, queue, gateway).handle(
+        entry_id, instruction_from_fields(fields)
+    )
+
+    assert outcome.allowed is True
+    assert gateway.withdrawn == ["zone-42"], "the cancel never reached the venue"
+    assert queue.published == [], "a cancel was published as a fill"
+    assert rows(session)[0].status is OrderAuditStatus.SENT, "the withdrawal went unrecorded"
+
+
+def test_a_refused_stop_move_is_still_recorded_and_acknowledged(
+    session: Session, session_factory: sessionmaker[Session]
+) -> None:
+    """The refusal is the interesting row. An operator asking "why is my stop still where the
+    entry left it" needs the instruction, the level, the instant it was decided, and the rule —
+    and `order_audit` is where that question is asked."""
+    live = a_live_session(session)
+    entry_id = "1-0"
+    fields = modify_stop_fields(
+        session_id=str(live.id),
+        client_id="zone-42-sl",
+        symbol="EURUSD",
+        stop_loss=Decimal("1.16500"),
+        decided_at=NOON,
+    )
+    queue = FakeQueue([(entry_id, fields)])
+
+    a_service(session_factory, queue, FakeGateway()).handle(
+        entry_id, instruction_from_fields(fields)
+    )
+
+    (row,) = rows(session)
+    assert row.status is OrderAuditStatus.REFUSED
+    assert row.reason is not None
+    assert "verify the move tightens" in row.reason
+    assert row.request["stop_loss"] == "1.16500", "the level was lost from the evidence"
+    assert row.request["decided_at"] == NOON.isoformat(), "the anti-lookahead stamp was lost"
+    assert queue.acked == [entry_id], "a refused instruction would be redelivered for ever"
+    assert queue.published == []
+
+
+def test_the_kind_decides_whether_a_fill_is_published_not_the_volume(
+    session: Session, session_factory: sessionmaker[Session]
+) -> None:
+    """⚠️ **A constructed answer** — the current `MT5Gateway.withdraw` always reports a filled
+    volume of zero, so nothing it can produce distinguishes this guard from the volume check
+    below it. Mutation says so: deleting the kind check survives every other test in this file.
+
+    The rule still holds, and the failure it prevents is the expensive kind. A cancel reuses the
+    **order's** `client_id` (that is the whole point of it), so a fill published for a cancel
+    would arrive at the broker, be matched to the entry that opened the position, and be folded
+    in as a *second entry* at the venue's withdrawal price. A phantom position, from an
+    instruction whose purpose was to remove one.
+    """
+    live = a_live_session(session)
+    entry_id = "1-0"
+    fields = cancel_fields(session_id=str(live.id), client_id="zone-42")
+    queue = FakeQueue([(entry_id, fields)])
+    gateway = FakeGateway()
+    gateway.withdrawal = Placement(
+        accepted=True,
+        ticket=77,
+        filled_volume=Decimal("0.10"),
+        price=Decimal("1.10000"),
+        retcode=10009,
+        comment="removed",
+        raw={"withdrew": 1},
+        deal=4_242,
+        spread=Decimal("0.00002"),
+    )
+
+    a_service(session_factory, queue, gateway).handle(entry_id, instruction_from_fields(fields))
+
+    assert queue.published == [], "a cancel was published as a fill because it carried a volume"

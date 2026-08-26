@@ -36,10 +36,11 @@ from tradeforge_executor.router import Outcome, Router
 from tradeforge_executor.wire import (
     FILLS_STREAM,
     ORDERS_STREAM,
+    Instruction,
     WireFill,
     WireOrder,
     fill_fields,
-    order_from_fields,
+    instruction_from_fields,
 )
 
 logger = logging.getLogger(__name__)
@@ -123,7 +124,7 @@ class OrderQueue:
             raise
         return True
 
-    def waiting(self) -> Iterator[tuple[str, WireOrder]]:
+    def waiting(self) -> Iterator[tuple[str, Instruction]]:
         """Every order, for ever, oldest first. The pending list first, then new ones.
 
         ⚠️ **Acknowledgement is the caller's**, deliberately unlike `CandleStream`, which acks
@@ -147,7 +148,7 @@ class OrderQueue:
 
             for entry_id, fields in entries:
                 try:
-                    order = order_from_fields(fields)
+                    order = instruction_from_fields(fields)
                 except (KeyError, ValueError):
                     logger.exception("unreadable order on the queue; skipping %s", entry_id)
                     self.ack(entry_id)
@@ -203,7 +204,7 @@ class Service:
             handled += 1
         return handled
 
-    def handle(self, entry_id: str, order: WireOrder) -> Outcome:
+    def handle(self, entry_id: str, order: Instruction) -> Outcome:
         """One order: decide, act, **record, then acknowledge**.
 
         ⚠️ The ack is last and it is not a detail. A process that died after acking and before
@@ -224,8 +225,13 @@ class Service:
         self.queue.ack(entry_id)
         return outcome
 
-    def _publish_fill(self, order: WireOrder, outcome: Outcome, *, at: dt.datetime) -> None:
+    def _publish_fill(self, order: Instruction, outcome: Outcome, *, at: dt.datetime) -> None:
         """Tell the session what the venue did — but only when the venue actually did it.
+
+        ⚠️ **Only an order can produce a fill.** A withdrawn cancel and a refused stop move both
+        happened *at* the venue and neither is a trade: publishing one as a fill would have the
+        session opening a position because it asked for an order to be taken away. The kind is
+        checked first, before anything else is read.
 
         ⚠️ **After the audit row, before the ack**, and both halves matter. After the row,
         because the trail is the record of last resort and must not be behind the thing it
@@ -245,6 +251,8 @@ class Service:
         session that the limit finally filled, later, is not this method — a deal that happens
         minutes after the entry was acknowledged has nobody in this loop watching for it.
         """
+        if not isinstance(order, WireOrder):
+            return
         placement = outcome.placement
         if not outcome.sent or placement is None or placement.filled_volume <= 0:
             return

@@ -20,9 +20,10 @@ import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+from tradeforge_engine.domain import ZERO, SignalKind
 from tradeforge_executor.gateway import OrderGateway, Placement
 from tradeforge_executor.safety import AccountSnapshot, KillSwitch, Limits, admits
-from tradeforge_executor.wire import WireOrder
+from tradeforge_executor.wire import Instruction, WireCancel, WireModifyStop
 
 logger = logging.getLogger(__name__)
 
@@ -63,9 +64,15 @@ class Router:
     switches: Sequence[KillSwitch]
 
     def route_one(
-        self, order: WireOrder, *, now: dt.datetime, core_is_alive: bool = True
+        self, order: Instruction, *, now: dt.datetime, core_is_alive: bool = True
     ) -> Outcome:
         """Decide, then act. Returns what to record — recording itself is the caller's.
+
+        ⚠️ **Three kinds arrive on one stream, and the dispatch is here rather than upstream.**
+        Order of arrival is the reason they share a stream (see `wire.KIND`): a limit armed and
+        cancelled two bars later must be placed before it is withdrawn, and two streams would let
+        the executor do it the other way round. Splitting them apart earlier would give that
+        ordering back for nothing.
 
         ⚠️ **A gateway that cannot be read is a refusal, not a crash.** Asking the account is the
         first thing that touches the terminal, and a terminal that is not answering is exactly
@@ -73,18 +80,38 @@ class Router:
         leave the entry unacknowledged, so the same order would be retried against the same dead
         terminal, for ever.
         """
+        if isinstance(order, WireModifyStop):
+            # ⚠️ Refused with a stated rule, not silently dropped and not waved through. A stop
+            # that *tightens* reduces risk and belongs with the exits — but the only thing
+            # asserting that it tightens is the session, three processes away, and a sign error
+            # there would arrive looking exactly like a tightening. Admitting it needs this
+            # machine to read the position's current stop and check the direction itself.
+            return self._refused(
+                order,
+                f"cannot move the stop of {order.symbol} to {order.stop_loss}: this executor "
+                f"cannot yet read the position and verify the move tightens, and it does not "
+                f"take the session's word for that (PR-304-A3-B)",
+            )
+
         try:
             account = self._snapshot(now)
         except Exception as error:  # a broken terminal is a refusal with a reason
             logger.exception("could not read the account; refusing %s", order.client_id)
             return self._refused(order, f"the terminal could not be read: {error}")
 
+        # Spelled as a branch rather than two conditional expressions because a `bool` does not
+        # narrow a union: mypy reads `order.request` on the cancel arm and is right to.
+        if isinstance(order, WireCancel):
+            intent, volume = SignalKind.CANCEL, ZERO
+        else:
+            intent, volume = order.request.intent, order.request.volume
+
         verdict = admits(
             # ⚠️ **The intent, not just the size.** Without it every gate reads an exit as though
             # it were an entry — and with the default `max_positions=1` that meant a session
             # could open a position and never close it. See `safety.admits`.
-            intent=order.request.intent,
-            volume=order.request.volume,
+            intent=intent,
+            volume=volume,
             account=account,
             limits=self.limits,
             switches=self.switches,
@@ -96,7 +123,11 @@ class Router:
             return self._refused(order, verdict.reason)
 
         try:
-            placement = self.gateway.send(order.request, client_id=order.client_id)
+            placement = (
+                self.gateway.withdraw(order.client_id)
+                if isinstance(order, WireCancel)
+                else self.gateway.send(order.request, client_id=order.client_id)
+            )
         except Exception as error:
             # ⚠️ An exception from the venue is an *outcome*, recorded as one. The alternative is
             # a loop that dies on the first timeout, and an order whose fate nobody wrote down.
@@ -118,7 +149,7 @@ class Router:
             open_positions=self.gateway.open_positions(),
         )
 
-    def _refused(self, order: WireOrder, reason: str) -> Outcome:
+    def _refused(self, order: Instruction, reason: str) -> Outcome:
         return Outcome(
             client_id=order.client_id,
             session_id=order.session_id,

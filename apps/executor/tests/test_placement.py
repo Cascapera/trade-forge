@@ -272,3 +272,56 @@ def test_the_venue_s_limit_is_read_from_the_wire_not_from_a_number_here() -> Non
     """Both ends need it — the venue's limit is what makes a name valid, and the side that
     *chooses* names is three processes away and must not learn MetaTrader to find out."""
     assert len(MT5Gateway()._comment("z" * 40)) == MAX_CLIENT_ID
+
+
+# --- withdrawing, and the rule that one answer is not enough ---------------------------
+
+
+class _Removal:
+    """An `OrderSendResult` for a `TRADE_ACTION_REMOVE`. Shape recorded on 26/08: the terminal
+    answered `retcode=10009` with the comment "Request executed"."""
+
+    def __init__(self, retcode: int, comment: str = "Request executed") -> None:
+        self.retcode = retcode
+        self.comment = comment
+
+
+class _Resting:
+    def __init__(self, ticket: int) -> None:
+        self.ticket = ticket
+
+
+def withdrawal_of(*codes: int) -> Placement:
+    orders = [_Resting(47_084_649 + index) for index in range(len(codes))]
+    answers = [_Removal(code) for code in codes]
+    return MT5Gateway()._withdrawal(_Retcodes(), "zone-42", orders, answers)
+
+
+def test_one_order_removed_cleanly_is_an_accepted_withdrawal() -> None:
+    placement = withdrawal_of(10009)
+
+    assert placement.accepted
+    assert placement.raw["withdrew"] == 1
+    assert placement.filled_volume == Decimal(0), "a withdrawal filled something"
+    assert placement.deal is None
+
+
+def test_a_withdrawal_is_not_a_success_unless_every_answer_is() -> None:
+    """⚠️ One name should match one order — but "should" is a fact about the strategy, not about
+    the account. A partial withdrawal reported as a success leaves an order live at the venue
+    that the session has already written off, and re-arms nothing to notice it.
+    """
+    placement = withdrawal_of(10009, 10013)
+
+    assert not placement.accepted, "a failed removal was reported as a clean withdrawal"
+    assert placement.raw["withdrew"] == 0, "the count claimed a withdrawal that did not happen"
+    assert placement.raw["retcodes"] == [10009, 10013], "the evidence lost the failing answer"
+
+
+def test_every_ticket_touched_is_in_the_evidence() -> None:
+    """`order_audit.response` is what an incident reads. A projection that recorded only the
+    first ticket would leave the second one unaccounted for on the exact row explaining why."""
+    placement = withdrawal_of(10009, 10009)
+
+    assert placement.raw["tickets"] == [47_084_649, 47_084_650]
+    assert placement.raw["withdrew"] == 2

@@ -22,7 +22,13 @@ from tradeforge_executor.gateway import Placement
 from tradeforge_executor.router import Router
 from tradeforge_executor.safety import Limits
 from tradeforge_executor.service import GROUP, OrderQueue, Service
-from tradeforge_executor.wire import ORDERS_STREAM, order_fields, order_from_fields
+from tradeforge_executor.wire import (
+    FILLS_STREAM,
+    ORDERS_STREAM,
+    fill_from_fields,
+    order_fields,
+    order_from_fields,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -36,6 +42,7 @@ class FakeQueue:
         self._entries = entries
         self.acked: list[str] = []
         self.groups: list[tuple[str, str]] = []
+        self.published: list[dict[str, str]] = []
 
     def xgroup_create(self, name: str, groupname: str, id: str, mkstream: bool) -> object:  # noqa: A002
         # ⚠️ The id is recorded, not swallowed. A double that ignored it would make
@@ -61,11 +68,16 @@ class FakeQueue:
         self.acked.extend(ids)
         return len(ids)
 
+    def xadd(self, name: str, fields: dict[str, str]) -> object:
+        self.published.append({"stream": name, **fields})
+        return "1-0"
+
 
 class FakeGateway:
-    def __init__(self, *, accepted: bool = True, broken: bool = False) -> None:
+    def __init__(self, *, accepted: bool = True, broken: bool = False, fills: str = "0.10") -> None:
         self._accepted = accepted
         self._broken = broken
+        self._fills = Decimal(fills)
         self.sent: list[str] = []
 
     def send(self, order: OrderRequest, *, client_id: str) -> Placement:
@@ -75,7 +87,7 @@ class FakeGateway:
         return Placement(
             accepted=self._accepted,
             ticket=1 if self._accepted else None,
-            filled_volume=Decimal("0.10") if self._accepted else Decimal(0),
+            filled_volume=self._fills if self._accepted else Decimal(0),
             price=Decimal("1.10000") if self._accepted else None,
             retcode=10009 if self._accepted else 10019,
             comment="done" if self._accepted else "no money",
@@ -186,6 +198,12 @@ def test_an_admitted_order_is_sent_recorded_and_then_acknowledged(
     assert gateway.sent == ["zone-42"]
     assert [row.status for row in rows(session)] == [OrderAuditStatus.SENT]
     assert queue.acked == [entry_id]
+
+    (fill,) = queue.published
+    assert fill["stream"] == FILLS_STREAM
+    assert fill["client_id"] == "zone-42", "the fill cannot be matched to its order"
+    assert fill["volume"] == "0.10"
+    assert fill["price"] == "1.10000", "the price went through a float on the way home"
 
 
 def test_nothing_is_acknowledged_before_it_is_recorded(
@@ -344,3 +362,120 @@ def _first(queue: OrderQueue, count: int) -> list[tuple[str, Any]]:
         if len(taken) >= count:
             break
     return taken
+
+
+# --------------------------------------------------------------------------------------------
+# The way home
+# --------------------------------------------------------------------------------------------
+
+
+def test_nothing_is_published_for_an_order_that_was_refused(
+    session: Session, session_factory: sessionmaker[Session]
+) -> None:
+    """⚠️ `fills.inbound` says what happened **at the venue**, and a refusal never reached one.
+
+    A "fill" of zero would leave a session waiting for a position it will never be told about —
+    or, worse, reading a zero-volume fill as a real one. The refusal already went to
+    `order_audit`, which is where an operator asks why.
+    """
+    live = a_live_session(session)
+    entry_id, fields = an_entry(str(live.id))
+    queue, gateway = FakeQueue([(entry_id, fields)]), FakeGateway()
+
+    a_service(session_factory, queue, gateway, switches=[Switch(True, name="the-handle")]).handle(
+        entry_id, order_from_fields(fields)
+    )
+
+    assert queue.published == [], "a refusal was published as if the venue had done something"
+
+
+def test_nothing_is_published_when_the_venue_rejects_the_order(
+    session: Session, session_factory: sessionmaker[Session]
+) -> None:
+    """The separating half of the one above, on the other side of the boundary: this machine
+    allowed it and the **venue** said no. Still nothing happened at the venue, so still no fill.
+    """
+    live = a_live_session(session)
+    entry_id, fields = an_entry(str(live.id))
+    queue = FakeQueue([(entry_id, fields)])
+
+    a_service(session_factory, queue, FakeGateway(accepted=False)).handle(
+        entry_id, order_from_fields(fields)
+    )
+
+    assert queue.published == []
+    assert rows(session)[0].status is OrderAuditStatus.ERROR
+
+
+def test_the_fill_is_published_after_the_audit_row_and_before_the_acknowledgement(
+    session: Session, session_factory: sessionmaker[Session]
+) -> None:
+    """⚠️ Both halves of that sandwich are load-bearing.
+
+    **After the row**, because the audit trail is the record of last resort and must not be
+    behind the thing it records. **Before the ack**, because a fill published for an entry that
+    was then redelivered would be published twice — and a session that saw one fill twice would
+    believe it holds two positions.
+
+    Separated by making the audit write fail: if the fill went first it would already be on the
+    stream when the row blew up.
+    """
+    live = a_live_session(session)
+    entry_id, fields = an_entry(str(live.id))
+    queue, gateway = FakeQueue([(entry_id, fields)]), FakeGateway()
+    order = order_from_fields(fields)
+    object.__setattr__(order, "client_id", "x" * 200)
+
+    with pytest.raises(Exception, match=r"(?i)value too long|character varying"):
+        a_service(session_factory, queue, gateway).handle(entry_id, order)
+
+    assert queue.published == [], "the fill was published before the row that records it"
+    assert queue.acked == []
+
+
+def test_a_published_fill_survives_the_round_trip(
+    session: Session, session_factory: sessionmaker[Session]
+) -> None:
+    """What the executor writes is what a session will read. The correlation is the `client_id`:
+    the session holds the `OrderRequest` it submitted and rebuilds the engine's `Fill` from the
+    two halves, which is why the request is not sent back over the wire a second time."""
+    live = a_live_session(session)
+    entry_id, fields = an_entry(str(live.id))
+    queue = FakeQueue([(entry_id, fields)])
+
+    a_service(session_factory, queue, FakeGateway()).handle(entry_id, order_from_fields(fields))
+
+    (published,) = queue.published
+    fill = fill_from_fields({k: v for k, v in published.items() if k != "stream"})
+    assert fill.client_id == "zone-42"
+    assert fill.session_id == str(live.id)
+    assert fill.symbol == "EURUSD"
+    assert str(fill.price) == "1.10000"
+    assert str(fill.volume) == "0.10"
+    assert fill.ticket == 1
+
+
+def test_a_partial_fill_travels_home_as_what_was_filled_not_what_was_asked(
+    session: Session, session_factory: sessionmaker[Session]
+) -> None:
+    """⚠️ **The one number where "asked" and "filled" must be allowed to disagree.**
+
+    Every other test in this file has the venue filling exactly what it was asked for, so the
+    two are the same number and a mutant publishing the *request's* volume sails through all of
+    them — which it did. Here the venue fills four hundredths of a tenth-lot order.
+
+    A partial fill that travelled home as the requested size would have the session believing it
+    holds a position two and a half times the one it has: every stop distance, every R multiple
+    and every subsequent size computed off a quantity that does not exist.
+    """
+    live = a_live_session(session)
+    entry_id, fields = an_entry(str(live.id))
+    queue = FakeQueue([(entry_id, fields)])
+
+    a_service(session_factory, queue, FakeGateway(fills="0.04")).handle(
+        entry_id, order_from_fields(fields)
+    )
+
+    (published,) = queue.published
+    assert published["volume"] == "0.04", "the session was told it got the whole order"
+    assert rows(session)[0].status is OrderAuditStatus.PARTIAL

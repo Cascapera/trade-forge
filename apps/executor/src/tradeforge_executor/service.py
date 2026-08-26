@@ -26,13 +26,20 @@ from dataclasses import dataclass
 from typing import Protocol, cast
 
 from redis.exceptions import ResponseError
-from redis.typing import GroupT, KeyT, StreamIdT
+from redis.typing import EncodableT, FieldT, GroupT, KeyT, ResponseT, StreamIdT
 from sqlalchemy.orm import Session, sessionmaker
 
 from tradeforge_db.session import session_scope
 from tradeforge_executor.ledger import record, session_is_alive
 from tradeforge_executor.router import Outcome, Router
-from tradeforge_executor.wire import ORDERS_STREAM, WireOrder, order_from_fields
+from tradeforge_executor.wire import (
+    FILLS_STREAM,
+    ORDERS_STREAM,
+    WireFill,
+    WireOrder,
+    fill_fields,
+    order_from_fields,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +85,17 @@ class StreamReader(Protocol):
     ) -> object: ...
 
     def xack(self, name: KeyT, groupname: GroupT, *ids: StreamIdT) -> object: ...
+
+    # ⚠️ `dict[FieldT, EncodableT]`, and `ResponseT`. The third time this file has had to be
+    # told: a protocol is satisfied by a **wider** parameter and a **narrower** return, and
+    # `dict` is invariant on top of that — `dict[str, str]` here is not satisfied by a client
+    # whose parameter is wider, however obviously compatible the values look.
+    #
+    # ⚠️ And **no `maxlen`**, though the real method has one. The real signature puts `id`
+    # before it, so declaring `maxlen` third here would let a caller pass it positionally and
+    # have it land on `id` — a stream entry with a hand-made id instead of a length cap. The
+    # narrow protocol is right for the usual reason too: this module never caps the stream.
+    def xadd(self, name: KeyT, fields: dict[FieldT, EncodableT]) -> ResponseT: ...
 
 
 @dataclass(slots=True)
@@ -140,6 +158,17 @@ class OrderQueue:
     def ack(self, entry_id: str) -> None:
         self.client.xack(ORDERS_STREAM, GROUP, entry_id)
 
+    def publish_fill(self, fill: WireFill) -> None:
+        """One entry on `fills.inbound`. Fan-out: every session reads it with its own group."""
+        # The dict is widened at the boundary, where the client's vocabulary starts. Typing
+        # `fill_fields` this way instead would push Redis's aliases into the wire module,
+        # which has no business knowing what a stream is.
+        # ⚠️ A cast, and an honest one: every key and value here *is* a `str`, which is both a
+        # `FieldT` and an `EncodableT`. What refuses the assignment is `dict`'s invariance —
+        # a type-system fact about the container, not a doubt about the contents.
+        fields = cast("dict[FieldT, EncodableT]", fill_fields(fill))
+        self.client.xadd(FILLS_STREAM, fields)
+
     def _stopped(self) -> bool:
         return self.stopping is not None and self.stopping()
 
@@ -190,5 +219,35 @@ class Service:
         with session_scope(self.factory) as db:
             record(db, order, outcome, now=moment)
 
+        self._publish_fill(order, outcome, at=moment)
         self.queue.ack(entry_id)
         return outcome
+
+    def _publish_fill(self, order: WireOrder, outcome: Outcome, *, at: dt.datetime) -> None:
+        """Tell the session what the venue did — but only when the venue actually did it.
+
+        ⚠️ **After the audit row, before the ack**, and both halves matter. After the row,
+        because the trail is the record of last resort and must not be behind the thing it
+        records. Before the ack, because a fill published for an entry that was then redelivered
+        would be published twice — and a session that saw one fill twice would believe it holds
+        two positions.
+
+        ⚠️ **Nothing is published for a refusal.** `fills.inbound` says what happened at the
+        venue, and a refusal never reached one; a "fill" of zero would be a session waiting for
+        a position it will never get told about. The refusal already went to `order_audit`, which
+        is where an operator asks why.
+        """
+        placement = outcome.placement
+        if not outcome.sent or placement is None or placement.filled_volume <= 0:
+            return
+        self.queue.publish_fill(
+            WireFill(
+                client_id=order.client_id,
+                session_id=order.session_id,
+                symbol=order.request.symbol,
+                at=at,
+                price=placement.price if placement.price is not None else order.request.volume * 0,
+                volume=placement.filled_volume,
+                ticket=placement.ticket,
+            )
+        )

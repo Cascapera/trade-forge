@@ -27,7 +27,17 @@ from decimal import Decimal
 
 from tradeforge_engine.domain import OrderRequest, Side, SignalKind
 
-__all__ = ["ORDERS_STREAM", "WireOrder", "order_fields", "order_from_fields", "stream_for"]
+__all__ = [
+    "FILLS_STREAM",
+    "ORDERS_STREAM",
+    "WireFill",
+    "WireOrder",
+    "fill_fields",
+    "fill_from_fields",
+    "order_fields",
+    "order_from_fields",
+    "stream_for",
+]
 
 ORDERS_STREAM = "orders.outbound"
 """One stream for every session, not one per session.
@@ -40,6 +50,18 @@ requirement, and getting them backwards is either half a market each or an order
 """
 
 FILLS_STREAM = "fills.inbound"
+"""What the venue did, on its way back to the session that asked.
+
+⚠️ **Fan-out, not a work queue** — the opposite of `orders.outbound` one line above, and the two
+sitting together is deliberate. An order must be handled by exactly one executor; a fill must be
+seen by the session that placed it, and by anything else watching (a panel, later). So a session
+reads this with **its own consumer group**, the way `CandleStream` does, and the executor writes
+one entry per outcome.
+
+Same file, same Redis, opposite requirements. Getting either backwards is silent: a shared group
+here means a session never learns its order filled, and a per-session group over there means the
+order goes out twice.
+"""
 
 
 def stream_for(_session_id: str) -> str:
@@ -122,3 +144,56 @@ def order_from_fields(fields: dict[str, str]) -> WireOrder:
 def _price(fields: dict[str, str], name: str) -> Decimal | None:
     raw = fields.get(name)
     return Decimal(raw) if raw is not None else None
+
+
+@dataclass(frozen=True, slots=True)
+class WireFill:
+    """What came back: which order, and what the venue actually did with it.
+
+    ⚠️ **`client_id` is the whole correlation.** The session holds the `OrderRequest` it
+    submitted, keyed by that id, and rebuilds the engine's `Fill` from the two halves — because
+    a `Fill` needs the request, and putting the request back on the wire would be sending the
+    same document twice and inviting the two copies to disagree.
+    """
+
+    client_id: str
+    session_id: str
+    symbol: str
+    at: dt.datetime
+    price: Decimal
+    volume: Decimal
+    ticket: int | None
+
+
+def fill_fields(fill: WireFill) -> dict[str, str]:
+    """The fill as a flat map of strings. Prices as decimal text, for the reason above.
+
+    ⚠️ `volume` is what was **actually** filled, which is not always what was asked for. A
+    partial fill that travelled home as the requested size would have the session believing it
+    holds a position twice the one it has.
+    """
+    fields = {
+        "client_id": fill.client_id,
+        "session_id": fill.session_id,
+        "symbol": fill.symbol,
+        "at": fill.at.isoformat(),
+        "price": str(fill.price),
+        "volume": str(fill.volume),
+    }
+    if fill.ticket is not None:
+        fields["ticket"] = str(fill.ticket)
+    return fields
+
+
+def fill_from_fields(fields: dict[str, str]) -> WireFill:
+    """The inverse. Raises on anything missing, for the same reason `order_from_fields` does."""
+    ticket = fields.get("ticket")
+    return WireFill(
+        client_id=fields["client_id"],
+        session_id=fields["session_id"],
+        symbol=fields["symbol"],
+        at=dt.datetime.fromisoformat(fields["at"]),
+        price=Decimal(fields["price"]),
+        volume=Decimal(fields["volume"]),
+        ticket=int(ticket) if ticket is not None else None,
+    )

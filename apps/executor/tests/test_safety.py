@@ -12,7 +12,15 @@ from decimal import Decimal
 
 import pytest
 
-from tradeforge_executor.safety import AccountSnapshot, KillSwitch, Limits, Verdict, admits
+from tradeforge_engine.domain import SignalKind
+from tradeforge_executor.safety import (
+    AccountSnapshot,
+    KillSwitch,
+    Limits,
+    Verdict,
+    admits,
+    reduces_risk,
+)
 
 NOON = dt.datetime(2026, 8, 25, 12, tzinfo=dt.UTC)
 
@@ -45,8 +53,9 @@ def healthy(
     )
 
 
-def ask(  # noqa: PLR0913 — the same six inputs `admits` takes, with defaults
+def ask(  # noqa: PLR0913 — the same inputs `admits` takes, with defaults
     *,
+    intent: SignalKind = SignalKind.ENTRY,
     volume: Decimal = Decimal("0.10"),
     account: AccountSnapshot | None = None,
     limits: Limits | None = None,
@@ -54,8 +63,14 @@ def ask(  # noqa: PLR0913 — the same six inputs `admits` takes, with defaults
     now: dt.datetime = NOON,
     core_is_alive: bool = True,
 ) -> Verdict:
-    """One order, with everything healthy unless a test says otherwise."""
+    """One order, with everything healthy unless a test says otherwise.
+
+    ⚠️ `ENTRY` by default, because that is the only kind of order every gate below applies to.
+    An exit or a cancel passes all of them — see `test_safety.py`'s last section — so a helper
+    defaulting to one of those would make every refusal test in this file vacuous at once.
+    """
     return admits(
+        intent=intent,
         volume=volume,
         account=account if account is not None else healthy(),
         limits=limits if limits is not None else Limits(),
@@ -306,3 +321,99 @@ def test_a_position_cap_of_zero_is_refused() -> None:
     order with a reason that reads like a strategy problem."""
     with pytest.raises(ValueError, match="at least 1"):
         Limits(max_positions=0)
+
+
+# --------------------------------------------------------------------------------------------
+# What only reduces risk is never vetoed
+# --------------------------------------------------------------------------------------------
+
+
+def test_a_session_at_the_position_cap_can_still_close_its_position() -> None:
+    """⚠️ **The measured bug this section exists for.**
+
+    `max_positions` defaults to 1, so a session that opened a position was holding exactly the
+    number that made every further order refused — including the exit. The trade ran on nothing
+    but its venue-side stop, and the strategy re-emitted the exit every bar, each one becoming a
+    refusal row and none of them becoming a close.
+
+    None of that was a bug in the cap. It was `admits` never being told what it was judging.
+    """
+    at_the_cap = healthy(open_positions=1)
+
+    assert not ask(intent=SignalKind.ENTRY, account=at_the_cap), "the cap stopped guarding"
+    assert ask(intent=SignalKind.EXIT, account=at_the_cap), "the position could never be closed"
+
+
+def test_the_daily_loss_cap_does_not_block_the_exit_that_would_stop_the_loss() -> None:
+    """The worst of the four, because the rule fires *because* the account is losing. Blocking
+    the exit then keeps the losing position open — the cap causing the thing it exists to
+    limit."""
+    broke = healthy(realised_today=Decimal("-500"))
+
+    assert not ask(intent=SignalKind.ENTRY, account=broke)
+    assert ask(intent=SignalKind.EXIT, account=broke), "the loss cap held the loser open"
+
+
+def test_a_raised_kill_switch_still_lets_a_position_be_closed() -> None:
+    """An operator pulls the handle to *stop*, and a switch that refuses the exit leaves them in
+    the trade. The switch is there to prevent new risk, not to prevent leaving."""
+    engaged = [Switch(True, name="the-handle")]
+
+    assert not ask(intent=SignalKind.ENTRY, switches=engaged)
+    assert ask(intent=SignalKind.EXIT, switches=engaged), "the handle locked the door from inside"
+
+
+def test_a_cancel_passes_the_same_gates_an_exit_does() -> None:
+    """A cancel withdraws an order that has not become a position. It cannot open anything."""
+    engaged = [Switch(True, name="the-handle")]
+
+    assert ask(intent=SignalKind.CANCEL, switches=engaged)
+    assert ask(intent=SignalKind.CANCEL, account=healthy(open_positions=99))
+    assert ask(intent=SignalKind.CANCEL, volume=Decimal("999"))
+
+
+def test_a_position_can_be_closed_outside_the_trading_window() -> None:
+    """The window says when this system may *start* something, not when it must stay in it."""
+    limits = Limits(window_open=dt.time(8, 0), window_close=dt.time(17, 0))
+    midnight = dt.datetime(2026, 8, 26, 2, tzinfo=dt.UTC)
+
+    assert not ask(intent=SignalKind.ENTRY, limits=limits, now=midnight)
+    assert ask(intent=SignalKind.EXIT, limits=limits, now=midnight)
+
+
+def test_an_exit_larger_than_the_volume_cap_still_goes_out() -> None:
+    """The cap sizes what may be *opened*. A position opened before the cap was lowered has to
+    be closable at the size it actually is, or it can never be closed at all."""
+    assert not ask(intent=SignalKind.ENTRY, volume=Decimal("5"))
+    assert ask(intent=SignalKind.EXIT, volume=Decimal("5"))
+
+
+def test_an_exit_from_a_session_that_stopped_beating_still_goes_out() -> None:
+    """⚠️ The one that is least obvious, and it follows the same rule.
+
+    `core_is_alive` exists so an order queued by a session that has since died is not sent on
+    its behalf — and the scenario that was written for is an *entry*. An exit is the opposite:
+    the position is real whether or not the session that opened it still exists, and closing it
+    is the safe end state rather than a new commitment made for a ghost.
+    """
+    assert not ask(intent=SignalKind.ENTRY, core_is_alive=False)
+    assert ask(intent=SignalKind.EXIT, core_is_alive=False)
+
+
+def test_a_naive_clock_is_still_refused_even_for_an_exit() -> None:
+    """The exemption is about *policy*. A naive clock is a caller bug, and a bug does not become
+    acceptable because the instruction it carries happens to be a safe one."""
+    with pytest.raises(ValueError, match="timezone-aware"):
+        ask(intent=SignalKind.EXIT, now=dt.datetime(2026, 8, 26, 12))  # noqa: DTZ001
+
+
+def test_a_stop_modification_is_not_yet_exempt() -> None:
+    """⚠️ Not an oversight. A *tightening* stop plainly reduces risk, and the engine only ever
+    tightens — but this machine must not take the session's word for that. A sign error three
+    processes away would arrive looking exactly like a tightening and be waved past every limit.
+    Admitting it needs the executor to read the position's current stop itself (PR-304-A3).
+    """
+    assert not reduces_risk(SignalKind.MODIFY_STOP)
+    assert reduces_risk(SignalKind.EXIT)
+    assert reduces_risk(SignalKind.CANCEL)
+    assert not reduces_risk(SignalKind.ENTRY)

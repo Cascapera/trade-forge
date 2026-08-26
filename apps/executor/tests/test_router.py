@@ -326,3 +326,42 @@ def test_every_field_on_the_wire_is_a_string() -> None:
     fields = order_fields(an_order().request, session_id="s-1", client_id="c-1")
 
     assert all(isinstance(value, str) for value in fields.values())
+
+
+def test_an_exit_reaches_the_venue_with_the_kill_switch_engaged() -> None:
+    """⚠️ The wiring, not the rule. `test_safety.py` proves `admits` exempts an exit; this proves
+    the router actually **tells** it which kind of order it is holding.
+
+    Asserted on the gateway's own record, the same way the refusal test above is: the question is
+    whether anything moved, and a router that judged correctly and then failed to send would look
+    identical from the verdict alone.
+    """
+    gateway = FakeGateway()
+
+    outcome = route(
+        gateway,
+        order=an_order(intent=SignalKind.EXIT),
+        switches=[Switch(True, name="the-handle")],
+    )
+
+    assert outcome.allowed is True, "the handle locked the door from inside"
+    assert [client_id for _order, client_id in gateway.sent] == ["zone-42"], (
+        "the exit was allowed and then not sent"
+    )
+    (sent, _name) = gateway.sent[0]
+    assert sent.intent is SignalKind.EXIT, "something other than the exit went out"
+
+
+def test_an_entry_with_the_same_switch_still_never_reaches_the_venue() -> None:
+    """The separating half. Without it the test above passes just as well against a router that
+    stopped consulting the safeguards at all."""
+    gateway = FakeGateway()
+
+    outcome = route(
+        gateway,
+        order=an_order(intent=SignalKind.ENTRY),
+        switches=[Switch(True, name="the-handle")],
+    )
+
+    assert outcome.allowed is False
+    assert gateway.sent == [], "the switch stopped guarding entries"

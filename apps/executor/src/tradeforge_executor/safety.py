@@ -31,6 +31,8 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Protocol
 
+from tradeforge_engine.domain import SignalKind
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -39,6 +41,7 @@ __all__ = [
     "Limits",
     "Verdict",
     "admits",
+    "reduces_risk",
 ]
 
 
@@ -144,8 +147,32 @@ class AccountSnapshot:
     """How many positions this executor is holding, by its own magic number."""
 
 
+def reduces_risk(intent: SignalKind) -> bool:
+    """Does this instruction only ever make the account safer?
+
+    ⚠️ **A safety rule, so it lives in the safety module** — not as a boolean the caller works
+    out and passes in. Somebody auditing what may pass a raised kill switch has to be able to
+    find the answer by reading this file, and a `reduces_risk=True` computed three modules away
+    is an answer they would have to go looking for.
+
+    Every gate below exists to stop the account taking on risk it did not authorise. An exit
+    closes a position; a cancel withdraws an order that has not become one. Neither can open
+    anything, and refusing either is the safeguard working against the thing it protects: it
+    leaves you holding the position you were trying to be rid of.
+
+    ⚠️ **`MODIFY_STOP` is deliberately not here yet**, though a *tightening* stop plainly reduces
+    risk. The engine only ever tightens (`Broker.modify_stop` raises on a loosening), but this
+    machine must not take the session's word for that — a sign error three processes away would
+    arrive here looking exactly like a tightening, and be waved past every limit. Admitting it
+    needs the executor to read the position's current stop and check the direction itself, which
+    is PR-304-A3's work and not a line to sneak in with this one.
+    """
+    return intent in (SignalKind.EXIT, SignalKind.CANCEL)
+
+
 def admits(  # noqa: PLR0913, PLR0911 — one guard per rule; each returns the reason it refused
     *,
+    intent: SignalKind,
     volume: Decimal,
     account: AccountSnapshot,
     limits: Limits,
@@ -160,6 +187,20 @@ def admits(  # noqa: PLR0913, PLR0911 — one guard per rule; each returns the r
     one of them means somebody pulled the handle and the other means a strategy asked for too
     much, and reporting the second while the first is engaged would send a person looking in the
     wrong place.
+
+    ⚠️ **An instruction that only reduces risk passes every gate below.** Measured before it was
+    changed: with the default `max_positions=1`, a session that opened a position could never
+    close it — the exit was refused by *"1 position(s) already open, cap is 1"*, every bar, for
+    ever, leaving the trade running on nothing but its venue-side stop. The daily loss cap was
+    worse in the same way: it fires **because** the account is losing, and then blocked the exit
+    that would have stopped the loss. And a kill switch that refuses an exit is an operator
+    pulling the handle and staying in the trade.
+
+    None of that was a bug in any single rule. It was `admits` never being told what kind of
+    instruction it was judging, so every one of them read an exit as though it were an entry.
+
+    ⚠️ **Not vetoing is not "not recording".** Every one of these still becomes a row in
+    `order_audit`; what changes is the verdict, never the trail.
     """
     if now.tzinfo is None:
         # ⚠️ A naive `now` against a UTC window silently shifts the whole trading day by
@@ -167,6 +208,12 @@ def admits(  # noqa: PLR0913, PLR0911 — one guard per rule; each returns the r
         # Brazil talking to a broker on UTC+3. Refused rather than assumed, the same way
         # `Candle.time` refuses one.
         raise ValueError("now must be timezone-aware; a naive clock cannot be UTC")
+
+    if reduces_risk(intent):
+        # Deliberately *before* the switches, and above every limit. See the docstring: each of
+        # these gates, applied to an exit or a cancel, refuses the one action that would make
+        # the account safer.
+        return ALLOWED
 
     for switch in switches:
         if switch.engaged():

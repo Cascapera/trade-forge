@@ -22,6 +22,7 @@ home. Nothing else spans the session, the executor and the venue.
 """
 
 import datetime as dt
+import json
 from dataclasses import dataclass
 from decimal import Decimal
 
@@ -31,7 +32,11 @@ __all__ = [
     "FILLS_STREAM",
     "MAX_CLIENT_ID",
     "ORDERS_STREAM",
+    "VENUE_STATE",
+    "VENUE_STATE_FRESH_FOR",
+    "HeldPosition",
     "Instruction",
+    "VenueState",
     "WireCancel",
     "WireFill",
     "WireModifyStop",
@@ -44,6 +49,8 @@ __all__ = [
     "order_fields",
     "order_from_fields",
     "stream_for",
+    "venue_state_from",
+    "venue_state_text",
 ]
 
 MAX_CLIENT_ID = 31
@@ -97,6 +104,114 @@ def stream_for(_session_id: str) -> str:
     change is visible here rather than in every call site.
     """
     return ORDERS_STREAM
+
+
+VENUE_STATE = "venue.positions"
+"""One Redis **key**, overwritten — not a stream, and the difference is the whole design.
+
+A stream is a record of things that happened; this is an answer to "what is at the venue **right
+now**". Nobody wants the history of that, and a consumer that fell behind on it would be reading
+about a position that closed an hour ago and refusing to start over it.
+
+⚠️ Written by the executor, which is the only process that may ask MetaTrader (AGENTS.md §5.4),
+and read by a session's `MT5Broker`, which may not. That asymmetry is why this exists at all: the
+broker keeps its own ledger, and a ledger has no way to notice a position it never opened.
+"""
+
+VENUE_STATE_FRESH_FOR = dt.timedelta(seconds=45)
+"""How old a snapshot may be before it stops counting as an answer.
+
+⚠️ **Absent and stale both mean "I do not know", and "I do not know" is not "there is nothing
+there".** A session that started on a missing key would be starting blind against an account that
+may well be holding a trade — the exact failure this key exists to prevent, arriving through the
+key itself. Same argument the kill switch makes about a layer that cannot be read.
+
+Three times the executor's publishing interval, so one missed beat is not an outage.
+"""
+
+
+@dataclass(frozen=True, slots=True)
+class HeldPosition:
+    """A position the venue holds under this project's magic number, as it reports it now.
+
+    ⚠️ **Its own type rather than the engine's `Position`**, and it lives here rather than in
+    `gateway.py` because it crosses a process boundary. The engine's `Position` is what a ledger
+    believes; this is what the venue says. Giving them one type would quietly assume the answer to
+    the question they exist to disagree about.
+    """
+
+    ticket: int
+    symbol: str
+    side: Side
+    volume: Decimal
+    price_open: Decimal
+    stop_loss: Decimal | None
+    """`None` when the position carries no stop at all. Not zero — MT5 reports an absent stop as
+    `0.0`, and a stop *at* zero is not a level anybody set."""
+
+
+@dataclass(frozen=True, slots=True)
+class VenueState:
+    """What the executor last saw the venue holding, and when it looked."""
+
+    at: dt.datetime
+    positions: tuple[HeldPosition, ...]
+
+    def is_stale(self, *, now: dt.datetime) -> bool:
+        """⚠️ A snapshot from the *future* is stale too. Clock skew between the two processes is
+        not something to average out — it is a reason to distrust the number entirely."""
+        return abs(now - self.at) > VENUE_STATE_FRESH_FOR
+
+
+def venue_state_text(state: VenueState) -> str:
+    """The snapshot as one JSON document, which is the only shape a Redis string has.
+
+    JSON rather than the flat field maps the streams use, because this is a **list** and a flat
+    map has no shape for one. Prices as decimal text for the reason every other price here is.
+    """
+    return json.dumps(
+        {
+            "at": state.at.isoformat(),
+            "positions": [
+                {
+                    "ticket": position.ticket,
+                    "symbol": position.symbol,
+                    "side": position.side.value,
+                    "volume": str(position.volume),
+                    "price_open": str(position.price_open),
+                    **(
+                        {} if position.stop_loss is None else {"stop_loss": str(position.stop_loss)}
+                    ),
+                }
+                for position in state.positions
+            ],
+        },
+        separators=(",", ":"),
+    )
+
+
+def venue_state_from(raw: str) -> VenueState:
+    """The inverse. Raises on anything malformed, which the reader treats as "I do not know".
+
+    ⚠️ **`stop_loss` absent means no stop**, and it is absent rather than `null` for the same
+    reason an optional price is left out of an order's field map: a value that never existed and
+    a value of nothing must not share a spelling.
+    """
+    document = json.loads(raw)
+    return VenueState(
+        at=dt.datetime.fromisoformat(document["at"]),
+        positions=tuple(
+            HeldPosition(
+                ticket=int(position["ticket"]),
+                symbol=position["symbol"],
+                side=Side(position["side"]),
+                volume=Decimal(position["volume"]),
+                price_open=Decimal(position["price_open"]),
+                stop_loss=(Decimal(position["stop_loss"]) if "stop_loss" in position else None),
+            )
+            for position in document["positions"]
+        ),
+    )
 
 
 KIND = "kind"

@@ -35,7 +35,7 @@ had one answer that always agreed with itself and told you nothing.
 
 import datetime as dt
 import logging
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Protocol, cast
 
 from redis.exceptions import ResponseError
@@ -57,18 +57,27 @@ from tradeforge_engine.domain import (
 )
 from tradeforge_engine.errors import EngineError
 from tradeforge_engine.portfolio import Portfolio
+from tradeforge_executor.snapshot import PUBLISH_EVERY
 from tradeforge_executor.wire import (
     FILLS_STREAM,
     MAX_CLIENT_ID,
+    VENUE_STATE,
+    VENUE_STATE_FRESH_FOR,
     WireFill,
     cancel_fields,
     fill_from_fields,
     modify_stop_fields,
     order_fields,
     stream_for,
+    venue_state_from,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _utcnow() -> dt.datetime:
+    return dt.datetime.now(dt.UTC)
+
 
 __all__ = ["MT5Broker", "OrderWire"]
 
@@ -116,11 +125,13 @@ class OrderWire(Protocol):
 
     def xack(self, name: KeyT, groupname: GroupT, *ids: StreamIdT) -> object: ...
 
+    def get(self, name: KeyT) -> object: ...
+
 
 class MT5Broker:
     """A `Broker` whose venue is an executor at the other end of two Redis streams."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 — one client and four keyword-only knobs
         self,
         client: OrderWire,
         *,
@@ -128,8 +139,10 @@ class MT5Broker:
         instrument: InstrumentSpec,
         initial_capital: Money,
         consumer: str = "session",
+        now: Callable[[], dt.datetime] | None = None,
     ) -> None:
         self._client = client
+        self._now = now or _utcnow
         self._session_id = session_id
         self._instrument = instrument
         self._portfolio = Portfolio(initial_capital=initial_capital, instrument=instrument)
@@ -150,6 +163,75 @@ class MT5Broker:
         self._minted = 0
 
     # ------------------------------------------------------------------ sending
+
+    def start(self) -> None:
+        """Make this broker usable, or refuse to let the session begin.
+
+        Two things, and the order is deliberate: **look at the venue first**, then subscribe. A
+        broker that created its consumer group and only then discovered an orphaned position
+        would leave a group behind for a session that never ran.
+
+        ⚠️ **The venue may not be holding anything.** This ledger starts empty by construction,
+        and it has no way to notice a position it did not open — so a session starting over one
+        left by a predecessor would size its next trade against an account already committed,
+        and never know. A session id is new on every process (`open_session` writes a new row),
+        so the dead session's fills are filtered out by `_read` and vanish silently. Nothing else
+        in this system is watching for that.
+
+        ⚠️ **Absent and stale are refusals too.** "I cannot tell what the venue holds" is not
+        "the venue holds nothing", and only one of them authorises trading. Same argument the
+        kill switch makes about a layer that cannot be read: the cost of refusing wrongly is a
+        session that does not start, and the cost of allowing wrongly is money.
+        """
+        self._refuse_unless_venue_is_flat()
+        self.ensure_group()
+
+    def _refuse_unless_venue_is_flat(self) -> None:
+        raw = self._client.get(VENUE_STATE)
+        if raw is None:
+            raise EngineError(
+                f"no venue snapshot at {VENUE_STATE!r}: the executor publishes one every "
+                f"{PUBLISH_EVERY.total_seconds():.0f}s, so this means it is not running — and "
+                f"not knowing what the account holds is not the same as it holding nothing"
+            )
+        # ⚠️ `str` or `bytes`, because that is the client's decision and not this module's: a
+        # `Redis` built with `decode_responses=True` hands back text and one without hands back
+        # bytes. A broker that understood only one would pass every test here and fail on the box
+        # where somebody configured the other.
+        if isinstance(raw, str):
+            document = raw
+        elif isinstance(raw, bytes | bytearray | memoryview):
+            document = bytes(raw).decode()
+        else:
+            raise EngineError(
+                f"the venue snapshot at {VENUE_STATE!r} came back as {type(raw).__name__}, "
+                f"which is neither text nor bytes"
+            )
+        try:
+            state = venue_state_from(document)
+        except Exception as error:
+            raise EngineError(
+                f"the venue snapshot at {VENUE_STATE!r} is unreadable: {error}"
+            ) from error
+
+        now = self._now()
+        if state.is_stale(now=now):
+            raise EngineError(
+                f"the venue snapshot is stamped {state.at.isoformat()} and it is now "
+                f"{now.isoformat()}: nothing has looked at the account for longer than "
+                f"{VENUE_STATE_FRESH_FOR.total_seconds():.0f}s"
+            )
+        if state.positions:
+            held = "; ".join(
+                f"{position.symbol} {position.side.value} {position.volume} @ "
+                f"{position.price_open} (ticket {position.ticket})"
+                for position in state.positions
+            )
+            raise EngineError(
+                f"the venue is already holding {len(state.positions)} position(s) under this "
+                f"project's magic number: {held}. This ledger starts empty and cannot account "
+                f"for them, so close them or hand them over before starting a session"
+            )
 
     def ensure_group(self) -> bool:
         """Create this session's consumer group. `True` if this call created it.

@@ -21,9 +21,9 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 from tradeforge_engine.domain import ZERO, Side, SignalKind
-from tradeforge_executor.gateway import HeldPosition, OrderGateway, Placement
+from tradeforge_executor.gateway import OrderGateway, Placement
 from tradeforge_executor.safety import AccountSnapshot, KillSwitch, Limits, admits
-from tradeforge_executor.wire import Instruction, WireCancel, WireModifyStop
+from tradeforge_executor.wire import HeldPosition, Instruction, WireCancel, WireModifyStop
 
 logger = logging.getLogger(__name__)
 

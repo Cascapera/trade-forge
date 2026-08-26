@@ -17,7 +17,7 @@ from decimal import Decimal
 from typing import Any, Protocol, Self
 
 from tradeforge_engine.domain import OrderRequest, Side, SignalKind
-from tradeforge_executor.wire import MAX_CLIENT_ID
+from tradeforge_executor.wire import MAX_CLIENT_ID, HeldPosition
 
 logger = logging.getLogger(__name__)
 
@@ -120,22 +120,6 @@ class Placement:
         return self.accepted and 0 < self.filled_volume < asked
 
 
-@dataclass(frozen=True, slots=True)
-class HeldPosition:
-    """A position **this executor** holds, as the venue reports it right now.
-
-    ⚠️ Its own type rather than the engine's `Position`, and the difference is the point: this is
-    what MT5 says, not what the session's ledger believes. Reconciling the two is a separate piece
-    of work, and giving them one type would quietly assume the answer.
-    """
-
-    ticket: int
-    side: Side
-    stop_loss: Decimal | None
-    """`None` when the position carries no stop at all. Not zero — MT5 reports an absent stop as
-    `0.0`, and a stop *at* zero is not a level anybody set."""
-
-
 class OrderGateway(Protocol):
     """Send one order, and say what the venue answered. Nothing else.
 
@@ -164,6 +148,10 @@ class OrderGateway(Protocol):
         advisor's position, an entirely different instrument — and the one instruction that acts
         on a position by ticket is the one below.
         """
+        ...
+
+    def holdings(self) -> tuple[HeldPosition, ...]:
+        """Everything this executor holds, across every symbol. For the venue snapshot."""
         ...
 
     def tighten(self, ticket: int, stop_loss: Decimal) -> Placement:
@@ -348,13 +336,22 @@ class MT5Gateway:
                 f"{len(held)} positions in {symbol} under magic {MAGIC}; this executor holds one "
                 f"at a time and will not guess which stop to move"
             )
-        position = held[0]
-        # MT5 reports an absent stop as 0.0, and a stop at zero is not a level anybody set.
-        level = Decimal(str(position.sl))
-        return HeldPosition(
-            ticket=int(position.ticket),
-            side=Side.LONG if int(position.type) == 0 else Side.SHORT,
-            stop_loss=level if level > 0 else None,
+        return _held(held[0])
+
+    def holdings(self) -> tuple[HeldPosition, ...]:
+        """**Everything** this executor holds, across every symbol, for the snapshot.
+
+        The plural sibling of `held()`, and deliberately not built out of it: `held()` answers
+        "which position do I act on in this symbol" and refuses to guess when there are two,
+        because acting on the wrong one moves a stop that is not ours to move. This one answers
+        "what is out there", and two is a thing it must be able to *report* rather than refuse —
+        a session that must not start because the venue is holding something needs to be told
+        what, not handed an exception about how many.
+        """
+        return tuple(
+            _held(position)
+            for position in (self._require().positions_get() or ())
+            if getattr(position, "magic", None) == MAGIC
         )
 
     def tighten(self, ticket: int, stop_loss: Decimal) -> Placement:
@@ -498,6 +495,24 @@ class MT5Gateway:
             deal=deal,
             spread=crossed,
         )
+
+
+def _held(position: Any) -> HeldPosition:  # noqa: ANN401 — whatever `positions_get` reports
+    """One MT5 position, read into the shared type.
+
+    ⚠️ `sl` of `0.0` becomes `None`. MT5 reports an absent stop that way, and a stop *at* zero is
+    not a level anybody set — collapsed, "unprotected" and "protected at nothing" become the same
+    answer, and only one of them makes arming a stop a tightening.
+    """
+    level = Decimal(str(position.sl))
+    return HeldPosition(
+        ticket=int(position.ticket),
+        symbol=str(position.symbol),
+        side=Side.LONG if int(position.type) == 0 else Side.SHORT,
+        volume=Decimal(str(position.volume)),
+        price_open=Decimal(str(position.price_open)),
+        stop_loss=level if level > 0 else None,
+    )
 
 
 def _jsonable(payload: dict[str, Any]) -> dict[str, Any]:

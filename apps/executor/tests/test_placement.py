@@ -340,11 +340,24 @@ class _Position:
     `ticket=47096513 type=0 volume=0.01 price_open=1.16524 sl=1.16014 comment='probe-a3b-sltp'`.
     """
 
-    def __init__(self, ticket: int, *, magic: int, kind: int = 0, sl: float = 1.16014) -> None:
+    def __init__(  # noqa: PLR0913 — the recorded fields, each with its recorded value
+        self,
+        ticket: int,
+        *,
+        magic: int,
+        kind: int = 0,
+        sl: float = 1.16014,
+        symbol: str = "EURUSD",
+        volume: float = 0.01,
+        price_open: float = 1.16524,
+    ) -> None:
         self.ticket = ticket
         self.magic = magic
         self.type = kind
         self.sl = sl
+        self.symbol = symbol
+        self.volume = volume
+        self.price_open = price_open
 
 
 class _Terminal:

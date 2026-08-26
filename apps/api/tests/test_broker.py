@@ -33,12 +33,17 @@ from tradeforge_executor.wire import (
     FILLS_STREAM,
     MAX_CLIENT_ID,
     ORDERS_STREAM,
+    HeldPosition,
+    VenueState,
     WireFill,
     fill_fields,
+    venue_state_text,
 )
 
 SESSION = "11111111-2222-3333-4444-555555555555"
 NOON = dt.datetime(2026, 8, 26, 12, tzinfo=dt.UTC)
+NOW = dt.datetime(2026, 8, 26, 20, tzinfo=dt.UTC)
+"""When the broker thinks it is. Snapshot freshness is measured against this."""
 HOUR = dt.timedelta(hours=1)
 
 EURUSD = InstrumentSpec(
@@ -68,6 +73,13 @@ class FakeStreams:
         self.acked: list[str] = []
         self.refuse_xadd = False
         self._seq = 0
+        self.state: str | None = venue_state_text(VenueState(at=NOW, positions=()))
+        """A fresh, empty snapshot by default: the venue was asked and holds nothing.
+
+        ⚠️ A *decision*, not a convenience. `None` means "no key at all", which the broker refuses
+        to start on — so a double defaulting to `None` would make every test here fail for the
+        same uninteresting reason, and one defaulting to a stale snapshot would hide the freshness
+        rule behind a permanent refusal."""
 
     # --- what the broker writes ---------------------------------------------------
     def xadd(self, name: KeyT, fields: dict[FieldT, EncodableT]) -> object:
@@ -115,6 +127,10 @@ class FakeStreams:
         self.pending.setdefault(consumername, []).extend(entry[0] for entry in fresh)
         return [(stream, fresh)]
 
+    def get(self, name: KeyT) -> object:
+        """The venue snapshot, or `None` for "there is no key". Two answers, never one."""
+        return self.state
+
     def xack(self, name: KeyT, groupname: GroupT, *ids: StreamIdT) -> object:
         for raw in ids:
             self.acked.append(str(raw))
@@ -130,8 +146,9 @@ def a_broker(client: FakeStreams, *, capital: str = "10000") -> MT5Broker:
         session_id=SESSION,
         instrument=EURUSD,
         initial_capital=Decimal(capital),
+        now=lambda: NOW,
     )
-    broker.ensure_group()
+    broker.start()
     return broker
 
 
@@ -638,3 +655,130 @@ def test_the_real_redis_client_satisfies_the_wire_protocol() -> None:
     type-check while the real thing did not."""
     wire: OrderWire = redis.Redis()
     assert wire is not None
+
+
+# --------------------------------------------------------------------------- starting
+
+
+def a_snapshot(*positions: HeldPosition, at: dt.datetime = NOW) -> str:
+    return venue_state_text(VenueState(at=at, positions=positions))
+
+
+def an_orphan(*, symbol: str = "EURUSD") -> HeldPosition:
+    """A position left at the venue by a session that died. Fields as the terminal reports them,
+    recorded 26/08."""
+    return HeldPosition(
+        ticket=47_096_513,
+        symbol=symbol,
+        side=Side.LONG,
+        volume=Decimal("0.01"),
+        price_open=Decimal("1.16524"),
+        stop_loss=Decimal("1.16014"),
+    )
+
+
+def starting(client: FakeStreams) -> MT5Broker:
+    return MT5Broker(
+        client,
+        session_id=SESSION,
+        instrument=EURUSD,
+        initial_capital=Decimal("10000"),
+        now=lambda: NOW,
+    )
+
+
+def test_a_session_will_not_start_over_a_position_it_did_not_open() -> None:
+    """⚠️ **The failure this whole path exists for, and it is silent without it.**
+
+    Every session process writes a *new* `live_sessions` row, so a restarted session has a new
+    id — and `_read` filters `fills.inbound` by that id. The dead session's fills are therefore
+    discarded without a word, its position stays open at the venue, and this ledger starts empty
+    and never learns. The next trade is then sized against an account that is already committed.
+    """
+    client = FakeStreams()
+    client.state = a_snapshot(an_orphan())
+
+    with pytest.raises(EngineError, match="already holding") as refusal:
+        starting(client).start()
+
+    message = str(refusal.value)
+    assert "EURUSD long 0.01" in message, "the refusal does not say what is out there"
+    assert "47096513" in message, "the refusal does not say which ticket to close"
+    assert client.groups == {}, "a group was created for a session that never ran"
+
+
+def test_a_flat_venue_starts_normally() -> None:
+    """The separating half. Without it, "refuse when a position exists" and "refuse always" are
+    the same test."""
+    client = FakeStreams()
+    client.state = a_snapshot()
+
+    starting(client).start()
+
+    assert client.groups, "the consumer group was never created"
+
+
+def test_no_snapshot_at_all_is_a_refusal_not_an_empty_account() -> None:
+    """⚠️ "I cannot tell what the venue holds" is not "the venue holds nothing", and only one of
+    them authorises trading. The same argument the kill switch makes about a layer that cannot be
+    read: refusing wrongly costs a session that does not start, allowing wrongly costs money."""
+    client = FakeStreams()
+    client.state = None
+
+    with pytest.raises(EngineError, match="no venue snapshot"):
+        starting(client).start()
+
+
+def test_a_stale_snapshot_is_a_refusal_and_says_how_stale() -> None:
+    """A snapshot nobody has refreshed says what the account looked like, not what it looks like.
+    The executor publishes every 15s; a minute of silence means it is not running."""
+    client = FakeStreams()
+    client.state = a_snapshot(at=NOW - dt.timedelta(minutes=5))
+
+    with pytest.raises(EngineError, match="nothing has looked at the account") as refusal:
+        starting(client).start()
+
+    assert (NOW - dt.timedelta(minutes=5)).isoformat() in str(refusal.value)
+
+
+def test_a_snapshot_from_the_future_is_stale_too() -> None:
+    """⚠️ Clock skew between the two processes is not something to average out — it is a reason
+    to distrust the number entirely. A snapshot stamped ahead of now is not fresher than fresh."""
+    client = FakeStreams()
+    client.state = a_snapshot(at=NOW + dt.timedelta(minutes=5))
+
+    with pytest.raises(EngineError, match="nothing has looked at the account"):
+        starting(client).start()
+
+
+def test_an_unreadable_snapshot_is_a_refusal() -> None:
+    """Malformed is one more way of not knowing, and it lands in the same place as the others."""
+    client = FakeStreams()
+    client.state = "{not json at all"
+
+    with pytest.raises(EngineError, match="unreadable"):
+        starting(client).start()
+
+
+def test_the_venue_is_looked_at_before_the_group_is_created() -> None:
+    """Order matters: a broker that subscribed first and then refused would leave a consumer
+    group behind for a session that never ran, and that group would collect every fill on the
+    stream for ever with nobody acknowledging any of it."""
+    client = FakeStreams()
+    client.state = a_snapshot(an_orphan())
+
+    with pytest.raises(EngineError):
+        starting(client).start()
+
+    assert client.groups == {}
+
+
+def test_a_position_in_another_symbol_still_stops_the_session() -> None:
+    """⚠️ The snapshot is everything under this project's magic number, not everything in the
+    instrument this session trades. A position in GBPUSD is still this project's risk, still
+    unaccounted for by this ledger, and still sized against the same account."""
+    client = FakeStreams()
+    client.state = a_snapshot(an_orphan(symbol="GBPUSD"))
+
+    with pytest.raises(EngineError, match="already holding"):
+        starting(client).start()

@@ -74,24 +74,41 @@ class FakeQueue:
 
 
 class FakeGateway:
-    def __init__(self, *, accepted: bool = True, broken: bool = False, fills: str = "0.10") -> None:
+    def __init__(
+        self,
+        *,
+        accepted: bool = True,
+        broken: bool = False,
+        fills: str = "0.10",
+        deal: int | None = 1_234,
+        price: str | None = "1.10000",
+    ) -> None:
         self._accepted = accepted
         self._broken = broken
         self._fills = Decimal(fills)
+        self._deal = deal
+        self._price = Decimal(price) if price is not None else None
         self.sent: list[str] = []
 
     def send(self, order: OrderRequest, *, client_id: str) -> Placement:
+        """⚠️ ``deal=None`` is a **resting** order: the venue accepted it and nothing executed.
+
+        That is the answer a limit order gets, and the one this fake used to be incapable of
+        giving -- it always answered as though every order filled the instant it was sent.
+        """
         if self._broken:
             raise ConnectionError("the terminal went away")
         self.sent.append(client_id)
+        executed = self._accepted and self._deal is not None
         return Placement(
             accepted=self._accepted,
             ticket=1 if self._accepted else None,
-            filled_volume=self._fills if self._accepted else Decimal(0),
-            price=Decimal("1.10000") if self._accepted else None,
+            filled_volume=self._fills if executed else Decimal(0),
+            price=self._price if executed else None,
             retcode=10009 if self._accepted else 10019,
             comment="done" if self._accepted else "no money",
             raw={"retcode": 10009 if self._accepted else 10019},
+            deal=self._deal if executed else None,
         )
 
     def balance(self) -> Decimal:
@@ -405,6 +422,54 @@ def test_nothing_is_published_when_the_venue_rejects_the_order(
 
     assert queue.published == []
     assert rows(session)[0].status is OrderAuditStatus.ERROR
+
+
+def test_a_resting_limit_order_is_recorded_and_acknowledged_but_never_published_as_a_fill(
+    session: Session, session_factory: sessionmaker[Session]
+) -> None:
+    """⚠️ The third way an order can end, and the one that used to be indistinguishable.
+
+    A limit order the venue **accepts and parks** is neither a refusal nor a trade. Measured
+    against a live terminal: it answers `retcode=10009` with the requested volume echoed back
+    and `deal=0` (see `test_placement.py`). Published as a fill, it would tell the session it
+    holds a position at the instant the order was armed — the engine's one forbidden thing,
+    reached around the outside of every guard that exists to prevent it.
+
+    The row is still written and the entry still acknowledged: something *did* happen at the
+    venue, and re-sending it on redelivery would arm the same zone twice.
+    """
+    live = a_live_session(session)
+    entry_id, fields = an_entry(str(live.id))
+    queue = FakeQueue([(entry_id, fields)])
+
+    a_service(session_factory, queue, FakeGateway(deal=None)).handle(
+        entry_id, order_from_fields(fields)
+    )
+
+    assert queue.published == [], "an order still resting in the book was published as a fill"
+    assert rows(session)[0].status is OrderAuditStatus.SENT, "the placement went unrecorded"
+    assert queue.acked == [entry_id], "a placed order would be sent again on redelivery"
+
+
+def test_a_deal_with_no_price_is_refused_rather_than_published_as_free(
+    session: Session, session_factory: sessionmaker[Session]
+) -> None:
+    """A volume with no price is a contradiction, and there is no honest `WireFill` for it.
+
+    Publishing zero would kill the session with `fill price must be positive` — an error about
+    the wrong thing, three processes away from the contradiction. `order_audit` already holds the
+    terminal's answer verbatim, so refusing here loses nothing an operator needs.
+    """
+    live = a_live_session(session)
+    entry_id, fields = an_entry(str(live.id))
+    queue = FakeQueue([(entry_id, fields)])
+
+    a_service(session_factory, queue, FakeGateway(price=None)).handle(
+        entry_id, order_from_fields(fields)
+    )
+
+    assert queue.published == [], "a fill with no price went out priced at nothing"
+    assert rows(session)[0].status is OrderAuditStatus.SENT
 
 
 def test_the_fill_is_published_after_the_audit_row_and_before_the_acknowledgement(

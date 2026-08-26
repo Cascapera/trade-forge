@@ -868,3 +868,51 @@ default de `tradeforge_test` no fixture `dsn` (com o `TRUNCATE` recusando-se a r
 banco cujo nome não termine em `_test`), ou um serviço postgres separado no compose. A guarda
 importa mais que o default: um default é uma sugestão, e o modo de falha aqui é perda de dados
 silenciosa.
+
+---
+
+## Uma ordem limite que preenche depois não tem quem avise a sessão
+
+Descoberto medindo o terminal em 26/08 (`fix/pr-304-placed-is-not-filled`). O executor trata **uma
+entrada da fila = uma decisão**: recebe a ordem, manda, grava, publica o fill se houve, dá o ack.
+Isso fecha certo para ordem a mercado, onde o negócio acontece dentro da chamada.
+
+Para uma **limite**, não fecha. A colocação volta `retcode=10009` com `deal=0` — aceita e parada no
+book — e agora o executor corretamente **não publica fill nenhum**. Só que o preenchimento de
+verdade acontece minutos ou horas depois, e nesse momento **não há ninguém naquele laço olhando**:
+a entrada já foi acked e o executor já esqueceu a ordem.
+
+Ou seja: hoje uma sessão que arma limite (que é o que a estratégia SMC faz — ADR-0015) abre
+posição no venue e **nunca fica sabendo**. O ledger do broker e a conta divergem em silêncio, que é
+o pior modo de falha possível para dinheiro real.
+
+**Conserto (candidato a PR-304-A3):** um laço próprio no executor que varre
+`history_deals_get(magic=770302)` desde o último deal visto e publica em `fills.inbound` o que
+apareceu, correlacionando pelo `client_id` no comment da ordem. É um segundo produtor da mesma
+stream, com a mesma regra de "publica só o que tem `deal`".
+
+⚠️ Enquanto isso não existe, **o executor só é honesto com ordem a mercado**. Uma sessão live com
+limite armada não deve subir.
+
+---
+
+## `Broker.cancel` e `Broker.modify_stop` não têm fio
+
+`orders.outbound` carrega `OrderRequest`, e o `__post_init__` recusa `CANCEL` e `MODIFY_STOP` — de
+propósito, e certo: um cancelamento não é uma ordem. A consequência é que metade do protocolo
+`Broker` não tem como chegar ao executor, e as duas metades que faltam são justamente as que a
+estratégia SMC usa (desarmar a limite quando a região morre, apertar o stop na condução — ADR-0018).
+
+**Conserto (candidato a PR-304-A3):** mensagem própria no fio, com `kind` explícito, não um
+`OrderRequest` alargado. Alargar a gramática abre o buraco do outro lado.
+
+---
+
+## O executor não confere `terminal_info().trade_allowed` na subida
+
+Medido em 26/08: com o botão AutoTrading do terminal desligado, **toda** ordem volta
+`accepted=False`, `retcode=10027`, e nada chega ao mercado. Falha fechada — mas em silêncio: a
+sessão roda o dia inteiro recusando ordens com uma mensagem plausível, e nenhum teste ponta a ponta
+contra o venue prova coisa nenhuma. `account_info().trade_allowed` continua `True` e engana.
+
+**Conserto:** o executor confere na subida e recusa subir armado com o botão desligado.

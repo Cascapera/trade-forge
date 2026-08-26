@@ -29,7 +29,13 @@ from tradeforge_engine.domain import (
 )
 from tradeforge_engine.errors import EngineError
 from tradeforge_engine.protocols import Broker
-from tradeforge_executor.wire import FILLS_STREAM, ORDERS_STREAM, WireFill, fill_fields
+from tradeforge_executor.wire import (
+    FILLS_STREAM,
+    MAX_CLIENT_ID,
+    ORDERS_STREAM,
+    WireFill,
+    fill_fields,
+)
 
 SESSION = "11111111-2222-3333-4444-555555555555"
 NOON = dt.datetime(2026, 8, 26, 12, tzinfo=dt.UTC)
@@ -215,7 +221,45 @@ def test_an_order_the_strategy_did_not_name_still_gets_a_name() -> None:
     broker.submit(an_order(client_id=None))
 
     names = [fields["client_id"] for _id, fields in client.entries[ORDERS_STREAM]]
-    assert names == [f"{SESSION}:1", f"{SESSION}:2"], "two orders shared one name"
+    assert names == ["s11111111-1", "s11111111-2"], "two orders shared one name"
+
+
+def test_a_minted_name_survives_the_venue_s_comment_field() -> None:
+    """⚠️ The bug this test was written after, measured on names this code produced.
+
+    A full uuid is 36 characters and the venue keeps 31, so `f"{session_id}:{n}"` reaches the
+    account with the counter cut off — and *every* minted order of a session lands under one
+    identical comment. Truncation does not shorten a name, it merges names, because every name
+    here ends in the part that distinguishes it.
+    """
+    client = FakeStreams()
+    broker = a_broker(client)
+    for _ in range(200):
+        broker.submit(an_order(client_id=None))
+
+    names = [fields["client_id"] for _id, fields in client.entries[ORDERS_STREAM]]
+    assert len(set(names)) == 200, "two minted names collided"
+    assert all(len(name) <= MAX_CLIENT_ID for name in names), "a name the venue would truncate"
+    assert len({name[:MAX_CLIENT_ID] for name in names}) == 200, "they merge at the account"
+
+
+def test_a_name_the_venue_cannot_hold_is_refused_rather_than_truncated() -> None:
+    """A strategy is free to name a zone anything; the venue is not free to keep it. A refusal is
+    loud, recorded and fixable — a silent merge is none of the three."""
+    client = FakeStreams()
+    result = a_broker(client).submit(an_order(client_id="z" * (MAX_CLIENT_ID + 1)))
+
+    assert not result.accepted
+    assert "the venue keeps" in result.reason
+    assert client.entries[ORDERS_STREAM] == [], "it went out to be merged anyway"
+
+
+def test_a_name_exactly_at_the_limit_is_accepted() -> None:
+    """The separating half: the guard must not be off by one against a name that fits."""
+    client = FakeStreams()
+    result = a_broker(client).submit(an_order(client_id="z" * MAX_CLIENT_ID))
+
+    assert result.accepted, "a name that fits exactly was refused"
 
 
 def test_a_stop_entry_is_refused_rather_than_sent_as_a_market_order() -> None:

@@ -29,6 +29,7 @@ from tradeforge_engine.domain import OrderRequest, Side, SignalKind
 
 __all__ = [
     "FILLS_STREAM",
+    "MAX_CLIENT_ID",
     "ORDERS_STREAM",
     "WireFill",
     "WireOrder",
@@ -38,6 +39,25 @@ __all__ = [
     "order_from_fields",
     "stream_for",
 ]
+
+MAX_CLIENT_ID = 31
+"""How much of a `client_id` the venue will keep, and therefore how long one may be.
+
+MT5 stores the order comment in a fixed field and takes the first 31 characters. Everything past
+that is dropped **without a word** — which is not a cosmetic loss: the comment is the only thing
+that makes a position on somebody else's screen traceable back to the zone that armed it, and the
+only part of this system that survives all three of its processes dying mid-flight.
+
+⚠️ **The tail is where names differ.** Every name this system generates ends in the part that
+distinguishes it — a counter, a bar's minute — so a truncation does not shorten a name, it
+*merges* names. Two orders arriving at the venue with the same comment cannot be told apart by
+anyone looking at the account, including the operator who is trying to work out which one to
+close.
+
+It lives here rather than in `gateway.py` because both ends need it: the venue's limit is what
+makes a name valid, and the side that *chooses* names is the session, three processes away, which
+must not learn how to talk to MetaTrader in order to find that out.
+"""
 
 ORDERS_STREAM = "orders.outbound"
 """One stream for every session, not one per session.

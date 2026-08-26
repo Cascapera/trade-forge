@@ -17,7 +17,7 @@ from typing import Any
 import pytest
 
 from tradeforge_engine.domain import OrderRequest, Side, SignalKind
-from tradeforge_executor.gateway import Placement
+from tradeforge_executor.gateway import HeldPosition, Placement
 from tradeforge_executor.router import Outcome, Router, start_of_day
 from tradeforge_executor.safety import KillSwitch, Limits
 from tradeforge_executor.wire import (
@@ -84,6 +84,8 @@ class FakeGateway:
         placement: Placement | None = None,
         broken: str | None = None,
         withdraws: bool = True,
+        holding: HeldPosition | None = None,
+        holding_readable: bool = True,
     ) -> None:
         self._balance = Decimal(balance)
         self._realised = Decimal(realised)
@@ -93,6 +95,10 @@ class FakeGateway:
         self.sent: list[tuple[OrderRequest, str]] = []
         self.withdrawn: list[str] = []
         self._withdraws = withdraws
+        self.holding = holding
+        self._holding_readable = holding_readable
+        self.asked_held: list[str] = []
+        self.tightened: list[tuple[int, Decimal]] = []
         self.asked_since: dt.datetime | None = None
 
     def send(self, order: OrderRequest, *, client_id: str) -> Placement:
@@ -112,6 +118,33 @@ class FakeGateway:
             retcode=10009 if self._withdraws else 10013,
             comment="removed" if self._withdraws else "no such order",
             raw={"withdrew": 1 if self._withdraws else 0},
+        )
+
+    def held(self, symbol: str) -> HeldPosition | None:
+        """What the double was told this executor is holding.
+
+        ⚠️ `None` is "nothing of ours is open" and `holding_readable=False` is "the terminal could
+        not be asked". Two different answers with two different remedies, so two different knobs:
+        collapsing them would make a broken terminal indistinguishable from a flat account.
+        """
+        self.asked_held.append(symbol)
+        if not self._holding_readable:
+            raise ConnectionError("the terminal went away mid-read")
+        return self.holding
+
+    def tighten(self, ticket: int, stop_loss: Decimal) -> Placement:
+        """⚠️ Recorded from a real `TRADE_ACTION_SLTP` on 26/08: `retcode=10009` with `deal=0`
+        and `order=0`. Nothing executed, so `Placement` reads it as a fill of nothing — which is
+        exactly right for a stop move, and comes free from the `deal` gate added in #155."""
+        self.tightened.append((ticket, stop_loss))
+        return Placement(
+            accepted=True,
+            ticket=ticket,
+            filled_volume=Decimal(0),
+            price=None,
+            retcode=10009,
+            comment="Request executed",
+            raw={"retcode": 10009, "deal": 0, "order": 0},
         )
 
     def balance(self) -> Decimal:
@@ -444,29 +477,103 @@ def test_a_cancel_that_found_nothing_is_still_an_accepted_instruction() -> None:
     assert outcome.placement.accepted is False, "the venue's answer was overwritten"
 
 
-def test_a_stop_move_is_refused_with_the_rule_that_refused_it() -> None:
-    """⚠️ A tightening stop reduces risk and belongs with the exits — but the only thing
-    asserting it tightens is the session, three processes away, and a sign error there would
-    arrive looking exactly like a tightening. Refused with a stated rule rather than dropped,
-    and rather than waved through."""
-    gateway = FakeGateway()
+def a_long(*, stop_loss: str | None = "1.16000", ticket: int = 47_096_513) -> HeldPosition:
+    return HeldPosition(
+        ticket=ticket,
+        side=Side.LONG,
+        stop_loss=Decimal(stop_loss) if stop_loss is not None else None,
+    )
+
+
+def test_a_tightening_stop_reaches_the_venue_by_the_ticket_we_established() -> None:
+    """⚠️ The ticket comes from `held()`, which filtered by magic — and it has to.
+
+    `TRADE_ACTION_SLTP` carries no magic and no symbol; measured on 26/08, the terminal echoes
+    back `magic=0, symbol=''`. The position ticket is the entire identity of the instruction, so
+    a ticket that did not come from that filter could belong to a manual trade or to another
+    expert advisor.
+    """
+    gateway = FakeGateway(holding=a_long(stop_loss="1.16000"))
+
+    outcome = route(gateway, order=a_stop_move(stop_loss="1.16200"))
+
+    assert outcome.allowed is True
+    assert gateway.asked_held == ["EURUSD"], "the position was never established as ours"
+    assert gateway.tightened == [(47_096_513, Decimal("1.16200"))]
+
+
+def test_a_loosening_stop_is_refused_here_because_the_venue_will_not_refuse_it() -> None:
+    """⚠️ **The measurement this whole path exists for.**
+
+    On 26/08 a real position on the demo had its stop moved from 1.16214 to 1.15714 — further
+    from price, more risk — and MT5 answered `retcode=10009` and did it. The venue has no opinion
+    about the direction. The position was sized against the stop it already had, so a sign error
+    upstream is one accepted instruction away from risk nobody authorised.
+    """
+    gateway = FakeGateway(holding=a_long(stop_loss="1.16200"))
+
+    outcome = route(gateway, order=a_stop_move(stop_loss="1.16000"))
+
+    assert outcome.allowed is False
+    assert outcome.reason is not None
+    assert "loosens it" in outcome.reason
+    assert gateway.tightened == [], "the loosening reached the venue, which would have done it"
+
+
+def test_a_short_tightens_downwards() -> None:
+    """The mirror, and the one a sign error produces: for a short, *lower* is tighter. A check
+    written for one side only passes every long test in this file and inverts the rule for half
+    the trades the strategy takes."""
+    holding = HeldPosition(ticket=1, side=Side.SHORT, stop_loss=Decimal("1.17000"))
+
+    tighter = route(FakeGateway(holding=holding), order=a_stop_move(stop_loss="1.16800"))
+    looser = route(FakeGateway(holding=holding), order=a_stop_move(stop_loss="1.17200"))
+
+    assert tighter.allowed is True, "a short was refused a tightening"
+    assert looser.allowed is False, "a short was allowed a loosening"
+
+
+def test_the_same_level_is_accepted_rather_than_punished() -> None:
+    """A strategy recomputing the same level every bar is not asking for anything. `>=`, not `>`
+    — the protocol says so, and a `>` would turn an idempotent instruction into a daily refusal
+    an operator has to learn to ignore."""
+    gateway = FakeGateway(holding=a_long(stop_loss="1.16200"))
+
+    assert route(gateway, order=a_stop_move(stop_loss="1.16200")).allowed is True
+
+
+def test_arming_a_stop_where_there_was_none_is_always_a_tightening() -> None:
+    """A position with no protection at all can only be made safer by acquiring some.
+    `Broker.modify_stop` says the same thing from the other end."""
+    gateway = FakeGateway(holding=a_long(stop_loss=None))
+
+    assert route(gateway, order=a_stop_move(stop_loss="1.10000")).allowed is True
+    assert gateway.tightened == [(47_096_513, Decimal("1.10000"))]
+
+
+def test_a_stop_move_with_no_position_of_ours_is_refused() -> None:
+    """The account may well hold something — just not under this executor's magic number. Moving
+    a stop by ticket is the one instruction where that distinction is the whole safety story."""
+    gateway = FakeGateway(holding=None)
 
     outcome = route(gateway, order=a_stop_move())
 
     assert outcome.allowed is False
     assert outcome.reason is not None
-    assert "verify the move tightens" in outcome.reason
-    assert gateway.sent == [], "it was sent to the venue as an order"
-    assert gateway.withdrawn == [], "it was sent to the venue as a withdrawal"
+    assert "no position of ours" in outcome.reason
+    assert gateway.tightened == []
 
 
-def test_a_stop_move_is_refused_before_the_terminal_is_even_asked() -> None:
-    """The separating half: refused on its own kind, not because the account happened to be
-    unreadable. A broken terminal would refuse everything and hide which rule was speaking."""
-    gateway = FakeGateway()
+def test_a_position_that_cannot_be_read_is_a_refusal_not_a_crash() -> None:
+    """⚠️ Distinct from "nothing of ours is open", and the reasons say which. A terminal that is
+    not answering is exactly when an instruction must not be sent — and letting the exception
+    escape would abort the loop and leave the entry unacknowledged, to be retried against the
+    same dead terminal for ever."""
+    gateway = FakeGateway(holding_readable=False)
 
     outcome = route(gateway, order=a_stop_move())
 
-    assert gateway.asked_since is None, "the account was read for an instruction never sent"
+    assert outcome.allowed is False
     assert outcome.reason is not None
-    assert "terminal" not in outcome.reason
+    assert "could not be read" in outcome.reason
+    assert gateway.tightened == []

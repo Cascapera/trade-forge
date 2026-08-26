@@ -950,20 +950,19 @@ comparar o que o ledger acha que tem com o que o venue diz que tem.
 
 ---
 
-## O executor precisa conferir sozinho que um stop está apertando
+## ~~O executor precisa conferir sozinho que um stop está apertando~~ — FECHADO (PR-304-A3-B)
 
-Ficou de fora do conserto de `reduces_risk` (`fix/pr-303-a2`), de propósito. Um stop que **aperta**
-reduz risco e deveria passar pelos portões como a saída e o cancelamento passam. Só que quem afirma
-que ele aperta é a sessão, três processos longe — e um erro de sinal lá chegaria aqui com a cara
-exata de um aperto, e seria passado por cima de todos os limites.
+Fechado, e a medição mudou a natureza do item. Ele estava escrito como "segunda linha de defesa";
+não é.
 
-A engine já garante isso do lado dela (`Broker.modify_stop` levanta num afrouxamento), mas
-**esta máquina não pode aceitar a palavra da sessão** — é o mesmo princípio que faz os limites
-viverem no executor e não no core.
+⚠️ **Medido em 26/08 numa posição real na demo: o MT5 aceita afrouxar o stop.** Movido de 1.16214
+para 1.15714 — mais longe do preço, mais risco — o terminal respondeu `retcode=10009` e fez. O
+venue **não tem opinião sobre a direção**.
 
-**Conserto (PR-304-A3, junto do fio):** antes de admitir um `MODIFY_STOP`, o executor lê a posição
-no venue (`positions_get` filtrado por magic) e compara a direção ele mesmo: para um long o nível
-novo tem que ser >= o atual, para um short <=. Aí `MODIFY_STOP` entra no `reduces_risk`.
+Então `Router._verified` não é uma verificação redundante: é **a única guarda** entre um erro de
+sinal na estratégia e uma conta carregando risco que ninguém autorizou. Ela lê a posição pelo
+magic, compara os níveis por lado, e recusa antes de qualquer envio.
 
-⚠️ Enquanto isso, um aperto de stop está sujeito a todos os limites — inclusive ao kill switch, o
-que é conservador na direção errada, mas é a direção segura enquanto não dá para verificar.
+⚠️ E a identidade também ficou sendo dela: o `TRADE_ACTION_SLTP` sai com `magic=0` e `symbol=''` —
+medido — então **o ticket é a identidade inteira** da instrução. Um ticket que não veio do filtro
+por magic poderia ser de um trade manual seu ou de outro EA.

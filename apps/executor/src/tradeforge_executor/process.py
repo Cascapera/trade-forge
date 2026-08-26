@@ -23,7 +23,7 @@ from redis import Redis
 from tradeforge_db.session import create_db_engine, create_session_factory
 from tradeforge_engine.domain import OrderRequest
 from tradeforge_executor.config import ExecutorSettings
-from tradeforge_executor.gateway import MT5Gateway, OrderGateway, Placement
+from tradeforge_executor.gateway import HeldPosition, MT5Gateway, OrderGateway, Placement
 from tradeforge_executor.kill_switch import EndpointFlag, FileFlag, RedisFlag
 from tradeforge_executor.router import Router
 from tradeforge_executor.safety import KillSwitch
@@ -89,6 +89,31 @@ class RefusingGateway:
             retcode=0,
             comment="dry run: the executor is not armed",
             raw={"dry_run": True, "withdraw": client_id},
+        )
+
+    def held(self, symbol: str) -> HeldPosition | None:
+        """⚠️ A **read**, so it passes through like the others. An unarmed executor must still be
+        able to say what the account is holding — that is how an operator checks a dry run against
+        reality, and inventing an empty answer would make the dry run agree with itself."""
+        return self._inner.held(symbol)
+
+    def tighten(self, ticket: int, stop_loss: Decimal) -> Placement:
+        """Refused, like `send` and `withdraw`. A dry run has opened nothing, so any ticket it
+        could act on belongs to somebody else — and `TRADE_ACTION_SLTP` carries no magic, so the
+        instruction itself would not object."""
+        logger.warning(
+            "DRY RUN: would move the stop of position %s to %s — pass --arm to act for real",
+            ticket,
+            stop_loss,
+        )
+        return Placement(
+            accepted=False,
+            ticket=ticket,
+            filled_volume=Decimal(0),
+            price=None,
+            retcode=0,
+            comment="dry run: the executor is not armed",
+            raw={"dry_run": True, "tighten": ticket},
         )
 
     # ⚠️ The reads pass straight through, and they must. The safeguards judge a real account —

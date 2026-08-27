@@ -5,12 +5,14 @@ is only the shell, and the part of it worth pinning is the signal handling — w
 get wrong in ways that never show up until a shutdown goes badly on a real machine.
 """
 
+import inspect
 import signal
 import threading
 
 import pytest
 
-from tradeforge_api.live.process import _parse, stop_on_signals
+from tradeforge_api.live.process import _parse, main, stop_on_signals
+from tradeforge_db.models import SessionMode
 
 
 @pytest.fixture(autouse=True)
@@ -145,3 +147,53 @@ def test_no_spread_means_no_cost_model_rather_than_a_zero_one() -> None:
     )
 
     assert args.spread_points is None
+
+
+def a_command(*extra: str) -> list[str]:
+    """The four arguments every session needs, plus whatever a test is actually about."""
+    return [
+        "--strategy",
+        "11111111-1111-1111-1111-111111111111",
+        "--instrument",
+        "22222222-2222-2222-2222-222222222222",
+        "--timeframe",
+        "H1",
+        "--capital",
+        "10000",
+        *extra,
+    ]
+
+
+def test_a_session_is_paper_unless_the_operator_says_otherwise() -> None:
+    """⚠️ **The third place this default has to hold**, after `SessionPlan.mode` and
+    `open_session`. It is also the one that matters most, because it is the one a human types:
+    the safe value costs nothing and the dangerous one costs a flag, in as many words.
+    """
+    assert _parse(a_command()).mode is SessionMode.PAPER
+
+
+def test_live_is_reachable_and_only_by_naming_it() -> None:
+    """Stated and it happens; mistyped and it is a parse error rather than a mode.
+
+    ⚠️ `choices` rather than a `--live` switch, so that "this is a paper session" is also
+    something an operator can say out loud — a flag whose absence is the whole statement reads
+    the same whether it was considered or forgotten.
+    """
+    assert _parse(a_command("--mode", "live")).mode is SessionMode.LIVE
+    assert _parse(a_command("--mode", "paper")).mode is SessionMode.PAPER
+
+    with pytest.raises(SystemExit):
+        _parse(a_command("--mode", "LIVE"))
+    with pytest.raises(SystemExit):
+        _parse(a_command("--mode", "real"))
+
+
+def test_the_promotion_gate_reads_its_number_from_configuration() -> None:
+    """⚠️ `LIVE_PROMOTION_DAYS` used to move a number nothing consulted: `run_session` fell
+    through to its own default of five, which happened to agree. A configuration option nobody
+    reads is worse than none — it is a promise on a page — so this pins that `main` passes it.
+    """
+    source = inspect.getsource(main)
+    assert "promotion_days=settings.live_promotion_days" in source, (
+        "main stopped passing the configured number; the gate is back to a hard-coded 5"
+    )

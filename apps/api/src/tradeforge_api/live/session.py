@@ -1,10 +1,11 @@
-"""One paper session, start to finish.
+"""One session, paper or real, start to finish.
 
 Everything this needs already exists; what was missing is the order the pieces go in, and that
 order is the content of this module. Read it top to bottom and it is the life of a session:
 
-    warm up over history  ->  hand over to a fresh broker  ->  open the row  ->
-    beat, and trade, and record, one bar at a time         ->  finish the row
+    warm up over history  ->  build the broker it will trade through  ->  open the row  ->
+    hand over what is still resting  ->  beat, and trade, and record, one bar at a time  ->
+    finish the row
 
 ⚠️ **A session is not a job.** `arq` applies `job_timeout` with `asyncio.wait_for`, and a
 session runs for days; a job that blocks the event loop freezes the whole queue, which PR #133
@@ -16,6 +17,24 @@ thing that schedules it.
 where it is. `warmup_bars` is a fact about what the seed actually used, and a row written first
 would have to be updated with it — a second write that can fail on its own. A session whose
 warm-up raised gets no row at all, which is the honest outcome: nothing ran.
+
+**Nothing is written *after* an order has gone out either**, and that is the newer half of the
+same sentence. A paper session's broker has no identity, so the row could be opened whenever;
+a real one's broker *is* its identity — `MT5Broker` is built with the session id, which names
+its consumer group, tags every envelope on `orders.outbound`, prefixes every `client_id` the
+account displays, and is what `order_audit.live_session_id` links a row by. `hand_over` submits.
+So a row opened after the hand-over would leave the first orders of a session — placed in its
+riskiest instant, on levels decided over history — sitting in `order_audit` with a NULL session,
+because the executor's `_known_session` degrades to NULL rather than losing the audit row.
+
+The id is therefore minted before the row exists, and `open_session` takes it. The row is still
+the record; it is just no longer the thing that names what it records.
+
+⚠️ **The venue is a seam, not an import.** This module never mentions `MT5Broker` and cannot:
+`AGENTS.md` §5.4 keeps everything outside `apps/collector` and `apps/executor` away from the
+broker's world, and a module that could reach a venue is a module a paper session could reach
+one through. What it takes is a `Venue` — a callable handed the session id — and it consults it
+**only** in live mode. There is no code path on which a session marked paper touches an account.
 """
 
 import datetime as dt
@@ -31,7 +50,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from tradeforge_api.live.heartbeat import session_heartbeat
 from tradeforge_api.live.promotion import promotion_for
-from tradeforge_api.live.recorder import LedgerWatch, TradeRecorder, record_bar
+from tradeforge_api.live.recorder import LedgerView, LedgerWatch, TradeRecorder, record_bar
 from tradeforge_api.live.splice import BarSource, splice
 from tradeforge_api.runner import (
     ENGINE_VERSION,
@@ -45,13 +64,28 @@ from tradeforge_db.live_sessions import finish_session, open_session, reconcile_
 from tradeforge_db.models import Instrument, LiveSession, SessionMode, Strategy
 from tradeforge_db.session import session_scope
 from tradeforge_engine import BacktestBroker, PercentRiskManager, compile_strategy
+from tradeforge_engine.domain import InstrumentSpec
 from tradeforge_engine.errors import EngineError
 from tradeforge_engine.loop import iter_run
+from tradeforge_engine.protocols import Broker, CostModel
 from tradeforge_engine.warmup import hand_over
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["SessionOutcome", "SessionPlan", "reconcile_on_start", "run_session"]
+__all__ = ["SessionOutcome", "SessionPlan", "Venue", "reconcile_on_start", "run_session"]
+
+type Venue = Callable[[uuid.UUID, InstrumentSpec], Broker]
+"""Builds the broker a **live** session trades through, ready to use.
+
+Handed the session's id and the instrument it will trade, and expected to return a broker that
+has already done whatever starting it needs — `MT5Broker.start()` reads the venue's snapshot and
+refuses over an orphaned position, or an absent, stale or unreadable one. Refusing *inside* the
+callable is deliberate: this module calls it at the one instant where a refusal still means no
+row was written, and a two-step `build then start` would let a caller get that order wrong.
+
+A callable rather than a broker, because the id does not exist until the warm-up is over, and a
+broker built before then would be built around an id nothing will ever be recorded under.
+"""
 
 
 def _utcnow() -> dt.datetime:
@@ -108,6 +142,7 @@ def run_session(  # noqa: PLR0913 — keyword-only; each names one seam of a ses
     plan: SessionPlan,
     parquet_root: Path,
     stopping: Callable[[], bool],
+    venue: Venue | None = None,
     promotion_days: int = 5,
     now: Callable[[], dt.datetime] = _utcnow,
 ) -> SessionOutcome:
@@ -118,8 +153,11 @@ def run_session(  # noqa: PLR0913 — keyword-only; each names one seam of a ses
     crash to propagate — the same doctrine the backtest worker follows.
 
     ⚠️ **A refusal to start does raise.** A warm-up that cannot run, a hand-over that lands
-    mid-position, a missing instrument: none of those produce a session, so none of them produce
-    a row to mark. `open_session`'s docstring says the same thing from the other side.
+    mid-position, a missing instrument, a venue that will not have this session: none of those
+    produce a session, so none of them produce a row to mark. `open_session`'s docstring says the
+    same thing from the other side.
+
+    `venue` is consulted only when `plan.mode` is live, and is then required — see `_broker_for`.
     """
     opened_at = now()
 
@@ -131,6 +169,15 @@ def run_session(  # noqa: PLR0913 — keyword-only; each names one seam of a ses
         verdict = promotion_for(db, plan.strategy_id, mode=plan.mode, required_days=promotion_days)
         if not verdict:
             raise EngineError(f"refusing to start a {plan.mode.value} session: {verdict.reason}")
+
+    # ⚠️ Asked here too, and for the same reason the promotion gate is: a live session with no
+    # venue to trade through is knowable now, and discovering it after the warm-up would spend
+    # minutes to say so. The refusal itself is not a convenience — see `_broker_for`.
+    if plan.mode is SessionMode.LIVE and venue is None:
+        raise EngineError(
+            "refusing to start a live session with no venue: without one this would run the "
+            "market through a BacktestBroker and report imaginary fills as real ones"
+        )
 
     with session_scope(factory) as db:
         strategy, instrument = _load(db, plan)
@@ -146,19 +193,15 @@ def run_session(  # noqa: PLR0913 — keyword-only; each names one seam of a ses
         opened_at=opened_at,
     )
 
-    # ⚠️ Two brokers, and the second is built empty rather than reset. A `reset_ledger()` would
-    # have to decide field by field what survives, and every field somebody forgets is a warm-up
-    # trade leaking into a live equity curve (ADR-0023).
-    def a_broker() -> BacktestBroker:
-        return BacktestBroker(
-            instrument=spec,
-            initial_capital=plan.initial_capital,
-            cost_model=build_cost_model(plan.cost_model),
-            take_profit_rr=take_profit_rr(definition),
-        )
-
-    warm = a_broker()
-    live = a_broker()
+    # ⚠️ **History is always replayed against a `BacktestBroker`, in both modes.** Warm-up is a
+    # backtest whose ledger is thrown away (ADR-0023), and replaying it against a venue would put
+    # months of decided-in-hindsight orders on a real account in the first seconds of a session.
+    warm = BacktestBroker(
+        instrument=spec,
+        initial_capital=plan.initial_capital,
+        cost_model=build_cost_model(plan.cost_model),
+        take_profit_rr=take_profit_rr(definition),
+    )
     risk = PercentRiskManager(percent=risk_percent(definition))
     compiled = compile_strategy(definition)
 
@@ -172,16 +215,39 @@ def run_session(  # noqa: PLR0913 — keyword-only; each names one seam of a ses
     ):
         pass
 
-    handover = hand_over(warm, live, symbol=symbol, bars=candles.warmed, risk=risk, instrument=spec)
-    logger.info(
-        "warmed over %d bars, carried %d resting order(s), refused %d",
-        handover.bars,
-        len(handover.carried),
-        len(handover.refused),
+    # ⚠️ **`hand_over` asks this too, and this one decides whether a row is written.** The order
+    # below is `open_session` *then* `hand_over`, so leaving the refusal to `hand_over` alone
+    # would leave a `running` row behind for a session that never opened. `hand_over` keeps its
+    # own guard because it is that function's invariant and it has other callers; delete this one
+    # and the session opens a row before finding out — which is the failure a test pins.
+    if warm.positions(symbol):
+        raise EngineError(
+            f"warm-up ended with an open position in {symbol}; a session cannot open mid-trade. "
+            "Seed a window that ends flat, or start once the strategy is out."
+        )
+
+    # ⚠️ **The id is minted before the row exists.** See the module docstring: `MT5Broker` is
+    # built with it, and `hand_over` submits — so an id that only appeared with the row would put
+    # this session's first orders into `order_audit` under a session that was not yet on file.
+    session_id = uuid.uuid4()
+    live = _broker_for(
+        plan,
+        venue,
+        session_id=session_id,
+        spec=spec,
+        cost_model=build_cost_model(plan.cost_model),
+        take_profit_rr=take_profit_rr(definition),
     )
 
+    # ⚠️ **Written before the hand-over, not after**, and in live that is the whole point of the
+    # ordering. `hand_over` re-submits what the warm-up left resting — measured at 35% to 73% of
+    # bars — and in live those go to the venue. A row opened afterwards would mean the riskiest
+    # orders a session ever places are the ones whose audit rows have no session to point at.
+    #
+    # `candles.warmed` rather than `handover.bars`: they are the same number — `hand_over` is
+    # handed the one and returns it as the other — and only one of them exists yet.
     with session_scope(factory) as db:
-        row = open_session(
+        open_session(
             db,
             strategy_id=plan.strategy_id,
             instrument_id=plan.instrument_id,
@@ -190,10 +256,18 @@ def run_session(  # noqa: PLR0913 — keyword-only; each names one seam of a ses
             cost_model=dict(plan.cost_model),
             engine_version=ENGINE_VERSION,
             mode=plan.mode,
-            warmup_bars=handover.bars,
+            warmup_bars=candles.warmed,
             at=opened_at,
+            session_id=session_id,
         )
-        session_id = row.id
+
+    handover = hand_over(warm, live, symbol=symbol, bars=candles.warmed, risk=risk, instrument=spec)
+    logger.info(
+        "warmed over %d bars, carried %d resting order(s), refused %d",
+        handover.bars,
+        len(handover.carried),
+        len(handover.refused),
+    )
 
     bars = 0
     failure: str | None = None
@@ -242,12 +316,60 @@ def run_session(  # noqa: PLR0913 — keyword-only; each names one seam of a ses
     )
 
 
+def _broker_for(  # noqa: PLR0913 — the plan, the seam, and the four facts a paper broker needs
+    plan: SessionPlan,
+    venue: Venue | None,
+    *,
+    session_id: uuid.UUID,
+    spec: InstrumentSpec,
+    cost_model: CostModel,
+    take_profit_rr: Decimal | None,
+) -> Broker:
+    """The broker the session itself will trade through. Paper is local; live is the venue.
+
+    ⚠️ **The branch is on `plan.mode`, not on whether a venue was handed in**, and the difference
+    is the whole safety property. `venue if venue is not None else a BacktestBroker` reads as the
+    same function and is not: it makes a paper session trade a real account the moment somebody
+    passes a venue by mistake, and — worse, because it is silent — it makes a *live* session run
+    on imaginary fills the moment somebody forgets to. One of those loses money and the other
+    reports money it never had. Modes are stated, never inferred.
+
+    ⚠️ **Built empty rather than reset.** A `reset_ledger()` on the warm-up's broker would have to
+    decide field by field what survives, and every field somebody forgets is a warm-up trade
+    leaking into a live equity curve (ADR-0023). Building this one fresh makes the money untouched
+    by construction: there is no path a warm-up fill could cross on, because there is no crossing.
+
+    ⚠️ **`initial_capital` is the plan's number even in live**, and it is worth saying why rather
+    than reaching for the account balance. `MT5Broker` keeps its own ledger (see its module
+    docstring), and what a session risks 1% of is the capital it was *allotted*, not everything
+    the account happens to hold — an account funding three sessions would otherwise have each of
+    them sizing against all of it. Reconciling that ledger against the venue's own is PR-304-A5's,
+    and the drift it finds is a signal precisely because the two are computed independently.
+    """
+    if plan.mode is not SessionMode.LIVE:
+        return BacktestBroker(
+            instrument=spec,
+            initial_capital=plan.initial_capital,
+            cost_model=cost_model,
+            take_profit_rr=take_profit_rr,
+        )
+    if venue is None:
+        # ⚠️ Unreachable through `run_session`, which refuses before the warm-up — and kept, on
+        # the criterion that matters: what does removing it do? `venue` is `Venue | None`, so
+        # `mypy --strict` catches the call today; the day this function grows a second caller,
+        # or the type widens, an absent guard means a live session silently falling through to
+        # `None()` at the one instant it is about to place real orders. A local invariant that
+        # fails loudly costs one branch.
+        raise EngineError("a live session needs a venue")
+    return venue(session_id, spec)
+
+
 def _persist(
     factory: sessionmaker[Session],
     *,
     watch: LedgerWatch,
     recorder: TradeRecorder,
-    broker: BacktestBroker,
+    broker: LedgerView,
     at: dt.datetime,
 ) -> None:
     """One bar's writes, in one transaction.

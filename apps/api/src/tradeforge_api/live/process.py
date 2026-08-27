@@ -22,11 +22,14 @@ from decimal import Decimal
 from redis import Redis
 
 from tradeforge_api.config import Settings
+from tradeforge_api.live.broker import MT5Broker
 from tradeforge_api.live.candle_stream import CandleStream
-from tradeforge_api.live.session import SessionPlan, reconcile_on_start, run_session
+from tradeforge_api.live.session import SessionPlan, Venue, reconcile_on_start, run_session
 from tradeforge_collector.live import Subscription
-from tradeforge_db.models import Instrument
+from tradeforge_db.models import Instrument, SessionMode
 from tradeforge_db.session import create_db_engine, create_session_factory, session_scope
+from tradeforge_engine.domain import InstrumentSpec
+from tradeforge_engine.protocols import Broker
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +73,7 @@ def stop_on_signals(stopping: threading.Event) -> None:
 def _parse(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="tradeforge-session",
-        description="Run one paper session until it is stopped.",
+        description="Run one session, paper or real, until it is stopped.",
     )
     parser.add_argument("--strategy", required=True, type=uuid.UUID, help="strategy id")
     parser.add_argument("--instrument", required=True, type=uuid.UUID, help="instrument id")
@@ -81,6 +84,18 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
         type=Decimal,
         default=None,
         help="charge this fixed spread; omitted means the bar's own spread",
+    )
+    # ⚠️ **`--mode live` is spelled out or it does not happen.** The safe value is the default and
+    # the dangerous one costs a flag — the same argument `SessionPlan.mode` and `open_session`
+    # both make, and the third place it has to hold, because this is the one a human types at
+    # three in the morning. `choices` rather than a `--live` switch so the paper case is
+    # something an operator can also state, and so a typo is a parse error rather than a mode.
+    parser.add_argument(
+        "--mode",
+        type=SessionMode,
+        choices=list(SessionMode),
+        default=SessionMode.PAPER,
+        help="paper (default) trades a local ledger; live sends orders to the venue",
     )
     return parser.parse_args(argv)
 
@@ -121,6 +136,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.spread_points is not None
             else {"type": "none"}
         ),
+        mode=args.mode,
     )
 
     try:
@@ -130,6 +146,12 @@ def main(argv: list[str] | None = None) -> int:
             plan=plan,
             parquet_root=settings.parquet_root,
             stopping=stopping.is_set,
+            venue=_venue(redis, plan.initial_capital),
+            # ⚠️ Passed, where it used to fall through to `run_session`'s own default of 5. The
+            # two agreed, so nothing was wrong — and nothing was configurable either: setting
+            # `LIVE_PROMOTION_DAYS` moved a number no code read. A configuration option nobody
+            # consults is worse than none, because it is a promise on a page.
+            promotion_days=settings.live_promotion_days,
         )
     finally:
         redis.close()
@@ -143,6 +165,34 @@ def main(argv: list[str] | None = None) -> int:
         f", error: {outcome.error}" if outcome.error else "",
     )
     return 1 if outcome.error else 0
+
+
+def _venue(redis: Redis, initial_capital: Decimal) -> Venue:
+    """How this process builds the broker a live session trades through.
+
+    Here rather than in `session.py`, and that placement is the point of the seam existing. This
+    file is where a *process* keeps the things a function does not have — its arguments, its
+    signals, its clients — and the Redis connection is one of them. `session.py` stays drivable
+    from a test with no server, and a session marked paper has no object to reach a venue with.
+
+    ⚠️ **`start()` is called here, inside the callable**, so that "built" and "usable" are one
+    step for whoever holds it. It reads the executor's snapshot of the account and refuses over an
+    orphaned position — or over one that is absent, stale or unreadable, because "I cannot tell
+    what the venue holds" is not "the venue holds nothing" (PR-304-A4). `session.py` invokes this
+    at the one instant where that refusal still means no row was written and no order was sent.
+    """
+
+    def build(session_id: uuid.UUID, spec: InstrumentSpec) -> Broker:
+        broker = MT5Broker(
+            redis,
+            session_id=str(session_id),
+            instrument=spec,
+            initial_capital=initial_capital,
+        )
+        broker.start()
+        return broker
+
+    return build
 
 
 def _stream(redis: Redis, subscription: Subscription, stopping: threading.Event) -> CandleStream:

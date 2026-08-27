@@ -65,6 +65,7 @@ def open_session(  # noqa: PLR0913 — keyword-only; each names one column of th
     mode: SessionMode = SessionMode.PAPER,
     warmup_bars: int,
     at: dt.datetime,
+    session_id: uuid.UUID | None = None,
 ) -> LiveSession:
     """Write the row for a session that is **about to start**, and hand it back.
 
@@ -72,6 +73,14 @@ def open_session(  # noqa: PLR0913 — keyword-only; each names one column of th
     a row written first would have to be updated with it, which is a second write that can fail
     on its own. A session whose warm-up raised never gets a row at all, which is the honest
     outcome: nothing ran.
+
+    ⚠️ **`session_id` exists so an id can be older than its row**, and only a live session needs
+    that. `MT5Broker` is built with the session's id — it is the consumer group, the envelope's
+    tag, the prefix of every `client_id` the account will display, and what `order_audit` links a
+    row by — and that broker has to exist, and refuse, *before* anything is written. Minting the
+    id here instead would mean the first orders of a session reach `order_audit` with a NULL
+    session: the riskiest orders in the system, orphaned, silently. Omitted, the column's own
+    default applies and nothing changes for a paper caller.
 
     `heartbeat_at` is left NULL. The loop sets it on its first beat, so a row with a status of
     `running` and no heartbeat means the process died between opening and its first bar — a
@@ -98,6 +107,11 @@ def open_session(  # noqa: PLR0913 — keyword-only; each names one column of th
         warmup_bars=warmup_bars,
         started_at=at,
     )
+    # Assigned rather than passed to the constructor: `id=None` would override the column's own
+    # `default=uuid.uuid4` with a NULL and fail the insert, so "no opinion" has to mean not
+    # naming the field at all.
+    if session_id is not None:
+        row.id = session_id
     session.add(row)
     session.flush()
     return row

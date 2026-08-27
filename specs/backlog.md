@@ -958,6 +958,42 @@ Duas regras que saíram disso e valem além deste PR:
 `order_audit` o custo de entrada, o `decided_at` e o `initial_stop_loss` — que é o denominador de
 todo R e não está no que o venue reporta.
 
+### Como a posição órfã diz de quem ela é (levantado pelo Guilherme, 27/08)
+
+> *"quando temos uma operação que ficou aberta e o sistema reinicia, que a gente saiba qual é a
+> estratégia usada para dar continuidade. Temos duas opções: a operação sempre tem um id único que
+> a corretora entrega, e no MT5 podemos adicionar comentário na ordem."*
+
+Está certo, e **metade já está construída** — o que vale registrar é qual das duas âncoras carrega
+o quê, porque a diferença decide o desenho do A5.
+
+* **O comentário já identifica a sessão.** O gateway escreve o `client_id` no comentário da ordem
+  (`gateway._comment`), e o `client_id` que o `MT5Broker` cunha é `s{session_id[:8]}-{n}`. A
+  sessão está em `live_sessions`, que tem `strategy_id`. Então o caminho comentário → sessão →
+  estratégia **existe hoje**, e não custa campo nenhum.
+* **O ticket é a identidade da instrução, não do dono.** Medido em 26/08: o `TRADE_ACTION_SLTP`
+  volta com `magic=0` e `symbol=''`, então o ticket é a única coisa que sobra para endereçar uma
+  posição. Mas ele nasce no venue e não sabe nada de estratégia — ele é a chave, não o registro.
+
+⚠️ **A escolha real não é "ticket ou comentário", é "carregar o dado ou carregar o endereço do
+dado".** O comentário tem **31 caracteres** (medido, PR #157) e truncar não encurta um nome:
+**funde** nomes. Um código de estratégia embutido ali gasta o pouco espaço que existe para dizer
+algo que o `order_audit` já diz inteiro — com o `decided_at`, o custo de entrada e o
+`initial_stop_loss` junto, que é exatamente o que a adoção precisa e que nunca caberia num
+comentário. O `client_id` é curto porque é um **ponteiro**.
+
+**O que falta de verdade para o A5**, então, não é identidade:
+
+1. `HeldPosition` (`executor/wire.py`) publica `ticket`, `symbol`, `side`, `volume`, `price_open`
+   e `stop_loss` — e **não publica o comentário**. Sem ele o retrato do venue diz "tem posição"
+   sem dizer de quem. Esse é o campo a acrescentar, e é barato.
+2. Do comentário sai o `client_id`; do `order_audit` sai a linha inteira daquela ordem. Aí o
+   `MT5Broker.start()` pode *adotar* em vez de recusar: reconstrói o `OrderRequest`, injeta a
+   posição no `Portfolio` e continua a conduzir o stop.
+3. ⚠️ **Uma posição cujo comentário não casa com nada no `order_audit` continua sendo recusa.**
+   Pode ser um trade manual seu ou de outro EA, e adotar às cegas põe risco que ninguém autorizou
+   dentro do denominador de todo R. "Não sei de quem é" não é "é minha".
+
 ---
 
 ## ~~O executor precisa conferir sozinho que um stop está apertando~~ — FECHADO (PR-304-A3-B)

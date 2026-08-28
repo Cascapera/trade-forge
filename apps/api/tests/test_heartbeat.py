@@ -97,6 +97,46 @@ def test_the_first_beat_happens_at_start_not_one_interval_later() -> None:
     assert counter.calls == 1, "a second beat arrived; the interval is not being honoured"
 
 
+def test_the_first_beat_has_landed_before_start_returns() -> None:
+    """⚠️ **"At `start()`" and "before `start()` returns" are different promises**, and the test
+    above cannot tell them apart — it polls with `wait_until`, so a beat made on the new thread
+    a moment later satisfies it.
+
+    The difference is what a caller may do next. `session.py` starts a heartbeat and then hands
+    the warm-up's resting orders to the venue, and the executor refuses orders from a session it
+    has not heard from. A beat that is merely *scheduled* is a session that is provably not yet
+    alive at the instant it places its riskiest orders.
+
+    ⚠️ **The beat has to cost something, or this test cannot fail.** Probed against the old
+    thread-first implementation: with a free beat the caller got there first 48 times in 200,
+    but with the beat costing a single millisecond — the floor for a round trip to Postgres, and
+    far below the real one — it was **200 out of 200**. A `Counter` here would make this test
+    flaky in the direction of passing.
+    """
+
+    class CostsARoundTrip:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def __call__(self) -> None:
+            time.sleep(0.001)
+            self.calls += 1
+
+    # Repeated because the failure it guards is a race, and one green start is one lucky
+    # schedule. Twenty is well inside the measured 200-for-200 and still finishes in 20ms.
+    for attempt in range(20):
+        beat = CostsARoundTrip()
+        heartbeat = Heartbeat(beat, every=NEVER)
+        heartbeat.start()
+        try:
+            assert beat.calls == 1, (
+                f"start() returned with no beat written (attempt {attempt}); a caller that acts "
+                "on being alive would act too early"
+            )
+        finally:
+            heartbeat.stop()
+
+
 def test_stopping_does_not_wait_for_the_interval() -> None:
     """⚠️ The one that separates `Event.wait` from `time.sleep`.
 
@@ -296,14 +336,25 @@ def test_stop_gives_up_rather_than_hanging_the_caller(caplog: pytest.LogCaptureF
 
     Reported at WARNING rather than raised: an exception would replace an orderly stop with a
     stack trace, and the caller is about to discover the same broken database on its own.
+
+    ⚠️ **The wedge starts with the second beat, and it has to.** The first beat is made by
+    `start()` on *this* thread, so a beat that hangs from the first call hangs `start()` — and
+    then the thread is sitting in `Event.wait`, `stop()` joins it instantly, and this test
+    passes with the give-up path never taken. The one the bound exists for is a beat on the
+    beating thread, which is every beat after the first.
     """
     wedged = threading.Event()
+    calls = 0
 
     def beat_that_will_not_finish() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return  # the synchronous one, so `start()` returns and the thread gets to run
         wedged.set()
         time.sleep(1.0)
 
-    heartbeat = Heartbeat(beat_that_will_not_finish, every=NEVER)
+    heartbeat = Heartbeat(beat_that_will_not_finish, every=TICK)
     heartbeat.start()
     assert wedged.wait(5), "the beat never started"
 

@@ -422,6 +422,19 @@ class StructureStrategy:
         break_ = self._structure.update(candle)
         marked = self._blocks.update(candle, break_)
 
+        # ⚠️ **The refusal is read first, and one state makes it matter.** `_observe_fill`
+        # falls back to "a position is open" as a sign that the armed order became a trade —
+        # which it has to, for the fill a live session never sees. But a *refused* order and
+        # an open position can coexist: the position is somebody else's, or one this session
+        # reconnected into. Reading the fill first would then spend a zone whose order the
+        # venue never took, and stamp `_fill_bar` for a trade that does not exist.
+        #
+        # ⚠️ **The knock-on, so it is not a surprise later:** on that bar `_fill_bar` is now
+        # *not* stamped, so `_conduct` may evaluate a breakeven candidate it used to suppress.
+        # Benign, and the reason is the guard's own: `_fill_bar` exists so the excursion from
+        # *before this phase's own limit filled* is not credited to it — and in this state the
+        # phase had no fill at all. The position on the bar belongs to somebody else.
+        self._observe_refusal(context)
         self._observe_fill(context)
 
         position = context.position
@@ -594,6 +607,39 @@ class StructureStrategy:
             self._filled = armed.block
             self._armed = None
             self._fill_bar = context.candle.time
+
+    def _observe_refusal(self, context: Context) -> None:
+        """Stop believing in an order that never reached the book.
+
+        A refusal arrives one bar after the order was asked for — it cannot arrive sooner, see
+        `Context.refusals` — and what it means here is narrow and specific: the name this phase
+        is holding does not exist anywhere. Not at the broker, not in a book, nowhere.
+
+        ⚠️ **Forgotten, not withdrawn, and the difference is the whole method.** `_withdraw`
+        emits a CANCEL because it takes back an order that *is* resting; there is nothing to
+        take back here, and a cancel for a name the venue never heard of is a round trip that
+        can only be answered "no". Measured on the window in `testing.arms_a_resting_limit`:
+        today the phase holds a refused name from bar 61 all the way to bar 109, and then sends
+        exactly that phantom cancel.
+
+        ⚠️ **The zone is not spent.** Only a fill spends a region (the class docstring, and the
+        author's rule) — a refused order was never a trade, so the region goes back to being
+        offerable and the qualifier may name it again. When it does, `_may_arm` mints a **new**
+        `client_id` off `_armed_count`, which matters more than it looks: re-offering under the
+        old name would be refused a second time as a duplicate, by a broker answering a
+        different question, and the retry would never converge.
+
+        ⚠️ **Matched by name, and only against the name currently held.** By the time a refusal
+        lands, the phase may have moved on — armed a different zone, or dropped this one when
+        its region stopped standing. A refusal for a name it is no longer holding is already
+        acted upon, and clearing `_armed` on it would forget an order that really is resting.
+        """
+        armed = self._armed
+        if armed is None or not armed.placed:
+            return
+        if any(refusal.client_id == armed.client_id for refusal in context.refusals):
+            logger.debug("%s never reached the book; the zone is offerable again", armed.client_id)
+            self._armed = None
 
     def _trade_outcome(self, context: Context) -> tuple[OrderBlock | None, OrderBlock | None]:
         """`(stopped, won)` — the zone whose trade ended on this bar, by how it ended.

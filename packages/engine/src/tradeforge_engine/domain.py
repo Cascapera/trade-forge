@@ -719,6 +719,71 @@ class OrderResult:
     reason: str = ""
 
 
+class RefusedBy(StrEnum):
+    """Which of the three gates between intent and the book turned an order away.
+
+    They are not interchangeable, and the difference is what a strategy would act on:
+    `SIZING` and `RISK` are answers about *this account at this moment* and change on their own
+    as equity does, while `BROKER` is an answer about the order itself. Collapsing them into one
+    "refused" would leave a strategy unable to tell "not with this much money" from "never this
+    order", which are opposite instructions.
+
+    ⚠️ There is deliberately no member for a venue refusing an order **after** it was accepted
+    onto the wire. That refusal is real — the executor makes it, three processes away — but
+    nothing in this package can produce one yet, and a member no producer reaches is a branch
+    no test can enter. It arrives with the transport that carries it home.
+    """
+
+    NO_POSITION = "no_position"
+    """An exit was asked for and there was nothing open to close.
+
+    The ghost read from the other side: a strategy asking to close a position it does not hold
+    is a strategy whose bookkeeping has already come apart from the broker's, and that is worth
+    telling it rather than logging at debug."""
+
+    SIZING = "sizing"
+    """The risk manager sized the order at zero, or had no stop to size against."""
+
+    RISK = "risk"
+    """The risk manager vetoed an order it had already sized."""
+
+    BROKER = "broker"
+    """The broker declined to take it: a name it already holds, an order it cannot rest."""
+
+
+@dataclass(frozen=True, slots=True)
+class Refusal:
+    """An order the strategy asked for that **never reached the book**, and why.
+
+    The sibling of `Fill`, and it exists for the sibling reason. `Context.fills` was added
+    because a strategy that never learns its order became a trade goes on treating the order as
+    resting; this is the same sentence with the other verb. A setup marks its armed order placed
+    the instant it *emits* the signal (`setups.py`), so every gate that turns an order away
+    silently leaves the strategy believing an order rests somewhere it does not — the ghost
+    ADR-0023 measured at **four of five** hand-over points, arriving through a different door.
+
+    ⚠️ **Correlated by `client_id`, not by holding the order.** `Fill` can carry its
+    `OrderRequest` because a fill implies one was built; a refusal does not — the sizing gate
+    turns a `Signal` away before any `OrderRequest` exists. The name is the one thing present at
+    all three gates, and it is what the strategy keyed its own bookkeeping by.
+
+    ⚠️ `client_id` is optional because a `Signal` need not carry one: a strategy that does not
+    name its orders (the DSL's condition trees do not) still gets told it was refused, it just
+    cannot match the refusal to a specific armed zone. An unnamed refusal is a log line, not a
+    correlation — which is honest, and better than pretending to a name that was never chosen.
+    """
+
+    client_id: str | None
+    intent: SignalKind
+    refused_by: RefusedBy
+    reason: str = ""
+    """What the **strategy** called this order (`"entry.choch"`), not why it was refused."""
+
+    detail: str = ""
+    """Why the gate said no, in its own words. Free text: it is for a human reading a log or an
+    incident, and the machine-readable half is `refused_by`."""
+
+
 @dataclass(frozen=True, slots=True)
 class Fill:
     """An order that actually executed, at a price, at a time, for a cost."""
@@ -889,6 +954,21 @@ class Context:
     stopped out inside a single bar opens a position that is already gone by the time
     this object is built, and a strategy that never learns its order became a trade
     will treat the order as still resting.
+    """
+
+    refusals: tuple[Refusal, ...] = ()
+    """Orders asked for on the **previous** bar that never reached the book (see `Refusal`).
+
+    ⚠️ **One bar behind `fills`, and the asymmetry is structural rather than a delay somebody
+    settled for.** A fill is born in step 1, before the strategy is shown the bar, so it belongs
+    to the bar it is handed with. A refusal is born in steps 3-4, *after* the strategy has
+    spoken — it cannot exist any earlier, because there was nothing to refuse. Handing bar N's
+    refusals to bar N's own `Context` would mean building the context after the decision it is
+    supposed to inform, which is the anti-lookahead rule read backwards.
+
+    So the earliest honest place is here, and it is early enough: the strategy learns before it
+    decides anything else. What it must not do is treat this as "nothing happened for a bar" —
+    an order refused on bar N was never resting *during* bar N either.
     """
 
 

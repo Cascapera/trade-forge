@@ -41,6 +41,8 @@ from tradeforge_engine.domain import (
     Money,
     OrderRequest,
     Position,
+    Refusal,
+    RefusedBy,
     Signal,
     SignalKind,
 )
@@ -99,6 +101,20 @@ class RunResult:
     final_account: AccountState
     candles_processed: int
 
+    refusals: tuple[Refusal, ...] = ()
+    """Every order the run intended and did not place, in the order it asked for them.
+
+    ⚠️ **Here because the field on `BarOutcome` claimed it and nothing delivered it.** That
+    docstring promised "the record of every order that was intended and did not happen" while
+    the only backtest consumer in the repo dropped the tuple on the floor — the shape of promise
+    this project has been bitten by before (`DEFAULT_BLOCK_MS` guaranteed a one-minute stop that
+    nothing implemented). A comment nobody can execute makes the next reader stop looking.
+
+    The question it answers is the one a backtest could not: **"why did this take no trades?"**
+    A run that placed nothing and a run that decided nothing produce the same empty `fills`, and
+    they mean opposite things about the strategy.
+    """
+
 
 @dataclass(frozen=True, slots=True)
 class BarOutcome:
@@ -117,6 +133,19 @@ class BarOutcome:
     candle: Candle
     fills: tuple[Fill, ...]
     equity: EquityPoint
+
+    refusals: tuple[Refusal, ...] = ()
+    """Orders this bar asked for that never reached the book (see `Refusal`).
+
+    ⚠️ **Not the ones the strategy was shown** — those are the previous bar's, and they went
+    into its `Context`. These were born after the strategy spoke, which is why they are reported
+    here and consumed by the next bar.
+
+    It is reported at all because until now a refusal existed nowhere: three `continue`s and a
+    `logger.debug`, so a run that placed nothing looked exactly like a run that decided nothing.
+    A consumer keeping these holds the record of every order that was intended and did not
+    happen, which is the half of a backtest nobody could see.
+    """
 
 
 def iter_run(  # noqa: PLR0913 — keyword-only; see run()
@@ -194,6 +223,7 @@ def run(  # noqa: PLR0913 — keyword-only; each one names a real axis of a back
     `iter_run` is for.
     """
     fills: list[Fill] = []
+    refusals: list[Refusal] = []
     equity_curve: list[EquityPoint] = []
     processed = 0
 
@@ -206,6 +236,7 @@ def run(  # noqa: PLR0913 — keyword-only; each one names a real axis of a back
         risk=risk,
     ):
         fills.extend(outcome.fills)
+        refusals.extend(outcome.refusals)
         equity_curve.append(outcome.equity)
         processed = outcome.index + 1
 
@@ -222,6 +253,7 @@ def run(  # noqa: PLR0913 — keyword-only; each one names a real axis of a back
             equity_curve=tuple(equity_curve),
             final_account=broker.account(),
             candles_processed=processed,
+            refusals=tuple(refusals),
         )
 
 
@@ -235,6 +267,11 @@ def _iter_run(  # noqa: PLR0913 — see run()
     risk: RiskManager,
 ) -> Iterator[BarOutcome]:
     previous: Candle | None = None
+    # Refusals born on the bar before the one about to run, waiting to be shown to the strategy.
+    # The loop owns this for the same reason it owns `window`: it is the only component that
+    # sees one bar end and the next begin, and a refusal is precisely a fact that crosses that
+    # boundary. See `Context.refusals` for why it cannot be delivered on its own bar.
+    pending: tuple[Refusal, ...] = ()
     # The arming window. Holds the decision bar plus the bars before it, and no more — see
     # SNAPSHOT_BARS_BEFORE. The loop owns it because the loop is the only component that sees
     # the stream, in backtest and in live alike, and because it is here that `decided_at` is
@@ -262,11 +299,16 @@ def _iter_run(  # noqa: PLR0913 — see run()
                 strategy=strategy,
                 broker=broker,
                 risk=risk,
+                refusals=pending,
             )
 
         yield outcome
 
         previous = candle
+        # ⚠️ Replaced, never accumulated. A refusal is news, and news delivered twice is a
+        # strategy told its order was turned away on a bar when nothing was asked — which for
+        # `StructurePhase` would forget an order it had just successfully armed.
+        pending = outcome.refusals
 
 
 def _step(  # noqa: PLR0913 — one bar of the loop; every argument is a seam or the bar itself
@@ -279,9 +321,13 @@ def _step(  # noqa: PLR0913 — one bar of the loop; every argument is a seam or
     strategy: Strategy,
     broker: Broker,
     risk: RiskManager,
+    refusals: tuple[Refusal, ...] = (),
 ) -> BarOutcome:
     """One bar, five ordered steps. The order is the anti-lookahead rule — see the module
-    docstring. Runs inside `ENGINE_CONTEXT`; its caller is responsible for that."""
+    docstring. Runs inside `ENGINE_CONTEXT`; its caller is responsible for that.
+
+    `refusals` is what the **previous** bar asked for and did not get; the ones this bar produces
+    come back on the `BarOutcome`. See `Context.refusals`."""
     # 1. The bar arrives. Whatever was decided on an earlier bar executes now, inside
     #    this one, at a price the strategy had not seen when it decided. This is the
     #    ONLY place a fill can be born.
@@ -305,9 +351,20 @@ def _step(  # noqa: PLR0913 — one bar of the loop; every argument is a seam or
         # bar revealed, and it is the only way a strategy learns of a trade that
         # opened and died inside one bar (ADR-0015).
         fills=tuple(born),
+        # The previous bar's, necessarily — a refusal is born below, after this object has
+        # been built and handed over. See `Context.refusals`.
+        refusals=refusals,
     )
 
     # 3-4. Intent -> size -> veto -> queue. Never intent -> fill.
+    #
+    # ⚠️ **Every path out of this loop that is not a queued order is recorded here.** A setup
+    # marks its armed order placed the moment it emits the signal, so a gate that turns an
+    # order away in silence leaves the strategy holding an order that does not exist — the
+    # ghost ADR-0023 measured at four of five hand-over points, arriving through whichever of
+    # these three doors happens to be open. `logger.debug` was not a channel; the strategy
+    # cannot read a log.
+    turned_away: list[Refusal] = []
     for signal in strategy.on_bar(context):
         # A cancel is the one intent that never becomes an order — it withdraws one. It
         # skips sizing and the veto for the same reason an exit skips sizing: there is
@@ -349,10 +406,27 @@ def _step(  # noqa: PLR0913 — one bar of the loop; every argument is a seam or
             continue
 
         order = _to_order(signal, context, instrument, risk, window)
-        if order is None:
+        if isinstance(order, Refusal):
+            logger.debug(
+                "%s refused %s at %s: %s",
+                order.refused_by,
+                order.reason,
+                candle.time,
+                order.detail,
+            )
+            turned_away.append(order)
             continue
         if not risk.allow(order, account):
             logger.debug("risk manager vetoed %s at %s", order.reason, candle.time)
+            turned_away.append(
+                Refusal(
+                    client_id=order.client_id,
+                    intent=order.intent,
+                    refused_by=RefusedBy.RISK,
+                    reason=order.reason,
+                    detail="the risk manager vetoed it",
+                )
+            )
             continue
         result = broker.submit(order)
         # A refusal is the broker declining to take the order at all — a duplicate name, an
@@ -360,6 +434,15 @@ def _step(  # noqa: PLR0913 — one bar of the loop; every argument is a seam or
         # never triggered, which is the one failure the strategy author cannot debug.
         if not result.accepted:
             logger.debug("broker refused %s at %s: %s", order.reason, candle.time, result.reason)
+            turned_away.append(
+                Refusal(
+                    client_id=order.client_id,
+                    intent=order.intent,
+                    refused_by=RefusedBy.BROKER,
+                    reason=order.reason,
+                    detail=result.reason,
+                )
+            )
 
     # 5. The account is worth what it is worth at the close of this bar.
     #
@@ -371,6 +454,7 @@ def _step(  # noqa: PLR0913 — one bar of the loop; every argument is a seam or
         candle=candle,
         fills=tuple(born),
         equity=EquityPoint(time=candle.time, equity=account.equity),
+        refusals=tuple(turned_away),
     )
 
 
@@ -380,18 +464,28 @@ def _to_order(
     instrument: InstrumentSpec,
     risk: RiskManager,
     window: Iterable[Candle],
-) -> OrderRequest | None:
-    """Turn intent into a sized order, or into nothing.
+) -> OrderRequest | Refusal:
+    """Turn intent into a sized order, or into the reason it did not become one.
 
     An exit is not sized: you close the position you have, all of it. Running an exit through
     the risk manager is how a stop-loss ends up rejected for exceeding the daily loss limit —
     the position closing *is* the thing that stops the loss.
+
+    ⚠️ **Total: there is no `None`.** Both paths that used to return one were silent — a debug
+    line and a `continue` — and silence is what this whole change is about. A caller that gets
+    something back always knows which of the two it is, and neither one can be dropped by
+    forgetting a branch.
     """
     if signal.kind is SignalKind.EXIT:
         position = context.position
         if position is None:
-            logger.debug("exit signal with no open position at %s", context.candle.time)
-            return None
+            return Refusal(
+                client_id=signal.client_id,
+                intent=SignalKind.EXIT,
+                refused_by=RefusedBy.NO_POSITION,
+                reason=signal.reason,
+                detail="there was no open position to close",
+            )
 
         # An exit does not rest at a price: the broker's own protective levels are the only
         # thing that closes a position at a level, and two paths closing one position is where
@@ -414,8 +508,13 @@ def _to_order(
 
     volume = risk.size(signal, context.account, instrument)
     if volume <= ZERO:
-        logger.debug("sizing returned %s at %s; no trade", volume, context.candle.time)
-        return None
+        return Refusal(
+            client_id=signal.client_id,
+            intent=signal.kind,
+            refused_by=RefusedBy.SIZING,
+            reason=signal.reason,
+            detail=f"sizing returned {volume}",
+        )
 
     return OrderRequest(
         symbol=instrument.symbol,

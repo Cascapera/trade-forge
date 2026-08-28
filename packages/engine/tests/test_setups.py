@@ -17,16 +17,22 @@ import pytest
 
 from tradeforge_engine.backtest_broker import BacktestBroker
 from tradeforge_engine.domain import (
+    AccountState,
     Candle,
     Context,
     Fill,
     OrderRequest,
+    OrderResult,
     Position,
+    Refusal,
+    RefusedBy,
     Side,
     Signal,
     SignalKind,
 )
-from tradeforge_engine.loop import ENGINE_CONTEXT, run
+from tradeforge_engine.loop import ENGINE_CONTEXT, iter_run, run
+from tradeforge_engine.risk import PercentRiskManager
+from tradeforge_engine.setup_factory import build_setup
 from tradeforge_engine.setups import (
     ChochQualifier,
     ContinuationQualifier,
@@ -45,10 +51,12 @@ from tradeforge_engine.structure import (
 from tradeforge_engine.testing import (
     AAPL,
     BULLISH_START,
+    EURUSD,
     HOUR,
     START,
     FixedRisk,
     ImmediateFillBroker,
+    arms_a_resting_limit,
     bar,
 )
 
@@ -2161,3 +2169,279 @@ def test_a_change_of_character_in_our_favour_is_not_a_break_in_our_favour() -> N
     )
 
     assert _trails(signals)[11] == []
+
+
+# --------------------------------------------------------------------------- #
+# An order that never reached the book                                          #
+# --------------------------------------------------------------------------- #
+
+
+def _drive_with_a_refusal(refused_bar: int) -> list[list[Signal]]:
+    """The measured EURUSD window, with the entry armed on `refused_bar` refused by the broker.
+
+    ⚠️ **The refusal is delivered on the bar *after* it happened**, because that is the only
+    place the loop can put it (`Context.refusals`) — the context for a bar is built before the
+    strategy speaks, and there is nothing to refuse until it has. Reproducing that here rather
+    than handing the refusal to its own bar is the difference between testing the rule and
+    testing a convenience.
+
+    ⚠️ **The real window, not a synthetic one.** Probed at all fifteen cuts of the golden
+    `ma_cross` document, that strategy arms nothing at all — it enters at market — so a scenario
+    built on it could not distinguish an implementation that re-offered from one that did not.
+    """
+    phase = build_setup({"type": "structure_choch"})
+    account = AccountState(balance=Decimal("10000"), equity=Decimal("10000"))
+    out: list[list[Signal]] = []
+    pending: tuple[Refusal, ...] = ()
+
+    with localcontext(ENGINE_CONTEXT):
+        for index, candle in enumerate(arms_a_resting_limit()):
+            signals = list(
+                phase.on_bar(
+                    Context(
+                        candle=candle,
+                        instrument=EURUSD,
+                        account=account,
+                        refusals=pending,
+                    )
+                )
+            )
+            out.append(signals)
+            pending = ()
+            if index == refused_bar:
+                pending = tuple(
+                    Refusal(
+                        client_id=signal.client_id,
+                        intent=signal.kind,
+                        refused_by=RefusedBy.BROKER,
+                        reason=signal.reason,
+                        detail="the venue would not take it",
+                    )
+                    for signal in signals
+                    if signal.kind is SignalKind.ENTRY
+                )
+    return out
+
+
+def test_a_zone_whose_order_was_refused_may_be_offered_again() -> None:
+    """**The ghost's third door, closed.** A refused order is not resting anywhere, so the zone
+    it was waiting at was never traded — and the author's rule draws the line at the fill.
+
+    Measured on `arms_a_resting_limit` (`scratchpad/probe_reoffer.py`): the phase arms
+    `demand-20240103T0200-1` on bar 61, and with the refusal observed it arms the same region
+    again on bar 62 under `-2`.
+
+    ⚠️ **The new name is the load-bearing half.** Re-offering under the old one would be refused
+    a second time as a duplicate — by a broker answering an entirely different question — and
+    the retry would never converge. The name changes because the region goes back through
+    `_may_arm`, which is the same door a withdrawal leaves it at.
+    """
+    signals = _drive_with_a_refusal(refused_bar=61)
+
+    [armed] = signals[61]
+    [re_armed] = signals[62]
+
+    assert armed.kind is SignalKind.ENTRY
+    assert armed.client_id == "demand-20240103T0200-1"
+    assert re_armed.kind is SignalKind.ENTRY, "the refused zone was never offered again"
+    assert re_armed.client_id == "demand-20240103T0200-2", "it was re-offered under the old name"
+    assert re_armed.limit_price == armed.limit_price, "a different level; this is another trade"
+
+
+def test_a_refused_order_is_forgotten_rather_than_withdrawn() -> None:
+    """⚠️ **A refusal is not a cancellation, and emitting one is the bug seen from the far side.**
+    `_withdraw` takes back an order that is resting; a refused order never reached a book, so a
+    cancel for it is a round trip the venue can only answer "no" to — under a name it has never
+    heard of.
+
+    Measured on the same window: today the phase carries the refused name from bar 61 to bar
+    109 and then sends exactly that phantom cancel. With the refusal observed, bar 62 emits an
+    entry and **nothing else**, and the cancel on 109 names the order that actually exists.
+    """
+    signals = _drive_with_a_refusal(refused_bar=61)
+
+    kinds = [signal.kind for signal in signals[62]]
+    assert SignalKind.CANCEL not in kinds, "a cancel was sent for an order the venue never accepted"
+
+    [cancel] = signals[109]
+    assert cancel.kind is SignalKind.CANCEL
+    assert cancel.client_id == "demand-20240103T0200-2", (
+        "the withdrawal still names the refused order rather than the one that replaced it"
+    )
+
+
+def test_a_refusal_naming_an_order_it_no_longer_holds_is_ignored() -> None:
+    """⚠️ **Written because the obvious implementation passed every other test here.** A version
+    that forgot its armed order on *any* refusal — rather than on one naming that order —
+    survived the two above, because in both of them the only refusal in flight is the one for
+    the order being held. The scenario could not tell the two apart, so it proved neither.
+
+    A refusal for a name the phase is no longer holding is not news: it has already been acted
+    upon, and the order the phase *is* holding is a different one that may be resting perfectly
+    well. Forgetting it would place a second limit on the same zone — under a third name — while
+    the second one sits in the book.
+
+    The stale refusal here names `-1`, the order refused on bar 61, and is delivered on bar 63,
+    by which time bar 62 has already re-armed the region as `-2`.
+    """
+    phase = build_setup({"type": "structure_choch"})
+    account = AccountState(balance=Decimal("10000"), equity=Decimal("10000"))
+    stale = Refusal(
+        client_id="demand-20240103T0200-1",
+        intent=SignalKind.ENTRY,
+        refused_by=RefusedBy.BROKER,
+        reason="entry.choch",
+        detail="a refusal for an order that was dealt with two bars ago",
+    )
+
+    out: list[list[Signal]] = []
+    pending: tuple[Refusal, ...] = ()
+    with localcontext(ENGINE_CONTEXT):
+        for index, candle in enumerate(arms_a_resting_limit()):
+            out.append(
+                list(
+                    phase.on_bar(
+                        Context(
+                            candle=candle,
+                            instrument=EURUSD,
+                            account=account,
+                            refusals=pending,
+                        )
+                    )
+                )
+            )
+            # Bar 61's order is refused; bar 63 is handed that same refusal a second time.
+            pending = (stale,) if index in (61, 62) else ()
+
+    assert out[62], "the fixture is broken: bar 62 did not re-arm, so bar 63 protects nothing"
+    assert out[62][0].client_id == "demand-20240103T0200-2", "bar 62 armed something unexpected"
+    assert out[63] == [], (
+        "the stale refusal forgot an order that was resting; the zone would now carry two limits"
+    )
+
+
+def test_a_refusal_born_in_the_loop_reaches_the_setup_that_armed_the_order() -> None:
+    """**The seam, end to end, with nothing fabricated.**
+
+    ⚠️ **Written because the two tests above cannot prove this and looked like they could.**
+    They build the `Refusal` by hand from the signal, so they exercise `_observe_refusal`
+    against a refusal the test itself named — which is true of the object and says nothing about
+    the loop that has to produce it. Measured: setting `client_id=None` at all four gates in
+    `loop.py` left every test in this file and in `test_loop.py` green, and put the ghost back
+    in full — the phase carried the dead name for 48 bars and sent a cancel for an order the
+    venue never accepted.
+
+    So here the loop is real, the strategy is real, the broker refuses for real, and the only
+    thing standing in for anything is *which* order gets refused.
+
+    The market is EURUSD, 2024-01-03: a bullish CHoCH confirms and a demand zone is armed at
+    1.03053. The venue will not take it — the shape of AutoTrading being off, which is the case
+    the transport in PR-304-B-D-2 makes reachable.
+    """
+
+    class RefusesTheFirstOrder(BacktestBroker):
+        """A real broker that declines exactly once, then behaves.
+
+        Subclassed rather than faked: the refusal has to travel the same path a real one does,
+        through `_step`, and a double large enough to do that would be a second broker.
+        """
+
+        def __init__(self) -> None:
+            super().__init__(instrument=EURUSD, initial_capital=Decimal("10000"))
+            self.refused: list[str | None] = []
+
+        def submit(self, order: OrderRequest) -> OrderResult:
+            if not self.refused:
+                self.refused.append(order.client_id)
+                return OrderResult(order=order, accepted=False, reason="the venue would not")
+            return super().submit(order)
+
+    broker = RefusesTheFirstOrder()
+    for _outcome in iter_run(
+        candles=iter(arms_a_resting_limit()),
+        timeframe=HOUR,
+        instrument=EURUSD,
+        strategy=build_setup({"type": "structure_choch"}),
+        broker=broker,
+        risk=PercentRiskManager(percent=Decimal("1")),
+    ):
+        pass
+
+    assert broker.refused == ["demand-20240103T0200-1"], (
+        "the broker refused something other than the armed limit; the scenario has drifted"
+    )
+    submitted = [order.client_id for order in broker.submitted]
+    assert "demand-20240103T0200-2" in submitted, (
+        "the refused zone was never offered again — the refusal did not reach the setup, or "
+        "reached it without the name of the order it refused"
+    )
+    assert "demand-20240103T0200-1" not in submitted, "the refused order counted as submitted"
+
+
+def test_a_refused_order_does_not_spend_its_zone_because_a_position_is_open() -> None:
+    """⚠️ **The one state where the order of the two observers decides the answer**, and it is
+    not reachable in a backtest — a position there can only come from an order that was
+    submitted. In live it is the case `_observe_fill`'s own docstring names: a reconnect that
+    swallows the fill, or a position opened outside this session.
+
+    Both are true at once here: the armed order was refused *and* a position is open. If the
+    fill is read first its fallback wins, and a zone whose order the venue never accepted is
+    marked traded — spent for ever, on a trade that does not exist. Reading the refusal first
+    forgets the name, and the fill observer correctly finds nothing of its own to claim.
+    """
+    phase = build_setup({"type": "structure_choch"})
+    account = AccountState(balance=Decimal("10000"), equity=Decimal("10000"))
+    candles = arms_a_resting_limit()
+
+    armed: Signal | None = None
+    re_armed: list[str | None] = []
+    with localcontext(ENGINE_CONTEXT):
+        for index, candle in enumerate(candles[:70]):
+            refusals: tuple[Refusal, ...] = ()
+            position = None
+            if index == 62 and armed is not None:
+                refusals = (
+                    Refusal(
+                        client_id=armed.client_id,
+                        intent=SignalKind.ENTRY,
+                        refused_by=RefusedBy.BROKER,
+                        reason=armed.reason,
+                        detail="the venue would not take it",
+                    ),
+                )
+                position = Position(
+                    symbol=EURUSD.symbol,
+                    side=Side.LONG,
+                    volume=Decimal(1),
+                    entry_price=candle.open,
+                    entry_time=candle.time,
+                )
+            signals = list(
+                phase.on_bar(
+                    Context(
+                        candle=candle,
+                        instrument=EURUSD,
+                        account=account,
+                        position=position,
+                        refusals=refusals,
+                    )
+                )
+            )
+            for signal in signals:
+                if signal.kind is SignalKind.ENTRY:
+                    if index > 62:
+                        re_armed.append(signal.client_id)
+                    else:
+                        armed = signal
+
+    assert armed is not None, "the fixture is broken: nothing was ever armed"
+    assert armed.client_id == "demand-20240103T0200-1", "the scenario has drifted"
+
+    # ⚠️ **Asked of the machinery, not of `_traded`.** "The zone was spent" is only observable
+    # as "it is never offered again" — reaching into the private set would let the assertion
+    # pass against a phase that recorded the right thing and acted on the wrong one.
+    assert re_armed, (
+        "the zone was never offered again: a refused order was counted as the trade that "
+        "spends a region, because a position happened to be open on the same bar"
+    )
+    assert re_armed[0] == "demand-20240103T0200-2", "it was re-offered under an unexpected name"

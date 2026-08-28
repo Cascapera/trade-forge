@@ -376,6 +376,15 @@ class ImmediateFillBroker:
     def trades(self) -> Sequence[ClosedTrade]:
         return self._portfolio.trades
 
+    def refusals(self) -> Sequence[Refusal]:
+        """Nothing arrives out of band here either — `submit` answers on the spot.
+
+        Refusals this broker makes (see `refuse_with`) travel the synchronous path, through
+        `OrderResult`, and the loop turns them into `Refusal`s itself. This is the *other*
+        channel, for verdicts that arrive later, and nothing in this file can produce one.
+        """
+        return ()
+
 
 @dataclass
 class ScriptedStrategy:

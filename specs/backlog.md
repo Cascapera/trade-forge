@@ -1087,7 +1087,7 @@ separa o conserto certo do vizinho.
 
 ---
 
-## ⚠️ PR-304-B-D-2 — A recusa do executor não volta para a estratégia (o transporte)
+## ~~A recusa do executor não volta para a estratégia (o transporte)~~ — FECHADO (PR-304-B-D-2a, ADR-0024)
 
 > **O PR-304-B-D-1 abriu o canal na engine** (`Context.refusals`). O que falta é o transporte:
 > a recusa que acontece **três processos adiante** ainda não tem como chegar nele.
@@ -1110,7 +1110,21 @@ Hoje isso só aparece no `order_audit`, que ninguém está lendo em tempo real.
 Qualquer outra recusa do executor (magic desconhecida, stop afrouxando, AutoTrading desligado)
 produz o mesmo fantasma.
 
-### O canal não pode ser o `fills.inbound`, e o executor já argumentou por quê
+### Como foi resolvido — ADR-0024
+
+`fills.inbound` **virou `venue.outcomes`**, carregando `Outcome = WireFill | WireRefusal`
+discriminadas por `kind` lido estritamente, espelhando o que a ida já fazia com três formas.
+
+⚠️ O nome antigo mentia depois da mudança (recusa não é fill), e o rename só foi barato por um
+fato medido: **zero entradas reais** nos 184 registros do stream antigo — todos de teste.
+
+**Três estados, não dois:** enviada e preencheu → `WireFill`; enviada e **em repouso** → nada;
+não enviada → `WireRefusal`. A ordem em repouso não é nem um nem outro.
+
+`RefusedBy` ganhou `EXECUTOR` e `VENUE` — separados porque **se comportam ao contrário**, e é
+essa distinção que o D-2c vai usar para o teto.
+
+### O argumento original (mantido, porque continua valendo)
 
 O docstring do `_publish_fill` decide isso antes de o problema aparecer:
 

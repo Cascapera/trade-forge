@@ -728,10 +728,11 @@ class RefusedBy(StrEnum):
     "refused" would leave a strategy unable to tell "not with this much money" from "never this
     order", which are opposite instructions.
 
-    ⚠️ There is deliberately no member for a venue refusing an order **after** it was accepted
-    onto the wire. That refusal is real — the executor makes it, three processes away — but
-    nothing in this package can produce one yet, and a member no producer reaches is a branch
-    no test can enter. It arrives with the transport that carries it home.
+    ⚠️ The last two arrive from **outside this process**, after `submit` already answered
+    `accepted` (ADR-0024). They are separate members rather than one "downstream" because they
+    behave oppositely: `EXECUTOR` refuses on a condition that changes on its own — a session that
+    resumes beating, a volume cap the next size clears — while `VENUE` is usually the same answer
+    next bar. A strategy deciding whether to offer a zone again is asking exactly that.
     """
 
     NO_POSITION = "no_position"
@@ -748,7 +749,15 @@ class RefusedBy(StrEnum):
     """The risk manager vetoed an order it had already sized."""
 
     BROKER = "broker"
-    """The broker declined to take it: a name it already holds, an order it cannot rest."""
+    """The broker declined to take it locally: a name it already holds, an order it cannot rest."""
+
+    EXECUTOR = "executor"
+    """A safeguard between here and the venue said no — the kill switch, the volume cap, a
+    session that stopped beating. Conditions that change without anybody changing the order."""
+
+    VENUE = "venue"
+    """The terminal itself refused. Carries the venue's own retcode in `detail`, because that
+    number is the only thing that distinguishes "your stop is too close" from "trading is off"."""
 
 
 @dataclass(frozen=True, slots=True)

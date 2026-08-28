@@ -15,12 +15,17 @@ from tradeforge_engine.domain import OrderRequest, Side, SignalKind
 from tradeforge_executor.wire import (
     KIND,
     WireCancel,
+    WireFill,
     WireModifyStop,
     WireOrder,
+    WireRefusal,
     cancel_fields,
+    fill_fields,
     instruction_from_fields,
     modify_stop_fields,
     order_fields,
+    outcome_from_fields,
+    refusal_fields,
 )
 
 NOON = dt.datetime(2026, 8, 26, 12, tzinfo=dt.UTC)
@@ -109,3 +114,87 @@ def test_the_kind_is_the_only_field_that_decides() -> None:
     fields[KIND] = "cancel"
 
     assert isinstance(instruction_from_fields(fields), WireCancel)
+
+
+# --------------------------------------------------------------------------- the way home
+
+
+def test_a_fill_and_a_refusal_both_survive_the_round_trip_with_their_kind() -> None:
+    """`venue.outcomes` carries two shapes and the reader dispatches on `kind` (ADR-0024)."""
+    fill = WireFill(
+        client_id="zone-42",
+        session_id="s-1",
+        symbol="EURUSD",
+        at=NOON,
+        price=Decimal("1.16667"),
+        volume=Decimal("1.00"),
+        spread=Decimal("0.00007"),
+        ticket=99,
+    )
+    refusal = WireRefusal(
+        client_id="zone-43",
+        session_id="s-1",
+        at=NOON,
+        reason="trading is off",
+        by_venue=True,
+        retcode=10027,
+    )
+
+    assert outcome_from_fields(fill_fields(fill)) == fill
+    assert outcome_from_fields(refusal_fields(refusal)) == refusal
+
+
+def test_an_outcome_with_no_kind_is_refused_rather_than_read_as_a_fill() -> None:
+    """⚠️ **A `fields.get(KIND, KIND_FILL)` would be worse here than its twin on the way out.**
+
+    Out there a guess sends an order, which can be cancelled. Here a guess folds an entry this
+    format cannot read straight into the session's **ledger** — and every number reported from
+    then on, including the equity the risk manager sizes the next trade against, is computed
+    from a ledger that has lost track of what it holds. Nothing later says so.
+
+    ⚠️ It is also what a *rename* leaves behind: the entries written before ADR-0024 carry no
+    `kind` at all, and a session's group starts at the beginning of the stream.
+    """
+    fields = fill_fields(
+        WireFill(
+            client_id="zone-42",
+            session_id="s-1",
+            symbol="EURUSD",
+            at=NOON,
+            price=Decimal("1.16667"),
+            volume=Decimal("1.00"),
+            spread=Decimal("0.00007"),
+            ticket=None,
+        )
+    )
+    del fields[KIND]
+
+    with pytest.raises(KeyError):
+        outcome_from_fields(fields)
+
+
+def test_an_unknown_outcome_kind_is_refused_rather_than_guessed() -> None:
+    """The half a *newer* writer produces: a session running yesterday's code meets an outcome
+    invented today. Refusing names the kind it could not read."""
+    fields = refusal_fields(
+        WireRefusal(client_id="z", session_id="s-1", at=NOON, reason="no", by_venue=False)
+    )
+    fields[KIND] = "partial_fill"
+
+    with pytest.raises(ValueError, match="unknown outcome kind"):
+        outcome_from_fields(fields)
+
+
+def test_a_refusal_that_never_reached_the_venue_carries_no_retcode() -> None:
+    """⚠️ **Absent and zero are different facts, and only one of them is a verdict.** Our own
+    safeguards refuse before the terminal is asked, so there is no number to report — and a
+    zero would read as a retcode the venue returned, which is a code that means success."""
+    fields = refusal_fields(
+        WireRefusal(client_id="z", session_id="s-1", at=NOON, reason="killed", by_venue=False)
+    )
+
+    assert "retcode" not in fields
+    decoded = outcome_from_fields(fields)
+    assert isinstance(decoded, WireRefusal)
+    assert decoded.retcode is None
+    assert decoded.by_venue is False

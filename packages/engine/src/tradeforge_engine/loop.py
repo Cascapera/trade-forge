@@ -308,7 +308,11 @@ def _iter_run(  # noqa: PLR0913 — see run()
         # ⚠️ Replaced, never accumulated. A refusal is news, and news delivered twice is a
         # strategy told its order was turned away on a bar when nothing was asked — which for
         # `StructurePhase` would forget an order it had just successfully armed.
-        pending = outcome.refusals
+        # ⚠️ **Asked outside `localcontext`, and after the yield, deliberately.** This is a read
+        # from another process's mailbox (ADR-0024), not arithmetic — and it must happen on every
+        # bar, including the ones `_step` produced nothing on, or a refusal that arrives while
+        # the strategy is quiet waits for the next order to be turned away before it is seen.
+        pending = (*outcome.refusals, *broker.refusals())
 
 
 def _step(  # noqa: PLR0913 — one bar of the loop; every argument is a seam or the bar itself

@@ -33,6 +33,7 @@ from tradeforge_engine.domain import (
     OrderRequest,
     OrderResult,
     Position,
+    Refusal,
     Signal,
     Volume,
     ZoneMark,
@@ -123,6 +124,25 @@ class Broker(Protocol):
     def on_bar(self, candle: Candle) -> Sequence[Fill]:
         """A new bar has arrived. Fill what is pending, check stops and targets, and mark
         the account to market at this candle's close.
+        """
+        ...
+
+    def refusals(self) -> Sequence[Refusal]:
+        """Orders this broker accepted onto its wire and later learned were **never placed**.
+
+        Drained: what is returned here is not returned again. The loop asks once a bar and folds
+        the answer into the next `Context.refusals`, beside the refusals its own gates produced.
+
+        ⚠️ **This exists because `submit` cannot answer it** (ADR-0024). `Broker.submit` promises
+        only that an order was queued — a local fact, knowable at once — and against a real venue
+        the verdict arrives afterwards, from another process. Measured in production on
+        2026-08-28: a session was told `accepted`, the executor refused the order 8ms later, and
+        the strategy crossed on believing it had armed a limit the venue never saw.
+
+        ⚠️ **A backtest broker returns nothing, and that is a fact rather than a stub.** In a
+        backtest `submit` *is* the verdict: there is no out of band, so there is nothing that
+        could arrive out of it. An implementation that had something to say here would be one
+        whose `submit` was lying.
         """
         ...
 

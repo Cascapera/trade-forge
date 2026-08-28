@@ -43,15 +43,18 @@ from tradeforge_engine.domain import (
     Candle,
     InstrumentSpec,
     OrderRequest,
+    RefusedBy,
     Side,
     SignalKind,
 )
 from tradeforge_executor.wire import (
-    FILLS_STREAM,
     ORDERS_STREAM,
+    VENUE_OUTCOMES,
     WireFill,
+    WireRefusal,
     fill_fields,
     order_from_fields,
+    refusal_fields,
 )
 
 pytestmark = pytest.mark.integration
@@ -97,7 +100,7 @@ def session_id(client: Redis) -> Iterator[str]:
         # The group may never have been created: a test that failed before `ensure_group`
         # leaves nothing to destroy, and that is not a second failure to report.
         with suppress(ResponseError):
-            client.xgroup_destroy(FILLS_STREAM, group)
+            client.xgroup_destroy(VENUE_OUTCOMES, group)
 
 
 def a_broker(client: Redis, session_id: str, *, group_suffix: str = "") -> MT5Broker:
@@ -157,7 +160,7 @@ def publish_fill(client: Redis, session_id: str, *, client_id: str = "zone-42") 
     # redis-py types the sync client's returns as `Awaitable[Any] | Any`, and `dict` is
     # invariant so a `dict[str, str]` is not the mapping it declares. Both are the client's
     # own typing, not a doubt about the values -- every key and value here is a `str`.
-    return str(client.xadd(FILLS_STREAM, cast("dict[Any, Any]", fields)))
+    return str(client.xadd(VENUE_OUTCOMES, cast("dict[Any, Any]", fields)))
 
 
 def test_the_encoding_survives_a_real_socket(client: Redis, session_id: str) -> None:
@@ -220,7 +223,7 @@ def test_a_fill_read_but_never_acknowledged_comes_back(client: Redis, session_id
     client.xreadgroup(
         groupname=f"session-{session_id}",
         consumername="session",
-        streams={FILLS_STREAM: ">"},
+        streams={VENUE_OUTCOMES: ">"},
     )
 
     (fill,) = broker.on_bar(a_candle())
@@ -247,5 +250,79 @@ def test_another_session_s_fill_is_acknowledged_not_left_pending(
 
     assert broker.on_bar(a_candle()) == ()
 
-    pending = cast("dict[str, Any]", client.xpending(FILLS_STREAM, f"session-{session_id}"))
+    pending = cast("dict[str, Any]", client.xpending(VENUE_OUTCOMES, f"session-{session_id}"))
     assert pending["pending"] == 0, "another session's entry was left on the pending list"
+
+
+def test_a_refusal_written_by_the_executor_is_read_back_as_the_engine_s(
+    client: Redis, session_id: str
+) -> None:
+    """**The seam, over a real socket, with nothing fabricated** (ADR-0024).
+
+    ⚠️ **Written because a unit test on either side proves neither.** The executor's tests assert
+    what it publishes; the broker's assert what it reads from a double. Between the two sits
+    redis-py and the encoding, and the previous PR in this line was refused by review for exactly
+    that gap — one file proving a refusal is born, another proving one is observed, and the
+    second fabricating the object. So this one goes through `Service._publish_outcome`'s own
+    encoder, a real Redis, and a real `MT5Broker`.
+
+    ⚠️ `retcode` is an `int` on the way in and Redis stores only strings. A round trip that
+    handed it back as `"10027"` — or dropped it — would leave a strategy unable to tell "trading
+    is off" from "your stop is too close", which are the two ends of whether to try again.
+    """
+    # `a_broker` already creates the group; `start()` additionally demands a fresh venue
+    # snapshot, which is the subject of two other tests and an unrelated reason to fail here.
+    broker = a_broker(client, session_id)
+    fields = refusal_fields(
+        WireRefusal(
+            client_id="zone-42",
+            session_id=session_id,
+            at=NOON + HOUR + dt.timedelta(seconds=18),
+            reason="the terminal is not accepting orders",
+            by_venue=True,
+            retcode=10027,
+        )
+    )
+    client.xadd(VENUE_OUTCOMES, cast("dict[Any, Any]", fields))
+
+    born = broker.on_bar(a_candle())
+
+    assert born == (), "a refusal was folded into the ledger"
+    [refusal] = broker.refusals()
+    assert refusal.client_id == "zone-42"
+    assert refusal.refused_by is RefusedBy.VENUE, "the venue's own refusal came back as ours"
+    assert "10027" in refusal.detail, "the retcode did not survive the socket"
+
+
+def test_a_fill_and_a_refusal_share_one_order_of_arrival(client: Redis, session_id: str) -> None:
+    """⚠️ **The reason they share a stream at all**, and the argument the outbound direction
+    already makes: *"One stream is one order of arrival. That is the whole argument"*.
+
+    Two streams would let a session read the refusal of one order and the fill of another in
+    whichever order the two happened to be polled. Here both are written by the executor's own
+    encoders and both come back off one read, each down its own path — the fill into the ledger,
+    the refusal into the mailbox — without either being mistaken for the other.
+    """
+    broker = a_broker(client, session_id)
+    broker.submit(an_order(client_id="filled-1"))
+    publish_fill(client, session_id, client_id="filled-1")
+    client.xadd(
+        VENUE_OUTCOMES,
+        cast(
+            "dict[Any, Any]",
+            refusal_fields(
+                WireRefusal(
+                    client_id="refused-1",
+                    session_id=session_id,
+                    at=NOON + HOUR + dt.timedelta(seconds=19),
+                    reason="no",
+                    by_venue=False,
+                )
+            ),
+        ),
+    )
+
+    born = broker.on_bar(a_candle())
+
+    assert [fill.order.client_id for fill in born] == ["filled-1"], "the refusal reached the ledger"
+    assert [refusal.client_id for refusal in broker.refusals()] == ["refused-1"]

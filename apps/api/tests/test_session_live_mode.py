@@ -50,6 +50,7 @@ from tradeforge_engine.domain import (
     OrderRequest,
     OrderResult,
     Position,
+    Refusal,
 )
 from tradeforge_engine.loop import iter_run
 from tradeforge_engine.testing import EURUSD, arms_a_resting_limit
@@ -223,6 +224,12 @@ class RecordingVenue:
         return AccountState(balance=Decimal("10000"), equity=Decimal("10000"))
 
     def trades(self) -> Sequence[ClosedTrade]:
+        return ()
+
+    def refusals(self) -> Sequence[Refusal]:
+        """Nothing arrives out of band at this probe. It records *when* the session asked things
+        of a venue (`timeline`); a refusal travelling home from a real executor is
+        `test_broker.py`'s subject, and a double large enough to model it would drift."""
         return ()
 
 

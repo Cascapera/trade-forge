@@ -34,13 +34,15 @@ from tradeforge_db.session import session_scope
 from tradeforge_executor.ledger import record, session_is_alive
 from tradeforge_executor.router import Outcome, Router
 from tradeforge_executor.wire import (
-    FILLS_STREAM,
     ORDERS_STREAM,
+    VENUE_OUTCOMES,
     Instruction,
     WireFill,
     WireOrder,
+    WireRefusal,
     fill_fields,
     instruction_from_fields,
+    refusal_fields,
 )
 
 logger = logging.getLogger(__name__)
@@ -160,16 +162,23 @@ class OrderQueue:
     def ack(self, entry_id: str) -> None:
         self.client.xack(ORDERS_STREAM, GROUP, entry_id)
 
-    def publish_fill(self, fill: WireFill) -> None:
-        """One entry on `fills.inbound`. Fan-out: every session reads it with its own group."""
+    def publish_outcome(self, outcome: WireFill | WireRefusal) -> None:
+        """One entry on `venue.outcomes`. Fan-out: every session reads it with its own group.
+
+        Takes either shape and lets each encode itself, so the `kind` a reader dispatches on is
+        written by the same code that owns the rest of that shape's fields (ADR-0024). A single
+        function with an `if` on the type here would be a second place the two formats have to
+        agree, and the two would agree on the day it was written.
+        """
         # The dict is widened at the boundary, where the client's vocabulary starts. Typing
         # `fill_fields` this way instead would push Redis's aliases into the wire module,
         # which has no business knowing what a stream is.
         # ⚠️ A cast, and an honest one: every key and value here *is* a `str`, which is both a
         # `FieldT` and an `EncodableT`. What refuses the assignment is `dict`'s invariance —
         # a type-system fact about the container, not a doubt about the contents.
-        fields = cast("dict[FieldT, EncodableT]", fill_fields(fill))
-        self.client.xadd(FILLS_STREAM, fields)
+        encoded = fill_fields(outcome) if isinstance(outcome, WireFill) else refusal_fields(outcome)
+        fields = cast("dict[FieldT, EncodableT]", encoded)
+        self.client.xadd(VENUE_OUTCOMES, fields)
 
     def _stopped(self) -> bool:
         return self.stopping is not None and self.stopping()
@@ -221,11 +230,11 @@ class Service:
         with session_scope(self.factory) as db:
             record(db, order, outcome, now=moment)
 
-        self._publish_fill(order, outcome, at=moment)
+        self._publish_outcome(order, outcome, at=moment)
         self.queue.ack(entry_id)
         return outcome
 
-    def _publish_fill(self, order: Instruction, outcome: Outcome, *, at: dt.datetime) -> None:
+    def _publish_outcome(self, order: Instruction, outcome: Outcome, *, at: dt.datetime) -> None:
         """Tell the session what the venue did — but only when the venue actually did it.
 
         ⚠️ **Only an order can produce a fill.** A withdrawn cancel and a refused stop move both
@@ -239,22 +248,46 @@ class Service:
         would be published twice — and a session that saw one fill twice would believe it holds
         two positions.
 
-        ⚠️ **Nothing is published for a refusal.** `fills.inbound` says what happened at the
-        venue, and a refusal never reached one; a "fill" of zero would be a session waiting for
-        a position it will never get told about. The refusal already went to `order_audit`, which
-        is where an operator asks why.
+        ⚠️ **A refusal is published, and it is NOT published as a fill** (ADR-0024). Those are
+        two rules and only the second one is old. A "fill" of zero would leave a session waiting
+        for a position it will never get told about — so a refusal travels as `WireRefusal`, its
+        own shape on the same stream, and the session folds it into `Context.refusals` rather
+        than into its ledger. Before ADR-0024 nothing was published at all and the refusal lived
+        only in `order_audit`, where nobody reads in time: measured in production on 2026-08-28,
+        a session crossed on believing it had armed a limit the venue never saw.
 
-        ⚠️ **Nothing is published for a *resting* order either**, which is the same rule and used
-        not to be the same code. A limit order accepted by the venue is a live order, not a
-        trade: `Placement.filled_volume` is zero until a deal exists (see its docstring), so an
-        order waiting in the book falls out here alongside the refusals. Whoever tells the
-        session that the limit finally filled, later, is not this method — a deal that happens
-        minutes after the entry was acknowledged has nobody in this loop watching for it.
+        ⚠️ **Nothing is published for a *resting* order** — the third outcome, and the one that
+        makes this three states rather than two. A limit accepted by the venue is a live order,
+        not a trade and not a refusal: `Placement.filled_volume` is zero until a deal exists (see
+        its docstring). Saying anything about it would claim something happened when what
+        happened is an order waiting. Whoever tells the session that the limit finally filled,
+        later, is not this method — a deal minutes after the entry was acknowledged has nobody in
+        this loop watching for it.
+
+        ⚠️ **Only an order produces either.** A withdrawn cancel and a refused stop move both
+        happened *at* the venue and neither is a trade; and a refused cancel is a ghost of its
+        own — an order the strategy believes it withdrew, still in the book — which the engine's
+        `Refusal` does not yet model, because it correlates with armed entries. Filed, not fixed.
         """
         if not isinstance(order, WireOrder):
             return
         placement = outcome.placement
-        if not outcome.sent or placement is None or placement.filled_volume <= 0:
+        if not outcome.sent or placement is None:
+            # Never reached a book: our own safeguard said no, or the venue did. Which of the
+            # two is the whole of `by_venue` — see `WireRefusal`.
+            self.queue.publish_outcome(
+                WireRefusal(
+                    client_id=order.client_id,
+                    session_id=order.session_id,
+                    at=at,
+                    reason=outcome.reason or "refused",
+                    by_venue=placement is not None,
+                    retcode=placement.retcode if placement is not None else None,
+                )
+            )
+            return
+        if placement.filled_volume <= 0:
+            # Resting. Neither outcome; see the docstring.
             return
         if placement.price is None:
             # A deal with a volume and no price is a contradiction, and there is no honest
@@ -266,12 +299,12 @@ class Service:
                 placement.deal,
                 placement.filled_volume,
                 order.client_id,
-                FILLS_STREAM,
+                VENUE_OUTCOMES,
             )
             return
         # `Placement.__post_init__` has already refused a filled volume with no quote, so this
         # is a `Decimal`. Narrowing it again would add a branch no test could enter.
-        self.queue.publish_fill(
+        self.queue.publish_outcome(
             WireFill(
                 client_id=order.client_id,
                 session_id=order.session_id,

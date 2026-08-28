@@ -6,6 +6,7 @@ can a decision made on candle N ever be executed with information from candle N?
 """
 
 import datetime as dt
+from collections.abc import Sequence
 from decimal import Decimal
 
 import pytest
@@ -15,6 +16,7 @@ from tradeforge_engine.domain import (
     OrderRequest,
     OrderResult,
     Position,
+    Refusal,
     RefusedBy,
     Side,
     SignalKind,
@@ -578,3 +580,59 @@ def test_a_backtest_can_say_why_it_took_no_trades() -> None:
     assert [refusal.client_id for refusal in result.refusals] == ["zone-7", "zone-9"], (
         "the run cannot say what it intended and did not place"
     )
+
+
+def test_the_loop_asks_the_broker_for_refusals_that_arrived_out_of_band() -> None:
+    """**ADR-0024's half inside the engine.** Against a real venue the verdict on an order
+    arrives after `submit` already answered `accepted`, from another process — so the broker has
+    somewhere to put it and the loop has to come and get it.
+
+    ⚠️ **On every bar, including the silent ones**, and that is the whole of what this pins. A
+    refusal for the order submitted on bar N lands while the strategy is doing nothing on bar
+    N+1. A loop that only drained the broker on bars where its own gates turned something away
+    would hold that refusal until the *next* order was refused — which for a setup arming one
+    zone at a time is for ever.
+    """
+
+    class RefusesOutOfBand(ImmediateFillBroker):
+        """A venue's verdict, arriving a bar late — the shape `MT5Broker` really has."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.asked = 0
+            self._mailbox = [
+                Refusal(
+                    client_id="zone-7",
+                    intent=SignalKind.ENTRY,
+                    refused_by=RefusedBy.VENUE,
+                    reason="entry.test",
+                    detail="the venue would not take it (retcode 10027)",
+                )
+            ]
+
+        def refusals(self) -> Sequence[Refusal]:
+            self.asked += 1
+            drained, self._mailbox = self._mailbox, []
+            return tuple(drained)
+
+    broker = RefusesOutOfBand()
+    strategy = ScriptedStrategy(script={2: [entry(client_id="zone-7")]})
+
+    run(
+        timeframe=HOUR,
+        candles=rising(6),
+        instrument=EURUSD,
+        strategy=strategy,
+        broker=broker,
+        risk=FixedRisk(),
+    )
+
+    assert broker.asked == 6, f"the broker was asked on {broker.asked} of 6 bars"
+    carrying = [index for index, seen in enumerate(strategy.refusals_seen) if seen]
+    assert carrying == [1], (
+        f"the out-of-band refusal reached the strategy on {carrying}; it is delivered on the bar "
+        "after it was drained, like any other"
+    )
+    [refusal] = strategy.refusals_seen[1]
+    assert refusal.refused_by is RefusedBy.VENUE
+    assert refusal.client_id == "zone-7"

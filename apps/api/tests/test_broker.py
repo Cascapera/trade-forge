@@ -199,7 +199,7 @@ def publish_fill(  # noqa: PLR0913 — keyword-only knobs on one fixture, not a 
     session_id: str = SESSION,
     at: dt.datetime = NOON + HOUR + dt.timedelta(seconds=18),
 ) -> None:
-    """What the executor puts on `fills.inbound`, through the real encoder."""
+    """What the executor puts on `venue.outcomes`, through the real encoder."""
     fields = fill_fields(
         WireFill(
             client_id=client_id,
@@ -472,7 +472,7 @@ def test_exits_are_folded_in_before_entries_that_arrived_in_the_same_bar() -> No
 
 
 def test_another_session_s_fill_is_acknowledged_and_ignored() -> None:
-    """⚠️ `fills.inbound` is fan-out, so this group is offered every fill any executor
+    """⚠️ `venue.outcomes` is fan-out, so this group is offered every fill any executor
     publishes. Acknowledged as well as ignored: an entry left pending is redelivered on every
     bar for the life of the session, and the pending list grows without bound."""
     client = FakeStreams()
@@ -724,7 +724,7 @@ def test_a_session_will_not_start_over_a_position_it_did_not_open() -> None:
     """⚠️ **The failure this whole path exists for, and it is silent without it.**
 
     Every session process writes a *new* `live_sessions` row, so a restarted session has a new
-    id — and `_read` filters `fills.inbound` by that id. The dead session's fills are therefore
+    id — and `_read` filters `venue.outcomes` by that id. The dead session's fills are therefore
     discarded without a word, its position stays open at the venue, and this ledger starts empty
     and never learns. The next trade is then sized against an account that is already committed.
     """
@@ -910,3 +910,55 @@ def test_a_refusal_for_a_name_this_session_never_sent_is_still_passed_on() -> No
 
     [refusal] = broker.refusals()
     assert refusal.client_id == "never-sent-by-us"
+
+
+def test_a_refusal_is_described_by_the_order_it_refuses_not_by_a_default() -> None:
+    """⚠️ **Written because the whole `_sent` lookup was deletable and nothing said so.**
+
+    `_refusal_from` fills `intent` and `reason` from the order this session sent, falling back
+    to `ENTRY` and `""` when it cannot find one. Every other fixture in this file refuses a
+    `client_id` that was never submitted — so both sides of both conditionals produce the same
+    object, and three one-token mutants survived the whole suite. The fixture that separates
+    them is the one where the order **exists and disagrees with the defaults**.
+
+    ⚠️ **The exit is the case that bites.** Kill switch armed mid-session, the strategy emits
+    its exit, the executor refuses it. Described by the defaults, the message says an *entry*
+    was refused, unnamed and unexplained — for what was really the exit of a position still
+    open at the venue. Inert today, because only `client_id` is read; the retry policy in
+    PR-304-B-D-2c is announced to decide on exactly these fields.
+    """
+    client = FakeStreams()
+    broker = a_broker(client)
+    broker.submit(
+        an_order(intent=SignalKind.EXIT, client_id="exit-1", reason="exit.sl", decided_at=NOON)
+    )
+    a_refusal(client, client_id="exit-1", reason="the kill switch is armed", by_venue=False)
+
+    broker.on_bar(a_candle())
+
+    [refusal] = broker.refusals()
+    assert refusal.intent is SignalKind.EXIT, (
+        "the refusal claims an entry was turned away; it was the exit of an open position"
+    )
+    assert refusal.reason == "exit.sl", "the strategy's own name for the order was replaced"
+    assert "the kill switch is armed" in refusal.detail, "the executor's words were dropped"
+
+
+def test_a_refusal_for_an_order_this_session_never_sent_says_it_does_not_know() -> None:
+    """The other side of the same lookup, and the reason `intent` may be `None`.
+
+    ⚠️ **A guess here would be indistinguishable from knowledge.** `wire.py` refuses to guess a
+    `kind` — *"read first and never guessed"* — and two layers up this used to guess `ENTRY` for
+    an order it had never heard of. `client_id` was already `str | None` precisely so "I do not
+    know" has a word; `intent` now has one too. A reader that must branch on intent can tell
+    the unknown from the known, instead of being handed a plausible wrong answer.
+    """
+    client = FakeStreams()
+    broker = a_broker(client)
+    a_refusal(client, client_id="never-sent-by-us")
+
+    broker.on_bar(a_candle())
+
+    [refusal] = broker.refusals()
+    assert refusal.intent is None, "an intent was invented for an order this session never sent"
+    assert refusal.reason == ""

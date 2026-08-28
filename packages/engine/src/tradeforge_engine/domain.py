@@ -783,7 +783,16 @@ class Refusal:
     """
 
     client_id: str | None
-    intent: SignalKind
+    intent: SignalKind | None
+    """What the order was for, or `None` when whoever built this could not tell.
+
+    ⚠️ **Optional for the same reason `client_id` is, and it was not always.** A refusal that
+    travels home from another process (ADR-0024) is matched against the orders this session
+    sent, and a session that restarted has forgotten them. Defaulting to `ENTRY` there produced
+    a message asserting a fact it did not have — indistinguishable, to any reader, from one that
+    did. `wire.py` refuses to guess a `kind` one layer down; this is the same rule, and a reader
+    that branches on intent can now tell the unknown from the known."""
+
     refused_by: RefusedBy
     reason: str = ""
     """What the **strategy** called this order (`"entry.choch"`), not why it was refused."""

@@ -887,7 +887,7 @@ posição no venue e **nunca fica sabendo**. O ledger do broker e a conta diverg
 o pior modo de falha possível para dinheiro real.
 
 **Conserto (candidato a PR-304-A3):** um laço próprio no executor que varre
-`history_deals_get(magic=770302)` desde o último deal visto e publica em `fills.inbound` o que
+`history_deals_get(magic=770302)` desde o último deal visto e publica em `venue.outcomes` o que
 apareceu, correlacionando pelo `client_id` no comment da ordem. É um segundo produtor da mesma
 stream, com a mesma regra de "publica só o que tem `deal`".
 

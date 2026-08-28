@@ -476,6 +476,12 @@ def test_a_refusal_by_our_own_safeguard_travels_home_as_a_refusal(
     assert published["by_venue"] == "no", "our own safeguard was reported as the venue's answer"
     assert "retcode" not in published, "a retcode for a venue that was never asked"
     assert published["client_id"] == fields["client_id"]
+    # ⚠️ The safeguard's own words, not a placeholder. `order_audit` records them too, but the
+    # trail is read by an operator afterwards and this is read by the strategy on the next bar;
+    # a constant here would tell it an order was refused and never say by what.
+    assert "the-handle" in published["reason"], (
+        f"the reason the switch gave was replaced: {published['reason']!r}"
+    )
 
 
 def test_a_refusal_by_the_venue_says_so_and_carries_its_retcode(

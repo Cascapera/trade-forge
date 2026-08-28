@@ -4,7 +4,7 @@
 the code it feeds. It proves that module's logic is self-consistent and nothing whatsoever about
 whether Redis agrees. The claims that need a server are:
 
-* `fills.inbound` is **fan-out** — two sessions, two groups, and each sees the same fill. That
+* `venue.outcomes` is **fan-out** — two sessions, two groups, and each sees the same fill. That
   is the opposite of `orders.outbound`, and getting it backwards is silent: a session simply
   never learns its order filled.
 * an entry stays on the pending list until it is acked, and comes back to a restarted broker;
@@ -199,7 +199,7 @@ def test_the_order_reaches_the_stream_the_executor_reads(client: Redis, session_
 def test_two_sessions_each_see_the_same_fill(client: Redis, session_id: str) -> None:
     """⚠️ **Fan-out, and this is the test that says so against a server.**
 
-    `fills.inbound` is the opposite of `orders.outbound`: an order must be handled by exactly
+    `venue.outcomes` is the opposite of `orders.outbound`: an order must be handled by exactly
     one executor, a fill must reach the session that placed it *and* anything else watching. If
     these two groups shared one, each would see roughly half the fills and neither would know.
     """

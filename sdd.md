@@ -162,7 +162,7 @@ Regras anti-vieses (inegociáveis, cobertas por testes):
 - Indicadores só enxergam candles já fechados.
 
 #### 3.3.3 Execution Service (Windows, Python)
-- Consome `orders.outbound` (Redis stream), executa via `mt5.order_send`, publica `fills.inbound`.
+- Consome `orders.outbound` (Redis stream), executa via `mt5.order_send`, publica `venue.outcomes` (ADR-0024; era `fills.inbound`).
 - **Salvaguardas locais** (funcionam mesmo se o core cair):
   - Kill switch (flag no Redis + arquivo local + endpoint de emergência).
   - Limite de perda diária e de posições simultâneas.

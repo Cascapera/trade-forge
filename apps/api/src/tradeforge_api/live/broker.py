@@ -10,7 +10,7 @@ this; it just had not met it yet.
 So the split is:
 
 * `submit` publishes to `orders.outbound` and says "accepted". Nothing waits.
-* `on_bar` drains `fills.inbound` — **with this session's own consumer group** — and hands the
+* `on_bar` drains `venue.outcomes` — **with this session's own consumer group** — and hands the
   loop the fills that arrived since the last bar. That is the same shape `BacktestBroker` has,
   where `on_bar` is also the only place a `Fill` can be born.
 
@@ -150,24 +150,30 @@ class MT5Broker:
         self._instrument = instrument
         self._portfolio = Portfolio(initial_capital=initial_capital, instrument=instrument)
         # ⚠️ The group is the **session's**, so this session sees every fill on the stream.
-        # `fills.inbound` is fan-out, the opposite of `orders.outbound`: an order must be handled
+        # `venue.outcomes` is fan-out, the opposite of `orders.outbound`: an order must be handled
         # by exactly one executor, a fill must reach the session that placed it. Sharing a group
         # here would mean a session silently never learns that its own order filled.
         self._group = f"session-{session_id}"
         self._consumer = consumer
         self._sent: dict[str, OrderRequest] = {}
-
-        # ⚠️ **A mailbox, not a log.** Refusals arrive between bars, from another process
-        # (ADR-0024); the loop drains this once a bar and folds it into the next
-        # `Context.refusals`. Draining is what makes it news exactly once — a refusal handed
-        # over twice would have `StructurePhase` forget an order it had since armed.
-        self._refused: list[Refusal] = []
         """Every order this broker put on the wire, by the name it went out under.
 
         ⚠️ **This is the other half of every fill**, and why the request does not travel home
         on the wire. A `Fill` needs its `OrderRequest`, and sending the same document twice
         invites the two copies to disagree — about the stop, about `decided_at`, about the
-        snapshot the loop attached. The `client_id` is the whole correlation (ADR-0014)."""
+        snapshot the loop attached. The `client_id` is the whole correlation (ADR-0014).
+
+        It is also what a refusal is described by (`_refusal_from`): the intent and the
+        strategy's own name for the order live here and nowhere on the wire."""
+
+        self._refused: list[Refusal] = []
+        """Refusals that arrived since the last bar, waiting for the loop to come and get them.
+
+        ⚠️ **A mailbox, not a log.** They arrive between bars, from another process (ADR-0024);
+        the loop drains this once a bar and folds it into the next `Context.refusals`. Draining
+        is what makes it news exactly once — a refusal handed over twice would have
+        `StructurePhase` forget an order it had since armed, and re-offer a zone whose limit may
+        be resting perfectly well."""
 
         self._minted = 0
 
@@ -194,6 +200,17 @@ class MT5Broker:
         """
         self._refuse_unless_venue_is_flat()
         self.ensure_group()
+        # ⚠️ **Named out loud because a mismatched deploy is silent otherwise** (ADR-0024). The
+        # stream was renamed from `fills.inbound`, and there is no dual-read: an executor running
+        # the older code publishes where nobody is listening, so this session would send orders,
+        # fill them at the venue, and never learn — the exact failure this whole line of work
+        # exists to kill, arriving through the door of a half-finished deploy. The two processes
+        # are started by hand, minutes apart, from different consoles.
+        logger.info(
+            "session %s listening on %r; the executor must be publishing there",
+            self._session_id,
+            VENUE_OUTCOMES,
+        )
 
     def _refuse_unless_venue_is_flat(self) -> None:
         raw = self._client.get(VENUE_STATE)
@@ -269,7 +286,7 @@ class MT5Broker:
 
         **A refusal here is local and immediate**: the wire would not carry the order faithfully,
         or Redis would not take it. Neither is the venue's opinion — the venue has not been asked
-        yet, and will answer into `order_audit` and `fills.inbound` in its own time.
+        yet, and will answer into `order_audit` and `venue.outcomes` in its own time.
         """
         if order.stop_price is not None:
             # ⚠️ Refused rather than sent, because `order_fields` does not carry `stop_price` and
@@ -434,7 +451,7 @@ class MT5Broker:
         return tuple(born)
 
     def _drain(self) -> list["_Arrived"]:
-        """Everything on `fills.inbound` for this session, oldest first, without blocking.
+        """Everything on `venue.outcomes` for this session, oldest first, without blocking.
 
         ⚠️ **Every entry is acknowledged, including the ones belonging to other sessions.** The
         stream is fan-out, so this group is offered every fill any executor publishes. Leaving
@@ -508,7 +525,7 @@ class MT5Broker:
         order = self._sent.get(wire.client_id)
         return Refusal(
             client_id=wire.client_id,
-            intent=order.intent if order is not None else SignalKind.ENTRY,
+            intent=order.intent if order is not None else None,
             refused_by=RefusedBy.VENUE if wire.by_venue else RefusedBy.EXECUTOR,
             reason=order.reason if order is not None else "",
             detail=detail,

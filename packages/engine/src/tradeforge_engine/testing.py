@@ -28,6 +28,7 @@ from tradeforge_engine.domain import (
     OrderRequest,
     OrderResult,
     Position,
+    Refusal,
     Side,
     Signal,
     SignalKind,
@@ -224,18 +225,39 @@ def entry(
     price: str = "1.10100",
     stop: str | None = None,
     reason: str = "test",
+    client_id: str | None = None,
 ) -> Signal:
+    """A signal to open. `client_id` names the order, which matters wherever a test is about
+    **correlation** rather than about the order existing: a `Refusal` carries the name and
+    nothing else of the order, so a test that leaves it unnamed cannot tell a refusal that
+    identified the order from one that lost track of which order it was."""
     return Signal(
         kind=SignalKind.ENTRY,
         side=side,
         reference_price=Decimal(price),
         stop_loss=Decimal(stop) if stop else None,
         reason=reason,
+        client_id=client_id,
     )
 
 
-def close_out(side: Side = Side.LONG, *, price: str = "1.10100", reason: str = "test") -> Signal:
-    return Signal(kind=SignalKind.EXIT, side=side, reference_price=Decimal(price), reason=reason)
+def close_out(
+    side: Side = Side.LONG,
+    *,
+    price: str = "1.10100",
+    reason: str = "test",
+    client_id: str | None = None,
+) -> Signal:
+    """A signal to close. Nothing in the repo names an exit today — the DSL does not and the
+    structure setups emit none — so `client_id` exists here for the one test that needs to see
+    a *named* refusal come back, and it is the reason `RefusedBy.NO_POSITION` can carry one."""
+    return Signal(
+        kind=SignalKind.EXIT,
+        side=side,
+        reference_price=Decimal(price),
+        reason=reason,
+        client_id=client_id,
+    )
 
 
 def modify_stop(
@@ -283,7 +305,20 @@ class ImmediateFillBroker:
         self._pending: list[OrderRequest] = []
         self.submitted: list[OrderRequest] = []
 
+        self.refuse_with: str | None = None
+        """Set to a reason and every `submit` is declined with it, until it is set back to
+        `None`. A real broker refuses for its own reasons — a duplicate name, an order it
+        cannot rest — and none of them are reachable from a test that only has this broker;
+        this is the switch that makes the refusal path drivable at all."""
+
+        self.refused: list[OrderRequest] = []
+
     def submit(self, order: OrderRequest) -> OrderResult:
+        if self.refuse_with is not None:
+            # Refused orders are not appended to `submitted`: the list means "reached the
+            # book", and a refusal is precisely the thing that did not.
+            self.refused.append(order)
+            return OrderResult(order=order, accepted=False, reason=self.refuse_with)
         self._pending.append(order)
         self.submitted.append(order)
         return OrderResult(order=order, accepted=True)
@@ -350,12 +385,16 @@ class ScriptedStrategy:
     seen: list[Candle] = field(default_factory=list)
     positions_seen: list[Side | None] = field(default_factory=list)
     fills_seen: list[tuple[Fill, ...]] = field(default_factory=list)
+    refusals_seen: list[tuple[Refusal, ...]] = field(default_factory=list)
+    """What `Context.refusals` held on each bar. Recorded, like `fills_seen`, because the
+    channel is only real if a strategy can be shown to have been handed something on it."""
 
     def on_bar(self, context: Context) -> Sequence[Signal]:
         index = len(self.seen)
         self.seen.append(context.candle)
         self.positions_seen.append(context.position.side if context.position else None)
         self.fills_seen.append(context.fills)
+        self.refusals_seen.append(context.refusals)
         return self.script.get(index, [])
 
 

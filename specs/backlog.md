@@ -1087,7 +1087,13 @@ separa o conserto certo do vizinho.
 
 ---
 
-## ⚠️ PR-304-B-D — A recusa do executor não volta para a estratégia
+## ⚠️ PR-304-B-D-2 — A recusa do executor não volta para a estratégia (o transporte)
+
+> **O PR-304-B-D-1 abriu o canal na engine** (`Context.refusals`). O que falta é o transporte:
+> a recusa que acontece **três processos adiante** ainda não tem como chegar nele.
+
+### O que sobrou depois do D-1
+
 
 **Separado do PR-304-B-C de propósito** (decisão de 28/08): é mudança de contrato entre três
 processos, e um PR = um escopo.
@@ -1100,6 +1106,107 @@ olhado — não pelo veto do risco, mas pela salvaguarda do executor.
 
 Hoje isso só aparece no `order_audit`, que ninguém está lendo em tempo real.
 
-⚠️ O PR-304-B-C fecha a causa que produziu a recusa medida na demo, **não o caminho de volta**.
+⚠️ O PR-304-B-C fechou a causa que produziu a recusa medida na demo, **não o caminho de volta**.
 Qualquer outra recusa do executor (magic desconhecida, stop afrouxando, AutoTrading desligado)
-produz o mesmo fantasma, em silêncio.
+produz o mesmo fantasma.
+
+### O canal não pode ser o `fills.inbound`, e o executor já argumentou por quê
+
+O docstring do `_publish_fill` decide isso antes de o problema aparecer:
+
+> *"`fills.inbound` says what happened at the venue, and a refusal never reached one; a 'fill'
+> of zero would be a session waiting for a position it will never get told about."*
+
+Está certo. Então o D-2 precisa de **decisão de transporte própria — provavelmente ADR**: stream
+novo, ou generalizar o `fills.inbound` para um stream de desfechos. E é irmã de um item que já
+está neste backlog: *"uma ordem limite que preenche depois não tem quem avise a sessão"*. **Mesmo
+canal, mesma decisão** — decidir os dois juntos, mesmo que construídos separado.
+
+### ⚠️ O teto de tentativas volta à mesa aqui, e agora com número
+
+O D-1 deixou a região **reoferível** depois de uma recusa (decisão do Guilherme, consistente com
+o ADR-0015: só o fill gasta uma região). Medido em `arms_a_resting_limit` com recusa
+**permanente**: a zona é re-armada **em toda barra enquanto estiver de pé** — 48 seguidas
+(barras 61→108), 50 no total das 175.
+
+Hoje isso não é alcançável: as recusas permanentes do `MT5Broker` são a ordem de breakout
+(nenhum setup emite `stop_price` — medido na demo) e o `client_id` longo demais (determinístico).
+Um teto agora seria guarda sem produtor.
+
+⚠️ **O D-2 torna alcançável.** `AutoTrading` desligado recusa **tudo** (retcode 10027) — recusa
+permanente de verdade. Aí são 48 ordens no fio e 48 linhas de `order_audit` por zona. Decidir o
+teto (ou distinguir recusa transitória de permanente pelo `RefusedBy`) faz parte do D-2.
+
+⚠️ **E há um perigo pior que o barulho:** se uma recusa se **perder** no transporte, a sessão
+re-arma sob nome novo enquanto a ordem antiga está de fato resting — **duas limites na mesma
+zona**, que é exatamente o que o docstring do `hand_over` avisa que um venue sem deduplicação
+por nome permite.
+
+---
+
+## O `hand_over` recusa em silêncio — o quinto ponto do ADR-0023
+
+Encontrado pelo `engine-guardian` fechando o PR-304-B-D-1. `warmup.py:207-224` tem **os mesmos
+três portões** que o `_step` tinha, monta `HandOver.refused` com os nomes das ordens que não
+atravessaram… e **não conta para a estratégia**.
+
+É o único ponto de hand-over do ADR-0023 que sobrou mudo. E agora é barato: o canal existe
+(`Context.refusals`) e os nomes já estão na mão — falta entregá-los no `Context` da **primeira
+barra viva** da sessão.
+
+⚠️ Item natural do **PR-304-B-D-2**, junto com o transporte: uma sessão que aquece e recusa
+carregar uma ordem em repouso nasce com exatamente o fantasma que o D-1 acabou de fechar em
+todo lugar menos aqui.
+
+---
+
+## A ordem re-armada depois de uma recusa perde os `levels` do snapshot
+
+**Medido** pelo `engine-guardian` na revisão do PR-304-B-D-1, sobre `arms_a_resting_limit`:
+
+```
+demand-...-1  levels [('choch', 1.03750)]     ← armada na barra do break
+demand-...-2  levels []                        ← re-armada uma barra depois
+```
+
+Preço, stop e zona são **idênticos**. O que some é o desenho da estrutura: o `_may_arm`
+recarimba `confirmed_by` com o `break_` da barra do re-arm, que é `None` porque não houve break
+naquela barra.
+
+⚠️ **O mecanismo é pré-existente** — é o mesmo caminho do re-arm depois de um `_withdraw` — mas o
+PR-304-B-D-1 o torna **o caminho normal de toda recusa**, então deixa de ser raro.
+
+Consequência: o `EntrySnapshot` da ordem que efetivamente entrou não desenha a estrutura que
+justificou a entrada. Quem abrir o gráfico daquele trade vê a zona e não vê o CHoCH.
+
+---
+
+## Uma `OrderRequest` de saída não carrega `client_id`
+
+Encontrado pelo `engine-guardian` no PR-304-B-D-1. Um EXIT **nomeado** recusado no portão
+`NO_POSITION` volta com nome (a `Refusal` lê `signal.client_id`); o mesmo EXIT recusado pelo
+`risk.allow` ou pelo broker volta com `client_id=None`, porque aí a `Refusal` lê
+`order.client_id` e o `_to_order` nunca põe um na ordem de saída.
+
+⚠️ **Sem produtor hoje:** a DSL (`strategy.py:255`) emite EXIT sem nome e a `StructureStrategy`
+não emite EXIT nenhum.
+
+⚠️ **NÃO faça o conserto ingênuo.** Dar à saída o `client_id` do sinal colide com o nome da
+entrada, que o `BacktestBroker` recusa como duplicata — trocaria "recusa anônima" por "recusa que
+**impede fechar a posição**", que é estritamente pior. A saída precisa de um nome **derivado e
+distinto** (`f"{client_id}.exit"`), o que é decisão de design e não patch. Vem junto com o
+primeiro produtor de saídas nomeadas.
+
+---
+
+## `modify_stop` recusado também não volta para a estratégia
+
+Encontrado ao construir o PR-304-B-D-1, fora do escopo dele. `loop.py` faz `logger.debug` quando
+`broker.modify_stop` devolve `False` e segue.
+
+Não produz o fantasma do `placed` — esse é sobre entradas — mas é a mesma classe: a estratégia
+pediu para apertar um stop, não apertou, e ela não fica sabendo. O `StructuralTrail` acredita que
+o stop se moveu.
+
+⚠️ O docstring do loop já registra que as duas causas (ordem ainda não preenchida vs. broker sem
+nível protetivo) são indistinguíveis dali. Um canal de volta teria que carregar qual foi.

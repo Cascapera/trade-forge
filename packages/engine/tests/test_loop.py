@@ -10,9 +10,17 @@ from decimal import Decimal
 
 import pytest
 
-from tradeforge_engine.domain import Candle, OrderRequest, OrderResult, Position, Side, SignalKind
+from tradeforge_engine.domain import (
+    Candle,
+    OrderRequest,
+    OrderResult,
+    Position,
+    RefusedBy,
+    Side,
+    SignalKind,
+)
 from tradeforge_engine.errors import EngineError, LookaheadError
-from tradeforge_engine.loop import run
+from tradeforge_engine.loop import iter_run, run
 from tradeforge_engine.testing import (
     EURUSD,
     HOUR,
@@ -377,4 +385,196 @@ def _an_order() -> OrderRequest:
         intent=SignalKind.ENTRY,
         volume=Decimal(1),
         decided_at=dt.datetime(2024, 1, 1, tzinfo=dt.UTC),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Orders that never reached the book, and the strategy being told so            #
+# --------------------------------------------------------------------------- #
+#
+# ⚠️ **Why this section exists at all.** Between the strategy asking and the order resting
+# there are four gates, and every one of them used to be a `continue` next to a
+# `logger.debug`. A setup marks its armed order placed the instant it *emits* the signal
+# (`setups.py`), so each of those gates left the strategy holding an order that does not
+# exist anywhere — the ghost ADR-0023 measured at four of five hand-over points, arriving
+# through whichever door happened to be open. A log is not a channel; a strategy cannot read
+# one.
+
+
+_LOST_THE_NAME = (
+    "the refusal came back without the name of the order it refuses. `client_id` is the whole "
+    "correlation — a `Refusal` carries no `OrderRequest` — so a strategy cannot tell which of "
+    "its armed zones was turned away, and `StructurePhase` goes on holding the ghost."
+)
+
+
+def test_a_broker_refusal_reaches_the_strategy_on_the_next_bar() -> None:
+    """The gate the demo account walked into, in miniature.
+
+    ⚠️ **On the next bar, and it cannot be sooner.** The `Context` for bar N is built in step 2
+    and the refusal happens in step 4 — so delivering it on its own bar would mean building the
+    context after the decision it is meant to inform. That is the anti-lookahead rule read
+    backwards, and it is why `Context.refusals` is documented as one bar behind `Context.fills`
+    rather than as a delay somebody settled for.
+    """
+    broker = ImmediateFillBroker()
+    broker.refuse_with = "no room at the venue"
+    strategy = ScriptedStrategy(script={2: [entry(client_id="zone-7")]})
+
+    run(
+        timeframe=HOUR,
+        candles=rising(6),
+        instrument=EURUSD,
+        strategy=strategy,
+        broker=broker,
+        risk=FixedRisk(),
+    )
+
+    assert broker.refused, "nothing was refused; this test proved nothing"
+    assert not broker.submitted, "the order reached the book after all"
+
+    assert strategy.refusals_seen[2] == (), "the refusal was delivered on its own bar"
+    [refusal] = strategy.refusals_seen[3]
+    assert refusal.refused_by is RefusedBy.BROKER
+    assert refusal.detail == "no room at the venue", "the broker's own words were dropped"
+    assert refusal.intent is SignalKind.ENTRY
+    assert refusal.client_id == "zone-7", _LOST_THE_NAME
+
+
+def test_a_risk_veto_reaches_the_strategy_too() -> None:
+    """⚠️ **This is the door ADR-0023 measured, and it was closed by removing the veto rather
+    than by fixing the feedback.** The veto is still there in every ordinary session — this is
+    the channel it should always have had."""
+    strategy = ScriptedStrategy(script={2: [entry(client_id="zone-7")]})
+    risk = FixedRisk(allow_all=False)
+
+    run(
+        timeframe=HOUR,
+        candles=rising(6),
+        instrument=EURUSD,
+        strategy=strategy,
+        broker=ImmediateFillBroker(),
+        risk=risk,
+    )
+
+    assert risk.vetoed, "nothing was vetoed; this test proved nothing"
+    [refusal] = strategy.refusals_seen[3]
+    assert refusal.refused_by is RefusedBy.RISK
+    assert refusal.client_id == "zone-7", _LOST_THE_NAME
+
+
+def test_an_order_sized_at_zero_is_a_refusal_not_a_silence() -> None:
+    """A size of zero is the risk manager saying "not this trade", and it used to be
+    indistinguishable from a strategy that decided nothing at all."""
+    strategy = ScriptedStrategy(script={2: [entry(client_id="zone-7")]})
+
+    run(
+        timeframe=HOUR,
+        candles=rising(6),
+        instrument=EURUSD,
+        strategy=strategy,
+        broker=ImmediateFillBroker(),
+        risk=FixedRisk(volume=Decimal(0)),
+    )
+
+    [refusal] = strategy.refusals_seen[3]
+    assert refusal.refused_by is RefusedBy.SIZING
+    assert "0" in refusal.detail, "the size that was refused is not in the message"
+    assert refusal.client_id == "zone-7", _LOST_THE_NAME
+
+
+def test_closing_a_position_that_is_not_there_is_a_refusal() -> None:
+    """The ghost read from the other side: a strategy asking to close what it does not hold has
+    already come apart from the broker, and that is worth telling it."""
+    strategy = ScriptedStrategy(script={2: [close_out(client_id="flatten-1")]})
+
+    run(
+        timeframe=HOUR,
+        candles=rising(6),
+        instrument=EURUSD,
+        strategy=strategy,
+        broker=ImmediateFillBroker(),
+        risk=FixedRisk(),
+    )
+
+    [refusal] = strategy.refusals_seen[3]
+    assert refusal.refused_by is RefusedBy.NO_POSITION
+    assert refusal.intent is SignalKind.EXIT
+    assert refusal.client_id == "flatten-1", _LOST_THE_NAME
+
+
+def test_a_refusal_is_news_once_and_is_not_repeated() -> None:
+    """⚠️ **Accumulating instead of replacing is the mutant that matters here**, and it is not a
+    tidiness point. `StructurePhase` forgets its armed order when it sees a refusal naming it;
+    a refusal redelivered on a later bar would forget an order the phase had *successfully*
+    armed in the meantime — turning one refused order into an endless one.
+    """
+    broker = ImmediateFillBroker()
+    broker.refuse_with = "no"
+    strategy = ScriptedStrategy(script={2: [entry()]})
+
+    run(
+        timeframe=HOUR,
+        candles=rising(8),
+        instrument=EURUSD,
+        strategy=strategy,
+        broker=broker,
+        risk=FixedRisk(),
+    )
+
+    carrying = [index for index, seen in enumerate(strategy.refusals_seen) if seen]
+    assert carrying == [3], f"the refusal was shown on {carrying}, not only on the bar after it"
+
+
+def test_the_run_reports_what_it_refused() -> None:
+    """⚠️ Without this the refusal is visible to a strategy and to nobody else — and the person
+    asking "why did this backtest take no trades" is not a strategy. A run that placed nothing
+    used to look exactly like a run that decided nothing."""
+    broker = ImmediateFillBroker()
+    broker.refuse_with = "no"
+
+    outcomes = list(
+        iter_run(
+            timeframe=HOUR,
+            candles=rising(6),
+            instrument=EURUSD,
+            strategy=ScriptedStrategy(script={2: [entry()]}),
+            broker=broker,
+            risk=FixedRisk(),
+        )
+    )
+
+    reported = [
+        (outcome.index, refusal.refused_by) for outcome in outcomes for refusal in outcome.refusals
+    ]
+    assert reported == [(2, RefusedBy.BROKER)], (
+        "the refusal is reported on the bar that produced it, not the bar it was shown on"
+    )
+
+
+def test_a_backtest_can_say_why_it_took_no_trades() -> None:
+    """⚠️ **The question a run could not answer.** A backtest that placed nothing and one that
+    decided nothing both come back with an empty `fills`, and they mean opposite things about
+    the strategy — one found no setup, the other found setups and could not act on them.
+
+    Written because `BarOutcome.refusals` promised exactly this record and `run()` dropped it:
+    a docstring nobody can execute is how the next reader stops looking.
+    """
+    broker = ImmediateFillBroker()
+    broker.refuse_with = "no"
+
+    result = run(
+        timeframe=HOUR,
+        candles=rising(8),
+        instrument=EURUSD,
+        strategy=ScriptedStrategy(
+            script={2: [entry(client_id="zone-7")], 4: [entry(client_id="zone-9")]}
+        ),
+        broker=broker,
+        risk=FixedRisk(),
+    )
+
+    assert result.fills == (), "the fixture is broken: something reached the book"
+    assert [refusal.client_id for refusal in result.refusals] == ["zone-7", "zone-9"], (
+        "the run cannot say what it intended and did not place"
     )

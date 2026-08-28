@@ -23,12 +23,15 @@ import uuid
 from collections.abc import Callable, Iterator, Sequence
 from decimal import Decimal
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
+from tradeforge_api.live.heartbeat import Heartbeat
 from tradeforge_api.live.session import SessionOutcome, SessionPlan, run_session
+from tradeforge_db.live_sessions import STALE_AFTER
 from tradeforge_db.models import (
     Instrument,
     LiveSession,
@@ -50,6 +53,7 @@ from tradeforge_engine.domain import (
 )
 from tradeforge_engine.loop import iter_run
 from tradeforge_engine.testing import EURUSD, arms_a_resting_limit
+from tradeforge_executor.ledger import session_is_alive
 
 from .test_live_session_acceptance import golden_candles, ma_cross_strategy
 from .test_session_integration import ListSource, factory_of
@@ -68,6 +72,73 @@ SYMBOL = EURUSD.symbol
 # the same thing and stops proving it the day the structure machine shifts by one bar — and it
 # leaves 70 live bars, where cut 174 leaves one.
 CUT = 105
+
+# What a warm-up costs the clock, measured on the demo account on 2026-08-28: 39 204 EURUSD M15
+# bars took **700 seconds**, against a `STALE_AFTER` of 60.
+#
+# ⚠️ **Declared, not spent.** Nothing here sleeps; the source below steps the clock by this once
+# the last history bar has gone through. The number only has to be larger than `STALE_AFTER`,
+# and it is the real one because the real one is what makes the failure legible in a message.
+WARM_UP_COSTS = dt.timedelta(seconds=700)
+
+
+class Clock:
+    """A clock the warm-up can push forward, read by the session **and** by the venue.
+
+    ⚠️ **One instance, two readers, and that is the point.** The bug this file grew to catch is
+    a comparison between two instants — when the row says the session started, and when the
+    session actually acted. A test whose clock is frozen makes those the same number and cannot
+    see it: `run_live` froze at the cut for the six ordering tests that came before this one, and
+    all six were **measured** to pass against the production bug in full — the hand-over back
+    above the heartbeat, and the first beat back on the spawned thread.
+    """
+
+    def __init__(self, at: dt.datetime) -> None:
+        self.at = at
+
+    def __call__(self) -> dt.datetime:
+        return self.at
+
+
+class WarmUpTakesTime(ListSource):
+    """A `ListSource` whose warm-up costs the clock what a real one costs.
+
+    The step lands after the last history bar and before the first live one, because that is
+    where `chain(history(), backlog(), candles())` exhausts this generator — which is exactly
+    where the real cost falls: `opened_at` is stamped before the first bar of history, and the
+    session's first order goes out after the last.
+    """
+
+    def __init__(
+        self,
+        backlog: list[Candle],
+        live: list[Candle],
+        *,
+        clock: Clock,
+        costs: dt.timedelta,
+    ) -> None:
+        super().__init__(backlog, live)
+        self._clock = clock
+        self._costs = costs
+
+    def backlog(self) -> Iterator[Candle]:
+        yield from super().backlog()
+        # Reached when the chain asks for one bar past the last: the warm-up is over.
+        self._clock.at += self._costs
+
+
+class Moment(NamedTuple):
+    """One thing the session asked of the venue, and what the database said at that instant.
+
+    Two questions, because they fail apart. `on_file` is whether the row exists — PR-304-B-B.
+    `alive` is `session_is_alive`, **the executor's own function**, which is the question that
+    actually decides whether an order is sent or refused. A session can be perfectly on file and
+    still be refused for having said nothing since before its warm-up.
+    """
+
+    what: str
+    on_file: bool
+    alive: bool
 
 
 def choch_strategy() -> dict[str, object]:
@@ -95,10 +166,16 @@ class RecordingVenue:
     answer that decides whether an audit row is orphaned.
     """
 
-    def __init__(self, factory: sessionmaker[Session], session_id: uuid.UUID) -> None:
+    def __init__(
+        self,
+        factory: sessionmaker[Session],
+        session_id: uuid.UUID,
+        now: Callable[[], dt.datetime],
+    ) -> None:
         self._factory = factory
+        self._now = now
         self.session_id = session_id
-        self.timeline: list[tuple[str, bool]] = []
+        self.timeline: list[Moment] = []
         self.submitted: list[OrderRequest] = []
         self.started = False
         self._position: Position | None = None
@@ -108,9 +185,13 @@ class RecordingVenue:
         db = self._factory()
         try:
             on_file = db.get(LiveSession, self.session_id) is not None
+            # ⚠️ The executor's own function, not a re-implementation of it. A local copy of the
+            # rule would be a copy this test could keep passing while the real one refused —
+            # which is precisely how the demo run got through every suite and then failed.
+            alive = session_is_alive(db, str(self.session_id), now=self._now())
         finally:
             db.close()
-        self.timeline.append((what, on_file))
+        self.timeline.append(Moment(what, on_file, alive))
 
     def start(self) -> None:
         self.started = True
@@ -221,14 +302,15 @@ def split() -> tuple[list[Candle], list[Candle], dt.datetime]:
 class VenueFactory:
     """Builds one `RecordingVenue` and remembers what it was handed."""
 
-    def __init__(self, factory: sessionmaker[Session]) -> None:
+    def __init__(self, factory: sessionmaker[Session], now: Callable[[], dt.datetime]) -> None:
         self._factory = factory
+        self._now = now
         self.calls: list[tuple[uuid.UUID, InstrumentSpec]] = []
         self.built: RecordingVenue | None = None
 
     def __call__(self, session_id: uuid.UUID, spec: InstrumentSpec) -> RecordingVenue:
         self.calls.append((session_id, spec))
-        self.built = RecordingVenue(self._factory, session_id)
+        self.built = RecordingVenue(self._factory, session_id, self._now)
         self.built.start()
         return self.built
 
@@ -239,18 +321,26 @@ def run_live(
     parquet_root: Path,
     *,
     venue: VenueFactory | None = None,
+    warm_up_costs: dt.timedelta = dt.timedelta(0),
 ) -> tuple[SessionOutcome, VenueFactory]:
+    """One live session over the measured window, with the venue watching.
+
+    `warm_up_costs` is zero by default, which keeps the eight ordering tests reading a still
+    clock — they are about *sequence*, and a moving clock would add a variable none of them are
+    asking about. The one test that is about duration passes `WARM_UP_COSTS`.
+    """
     factory = factory_of(session_factory)
     history, live_bars, cut = split()
-    made = venue if venue is not None else VenueFactory(factory)
+    clock = Clock(cut)
+    made = venue if venue is not None else VenueFactory(factory, clock)
     outcome = run_session(
         factory=factory,
-        source=ListSource(history, live_bars),
+        source=WarmUpTakesTime(history, live_bars, clock=clock, costs=warm_up_costs),
         plan=plan,
         parquet_root=parquet_root,
         stopping=lambda: False,
         venue=made,
-        now=lambda: cut,
+        now=clock,
     )
     return outcome, made
 
@@ -309,12 +399,94 @@ def test_the_row_exists_before_the_hand_over_sends_its_first_order(
     venue = made.built
     assert venue is not None
 
-    submits = [(what, on_file) for what, on_file in venue.timeline if what == "submit"]
+    submits = [moment for moment in venue.timeline if moment.what == "submit"]
     assert submits, "no order was ever submitted; this test proved nothing"
-    assert all(on_file for _what, on_file in submits), (
+    assert all(moment.on_file for moment in submits), (
         f"an order went out before the session was on file: {venue.timeline}"
     )
     assert venue.submitted, "the hand-over carried nothing"
+
+
+def test_a_long_warm_up_still_leaves_the_session_alive_when_it_places_its_first_order(
+    session: Session,
+    session_factory: Callable[[], Session],
+    live_plan: SessionPlan,
+    parquet_root: Path,
+) -> None:
+    """**Measured on the demo account, 2026-08-28, and it refused the order.**
+
+    The session warmed over 39 204 bars, opened its row, and `hand_over` put its limit on the
+    wire. The executor answered *"the core is not answering; no new orders while it is silent"*
+    and wrote `refused` into `order_audit`. Nothing was broken: `open_session` leaves
+    `heartbeat_at` NULL on purpose, `silence()` falls back to `started_at` when there is no
+    beat, and `started_at` is stamped **before** the warm-up. Three correct decisions summing to
+    a session that is declared dead in the instant it first acts.
+
+    ⚠️ **It is systematic, and it gets worse with the thing that makes a session better.** The
+    more history a session warms over, the longer it has been "silent" when it places its first
+    order — 700 s here against a limit of 60.
+
+    ⚠️ **What this asserts is the silence at the instant of the submit, not a count of beats.**
+    `test_a_running_session_says_it_is_alive` next door reads `heartbeat_at` off the finished
+    row, and passes against the bug: by the time a session stops, it has beaten plenty. The
+    question is whether it had beaten *yet* when the order went out.
+    """
+    _outcome, made = run_live(session_factory, live_plan, parquet_root, warm_up_costs=WARM_UP_COSTS)
+    venue = made.built
+    assert venue is not None
+
+    # The fixture has to be able to say no. A warm-up that cost nothing, or a limit longer than
+    # it, would make every assertion below pass against a session that never beat at all.
+    assert WARM_UP_COSTS > STALE_AFTER, "the warm-up is shorter than the limit; nothing is proved"
+
+    submits = [moment for moment in venue.timeline if moment.what == "submit"]
+    assert submits, "no order was ever submitted; this test proved nothing"
+    assert all(moment.alive for moment in submits), (
+        "the executor would refuse this session's own orders — it had not said it was alive "
+        f"when it placed them: {venue.timeline}"
+    )
+
+
+def test_a_session_that_cannot_write_its_first_heartbeat_hands_nothing_over(
+    session: Session,
+    session_factory: Callable[[], Session],
+    live_plan: SessionPlan,
+    parquet_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """**How the ordering above fails if it fails — the question a new guard has to answer.**
+
+    `Heartbeat.start()` swallows what its beat raises, on purpose: a transient failure mid-session
+    must not stop a heartbeat for good. But that means "the heartbeat is open" is not the same
+    claim as "the row says the session is alive", and if they came apart here the session would
+    walk straight back into the demo failure — placing orders the executor refuses, while the
+    strategy crosses over believing they rest at the venue (ADR-0023's ghost, from the side
+    nobody was watching).
+
+    So it refuses, loudly, and **before anything reaches the venue**. The row is left `running`
+    with no beat, which is what `reconcile_stale` exists to settle — the same shape a hand-over
+    that refuses already leaves.
+    """
+
+    def a_heartbeat_that_cannot_reach_the_database(*_a: object, **_k: object) -> Heartbeat:
+        def beat() -> None:
+            raise RuntimeError("the database is gone")
+
+        return Heartbeat(beat, every=dt.timedelta(seconds=30), name="heartbeat-refusing")
+
+    monkeypatch.setattr(
+        "tradeforge_api.live.session.session_heartbeat", a_heartbeat_that_cannot_reach_the_database
+    )
+
+    made = VenueFactory(factory_of(session_factory), lambda: split()[2])
+    with pytest.raises(Exception, match=r"(?i)heartbeat"):
+        run_live(session_factory, live_plan, parquet_root, venue=made)
+
+    venue = made.built
+    assert venue is not None, "the venue was never built; the refusal came too early to prove this"
+    assert venue.submitted == [], (
+        "an order reached the venue from a session that could not say it was alive"
+    )
 
 
 def test_the_venue_is_built_and_refused_before_the_row_is_written(
@@ -335,7 +507,7 @@ def test_the_venue_is_built_and_refused_before_the_row_is_written(
     assert venue is not None
     assert venue.started
 
-    before_the_row = [what for what, on_file in venue.timeline if not on_file]
+    before_the_row = [moment.what for moment in venue.timeline if not moment.on_file]
     assert before_the_row == ["built", "start"], (
         f"the venue was started after the row was written: {venue.timeline}"
     )
@@ -537,7 +709,7 @@ def test_the_warm_up_holding_a_position_writes_no_row_and_builds_no_venue(
 
     candles = golden_candles()
     mid = a_bar_holding_a_position(candles)
-    made = VenueFactory(factory_of(session_factory))
+    made = VenueFactory(factory_of(session_factory), lambda: candles[mid].time)
 
     with pytest.raises(Exception, match=r"(?i)position"):
         run_session(

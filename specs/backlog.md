@@ -1012,3 +1012,94 @@ magic, compara os níveis por lado, e recusa antes de qualquer envio.
 ⚠️ E a identidade também ficou sendo dela: o `TRADE_ACTION_SLTP` sai com `magic=0` e `symbol=''` —
 medido — então **o ticket é a identidade inteira** da instrução. Um ticket que não veio do filtro
 por magic poderia ser de um trade manual seu ou de outro EA.
+
+---
+
+## ~~O aquecimento faz a sessão nascer parecendo morta~~ — FECHADO (PR-304-B-C)
+
+**Medido contra a conta demo em 28/08/2026, na primeira sessão `live` que este projeto rodou.**
+A sessão subiu certa, aqueceu sobre 39.204 barras, abriu a linha, e o `hand_over` colocou sua
+ordem no fio. O executor a **recusou**:
+
+```
+order_audit: demand-20260730T1500-360  ·  refused
+             "the core is not answering; no new orders while it is silent"
+```
+
+### A causa, com os números
+
+```
+started_at        00:03:33   ← `opened_at = now()` no TOPO do `run_session`
+ordem submetida   00:15:13   ← depois do aquecimento
+silêncio               700s   contra STALE_AFTER = 60s
+```
+
+O executor pergunta `ledger.session_is_alive`, que cai em
+`is_stale(heartbeat_at=None, started_at=…, now=…)`. E `heartbeat_at` **é NULL nesse instante**,
+por três decisões que estão individualmente certas e se somam errado:
+
+1. `open_session` deixa `heartbeat_at` NULL **de propósito** — é assim que se distingue "o
+   processo morreu entre abrir a linha e a primeira barra".
+2. `session.py` abre o `session_heartbeat` **depois** do `hand_over`. Era correto quando o
+   hand-over era local; desde o PR-304-B-B ele **envia ao venue**.
+3. `silence()` cai em `started_at` quando não há beat — e `started_at` é o instante **anterior ao
+   aquecimento**.
+
+⚠️ **É sistemático e piora com o que deveria melhorar a sessão:** quanto mais história ela aquece,
+mais morta ela parece no exato instante em que coloca sua primeira ordem. Com 39 mil barras são
+700 s de "silêncio" para um limite de 60.
+
+### E tem uma segunda cara, pior
+
+`MT5Broker.submit` respondeu `accepted` — e está **certo**, porque aceito é um fato local e o
+protocolo diz isso desde a fase 1. Mas o executor recusou depois. Então a estratégia atravessou
+para a sessão **acreditando que armou uma limite que o venue nunca viu**: o fantasma do ADR-0023,
+chegando pelo lado que ninguém tinha olhado — não pelo veto do risco, mas pela salvaguarda do
+executor, três processos adiante e assíncrona.
+
+### O conserto, e o que ele precisou além do óbvio
+
+Abrir o `session_heartbeat` **antes** do `hand_over`. Mas isso sozinho não bastou, e a medição é
+o motivo: `Heartbeat.start()` só *disparava a thread*, e o primeiro beat acontecia nela. Sondado
+sobre 200 partidas, com um beat custando 1 ms — o piso de um round-trip ao Postgres:
+
+```
+beat custa   0.0 ms -> o chamador seguiu ANTES do 1o beat em  48/200
+beat custa   1.0 ms -> o chamador seguiu ANTES do 1o beat em 200/200
+```
+
+Ou seja: subir o `with` sozinho trocaria uma falha sistemática de 700 s por uma corrida perdida
+**sempre**, e do mesmo jeito silencioso. Então `start()` passou a bater de forma **síncrona, na
+thread do chamador**, antes de criar a thread da cadência — que é o que o docstring do módulo já
+prometia (*"it happens at `start()`"*) sem entregar.
+
+E como `start()` engole o que o beat levanta (de propósito: falha transitória não pode parar um
+heartbeat), "o heartbeat está aberto" não é "a linha diz que está viva". O `session.py` confere
+`beating.beats` e **recusa o hand-over** se o primeiro beat não pegou.
+
+⚠️ Não confundir com "aumentar `STALE_AFTER`". Verificado como mutante: subir o limite mata o
+teste pela guarda de vacuidade (`WARM_UP_COSTS > STALE_AFTER`), como tem que ser.
+
+⚠️ **E o conserto tentador de uma linha também foi verificado**: `open_session` gravar
+`heartbeat_at = at`. Com o código pré-PR mais essa linha, o golden **continua vermelho** — porque
+`at` é o instante anterior ao aquecimento, então a sessão segue silenciosa por 700 s. O teste
+separa o conserto certo do vizinho.
+
+---
+
+## ⚠️ PR-304-B-D — A recusa do executor não volta para a estratégia
+
+**Separado do PR-304-B-C de propósito** (decisão de 28/08): é mudança de contrato entre três
+processos, e um PR = um escopo.
+
+`MT5Broker.submit` responde `accepted` — e está **certo**, porque aceito é um fato local e o
+protocolo diz isso desde a fase 1. Mas o executor pode recusar depois, assíncrono e três
+processos adiante. Quando isso acontece, a estratégia atravessa **acreditando que armou uma
+limite que o venue nunca viu**: o fantasma do ADR-0023, chegando pelo lado que ninguém tinha
+olhado — não pelo veto do risco, mas pela salvaguarda do executor.
+
+Hoje isso só aparece no `order_audit`, que ninguém está lendo em tempo real.
+
+⚠️ O PR-304-B-C fecha a causa que produziu a recusa medida na demo, **não o caminho de volta**.
+Qualquer outra recusa do executor (magic desconhecida, stop afrouxando, AutoTrading desligado)
+produz o mesmo fantasma, em silêncio.

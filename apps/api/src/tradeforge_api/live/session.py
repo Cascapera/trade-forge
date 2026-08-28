@@ -4,8 +4,14 @@ Everything this needs already exists; what was missing is the order the pieces g
 order is the content of this module. Read it top to bottom and it is the life of a session:
 
     warm up over history  ->  build the broker it will trade through  ->  open the row  ->
-    hand over what is still resting  ->  beat, and trade, and record, one bar at a time  ->
-    finish the row
+    say it is alive  ->  hand over what is still resting  ->  trade and record, one bar at a
+    time  ->  finish the row
+
+⚠️ **"Say it is alive" comes before the hand-over, and it did not always.** The hand-over
+submits, the executor refuses orders from a session it has not heard from, and `started_at` is
+stamped before a warm-up that takes minutes — so a session that beat only once it started
+trading had every one of its first orders refused. Measured against the demo account; the
+comment at the `session_heartbeat` call carries the numbers.
 
 ⚠️ **A session is not a job.** `arq` applies `job_timeout` with `asyncio.wait_for`, and a
 session runs for days; a job that blocks the event loop freezes the whole queue, which PR #133
@@ -261,27 +267,50 @@ def run_session(  # noqa: PLR0913 — keyword-only; each names one seam of a ses
             session_id=session_id,
         )
 
-    handover = hand_over(warm, live, symbol=symbol, bars=candles.warmed, risk=risk, instrument=spec)
-    logger.info(
-        "warmed over %d bars, carried %d resting order(s), refused %d",
-        handover.bars,
-        len(handover.carried),
-        len(handover.refused),
-    )
-
     bars = 0
     failure: str | None = None
     watch = LedgerWatch(symbol)
     recorder = TradeRecorder(session_id, plan.instrument_id)
 
-    # The heartbeat starts before the first bar and stops before the row is finished. Both ends
-    # matter: a session is alive from the moment it opens, and a beat landing after `stopped_at`
-    # would leave a stopped row claiming it was heard from afterwards.
-    try:
-        # ⚠️ The session hands over its own clock. Two clocks in one session is not a test
-        # artefact: `stopped_at` and `heartbeat_at` are compared by anyone reading the row, and a
-        # beat stamped from a different source than the stop can land after it.
-        with session_heartbeat(factory, session_id, now=now):
+    # ⚠️ **The beat opens before the hand-over, not after it, and that ordering is a live bug
+    # this cost an account to find.** Measured on the demo on 2026-08-28: a session warmed over
+    # 39 204 bars, opened its row, and `hand_over` put its limit on the wire — and the executor
+    # refused it, because `session_is_alive` saw `heartbeat_at` NULL and fell back to
+    # `started_at`, which is stamped *before* the warm-up. 700 s of "silence" against a 60 s
+    # limit. Three correct decisions summing to a session declared dead in the instant it first
+    # acts, and it gets **worse the more history a session warms over**.
+    #
+    # So the heartbeat now covers every moment the session acts, not just the moments it trades.
+    # The other end is unchanged and still matters: it stops before the row is finished, because
+    # a beat landing after `stopped_at` would leave a stopped row claiming it was heard from
+    # afterwards.
+    #
+    # ⚠️ The session hands over its own clock. Two clocks in one session is not a test artefact:
+    # `stopped_at` and `heartbeat_at` are compared by anyone reading the row, and a beat stamped
+    # from a different source than the stop can land after it.
+    with session_heartbeat(factory, session_id, now=now) as beating:
+        # ⚠️ **How the ordering above fails if it fails.** `Heartbeat.start()` beats on this
+        # thread and swallows what that beat raises, so "the heartbeat is open" is not by itself
+        # "the row says so" — a database that refused this one write would put us straight back
+        # in the failure above, silently, with the strategy believing it armed an order the
+        # venue was never allowed to hear about. A refusal to start, like every other one here.
+        if not beating.beats:
+            raise EngineError(
+                "refusing to hand over: the session could not write its first heartbeat, so the "
+                "executor would refuse every order it places as coming from a silent session"
+            )
+
+        handover = hand_over(
+            warm, live, symbol=symbol, bars=candles.warmed, risk=risk, instrument=spec
+        )
+        logger.info(
+            "warmed over %d bars, carried %d resting order(s), refused %d",
+            handover.bars,
+            len(handover.carried),
+            len(handover.refused),
+        )
+
+        try:
             for outcome in iter_run(
                 candles=candles.live(),
                 timeframe=timeframe,
@@ -300,9 +329,9 @@ def run_session(  # noqa: PLR0913 — keyword-only; each names one seam of a ses
                 bars += 1
                 if stopping():
                     break
-    except Exception as exc:  # a failed session is a recorded result, not a crash
-        failure = f"{type(exc).__name__}: {exc}"
-        logger.exception("session %s failed after %d bars", session_id, bars)
+        except Exception as exc:  # a failed session is a recorded result, not a crash
+            failure = f"{type(exc).__name__}: {exc}"
+            logger.exception("session %s failed after %d bars", session_id, bars)
 
     with session_scope(factory) as db:
         finish_session(db, session_id, at=now(), error=failure)

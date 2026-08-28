@@ -20,12 +20,18 @@ advanced" are different questions, and a single answer to both is the failure th
 already documented once, when the collector agent's hourly arq health check nearly had a
 healthy agent declared stuck.
 
-**On the first beat.** It happens at `start()`, not one interval later. `open_session` leaves
-`heartbeat_at` NULL and reads that as "died between opening and its first bar"; the beat's
-documented meaning is that the process exists, and it does exist at start. Waiting an interval
-would make a session killed five seconds in indistinguishable from one whose thread never ran.
-Reconciliation is unaffected either way — `is_stale` measures from `started_at` when the beat is
-NULL.
+**On the first beat.** It happens at `start()`, not one interval later, and it happens **before
+`start()` returns**. `open_session` leaves `heartbeat_at` NULL and reads that as "died between
+opening and its first bar"; the beat's documented meaning is that the process exists, and it does
+exist at start. Waiting an interval would make a session killed five seconds in indistinguishable
+from one whose thread never ran.
+
+⚠️ **"At `start()`" used to mean "on the thread `start()` spawned", and those are not the same
+promise.** A caller that begins a heartbeat because it is about to do something that requires
+being alive got a beat that had not landed yet — measured, 200 starts out of 200 at a realistic
+beat cost. `session.py` is that caller, and the demo account produced the failure in full: a
+session warmed over 39 204 bars, opened its row, placed the warm-up's resting order, and the
+executor refused it as silent for 700 s. See `start()`.
 """
 
 import datetime as dt
@@ -96,11 +102,23 @@ class Heartbeat:
         """Beats that raised. See `_loop` for why they do not end the thread."""
 
     def start(self) -> None:
-        """Beat now, then every interval, on a daemon thread.
+        """Beat now — **on the caller's thread** — then every interval, on a daemon thread.
 
         Daemon so that a crashed main thread cannot leave a process alive purely because
         something is still writing heartbeats — a session that keeps claiming to be alive after
         its engine died is the exact reading this module exists to prevent.
+
+        ⚠️ **The first beat is synchronous, and that is not a detail of scheduling.** This used
+        to happen on the new thread, and "beat now" then meant "beat soon": `start()` returned
+        with nothing written, and the caller carried on. Measured over 200 starts with a beat
+        costing a millisecond — the floor for a Postgres round trip — the caller was ahead of
+        the first beat **200 times out of 200**. So a caller that starts a heartbeat and then
+        does something that depends on being alive is, in practice, always doing it too early.
+        `session.py` is exactly that caller: it places the warm-up's resting orders immediately
+        afterwards, and the executor refuses orders from a session that has not been heard from.
+
+        The cost is that `start()` now blocks for one beat. Bounded by `BEAT_LOCK_TIMEOUT`, and
+        paid once.
         """
         if self._thread is not None:
             # Two threads beating is not twice as alive; it is two writers on one column and a
@@ -111,6 +129,11 @@ class Heartbeat:
         # thread has not noticed yet, and clearing on the way out would give a beat still in
         # flight a fresh licence to loop.
         self._stopping.clear()
+        # ⚠️ Before the thread exists, so `beats` is already truthful when `start()` returns and
+        # a caller can *ask*. Swallowed like any other beat rather than raised: whether a
+        # heartbeat that could not reach the database is fatal is the caller's question, not
+        # this class's, and `session.py` refuses on it.
+        self._beat_safely()
         self._thread = threading.Thread(target=self._loop, name=self._name, daemon=True)
         self._thread.start()
 
@@ -137,13 +160,15 @@ class Heartbeat:
             )
 
     def _loop(self) -> None:
+        # Waits *first*: the beat for this instant was already made by `start()`, on the
+        # caller's thread. Beating again here would double the write and, worse, make the first
+        # interval half an interval.
+        #
         # `Event.wait` rather than `sleep`, so `stop()` returns immediately instead of after up
         # to a full interval. On a 15-second beat that is the difference between a session
         # process exiting at once and appearing to hang.
-        while True:
+        while not self._stopping.wait(self._interval):
             self._beat_safely()
-            if self._stopping.wait(self._interval):
-                return
 
     def _beat_safely(self) -> None:
         """One beat, and never an exception.

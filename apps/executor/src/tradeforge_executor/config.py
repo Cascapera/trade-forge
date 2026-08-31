@@ -60,6 +60,49 @@ class ExecutorSettings(PostgresSettings):
     stop being moved. It also bounds how long a shutdown takes to be noticed.
     """
 
+    server_offset: dt.timedelta = dt.timedelta(hours=3)
+    """How far the terminal's clock is ahead of UTC. **Stated, never measured.**
+
+    ⚠️ **MT5 hands out server time labelled as if it were UTC**, and there is no API that says so.
+    Measured on 2026-08-31 against this terminal: `symbol_info_tick().time` read as UTC gave
+    `20:49` while UTC was `17:49`. Every timestamp from the terminal carries that offset —
+    `history_deals_get` interprets its *arguments* in it too — so a gateway that did not correct
+    for it would look for a deal's quote three hours away from the deal, find nothing, and report
+    a thin market. Silent, and indistinguishable from the real thing.
+
+    ⚠️ **Stated rather than inferred, for the reason `tradeforge_collector.mt5_source` gives**: an
+    offset measured from the newest tick is a measurement of when the market last traded, so a
+    shut market makes it grow, and a number that changes with the weekend is not a clock. Stated
+    is also deterministic, which is this project's second invariant.
+
+    ⚠️ **The same fact lives in the collector's `--server-offset`**, and the two can drift. Filed
+    in `specs/backlog.md`: they describe one terminal and should eventually have one home.
+    """
+
+    deal_quote_window: dt.timedelta = dt.timedelta(seconds=2)
+    """How far from a deal a tick may be and still be called that deal's quote.
+
+    ⚠️ **A declared bound, not "the nearest tick there is".** A deal's own quote is not in MT5's
+    history; only the tick stream around it is. Measured on 2026-08-31 against a real deal from a
+    thin evening (2026-08-26 20:52:36 UTC): `±1s` returned **no ticks at all**, and `±5s`
+    returned one, **3 438 ms away**. So "nearest" can mean seconds, and a spread from seconds
+    away charged as the deal's own is the shape of error this project has a rule about — a
+    contaminated measurement is safe to stamp and disastrous in an `if`, and this one decides
+    money.
+
+    Outside this window the deal is **not published** rather than priced with the closest thing
+    to hand. `Placement.__post_init__` already refuses a fill that cannot say what crossing cost;
+    this is the same refusal on the path where the quote has to be recovered instead of read.
+    """
+
+    deal_scan_every: dt.timedelta = dt.timedelta(seconds=10)
+    """How often the executor asks the venue what it has executed since last time.
+
+    Bounds how long a session can hold a position it has not been told about. Not free: each scan
+    is a round trip to the terminal, and the terminal is single-threaded — see `DealWatch` for
+    why this is a thread of its own rather than a line in the order loop.
+    """
+
     @property
     def redis_url(self) -> str:
         return f"redis://{self.redis_host}:{self.redis_port}/0"

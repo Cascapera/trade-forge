@@ -33,7 +33,7 @@ from tradeforge_executor.wire import (
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["record", "request_fields", "session_is_alive"]
+__all__ = ["deal_was_reported", "record", "request_fields", "session_for", "session_is_alive"]
 
 
 def session_is_alive(db: Session, session_id: str, *, now: dt.datetime) -> bool:
@@ -147,6 +147,67 @@ def _verdict(outcome: Outcome, order: Instruction) -> tuple[OrderAuditStatus, st
         # believes it has.
         return OrderAuditStatus.PARTIAL, None
     return OrderAuditStatus.SENT, None
+
+
+def session_for(db: Session, client_id: str) -> str | None:
+    """Which live session sent the order named `client_id`, or `None` if this cannot be said.
+
+    ⚠️ **Read back out of `order_audit`, which is the only record that a name and a session ever
+    belonged together.** A deal read from the venue's history carries the name in its comment and
+    nothing else; the executor that sent it may have restarted since, and an in-memory map would
+    be exactly as forgetful as the bug this supports (`deals.py`) exists to fix.
+
+    ⚠️ **The most recent row wins, and rows with no session are not answers.** A `client_id` is
+    minted per arming, so repeats across sessions are possible in principle; the latest sending of
+    that name is the one a deal arriving now belongs to. A row whose `live_session_id` is NULL was
+    written for a session that was not on file — see `record` — and it says nothing about who
+    owns this deal.
+
+    ⚠️ **`None` is a refusal, not an absence to be worked around.** `WireFill.session_id` routes a
+    fill to the strategy that armed it, so guessing here would hand a real position to a session
+    that never asked for one — the ghost of ADR-0023 with the sign flipped, and a worse one,
+    because the position is real.
+    """
+    found = (
+        db.query(OrderAudit.live_session_id)
+        .filter(OrderAudit.client_id == client_id, OrderAudit.live_session_id.is_not(None))
+        .order_by(OrderAudit.requested_at.desc())
+        .first()
+    )
+    return str(found[0]) if found is not None else None
+
+
+def deal_was_reported(db: Session, ticket: int) -> bool:
+    """Did the order loop already publish this execution when it placed the order?
+
+    ⚠️ **The de-duplication that matters, and it is here rather than in a watermark.** A market
+    order trades inside `order_send`, so the order loop publishes its `WireFill` on the spot — and
+    that same execution is in the venue's history, where `deals.py` will find it. Publishing it
+    twice would have a session open two positions in its ledger for one trade, which is strictly
+    worse than the bug that scan exists to fix.
+
+    ⚠️ **`order_audit.response` is the record, and it is durable in the right way.** The row is
+    written in the same unit of work as the send and before the ack (see `Service.handle`), so a
+    deal whose ticket appears in a response was reported by a run that got far enough to record
+    it. A watermark cannot make that promise: the order loop does not know the deal's *instant* —
+    `order_send` answers with a ticket and no time — and a process that died between publishing
+    and advancing a mark would leave the duplicate this prevents.
+
+    The watermark still earns its place; it just does a different job. It bounds how far back each
+    scan asks, so a ten-second loop does not re-read a month of history. Correctness here, cost
+    there.
+    """
+    # ⚠️ **Zero is not a deal, and it is in almost every row.** The terminal answers a *resting*
+    # order with `deal=0` — the echo `Placement.__post_init__` exists to refuse — so
+    # `response['deal']` is `0` on every limit this system has ever placed. Matched literally, a
+    # ticket of zero would come back "already reported" against all of them, and the caller would
+    # read that as licence to suppress a fill. There is no execution numbered zero to ask about.
+    if ticket == 0:
+        return False
+    found = (
+        db.query(OrderAudit.id).filter(OrderAudit.response["deal"].astext == str(ticket)).first()
+    )
+    return found is not None
 
 
 def _known_session(db: Session, session_id: str) -> uuid.UUID | None:

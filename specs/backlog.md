@@ -891,8 +891,16 @@ o pior modo de falha possível para dinheiro real.
 apareceu, correlacionando pelo `client_id` no comment da ordem. É um segundo produtor da mesma
 stream, com a mesma regra de "publica só o que tem `deal`".
 
-⚠️ Enquanto isso não existe, **o executor só é honesto com ordem a mercado**. Uma sessão live com
-limite armada não deve subir.
+✅ **FECHADO no PR-304-B-D-2d.** `DealWatch` varre `history_deals_get` numa thread própria a cada
+10 s, recupera a cotação do tick mais próximo (janela declarada) e publica em `venue.outcomes`.
+De-duplicação pelo `order_audit` (`ledger.deal_was_reported`), não por marca d'água — o laço de
+ordens não sabe o *instante* do deal, então não tem como avançar uma marca honestamente.
+
+⚠️ **Descoberto ao construir:** os timestamps do MT5 vêm no relógio do **servidor** (medido:
+UTC+3), inclusive nos argumentos do `history_deals_get`. Sem corrigir, todo deal fica 3 h no
+futuro, a busca de cotação não acha nada e o log diz "mercado fino". Agora há
+`ExecutorSettings.server_offset`, declarado e não medido — ⚠️ **e o mesmo fato vive no
+`--server-offset` do coletor**; os dois descrevem um terminal só e deviam ter uma casa só.
 
 ---
 

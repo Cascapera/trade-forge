@@ -5,9 +5,15 @@ send it, record it, publish the fill if there was one, ack. That closes correctl
 order, where the trade happens inside the call. For a **limit** it does not. The placement comes
 back `retcode=10009` with `deal=0` — accepted and resting — and the execution happens minutes or
 hours later, by which time the entry has been acknowledged and the executor has forgotten the
-order. A session that arms limits, which is what the SMC strategy does (ADR-0015), opens a
+order. A session that arms limits, which is what the SMC strategy does (ADR-0014), opens a
 position at the venue and is **never told**. The ledger and the account then diverge in silence,
 which is the worst failure mode there is for real money.
+
+⚠️ **And the damage is not only in the money.** ADR-0015's rule is that a region is spent by the
+**fill**, not by the placement — so a fill nobody hears about is a zone that never burns, and the
+strategy goes on offering a region it has already traded. The ledger diverging is what an operator
+would eventually see on a statement; this one is invisible from outside and changes what the
+strategy decides next.
 
 **Why a thread, and not a line in the order loop.** `snapshot.py` made this argument first and it
 applies here unchanged: *the cadence of a signal must not be borrowed from the cadence of the

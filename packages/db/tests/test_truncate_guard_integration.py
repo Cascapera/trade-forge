@@ -16,7 +16,6 @@ from collections.abc import Iterator
 
 import pytest
 from sqlalchemy import URL, Engine, create_engine, text
-from sqlalchemy.exc import ProgrammingError
 
 from tradeforge_db.config import PostgresSettings
 from tradeforge_db.session import create_db_engine
@@ -64,28 +63,29 @@ def test_truncate_refuses_a_database_not_named_as_disposable(maintenance_engine:
     )
 
 
-def test_the_refusal_leaves_the_audit_trigger_alone(maintenance_engine: Engine) -> None:
+def test_nothing_is_executed_before_the_refusal(maintenance_engine: Engine) -> None:
     """The other half of the ordering, asserted where it can be seen rather than inferred.
 
     ⚠️ This is not a restatement of the test above. That one shows *which* exception comes out;
     this one shows the database was not touched on the way to it. They come apart in exactly the
     implementation worth worrying about: an unguard, then a refusal, then a `finally` that
-    re-guards would satisfy the first test and leave a real window — narrow, and open — in which
-    `order_audit` is not append-only.
+    re-guards would satisfy the first test and still leave a real window — narrow, and open — in
+    which `order_audit` is not append-only on a database nobody meant to touch.
+
+    ⚠️ **The read after the refusal is the assertion, and it works by Postgres' own rule**: a
+    statement that errors poisons the whole transaction, so every later one on that connection is
+    refused until rollback. Against an implementation that reached `_UNGUARD` — which fails here,
+    because `postgres` has no `order_audit` — this line raises instead of answering. Named as
+    "nothing is executed" rather than "the trigger is left alone" because the maintenance database
+    has no such trigger to leave alone; what is proven is the step before it.
     """
     with maintenance_engine.connect() as connection:
         before = connection.execute(text("SELECT current_database()")).scalar_one()
+
         with pytest.raises(NotDisposableError):
             truncate(connection, TABLES_CHILD_FIRST)
 
-        # The connection is still usable and still on the same database: nothing was executed,
-        # so nothing aborted the transaction. Against an implementation that reached `_UNGUARD`,
-        # this read raises `ProgrammingError` — the failed statement poisons the transaction —
-        # which is the observable difference between "refused" and "refused after trying".
-        try:
-            after = connection.execute(text("SELECT current_database()")).scalar_one()
-        except ProgrammingError as exc:  # pragma: no cover - only on a regression
-            pytest.fail(f"a statement ran before the refusal and broke the transaction: {exc}")
+        after = connection.execute(text("SELECT current_database()")).scalar_one()
 
     assert after == before == MAINTENANCE
 

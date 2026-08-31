@@ -72,6 +72,46 @@ stopped by the noise of the turn itself.
 """
 
 
+MAX_ARMING_ATTEMPTS = 3
+"""How many times **in a row** one zone may be armed and turned away before it stops being offered.
+
+⚠️ **In a row, and the word is load-bearing.** An order that is re-armed and then rests in the
+book without being refused clears the streak — whatever was turning it away has stopped. Counted
+cumulatively instead, three one-minute hiccups spread across thirty-nine hours would retire a
+setup exactly as a forty-five-minute outage would; measured on `arms_a_resting_limit`, refusals on
+bars 61, 80 and 100 with healthy resting in between burned the zone. That is a different rule from
+the one chosen, and the cost quoted below is the cost of *this* one.
+
+⚠️ **A rule about the method, not a safeguard**, and that decides where it lives and who chose
+it. The refusals a strategy sees are not only the live ones — `SIZING`, `RISK` and `BROKER` fire
+in a backtest too — so this number changes what the strategy does everywhere, not only against a
+venue. It is enforced in `_may_arm`, the single chokepoint for *may this region be traded at
+all*, beside the rules that say a zone is spent or a region no longer stands.
+
+**Measured, which is why a cap exists at all.** On `arms_a_resting_limit` against a permanent
+refusal, the zone is re-armed on **every bar it stands** — 48 in a row (bars 61 to 108), 50 across
+the 175. Each attempt puts an order on the wire, writes an `order_audit` row, and mints a fresh
+`client_id`; and a re-armed order re-stamps `confirmed_by` from a bar with no break in it, so the
+`EntrySnapshot` of whichever attempt finally enters stops drawing the structure that justified it.
+The loop does not merely make noise — it degrades the record of the trade it eventually opens.
+
+**Three, chosen by Guilherme on 2026-08-31, with the cost stated rather than hidden.** Three
+attempts is three orders instead of forty-eight. Against a *transient* outage — the executor
+down, a session that stopped beating — three M15 bars is about 45 minutes, and a stoppage longer
+than that burns the zone over an infrastructure problem that later cleared. Taken knowingly: a
+setup 45 minutes stale is usually not the setup any more.
+
+⚠️ **A count, deliberately, and not a judgement about *why*.** The plan of record was to cap only
+refusals that will not clear on their own, told apart by `RefusedBy` — and a live session on
+2026-08-31 falsified that premise. The executor's volume cap arrives as `EXECUTOR`, documented as
+*"conditions that change without anybody changing the order"*, and is perfectly permanent: same
+capital, same stop, 0.11 lots every time. The other candidate — comparing the repeated `detail` —
+builds policy on free text that `Refusal` reserves for humans by name. A count needs neither, and
+is deterministic, which this project's second invariant requires of anything a backtest depends
+on.
+"""
+
+
 @dataclass(frozen=True, slots=True)
 class SetupContext:
     """Everything a qualifier is allowed to see on one bar.
@@ -380,6 +420,9 @@ class StructureStrategy:
         # Zones whose order became a trade. Membership only — never iterated — so it cannot
         # leak set ordering into a result (`AGENTS.md §5.2`).
         self._traded: set[OrderBlock] = set()
+        # How many times each zone has been armed and turned away. Read by `_may_arm` and never
+        # iterated, for the same reason `_traded` is not.
+        self._refused: dict[OrderBlock, int] = {}
         # The zone whose trade is currently open (or ended on a bar not yet reported). This is
         # what lets the machinery tell the qualifier *how* a trade ended — see
         # `SetupContext.stopped`.
@@ -622,6 +665,20 @@ class StructureStrategy:
         today the phase holds a refused name from bar 61 all the way to bar 109, and then sends
         exactly that phantom cancel.
 
+        ⚠️ **Only a refusal counts against the cap; a withdrawal does not.** `_withdraw` is this
+        strategy taking its own order back because it changed its mind — a different zone
+        qualified, or the region stopped standing. Nothing turned the order away, so nothing
+        about the venue or the account has been learned, and spending an attempt on it would
+        retire zones that are working exactly as intended.
+
+        ⚠️ **Unobservable in the measured window, and kept deliberately** — the same standing as
+        the `_traded` check in `_may_arm`, which says so in as many words. Probed on
+        `arms_a_resting_limit`: each zone is withdrawn at most once (the cancel on bar 109) and
+        never re-armed afterwards, so three withdrawals on one region cannot be reached and the
+        mutant that counts them **survives the suite**. Recorded rather than deleted on the
+        strength of a green run: the day a qualifier flips between two zones repeatedly, counting
+        withdrawals would silently retire both.
+
         ⚠️ **The zone is not spent.** Only a fill spends a region (the class docstring, and the
         author's rule) — a refused order was never a trade, so the region goes back to being
         offerable and the qualifier may name it again. When it does, `_may_arm` mints a **new**
@@ -637,9 +694,28 @@ class StructureStrategy:
         armed = self._armed
         if armed is None or not armed.placed:
             return
-        if any(refusal.client_id == armed.client_id for refusal in context.refusals):
-            logger.debug("%s never reached the book; the zone is offerable again", armed.client_id)
-            self._armed = None
+        if not any(refusal.client_id == armed.client_id for refusal in context.refusals):
+            # ⚠️ **The streak is broken by an order that simply rested**, and this line is the
+            # difference between two rules that are easy to confuse. The cap is on refusals *in a
+            # row*: a zone whose order was turned away, re-armed, and then sat healthily in the
+            # book for eighteen bars has not spent an attempt — whatever refused it went away.
+            #
+            # Counted cumulatively instead, three one-minute hiccups spread over thirty-nine
+            # hours retire a setup exactly as a forty-five-minute outage would, which is not the
+            # rule that was chosen and not the cost that was quoted for it. Measured on
+            # `arms_a_resting_limit`: refusals on bars 61, 80 and 100 — resting fine in between —
+            # burned the zone under the cumulative reading.
+            self._refused.pop(armed.block, None)
+            return
+
+        self._refused[armed.block] = self._refused.get(armed.block, 0) + 1
+        logger.debug(
+            "%s never reached the book; attempt %d of %d in a row on this zone",
+            armed.client_id,
+            self._refused[armed.block],
+            MAX_ARMING_ATTEMPTS,
+        )
+        self._armed = None
 
     def _trade_outcome(self, context: Context) -> tuple[OrderBlock | None, OrderBlock | None]:
         """`(stopped, won)` — the zone whose trade ended on this bar, by how it ended.
@@ -672,7 +748,7 @@ class StructureStrategy:
         touches. Every rule about *whether a region may be traded* is therefore enforced here,
         once, on the zone actually about to be armed.
 
-        Four refusals, in the order they are cheapest to answer:
+        Five refusals, in the order they are cheapest to answer:
 
         * **The zone already armed.** Re-naming it is not a new setup; acting on the repeat would
           withdraw a resting order and put an identical one back a bar later, moving the fill to
@@ -682,6 +758,10 @@ class StructureStrategy:
         * **A zone that no longer stands** — mitigated, or dropped by the tracker. Checking this
           only at the top of the bar would be a bar too late: the broker fills before the strategy
           runs (`loop.py`), so an order armed on a dead zone fills before its cancel is ever sent.
+        * **A zone turned away `MAX_ARMING_ATTEMPTS` times in a row.** The cap on re-offering,
+          and it belongs here rather than beside the refusal that increments it, for the reason
+          the rest of this list exists: every rule about whether a region may be traded is
+          enforced at one chokepoint.
         * **A zone that has already given its trade.** Only a *fill* puts a zone in `_traded` —
           an order withdrawn untouched leaves its region free to be named again. Under his
           mitigation rule this check is currently unreachable, because the fill and the touch that
@@ -694,6 +774,8 @@ class StructureStrategy:
         if not block.primary and not self._allow_secondary:
             return False
         if block in self._traded:
+            return False
+        if self._refused.get(block, 0) >= MAX_ARMING_ATTEMPTS:
             return False
         return self._still_standing(block)
 

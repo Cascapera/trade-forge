@@ -1164,6 +1164,15 @@ re-arma sob nome novo enquanto a ordem antiga está de fato resting — **duas l
 zona**, que é exatamente o que o docstring do `hand_over` avisa que um venue sem deduplicação
 por nome permite.
 
+✅ **FECHADO no PR-304-B-D-2c**, com **teto por contagem** (`MAX_ARMING_ATTEMPTS = 3`, no
+`_may_arm`) e **não** pela distinção `EXECUTOR`/`VENUE` — essa premissa caiu: medido ao vivo em
+31/08, o teto de volume do executor chega como `EXECUTOR`, documentado como *"condições que mudam
+sozinhas"*, e é permanente. A outra candidata (comparar o `detail` repetido) construiria política
+sobre texto livre, que a `Refusal` reserva para humanos.
+
+Medido: 48 re-armagens na demand viram 3; a supply fica em 2, intocada. ⚠️ Custo declarado: uma
+parada de infra maior que ~45 min em M15 **queima a zona**. Decisão do Guilherme em 31/08.
+
 ---
 
 ## ~~O `hand_over` recusa em silêncio — o quinto ponto do ADR-0023~~ — FECHADO no PR-304-B-D-2b

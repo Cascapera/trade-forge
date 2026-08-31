@@ -15,7 +15,9 @@ from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, localcontext
 
 import pytest
 
+from tradeforge_engine import setups
 from tradeforge_engine.backtest_broker import BacktestBroker
+from tradeforge_engine.costs import NoCostModel
 from tradeforge_engine.domain import (
     AccountState,
     Candle,
@@ -34,6 +36,7 @@ from tradeforge_engine.loop import ENGINE_CONTEXT, iter_run, run
 from tradeforge_engine.risk import PercentRiskManager
 from tradeforge_engine.setup_factory import build_setup
 from tradeforge_engine.setups import (
+    MAX_ARMING_ATTEMPTS,
     ChochQualifier,
     ContinuationQualifier,
     SetupContext,
@@ -2445,3 +2448,175 @@ def test_a_refused_order_does_not_spend_its_zone_because_a_position_is_open() ->
         "spends a region, because a position happened to be open on the same bar"
     )
     assert re_armed[0] == "demand-20240103T0200-2", "it was re-offered under an unexpected name"
+
+
+# --------------------------------------------------------------------------- #
+# The cap on how many times one zone may be offered (PR-304-B-D-2c)             #
+# --------------------------------------------------------------------------- #
+
+
+class _RefusesEverything(BacktestBroker):
+    """A permanent refusal, through the `BROKER` gate — which exists in a backtest too.
+
+    ⚠️ That is the point of using this gate rather than a live one: the cap is a rule about the
+    method, so the scenario that measures it must not need a venue.
+    """
+
+    def submit(self, order: OrderRequest) -> OrderResult:
+        return OrderResult(order=order, accepted=False, reason="permanently no")
+
+
+def _refusals_per_zone(broker: BacktestBroker) -> dict[str, int]:
+    counted: dict[str, int] = {}
+    for outcome in iter_run(
+        candles=arms_a_resting_limit(),
+        timeframe=HOUR,
+        instrument=EURUSD,
+        strategy=build_setup({"type": "structure_choch"}),
+        broker=broker,
+        risk=PercentRiskManager(percent=Decimal(1)),
+    ):
+        for refusal in outcome.refusals:
+            if refusal.client_id is None:
+                continue
+            zone = refusal.client_id.rsplit("-", 1)[0]
+            counted[zone] = counted.get(zone, 0) + 1
+    return counted
+
+
+def test_a_zone_stops_being_offered_after_three_refusals() -> None:
+    """The measured loop, capped. ⚠️ **Both zones are asserted, and that is what separates a cap
+    per zone from a cap per run.**
+
+    Measured on `arms_a_resting_limit` against a permanent refusal *without* the cap: the demand
+    zone is re-armed on every bar it stands — **48** in a row, bars 61 to 108 — and the supply
+    zone twice, 50 in all. A single counter for the whole strategy would come back as three
+    refusals total and satisfy any assertion made about one zone alone.
+
+    The supply zone at **2** is the other half: it is under the cap, so it is untouched. A cap
+    that fired early would show it at 1, and a test that only looked at the capped zone would not
+    notice.
+    """
+    counted = _refusals_per_zone(
+        _RefusesEverything(
+            instrument=EURUSD, initial_capital=Decimal(10_000), cost_model=NoCostModel()
+        )
+    )
+
+    # ⚠️ **The literal three, not `MAX_ARMING_ATTEMPTS`.** Written against the constant, this
+    # assertion follows the rule wherever it goes: a mutant raising the cap to four changes the
+    # code and the expectation together and survives — measured. The number is Guilherme's
+    # decision (see the constant's docstring), so changing it has to be a deliberate act that
+    # edits a test, not a one-character edit nothing notices.
+    assert counted == {
+        "demand-20240103T0200": 3,
+        "supply-20240104T1600": 2,
+    }, f"the cap did not bite per zone: {counted}"
+    assert MAX_ARMING_ATTEMPTS == 3, "the constant and the measured behaviour disagree"
+
+
+def test_the_cap_is_what_stops_it_and_not_the_market(monkeypatch: pytest.MonkeyPatch) -> None:
+    """⚠️ **The vacuity check, and the test above is worth little without it.**
+
+    Three refusals could just as easily be a window where the zone stopped standing on its own —
+    and that reading would go on passing with the cap deleted. Lifting the cap out of reach
+    restores the measured **48**, so the number above is the rule doing something rather than the
+    market running out of bars.
+    """
+    monkeypatch.setattr(setups, "MAX_ARMING_ATTEMPTS", 10_000)
+
+    lifted = _refusals_per_zone(
+        _RefusesEverything(
+            instrument=EURUSD, initial_capital=Decimal(10_000), cost_model=NoCostModel()
+        )
+    )
+
+    assert lifted["demand-20240103T0200"] == 48, (
+        "the zone stopped being armed for a reason other than the cap; the golden above proves "
+        "nothing about the rule"
+    )
+    assert sum(lifted.values()) == 50
+
+
+def _entries_when_refused_on(bars: set[int]) -> list[tuple[int, str | None]]:
+    """Every entry the phase emits when the name it is *currently holding* is refused on `bars`.
+
+    ⚠️ **Refuses the held name, not the one emitted on that bar**, which is the ADR-0024 path and
+    the only one that can produce refusals with healthy gaps between them: `submit` already
+    answered `accepted`, and the verdict arrives later from another process. `_drive_with_a_refusal`
+    refuses on the bar of the arming, so every refusal it makes is consecutive with the last —
+    a scenario in which "three in a row" and "three ever" cannot be told apart.
+    """
+    phase = build_setup({"type": "structure_choch"})
+    account = AccountState(balance=Decimal("10000"), equity=Decimal("10000"))
+    entries: list[tuple[int, str | None]] = []
+    pending: tuple[Refusal, ...] = ()
+    held: str | None = None
+
+    with localcontext(ENGINE_CONTEXT):
+        for index, candle in enumerate(arms_a_resting_limit()):
+            signals = list(
+                phase.on_bar(
+                    Context(candle=candle, instrument=EURUSD, account=account, refusals=pending)
+                )
+            )
+            for signal in signals:
+                if signal.kind is SignalKind.ENTRY:
+                    entries.append((index, signal.client_id))
+                    held = signal.client_id
+            pending = ()
+            if index in bars and held is not None:
+                pending = (
+                    Refusal(
+                        client_id=held,
+                        intent=SignalKind.ENTRY,
+                        refused_by=RefusedBy.EXECUTOR,
+                        reason="entry.choch",
+                        detail="volume 0.11 is above the cap of 0.10",
+                    ),
+                )
+    return entries
+
+
+def test_refusals_with_healthy_resting_between_them_do_not_retire_a_zone() -> None:
+    """⚠️ **The cap is on refusals *in a row*, and this is the only test that says so.**
+
+    Counted cumulatively — which is what the first version of this rule did — three one-minute
+    hiccups spread across thirty-nine hours retire a setup exactly as a forty-five-minute outage
+    would. That is not the rule that was chosen, and it is not the cost that was quoted for it.
+
+    Measured on `arms_a_resting_limit`, refusing the held name on bars 61, 80 and 100 — the order
+    rests untouched for eighteen and nineteen bars in between:
+
+    * consecutive reading (this one): armed again as `-2`, `-3`, `-4`; the zone survives
+    * cumulative reading: the third refusal retires it and `-4` never exists
+
+    ⚠️ The mutant that restores the cumulative reading is one line, and it **survived all 806
+    engine tests** before this existed — the golden below refuses on every bar, and in that
+    scenario the two rules are the same rule.
+    """
+    scattered = _entries_when_refused_on({61, 80, 100})
+
+    names = [name for _bar, name in scattered if name and name.startswith("demand-")]
+    assert names == [
+        "demand-20240103T0200-1",
+        "demand-20240103T0200-2",
+        "demand-20240103T0200-3",
+        "demand-20240103T0200-4",
+    ], f"a zone that rested healthily between refusals was retired anyway: {names}"
+
+
+def test_three_refusals_in_a_row_do_retire_it() -> None:
+    """The other arm of the same fixture, and it is what makes the one above mean something.
+
+    Refused on 61, 62 and 63 — nothing rests in between — the zone stops being offered. Without
+    this, "the zone survived" could be read as a cap that never fires at all.
+    """
+    consecutive = _entries_when_refused_on({61, 62, 63})
+
+    names = [name for _bar, name in consecutive if name and name.startswith("demand-")]
+    assert names == [
+        "demand-20240103T0200-1",
+        "demand-20240103T0200-2",
+        "demand-20240103T0200-3",
+    ], f"the cap did not retire a zone refused three times running: {names}"

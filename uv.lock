@@ -505,13 +505,13 @@ wheels = [
 
 [[package]]
 name = "metatrader5"
-version = "5.0.6090"
+version = "5.0.6147"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/74/be/628204c9990d55aa075a6d0182b59fa0feddc0a842d628fb943b69df102e/metatrader5-5.0.6090-cp312-cp312-win_amd64.whl", hash = "sha256:70601ae582a0d9a5b8e4d074b6f198ccf82a3172ced4c8eb4b47ad091f578a86", size = 47928, upload-time = "2026-08-01T12:31:19.146Z" },
+    { url = "https://files.pythonhosted.org/packages/94/aa/9416b777a5458a936eadae06a0e237d0f6a3890d9548e37ee8b33505b897/metatrader5-5.0.6147-cp312-cp312-win_amd64.whl", hash = "sha256:5b1c0f886809b38cf594c0142bc2a32d98d34e8b9fc0297bab7878957be00f56", size = 47969, upload-time = "2026-08-27T00:15:40.459Z" },
 ]
 
 [[package]]

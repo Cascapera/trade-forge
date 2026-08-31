@@ -1158,19 +1158,38 @@ por nome permite.
 
 ---
 
-## O `hand_over` recusa em silêncio — o quinto ponto do ADR-0023
+## ~~O `hand_over` recusa em silêncio — o quinto ponto do ADR-0023~~ — FECHADO no PR-304-B-D-2b
 
-Encontrado pelo `engine-guardian` fechando o PR-304-B-D-1. `warmup.py:207-224` tem **os mesmos
-três portões** que o `_step` tinha, monta `HandOver.refused` com os nomes das ordens que não
-atravessaram… e **não conta para a estratégia**.
+`HandOver.refused` virou `tuple[Refusal, ...]` (os três portões carimbam quem recusou), o
+`iter_run` ganhou `refusals=` para a semente do que foi recusado **antes da primeira barra**, e o
+`session.py` passa uma coisa na outra. Medido sobre `arms_a_resting_limit` cortado na barra 70,
+com o venue recusando só a ordem do hand-over:
 
-É o único ponto de hand-over do ADR-0023 que sobrou mudo. E agora é barato: o canal existe
-(`Context.refusals`) e os nomes já estão na mão — falta entregá-los no `Context` da **primeira
-barra viva** da sessão.
+| | zona reoferecida | trades fechados |
+|---|---|---|
+| recusas não repassadas | nunca | **0** |
+| repassadas | 1ª barra viva, como `-2` | **1** |
 
-⚠️ Item natural do **PR-304-B-D-2**, junto com o transporte: uma sessão que aquece e recusa
-carregar uma ordem em repouso nasce com exatamente o fantasma que o D-1 acabou de fechar em
-todo lugar menos aqui.
+⚠️ Não era relatório: era **um trade**. A região que o aquecimento armou nunca mais era negociada
+— a frase do ADR-0023, chegando pelo último ponto que ainda estava mudo.
+
+---
+
+## A ordem das recusas do hand-over não é observável
+
+Encontrado pelo `engine-guardian` fechando o PR-304-B-D-2b. `pending = tuple(reversed(refusals))`
+em `loop.py` **sobrevive**: toda fixture tem exatamente uma recusa no hand-over, então nenhum
+teste separa uma ordem da outra.
+
+Não é bug hoje — nada depende da ordem, e `_observe_refusal` casa por nome, não por posição. Mas
+as duas irmãs prometem ordem no docstring (`HandOver.carried` diz "in the order they were
+submitted", `RunResult.refusals` diz "in the order it asked for them") e `HandOver.refused` não
+promete nada. **Fica dívida consciente**: no dia em que a ordem passar a importar, o teste que a
+prenderia precisa de um aquecimento que deixe duas ordens em repouso e as veja recusadas.
+
+⚠️ A `StructurePhase` tem um único slot `_armed`, então duas recusas simultâneas do hand-over só
+são alcançáveis por um double — que é como `test_every_resting_order_crosses_not_just_the_first`
+já testa o laço.
 
 ---
 

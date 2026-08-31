@@ -528,6 +528,85 @@ def test_a_refusal_is_news_once_and_is_not_repeated() -> None:
     assert carrying == [3], f"the refusal was shown on {carrying}, not only on the bar after it"
 
 
+def test_a_refusal_from_before_the_first_bar_is_shown_on_it() -> None:
+    """The hand-over's gap, at the loop's own level (PR-304-B-D-2b).
+
+    A session warms against one broker and trades against another, and an order can be refused
+    *between* the two loops — by a gate no `BarOutcome` will ever report, because no bar of this
+    stream was running when it happened. `iter_run(refusals=...)` is the only door that fact has.
+
+    ⚠️ **Both halves of the assertion are the test.** Shown on bar 0 rather than bar 1 is what
+    separates this from a loop that seeds `pending` after the first `_step`, which would look
+    identical in any scenario where the strategy is idle early. And gone by bar 1 is what
+    separates it from a seed that is never replaced: `StructurePhase` forgets its armed order on
+    a refusal naming it, so a hand-over refusal redelivered for ever would make the phase forget
+    every order it armed afterwards, one bar after arming it — the ghost, rebuilt by the cure.
+    """
+    inherited = Refusal(
+        client_id="zone-7",
+        intent=SignalKind.ENTRY,
+        refused_by=RefusedBy.BROKER,
+        reason="entry.choch",
+        detail="the hand-over could not place it",
+    )
+    strategy = ScriptedStrategy()
+
+    list(
+        iter_run(
+            timeframe=HOUR,
+            candles=rising(4),
+            instrument=EURUSD,
+            strategy=strategy,
+            broker=ImmediateFillBroker(),
+            risk=FixedRisk(),
+            refusals=(inherited,),
+        )
+    )
+
+    assert strategy.refusals_seen[0] == (inherited,), (
+        "the strategy was never shown what the hand-over could not carry"
+    )
+    carrying = [index for index, seen in enumerate(strategy.refusals_seen) if seen]
+    assert carrying == [0], f"the inherited refusal was shown on {carrying}, not only on bar 0"
+
+
+def test_an_inherited_refusal_is_not_reported_as_this_run_s_own() -> None:
+    """⚠️ It was refused before this stream began, so no bar of it produced this.
+
+    `BarOutcome.refusals` is documented as "orders **this bar** asked for", and `RunResult`
+    accumulates exactly those into the record that answers "why did this run take no trades?".
+    A seed folded in there would put a refusal in both halves of that answer — shown to the
+    strategy *and* claimed as this stream's own work — and the first consumer to add up a
+    session's bars would count it twice.
+
+    ⚠️ Nothing persists `outcome.refusals` today (`session.py`'s `_persist` writes fills and
+    trades), so this is a contract kept before it has a consumer rather than a bug prevented.
+    Said plainly because the reverse — a docstring naming a consequence that no code can
+    produce — is how the next reader stops looking.
+    """
+    inherited = Refusal(
+        client_id="zone-7",
+        intent=SignalKind.ENTRY,
+        refused_by=RefusedBy.BROKER,
+        reason="entry.choch",
+        detail="the hand-over could not place it",
+    )
+
+    outcomes = list(
+        iter_run(
+            timeframe=HOUR,
+            candles=rising(4),
+            instrument=EURUSD,
+            strategy=ScriptedStrategy(),
+            broker=ImmediateFillBroker(),
+            risk=FixedRisk(),
+            refusals=(inherited,),
+        )
+    )
+
+    assert [refusal for outcome in outcomes for refusal in outcome.refusals] == []
+
+
 def test_the_run_reports_what_it_refused() -> None:
     """⚠️ Without this the refusal is visible to a strategy and to nobody else — and the person
     asking "why did this backtest take no trades" is not a strategy. A run that placed nothing

@@ -21,7 +21,15 @@ from tradeforge_executor.wire import MAX_CLIENT_ID, HeldPosition
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["MAGIC", "MT5Gateway", "OrderGateway", "Placement"]
+__all__ = [
+    "MAGIC",
+    "MT5Gateway",
+    "OrderGateway",
+    "Placement",
+    "VenueDeal",
+    "deal_from",
+    "spread_from",
+]
 
 # Stamped on every order this project sends, and the only thing that makes an account's positions
 # answerable.
@@ -120,6 +128,121 @@ class Placement:
         return self.accepted and 0 < self.filled_volume < asked
 
 
+@dataclass(frozen=True, slots=True)
+class VenueDeal:
+    """An execution the venue has already recorded, read back from its history.
+
+    The sibling of `Placement` for the half a send cannot see. `Placement` is what the terminal
+    answered *while the order was being placed*; this is what the terminal remembers afterwards,
+    which is the only way a limit that filled an hour later can be noticed at all.
+
+    ⚠️ **Not a `WireFill`, and the distance matters.** This is what MT5 reports; a `WireFill` is
+    what the session is told. Between them sits the one thing history does not carry — the quote
+    at the moment of the deal — and refusing to collapse the two types is what keeps that gap
+    from being filled in silently. See `MT5Gateway.spread_at`.
+
+    ⚠️ It does not live in `wire.py` because it never crosses a process boundary: the executor
+    reads it, prices it, and publishes something else. `HeldPosition` is in `wire.py` precisely
+    because it does cross one.
+    """
+
+    ticket: int
+    """The **deal** ticket, not the order's. Unique per execution, and what the watermark counts."""
+
+    order_ticket: int
+    client_id: str
+    """The name the strategy gave the order, read back out of the deal's comment.
+
+    ⚠️ The comment is the only field that survives from our side into the venue's own history,
+    which is why `send` writes it there and why `MAX_CLIENT_ID` exists. A deal whose comment is
+    empty or unrecognisable is not ours to publish — see `deals_since`.
+    """
+
+    symbol: str
+    at: dt.datetime
+    price: Decimal
+    volume: Decimal
+    entry: int
+    """MT5's `DEAL_ENTRY_*`: whether this execution opened, closed or reversed a position.
+
+    Carried rather than interpreted here. The gateway's job is to report what the venue says;
+    deciding what an entry code means for a session's ledger is a decision, and decisions do not
+    belong in the file that talks to the terminal."""
+
+
+def deal_from(raw: Any, *, server_offset: dt.timedelta) -> VenueDeal | None:  # noqa: ANN401
+    """One record of MT5's deal history as a `VenueDeal`, or `None` if it is not ours to publish.
+
+    ⚠️ **A pure function, and that is the point.** `MT5Gateway` has no unit tests on purpose — a
+    mock of `history_deals_get` proves only that this file calls a function this file describes —
+    and the protection its docstring names is *"having every decision that leads to it tested
+    elsewhere"*. Reading a comment as a name and correcting a clock are decisions. Measured: two
+    mutants that broke them both survived the whole suite while they lived inside the method.
+
+    ⚠️ **The clock correction is the one that fails silently.** MT5 hands out **server time
+    labelled as UTC** — measured 2026-08-31, `symbol_info_tick().time` read as UTC said `20:49`
+    when UTC was `17:49`. Left uncorrected, every deal is stamped three hours into the future, the
+    quote lookup searches three hours from the trade, finds nothing, and the executor reports a
+    thin market. See `ExecutorSettings.server_offset`.
+
+    ⚠️ **A deal with no readable name is `None`, never a guess.** The comment is the only field of
+    ours that survives into the venue's own history. Correlating an unnamed deal to a zone by
+    proximity would tell a session that a region it never armed had traded.
+    """
+    client_id = str(getattr(raw, "comment", "") or "").strip()
+    if not client_id:
+        logger.warning(
+            "deal %s under magic %s carries no name; it cannot be correlated to a zone",
+            getattr(raw, "ticket", "?"),
+            MAGIC,
+        )
+        return None
+    return VenueDeal(
+        ticket=int(raw.ticket),
+        order_ticket=int(raw.order),
+        client_id=client_id,
+        symbol=str(raw.symbol),
+        # `time_msc` rather than `time`: two deals inside one second are two deals, and a
+        # watermark counted in whole seconds would skip the second of them.
+        at=dt.datetime.fromtimestamp(int(raw.time_msc) / 1000, dt.UTC) - server_offset,
+        price=Decimal(str(raw.price)),
+        volume=Decimal(str(raw.volume)),
+        entry=int(raw.entry),
+    )
+
+
+def spread_from(ticks: Any, at_ms: float) -> Decimal | None:  # noqa: ANN401
+    """The crossing cost at `at_ms`, from the ticks around it — or `None` if none prices it.
+
+    ⚠️ **Pure, and out here for the reason `deal_from` is.** `MT5Gateway` has no unit tests by
+    policy; what protects it is *"having every decision that leads to it tested elsewhere"*. Two
+    decisions live in this function, and both were measured surviving the whole suite while they
+    sat inside the method: which tick counts as *the* tick, and whether a tick prices a crossing
+    at all.
+
+    ⚠️ **Nearest by time, not first in the window.** Ticks either side of a deal are both
+    candidates and the one before it is often the better answer. A mutant taking the *furthest*
+    tick in the window is the plausible neighbour here — it returns a real quote from a real tick,
+    just the wrong one, and the further it is the more wrong the cost.
+
+    ⚠️ **A tick with no book does not price a crossing, and zero is not the answer.** MT5
+    publishes trade-only ticks with no quote attached. `ask == 0` makes `ask - bid` negative,
+    which `Placement` refuses one layer down as *"a spread is a magnitude"* — but only after this
+    had already called it an answer. And `bid == ask == 0` subtracts to a clean **zero**, which
+    nothing downstream refuses at all: free execution, published as a measurement. Both are the
+    absence of a quote, so both are `None`.
+    """
+    if ticks is None or len(ticks) == 0:
+        return None
+    nearest = min(ticks, key=lambda tick: abs(int(tick["time_msc"]) - at_ms))
+    if nearest["ask"] <= 0 or nearest["bid"] <= 0:
+        return None
+    # Through `str`, never `Decimal(float)`: the venue quotes 1.16667 and the binary double
+    # nearest it is not that number. Same reason `send` does it.
+    spread = Decimal(str(nearest["ask"])) - Decimal(str(nearest["bid"]))
+    return spread if spread >= 0 else None
+
+
 class OrderGateway(Protocol):
     """Send one order, and say what the venue answered. Nothing else.
 
@@ -186,9 +309,19 @@ class MT5Gateway:
     that leads to it tested elsewhere.
     """
 
-    def __init__(self, *, terminal: Any = None, deviation: int = 20) -> None:  # noqa: ANN401
+    def __init__(
+        self,
+        *,
+        terminal: Any = None,  # noqa: ANN401 — MetaTrader5 ships no type stubs
+        deviation: int = 20,
+        server_offset: dt.timedelta = dt.timedelta(0),
+    ) -> None:
         self._terminal = terminal
         self._mt5: Any = None
+        self._server_offset = server_offset
+        """How far the terminal's clock is ahead of UTC. Applied at this boundary and nowhere
+        else, so everything above this file speaks UTC — see `ExecutorSettings.server_offset`."""
+
         self._deviation = deviation
         """Slippage the venue may take, in points. Not the engine's `slippage_ticks`: that one
         models a backtest's assumption, this one is a real instruction to a real broker."""
@@ -392,6 +525,66 @@ class MT5Gateway:
             (Decimal(str(deal.profit)) for deal in deals if getattr(deal, "magic", None) == MAGIC),
             Decimal(0),
         )
+
+    def deals_since(self, moment: dt.datetime) -> tuple[VenueDeal, ...]:
+        """Every execution under this project's magic since `moment`, oldest first.
+
+        ⚠️ **The half `send` cannot see.** A limit comes back `retcode=10009` with `deal=0` —
+        accepted and resting — and the execution happens minutes or hours later, when the entry
+        that placed it has long been acknowledged and nobody in that loop is watching. Read from
+        history is the only way it is ever noticed.
+
+        ⚠️ **Filtered by magic *and* by a name we recognise**, and both halves are load-bearing.
+        The magic keeps another advisor's trades and the account's manual ones out — the same
+        argument `realised_since` makes. The comment is what says *which* order this was: it is
+        the only field of ours that survives into the venue's own history, which is why `send`
+        writes `client_id` there. A deal of ours with a comment we cannot read is reported and
+        skipped, never guessed at: correlating it to the wrong zone is worse than not
+        correlating it, because a session would then believe a different region had traded.
+
+        Oldest first because the caller advances a watermark through them, and a watermark that
+        moves through unsorted history skips whatever arrives behind it.
+        """
+        mt5 = self._require()
+        # ⚠️ Both bounds go **in server time**: `history_deals_get` interprets its arguments in
+        # the terminal's clock, so a UTC window would ask about three hours ago and answer
+        # confidently about the wrong interval.
+        since = moment + self._server_offset
+        until = dt.datetime.now(dt.UTC) + self._server_offset
+        found = mt5.history_deals_get(since, until) or ()
+        ours = (deal for deal in found if getattr(deal, "magic", None) == MAGIC)
+        deals = [
+            shaped
+            for shaped in (deal_from(deal, server_offset=self._server_offset) for deal in ours)
+            if shaped is not None
+        ]
+        deals.sort(key=lambda deal: (deal.at, deal.ticket))
+        return tuple(deals)
+
+    def spread_at(self, symbol: str, at: dt.datetime, *, within: dt.timedelta) -> Decimal | None:
+        """Ask minus bid at the tick nearest `at`, or `None` if none is near enough.
+
+        ⚠️ **`None` is a refusal to guess, and the caller must treat it as one.** The quote at a
+        deal is the one number the venue does not keep — `send` reads it before the order goes
+        precisely because it cannot be recovered from the answer. It *can* be recovered from the
+        tick stream, and that is what this does; what it must not do is answer with whatever tick
+        is closest regardless of how far. Measured on a real deal from a thin evening, the
+        nearest tick was **3 438 ms** away, and a spread from 3.4 seconds later charged as the
+        deal's own is a made-up cost wearing a measurement's clothes.
+
+        So the window is the caller's to declare (`ExecutorSettings.deal_quote_window`) and this
+        answers within it or not at all.
+
+        ⚠️ Nearest by time, not first in the window: ticks either side of a deal are both
+        candidates, and the one before it is often the better answer.
+        """
+        mt5 = self._require()
+        # In server time, like every other instant this API takes — see `deals_since`.
+        at_server = at + self._server_offset
+        ticks = mt5.copy_ticks_range(
+            symbol, at_server - within, at_server + within, mt5.COPY_TICKS_ALL
+        )
+        return spread_from(ticks, at_server.timestamp() * 1000)
 
     def _require(self) -> Any:  # noqa: ANN401 — MetaTrader5 ships no type stubs
         if self._mt5 is None:

@@ -19,12 +19,15 @@ import types
 from decimal import Decimal
 
 from redis import Redis
+from sqlalchemy.orm import Session, sessionmaker
 
 from tradeforge_db.session import create_db_engine, create_session_factory
 from tradeforge_engine.domain import OrderRequest
 from tradeforge_executor.config import ExecutorSettings
+from tradeforge_executor.deals import DealWatch
 from tradeforge_executor.gateway import MT5Gateway, OrderGateway, Placement
 from tradeforge_executor.kill_switch import EndpointFlag, FileFlag, RedisFlag
+from tradeforge_executor.ledger import deal_was_reported, session_for
 from tradeforge_executor.router import Router
 from tradeforge_executor.safety import KillSwitch
 from tradeforge_executor.service import GROUP, OrderQueue, Service
@@ -40,6 +43,38 @@ _STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM)
 
 def _utcnow() -> dt.datetime:
     return dt.datetime.now(dt.UTC)
+
+
+def _session_of(factory: sessionmaker[Session], client_id: str) -> str | None:
+    """Which session armed `client_id`, on a connection of this scan's own.
+
+    ⚠️ **Its own session, opened and closed per question**, because the caller is another thread.
+    A SQLAlchemy `Session` is not safe to share across threads, and `DealWatch` runs beside the
+    order loop rather than inside it — handing it the loop's session would make two threads write
+    through one connection, which fails intermittently and under load, which is to say when a
+    session is busiest.
+
+    ⚠️ **A database this cannot reach raises, and does not answer `None`.** The two are different
+    facts and collapsing them loses a position for ever: `None` means "asked, and no session owns
+    this name", which is final; a failed query means "could not ask", which is not. `DealWatch`
+    reads the difference — a raise leaves the deal for the next scan, a `None` retires it — and an
+    earlier draft returned `None` for both, so a `docker compose restart postgres` during a fill
+    would have buried that fill behind the watermark permanently.
+    """
+    with factory() as db:
+        return session_for(db, client_id)
+
+
+def _already_reported(factory: sessionmaker[Session], ticket: int) -> bool:
+    """Did the order loop already publish this deal? On its own connection, like `_session_of`.
+
+    ⚠️ **Raises rather than guessing, like `_session_of`.** An earlier draft answered `True` on a
+    failed query — "assume it was reported, do not publish" — which is safe for that one scan and
+    permanent afterwards, because the watermark moved on regardless. A raise says "could not ask",
+    and the scan leaves the deal where it is.
+    """
+    with factory() as db:
+        return deal_was_reported(db, ticket)
 
 
 class RefusingGateway:
@@ -189,7 +224,7 @@ def main(argv: list[str] | None = None) -> int:
     stopping = threading.Event()
     stop_on_signals(stopping)
 
-    terminal = MT5Gateway().connect()
+    terminal = MT5Gateway(server_offset=settings.server_offset).connect()
     gateway: OrderGateway = terminal if args.arm else RefusingGateway(terminal)
     if args.arm:
         logger.critical("ARMED: orders from this queue will be sent to MetaTrader 5")
@@ -222,8 +257,29 @@ def main(argv: list[str] | None = None) -> int:
     # dry run still reports what is really out there rather than an empty account it invented.
     snapshot = VenueSnapshot(redis, gateway)
 
+    # ⚠️ **Armed or not, for the same reason the snapshot is**, and here the argument is sharper.
+    # A dry run still means a *previous* armed run may have left a limit resting at the venue, and
+    # that limit can fill while this process watches. Not scanning would be this executor choosing
+    # not to look at a position that exists.
+    #
+    # ⚠️ It reads through `terminal`, not `gateway`: `RefusingGateway` refuses the *send*, and
+    # `deals_since`/`spread_at` are reads. Passing the refusing wrapper would make a dry run report
+    # an account with no history, which is the empty-answer failure `VenueSnapshot` documents.
+    deals = DealWatch(
+        redis,
+        terminal,
+        # ⚠️ `service.queue`, not `service`: `publish_outcome` belongs to `OrderQueue`, which is
+        # the object that owns the Redis client. mypy refused the wrong one, which is the whole
+        # reason `OutcomePublisher` is a protocol and not a `Callable` somebody remembered to pass.
+        service.queue,
+        session_of=lambda client_id: _session_of(factory, client_id),
+        already_reported=lambda ticket: _already_reported(factory, ticket),
+        every=settings.deal_scan_every,
+        quote_window=settings.deal_quote_window,
+    )
+
     try:
-        with snapshot:
+        with snapshot, deals:
             handled = service.run()
     finally:
         terminal.close()

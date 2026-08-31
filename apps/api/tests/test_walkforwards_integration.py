@@ -10,8 +10,11 @@ Run locally with `docker compose up -d`, then:
 
     POSTGRES_DB=tradeforge_test uv run pytest -m integration
 
-⚠️ The variable is not optional. Without it the integration suite truncates whatever database
-the environment points at, which on a developer machine is the real one.
+⚠️ The variable is not optional, and since 2026-08-31 it is not merely asked for either:
+`tradeforge_db.testing.truncate` refuses to empty a database whose name does not end in `_test`,
+so a run pointed at the real one now stops in its fixture instead of emptying six tables. This
+paragraph said the same thing on its own for months and the loss happened twice anyway — see
+`packages/db/tests/test_truncate_guard_integration.py`.
 """
 
 import asyncio

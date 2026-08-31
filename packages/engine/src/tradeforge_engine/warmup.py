@@ -50,6 +50,8 @@ from tradeforge_engine.domain import (
     ZERO,
     InstrumentSpec,
     OrderRequest,
+    Refusal,
+    RefusedBy,
     Signal,
     SignalKind,
 )
@@ -107,7 +109,7 @@ class HandOver:
         *,
         bars: int,
         carried: tuple[OrderRequest, ...],
-        refused: tuple[str, ...],
+        refused: tuple[Refusal, ...],
         warm_trades: int = 0,
     ) -> None:
         self.bars = bars
@@ -117,13 +119,24 @@ class HandOver:
         """The resting orders re-placed on the live broker, in the order they were submitted."""
 
         self.refused = refused
-        """`client_id`s that did not cross. Empty is the expected answer.
+        """The orders that did not cross, and which gate turned each one away. Empty is the
+        expected answer.
 
-        Two causes, both reported the same way because the consequence is the same: the fresh
-        broker rejected the order, or it re-sized to zero against the session's own account (no
-        stop to size against, or an account too small for one lot step). Reported rather than
-        raised because the session is otherwise fine and the operator needs to know *which*
-        region will not be traded — an exception would replace that with a stack trace.
+        Reported rather than raised because the session is otherwise fine and the operator needs
+        to know *which* region will not be traded — an exception would replace that with a stack
+        trace.
+
+        ⚠️ **`Refusal`s rather than names, and the caller is expected to hand them to the
+        strategy** — `iter_run(refusals=...)`, which delivers them on the session's first live
+        bar. This was a `tuple[str, ...]` until PR-304-B-D-2b, and the strings were the last
+        silent hand-over point in ADR-0023: the strategy marks an order placed the instant it
+        emits the signal, so a name that only ever reached a log left it holding an order the
+        session's broker had refused. Four of five measured hand-over points produced that ghost.
+
+        Three gates, and they are not interchangeable — see `RefusedBy`. `SIZING` and `RISK` are
+        answers about *this account at this moment*; `BROKER` is an answer about the order
+        itself. A strategy deciding whether to offer the zone again is asking exactly that, and
+        a caller that only wanted to print them can still read `client_id`.
         """
 
         self.warm_trades = warm_trades
@@ -189,7 +202,7 @@ def hand_over(  # noqa: PLR0913 — two brokers, the symbol, and the two seams a
 
     account = live.account()
     carried: list[OrderRequest] = []
-    refused: list[str] = []
+    refused: list[Refusal] = []
     # The engine pins its own arithmetic for the same reason `run()` does: `risk.size` divides
     # `Decimal`s, and `getcontext()` is process-global and mutable — any library in this process
     # that sets `prec` or `rounding` changes every number the engine produces.
@@ -207,7 +220,13 @@ def hand_over(  # noqa: PLR0913 — two brokers, the symbol, and the two seams a
             signal = _as_signal(order)
             volume = risk.size(signal, account, instrument)
             if volume <= ZERO:
-                refused.append(order.client_id or order.reason)
+                # ⚠️ `client_id` and `reason` are separate fields, and used to be one. The old
+                # `client_id or order.reason` put a *reason* into a slot every consumer reads as
+                # a name: `StructurePhase._observe_refusal` matches `refusal.client_id` against
+                # the name it is holding, so an unnamed order's reason arriving there is a string
+                # that can only ever match by accident. An unnamed refusal is a log line, not a
+                # correlation — `Refusal` says so, and this now says the same.
+                refused.append(_refusal(order, RefusedBy.SIZING, f"sizing returned {volume}"))
                 continue
             resized = replace(order, volume=volume)
             # ⚠️ **`allow` as well as `size`, and the split is the point.** `protocols.py` keeps
@@ -218,18 +237,36 @@ def hand_over(  # noqa: PLR0913 — two brokers, the symbol, and the two seams a
             # it will look for the calls to `allow`, and this has to be one of them
             # (AGENTS.md §5.7).
             if not risk.allow(resized, account):
-                refused.append(order.client_id or order.reason)
+                refused.append(_refusal(resized, RefusedBy.RISK, "the risk manager vetoed it"))
                 continue
-            if live.submit(resized).accepted:
+            result = live.submit(resized)
+            if result.accepted:
                 carried.append(resized)
             else:
-                refused.append(order.client_id or order.reason)
+                refused.append(_refusal(resized, RefusedBy.BROKER, result.reason))
 
     return HandOver(
         bars=bars,
         carried=tuple(carried),
         refused=tuple(refused),
         warm_trades=len(warm.trades()),
+    )
+
+
+def _refusal(order: OrderRequest, refused_by: RefusedBy, detail: str) -> Refusal:
+    """The order the hand-over turned away, in the shape the strategy is shown refusals in.
+
+    ⚠️ **`intent` is read off the order, never assumed**, even though every order a hand-over
+    carries is resting and only entries rest today. That same guess was made one layer down in
+    PR-304-B-D-2a and had to be taken back in review: a default that is usually right is
+    indistinguishable, to whoever reads the record, from a fact somebody actually had.
+    """
+    return Refusal(
+        client_id=order.client_id,
+        intent=order.intent,
+        refused_by=refused_by,
+        reason=order.reason,
+        detail=detail,
     )
 
 

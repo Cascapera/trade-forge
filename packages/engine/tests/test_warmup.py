@@ -12,6 +12,8 @@ holds. A scripted strategy cannot fail that way — it has no bookkeeping to dis
 would have passed the broken design.
 """
 
+from collections.abc import Sequence
+from dataclasses import replace
 from decimal import Decimal
 
 import pytest
@@ -25,6 +27,7 @@ from tradeforge_engine.domain import (
     InstrumentSpec,
     OrderRequest,
     OrderResult,
+    RefusedBy,
     Side,
     Signal,
     SignalKind,
@@ -256,6 +259,91 @@ def test_what_the_live_broker_refuses_is_reported_not_raised() -> None:
 
     assert result.carried == ()
     assert result.refused, "a refusal happened and was not reported"
+    assert result.refused[0].refused_by is RefusedBy.BROKER
+    assert result.refused[0].detail == "no", (
+        "the broker's own words were dropped; `detail` is the half a human reads, and the "
+        "difference between 'a name I already hold' and 'an order I cannot rest' lives there"
+    )
+
+
+class _RefusesTheFirstOrderItIsHanded(BacktestBroker):
+    """The shape production actually took, on the demo of 2026-08-28.
+
+    The hand-over's order was refused and every order the session placed afterwards went
+    through — so a broker that refuses *everything* cannot show this failure, because a session
+    that can never place anything looks the same whether or not it knows.
+    """
+
+    submits = 0
+
+    def submit(self, order: OrderRequest) -> OrderResult:
+        self.submits += 1
+        if self.submits == 1:
+            return OrderResult(order=order, accepted=False, reason="the venue said no")
+        return super().submit(order)
+
+
+def test_an_order_the_hand_over_could_not_carry_is_not_left_believed_in() -> None:
+    """The fifth silent point of ADR-0023, measured end to end — and it costs a trade.
+
+    Warm-up and live bars are two loops around **one strategy object**, and the gap between them
+    is the only place an order can be refused with no bar running to report it. `StructurePhase`
+    marks its order placed the instant it emits the signal, so the strategy crosses believing a
+    limit rests at a venue that refused it.
+
+    Measured on `arms_a_resting_limit`, cut at bar 70 with the demand zone armed and resting:
+
+    | | zone re-offered | closed trades |
+    |---|---|---|
+    | refusals not handed on | never | **0** |
+    | handed on (this test)  | first live bar, as `-2` | **1** |
+
+    So it is not a reporting nicety: the region the warm-up armed is silently never traded
+    again, which is the sentence ADR-0023 uses and the reason the veto design was thrown out.
+
+    ⚠️ **The re-arm carries a new name.** `_may_arm` mints it off `_armed_count`, and it has to:
+    re-offering under the old name would be refused a second time as a duplicate, by a broker
+    answering a different question, and the retry would never converge.
+    """
+    bars = a_structure_market()
+    cut = 70
+    strategy = build_setup({"type": "structure_choch"})
+    warmed = warm(bars[:cut], strategy)
+    [armed] = warmed.resting()
+    assert not warmed.positions("EURUSD"), "the cut lands mid-trade; a hand-over would refuse"
+
+    live = _RefusesTheFirstOrderItIsHanded(
+        instrument=EURUSD, initial_capital=CAPITAL, cost_model=NoCostModel()
+    )
+    handover = carry(warmed, live, bars=cut)
+    assert handover.carried == (), "the venue took it; there is no refusal to hand on"
+    assert [r.client_id for r in handover.refused] == [armed.client_id]
+
+    session = iter_run(
+        candles=bars[cut:],
+        timeframe=HOUR,
+        instrument=EURUSD,
+        strategy=strategy,
+        broker=live,
+        risk=RISK,
+        refusals=handover.refused,
+    )
+
+    next(session)
+    reoffered = [order.client_id for order in live.resting()]
+    assert reoffered, (
+        "after the first live bar nothing rests: the strategy is still believing in "
+        f"{armed.client_id}, which the venue refused, so it never offered the zone again"
+    )
+    assert reoffered != [armed.client_id], "it re-armed under the name the venue already refused"
+
+    for _ in session:
+        pass
+
+    assert len(live.trades()) == 1, (
+        "the zone the warm-up armed was never traded — the ghost ADR-0023 measured, arriving "
+        "through the one hand-over point that was still silent"
+    )
 
 
 def test_the_hand_over_records_the_bars_it_was_told() -> None:
@@ -320,8 +408,20 @@ def test_an_order_that_resizes_to_nothing_does_not_cross() -> None:
     )
 
     assert result.carried == ()
-    assert result.refused == (resting.client_id,)
     assert live.resting() == ()
+
+    assert [r.client_id for r in result.refused] == [resting.client_id]
+    assert result.refused[0].refused_by is RefusedBy.SIZING, (
+        "the gate that turned it away was not recorded; a strategy cannot tell "
+        "'not with this much money' from 'never this order' if all three gates report the same"
+    )
+    assert result.refused[0].intent is resting.intent
+    assert result.refused[0].reason == resting.reason
+    # ⚠️ **The size that was refused, not the size the order carried.** `f"...{order.volume}"` is
+    # the plausible neighbour and it survived until this line existed: a zero-sized refusal would
+    # report *"sizing returned 1.09"*, which reads to whoever answers the incident as the
+    # opposite of what happened.
+    assert result.refused[0].detail == "sizing returned 0"
 
 
 def test_handing_over_twice_is_refused() -> None:
@@ -386,6 +486,61 @@ def test_every_resting_order_crosses_not_just_the_first() -> None:
     assert len(live.resting()) == 2
 
 
+class _ReportsWhateverItIsTold(BacktestBroker):
+    """A warm broker reporting orders a `BacktestBroker` would refuse to rest.
+
+    ⚠️ **Deliberate, and here is the argument for it.** `hand_over` reads `_resting_orders`
+    through the `RestingOrders` **protocol** — a `Protocol` precisely so that something other
+    than this class can answer it one day — and the two fields below cannot be observed through
+    the class, measured: `submit` refuses an unnamed order (*"a resting order needs a client_id:
+    nothing else can cancel it later"*) and refuses a resting exit (*"only an entry can rest at a
+    level"*). So every fixture in this file hands the hand-over a **named entry**, and against
+    those, a refusal that guessed both fields is indistinguishable from one that read them.
+
+    Both guesses are plausible enough to have been written: `client_id or reason` is what this
+    code said until PR-304-B-D-2b, and a hardcoded `ENTRY` is the exact defect review caught one
+    layer down in PR-304-B-D-2a. Neither would fail visibly — a reason in a name slot simply
+    never matches, and `StructurePhase` goes on holding an order that does not exist.
+    """
+
+    told: tuple[OrderRequest, ...] = ()
+
+    def resting(self) -> Sequence[OrderRequest]:
+        return self.told
+
+
+def test_a_refusal_does_not_invent_the_two_fields_it_cannot_see() -> None:
+    """An order with no name comes back with no name, and an exit comes back as an exit.
+
+    `Refusal` says an unnamed refusal is a log line and not a correlation — which is honest, and
+    strictly better than a name that was never chosen. The failure of the alternative is silent
+    in both directions: a `reason` in the `client_id` slot is matched against the names a
+    strategy holds and never matches one, and an intent that is guessed reads, to anybody
+    downstream, exactly like an intent somebody knew.
+    """
+    warmed = _ReportsWhateverItIsTold(
+        instrument=EURUSD, initial_capital=CAPITAL, cost_model=NoCostModel()
+    )
+    warmed.told = (
+        replace(_a_limit(client_id="zone-a", limit="1.03000"), client_id=None),
+        replace(_a_limit(client_id="flatten-1", limit="1.02500"), intent=SignalKind.EXIT),
+    )
+    live = a_broker()
+
+    result = carry(warmed, live)
+
+    assert result.carried == (), "the live broker rested what it says it will not rest"
+    unnamed, exiting = result.refused
+    assert unnamed.refused_by is RefusedBy.BROKER
+    assert unnamed.client_id is None, (
+        f"the refusal is named {unnamed.client_id!r}, which the order never was — a reason "
+        "smuggled into the slot every consumer reads as a name"
+    )
+    assert unnamed.reason == "entry.test", "the reason was dropped along with the name"
+    assert exiting.intent is SignalKind.EXIT, "the intent was assumed rather than read"
+    assert exiting.client_id == "flatten-1"
+
+
 class _NeverSizes:
     """A risk manager that always answers zero — "no trade", in the loop's own vocabulary."""
 
@@ -428,8 +583,18 @@ def test_the_risk_manager_can_still_veto_a_carried_order() -> None:
     )
 
     assert result.carried == ()
-    assert result.refused == (resting.client_id,)
     assert live.resting() == (), "a vetoed order reached the broker"
+
+    # ⚠️ **`RISK`, and the sibling test above asserts `SIZING` on the same window and the same
+    # order.** Until PR-304-B-D-2b both said `== (resting.client_id,)` — the same assertion,
+    # passing for two different reasons, which is a fixture where the branches coincide. A
+    # hand-over that reported one constant gate for everything satisfied both.
+    assert [r.client_id for r in result.refused] == [resting.client_id]
+    assert result.refused[0].refused_by is RefusedBy.RISK
+    assert result.refused[0].detail == "the risk manager vetoed it", (
+        "this gate can say the broker's words with nobody noticing — `detail` is free text, so "
+        "the only thing keeping each gate speaking for itself is a test that reads it"
+    )
 
 
 class _VetoesEverything:

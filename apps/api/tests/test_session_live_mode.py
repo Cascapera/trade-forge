@@ -51,6 +51,7 @@ from tradeforge_engine.domain import (
     OrderResult,
     Position,
     Refusal,
+    RefusedBy,
 )
 from tradeforge_engine.loop import iter_run
 from tradeforge_engine.testing import EURUSD, arms_a_resting_limit
@@ -768,3 +769,81 @@ def a_bar_holding_a_position(candles: list[Candle]) -> int:
         if broker.positions(SYMBOL):
             return index + 1
     raise AssertionError("this window never holds a position; the scenario cannot be built")
+
+
+# --------------------------------------------------------------------------- #
+# What the hand-over could not carry reaches the strategy (PR-304-B-D-2b)       #
+# --------------------------------------------------------------------------- #
+
+
+class RefusesTheFirstOrder(RecordingVenue):
+    """A venue that refuses the hand-over's order and takes everything after it.
+
+    ⚠️ **The shape the demo of 2026-08-28 actually took**, and it matters that it is not "refuses
+    everything": a session that can never place an order looks identical whether or not it knows
+    its first one was refused. The failure is only visible in a session that *could* have traded
+    the zone and did not.
+    """
+
+    def submit(self, order: OrderRequest) -> OrderResult:
+        result = super().submit(order)
+        if len(self.submitted) == 1:
+            return OrderResult(order=order, accepted=False, reason="the venue said no")
+        return result
+
+
+class RefusingVenueFactory(VenueFactory):
+    def __call__(self, session_id: uuid.UUID, spec: InstrumentSpec) -> RecordingVenue:
+        self.calls.append((session_id, spec))
+        self.built = RefusesTheFirstOrder(self._factory, session_id, self._now)
+        self.built.start()
+        return self.built
+
+
+def test_an_order_the_venue_refused_at_the_hand_over_is_told_to_the_strategy(
+    session: Session,
+    session_factory: Callable[[], Session],
+    live_plan: SessionPlan,
+    parquet_root: Path,
+) -> None:
+    """The last silent hand-over point of ADR-0023, at the seam that produced it.
+
+    The warm-up and the live bars are two loops around **one** compiled strategy, and the gap
+    between them is the only place an order can be refused with no bar running to report it.
+    `StructurePhase` marks its order placed when it emits the signal, so unless `run_session`
+    hands `handover.refused` to `iter_run`, the strategy crosses believing a limit rests at a
+    venue that refused it — and never offers that zone again.
+
+    Measured on this window at `CUT`, with the venue above:
+
+    | | orders on the demand zone |
+    |---|---|
+    | `refusals=` not passed | `['demand-20240103T0200-1']` |
+    | passed (this test) | `['demand-20240103T0200-1', 'demand-20240103T0200-2']` |
+
+    The second name is minted on the **first live bar**. It is a new name because re-offering
+    under the old one would be refused again as a duplicate, by a broker answering a different
+    question, and the retry would never converge.
+
+    ⚠️ **Names by shape, not by string.** The exact ids move if the structure machine shifts by
+    a bar, and this test is about the strategy learning — `test_warmup.py` owns the arithmetic.
+    """
+    factory = RefusingVenueFactory(factory_of(session_factory), Clock(split()[2]))
+    outcome, made = run_live(session_factory, live_plan, parquet_root, venue=factory)
+
+    assert made.built is not None
+    refused = [r.client_id for r in outcome.refused_orders]
+    assert len(refused) == 1, f"the hand-over refusal did not happen: {outcome.refused_orders}"
+    assert outcome.refused_orders[0].refused_by is RefusedBy.BROKER
+
+    demand = [
+        order.client_id
+        for order in made.built.submitted
+        if order.client_id is not None and order.client_id.startswith("demand-")
+    ]
+    assert demand[0] == refused[0], "the first order on the zone was not the refused one"
+    assert len(demand) == 2, (
+        f"the session placed {demand} on the demand zone: the strategy is still believing in "
+        f"{refused[0]}, which the venue refused, so it never offered the region again"
+    )
+    assert demand[1] != demand[0], "it re-armed under the name the venue already refused"

@@ -70,7 +70,7 @@ from tradeforge_db.live_sessions import finish_session, open_session, reconcile_
 from tradeforge_db.models import Instrument, LiveSession, SessionMode, Strategy
 from tradeforge_db.session import session_scope
 from tradeforge_engine import BacktestBroker, PercentRiskManager, compile_strategy
-from tradeforge_engine.domain import InstrumentSpec
+from tradeforge_engine.domain import InstrumentSpec, Refusal
 from tradeforge_engine.errors import EngineError
 from tradeforge_engine.loop import iter_run
 from tradeforge_engine.protocols import Broker, CostModel
@@ -122,7 +122,16 @@ class SessionOutcome:
     session_id: uuid.UUID
     warmup_bars: int
     bars: int
-    refused_orders: tuple[str, ...]
+
+    refused_orders: tuple[Refusal, ...]
+    """What the hand-over could not carry onto the session's broker, and which gate said so.
+
+    ⚠️ **The same objects the strategy was shown**, not a report built beside them. These are
+    handed to `iter_run` as the first live bar's `Context.refusals`, so an operator reading this
+    field and the strategy reading its context are reading one fact — and a future caller that
+    reports these without passing them on will be reporting a ghost it helped create.
+    """
+
     error: str | None
 
 
@@ -311,6 +320,13 @@ def run_session(  # noqa: PLR0913 — keyword-only; each names one seam of a ses
         )
 
         try:
+            # ⚠️ **`refusals=` is the whole of PR-304-B-D-2b, and dropping it is silent.** The
+            # warm-up and the live bars are two loops around one strategy object, and the gap
+            # between them is the only place an order can be refused with no bar running to
+            # report it. `compiled` marked that order placed when it emitted the signal; without
+            # this argument it holds the name for the rest of the session, never offers the zone
+            # again, and eventually sends a cancel for a name the venue never heard of. The
+            # session logs `refused 2` while the strategy believes both are resting.
             for outcome in iter_run(
                 candles=candles.live(),
                 timeframe=timeframe,
@@ -318,6 +334,7 @@ def run_session(  # noqa: PLR0913 — keyword-only; each names one seam of a ses
                 strategy=compiled,
                 broker=live,
                 risk=risk,
+                refusals=handover.refused,
             ):
                 _persist(
                     factory,

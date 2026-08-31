@@ -156,6 +156,7 @@ def iter_run(  # noqa: PLR0913 — keyword-only; see run()
     strategy: Strategy,
     broker: Broker,
     risk: RiskManager,
+    refusals: tuple[Refusal, ...] = (),
 ) -> Iterator[BarOutcome]:
     """The loop itself, one `BarOutcome` at a time, for as long as candles keep arriving.
 
@@ -178,6 +179,20 @@ def iter_run(  # noqa: PLR0913 — keyword-only; see run()
     And holding the context across the `yield` would push the engine's precision and rounding
     onto whatever the consumer does with the bar, which for a live session is database writes:
     the engine would be silently reconfiguring code that is not the engine.
+
+    ⚠️ **`refusals` is what was turned away *before this stream's first bar*, and there is
+    exactly one producer of it: `warmup.hand_over`.** A session's warm-up runs against one
+    broker and its live bars against another, so an order the strategy armed on the last bar of
+    history can be refused in the gap between the two loops — by a gate no `BarOutcome` will ever
+    report, because no bar of this stream was running when it happened. Left here, that is the
+    fifth silent hand-over point of ADR-0023: the strategy crosses believing an order rests
+    somewhere it does not, and stops offering the zone for ever.
+
+    It is delivered on the **first** bar and then replaced like any other pending refusal, which
+    is the same rule the loop already follows rather than an exception to it — a refusal is
+    handed to the next bar on which the strategy speaks, and for these that is the first one
+    there is. A backtest has no hand-over and therefore no producer, which is why `run()` does
+    not take this: a parameter nothing can fill is a promise nobody can keep.
     """
     if timeframe <= dt.timedelta(0):
         raise ValueError(f"timeframe must be positive, got {timeframe}")
@@ -193,6 +208,7 @@ def iter_run(  # noqa: PLR0913 — keyword-only; see run()
         strategy=strategy,
         broker=broker,
         risk=risk,
+        refusals=refusals,
     )
 
 
@@ -265,13 +281,19 @@ def _iter_run(  # noqa: PLR0913 — see run()
     strategy: Strategy,
     broker: Broker,
     risk: RiskManager,
+    refusals: tuple[Refusal, ...] = (),
 ) -> Iterator[BarOutcome]:
     previous: Candle | None = None
     # Refusals born on the bar before the one about to run, waiting to be shown to the strategy.
     # The loop owns this for the same reason it owns `window`: it is the only component that
     # sees one bar end and the next begin, and a refusal is precisely a fact that crosses that
     # boundary. See `Context.refusals` for why it cannot be delivered on its own bar.
-    pending: tuple[Refusal, ...] = ()
+    #
+    # It starts at whatever was refused before this stream began — the hand-over's, and nothing
+    # else has any (see `iter_run`). Seeded here rather than yielded as a bar of its own: these
+    # refusals belong to no candle, and inventing one to carry them would put a bar in the
+    # equity curve that the market never produced.
+    pending: tuple[Refusal, ...] = refusals
     # The arming window. Holds the decision bar plus the bars before it, and no more — see
     # SNAPSHOT_BARS_BEFORE. The loop owns it because the loop is the only component that sees
     # the stream, in backtest and in live alike, and because it is here that `decided_at` is

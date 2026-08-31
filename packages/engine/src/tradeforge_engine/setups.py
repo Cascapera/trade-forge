@@ -97,9 +97,17 @@ The loop does not merely make noise — it degrades the record of the trade it e
 
 **Three, chosen by Guilherme on 2026-08-31, with the cost stated rather than hidden.** Three
 attempts is three orders instead of forty-eight. Against a *transient* outage — the executor
-down, a session that stopped beating — three M15 bars is about 45 minutes, and a stoppage longer
-than that burns the zone over an infrastructure problem that later cleared. Taken knowingly: a
-setup 45 minutes stale is usually not the setup any more.
+down, a session that stopped beating — a stoppage lasting longer than three bars burns the zone
+over an infrastructure problem that later cleared. Taken knowingly: a setup that stale is usually
+not the setup any more.
+
+⚠️ **The cap counts bars; the tolerance it buys is measured in clock time, and the two are only
+the same on one timeframe.** Three bars is about 45 minutes on M15 — the timeframe this was
+chosen for — but three *minutes* on M1 and three *days* on D1. So the same number is a forgiving
+rule on a slow chart and an unforgiving one on a fast chart, and a strategy moved to M1 inherits a
+tolerance nobody re-decided. Named here because the fixture that proves the rule runs on **H1**,
+where the refusals on bars 61 and 100 are thirty-nine hours apart: reading the test as "45
+minutes" would be reading the wrong clock.
 
 ⚠️ **A count, deliberately, and not a judgement about *why*.** The plan of record was to cap only
 refusals that will not clear on their own, told apart by `RefusedBy` — and a live session on

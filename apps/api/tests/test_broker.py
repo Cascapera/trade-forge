@@ -24,19 +24,22 @@ from tradeforge_engine.domain import (
     Candle,
     InstrumentSpec,
     OrderRequest,
+    RefusedBy,
     Side,
     SignalKind,
 )
 from tradeforge_engine.errors import EngineError
 from tradeforge_engine.protocols import Broker
 from tradeforge_executor.wire import (
-    FILLS_STREAM,
     MAX_CLIENT_ID,
     ORDERS_STREAM,
+    VENUE_OUTCOMES,
     HeldPosition,
     VenueState,
     WireFill,
+    WireRefusal,
     fill_fields,
+    refusal_fields,
     venue_state_text,
 )
 
@@ -66,7 +69,7 @@ class FakeStreams:
     def __init__(self) -> None:
         self.entries: dict[str, list[tuple[str, dict[str, str]]]] = {
             ORDERS_STREAM: [],
-            FILLS_STREAM: [],
+            VENUE_OUTCOMES: [],
         }
         self.groups: dict[str, int] = {}
         self.pending: dict[str, list[str]] = {}
@@ -196,7 +199,7 @@ def publish_fill(  # noqa: PLR0913 — keyword-only knobs on one fixture, not a 
     session_id: str = SESSION,
     at: dt.datetime = NOON + HOUR + dt.timedelta(seconds=18),
 ) -> None:
-    """What the executor puts on `fills.inbound`, through the real encoder."""
+    """What the executor puts on `venue.outcomes`, through the real encoder."""
     fields = fill_fields(
         WireFill(
             client_id=client_id,
@@ -209,7 +212,37 @@ def publish_fill(  # noqa: PLR0913 — keyword-only knobs on one fixture, not a 
             ticket=99,
         )
     )
-    client.xadd(FILLS_STREAM, dict(fields.items()))
+    client.xadd(VENUE_OUTCOMES, dict(fields.items()))
+
+
+def a_refusal(  # noqa: PLR0913 — keyword-only; each names one field of the wire shape
+    client: FakeStreams,
+    *,
+    client_id: str = "zone-1",
+    reason: str = "the venue would not take it",
+    by_venue: bool = True,
+    retcode: int | None = 10027,
+    session_id: str = SESSION,
+    at: dt.datetime = NOON + HOUR + dt.timedelta(seconds=18),
+) -> None:
+    """What the executor puts on `venue.outcomes` when an order never reached a book.
+
+    ⚠️ **Through the real encoder**, like `a_fill` above and for the same reason: a test that
+    hand-built the field map would agree with the reader on the day it was written and stop
+    agreeing the day the executor changed one key — and the disagreement would arrive as a
+    session never learning its order was refused, not as an error.
+    """
+    fields = refusal_fields(
+        WireRefusal(
+            client_id=client_id,
+            session_id=session_id,
+            at=at,
+            reason=reason,
+            by_venue=by_venue,
+            retcode=retcode,
+        )
+    )
+    client.xadd(VENUE_OUTCOMES, dict(fields.items()))
 
 
 # --------------------------------------------------------------------------- sending
@@ -226,7 +259,7 @@ def test_an_accepted_order_is_on_the_wire_and_nothing_waited_for_the_venue() -> 
     assert fields["client_id"] == "zone-42"
     assert fields["session_id"] == SESSION
     assert fields["volume"] == "1.00", "the size went through a float on the way out"
-    assert client.entries[FILLS_STREAM] == [], "submitting invented a fill"
+    assert client.entries[VENUE_OUTCOMES] == [], "submitting invented a fill"
 
 
 def test_an_order_the_strategy_did_not_name_still_gets_a_name() -> None:
@@ -439,7 +472,7 @@ def test_exits_are_folded_in_before_entries_that_arrived_in_the_same_bar() -> No
 
 
 def test_another_session_s_fill_is_acknowledged_and_ignored() -> None:
-    """⚠️ `fills.inbound` is fan-out, so this group is offered every fill any executor
+    """⚠️ `venue.outcomes` is fan-out, so this group is offered every fill any executor
     publishes. Acknowledged as well as ignored: an entry left pending is redelivered on every
     bar for the life of the session, and the pending list grows without bound."""
     client = FakeStreams()
@@ -467,7 +500,7 @@ def test_an_unreadable_entry_is_skipped_rather_than_wedging_every_bar() -> None:
     and the next bar fails exactly like this one, for ever."""
     client = FakeStreams()
     broker = a_broker(client)
-    client.xadd(FILLS_STREAM, {"client_id": "zone-42", "session_id": SESSION})
+    client.xadd(VENUE_OUTCOMES, {"client_id": "zone-42", "session_id": SESSION})
 
     assert broker.on_bar(a_candle()) == ()
     assert client.acked == ["1-0"]
@@ -485,7 +518,7 @@ def test_a_fill_read_but_not_folded_in_comes_back_on_the_next_bar() -> None:
     client.xreadgroup(
         groupname=f"session-{SESSION}",
         consumername="session",
-        streams={FILLS_STREAM: ">"},
+        streams={VENUE_OUTCOMES: ">"},
     )
 
     (fill,) = broker.on_bar(a_candle())
@@ -691,7 +724,7 @@ def test_a_session_will_not_start_over_a_position_it_did_not_open() -> None:
     """⚠️ **The failure this whole path exists for, and it is silent without it.**
 
     Every session process writes a *new* `live_sessions` row, so a restarted session has a new
-    id — and `_read` filters `fills.inbound` by that id. The dead session's fills are therefore
+    id — and `_read` filters `venue.outcomes` by that id. The dead session's fills are therefore
     discarded without a word, its position stays open at the venue, and this ledger starts empty
     and never learns. The next trade is then sized against an account that is already committed.
     """
@@ -782,3 +815,150 @@ def test_a_position_in_another_symbol_still_stops_the_session() -> None:
 
     with pytest.raises(EngineError, match="already holding"):
         starting(client).start()
+
+
+# --------------------------------------------------------------------------- refusals home
+
+
+def test_a_refusal_from_the_executor_comes_back_as_the_engine_s_refusal() -> None:
+    """**The whole of ADR-0024, in one assertion.** `submit` answered `accepted` — correctly, it
+    is a local fact — and the verdict arrived afterwards, from another process. Without this the
+    strategy crosses on believing it armed a limit the venue never saw.
+
+    ⚠️ **It does not come back through `on_bar`.** A refusal is not something the ledger folds
+    in; it is something the *strategy* has to be told, so it travels the channel the loop drains
+    into `Context.refusals` and the fills path answers nothing.
+    """
+    client = FakeStreams()
+    broker = a_broker(client)
+    broker.start()
+    a_refusal(client, client_id="zone-1", by_venue=True, retcode=10027)
+
+    born = broker.on_bar(a_candle())
+
+    assert born == (), "a refusal was folded into the ledger as if something had happened"
+    [refusal] = broker.refusals()
+    assert refusal.client_id == "zone-1"
+    assert refusal.refused_by is RefusedBy.VENUE
+    assert "10027" in refusal.detail, "the venue's own number was dropped on the way"
+
+
+def test_our_own_safeguard_and_the_venue_do_not_arrive_under_one_word() -> None:
+    """⚠️ **The distinction decides whether a zone is offered again.** `EXECUTOR` refuses on a
+    condition that changes by itself — a session that resumes beating, a volume cap the next
+    size clears — and the terminal saying no is usually the same answer next bar. Collapsing
+    them would hand a strategy one word for two opposite instructions.
+    """
+    client = FakeStreams()
+    broker = a_broker(client)
+    broker.start()
+    a_refusal(client, client_id="ours", by_venue=False, retcode=None)
+
+    broker.on_bar(a_candle())
+
+    [refusal] = broker.refusals()
+    assert refusal.refused_by is RefusedBy.EXECUTOR
+    assert "retcode" not in refusal.detail, "a retcode for a venue that was never asked"
+
+
+def test_a_refusal_is_news_once_and_the_mailbox_is_drained() -> None:
+    """⚠️ **Handed over twice, a refusal makes `StructurePhase` forget an order it had since
+    armed** — the zone is re-offered under a new name while the old one may be resting, and one
+    region ends up carrying two limits. The loop asks every bar, so "nothing new" has to be the
+    answer on every bar but one.
+    """
+    client = FakeStreams()
+    broker = a_broker(client)
+    broker.start()
+    a_refusal(client, client_id="zone-1")
+
+    broker.on_bar(a_candle())
+
+    assert len(broker.refusals()) == 1
+    assert broker.refusals() == (), "the same refusal was reported twice"
+    broker.on_bar(a_candle())
+    assert broker.refusals() == (), "a bar with nothing on the wire invented a refusal"
+
+
+def test_another_session_s_refusal_is_not_ours() -> None:
+    """The stream is fan-out: this group is offered every outcome any executor publishes. A
+    refusal for somebody else's order carries somebody else's `client_id`, and acting on it
+    would have this session forget an order that is resting perfectly well."""
+    client = FakeStreams()
+    broker = a_broker(client)
+    broker.start()
+    a_refusal(client, client_id="theirs", session_id="c0ffee00-0000-4000-8000-000000000000")
+
+    broker.on_bar(a_candle())
+
+    assert broker.refusals() == ()
+
+
+def test_a_refusal_for_a_name_this_session_never_sent_is_still_passed_on() -> None:
+    """⚠️ **The opposite rule to a fill's, and deliberately.** A fill this session cannot
+    attribute stops it — the ledger is about to be wrong about a real position. A refusal is
+    about an order that exists **nowhere**, so there is nothing to be wrong about; and the
+    strategy keys its own bookkeeping by the name, not by this broker's dictionary. Refusing to
+    pass it on would lose the one message that says "that order is not there".
+    """
+    client = FakeStreams()
+    broker = a_broker(client)
+    broker.start()
+    a_refusal(client, client_id="never-sent-by-us")
+
+    broker.on_bar(a_candle())
+
+    [refusal] = broker.refusals()
+    assert refusal.client_id == "never-sent-by-us"
+
+
+def test_a_refusal_is_described_by_the_order_it_refuses_not_by_a_default() -> None:
+    """⚠️ **Written because the whole `_sent` lookup was deletable and nothing said so.**
+
+    `_refusal_from` fills `intent` and `reason` from the order this session sent, falling back
+    to `ENTRY` and `""` when it cannot find one. Every other fixture in this file refuses a
+    `client_id` that was never submitted — so both sides of both conditionals produce the same
+    object, and three one-token mutants survived the whole suite. The fixture that separates
+    them is the one where the order **exists and disagrees with the defaults**.
+
+    ⚠️ **The exit is the case that bites.** Kill switch armed mid-session, the strategy emits
+    its exit, the executor refuses it. Described by the defaults, the message says an *entry*
+    was refused, unnamed and unexplained — for what was really the exit of a position still
+    open at the venue. Inert today, because only `client_id` is read; the retry policy in
+    PR-304-B-D-2c is announced to decide on exactly these fields.
+    """
+    client = FakeStreams()
+    broker = a_broker(client)
+    broker.submit(
+        an_order(intent=SignalKind.EXIT, client_id="exit-1", reason="exit.sl", decided_at=NOON)
+    )
+    a_refusal(client, client_id="exit-1", reason="the kill switch is armed", by_venue=False)
+
+    broker.on_bar(a_candle())
+
+    [refusal] = broker.refusals()
+    assert refusal.intent is SignalKind.EXIT, (
+        "the refusal claims an entry was turned away; it was the exit of an open position"
+    )
+    assert refusal.reason == "exit.sl", "the strategy's own name for the order was replaced"
+    assert "the kill switch is armed" in refusal.detail, "the executor's words were dropped"
+
+
+def test_a_refusal_for_an_order_this_session_never_sent_says_it_does_not_know() -> None:
+    """The other side of the same lookup, and the reason `intent` may be `None`.
+
+    ⚠️ **A guess here would be indistinguishable from knowledge.** `wire.py` refuses to guess a
+    `kind` — *"read first and never guessed"* — and two layers up this used to guess `ENTRY` for
+    an order it had never heard of. `client_id` was already `str | None` precisely so "I do not
+    know" has a word; `intent` now has one too. A reader that must branch on intent can tell
+    the unknown from the known, instead of being handed a plausible wrong answer.
+    """
+    client = FakeStreams()
+    broker = a_broker(client)
+    a_refusal(client, client_id="never-sent-by-us")
+
+    broker.on_bar(a_candle())
+
+    [refusal] = broker.refusals()
+    assert refusal.intent is None, "an intent was invented for an order this session never sent"
+    assert refusal.reason == ""

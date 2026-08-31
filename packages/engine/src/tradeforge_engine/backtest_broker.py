@@ -51,6 +51,7 @@ from tradeforge_engine.domain import (
     OrderRequest,
     OrderResult,
     Position,
+    Refusal,
     Side,
     SignalKind,
     _require_utc,
@@ -488,6 +489,17 @@ class BacktestBroker:
 
     def trades(self) -> Sequence[ClosedTrade]:
         return self._portfolio.trades
+
+    def refusals(self) -> Sequence[Refusal]:
+        """Always empty, and that is an answer rather than a stub (ADR-0024).
+
+        A refusal reaches a broker out of band only when the verdict on an order arrives after
+        `submit` returned — which needs another process. Here `submit` **is** the verdict: it
+        inspects the book and answers on the spot, so there is no window for one to arrive in.
+        An implementation of this that had something to say would be one whose `submit` was
+        lying about what it knew.
+        """
+        return ()
 
     # ----------------------------------------------------------------------- #
     # Fills                                                                    #

@@ -23,8 +23,9 @@ from tradeforge_executor.router import Router
 from tradeforge_executor.safety import Limits
 from tradeforge_executor.service import GROUP, OrderQueue, Service
 from tradeforge_executor.wire import (
-    FILLS_STREAM,
+    KIND_REFUSAL,
     ORDERS_STREAM,
+    VENUE_OUTCOMES,
     HeldPosition,
     cancel_fields,
     fill_from_fields,
@@ -281,7 +282,7 @@ def test_an_admitted_order_is_sent_recorded_and_then_acknowledged(
     assert queue.acked == [entry_id]
 
     (fill,) = queue.published
-    assert fill["stream"] == FILLS_STREAM
+    assert fill["stream"] == VENUE_OUTCOMES
     assert fill["client_id"] == "zone-42", "the fill cannot be matched to its order"
     assert fill["volume"] == "0.10"
     assert fill["price"] == "1.10000", "the price went through a float on the way home"
@@ -450,14 +451,17 @@ def _first(queue: OrderQueue, count: int) -> list[tuple[str, Any]]:
 # --------------------------------------------------------------------------------------------
 
 
-def test_nothing_is_published_for_an_order_that_was_refused(
+def test_a_refusal_by_our_own_safeguard_travels_home_as_a_refusal(
     session: Session, session_factory: sessionmaker[Session]
 ) -> None:
-    """⚠️ `fills.inbound` says what happened **at the venue**, and a refusal never reached one.
+    """⚠️ **Two rules, and only the second is old** (ADR-0024). A refusal *is* published — the
+    session is otherwise left believing it armed an order the venue never saw, measured in
+    production on 2026-08-28 — but it is **not** published as a fill. A "fill" of zero would
+    leave a session waiting for a position it will never be told about.
 
-    A "fill" of zero would leave a session waiting for a position it will never be told about —
-    or, worse, reading a zero-volume fill as a real one. The refusal already went to
-    `order_audit`, which is where an operator asks why.
+    Here the kill switch refused it, so nothing was asked of the venue: `by_venue` is `no` and
+    there is no retcode. `order_audit` still holds the record; this is the channel the strategy
+    can actually read.
     """
     live = a_live_session(session)
     entry_id, fields = an_entry(str(live.id))
@@ -467,14 +471,30 @@ def test_nothing_is_published_for_an_order_that_was_refused(
         entry_id, order_from_fields(fields)
     )
 
-    assert queue.published == [], "a refusal was published as if the venue had done something"
+    [published] = queue.published
+    assert published["kind"] == KIND_REFUSAL, "a refusal went home wearing another kind"
+    assert published["by_venue"] == "no", "our own safeguard was reported as the venue's answer"
+    assert "retcode" not in published, "a retcode for a venue that was never asked"
+    assert published["client_id"] == fields["client_id"]
+    # ⚠️ The safeguard's own words, not a placeholder. `order_audit` records them too, but the
+    # trail is read by an operator afterwards and this is read by the strategy on the next bar;
+    # a constant here would tell it an order was refused and never say by what.
+    assert "the-handle" in published["reason"], (
+        f"the reason the switch gave was replaced: {published['reason']!r}"
+    )
 
 
-def test_nothing_is_published_when_the_venue_rejects_the_order(
+def test_a_refusal_by_the_venue_says_so_and_carries_its_retcode(
     session: Session, session_factory: sessionmaker[Session]
 ) -> None:
     """The separating half of the one above, on the other side of the boundary: this machine
-    allowed it and the **venue** said no. Still nothing happened at the venue, so still no fill.
+    allowed it and the **venue** said no.
+
+    ⚠️ **The distinction is not bookkeeping.** `EXECUTOR` refuses on conditions that change by
+    themselves — a session that resumes beating, a volume cap the next size clears — while the
+    terminal saying no is usually the same answer next bar. A strategy deciding whether to offer
+    the zone again is asking exactly that, so the two cannot arrive under one word. The retcode
+    is what separates "your stop is too close" from "trading is off".
     """
     live = a_live_session(session)
     entry_id, fields = an_entry(str(live.id))
@@ -484,7 +504,10 @@ def test_nothing_is_published_when_the_venue_rejects_the_order(
         entry_id, order_from_fields(fields)
     )
 
-    assert queue.published == []
+    [published] = queue.published
+    assert published["kind"] == KIND_REFUSAL
+    assert published["by_venue"] == "yes", "the venue's own refusal was reported as ours"
+    assert "retcode" in published, "the venue answered and its number was dropped"
     assert rows(session)[0].status is OrderAuditStatus.ERROR
 
 

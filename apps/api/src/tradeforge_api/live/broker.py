@@ -10,7 +10,7 @@ this; it just had not met it yet.
 So the split is:
 
 * `submit` publishes to `orders.outbound` and says "accepted". Nothing waits.
-* `on_bar` drains `fills.inbound` — **with this session's own consumer group** — and hands the
+* `on_bar` drains `venue.outcomes` — **with this session's own consumer group** — and hands the
   loop the fills that arrived since the last bar. That is the same shape `BacktestBroker` has,
   where `on_bar` is also the only place a `Fill` can be born.
 
@@ -52,6 +52,8 @@ from tradeforge_engine.domain import (
     OrderRequest,
     OrderResult,
     Position,
+    Refusal,
+    RefusedBy,
     Side,
     SignalKind,
 )
@@ -59,15 +61,16 @@ from tradeforge_engine.errors import EngineError
 from tradeforge_engine.portfolio import Portfolio
 from tradeforge_executor.snapshot import PUBLISH_EVERY
 from tradeforge_executor.wire import (
-    FILLS_STREAM,
     MAX_CLIENT_ID,
+    VENUE_OUTCOMES,
     VENUE_STATE,
     VENUE_STATE_FRESH_FOR,
     WireFill,
+    WireRefusal,
     cancel_fields,
-    fill_from_fields,
     modify_stop_fields,
     order_fields,
+    outcome_from_fields,
     stream_for,
     venue_state_from,
 )
@@ -147,7 +150,7 @@ class MT5Broker:
         self._instrument = instrument
         self._portfolio = Portfolio(initial_capital=initial_capital, instrument=instrument)
         # ⚠️ The group is the **session's**, so this session sees every fill on the stream.
-        # `fills.inbound` is fan-out, the opposite of `orders.outbound`: an order must be handled
+        # `venue.outcomes` is fan-out, the opposite of `orders.outbound`: an order must be handled
         # by exactly one executor, a fill must reach the session that placed it. Sharing a group
         # here would mean a session silently never learns that its own order filled.
         self._group = f"session-{session_id}"
@@ -158,7 +161,19 @@ class MT5Broker:
         ⚠️ **This is the other half of every fill**, and why the request does not travel home
         on the wire. A `Fill` needs its `OrderRequest`, and sending the same document twice
         invites the two copies to disagree — about the stop, about `decided_at`, about the
-        snapshot the loop attached. The `client_id` is the whole correlation (ADR-0014)."""
+        snapshot the loop attached. The `client_id` is the whole correlation (ADR-0014).
+
+        It is also what a refusal is described by (`_refusal_from`): the intent and the
+        strategy's own name for the order live here and nowhere on the wire."""
+
+        self._refused: list[Refusal] = []
+        """Refusals that arrived since the last bar, waiting for the loop to come and get them.
+
+        ⚠️ **A mailbox, not a log.** They arrive between bars, from another process (ADR-0024);
+        the loop drains this once a bar and folds it into the next `Context.refusals`. Draining
+        is what makes it news exactly once — a refusal handed over twice would have
+        `StructurePhase` forget an order it had since armed, and re-offer a zone whose limit may
+        be resting perfectly well."""
 
         self._minted = 0
 
@@ -185,6 +200,17 @@ class MT5Broker:
         """
         self._refuse_unless_venue_is_flat()
         self.ensure_group()
+        # ⚠️ **Named out loud because a mismatched deploy is silent otherwise** (ADR-0024). The
+        # stream was renamed from `fills.inbound`, and there is no dual-read: an executor running
+        # the older code publishes where nobody is listening, so this session would send orders,
+        # fill them at the venue, and never learn — the exact failure this whole line of work
+        # exists to kill, arriving through the door of a half-finished deploy. The two processes
+        # are started by hand, minutes apart, from different consoles.
+        logger.info(
+            "session %s listening on %r; the executor must be publishing there",
+            self._session_id,
+            VENUE_OUTCOMES,
+        )
 
     def _refuse_unless_venue_is_flat(self) -> None:
         raw = self._client.get(VENUE_STATE)
@@ -247,7 +273,7 @@ class MT5Broker:
         """
         try:
             self._client.xgroup_create(
-                name=FILLS_STREAM, groupname=self._group, id=_PENDING, mkstream=True
+                name=VENUE_OUTCOMES, groupname=self._group, id=_PENDING, mkstream=True
             )
         except ResponseError as error:
             if "BUSYGROUP" in str(error).upper():
@@ -260,7 +286,7 @@ class MT5Broker:
 
         **A refusal here is local and immediate**: the wire would not carry the order faithfully,
         or Redis would not take it. Neither is the venue's opinion — the venue has not been asked
-        yet, and will answer into `order_audit` and `fills.inbound` in its own time.
+        yet, and will answer into `order_audit` and `venue.outcomes` in its own time.
         """
         if order.stop_price is not None:
             # ⚠️ Refused rather than sent, because `order_fields` does not carry `stop_price` and
@@ -425,7 +451,7 @@ class MT5Broker:
         return tuple(born)
 
     def _drain(self) -> list["_Arrived"]:
-        """Everything on `fills.inbound` for this session, oldest first, without blocking.
+        """Everything on `venue.outcomes` for this session, oldest first, without blocking.
 
         ⚠️ **Every entry is acknowledged, including the ones belonging to other sessions.** The
         stream is fan-out, so this group is offered every fill any executor publishes. Leaving
@@ -441,7 +467,7 @@ class MT5Broker:
             answer = self._client.xreadgroup(
                 groupname=self._group,
                 consumername=self._consumer,
-                streams={FILLS_STREAM: start},
+                streams={VENUE_OUTCOMES: start},
                 count=_BATCH,
             )
             for _stream, entries in cast(
@@ -451,7 +477,7 @@ class MT5Broker:
                     mine = self._read(entry_id, fields)
                     if mine is not None:
                         arrived.append(mine)
-                    self._client.xack(FILLS_STREAM, self._group, entry_id)
+                    self._client.xack(VENUE_OUTCOMES, self._group, entry_id)
         return arrived
 
     def _read(self, entry_id: str, fields: dict[str, str]) -> "_Arrived | None":
@@ -463,13 +489,57 @@ class MT5Broker:
         holds what the venue actually said.
         """
         try:
-            wire = fill_from_fields(fields)
+            outcome = outcome_from_fields(fields)
         except (KeyError, ValueError, ArithmeticError):
-            logger.exception("unreadable fill %s; acknowledged and skipped", entry_id)
+            logger.exception("unreadable outcome %s; acknowledged and skipped", entry_id)
             return None
-        if wire.session_id != self._session_id:
+        if outcome.session_id != self._session_id:
             return None
-        return _Arrived(wire=wire, order=self._request_for(wire))
+        if isinstance(outcome, WireRefusal):
+            # ⚠️ **Not returned to the caller**, because a refusal is not something `on_bar`
+            # folds into the ledger — it is something the *strategy* has to be told. It goes to
+            # the mailbox the loop drains, and this method answers `None` the same way it does
+            # for another session's entry: nothing here for the fills path.
+            self._refused.append(self._refusal_from(outcome))
+            return None
+        return _Arrived(wire=outcome, order=self._request_for(outcome))
+
+    def _refusal_from(self, wire: WireRefusal) -> Refusal:
+        """The wire's refusal as the engine's, which is a narrowing and worth naming.
+
+        ⚠️ **`by_venue` decides the gate, and the two are not interchangeable.** `VENUE` means
+        the terminal said no — usually the same answer next bar; `EXECUTOR` means a safeguard in
+        between did, on a condition that changes by itself. A strategy deciding whether to offer
+        the zone again is asking exactly that, so collapsing them would hand it one word for two
+        instructions.
+
+        ⚠️ **The order is not looked up.** Unlike a fill — which raises when this session cannot
+        attribute it, because an unattributed fill means the ledger is wrong — a refusal is about
+        an order that does **not** exist anywhere. There is nothing to be wrong about, and a
+        refusal for a name this session does not recognise is still worth passing on: the
+        strategy keys its own bookkeeping by that name, not this dictionary.
+        """
+        detail = wire.reason
+        if wire.retcode is not None:
+            detail = f"{detail} (retcode {wire.retcode})"
+        order = self._sent.get(wire.client_id)
+        return Refusal(
+            client_id=wire.client_id,
+            intent=order.intent if order is not None else None,
+            refused_by=RefusedBy.VENUE if wire.by_venue else RefusedBy.EXECUTOR,
+            reason=order.reason if order is not None else "",
+            detail=detail,
+        )
+
+    def refusals(self) -> Sequence[Refusal]:
+        """Everything that arrived saying an order was never placed, and never twice.
+
+        Drained rather than read: see `_refused`. The loop asks once a bar, including on bars
+        where nothing was submitted — which is most of them, and exactly when a refusal for the
+        previous bar's order lands.
+        """
+        drained, self._refused = self._refused, []
+        return tuple(drained)
 
     def _request_for(self, wire: WireFill) -> OrderRequest:
         """The order this fill belongs to, or a stop.

@@ -63,7 +63,7 @@ barras no AUDCAD H1 e em **730** no BTCUSD H1. A sessão registra quantas barras
 quantas precisaria, porque a segunda não é conhecível.
 
 ## PR-303 — Execution Service + salvaguardas
-**Escopo:** `apps/executor`: consome `orders.outbound`, executa `mt5.order_send` (conta DEMO), publica `fills.inbound`; kill switch em 3 camadas (flag Redis + arquivo local + endpoint); limites locais (perda diária, volume máx., posições máx., janela de horário); `order_audit` append-only; heartbeat com política configurável.
+**Escopo:** `apps/executor`: consome `orders.outbound`, executa `mt5.order_send` (conta DEMO), publica `venue.outcomes` (ADR-0024; era `fills.inbound`); kill switch em 3 camadas (flag Redis + arquivo local + endpoint); limites locais (perda diária, volume máx., posições máx., janela de horário); `order_audit` append-only; heartbeat com política configurável.
 **Aceite:** suíte com MT5 mockado cobrindo: rejeição, fill parcial, desconexão, kill switch em cada camada, limite estourado; execução real em CONTA DEMO.
 **Você vai aprender:** design de sistemas que falham com segurança (fail-safe vs fail-open), auditoria append-only, por que os limites vivem no executor e não no core.
 

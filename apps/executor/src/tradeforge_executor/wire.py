@@ -29,18 +29,22 @@ from decimal import Decimal
 from tradeforge_engine.domain import OrderRequest, Side, SignalKind
 
 __all__ = [
-    "FILLS_STREAM",
+    "KIND_FILL",
+    "KIND_REFUSAL",
     "MAX_CLIENT_ID",
     "ORDERS_STREAM",
+    "VENUE_OUTCOMES",
     "VENUE_STATE",
     "VENUE_STATE_FRESH_FOR",
     "HeldPosition",
     "Instruction",
+    "Outcome",
     "VenueState",
     "WireCancel",
     "WireFill",
     "WireModifyStop",
     "WireOrder",
+    "WireRefusal",
     "cancel_fields",
     "fill_fields",
     "fill_from_fields",
@@ -48,6 +52,8 @@ __all__ = [
     "modify_stop_fields",
     "order_fields",
     "order_from_fields",
+    "outcome_from_fields",
+    "refusal_fields",
     "stream_for",
     "venue_state_from",
     "venue_state_text",
@@ -82,18 +88,28 @@ the failure mode the candle stream had to be designed *away* from. Same primitiv
 requirement, and getting them backwards is either half a market each or an order sent twice.
 """
 
-FILLS_STREAM = "fills.inbound"
-"""What the venue did, on its way back to the session that asked.
+VENUE_OUTCOMES = "venue.outcomes"
+"""What became of an order, on its way back to the session that asked.
 
 ⚠️ **Fan-out, not a work queue** — the opposite of `orders.outbound` one line above, and the two
-sitting together is deliberate. An order must be handled by exactly one executor; a fill must be
-seen by the session that placed it, and by anything else watching (a panel, later). So a session
-reads this with **its own consumer group**, the way `CandleStream` does, and the executor writes
-one entry per outcome.
+sitting together is deliberate. An order must be handled by exactly one executor; an outcome must
+be seen by the session that placed it, and by anything else watching (a panel, later). So a
+session reads this with **its own consumer group**, the way `CandleStream` does, and the executor
+writes one entry per outcome.
 
 Same file, same Redis, opposite requirements. Getting either backwards is silent: a shared group
 here means a session never learns its order filled, and a per-session group over there means the
 order goes out twice.
+
+⚠️ **It was called `fills.inbound`, and the rename is the point of ADR-0024.** A refusal is not a
+fill — `_publish_outcome` refuses to publish one as a fill, and it is right — but a refusal and a
+fill are two things that can happen to *one order*, and they must arrive in the order they
+happened. Two streams would be two orders of arrival for one pedido, which is exactly the failure
+`KIND` below documents on the way out. So: one stream, two shapes, one `kind`.
+
+⚠️ **Three outcomes, not two, and the third publishes nothing.** An order accepted by the venue
+and still resting is neither filled nor refused; saying anything about it would claim something
+happened when what happened is an order waiting.
 """
 
 
@@ -234,6 +250,14 @@ that usually works is the kind that fails silently the once it does not.
 KIND_ORDER = "order"
 KIND_CANCEL = "cancel"
 KIND_MODIFY_STOP = "modify_stop"
+
+# ...and on the way home. Same field name, same doctrine: read first, never guessed. Guessing
+# "fill" for an entry this format cannot read is worse here than guessing "order" is on the way
+# out — an order sent wrongly can be cancelled, a fill folded into the ledger wrongly makes every
+# number the session reports afterwards, including the equity the risk manager sizes against,
+# computed from a ledger that has lost track of what it holds.
+KIND_FILL = "fill"
+KIND_REFUSAL = "refusal"
 
 
 @dataclass(frozen=True, slots=True)
@@ -448,6 +472,7 @@ def fill_fields(fill: WireFill) -> dict[str, str]:
     holds a position twice the one it has.
     """
     fields = {
+        KIND: KIND_FILL,
         "client_id": fill.client_id,
         "session_id": fill.session_id,
         "symbol": fill.symbol,
@@ -459,6 +484,84 @@ def fill_fields(fill: WireFill) -> dict[str, str]:
     if fill.ticket is not None:
         fields["ticket"] = str(fill.ticket)
     return fields
+
+
+@dataclass(frozen=True, slots=True)
+class WireRefusal:
+    """An order that **never reached a book**, and why — the mirror of `WireFill`.
+
+    ⚠️ **`accepted` was true and this is still the answer.** `Broker.submit` promises only that
+    an order was queued (phase 1), so a session is told "accepted" the instant the order is on
+    the stream, and everything below happens afterwards, in another process. Without this the
+    strategy crosses on believing it armed an order the venue never saw: the ghost ADR-0023
+    measured, arriving from three processes away. Measured in production on 2026-08-28.
+
+    ⚠️ **`by_venue` separates two refusals that read alike and behave oppositely.** Our own
+    safeguards — the kill switch, the volume cap, a session that stopped beating — refuse
+    conditions that *change on their own*; the terminal refusing (AutoTrading off, a bad stop
+    level) usually will not. A strategy deciding whether to offer the zone again is asking
+    exactly that, so the two cannot arrive under one word.
+
+    ⚠️ `retcode` is the venue's own number, or absent when the venue was never asked. Absent and
+    zero are different facts and only one is a verdict.
+    """
+
+    client_id: str
+    session_id: str
+    at: dt.datetime
+    reason: str
+    by_venue: bool
+    retcode: int | None = None
+
+
+type Outcome = WireFill | WireRefusal
+"""What comes off `venue.outcomes`. Two shapes, one stream, one order of arrival."""
+
+
+def refusal_fields(refusal: WireRefusal) -> dict[str, str]:
+    """The refusal as a flat map of strings, tagged with its kind."""
+    fields = {
+        KIND: KIND_REFUSAL,
+        "client_id": refusal.client_id,
+        "session_id": refusal.session_id,
+        "at": refusal.at.isoformat(),
+        "reason": refusal.reason,
+        # Booleans have no wire type here either. Spelled as a word rather than "0"/"1" so a
+        # human reading `XRANGE` output does not have to remember which way round it was.
+        "by_venue": "yes" if refusal.by_venue else "no",
+    }
+    if refusal.retcode is not None:
+        fields["retcode"] = str(refusal.retcode)
+    return fields
+
+
+def outcome_from_fields(fields: dict[str, str]) -> Outcome:
+    """One entry off `venue.outcomes`, whichever of the two it is.
+
+    ⚠️ **The `kind` is read first and never guessed** — the same rule as
+    `instruction_from_fields`, and it bites harder in this direction. A missing `kind` defaulted
+    to "fill" would fold an entry this format cannot read straight into the session's ledger, and
+    every number reported from then on — including the equity the risk manager sizes against —
+    is computed from a ledger that has lost track of what it holds. An order sent wrongly can be
+    cancelled; a ledger silently wrong cannot be noticed.
+    """
+    kind = fields[KIND]
+    if kind == KIND_FILL:
+        return fill_from_fields(fields)
+    if kind == KIND_REFUSAL:
+        retcode = fields.get("retcode")
+        return WireRefusal(
+            client_id=fields["client_id"],
+            session_id=fields["session_id"],
+            at=dt.datetime.fromisoformat(fields["at"]),
+            reason=fields["reason"],
+            # Anything that is not the affirmative is a no. A truthy default would make a
+            # corrupted field read as "the venue said so", which is the half that suppresses a
+            # retry — the safer misreading is the one that lets the zone be offered again.
+            by_venue=fields["by_venue"] == "yes",
+            retcode=int(retcode) if retcode is not None else None,
+        )
+    raise ValueError(f"unknown outcome kind {kind!r} on {VENUE_OUTCOMES}")
 
 
 def fill_from_fields(fields: dict[str, str]) -> WireFill:

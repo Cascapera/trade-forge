@@ -1302,3 +1302,22 @@ class CollectionOut(_Out):
     requested_at: dt.datetime
     started_at: dt.datetime | None = None
     finished_at: dt.datetime | None = None
+
+
+class KillSwitchOut(BaseModel):
+    """The state of the **one** kill-switch layer this API can see and write.
+
+    ⚠️ **`engaged: false` does not mean the executor is trading.** Two of the three layers are
+    invisible from here — a file on the executor's disk and a flag in its memory — and either
+    one engaged stops everything while this body reports `false`. That is why `layer` is on the
+    body rather than implied: whatever renders this must say *which* handle it is showing, or it
+    will tell an operator the machine is live when it is not.
+
+    ⚠️ **And engaged does not mean flat.** The switch refuses new risk; exits, cancels and
+    tightening stops are cleared before the switches are ever consulted (`safety.admits`), so
+    open positions stay open, protected by the stop already sitting at the venue.
+    """
+
+    engaged: bool
+    engaged_at: dt.datetime | None = None
+    layer: str

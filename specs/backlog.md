@@ -1260,3 +1260,79 @@ o stop se moveu.
 
 ⚠️ O docstring do loop já registra que as duas causas (ordem ainda não preenchida vs. broker sem
 nível protetivo) são indistinguíveis dali. Um canal de volta teria que carregar qual foi.
+
+---
+
+## O aceite do PR-304 promete "kill switch encerra tudo", e o mecanismo não encerra nada
+
+Encontrado ao construir o PR-304-C1, lendo `safety.admits` antes de escrever a rota. O
+`specs/fase-3.md` diz: *"kill switch encerra tudo"*. O que o switch faz é outra coisa:
+
+```python
+if reduces_risk(intent):   # EXIT, CANCEL, MODIFY_STOP
+    return ALLOWED         # ← ANTES dos switches, deliberadamente
+for switch in switches: ...
+```
+
+Ele **barra risco novo e libera a saída**. Posição aberta continua aberta com o stop que já está
+no venue; a sessão continua de pé e leva recusa a cada entrada. O docstring do `admits` argumenta
+o porquê e está certo: *"a kill switch that refuses an exit is an operator pulling the handle and
+staying in the trade"*.
+
+⚠️ **Isso é um problema de rótulo, não de mecanismo — e por isso é perigoso.** Um botão escrito
+"encerrar tudo" que deixa posição aberta ensina o operador a acreditar numa coisa que não
+acontece, exatamente no momento em que ele não vai conferir. O `KillSwitchOut` já carrega o
+`layer` para a tela poder ser específica, mas o texto do C4 precisa de decisão explícita.
+
+**Duas opções, e é decisão do Guilherme:**
+
+1. **Rotular honesto** (barato): o botão diz "parar de abrir posição", e a tela mostra as posições
+   que continuam abertas. Nenhum código novo.
+2. **Construir o "flatten"** (mecanismo novo): um caminho que fecha posição a mercado e cancela as
+   pendentes. Não existe hoje em camada nenhuma, e teria que passar pelo próprio switch engajado
+   (é `reduces_risk`, então passa) — mas quem o dispara, com que idempotência, e o que acontece se
+   o venue recusar metade, é projeto inteiro.
+
+---
+
+## Uma sessão viva com o kill switch engajado queima as zonas
+
+Encontrado ao construir o PR-304-C1, percorrendo o caminho. Com o switch engajado, cada tentativa
+de armar vira recusa, e `setups.MAX_ARMING_ATTEMPTS` aposenta a zona depois de **3 recusas
+seguidas**. Soltar o switch não devolve a zona.
+
+Não é bug: é o mesmo custo declarado no #181 para parada de infra maior que ~3 barras. Está aqui
+porque o **caminho é novo** — antes só se chegava nele por acidente (Redis fora, executor morto), e
+agora existe um botão que leva a ele de propósito, apertado por alguém que não fez essa conta.
+
+⚠️ Consequência prática para o C2/C4: depois de um kill, a sessão precisa ser **reiniciada**, não
+apenas des-killada. A tela tem que dizer isso.
+
+---
+
+## `venue.outcomes` nunca é podado, e uma sessão nova perde uma barra por 500 entradas
+
+Encontrado ao rodar o portão do PR-304-C1 (01/09). Um teste **de outra área** falhou, e a causa
+não era o PR: é estado real deixado pela demo ao vivo de 31/08.
+
+```
+XLEN venue.outcomes          503
+broker._BATCH                500     ← lê 500 por barra
+```
+
+`ensure_group` cria o grupo em `id="0"` — de propósito, para que um fill chegado durante o
+aquecimento não se perca. Consequência não intencionada: uma sessão que nasce hoje recebe as
+**500 entradas mais velhas** na 1ª barra, dá `xack` em todas, e só vê o que é dela na 2ª.
+
+⚠️ **Não é artefato de teste, é produção.** Em M15 isso são **15 minutos** até a sessão ficar
+sabendo de um fill — e a notícia do fill é exatamente o que o PR-304-B-D-2d existe para entregar.
+Cada 500 entradas acumuladas custam mais uma barra. O stream nunca é podado, então isso só piora.
+
+⚠️ **E o número é exatamente 503 contra 500**, o que quer dizer que a coisa passou de despercebida
+a quebrada com três entradas. Antes disso todo teste era verde por sorte.
+
+Conserto provável: `XADD ... MAXLEN ~ N` no lado do executor (ele é dono do stream), ou um
+`xautoclaim`/salto de marca d'água no lado da sessão. **Decisão de design**, porque o `id="0"`
+protege um caso real (fill durante o aquecimento) e um `$` ingênuo o perderia.
+
+⚠️ CI não vê: cada job sobe um Redis vazio. Só aparece numa máquina que já operou.

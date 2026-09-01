@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 
 from tradeforge_api.config import Settings
 from tradeforge_api.kill_switch import KillSwitch
+from tradeforge_api.live.stop import StopStore
 from tradeforge_api.queue import JobQueue
 
 
@@ -41,7 +42,13 @@ def get_kill_switch(request: Request) -> KillSwitch:
     return switch
 
 
+def get_stop_store(request: Request) -> StopStore:
+    store: StopStore = request.app.state.stop_store
+    return store
+
+
 SettingsDep = Annotated[Settings, Depends(get_settings)]
 SessionDep = Annotated[Session, Depends(get_session)]
 QueueDep = Annotated[JobQueue, Depends(get_queue)]
 KillSwitchDep = Annotated[KillSwitch, Depends(get_kill_switch)]
+StopStoreDep = Annotated[StopStore, Depends(get_stop_store)]

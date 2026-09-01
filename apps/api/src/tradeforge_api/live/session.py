@@ -114,6 +114,18 @@ class SessionPlan:
     would have each of them say so — which reads as tidier right up to the day a new caller is
     added and the value they have to remember is the dangerous one."""
 
+    session_id: uuid.UUID | None = None
+    """The id this session will have, when the caller needs to know it **before** it exists.
+
+    ⚠️ **Not an output moved to the input for tidiness.** A process that can be asked to stop has
+    to be able to recognise a request addressed to it, and a request is addressed by id — so the
+    id has to be knowable by whoever builds the stopping predicate, which happens before
+    `run_session` is even called. Minted below when nobody supplied one, exactly as before.
+
+    It also fixes something that was merely annoying: the id used to appear in the log *after*
+    the warm-up, which on the last real run was 39 363 bars. An operator watching a session come
+    up had nothing to type into a query for minutes."""
+
 
 @dataclass(frozen=True, slots=True)
 class SessionOutcome:
@@ -244,7 +256,12 @@ def run_session(  # noqa: PLR0913 — keyword-only; each names one seam of a ses
     # ⚠️ **The id is minted before the row exists.** See the module docstring: `MT5Broker` is
     # built with it, and `hand_over` submits — so an id that only appeared with the row would put
     # this session's first orders into `order_audit` under a session that was not yet on file.
-    session_id = uuid.uuid4()
+    #
+    # ⚠️ And earlier still when the caller supplies one, because "before the row" is not early
+    # enough for everybody: a stop request is addressed by id, so whoever builds the stopping
+    # predicate needs the name before this function starts. `is None` rather than `or`, because
+    # the fallback must trigger on *absence* and nothing else.
+    session_id = plan.session_id if plan.session_id is not None else uuid.uuid4()
     live = _broker_for(
         plan,
         venue,

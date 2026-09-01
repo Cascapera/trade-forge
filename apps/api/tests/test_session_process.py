@@ -197,3 +197,42 @@ def test_the_promotion_gate_reads_its_number_from_configuration() -> None:
     assert "promotion_days=settings.live_promotion_days" in source, (
         "main stopped passing the configured number; the gate is back to a hard-coded 5"
     )
+
+
+def test_a_stop_request_reaches_both_places_a_session_waits() -> None:
+    """⚠️ **The stream, not just the bar loop**, and getting this half right is invisible.
+
+    A session spends nearly all of its life blocked inside `CandleStream`, not between bars. Wire
+    the new predicate into `run_session` alone and everything still works — a stop is honoured,
+    the row is written, the tests pass — except that it is honoured *at the next bar*, which on
+    H4 is four hours after somebody pressed the button and on D1 is the next day.
+
+    A source assertion, like the promotion-days test above and for the same reason: `main` is the
+    one place in this app where wiring is the whole behaviour, and it cannot be reached without a
+    database, a Redis and a terminal. What it pins is exact — one predicate, built once, handed
+    to both waiters.
+    """
+    source = inspect.getsource(main)
+
+    assert "stop_predicate(redis, session_id, signalled=stopping.is_set)" in source, (
+        "main stopped combining the signal with the stop request"
+    )
+    assert "_stream(redis, subscription, should_stop)" in source, (
+        "the stream is back on the signal alone; a stop now waits for the next bar"
+    )
+    assert "stopping=should_stop" in source, "run_session is back on the signal alone"
+
+
+def test_the_session_is_named_before_it_is_warmed() -> None:
+    """The id has to exist before the predicate that reads a request addressed to it.
+
+    ⚠️ It also fixes something that was merely annoying: minted inside `run_session`, the id only
+    reached the log *after* the warm-up — 39 363 bars on the last real run — so an operator had
+    nothing to query with for minutes.
+    """
+    source = inspect.getsource(main)
+
+    assert source.index("session_id = uuid.uuid4()") < source.index("stop_predicate("), (
+        "the predicate is built before the session has a name"
+    )
+    assert "session_id=session_id" in source, "the plan no longer carries the minted id"

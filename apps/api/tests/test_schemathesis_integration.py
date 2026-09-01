@@ -38,6 +38,11 @@ class _FakeQueue:
 class _FakeSwitchStore:
     """⚠️ **Not an optimisation — the reason this file does not halt live trading.**
 
+    Doubles as the stop store: the fuzzer also presses `POST /live-sessions/{id}/stop`, and
+    against the real client that would write a real stop request. Every id it draws is a random
+    uuid that 404s today, which is precisely the kind of "safe by accident" this project has
+    learned not to rely on — the guarantee should not depend on no session ever matching.
+
     Postgres is real here on purpose, and Redis is real on this machine too. The fuzzer reads the
     app's own OpenAPI and presses *every* operation, which now includes
     `POST /executor/kill-switch` — against the real client that would be exactly the key the
@@ -63,6 +68,10 @@ class _FakeSwitchStore:
         self.keys.update({str(key): str(value) for key, value in mapping.items()})
         return True
 
+    def set(self, name: Any, value: Any) -> bool:
+        self.keys[str(name)] = str(value)
+        return True
+
 
 @pytest.fixture
 def api_schema(session_factory: Callable[[], Session], settings: Settings, tmp_path: Path) -> Any:
@@ -71,6 +80,7 @@ def api_schema(session_factory: Callable[[], Session], settings: Settings, tmp_p
         session_factory=session_factory,
         arq_pool=_FakeQueue(),
         kill_switch=KillSwitch(_FakeSwitchStore()),
+        stop_store=_FakeSwitchStore(),
     )
     return schemathesis.openapi.from_asgi("/openapi.json", app)
 
@@ -125,6 +135,7 @@ def test_a_nul_byte_in_a_text_filter_is_refused_and_not_a_crash(
         session_factory=session_factory,
         arq_pool=_FakeQueue(),
         kill_switch=KillSwitch(_FakeSwitchStore()),
+        stop_store=_FakeSwitchStore(),
     )
     with TestClient(app) as client:
         response = client.get(path, params={parameter: "\x00"})

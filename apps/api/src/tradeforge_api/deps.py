@@ -13,6 +13,7 @@ from fastapi import Depends, Request
 from sqlalchemy.orm import Session
 
 from tradeforge_api.config import Settings
+from tradeforge_api.kill_switch import KillSwitch
 from tradeforge_api.queue import JobQueue
 
 
@@ -35,6 +36,12 @@ def get_queue(request: Request) -> JobQueue:
     return pool
 
 
+def get_kill_switch(request: Request) -> KillSwitch:
+    switch: KillSwitch = request.app.state.kill_switch
+    return switch
+
+
 SettingsDep = Annotated[Settings, Depends(get_settings)]
 SessionDep = Annotated[Session, Depends(get_session)]
 QueueDep = Annotated[JobQueue, Depends(get_queue)]
+KillSwitchDep = Annotated[KillSwitch, Depends(get_kill_switch)]

@@ -24,6 +24,7 @@ from hypothesis import settings
 from sqlalchemy.orm import Session
 
 from tradeforge_api.config import Settings
+from tradeforge_api.kill_switch import KillSwitch
 from tradeforge_api.main import create_app
 
 pytestmark = pytest.mark.integration
@@ -34,12 +35,42 @@ class _FakeQueue:
         return None
 
 
+class _FakeSwitchStore:
+    """⚠️ **Not an optimisation — the reason this file does not halt live trading.**
+
+    Postgres is real here on purpose, and Redis is real on this machine too. The fuzzer reads the
+    app's own OpenAPI and presses *every* operation, which now includes
+    `POST /executor/kill-switch` — against the real client that would be exactly the key the
+    executor reads, written to the real Redis, left behind after the run. The next live session
+    would then refuse every entry it tried, with nothing raised anywhere and no line in any log
+    connecting it to a test.
+
+    That is the shape of the accident that truncated this project's `trades` table on 28/08: a
+    test process sharing a write path with production state. Faked here so the fuzzer can press
+    the button as hard as it likes.
+    """
+
+    def __init__(self) -> None:
+        self.keys: dict[str, str] = {}
+
+    def exists(self, *names: Any) -> int:
+        return sum(1 for name in names if name in self.keys)
+
+    def get(self, name: Any) -> str | None:
+        return self.keys.get(name)
+
+    def mset(self, mapping: Any) -> bool:
+        self.keys.update({str(key): str(value) for key, value in mapping.items()})
+        return True
+
+
 @pytest.fixture
 def api_schema(session_factory: Callable[[], Session], settings: Settings, tmp_path: Path) -> Any:
     app = create_app(
         settings=settings.model_copy(update={"parquet_root": tmp_path}),
         session_factory=session_factory,
         arq_pool=_FakeQueue(),
+        kill_switch=KillSwitch(_FakeSwitchStore()),
     )
     return schemathesis.openapi.from_asgi("/openapi.json", app)
 
@@ -93,6 +124,7 @@ def test_a_nul_byte_in_a_text_filter_is_refused_and_not_a_crash(
         settings=settings.model_copy(update={"parquet_root": tmp_path}),
         session_factory=session_factory,
         arq_pool=_FakeQueue(),
+        kill_switch=KillSwitch(_FakeSwitchStore()),
     )
     with TestClient(app) as client:
         response = client.get(path, params={parameter: "\x00"})

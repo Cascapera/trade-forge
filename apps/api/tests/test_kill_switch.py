@@ -100,8 +100,9 @@ def test_what_the_api_writes_is_what_the_executor_reads(
     flag = RedisFlag(store)
     assert flag.engaged() is False
 
-    assert client.post(ROUTE).status_code == 200
+    pressed = client.post(ROUTE)
 
+    assert pressed.status_code == 200
     assert flag.engaged() is True
 
 
@@ -301,8 +302,14 @@ def test_there_is_no_way_to_release_over_http(client: TestClient) -> None:
     can un-kill. This asserts 405 rather than 404: the path exists, the verb does not, which is
     the difference between "not built yet" and "refused on purpose".
     """
-    assert client.delete(ROUTE).status_code == 405
-    assert client.put(ROUTE).status_code == 405
+    # Called outside the assert, deliberately: a request inside one is a request that stops
+    # happening under `python -O`, which turns a test that checks a refusal into a test that
+    # checks nothing. CodeQL calls it `py/side-effect-in-assert` and it is right.
+    deleted = client.delete(ROUTE)
+    replaced = client.put(ROUTE)
+
+    assert deleted.status_code == 405
+    assert replaced.status_code == 405
 
 
 def test_the_documented_release_actually_releases(client: TestClient, store: _FakeRedis) -> None:

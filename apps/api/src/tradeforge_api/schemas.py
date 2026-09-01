@@ -1321,3 +1321,121 @@ class KillSwitchOut(BaseModel):
     engaged: bool
     engaged_at: dt.datetime | None = None
     layer: str
+
+
+class OpenPositionOut(BaseModel):
+    """A trade this session opened and has not closed.
+
+    ⚠️ Read from `trades` with no exit, which is what the table means by an open position — the
+    model's own comment says so: *"An open position has no exit yet"*. Not read from the venue:
+    what MetaTrader holds is the whole account, and an account can carry a position this session
+    did not take.
+    """
+
+    id: int
+    direction: str
+    entry_time: dt.datetime
+    entry_price: Money
+    volume: Money
+    stop_loss: Money | None = None
+    take_profit: Money | None = None
+
+
+class LiveSessionOut(BaseModel):
+    """One session as the panel sees it: the row, plus the two things the row cannot say.
+
+    ⚠️ **`status: running` is not "alive".** The thing that would change a status is the process,
+    so a session that died leaves the row saying `running` for ever — which is exactly why
+    `heartbeat_at` exists and why `stale` is on this body. A panel that showed only `status`
+    would report a dead session as healthy, and the failure is silent by construction.
+
+    ⚠️ `stale` is `tradeforge_db.live_sessions.is_stale`, called, not re-derived here. That rule
+    owns its own boundary (`>=`, at `BEAT_EVERY * 4`) and had a mutant survive once because the
+    only test of it wrote the comparison out in its own body.
+    """
+
+    id: uuid.UUID
+    strategy_id: uuid.UUID
+    instrument_id: uuid.UUID
+    symbol: str
+    timeframe: str
+    mode: str
+    status: str
+    initial_capital: Money
+    engine_version: str
+    warmup_bars: int
+    started_at: dt.datetime
+    stopped_at: dt.datetime | None = None
+    heartbeat_at: dt.datetime | None = None
+    last_bar_time: dt.datetime | None = None
+    error: str | None = None
+
+    stale: bool
+    silent_for_seconds: int
+    """How long since it was last heard from — from the last beat, or from `started_at` when
+    there has never been one. Reported beside `stale` rather than instead of it: the number is
+    what an operator judges by, the boolean is what the system decided."""
+
+
+class LiveSessionsPage(BaseModel):
+    total: int
+    sessions: Sequence[LiveSessionOut]
+
+
+class LiveSessionDetail(LiveSessionOut):
+    """One session, plus what it is holding, what it realised today, and whether it was asked
+    to stop.
+
+    ⚠️ **`stop_requested_at` is why this body needs Redis and the list does not.** The list is
+    pure Postgres on purpose: a panel that cannot enumerate its sessions because Redis blinked is
+    a panel that fails at the moment it is most needed. The detail is the screen somebody is on
+    when they are about to press stop, so *that* one refuses to answer rather than misreport.
+    """
+
+    stop_requested_at: dt.datetime | None = None
+    """When somebody asked it to stop, if anybody has. `None` is "nobody asked" — and it is only
+    ever that, because a Redis this endpoint could not read is a 503 rather than a `None`.
+
+    A request standing here while `status` is still `running` is not a contradiction: it is the
+    honest picture of a session that has not reached its next read yet, which on a blocked stream
+    is up to `DEFAULT_BLOCK_MS` away."""
+
+    open_positions: Sequence[OpenPositionOut]
+
+    realised_today: Money
+    """Net P&L of the trades this session **closed** today, UTC.
+
+    ⚠️ UTC, the same midnight the executor's daily loss cap counts from (`router.start_of_day`).
+    Three clocks are in play in this system — the operator's UTC-3, the database's UTC and the
+    broker's UTC+3 — and a panel that totalled a different day from the cap that stops trading
+    would explain neither number.
+
+    ⚠️ Realised, so an open position contributes nothing. Zero here is a real statement ("nothing
+    was closed today"), which is why `trades_closed_today` is beside it: zero from no trades and
+    zero from two trades that cancelled out are different days.
+    """
+
+    trades_closed_today: int
+
+
+class SessionEventOut(BaseModel):
+    """One row of `order_audit` — every order this session's executor was asked to send.
+
+    The event log of the panel, and it is an outcome log rather than a progress log: *"Every
+    value is an outcome, never a stage"*. A refusal is here with the rule that refused it, which
+    is what answers "why did my strategy stop trading at 11am".
+    """
+
+    id: uuid.UUID
+    client_id: str
+    status: str
+    reason: str | None = None
+    requested_at: dt.datetime
+    resolved_at: dt.datetime | None = None
+    request: dict[str, Any]
+    response: dict[str, Any] | None = None
+
+
+class SessionEventsPage(BaseModel):
+    total: int
+    events: Sequence[SessionEventOut]

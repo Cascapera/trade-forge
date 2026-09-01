@@ -17,6 +17,7 @@ import sys
 import threading
 import types
 import uuid
+from collections.abc import Callable
 from decimal import Decimal
 
 from redis import Redis
@@ -25,6 +26,7 @@ from tradeforge_api.config import Settings
 from tradeforge_api.live.broker import MT5Broker
 from tradeforge_api.live.candle_stream import CandleStream
 from tradeforge_api.live.session import SessionPlan, Venue, reconcile_on_start, run_session
+from tradeforge_api.live.stop import stop_predicate
 from tradeforge_collector.live import Subscription
 from tradeforge_db.models import Instrument, SessionMode
 from tradeforge_db.session import create_db_engine, create_session_factory, session_scope
@@ -117,6 +119,22 @@ def main(argv: list[str] | None = None) -> int:
     stopping = threading.Event()
     stop_on_signals(stopping)
 
+    # ⚠️ **Minted here rather than inside `run_session`, and that is what makes the session
+    # addressable.** A stop request names a session by id, so the predicate below has to know
+    # the name before the session exists. See `SessionPlan.session_id`.
+    session_id = uuid.uuid4()
+
+    # A signal to this process, **or** somebody asking this session to stop. The `or` is the
+    # whole feature: `run_session` documents `stopping` as a predicate rather than an `Event`
+    # precisely "so the caller owns what stopping means", and on Windows the signal half is
+    # nearly unreachable from outside — measured 25/08, `taskkill` without `/F` is refused and
+    # `kill -INT` never arrives. Without the second half, a session on the trading box can only
+    # be ended by killing the process, which leaves a `running` row that `reconcile_stale`
+    # correctly reports as a **failure**: a clean stop recorded as a crash.
+    should_stop = stop_predicate(redis, session_id, signalled=stopping.is_set)
+
+    logger.info("session %s starting; warming up before it opens", session_id)
+
     # ⚠️ The stream is keyed on the *symbol*, and only the database knows which symbol an
     # instrument id is. Read here rather than inside `run_session` so that a wrong id fails
     # before a consumer group is created for a stream that will never carry anything.
@@ -137,15 +155,16 @@ def main(argv: list[str] | None = None) -> int:
             else {"type": "none"}
         ),
         mode=args.mode,
+        session_id=session_id,
     )
 
     try:
         outcome = run_session(
             factory=factory,
-            source=_stream(redis, subscription, stopping),
+            source=_stream(redis, subscription, should_stop),
             plan=plan,
             parquet_root=settings.parquet_root,
-            stopping=stopping.is_set,
+            stopping=should_stop,
             venue=_venue(redis, plan.initial_capital),
             # ⚠️ Passed, where it used to fall through to `run_session`'s own default of 5. The
             # two agreed, so nothing was wrong — and nothing was configurable either: setting
@@ -195,7 +214,7 @@ def _venue(redis: Redis, initial_capital: Decimal) -> Venue:
     return build
 
 
-def _stream(redis: Redis, subscription: Subscription, stopping: threading.Event) -> CandleStream:
+def _stream(redis: Redis, subscription: Subscription, stopping: Callable[[], bool]) -> CandleStream:
     """The session's own consumer group, reading from the beginning of the stream.
 
     ⚠️ `start_id="0"`, not the class default of `"$"`. The splice needs to *see* the bars that
@@ -210,7 +229,10 @@ def _stream(redis: Redis, subscription: Subscription, stopping: threading.Event)
         subscription,
         group=f"session-{uuid.uuid4().hex}",
         start_id="0",
-        stopping=stopping.is_set,
+        # ⚠️ The same predicate `run_session` gets, not `Event.is_set`. The stream is where a
+        # session spends nearly all of its time — blocked on a read — so a stop that only the
+        # bar loop honoured would wait for the next bar, which on H4 is four hours.
+        stopping=stopping,
     )
 
 

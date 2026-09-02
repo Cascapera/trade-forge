@@ -374,3 +374,88 @@ test('a list with nothing in it says no session was ever started', () => {
 
   expect(screen.getByText(/no session has ever been started/i)).toBeInTheDocument()
 })
+
+// --------------------------------------------------------------------------- //
+// The states a session can be in, and the ones it can fail in                   //
+// --------------------------------------------------------------------------- //
+
+test.each([
+  ['stopped' as const, 'stopped'],
+  ['failed' as const, 'failed'],
+])('a %s session is badged as such', (status, shown) => {
+  arrange({ rows: [listed({ status, stopped_at: '2026-09-01T12:00:00Z' })] })
+
+  renderWithProviders(<LiveSessions />)
+
+  expect(within(screen.getByRole('table')).getByText(shown)).toBeInTheDocument()
+})
+
+test('a short silence is counted in seconds, a long one in minutes', () => {
+  // ⚠️ `stale` is what decides; this is only how the number reads. Rendering 240s as "240s" is not
+  // wrong, it is unreadable — and the number on this badge is the one somebody squints at to
+  // decide whether to go and look at the machine.
+  arrange({ rows: [listed({ stale: true, silent_for_seconds: 65 })] })
+
+  renderWithProviders(<LiveSessions />)
+
+  expect(within(screen.getByRole('table')).getByText(/silent 65s/i)).toBeInTheDocument()
+})
+
+test('a session with no bar yet shows a dash rather than an invented time', () => {
+  arrange({ rows: [listed({ last_bar_time: null })] })
+
+  renderWithProviders(<LiveSessions />)
+
+  expect(within(screen.getByRole('table')).getByText('—')).toBeInTheDocument()
+})
+
+test('a stop that could not be recorded says the session is still running', () => {
+  // ⚠️ The request was not written, so nothing will act on it. A screen that showed "stopping…"
+  // would have an operator waiting on a message nobody sent.
+  arrange()
+  stop.mockReturnValue({ mutate: vi.fn(), isPending: false, isError: true } as unknown as ReturnType<
+    typeof useStopLiveSession
+  >)
+
+  renderWithProviders(<LiveSessions />)
+
+  expect(screen.getByText(/request was not recorded/i)).toBeInTheDocument()
+})
+
+test('a detail that could not be read says the session itself is unaffected', () => {
+  // The detail 503s rather than guessing at the stop state. The screen repeats that honestly:
+  // what is missing is the panel's knowledge, not the session.
+  arrange()
+  session.mockReturnValue({ data: undefined, isError: true } as unknown as ReturnType<
+    typeof useLiveSession
+  >)
+
+  renderWithProviders(<LiveSessions />)
+
+  expect(screen.getByText(/session itself is unaffected/i)).toBeInTheDocument()
+})
+
+test('with nothing running, the newest session is opened anyway', () => {
+  // ⚠️ A panel that opened on nothing when every session has ended would make the commonest
+  // after-hours question — "what did it do today?" — take a click nobody knows to make.
+  arrange({ rows: [listed({ id: 'sess-old', status: 'stopped' })] })
+
+  renderWithProviders(<LiveSessions />)
+
+  expect(screen.getByRole('button', { name: /stop session/i })).toBeDisabled()
+})
+
+test('clicking a row opens that session instead of the default one', () => {
+  // ⚠️ Never tested until the coverage gate pointed at the click handler, and it is a feature
+  // rather than a line: with more than one session running, the screen opens the first *running*
+  // one, and picking another is the only way to look at the rest. A panel that always showed the
+  // same session would be unusable on precisely the day it matters — the day two are live.
+  const other = listed({ id: 'sess-2', symbol: 'GBPUSD' })
+  arrange({ rows: [listed(), other] })
+
+  renderWithProviders(<LiveSessions />)
+  fireEvent.click(screen.getByText('GBPUSD'))
+
+  // `useLiveSession` is asked about the row that was clicked, not the one that was open.
+  expect(session).toHaveBeenLastCalledWith('sess-2', true)
+})

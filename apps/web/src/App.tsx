@@ -6,6 +6,7 @@ import { LaunchBacktest } from './screens/LaunchBacktest'
 import { LaunchBasket } from './screens/LaunchBasket'
 import { Results } from './screens/Results'
 import { LaunchStudy } from './screens/LaunchStudy'
+import { LiveSessions } from './screens/LiveSessions'
 import { RunLog } from './screens/RunLog'
 import { StrategyBuilder } from './screens/StrategyBuilder'
 import { StudyResult } from './screens/StudyResult'
@@ -58,6 +59,12 @@ export function App(): React.JSX.Element {
             <NavLink to="/runs" className={navClass}>
               Run log
             </NavLink>
+            {/* The only screen here about money that is already at risk. Everything to its left is
+                a question about the past; this one is a machine that is trading right now, and it
+                carries the two handles for stopping it. */}
+            <NavLink to="/live" className={navClass}>
+              Live
+            </NavLink>
             {/* Last, because it is upstream of everything else and reached least often: a symbol
                 is collected once and backtested for weeks. */}
             <NavLink to="/collect" className={navClass}>
@@ -95,6 +102,7 @@ export function App(): React.JSX.Element {
           <Route path="/walkforwards/:id" element={<WalkForwardResult />} />
           <Route path="/collect" element={<CollectSymbol />} />
           <Route path="/runs" element={<RunLog />} />
+          <Route path="/live" element={<LiveSessions />} />
           <Route path="/results/:id" element={<Results />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>

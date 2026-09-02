@@ -27,7 +27,11 @@ import type {
   CreatedWalkForward,
   EquityPoint,
   Instrument,
+  KillSwitch,
+  LiveSessionDetail,
+  LiveSessionsPage,
   OverlaysResponse,
+  SessionEventsPage,
   Snapshot,
   StrategiesPage,
   StrategyFilters,
@@ -556,4 +560,90 @@ export function useAutoProbe(args: {
   // What is still ahead of the collection: everything asked for that has not come back. The
   // screen says this so a wait reads as a queue rather than as nothing happening.
   return { queued: missing.length }
+}
+
+// --------------------------------------------------------------------------- //
+// Live sessions                                                                //
+// --------------------------------------------------------------------------- //
+
+/**
+ * Every live session.
+ *
+ * ⚠️ Polled on a slow cadence **even while a socket is open**, and the two are not redundant: the
+ * socket watches one session, this watches the arrival of *another* one. A session started from a
+ * terminal on the trading box would otherwise never appear until somebody reloaded the page.
+ */
+export function useLiveSessions(status?: string) {
+  return useQuery<LiveSessionsPage>({
+    queryKey: ['live-sessions', status ?? null],
+    queryFn: () => api.listLiveSessions(status),
+    refetchInterval: STUDY_POLL_MS,
+  })
+}
+
+/**
+ * One session in full.
+ *
+ * ⚠️ **`live` turns the polling off, and losing the socket turns it back on.** A screen that
+ * simply stopped updating when a socket dropped would look exactly like a quiet market, which is
+ * the one thing a live panel must never be mistakable for.
+ */
+export function useLiveSession(id: string | undefined, live: boolean) {
+  return useQuery<LiveSessionDetail>({
+    queryKey: ['live-session', id],
+    queryFn: id === undefined ? skipToken : () => api.getLiveSession(id),
+    refetchInterval: live ? false : POLL_MS,
+  })
+}
+
+export function useSessionEvents(id: string | undefined, live: boolean) {
+  return useQuery<SessionEventsPage>({
+    queryKey: ['session-events', id],
+    queryFn: id === undefined ? skipToken : () => api.listSessionEvents(id, 50),
+    refetchInterval: live ? false : STUDY_POLL_MS,
+  })
+}
+
+/**
+ * Ask a session to stop.
+ *
+ * ⚠️ The response still says `running`, and that is correct rather than a lag to paper over: only
+ * the session writes `stopped_at`, when it has actually finished. The screen reports the *request*
+ * landing (`stop_requested_at`), never the outcome it cannot observe.
+ */
+export function useStopLiveSession() {
+  const client = useQueryClient()
+  return useMutation<LiveSessionDetail, Error, string>({
+    mutationFn: (id: string) => api.stopLiveSession(id),
+    onSuccess: (session) => {
+      client.setQueryData(['live-session', session.id], session)
+      void client.invalidateQueries({ queryKey: ['live-sessions'] })
+    },
+  })
+}
+
+/**
+ * The kill switch, polled — because this API can only see one of its three layers.
+ *
+ * The file layer lives on the executor's own disk and the endpoint layer in its memory; either one
+ * engaged stops everything while this reports `false`. Nothing pushes a change, and somebody at a
+ * shell can engage it, so a screen that read this once would go on showing a machine as armed
+ * after it had been stopped by hand.
+ */
+export function useKillSwitch() {
+  return useQuery<KillSwitch>({
+    queryKey: ['kill-switch'],
+    queryFn: api.getKillSwitch,
+    refetchInterval: STUDY_POLL_MS,
+  })
+}
+
+export function useEngageKillSwitch() {
+  const client = useQueryClient()
+  return useMutation<KillSwitch>({
+    mutationFn: api.engageKillSwitch,
+    onSuccess: (state) => {
+      client.setQueryData(['kill-switch'], state)
+    },
+  })
 }

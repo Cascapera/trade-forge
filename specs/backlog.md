@@ -1263,7 +1263,7 @@ nível protetivo) são indistinguíveis dali. Um canal de volta teria que carreg
 
 ---
 
-## O aceite do PR-304 promete "kill switch encerra tudo", e o mecanismo não encerra nada
+## ~~O aceite do PR-304 promete "kill switch encerra tudo"~~ — DECIDIDO 01/09, opção 1
 
 Encontrado ao construir o PR-304-C1, lendo `safety.admits` antes de escrever a rota. O
 `specs/fase-3.md` diz: *"kill switch encerra tudo"*. O que o switch faz é outra coisa:
@@ -1284,14 +1284,14 @@ staying in the trade"*.
 acontece, exatamente no momento em que ele não vai conferir. O `KillSwitchOut` já carrega o
 `layer` para a tela poder ser específica, mas o texto do C4 precisa de decisão explícita.
 
-**Duas opções, e é decisão do Guilherme:**
+✅ **Decidido em 01/09 e feito no PR-304-C4: opção 1, rotular honesto.** O `specs/fase-3.md` foi
+corrigido na fonte, e a tela diz ao lado de cada botão o que ele **não** faz — com teste prendendo
+as duas frases, porque um rótulo é a única coisa nesta tela que nenhum outro teste protege.
 
-1. **Rotular honesto** (barato): o botão diz "parar de abrir posição", e a tela mostra as posições
-   que continuam abertas. Nenhum código novo.
-2. **Construir o "flatten"** (mecanismo novo): um caminho que fecha posição a mercado e cancela as
-   pendentes. Não existe hoje em camada nenhuma, e teria que passar pelo próprio switch engajado
-   (é `reduces_risk`, então passa) — mas quem o dispara, com que idempotência, e o que acontece se
-   o venue recusar metade, é projeto inteiro.
+**A opção 2 continua não existindo, e fica aqui caso um dia seja preciso:** construir o *flatten*
+— um caminho que fecha posição a mercado e cancela as pendentes. Passaria pelo switch engajado
+(é `reduces_risk`), mas quem o dispara, com que idempotência, e o que acontece se o venue recusar
+metade é projeto inteiro.
 
 ---
 

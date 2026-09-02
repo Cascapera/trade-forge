@@ -69,7 +69,11 @@ quantas precisaria, porque a segunda não é conhecível.
 
 ## PR-304 — MT5Broker + painel live
 **Escopo:** `MT5Broker` (proxy via fila para o executor); UI: painel de sessões live (posições, P&L do dia, estado, log de eventos) com **kill switch em destaque**; promoção paper→real exige N dias de paper registrados (configurável).
-**Aceite:** fluxo completo em conta demo: ativar sessão → ordem → fill → painel atualiza via WS → kill switch encerra tudo; trava de paper prévio testada.
+**Aceite:** fluxo completo em conta demo: ativar sessão → ordem → fill → painel atualiza via WS → kill switch **impede risco novo**; trava de paper prévio testada.
+
+> ⚠️ **Corrigido em 01/09/2026, no PR-304-C4.** Este aceite dizia *"kill switch encerra tudo"* e o mecanismo não encerra nada: `safety.admits` libera `EXIT`/`CANCEL`/`MODIFY_STOP` **antes** de consultar os switches, de propósito — *"a kill switch that refuses an exit is an operator pulling the handle and staying in the trade"*. Posição aberta continua aberta, protegida pelo stop que já está no venue.
+>
+> Decisão do Guilherme (01/09): **rotular honesto**, não construir o *flatten*. A tela diz, ao lado de cada botão, o que ele não faz. Um mecanismo que fecha posição a mercado continua não existindo em camada nenhuma, e continua no `specs/backlog.md` se um dia for preciso.
 **Você vai aprender:** UX de sistemas críticos, idempotência de ordens (retry sem duplicar), reconciliação de estado (posições no MT5 vs no banco).
 
 ## PR-305 — IA: analista de backtest

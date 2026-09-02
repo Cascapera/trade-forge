@@ -19,8 +19,12 @@ import type {
   CreatedStudy,
   CreatedWalkForward,
   EquityPoint,
+  KillSwitch,
   Instrument,
+  LiveSessionDetail,
+  LiveSessionsPage,
   OverlaysResponse,
+  SessionEventsPage,
   Snapshot,
   StrategiesPage,
   StrategyFilters,
@@ -151,4 +155,45 @@ export const api = {
   // different requests, and that distinction is already written down once.
   listStrategies: (filters: StrategyFilters = {}): Promise<StrategiesPage> =>
     request('GET', `/strategies${query({ ...filters, include_generated: filters.include_generated === true ? 'true' : undefined })}`),
+
+  // ⚠️ The list is the one endpoint here that cannot be taken down by Redis — it is pure Postgres
+  // on the server, on purpose, because it is the screen somebody opens when they suspect
+  // something is wrong. The detail below is the one that asks Redis, and answers 503 rather than
+  // guessing at the stop state.
+  listLiveSessions: (status?: string): Promise<LiveSessionsPage> =>
+    request('GET', `/live-sessions${query({ status })}`),
+  getLiveSession: (id: string): Promise<LiveSessionDetail> => request('GET', `/live-sessions/${id}`),
+  listSessionEvents: (id: string, limit?: number): Promise<SessionEventsPage> =>
+    request('GET', `/live-sessions/${id}/events${query({ limit })}`),
+  // Asks the session to finish the bar it is on and stop. **It does not close the position** —
+  // exits, cancels and tightening stops pass a stopped session's safeguards by design, and what
+  // stops is the management, not the trade. The screen has to say so beside the button.
+  //
+  // Returns the detail, and `status` will still say `running`: only the session writes
+  // `stopped_at`, when it has actually finished. `stop_requested_at` is what says the ask landed.
+  stopLiveSession: (id: string): Promise<LiveSessionDetail> =>
+    request('POST', `/live-sessions/${id}/stop`),
+
+  getKillSwitch: (): Promise<KillSwitch> => request('GET', '/executor/kill-switch'),
+  // ⚠️ **One-way from here, by decision.** There is no release endpoint and there must not be:
+  // an endpoint that can un-kill is an endpoint a retry can un-kill. Releasing is
+  // `redis-cli DEL executor:kill-switch`, from a shell, by somebody who has looked.
+  engageKillSwitch: (): Promise<KillSwitch> => request('POST', '/executor/kill-switch'),
+}
+
+/**
+ * The `ws://` (or `wss://`) address of a path served under the same prefix as the REST API.
+ *
+ * ⚠️ Derived rather than configured, and derived from `BASE_URL` rather than from the page. The
+ * API prefix is `/api` in dev and in the built image, and an absolute `VITE_API_URL` in anything
+ * else; a socket URL assembled from `window.location` alone would ignore that and connect to the
+ * wrong host the moment the two differ.
+ *
+ * ⚠️ `wss` under `https`, always. A browser refuses a plain `ws://` from a secure page, and the
+ * failure arrives as a closed socket with no reason attached.
+ */
+export function socketUrl(path: string): string {
+  const url = new URL(`${BASE_URL}${path}`, window.location.href)
+  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
+  return url.toString()
 }

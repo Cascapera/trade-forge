@@ -764,3 +764,101 @@ export interface Collection {
   started_at: string | null
   finished_at: string | null
 }
+
+/**
+ * One live session as the panel sees it.
+ *
+ * ⚠️ **`status: 'running'` is not "alive".** The thing that would change a status is the process,
+ * so a session that died leaves its row saying `running` for ever — which is exactly why `stale`
+ * is on this shape. A screen that rendered `status` alone would show the deadest sessions as the
+ * healthiest, and nothing would look wrong.
+ */
+export interface LiveSession {
+  id: string
+  strategy_id: string
+  instrument_id: string
+  symbol: string
+  timeframe: string
+  mode: string
+  status: 'running' | 'stopped' | 'failed'
+  /** Money crosses the wire as text; the exact decimal is preserved all the way here. */
+  initial_capital: string
+  engine_version: string
+  warmup_bars: number
+  started_at: string
+  stopped_at: string | null
+  heartbeat_at: string | null
+  last_bar_time: string | null
+  error: string | null
+  /** The freshness question already answered by the server. Render this, not a clock of your own. */
+  stale: boolean
+  silent_for_seconds: number
+}
+
+/** A trade this session opened and has not closed — `trades` with no exit, not the venue. */
+export interface OpenPosition {
+  id: number
+  direction: string
+  entry_time: string
+  entry_price: string
+  volume: string
+  stop_loss: string | null
+  take_profit: string | null
+}
+
+export interface LiveSessionDetail extends LiveSession {
+  /**
+   * When somebody asked it to stop, if anybody has. `null` is "nobody asked" and only ever that:
+   * a Redis the API could not read is a 503, never a `null`.
+   */
+  stop_requested_at: string | null
+  open_positions: OpenPosition[]
+  /** Net P&L of what this session **closed** today, UTC — the same midnight the loss cap counts. */
+  realised_today: string
+  /** ⚠️ Beside the total, because zero from no trades and zero from two that cancelled differ. */
+  trades_closed_today: number
+}
+
+export interface LiveSessionsPage {
+  total: number
+  sessions: LiveSession[]
+}
+
+/** One row of `order_audit`: every order the executor was asked to send, and what became of it. */
+export interface SessionEvent {
+  id: string
+  client_id: string
+  status: string
+  /** The rule that refused it. `null` means no refusal happened, not an unexplained one. */
+  reason: string | null
+  requested_at: string
+  resolved_at: string | null
+  request: Record<string, unknown>
+  response: Record<string, unknown> | null
+}
+
+export interface SessionEventsPage {
+  total: number
+  events: SessionEvent[]
+}
+
+/**
+ * The state of the **one** kill-switch layer the API can see and write.
+ *
+ * ⚠️ `engaged: false` does not mean the executor is trading. Two of the three layers are invisible
+ * from here — a file on the executor's disk and a flag in its memory — and either one engaged
+ * stops everything while this reports `false`. That is why `layer` is on the body: whatever
+ * renders it must name the handle it is showing.
+ */
+export interface KillSwitch {
+  engaged: boolean
+  engaged_at: string | null
+  layer: string
+}
+
+/** A frame off `WS /ws/live-sessions/{id}`. Four shapes, one `type`. */
+export type SessionFrame =
+  | { type: 'state'; session: LiveSession }
+  | { type: 'fill'; client_id: string; at: string; symbol: string; price: string; volume: string; spread: string }
+  | { type: 'refusal'; client_id: string; at: string; reason: string; by_venue: boolean; retcode: number | null }
+  | { type: 'error'; detail: string }

@@ -33,7 +33,8 @@ from pydantic import (
 
 from tradeforge_api.walkforward import MAX_FOLDS, MIN_FOLDS
 from tradeforge_collector.classify import asset_class_from_path
-from tradeforge_db.models import SelectionMetric
+from tradeforge_db.live_sessions import is_stale, silence
+from tradeforge_db.models import LiveSession, SelectionMetric
 from tradeforge_engine.domain import AssetClass
 from tradeforge_schema.models import TIMEFRAMES
 
@@ -1439,3 +1440,38 @@ class SessionEventOut(BaseModel):
 class SessionEventsPage(BaseModel):
     total: int
     events: Sequence[SessionEventOut]
+
+
+def session_fields(row: LiveSession, symbol: str, *, now: dt.datetime) -> dict[str, Any]:
+    """The fields every view of a session shares, including the two the row cannot state.
+
+    Public and here rather than private in the router, because it has two callers that must not
+    drift: `/live-sessions` and the WebSocket. A panel that got `stale` from one shape over HTTP
+    and a different shape over the socket would flicker between two truths on every event.
+    """
+    return {
+        "id": row.id,
+        "strategy_id": row.strategy_id,
+        "instrument_id": row.instrument_id,
+        "symbol": symbol,
+        "timeframe": row.timeframe,
+        "mode": row.mode.value,
+        "status": row.status.value,
+        "initial_capital": row.initial_capital,
+        "engine_version": row.engine_version,
+        "warmup_bars": row.warmup_bars,
+        "started_at": row.started_at,
+        "stopped_at": row.stopped_at,
+        "heartbeat_at": row.heartbeat_at,
+        "last_bar_time": row.last_bar_time,
+        "error": row.error,
+        # ⚠️ Called, never re-derived. `is_stale` owns the boundary — silent for *exactly*
+        # `STALE_AFTER` counts — and the last test that wrote that comparison out in its own body
+        # pinned itself instead of the rule, letting a mutant through both suites.
+        "stale": is_stale(heartbeat_at=row.heartbeat_at, started_at=row.started_at, now=now),
+        "silent_for_seconds": int(
+            silence(
+                heartbeat_at=row.heartbeat_at, started_at=row.started_at, now=now
+            ).total_seconds()
+        ),
+    }

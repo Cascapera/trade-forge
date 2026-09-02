@@ -1336,3 +1336,67 @@ Conserto provável: `XADD ... MAXLEN ~ N` no lado do executor (ele é dono do st
 protege um caso real (fill durante o aquecimento) e um `$` ingênuo o perderia.
 
 ⚠️ CI não vê: cada job sobe um Redis vazio. Só aparece numa máquina que já operou.
+
+---
+
+## A ajuda do `--spread-points` promete o spread da barra e entrega custo zero
+
+Encontrado na passada B da demo (02/09/2026), ao investigar por que toda barra publicada chegava
+com `spread = 0`.
+
+```
+apps/api/.../live/process.py:88   help="charge this fixed spread; omitted means the bar's own spread"
+apps/api/.../live/process.py:155  else {"type": "none"}          ->  build_cost_model  ->  NoCostModel()
+```
+
+Omitir a flag **não** cobra o spread da barra: cobra **nada**. As duas sessões de 31/08 e a de
+02/09 estão gravadas no banco com `cost_model = {"type": "none"}`.
+
+⚠️ **Em `live` isso é inofensivo e é por isso que passou despercebido**: o `MT5Broker` precifica o
+fill com o `wire.spread` medido no venue (`crossed = wire.spread if arrived.buys else ZERO`), não
+com o `cost_model` da sessão. Em **paper** não há venue, então uma sessão paper roda de graça
+enquanto a ajuda afirma que cobra — e paper é justamente o que o portão de promoção usa como
+evidência para liberar live.
+
+Conserto: ou implementar o que a ajuda promete, ou mudar a ajuda para dizer `none`. **A segunda
+não é só texto** — ver a seção seguinte, que mostra que a primeira não funcionaria nesta fonte.
+
+## Esta corretora publica `spread = 0` em toda barra
+
+Medido em 02/09/2026, Tradeview-Demo, com mercado aberto (tick de 5 s atrás, spread vivo de 8
+pontos): `copy_rates_from_pos` devolve `spread=0` em **todas** as barras M1 e M15. O coletor
+repassa fielmente; o zero é da fonte, não nosso.
+
+⚠️ Consequência para o item acima: implementar *"o spread da barra"* nesta fonte cobraria **zero
+parecendo que mediu** — o modo de falha que [[nulo-e-zero-sao-afirmacoes-diferentes]] descreve, só
+que vindo de fora. Se o custo do live tem de sair de um número medido, ele tem de sair do **tick**
+(`symbol_info().spread`, com mercado aberto) ou do `wire.spread` do deal, nunca do campo da barra.
+
+Decidir junto: o `Candle.spread` deveria ser `None` quando a fonte não mede, em vez de `0`?
+
+## `fills.inbound` ficou órfã no Redis desde a #166
+
+A chave existe, ninguém escreve, ninguém lê — o stream foi renomeado para `venue.outcomes` sem
+dual-read (decisão consciente na época). É lixo, não bug: custa memória desprezível e confunde
+quem for depurar por `KEYS *`, que é exatamente o que se faz quando algo está errado.
+
+Limpar junto da poda do `venue.outcomes` (seção acima), que mexe no mesmo lugar.
+
+## A volta do `DealWatch` não se prova esperando o mercado
+
+A passada B (02/09) colocou a limite no venue com ticket real — e ela nasceu **77,6 pips abaixo do
+preço** (1,15072 contra 1,15848). Não preenche no dia, e pode não preencher nunca: a estrutura
+pode invalidar a zona antes.
+
+⚠️ Então o **maior buraco que sobra na pilha live** — fill -> `WireFill` -> a sessão fica sabendo —
+não é uma questão de deixar rodando mais tempo. Precisa de um cenário onde a limite nasça perto do
+preço. Opções, nenhuma escolhida:
+
+* uma estratégia de demonstração cuja zona seja recente (a atual arma zona de 30/07);
+* um símbolo mais volátil, onde 77 pips seja uma tarde;
+* um caminho de teste que injete um deal no `history_deals_get` — mas aí não é o venue de verdade,
+  e [[fake-que-diverge-do-real]] já custou 22 mutantes cegos uma vez.
+
+⚠️ E `RefusedBy.VENUE` continua igualmente sem prova, por ironia: `--capital 800` conserta o teto
+de volume do executor e **por isso mesmo** tira de cena a única recusa que a gente conseguia
+produzir de propósito.

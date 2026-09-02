@@ -39,8 +39,8 @@ from tradeforge_api.schemas import (
     OpenPositionOut,
     SessionEventOut,
     SessionEventsPage,
+    session_fields,
 )
-from tradeforge_db.live_sessions import is_stale, silence
 from tradeforge_db.models import Instrument, LiveSession, LiveSessionStatus, OrderAudit, Trade
 
 router = APIRouter(tags=["live-sessions"])
@@ -84,36 +84,6 @@ def _load(session: Session, session_id: uuid.UUID) -> tuple[LiveSession, str]:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="live session not found")
     symbol = session.scalar(select(Instrument.symbol).where(Instrument.id == row.instrument_id))
     return row, symbol or ""
-
-
-def _project(row: LiveSession, symbol: str, *, now: dt.datetime) -> dict[str, object]:
-    """The fields every view of a session shares, including the two the row cannot state."""
-    return {
-        "id": row.id,
-        "strategy_id": row.strategy_id,
-        "instrument_id": row.instrument_id,
-        "symbol": symbol,
-        "timeframe": row.timeframe,
-        "mode": row.mode.value,
-        "status": row.status.value,
-        "initial_capital": row.initial_capital,
-        "engine_version": row.engine_version,
-        "warmup_bars": row.warmup_bars,
-        "started_at": row.started_at,
-        "stopped_at": row.stopped_at,
-        "heartbeat_at": row.heartbeat_at,
-        "last_bar_time": row.last_bar_time,
-        "error": row.error,
-        # ⚠️ Called, never re-derived. `is_stale` owns the boundary — silent for *exactly*
-        # `STALE_AFTER` counts — and the last test that wrote that comparison out in its own body
-        # pinned itself instead of the rule, letting a mutant through both suites.
-        "stale": is_stale(heartbeat_at=row.heartbeat_at, started_at=row.started_at, now=now),
-        "silent_for_seconds": int(
-            silence(
-                heartbeat_at=row.heartbeat_at, started_at=row.started_at, now=now
-            ).total_seconds()
-        ),
-    }
 
 
 @router.get("/live-sessions", response_model=LiveSessionsPage)
@@ -168,7 +138,7 @@ def list_sessions(
     return LiveSessionsPage(
         total=total,
         sessions=[
-            LiveSessionOut(**_project(row, symbols.get(row.instrument_id, ""), now=now))
+            LiveSessionOut(**session_fields(row, symbols.get(row.instrument_id, ""), now=now))
             for row in rows
         ],
     )
@@ -209,7 +179,7 @@ def get_session(
         ) from error
 
     return LiveSessionDetail(
-        **_project(row, symbol, now=now),
+        **session_fields(row, symbol, now=now),
         stop_requested_at=asked_at,
         open_positions=[
             OpenPositionOut(

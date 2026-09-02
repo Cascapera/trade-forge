@@ -231,6 +231,26 @@ test('a session already asked to stop still reads as running, and cannot be aske
   expect(screen.getByText('running', { selector: 'code' })).toBeInTheDocument()
 })
 
+test('the wait it quotes is the minute the mechanism takes, not a moment', () => {
+  // ⚠️ This sentence said "up to a few seconds" and that was wrong by an order of magnitude. A
+  // stop is noticed when the session's blocking read of the candle stream comes back empty, and
+  // `DEFAULT_BLOCK_MS` bounds that at 60 000 ms — so the expected wait is about thirty seconds.
+  // Measured against a real live session on 2026-09-02: 36.2 s from the click to `stopped_at`.
+  //
+  // Asserted because it is the failure this understatement causes that matters, not the wording:
+  // an operator promised seconds reaches for the task manager at second twenty, and a forced kill
+  // is the one outcome this button exists to prevent — it leaves the row `running` for ever and
+  // the position unmanaged at the venue.
+  arrange({ detail: detailed({ stop_requested_at: '2026-09-01T12:31:00Z' }) })
+
+  renderWithProviders(<LiveSessions />)
+
+  expect(screen.getByText(/up to a minute/i)).toBeInTheDocument()
+  // The understatement itself, named — so reintroducing it fails here rather than passing on a
+  // looser regex that any wording about waiting would satisfy.
+  expect(screen.queryByText(/a few seconds/i)).not.toBeInTheDocument()
+})
+
 test('stopping asks the API for the selected session', () => {
   const { mutate } = arrange()
 

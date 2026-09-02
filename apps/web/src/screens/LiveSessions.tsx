@@ -150,6 +150,17 @@ function SessionRow(props: {
  * Only the session writes `stopped_at`, when it has actually finished; a screen that flipped the
  * status itself would be reporting an outcome it cannot observe — and on a session whose process
  * is already dead it would show `stopped` over a position sitting unmanaged at the venue.
+ *
+ * ⚠️ **The wait is up to a minute, and this sentence used to say "a few seconds".** A stop is
+ * noticed when the session's blocking read of the candle stream comes back empty, which
+ * `CandleStream.DEFAULT_BLOCK_MS` bounds at 60 000 ms — so the click lands at a uniformly random
+ * point inside that window and the expected wait is around thirty seconds, not a moment. Measured
+ * against a real live session on 2026-09-02: **36.2 s** from the click to `stopped_at`.
+ *
+ * The number is hand-carried from a server constant this bundle cannot import, so it can drift.
+ * It is written here rather than left vague on purpose: a vague label cannot be caught drifting,
+ * and an operator who was told "a few seconds" reaches for the task manager at second twenty —
+ * which is precisely the forced kill this button exists to avoid.
  */
 function StopButton(props: { session: LiveSessionDetail }): React.JSX.Element {
   const stop = useStopLiveSession()
@@ -179,9 +190,9 @@ function StopButton(props: { session: LiveSessionDetail }): React.JSX.Element {
       </div>
       {asked && running && (
         <p className="mt-2 text-xs text-amber-200">
-          Asked at {clock(session.stop_requested_at)}. It stops when it next comes up for air,
-          which on a quiet market is up to a few seconds — the row still says <code>running</code>{' '}
-          until the session itself writes that it finished.
+          Asked at {clock(session.stop_requested_at)}. It stops when its read of the candle
+          stream next comes back empty, which is <strong>up to a minute</strong> — the row still
+          says <code>running</code> until the session itself writes that it finished.
         </p>
       )}
       {stop.isError && (

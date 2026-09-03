@@ -571,13 +571,20 @@ export interface StructureChochSetup {
  * Not directional: which side is traded follows the structure, so there is no `side` here.
  * `stop_buffer` is a *fraction of the zone's width*, not ticks — the zone is the unit.
  *
- * `entry_point` is where inside the region the order rests — the author's book, 11.4. `edge`
- * puts it on the near edge, which costs a stop the full width of the region; `midpoint` puts it
- * at 50%, roughly halving the stop so the same risk buys more size. The trade-off is his:
- * "muitas vezes o preço não chega aos 50% e acaba indo em direção ao nosso alvo sem nos ativar".
- * `edge` is the default because changing it would move every result already recorded.
+ * `entry_point` chooses which of the author's activations the setup uses. `edge` and `midpoint`
+ * are his chapter 11.4 and both rest a *limit* inside the region, waiting for price to come
+ * back: `edge` on the near edge, costing a stop the full width of the region, and `midpoint` at
+ * 50%, roughly halving the stop so the same risk buys more size. The trade-off between those two
+ * is his — "muitas vezes o preço não chega aos 50% e acaba indo em direção ao nosso alvo sem nos
+ * ativar". `edge` is the default because changing it would move every result already recorded.
  *
- * ⚠️ **Two values, not a fraction.** A free number would let an entry approach the far edge,
+ * `return_pass` is his chapter 11.5 and a different shape of trade. Nothing is placed when the
+ * zone is marked; price coming back to the 50% is what *places* the order, as a stop on the far
+ * side of the near edge, and it fills only if price then resumes its move and passes back out
+ * through the region. It carries the widest stop of the three, and its order is cancelled — not
+ * filled — if price instead reaches the level that stop would occupy.
+ *
+ * ⚠️ **Named values, not a fraction.** A free number would let an entry approach the far edge,
  * where risk collapses to the stop buffer alone and position sizing divides by nearly nothing.
  * His model 2 — the marking candle's body limit — is absent for a different reason: the region
  * records only that candle's high and low, so the body is not there to read.
@@ -585,7 +592,7 @@ export interface StructureChochSetup {
 export interface StructureParams {
   allow_secondary?: AllowSecondary;
   breakeven_at_r?: BreakevenAtR2;
-  entry_point?: "edge" | "midpoint";
+  entry_point?: "edge" | "midpoint" | "return_pass";
   stop_buffer?: StopBuffer;
 }
 /**
@@ -604,7 +611,7 @@ export interface StructureContinuationSetup {
 export interface ContinuationParams {
   allow_secondary?: AllowSecondary1;
   breakeven_at_r?: BreakevenAtR3;
-  entry_point?: "edge" | "midpoint";
+  entry_point?: "edge" | "midpoint" | "return_pass";
   max_bos?: MaxBos;
   stop_buffer?: StopBuffer1;
 }

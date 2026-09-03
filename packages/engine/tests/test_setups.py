@@ -1277,6 +1277,266 @@ def test_a_one_bar_round_trip_through_the_real_broker_spends_the_zone() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# The return pass — his book, 11.5                                             #
+# --------------------------------------------------------------------------- #
+
+# The same [90, 100] region, read the other way round. Nothing is placed when the zone is armed;
+# price coming back to the 50% at 95 is what places a **stop** at 101, one buffer above the near
+# edge, and the order fills only if price then passes back out through the region. It is cancelled
+# at 89 — the level its own stop would have occupied.
+_RETURN_TO_95 = bar(13, open_="99", close="97", high="100", low="95")
+
+
+def _return_pass() -> StructureStrategy:
+    """A return-pass setup on the first zone the detector marks, and nothing after it.
+
+    `_Once` rather than `_Marked` because these scenarios drive price back through the region and
+    out again, which is decisive enough to mark zones of its own — and a qualifier that took one
+    would leave the test asserting two setups at once.
+    """
+    return StructureStrategy(qualifier=_Once(), entry_point=ZoneEntryPoint.RETURN_PASS)
+
+
+def test_the_return_pass_waits_for_the_fifty_percent_before_placing_anything() -> None:
+    """His model 11.5 against his 11.4, on the *same bars*, which is the whole contrast.
+
+    `MIDPOINT` places on bar 9, the bar its zone is armed on, and waits inside the region for
+    price to come down to it. `RETURN_PASS` places nothing there — the book stays empty for four
+    bars — and the order appears on bar 13, the bar price finally reaches the 50%. The level that
+    was the *entry* for one model is the *trigger* for the other, which is his own sentence:
+    "atinge o 50% onde o gatilho anterior ativaria o trade".
+
+    ⚠️ The two assertions on bar 9 are not decoration. Without the empty one, every claim here
+    also passes for an implementation that places at arming and merely computes a different
+    price — which is the likeliest wrong version of this feature.
+    """
+    bars = [*_IMPULSE, *_PULLBACK_TO_98, _RETURN_TO_95]
+
+    midpoint = _drive_from_bullish(
+        StructureStrategy(qualifier=_Once(), entry_point=ZoneEntryPoint.MIDPOINT), bars
+    )
+    return_pass = _drive_from_bullish(_return_pass(), bars)
+
+    [resting] = midpoint[9]
+    assert (resting.limit_price, resting.stop_loss) == (Decimal("95"), Decimal("89"))
+    assert return_pass[9] == []  # nothing is placed when the zone is armed
+    assert return_pass[10] == return_pass[11] == return_pass[12] == []
+    [placed] = return_pass[13]
+    assert placed.kind is SignalKind.ENTRY
+
+
+def test_the_return_pass_order_is_a_stop_above_the_region_not_a_limit_inside_it() -> None:
+    """The order shape, and it is the reason this entry point could not be a third price.
+
+    A demand [90, 100] triggers at 101 — the near edge plus the same buffer that puts the stop at
+    89 — and it is a `stop_price`, not a `limit_price` (ADR-0016). The distinction is not
+    bookkeeping: a limit at 101 with the market at 97 rests on the wrong side and `Signal` refuses
+    it, and a limit that *were* accepted there would fill instantly at the next open instead of
+    waiting for price to break back out of the region, which is the entire event this model is
+    named after.
+
+    Its cost is visible in the same numbers: risk 12, against the edge's 11 and the midpoint's 6.
+    That is what it pays for not needing price to turn while sitting inside the region.
+    """
+    [placed] = _drive_from_bullish(_return_pass(), [*_IMPULSE, *_PULLBACK_TO_98, _RETURN_TO_95])[13]
+
+    assert placed.limit_price is None
+    assert (placed.side, placed.stop_price, placed.stop_loss) == (
+        Side.LONG,
+        Decimal("101"),
+        Decimal("89"),
+    )
+
+
+def test_the_sell_side_of_the_return_pass_places_its_stop_below_the_region() -> None:
+    """The mirror, and a separate test because every one of these signs is a separate line.
+
+    ⚠️ Written up front rather than after a review asked for it: the last entry point shipped six
+    tests, all of them long, and two plausible mutants lived in the mute half. Mirrored about 200
+    the supply region is [100, 110], price comes back up to the 50% at 105, and the sell stop
+    goes one buffer *below* the near edge at 99 with its stop at 111.
+    """
+    [placed] = _drive(_return_pass(), _mirror([*_IMPULSE, *_PULLBACK_TO_98, _RETURN_TO_95]))[13]
+
+    assert placed.limit_price is None
+    assert (placed.side, placed.stop_price, placed.stop_loss) == (
+        Side.SHORT,
+        Decimal("99"),
+        Decimal("111"),
+    )
+
+
+def test_the_trigger_is_the_same_fifty_percent_the_midpoint_entry_rests_at() -> None:
+    """Both models read one function, and this is the zone where reading two would show.
+
+    ⚠️ **On [90, 100] the midpoint is 95 and every plausible rounding agrees**, so the ordinary
+    fixture cannot tell a shared level from two coincidentally-equal ones. Widened by a single
+    tick to [90, 100.01], half falls at 95.005 — off the grid — and the direction of the rounding
+    becomes observable: `MIDPOINT` rests at 95.01, and the return pass arms on a bar whose low
+    reaches 95.01 but not on one that stops at 95.02.
+
+    A `ROUND_FLOOR` trigger would put the level at 95.00 and let the 95.01 bar pass untouched,
+    with nothing else in the suite disagreeing.
+    """
+    odd = list(_IMPULSE)
+    odd[3] = bar(3, open_="99", close="99", high="100.01", low="90")
+
+    [resting] = _drive_from_bullish(
+        StructureStrategy(qualifier=_Marked(), entry_point=ZoneEntryPoint.MIDPOINT), odd
+    )[9]
+    assert resting.limit_price == Decimal("95.01")
+
+    def armed_on(low: str) -> list[Signal]:
+        stops_at = bar(13, open_="99", close="97", high="100", low=low)
+        return _drive_from_bullish(_return_pass(), [*odd, *_PULLBACK_TO_98, stops_at])[13]
+
+    assert armed_on("95.02") == []  # a tick short of the level, and it is a tick that counts
+    [placed] = armed_on("95.01")
+    assert placed.kind is SignalKind.ENTRY
+
+
+def test_the_return_pass_order_is_cancelled_where_its_own_stop_would_have_been() -> None:
+    """His cancel rule: reach 89 and the order is taken back rather than left to fill.
+
+    The setup never opens a trade that is already stopped — which is what a fill at 101 would be
+    on a bar that had traded 89 first. `_ran_away`, the rule that ends the other two entry points,
+    cannot serve here: it fires when price *leaves* the region upward, and leaving upward is this
+    order's fill.
+
+    The paired bar is what makes it a rule rather than a coincidence — a low of 90 leaves the
+    order standing, and only 89 takes it back.
+    """
+
+    def after(low: str) -> list[list[Signal]]:
+        return _drive_from_bullish(
+            _return_pass(),
+            [
+                *_IMPULSE,
+                *_PULLBACK_TO_98,
+                _RETURN_TO_95,
+                bar(14, open_="97", close="92", high="98", low=low),
+            ],
+        )
+
+    standing = after("90")
+    assert standing[14] == []  # one above the level, and the order is still there
+
+    cancelled = after("89")
+    [placed] = cancelled[13]
+    [cancel] = cancelled[14]
+    assert (cancel.kind, cancel.client_id) == (SignalKind.CANCEL, placed.client_id)
+
+
+def test_the_sell_side_is_cancelled_above_its_region() -> None:
+    """The cancel rule mirrored — the sign of the comparison is its own line, so it is its own
+    test. Supply [100, 110]: the order rests at 99 and is taken back when price reaches 111."""
+
+    def after(low: str) -> list[list[Signal]]:
+        # Parametrised on the *low*, because reflection swaps the extremes: a pre-mirror low of 89
+        # is the mirrored bar's high of 111. Naming the level we care about directly would build a
+        # candle that does not contain its own body, which `Candle` refuses.
+        return _drive(
+            _return_pass(),
+            _mirror(
+                [
+                    *_IMPULSE,
+                    *_PULLBACK_TO_98,
+                    _RETURN_TO_95,
+                    bar(14, open_="97", close="92", high="98", low=low),
+                ]
+            ),
+        )
+
+    assert after("90")[14] == []  # mirrors to a high of 110, one short of the level
+    cancelled = after("89")  # mirrors to 111
+    [placed] = cancelled[13]
+    [cancel] = cancelled[14]
+    assert (cancel.kind, cancel.client_id) == (SignalKind.CANCEL, placed.client_id)
+
+
+def test_a_bar_that_closes_past_the_trigger_gives_the_zone_up_instead_of_placing() -> None:
+    """⚠️ The bar that does the whole move by itself, and the one place this could fill a trade
+    the method never took.
+
+    A bar can wick to the 50% and close back out above 101. The order cannot be placed there: a
+    buy stop at 101 with the market at 103 reaches the book already triggered, so it becomes a
+    market order at the next open — sized against a level price never had to break. ADR-0016 says
+    exactly this about a stop on the wrong side, and `Signal` would raise.
+
+    The zone is given up rather than kept waiting, because keeping it would place the order on
+    some later dip to the 50% and enter on a break of a level price has already broken.
+
+    Three closes, one boundary: 100 places, 101 does not, 103 does not. The first is what makes
+    the other two mean something — the machine is speaking on these bars, and choosing silence.
+    """
+
+    def closing_at(close: str, high: str) -> list[Signal]:
+        wick = bar(13, open_="99", close=close, high=high, low="95")
+        return _drive_from_bullish(_return_pass(), [*_IMPULSE, *_PULLBACK_TO_98, wick])[13]
+
+    [placed] = closing_at("100", "100")
+    assert placed.stop_price == Decimal("101")
+    assert closing_at("101", "102") == []  # closed *at* the trigger: already through it
+    assert closing_at("103", "104") == []
+
+
+def test_a_sell_trigger_the_buffer_drives_to_zero_or_below_arms_nothing() -> None:
+    """⚠️ A guard this entry point needs and the other two do not, because it inverts which side
+    of the region carries the order.
+
+    For a limit entry only a *demand* zone can push a level through zero — its stop is the one
+    below the region — and `_entry_for` has refused that for as long as it has existed. A return
+    pass puts the **order** on the low side of a supply zone, so it is the supply mirror that
+    breaks: here the stop is a healthy 310 and the trigger is -100.
+
+    That asymmetry is the test. Both sides go quiet under an absurd buffer, but for different
+    reasons — the buy on the old stop guard, the sell on the new trigger one — so the sell side
+    is the only one that says anything about the line this test exists for. Without the guard the
+    order is not merely wrong, it raises: `Signal` refuses a non-positive stop price outright.
+    """
+    absurd = StructureStrategy(
+        qualifier=_Once(), entry_point=ZoneEntryPoint.RETURN_PASS, stop_buffer=Decimal(20)
+    )
+    bars = [*_IMPULSE, *_PULLBACK_TO_98, _RETURN_TO_95]
+
+    assert _drive(absurd, _mirror(bars))[13] == []
+    # And the same bars at the real buffer do place, so the silence above is a refusal rather
+    # than a scenario that never reached the trigger.
+    [placed] = _drive(_return_pass(), _mirror(bars))[13]
+    assert placed.stop_price == Decimal("99")
+
+
+def test_a_zone_given_up_before_its_order_reached_the_book_sends_no_cancel() -> None:
+    """A cancel for an order the venue never received is noise, and 11.5 would make it routine.
+
+    Under the two limit entries an armed zone has an order on the book within the same bar, so
+    withdrawing an unplaced one was a rarity the broker's tolerant `False` covered. A return-pass
+    zone is armed with nothing on the book for as many bars as price takes to come back, and most
+    never get an order at all.
+
+    Both halves are asserted here, because silence only means something if the machine had a
+    chance to speak: the zone that never placed goes quietly, and the one that did sends its
+    cancel by name.
+    """
+    never_placed = _drive_from_bullish(
+        _return_pass(),
+        [*_IMPULSE, *_PULLBACK_TO_98, bar(13, open_="99", close="92", high="100", low="89")],
+    )
+    assert never_placed[13] == []  # it reached the 50% and the cancel level on one bar
+
+    placed_then_cancelled = _drive_from_bullish(
+        _return_pass(),
+        [
+            *_IMPULSE,
+            *_PULLBACK_TO_98,
+            _RETURN_TO_95,
+            bar(14, open_="97", close="92", high="98", low="89"),
+        ],
+    )
+    assert [s.kind for s in placed_then_cancelled[14]] == [SignalKind.CANCEL]
+
+
+# --------------------------------------------------------------------------- #
 # The choch setup                                                               #
 # --------------------------------------------------------------------------- #
 

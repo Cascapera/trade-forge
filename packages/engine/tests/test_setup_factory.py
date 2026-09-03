@@ -18,7 +18,12 @@ import pytest
 from tradeforge_engine.domain import Side
 from tradeforge_engine.errors import EngineError
 from tradeforge_engine.setup_factory import build_setup
-from tradeforge_engine.setups import ChochQualifier, ContinuationQualifier, StructureStrategy
+from tradeforge_engine.setups import (
+    ChochQualifier,
+    ContinuationQualifier,
+    StructureStrategy,
+    ZoneEntryPoint,
+)
 from tradeforge_engine.swing import Mme9BreakoutStrategy, PontoContinuoStrategy
 
 
@@ -205,3 +210,18 @@ def test_an_unknown_entry_point_is_refused_rather_than_defaulted() -> None:
     for kind in ("structure_choch", "structure_continuation"):
         with pytest.raises(EngineError, match="setup entry_point must be"):
             build_setup({"type": kind, "params": {"entry_point": "body"}})
+
+
+def test_the_return_pass_entry_point_reaches_the_engine() -> None:
+    """The value the DSL gained for 11.5, carried the whole way from a raw document to the enum.
+
+    ⚠️ The refusal above and this acceptance are one mechanism read twice, and neither alone says
+    it works: the allowed set is derived from `ZoneEntryPoint`, so a value missing from the enum
+    is refused with the same message an unknown one gets. `"body"` proves the gate closes, and
+    only a value that must pass proves it opens — on the field that is *not* the default, or the
+    assertion would hold for a factory that dropped it.
+    """
+    for kind in ("structure_choch", "structure_continuation"):
+        setup = _built(kind, entry_point="return_pass")
+        assert isinstance(setup, StructureStrategy)
+        assert setup._entry_point is ZoneEntryPoint.RETURN_PASS

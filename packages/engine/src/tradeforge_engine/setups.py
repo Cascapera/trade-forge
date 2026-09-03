@@ -994,14 +994,11 @@ class StructureStrategy:
 
         demand = block.kind is ZoneKind.DEMAND
         side = Side.LONG if demand else Side.SHORT
-        # Rounded *away* from the entry, so the stop never ends up nearer the zone than the buffer
-        # says. Rounding to nearest would sometimes shave it back onto the edge, which is the one
-        # place the buffer exists to keep it off.
-        stop = (
-            _to_tick(block.bottom - buffer, tick, ROUND_FLOOR)
-            if demand
-            else _to_tick(block.top + buffer, tick, ROUND_CEILING)
-        )
+        # Past the edge the trade is *not* travelling towards: below a demand region, above a
+        # supply one. `_beyond_edge` owns the rounding — away from the zone, so the stop never
+        # ends up nearer it than the buffer says — and `_expired` asks that same function for
+        # this very level when it decides a `RETURN_PASS` order has been taken back.
+        stop = _beyond_edge(block, tick, buffer, upward=not demand)
         if stop <= ZERO:
             logger.debug("zone at %s would need a stop at %s; nothing to arm", block.time, stop)
             return None
@@ -1044,11 +1041,7 @@ class StructureStrategy:
         tick = context.instrument.tick_size
         if not self._reached_midpoint(block, context.candle, tick):
             return None
-        trigger = (
-            _to_tick(block.top + buffer, tick, ROUND_CEILING)
-            if side is Side.LONG
-            else _to_tick(block.bottom - buffer, tick, ROUND_FLOOR)
-        )
+        trigger = _beyond_edge(block, tick, buffer, upward=side is Side.LONG)
         if trigger <= ZERO:
             logger.debug("zone at %s would trigger at %s; nothing to arm", block.time, trigger)
             return None
@@ -1128,7 +1121,9 @@ class StructureStrategy:
         * `EDGE` and `MIDPOINT` wait *inside* the region for price to come back, so they are
           abandoned when price leaves — `_ran_away`, a full height clear of the near edge.
         * `RETURN_PASS` waits *outside* it for price to break out, so leaving upward is the fill.
-          It dies on the other side: price reaching the level its own stop would occupy.
+          It dies on the other side: price reaching the level its own stop would occupy — the
+          same `_beyond_edge` call `_entry_for` makes for the stop, not a second expression for
+          it, so the two cannot drift apart on a zone whose buffer falls between ticks.
 
         ⚠️ **This is asked on every bar an order is armed, placed or not.** For `RETURN_PASS` that
         matters more than it looks: the region can break downward while the book is still empty,
@@ -1149,8 +1144,8 @@ class StructureStrategy:
         buffer = size * self._stop_buffer
         candle = context.candle
         if block.kind is ZoneKind.DEMAND:
-            return candle.low <= _to_tick(block.bottom - buffer, tick, ROUND_FLOOR)
-        return candle.high >= _to_tick(block.top + buffer, tick, ROUND_CEILING)
+            return candle.low <= _beyond_edge(block, tick, buffer, upward=False)
+        return candle.high >= _beyond_edge(block, tick, buffer, upward=True)
 
     def _ran_away(self, block: OrderBlock, candle: Candle) -> bool:
         """Has price cleared the region by a full height, abandoning the order?
@@ -1255,6 +1250,28 @@ def _to_tick(price: Money, tick: Money, rounding: str) -> Money:
     does not exist — it would fill in the backtest and be rejected by the venue.
     """
     return (price / tick).to_integral_value(rounding=rounding) * tick
+
+
+def _beyond_edge(block: OrderBlock, tick: Money, buffer: Money, *, upward: bool) -> Money:
+    """One buffer clear of a region's edge, on the price grid, rounded away from the region.
+
+    ⚠️ **One function because three callers must never disagree.** The same two levels are asked
+    for under three names: the stop of every entry (a buffer past the edge the trade is *not*
+    travelling towards), the `RETURN_PASS` trigger (a buffer past the edge it is), and the level
+    that takes a `RETURN_PASS` order back — which *is* that order's stop, and is why this one
+    matters most. Written twice, the cancel and the stop agree on every zone whose buffer lands
+    on the grid and part company on the first one that does not, and nothing downstream would
+    report it: the backtest simply loses a trade whose stop was never touched and files it as a
+    cancellation.
+
+    The rounding is directional for the reason it is everywhere else in this file, and the two
+    directions are one rule — *away from the region*. A level above is rounded up and a level
+    below is rounded down, so snapping to the grid never brings a stop nearer the zone than the
+    buffer says, nor hands a breakout a level easier to break than the region actually offers.
+    """
+    if upward:
+        return _to_tick(block.top + buffer, tick, ROUND_CEILING)
+    return _to_tick(block.bottom - buffer, tick, ROUND_FLOOR)
 
 
 def _midpoint(block: OrderBlock, tick: Money, side: Side) -> Money:

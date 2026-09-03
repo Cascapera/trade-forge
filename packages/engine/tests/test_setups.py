@@ -1393,6 +1393,46 @@ def test_the_trigger_is_the_same_fifty_percent_the_midpoint_entry_rests_at() -> 
     assert armed_on("95.02") == []  # a tick short of the level, and it is a tick that counts
     [placed] = armed_on("95.01")
     assert placed.kind is SignalKind.ENTRY
+    # ⚠️ The trigger is off the grid on this zone too — 100.01 + 1.001 = 101.011 — so the
+    # direction of *its* rounding is observable here and nowhere else in the suite. Rounded down
+    # it would sit at 101.01: a tick nearer the market, filling on bars that should not reach it,
+    # and sizing the trade against a risk of 12.02 rather than the 12.03 the region asks for.
+    assert (placed.stop_price, placed.stop_loss) == (Decimal("101.02"), Decimal("88.99"))
+
+
+def test_the_sell_trigger_is_the_same_fifty_percent_its_midpoint_entry_rests_at() -> None:
+    """The identity mirrored, on the zone where the direction of the rounding is observable.
+
+    ⚠️ **This is the half the previous entry point shipped without.** Its sell tests all used
+    regions whose midpoint lands on the grid, where both roundings agree — so a mutant reading
+    half with the *buy's* rounding lived in the mute side of the mirror, and only the sell was
+    wrong. The reflection of [90, 100.01] is supply [99.99, 110]: half falls at 104.995, a sell
+    is rounded down, and `MIDPOINT` rests at 104.99. Rounded up the level would be 105.00, the
+    return pass would arm a bar later than the model it is defined against, and nothing
+    downstream would say so.
+
+    The trigger's own rounding is here for the same reason: 99.99 - 1.001 = 98.989 is off the
+    grid, and rounded up it would be 98.99 — a tick nearer the market, on the side where nearer
+    means easier to trigger.
+    """
+    odd = list(_IMPULSE)
+    odd[3] = bar(3, open_="99", close="99", high="100.01", low="90")
+
+    [resting] = _drive(
+        StructureStrategy(qualifier=_Marked(), entry_point=ZoneEntryPoint.MIDPOINT), _mirror(odd)
+    )[9]
+    assert resting.limit_price == Decimal("104.99")
+
+    def armed_on(low: str) -> list[Signal]:
+        # Parametrised on the pre-mirror *low*, as the other mirrored scenarios are: reflection
+        # turns a low of 95.01 into the high of 104.99 that this test is actually about.
+        stops_at = bar(13, open_="99", close="97", high="100", low=low)
+        return _drive(_return_pass(), _mirror([*odd, *_PULLBACK_TO_98, stops_at]))[13]
+
+    assert armed_on("95.02") == []  # mirrors to a high of 104.98, a tick short of the level
+    [placed] = armed_on("95.01")
+    assert placed.kind is SignalKind.ENTRY
+    assert (placed.stop_price, placed.stop_loss) == (Decimal("98.98"), Decimal("111.01"))
 
 
 def test_the_return_pass_order_is_cancelled_where_its_own_stop_would_have_been() -> None:
@@ -1452,6 +1492,113 @@ def test_the_sell_side_is_cancelled_above_its_region() -> None:
     [placed] = cancelled[13]
     [cancel] = cancelled[14]
     assert (cancel.kind, cancel.client_id) == (SignalKind.CANCEL, placed.client_id)
+
+
+def test_the_cancel_level_is_the_orders_own_stop_on_a_zone_that_falls_between_ticks() -> None:
+    """One level, asserted against the order that carries it — not two that happen to agree.
+
+    ⚠️ **On [90, 100] the buffer lands on the grid**: 90 - 1 is 89 whichever way it is rounded,
+    so the ordinary fixture cannot tell a shared call from two expressions written separately.
+    Widened by a tick to [90, 100.01] the buffer is 1.001, the level falls at 88.999, and the
+    rounding becomes visible — the order's stop is 88.99 and so is the level that takes it back.
+
+    Rounded the other way the cancel would sit at 89.00 and retire the order on a bar whose low
+    was 89.00: a bar that never touched the stop, and that could go on to break 101.02 for a
+    legitimate trade. That trade would disappear from every backtest, filed as a cancellation,
+    with no test failing and nothing to say a level had drifted a tick.
+    """
+    odd = list(_IMPULSE)
+    odd[3] = bar(3, open_="99", close="99", high="100.01", low="90")
+
+    def after(low: str) -> list[list[Signal]]:
+        return _drive_from_bullish(
+            _return_pass(),
+            [
+                *odd,
+                *_PULLBACK_TO_98,
+                _RETURN_TO_95,  # a low of 95 still reaches this zone's 50%, which is 95.01
+                bar(14, open_="97", close="92", high="98", low=low),
+            ],
+        )
+
+    standing = after("89.00")
+    [placed] = standing[13]
+    assert placed.stop_loss == Decimal("88.99")
+    assert standing[14] == []  # one tick above its own stop, and the order is still there
+
+    cancelled = after("88.99")  # the stop's own level, to the tick
+    [cancel] = cancelled[14]
+    assert (cancel.kind, cancel.client_id) == (SignalKind.CANCEL, placed.client_id)
+
+
+def test_a_bar_that_reaches_the_cancel_level_and_the_trigger_fills_and_is_stopped() -> None:
+    """⚠️ The one bar where the cancel rule and the fill rule both apply, and the engine chooses.
+
+    Bar 14 opens at 98, wicks down to 89 — the level that takes the order back — and then trades
+    107, through the 101 trigger. Two rules answer on the same bar and only one thing can happen.
+    His rule says reaching 89 cancels; the engine fills and stops, for -12.
+
+    It is not lookahead, and it is the **pessimistic** of the two readings — cancelling would end
+    the bar at zero — so it is the safe way to be wrong, and it is what a real venue would do
+    with an order that was working when the market traded through it. But it is a precedence
+    nothing states, in a path whose own documentation says the opposite, so the number is nailed
+    down here rather than left to be rediscovered as a surprise in a backtest.
+    """
+    result = run(
+        candles=[
+            *BULLISH_START,
+            *_IMPULSE,
+            *_PULLBACK_TO_98,
+            _RETURN_TO_95,  # places the stop at 101; its cancel level is 89
+            bar(14, open_="98", close="103", high="107", low="89"),
+        ],
+        timeframe=HOUR,
+        instrument=AAPL,
+        strategy=_return_pass(),
+        broker=BacktestBroker(instrument=AAPL, initial_capital=Decimal(10_000)),
+        risk=FixedRisk(volume=Decimal(1)),
+    )
+
+    [trade] = result.trades
+    assert (trade.entry_price, trade.exit_price, trade.net_pnl) == (
+        Decimal("101"),
+        Decimal("89"),
+        Decimal("-12"),
+    )
+
+
+def test_the_return_pass_is_not_abandoned_by_the_rule_that_ends_the_other_two() -> None:
+    """The third of the three rules this model announces, and the one that had no test.
+
+    `_ran_away` retires `EDGE` and `MIDPOINT` when price leaves the region by a full height —
+    for an order waiting *inside* the zone, leaving is the trade going away. For `RETURN_PASS`
+    leaving upward is the **fill**, so the rule cannot serve, and wiring it back in survives
+    every other scenario in this file.
+
+    The bars that separate them: 12 touches the 100 edge and mitigates the region, 13 clears it
+    by a full height to 110 *without ever reaching the 50%*, and 14 comes back for 95.
+    `_ran_away` would have given the name up on bar 13, and the return the whole model exists to
+    wait for would arrive to find nothing armed.
+    """
+    out = _drive_from_bullish(
+        _return_pass(),
+        [
+            *_IMPULSE,
+            bar(10, open_="124", close="115", high="125", low="114"),
+            bar(11, open_="115", close="105", high="116", low="104"),
+            bar(12, open_="105", close="101", high="106", low="100"),  # first touch: mitigated
+            bar(13, open_="101", close="109", high="110", low="100"),  # a full height clear
+            bar(14, open_="101", close="97", high="101", low="95"),  # back for the 50%
+        ],
+    )
+
+    assert (out[12], out[13]) == ([], [])  # nothing placed on the way out, and nothing retired
+    [placed] = out[14]
+    assert (placed.kind, placed.stop_price, placed.stop_loss) == (
+        SignalKind.ENTRY,
+        Decimal("101"),
+        Decimal("89"),
+    )
 
 
 def test_a_bar_that_closes_past_the_trigger_gives_the_zone_up_instead_of_placing() -> None:

@@ -1183,6 +1183,44 @@ def test_an_order_is_abandoned_once_price_leaves_a_region_it_visited() -> None:
     assert (cancel.kind, cancel.client_id) == (SignalKind.CANCEL, armed.client_id)
 
 
+def test_the_sell_side_abandons_below_the_region_it_visited() -> None:
+    """The same rule mirrored — and it is a separate test because the sign is a separate line.
+
+    ⚠️ Written after a review found that **nothing here exercised the sell branch of
+    `_ran_away`**. Two plausible mutants survived the whole suite: flipping `bottom - clearance`
+    to `bottom + clearance`, and pasting the buy branch's `candle.high >=` over it. Either one
+    withdraws the order on the bar the region is *mitigated* — reinstating, on the sell side only,
+    the exact behaviour this entry point exists to remove. `MIDPOINT` would then be a setting that
+    cannot produce a short trade, in a backtest that runs clean and reports a number.
+
+    Mirrored about 200: the supply region is [100, 110], the order rests at 105 with its stop at
+    111, and abandonment is one height *below* the near edge — 90. Bar 12 wicks to 94 and takes
+    the 100 edge; bar 13 goes no lower than 94; bar 14 reaches 90.
+    """
+    signals = _drive(
+        StructureStrategy(qualifier=_Once(), entry_point=ZoneEntryPoint.MIDPOINT),
+        _mirror(
+            [
+                *_IMPULSE,
+                *_PULLBACK_TO_98,
+                bar(13, open_="99", close="105", high="106", low="99"),
+                bar(14, open_="105", close="109", high="110", low="104"),
+            ]
+        ),
+    )
+
+    [armed] = signals[9]
+    assert (armed.side, armed.limit_price, armed.stop_loss) == (
+        Side.SHORT,
+        Decimal("105"),
+        Decimal("111"),
+    )
+    assert signals[12] == []  # the bar that mitigates the region does not take the order
+    assert signals[13] == []  # 94 is not yet a height clear of the 100 edge
+    [cancel] = signals[14]
+    assert (cancel.kind, cancel.client_id) == (SignalKind.CANCEL, armed.client_id)
+
+
 def test_an_order_is_not_abandoned_while_price_has_never_come_back() -> None:
     """⚠️ **The clock starts at the visit, not at the arming** — and getting this backwards is not
     a corner case, it retires every order the setup ever places.

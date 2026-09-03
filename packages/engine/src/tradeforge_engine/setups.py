@@ -896,7 +896,10 @@ class StructureStrategy:
         immediately after", and it is gone rather than reworded** — mitigation no longer withdraws
         anything. The invariant survives it because this method is only ever reached for an order
         being *placed*, and placing happens on the arming bar, which `_may_arm` has already
-        guaranteed is a bar the region was untouched on. The `MIDPOINT` limit is on the far side
+        guaranteed is a bar the region was untouched on. (Strictly, a later bar can reach here too
+        — the two `None` returns below leave `placed` false — but both are functions of the block
+        and the tick size alone, so a region that answered `None` once answers `None` for ever and
+        never reaches the lines that read price.) The `MIDPOINT` limit is on the far side
         of the edge from price, so it rests below a buy and above a sell exactly as the edge one
         did.
 

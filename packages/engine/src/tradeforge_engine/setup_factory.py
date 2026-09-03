@@ -25,7 +25,12 @@ from typing import Any
 from tradeforge_engine.domain import Side
 from tradeforge_engine.errors import EngineError
 from tradeforge_engine.protocols import Strategy
-from tradeforge_engine.setups import ChochQualifier, ContinuationQualifier, StructureStrategy
+from tradeforge_engine.setups import (
+    ChochQualifier,
+    ContinuationQualifier,
+    StructureStrategy,
+    ZoneEntryPoint,
+)
 from tradeforge_engine.swing import Mme9BreakoutStrategy, PontoContinuoStrategy
 
 _SIDES: Mapping[str, Side] = {"long": Side.LONG, "short": Side.SHORT}
@@ -131,6 +136,15 @@ def _structure_kwargs(params: Mapping[str, object]) -> dict[str, Any]:
     _flag(params, "allow_secondary", kwargs)
     _decimal(params, "stop_buffer", kwargs)
     _optional_decimal(params, "breakeven_at_r", kwargs)
+    if "entry_point" in params:
+        # Raised rather than defaulted, like the average above. A document naming an entry point
+        # this engine does not have is asking for a method it will not get, and falling back to
+        # the edge would run it silently at the widest stop of the two.
+        raw = params["entry_point"]
+        if not isinstance(raw, str) or raw not in {point.value for point in ZoneEntryPoint}:
+            allowed = ", ".join(repr(point.value) for point in ZoneEntryPoint)
+            raise EngineError(f"setup entry_point must be one of {allowed}, got {raw!r}")
+        kwargs["entry_point"] = ZoneEntryPoint(raw)
     return kwargs
 
 

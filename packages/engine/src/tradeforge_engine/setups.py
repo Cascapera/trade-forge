@@ -34,6 +34,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
+from enum import StrEnum
 from typing import Protocol
 
 from tradeforge_engine.conduction import StructuralTrail, breakeven_candidate, tighten
@@ -69,6 +70,64 @@ The author's numbers: a supply zone of [90, 100] is sold from 90 with the stop a
 demand zone of [90, 100] is bought at 100 with the stop at 89. The zone is ten wide, so the stop
 clears it by one — the region is where price is expected to turn, and a stop *on* its edge is
 stopped by the noise of the turn itself.
+"""
+
+
+class ZoneEntryPoint(StrEnum):
+    """Where inside the region the order rests — the author's book, chapter 11.4.
+
+    He lists three activations for an entry on a marked region and rates them. This carries two of
+    them; the third is deliberately absent.
+
+    * `EDGE` — the order on the near edge, the stop past the far one. His model 1, and what this
+      engine did exclusively until now. He notes its cost in as many words: *"o tamanho do stop
+      acaba sendo maior, equivalente ao tamanho total da região"*. It is the default here for a
+      duller reason than merit — changing it would silently move every backtest already recorded.
+    * `MIDPOINT` — the order at 50% of the region, the stop still past the far edge. His model 3,
+      *"que considero o mais vantajoso"*: roughly half the stop, so the same risk buys more size.
+      Its cost is his too — *"muitas vezes o preço não chega aos 50% e acaba indo em direção ao
+      nosso alvo sem nos ativar, deixando-nos na pedra"*.
+
+    **The body limit — his model 2 — is not here, and its absence is a data fact rather than an
+    opinion.** `OrderBlock` carries `top` and `bottom` only, and those are the marking candle's
+    high and low. The body needs that candle's open and close, which the region has never
+    recorded; adding it reaches the detector, the persisted snapshot and the API's `Zone`. Both
+    values here are arithmetic on the two numbers the region already carries.
+
+    ⚠️ **This is not a free dial to widen.** A fraction was considered and refused: at anything
+    approaching the far edge the entry meets the stop, risk goes to the buffer alone, and position
+    sizing divides by very nearly nothing. Two named points are two the author has traded.
+    """
+
+    EDGE = "edge"
+    MIDPOINT = "midpoint"
+
+
+ABANDON_AT_ZONE_HEIGHTS = Decimal(1)
+"""How far past the near edge price may run, in multiples of the region's own height, before a
+resting order is abandoned.
+
+**The author's rule, given on 2026-09-02, and it exists because `MIDPOINT` broke a coincidence.**
+While the order rested on the near edge, the touch that mitigated the region and the touch that
+filled the order were the same event, so "the order lives as long as the region does" needed no
+second thought. An order at 50% can be left behind: price reaches into the region, turns at 98
+without ever trading 95, and walks away. His answer, in his numbers — region [90, 100], height
+ten, order at 95: *"quando o preço atingir 110 a ordem deve ser retirada e a entrada neste ponto
+deve ser abortada"*. One height above the near edge for a demand region, one below it for supply.
+
+⚠️ **Measured on the region's own scale, not in ticks and not in bars.** A ten-point region and a
+hundred-point region are not the same distance from being wrong, and a clock says nothing about
+either. The region supplies its own unit, which is the same reasoning `DEFAULT_STOP_BUFFER`
+already runs on.
+
+⚠️⚠️ **The clock starts when price enters the region, never when the order is armed** — his
+correction, and the first version of this got it backwards. A demand region is *created* by an
+upward impulse, so at the moment it is marked price is already leaving it: the level one height
+above the top is reached almost at once, and abandoning there would retire every order before
+price had any chance to come back. Measured, not reasoned — counting from the arming bar broke 9
+of the engine's own tests, all of them edge entries that never got to fill. The rule is about a
+region that was *visited and left*, which is precisely the gap `MIDPOINT` opens and the reason
+`EDGE` never needed it: on the edge, being visited and being filled are the same event.
 """
 
 
@@ -364,11 +423,19 @@ class StructureStrategy:
     this backtest take that trade" into a question about which of four orders won a race, and the
     honest answer would be *arrival order in a list*. One order is auditable.
 
-    **The order's life is the zone's life.** There is no separate expiry. While the zone still
-    stands the order waits; the bar the zone is spent — the first wick back to its entry edge, or
-    simply aged out of the tracker — the order is withdrawn. Only the strategy can know that,
-    which is why `Broker.cancel` exists and why the broker is never told about zones
+    **The order outlives the region being touched, and dies when the market leaves.** It used to
+    be simpler — the order's life *was* the zone's life — and that worked only because the entry
+    sat on the near edge, where the wick that mitigates a region and the wick that fills the order
+    are the same wick. An order at the midpoint is not reached by that wick, so retiring it there
+    would make `ZoneEntryPoint.MIDPOINT` a setting that can never produce a trade. Two things end
+    a standing order now: price clears the region by a full height (`ABANDON_AT_ZONE_HEIGHTS`), or
+    the tracker drops the region and nothing is watching it any more. Only the strategy can know
+    either, which is why `Broker.cancel` exists and why the broker is never told about zones
     (`AGENTS.md §5.4`).
+
+    **Mitigation still retires the region, just not the order.** `_may_arm` refuses a mitigated
+    zone exactly as before, so a region is still offered once and there is still no path that
+    re-arms one. What survives the touch is *this* order, not the right to place another.
 
     **One trade per zone, ever.** A region whose order filled is finished here, whether the stop,
     the target, or the same bar ended the trade. Without this the machine martingales: a stateful
@@ -376,10 +443,12 @@ class StructureStrategy:
     level into the same downtrend until the zone finally breaks. The backtest then reports a setup
     that averages down, and the equity curve blames the setup rather than this class.
 
-    **That guard is currently redundant, and is kept anyway — read this before deleting it.**
-    Under his mitigation rule the entry edge *is* where the order rests, so any fill is a touch of
-    the edge on that same bar, and `_blocks.update` runs at the top of `on_bar` — before the fill
-    is observed and before anything may be armed. The region is therefore already dead when
+    **That guard is still redundant, and is kept anyway — read this before deleting it.**
+    It stays unreachable under both entry points, but the argument is no longer the one that used
+    to be written here. On `EDGE` the fill *is* the touch that retires the region, so the region
+    is dead on the fill's own bar. On `MIDPOINT` the two come apart — the touch retires the region
+    at the near edge, the fill happens later and deeper — and the region is then dead *earlier*
+    than the fill rather than at the same instant. Either way it is already retired when
     `_may_arm` asks, and `_still_standing` refuses it without `_traded` ever being consulted.
     Verified by mutation: deleting the `_traded` check breaks no test, and there is no path where
     only it catches. Two reasons it stays. It states a **different** invariant — one trade per
@@ -401,13 +470,14 @@ class StructureStrategy:
     position opened and died inside a single bar, invisible to both.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 — one qualifier and five knobs, every one keyword-only
         self,
         *,
         qualifier: SetupQualifier,
         name: str = "structure",
         allow_secondary: bool = False,
         stop_buffer: Decimal = DEFAULT_STOP_BUFFER,
+        entry_point: ZoneEntryPoint = ZoneEntryPoint.EDGE,
         breakeven_at_r: Decimal | None = Decimal(2),
     ) -> None:
         if stop_buffer < ZERO:
@@ -419,6 +489,9 @@ class StructureStrategy:
         self._name = name
         self._allow_secondary = allow_secondary
         self._stop_buffer = stop_buffer
+        # Where the order rests inside the region. `EDGE` is the default so that adding this
+        # parameter changes no recorded result — see `ZoneEntryPoint`.
+        self._entry_point = entry_point
         self._breakeven_at_r = breakeven_at_r
 
         self._structure = MarketStructure()
@@ -506,9 +579,19 @@ class StructureStrategy:
         signals: list[Signal] = []
         stopped, won = self._trade_outcome(context)
 
-        # A zone that no longer stands takes its order with it, before anything else this bar:
-        # the order was only ever an expression of that region's validity.
-        if self._armed is not None and not self._still_standing(self._armed.block):
+        # ⚠️ **Mitigation no longer takes the order with it, and that is this rule's whole
+        # point.** A region is mitigated by the first wick to its near edge; an order resting at
+        # the midpoint has not been reached by that wick, and retiring it there would mean the
+        # `MIDPOINT` entry could never fill at all. What ends a standing order now is one of two
+        # things: the market ran away from the region (`_ran_away`), or the tracker dropped the
+        # region entirely and nothing is watching it any more.
+        #
+        # Arming is unchanged — `_may_arm` still refuses a mitigated region — so the region is
+        # still offered exactly once. What survives mitigation is *this* order, not the right to
+        # place another.
+        if self._armed is not None and (
+            not self._tracked(self._armed.block) or self._ran_away(self._armed.block, candle)
+        ):
             signals.append(self._withdraw(self._armed, candle))
             self._armed = None
 
@@ -805,9 +888,20 @@ class StructureStrategy:
         the order was held back until a bar closed clear. Under his mitigation rule that state
         cannot arrive. For a demand region, price being inside means `close < top`, which implies
         `low <= top` — and `low <= top` is precisely what retires the region. `on_bar` settles
-        that first: `_blocks.update` marks the region on the bar price reached it, the standing
-        order is withdrawn immediately after, and `_may_arm` refuses a region that no longer
-        stands. A region that reaches this method is one price has not touched.
+        that first: `_blocks.update` marks the region on the bar price reached it, and `_may_arm`
+        refuses a region that no longer stands. A region that reaches this method is one price has
+        not touched.
+
+        ⚠️ **One clause of that argument used to be "and the standing order is withdrawn
+        immediately after", and it is gone rather than reworded** — mitigation no longer withdraws
+        anything. The invariant survives it because this method is only ever reached for an order
+        being *placed*, and placing happens on the arming bar, which `_may_arm` has already
+        guaranteed is a bar the region was untouched on. (Strictly, a later bar can reach here too
+        — the two `None` returns below leave `placed` false — but both are functions of the block
+        and the tick size alone, so a region that answered `None` once answers `None` for ever and
+        never reaches the lines that read price.) The `MIDPOINT` limit is on the far side
+        of the edge from price, so it rests below a buy and above a sell exactly as the edge one
+        did.
 
         Verified as well as argued: instrumented over the same 3480 real AAPL H1 candles, across
         choch and continuation with secondaries on and off, the branch was reached zero times. It
@@ -841,11 +935,25 @@ class StructureStrategy:
             if stop <= ZERO:
                 logger.debug("zone at %s would need a stop at %s; nothing to arm", block.time, stop)
                 return None
-            return ZoneEntry(side=Side.LONG, limit_price=block.top, stop_loss=stop)
+            # A buy rounded *up* to the grid, so the tick never hands the trade a price better
+            # than the midpoint actually is. Same doctrine as the stop one line above: rounding
+            # is not allowed to flatter the entry.
+            limit = (
+                block.top
+                if self._entry_point is ZoneEntryPoint.EDGE
+                else _to_tick(block.bottom + size / 2, tick, ROUND_CEILING)
+            )
+            return ZoneEntry(side=Side.LONG, limit_price=limit, stop_loss=stop)
 
+        # And a sell rounded *down*, for the mirror of the same reason.
+        limit = (
+            block.bottom
+            if self._entry_point is ZoneEntryPoint.EDGE
+            else _to_tick(block.bottom + size / 2, tick, ROUND_FLOOR)
+        )
         return ZoneEntry(
             side=Side.SHORT,
-            limit_price=block.bottom,
+            limit_price=limit,
             stop_loss=_to_tick(block.top + buffer, tick, ROUND_CEILING),
         )
 
@@ -854,16 +962,80 @@ class StructureStrategy:
     # ----------------------------------------------------------------------- #
 
     def _still_standing(self, block: OrderBlock) -> bool:
-        """Is this zone still one the tracker holds and still usable?
+        """May a *new* order be put on this zone — is it still held, and still unmitigated?
+
+        ⚠️ **This answers the arming question only.** It used to answer both, because under the
+        edge entry the two were the same question: the wick that mitigated a region was the wick
+        that filled the order resting on its edge, so "may it be armed" and "should the order
+        stay" always agreed. They no longer do. A standing order's life is `_tracked` plus
+        `_ran_away`; this is what `_may_arm` asks before minting a new one.
 
         A zone the detector has dropped is as dead as a mitigated one — it aged out of the window
-        the method looks back over, and an order left resting on it would fill off a region
-        nothing is watching any more.
+        the method looks back over.
         """
         for tracked in self._blocks.zones:
             if tracked.block == block:
                 return tracked.usable
         return False
+
+    def _mitigated(self, block: OrderBlock) -> bool:
+        """Has price already come back and taken this region's near edge?
+
+        The detector's own mark, read rather than recomputed — his indicator owns that rule
+        (`low <= top` for demand, `high >= bottom` for supply) and a second copy of it here would
+        be one to keep in step.
+
+        ⚠️ **False for a region the tracker has dropped**, which is deliberate but never load
+        bearing: `_tracked` is asked first at the one call site, and a dropped region takes its
+        order with it regardless of what this would have said.
+        """
+        return any(tracked.block == block and tracked.mitigated for tracked in self._blocks.zones)
+
+    def _tracked(self, block: OrderBlock) -> bool:
+        """Is the detector still holding this region at all?
+
+        Deliberately *not* `_still_standing`: this asks only whether anything is still watching
+        the region, not whether it has been touched. A region that aged out of the tracker's
+        window takes its order with it — nothing downstream would notice the region breaking, and
+        an order left resting there fills off a level no longer being maintained.
+        """
+        return any(tracked.block == block for tracked in self._blocks.zones)
+
+    def _ran_away(self, block: OrderBlock, candle: Candle) -> bool:
+        """Has price cleared the region by a full height, abandoning the order?
+
+        The author's rule (`ABANDON_AT_ZONE_HEIGHTS`), in his own example: a demand region
+        [90, 100] with the order at 95, price returns and touches 100, stops at 98 without ever
+        trading 95, and turns back up. The order is abandoned when price reaches 110 — one height
+        above the near edge. The supply mirror abandons at 80.
+
+        ⚠️ **Two conditions, and the first is the one that is easy to lose.** Price must have
+        *entered* the region, and then cleared it by a height. An order waiting on a region price
+        has never come back to is not abandoned however far the market travels — it is still
+        waiting for exactly the event it was placed for.
+
+        ⚠️ **Read off the bar's extreme, not its close.** The order is a level in the book and the
+        market reaching a level is a wick, not a settlement — the same reading his mitigation rule
+        uses one method away. A close-based test would keep an order alive through a bar that
+        traded a full height clear of it and came back.
+
+        ⚠️ **The withdrawal it triggers takes effect on the next bar, and that is correct rather
+        than late.** `loop.py` fills before the strategy runs, so an order the market reached on
+        this same bar is already a trade by the time this is asked — and it should be: the
+        abandonment rule is about price *never coming to us*, so a bar that traded through the
+        limit filled it, exactly as a resting order at a broker would have.
+        """
+        # ⚠️ Nothing is abandoned before the region has been visited, and this guard is the whole
+        # rule rather than an optimisation. See `ABANDON_AT_ZONE_HEIGHTS`: counting from the
+        # arming bar abandons every order while price is still walking away from the impulse that
+        # marked the zone.
+        if not self._mitigated(block):
+            return False
+        height = block.top - block.bottom
+        clearance = height * ABANDON_AT_ZONE_HEIGHTS
+        if block.kind is ZoneKind.DEMAND:
+            return candle.high >= block.top + clearance
+        return candle.low <= block.bottom - clearance
 
     def _withdraw(self, armed: _Armed, candle: Candle) -> Signal:
         """Take back a named order. Harmless if it never reached the book — a cancel for an order

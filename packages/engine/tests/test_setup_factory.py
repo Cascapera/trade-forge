@@ -191,3 +191,17 @@ def test_a_parameter_the_engine_class_rejects_still_raises() -> None:
     period of zero reaches `PontoContinuoStrategy` and is refused there, with its message."""
     with pytest.raises(ValueError, match="average period must be >= 1"):
         _built("ponto_continuo", side="long", period=0)
+
+
+def test_an_unknown_entry_point_is_refused_rather_than_defaulted() -> None:
+    """⚠️ A document naming an entry point this engine does not have must not run at the edge.
+
+    `build_setup` takes a raw `Mapping`, not the Pydantic model — a strategy stored in JSONB
+    reaches it unvalidated. `"body"` is the likeliest wrong value of all, because the author's own
+    book lists it as model 2 and the engine deliberately does not carry it. Defaulting would run
+    that document at the widest stop of the two and report the result as the method the document
+    asked for.
+    """
+    for kind in ("structure_choch", "structure_continuation"):
+        with pytest.raises(EngineError, match="setup entry_point must be"):
+            build_setup({"type": kind, "params": {"entry_point": "body"}})

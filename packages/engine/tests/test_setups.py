@@ -41,6 +41,7 @@ from tradeforge_engine.setups import (
     ContinuationQualifier,
     SetupContext,
     StructureStrategy,
+    ZoneEntryPoint,
     _to_tick,
 )
 from tradeforge_engine.structure import (
@@ -1046,6 +1047,163 @@ def test_the_order_fills_at_the_zone_edge_when_price_comes_back() -> None:
     assert fill.time == _at(12)
     assert fill.price == Decimal("100")  # the zone's edge, not bar 12's open of 105
     assert fill.order.stop_loss == Decimal("89")
+
+
+# --------------------------------------------------------------------------- #
+# Where the order rests inside the region — his book, 11.4                     #
+# --------------------------------------------------------------------------- #
+
+# The region `_IMPULSE` marks is [90, 100] — the author's own example numbers. Midpoint 95,
+# stop 89, and the level a visited region is abandoned at is 100 + 10 = 110.
+_PULLBACK_TO_98 = [
+    bar(10, open_="124", close="115", high="125", low="114"),
+    bar(11, open_="115", close="105", high="116", low="104"),
+    bar(12, open_="105", close="99", high="106", low="98"),  # takes the 100 edge, stops at 98
+]
+
+
+def test_the_midpoint_entry_rests_at_half_the_region_with_the_same_stop() -> None:
+    """His model 3: the order at 50%, the stop still past the far edge.
+
+    The stop is the point. Both models put it at 89, so the midpoint entry buys the *same* zone
+    with 6 of risk instead of 11 — which is his whole argument for preferring it: "um stop 50%
+    menor... permite aumentar a quantidade de contratos, mantendo o mesmo valor de risco".
+    """
+    [edge] = _drive_from_bullish(
+        StructureStrategy(qualifier=_Marked(), entry_point=ZoneEntryPoint.EDGE), _IMPULSE
+    )[9]
+    [midpoint] = _drive_from_bullish(
+        StructureStrategy(qualifier=_Marked(), entry_point=ZoneEntryPoint.MIDPOINT), _IMPULSE
+    )[9]
+
+    assert (edge.limit_price, edge.stop_loss) == (Decimal("100"), Decimal("89"))
+    assert (midpoint.limit_price, midpoint.stop_loss) == (Decimal("95"), Decimal("89"))
+
+
+def test_the_midpoint_is_rounded_so_the_tick_never_flatters_the_entry() -> None:
+    """A region whose half lands between ticks, on both sides of the book.
+
+    [90.01, 100] is 9.99 wide, so the true midpoint is 95.005 and AAPL's grid is a cent. A buy
+    rounds **up** to 95.01 and the mirrored sell rounds **down** to 104.99: in both directions the
+    order is placed at a price no better than the midpoint really is. Rounding to nearest would
+    hand half of all odd-width regions an entry the method never offered — the same reasoning that
+    already rounds the stop away from the zone rather than onto it.
+    """
+    odd = list(_IMPULSE)
+    odd[3] = bar(3, open_="99", close="99", high="100", low="90.01")  # region [90.01, 100]
+
+    [long_] = _drive_from_bullish(
+        StructureStrategy(qualifier=_Marked(), entry_point=ZoneEntryPoint.MIDPOINT), odd
+    )[9]
+    [short] = _drive(
+        StructureStrategy(qualifier=_Marked(), entry_point=ZoneEntryPoint.MIDPOINT), _mirror(odd)
+    )[9]
+
+    assert long_.limit_price == Decimal("95.01")  # up, away from a better buy
+    assert short.limit_price == Decimal("104.99")  # down, away from a better sell
+
+
+def test_the_pullback_that_fills_on_the_edge_leaves_the_midpoint_on_the_stone() -> None:
+    """The same three bars, the two models, opposite outcomes — through the real broker.
+
+    Price dips to 98. That is through the 100 edge and nowhere near 95, so the edge model is in a
+    trade and the midpoint model is not. His own words for the second half: "muitas vezes o preço
+    não chega aos 50% e acaba indo em direção ao nosso alvo sem nos ativar, deixando-nos na
+    pedra". It is the cost of the smaller stop, and it is a real cost.
+    """
+
+    def entries(entry_point: ZoneEntryPoint) -> list[Fill]:
+        result = run(
+            candles=[*BULLISH_START, *_IMPULSE, *_PULLBACK_TO_98],
+            timeframe=HOUR,
+            instrument=AAPL,
+            strategy=StructureStrategy(qualifier=_Marked(), entry_point=entry_point),
+            broker=BacktestBroker(instrument=AAPL, initial_capital=Decimal(10_000)),
+            risk=FixedRisk(volume=Decimal(1)),
+        )
+        return [f for f in result.fills if f.order.intent is SignalKind.ENTRY]
+
+    [filled] = entries(ZoneEntryPoint.EDGE)
+    assert (filled.time, filled.price) == (_at(12), Decimal("100"))
+    assert entries(ZoneEntryPoint.MIDPOINT) == []
+
+
+def test_the_midpoint_order_outlives_the_touch_that_retires_its_region() -> None:
+    """⚠️ **The rule this whole entry point depends on**, and the one a mutant kills silently.
+
+    Bar 12 wicks to 98, which takes the region's 100 edge: under his indicator the region is
+    *mitigated* there, and it is never offered again. Until now that same touch also withdrew the
+    order, because on the edge the two were one event. An order at 95 has not been reached by it.
+
+    Bar 13 goes to 94 and the order fills at 95 — one bar after the region was retired. Restore
+    "mitigation withdraws the order" and this is a scenario with no trade in it at all, which is
+    what `ZoneEntryPoint.MIDPOINT` would be worth.
+    """
+    result = run(
+        candles=[
+            *BULLISH_START,
+            *_IMPULSE,
+            *_PULLBACK_TO_98,
+            bar(13, open_="99", close="95", high="100", low="94"),  # reaches the 95 midpoint
+        ],
+        timeframe=HOUR,
+        instrument=AAPL,
+        strategy=StructureStrategy(qualifier=_Marked(), entry_point=ZoneEntryPoint.MIDPOINT),
+        broker=BacktestBroker(instrument=AAPL, initial_capital=Decimal(10_000)),
+        risk=FixedRisk(volume=Decimal(1)),
+    )
+
+    [fill] = [f for f in result.fills if f.order.intent is SignalKind.ENTRY]
+    assert fill.time == _at(13)  # a bar *after* the region was mitigated
+    assert fill.price == Decimal("95")
+    assert fill.order.stop_loss == Decimal("89")
+
+
+def test_an_order_is_abandoned_once_price_leaves_a_region_it_visited() -> None:
+    """His second event: the region was visited, the order was not reached, the market left.
+
+    Bar 12 takes the 100 edge and turns at 98. Bar 14 reaches 110 — one region height above the
+    edge — and the order is withdrawn there. "Quando o preço atingir 110 a ordem deve ser retirada
+    e a entrada neste ponto deve ser abortada."
+    """
+    signals = _drive_from_bullish(
+        StructureStrategy(qualifier=_Once(), entry_point=ZoneEntryPoint.MIDPOINT),
+        [
+            *_IMPULSE,
+            *_PULLBACK_TO_98,
+            bar(13, open_="99", close="105", high="106", low="99"),
+            bar(14, open_="105", close="109", high="110", low="104"),  # 110: one height clear
+        ],
+    )
+
+    [armed] = signals[9]
+    assert (armed.kind, armed.limit_price) == (SignalKind.ENTRY, Decimal("95"))
+    assert signals[13] == []  # 106 is not yet a height clear of the edge
+    [cancel] = signals[14]
+    assert (cancel.kind, cancel.client_id) == (SignalKind.CANCEL, armed.client_id)
+
+
+def test_an_order_is_not_abandoned_while_price_has_never_come_back() -> None:
+    """⚠️ **The clock starts at the visit, not at the arming** — and getting this backwards is not
+    a corner case, it retires every order the setup ever places.
+
+    A demand region is *left behind* by an upward impulse, so at the moment it is marked price is
+    already walking away from it: `_IMPULSE` itself trades 110, 115 and 125 while the region sits
+    at [90, 100]. Bar 10 here goes to 131. Measured against the first version of this rule, which
+    counted clearance from the arming bar: 9 of this file's tests failed, all of them orders
+    abandoned before price had any chance to return.
+
+    Nothing is emitted after the entry. The order is still waiting for exactly the event it was
+    placed for.
+    """
+    signals = _drive_from_bullish(
+        StructureStrategy(qualifier=_Once(), entry_point=ZoneEntryPoint.MIDPOINT),
+        [*_IMPULSE, bar(10, open_="124", close="130", high="131", low="123")],  # never near 100
+    )
+
+    [armed] = signals[9]
+    assert armed.kind is SignalKind.ENTRY
+    assert signals[10] == []
 
 
 def test_a_one_bar_round_trip_through_the_real_broker_spends_the_zone() -> None:

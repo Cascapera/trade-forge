@@ -38,7 +38,12 @@ import pytest
 from tradeforge_engine import setup_factory
 from tradeforge_engine.domain import Side
 from tradeforge_engine.setup_factory import _BUILDERS, build_setup
-from tradeforge_engine.setups import ChochQualifier, ContinuationQualifier, StructureStrategy
+from tradeforge_engine.setups import (
+    ChochQualifier,
+    ContinuationQualifier,
+    StructureStrategy,
+    ZoneEntryPoint,
+)
 from tradeforge_engine.swing import Mme9BreakoutStrategy, PontoContinuoStrategy
 from tradeforge_schema.models import (
     ContinuationParams,
@@ -108,12 +113,17 @@ _PROBES: dict[str, dict[str, tuple[Any, Any]]] = {
         "allow_secondary": (True, True),
         "stop_buffer": (0.3, Decimal("0.3")),
         "breakeven_at_r": (4.7, Decimal("4.7")),
+        # The document carries the wire string; the engine must receive the enum. `StrEnum` makes
+        # the two compare equal, which is exactly why the probe is `midpoint` and not `edge`: on
+        # the default the assertion would hold whether the factory routed the field or dropped it.
+        "entry_point": ("midpoint", ZoneEntryPoint.MIDPOINT),
     },
     "structure_continuation": {
         "allow_secondary": (True, True),
         "stop_buffer": (0.3, Decimal("0.3")),
         "breakeven_at_r": (4.7, Decimal("4.7")),
         "max_bos": (7, 7),
+        "entry_point": ("midpoint", ZoneEntryPoint.MIDPOINT),
     },
 }
 

@@ -570,10 +570,22 @@ export interface StructureChochSetup {
  *
  * Not directional: which side is traded follows the structure, so there is no `side` here.
  * `stop_buffer` is a *fraction of the zone's width*, not ticks — the zone is the unit.
+ *
+ * `entry_point` is where inside the region the order rests — the author's book, 11.4. `edge`
+ * puts it on the near edge, which costs a stop the full width of the region; `midpoint` puts it
+ * at 50%, roughly halving the stop so the same risk buys more size. The trade-off is his:
+ * "muitas vezes o preço não chega aos 50% e acaba indo em direção ao nosso alvo sem nos ativar".
+ * `edge` is the default because changing it would move every result already recorded.
+ *
+ * ⚠️ **Two values, not a fraction.** A free number would let an entry approach the far edge,
+ * where risk collapses to the stop buffer alone and position sizing divides by nearly nothing.
+ * His model 2 — the marking candle's body limit — is absent for a different reason: the region
+ * records only that candle's high and low, so the body is not there to read.
  */
 export interface StructureParams {
   allow_secondary?: AllowSecondary;
   breakeven_at_r?: BreakevenAtR2;
+  entry_point?: "edge" | "midpoint";
   stop_buffer?: StopBuffer;
 }
 /**
@@ -592,6 +604,7 @@ export interface StructureContinuationSetup {
 export interface ContinuationParams {
   allow_secondary?: AllowSecondary1;
   breakeven_at_r?: BreakevenAtR3;
+  entry_point?: "edge" | "midpoint";
   max_bos?: MaxBos;
   stop_buffer?: StopBuffer1;
 }

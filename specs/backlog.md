@@ -1400,3 +1400,44 @@ preço. Opções, nenhuma escolhida:
 ⚠️ E `RefusedBy.VENUE` continua igualmente sem prova, por ironia: `--capital 800` conserta o teto
 de volume do executor e **por isso mesmo** tira de cena a única recusa que a gente conseguia
 produzir de propósito.
+
+## O docstring do `_conduct` descreve algo falso para o `RETURN_PASS`
+
+Achado pelo `engine-guardian` na #190 (03/09/2026), como observação não-bloqueante.
+
+`packages/engine/src/tradeforge_engine/setups.py:757` justifica a supressão do breakeven na barra
+do fill assim: *"a **limit** entry fills in the middle of a bar the trade did not live through...
+The swing family does not need this guard, because a **stop** entry fills going through its level
+in the direction of travel"*.
+
+O `RETURN_PASS` **é** entrada por stop e mesmo assim herda a supressão. O efeito é conservador — o
+backtest piora, não melhora — então não é bug. Mas é documentação errada num caminho de
+corretude, e [[docstring-e-afirmacao-testavel]] diz o que isso faz: quem lê para de procurar.
+
+Decidir junto: a supressão deveria seguir a **forma da ordem** (limite sim, stop não) em vez da
+família do setup? Se sim, é mudança de comportamento e precisa de golden próprio.
+
+## A UI ganhou `"return_pass"` no tipo e ninguém olhou a tela
+
+A #190 ampliou o enum no `models.py`, e `strategy.schema.json` e `strategy.ts` foram regerados —
+então o tipo TS conhece a opção. **Ninguém verificou se a tela oferece as três**, nem se ela
+oferece só `edge` e `midpoint` com o terceiro valor chegando apenas por JSON cru.
+
+⚠️ O portão do PR não pega isso: `tsc --noEmit` passa com uma lista de opções incompleta, porque
+uma lista menor que o union continua sendo atribuível. [[completude-provada-no-compilador]] tem a
+forma que provaria (`Exclude<...> extends never`), e ela não está aplicada aqui.
+
+## Nenhuma medição agregada de `MIDPOINT` nem de `RETURN_PASS`
+
+Anotado na #189 e **piorado** pela #190. Ninguém rodou os dois pontos de entrada novos contra
+dados reais: quantas ordens passam a existir, por quanto tempo, quantos trades novos aparecem.
+
+⚠️ A #190 aumenta a urgência porque a passagem na volta segura o **nome** da zona sem nada no book
+por quantas barras o preço levar para voltar — é o entry point que vive mais tempo dos três. E é
+o mesmo mecanismo que torna o termo `not self._tracked(...)` (sem teste que o prenda, expiração em
+`_MAX_ZONES = 200`) deixar de ser teórico num backtest longo. Prendê-lo honestamente exige um
+`_MAX_ZONES` injetável, não um cenário de 200 zonas.
+
+⚠️ Ao escolher a série: [[dados-ohlcv-sao-sinteticos]] — `data/ohlcv` veio de `--source mock`, então
+medir ali prova encanamento, não mercado. É o número que eu pediria **antes** de rodar qualquer um
+dos dois em paper.

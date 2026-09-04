@@ -37,6 +37,7 @@ from tradeforge_engine.risk import PercentRiskManager
 from tradeforge_engine.setup_factory import build_setup
 from tradeforge_engine.setups import (
     MAX_ARMING_ATTEMPTS,
+    BotinhaActivation,
     ChochQualifier,
     ContinuationQualifier,
     SetupContext,
@@ -3419,7 +3420,11 @@ def test_the_same_bars_without_volume_place_no_botinha_order() -> None:
     assert all(bar_signals == [] for bar_signals in mute)
 
 
-def test_an_older_entry_point_is_never_re_priced() -> None:
+@pytest.mark.parametrize(
+    "entry_point",
+    [ZoneEntryPoint.EDGE, ZoneEntryPoint.MIDPOINT, ZoneEntryPoint.RETURN_PASS],
+)
+def test_an_older_entry_point_is_never_re_priced(entry_point: ZoneEntryPoint) -> None:
     """The three region-arithmetic activations answer the same level on every bar, so the chase
     never fires for them and nothing they do changes.
 
@@ -3429,14 +3434,15 @@ def test_an_older_entry_point_is_never_re_priced() -> None:
     places once and is never withdrawn.
     """
     signals = _drive_from_bullish(
-        StructureStrategy(qualifier=_Marked(), entry_point=ZoneEntryPoint.MIDPOINT),
+        StructureStrategy(qualifier=_Marked(), entry_point=entry_point),
         [*_IMPULSE, *_REACTION_IN_THE_REGION, *_DRIFTS_UP],
     )
 
     entries = [s for bar_signals in signals for s in bar_signals if s.kind is SignalKind.ENTRY]
     cancels = [s for bar_signals in signals for s in bar_signals if s.kind is SignalKind.CANCEL]
+    # Exactly one, not "at most": all three place on this fixture, and a `<=` would let a path
+    # that quietly placed nothing pass as a path that placed once and was never withdrawn.
     assert len(entries) == 1
-    assert entries[0].limit_price == Decimal("95")
     assert cancels == []
 
 
@@ -3490,3 +3496,54 @@ def test_a_region_the_window_ran_out_on_is_never_offered_again() -> None:
     # The qualifier is still naming the region on every one of these bars; the chokepoint is what
     # says no. Without it the setup would re-arm and start a fresh seven-bar window for ever.
     assert all(bar_signals == [] for bar_signals in signals[22:])
+
+
+def test_the_hand_over_bar_reaches_the_new_regions_formation() -> None:
+    """A zone named while another is armed is observed twice on the same bar, and the second call
+    has to get through.
+
+    The strategy folds the bar into the activation before asking whether the resting order has
+    expired, and again after arming — because a zone named on this very bar has had no `observe`
+    at the first of those points. The guard that makes the pair idempotent is keyed to the bar's
+    time, so the reset when a *new* zone starts its formation is the only thing that lets the
+    second call past it.
+
+    ⚠️ **Without the reset the suite stays green and the numbers move.** The new region's
+    formation never sees the bar it was armed on. If that bar is one price is already inside — the
+    ordinary case, since a break that names a zone often happens while price is working in it —
+    then it is the anchor candidate, and losing it hands the anchor to the next low instead. A
+    different anchor is a different band, a different entry and a different stop, with nothing
+    anywhere to say so.
+
+    Asserted through the public surface: the hand-over bar enters the new region *and* closes up,
+    so it anchors that formation by itself, and his own arithmetic follows — the band is 100 to 90,
+    so the order is 91 and the stop 81. Formation blind to the bar, no lines, no order at all.
+    """
+    given_up = _zone_at("210", "200", hour=1)
+    named_now = _zone_at("100", "90", hour=2)
+    hand_over = bar(5, open_="91", high="110", low="90", close="100", tick_volume=1000)
+    context = Context(candle=hand_over, instrument=AAPL, account=_ACCOUNT)
+
+    activation = BotinhaActivation()
+    with localcontext(ENGINE_CONTEXT):
+        activation.observe(given_up, context=context)  # the zone being released
+        activation.observe(named_now, context=context)  # the hand-over
+        entry = activation.entry_for(named_now, context=context)
+
+    assert entry is not None
+    assert entry.limit_price == Decimal("91.00")
+    assert entry.stop_loss == Decimal("81.00")
+
+
+def _zone_at(top: str, bottom: str, *, hour: int) -> OrderBlock:
+    """A demand region with a time of its own, so two of them are different keys."""
+    marked = START.replace(hour=hour)
+    return OrderBlock(
+        kind=ZoneKind.DEMAND,
+        top=Decimal(top),
+        bottom=Decimal(bottom),
+        time=marked,
+        confirmed_at=marked,
+        break_kind=StructureKind.BOS,
+        primary=True,
+    )

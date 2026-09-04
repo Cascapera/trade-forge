@@ -1520,12 +1520,19 @@ class StructureStrategy:
         # line leaves the suite green: the zone is re-armed on every bar the qualifier offers it
         # and quietly places no order. The cost is invisible rather than absent. Each silent
         # re-arm mints a fresh `client_id` and advances the counter every later order is named
-        # from, which is the audit noise `MAX_ARMING_ATTEMPTS` exists to stop.
+        # from, which is the audit noise `MAX_ARMING_ATTEMPTS` exists to stop — and that counter
+        # is *observable*: the next region armed after a spent one carries an inflated number in
+        # its own name. So this line is not inherently untestable, it is currently untested, and
+        # the difference matters to whoever reads this next.
         #
         # And the masking is an accident of one line elsewhere: `_formation_for` reuses the dead
         # formation because the block has not changed. Anyone who later makes it start a fresh
         # one on a re-arm — a reasonable thing to want — hands the region a second seven-bar
         # window, and his rule that the window spends the region is gone with no test to say so.
+        #
+        # ⚠️ The same line from the other side, and it is live today: naming A, then B, then A
+        # again *does* restart A's formation, because `_watching` changed twice. This refusal is
+        # what stops that from handing a spent region a second seven-bar window.
         # The rule belongs at this chokepoint; the silence is a coincidence.
 
         if self._activation.spent(block):

@@ -123,6 +123,7 @@ class VwapFormation:
         "_bars_to_trigger",
         "_block",
         "_botinha",
+        "_last_bar",
         "_pending",
         "_state",
         "_typical",
@@ -145,6 +146,7 @@ class VwapFormation:
         self._state = FormationState.WATCHING
         self._pending: list[Candle] = []
         self._anchor: Candle | None = None
+        self._last_bar: Candle | None = None
         # ⚠️ **Both lines are built here, before there is an anchor to give them.** Not because
         # anything reads them yet — nothing does until `_anchor_here` feeds them — but because
         # building them is what *validates* the volume source, and `AnchoredVWAP` owns that list.
@@ -177,6 +179,19 @@ class VwapFormation:
         return self._anchor
 
     @property
+    def last_bar(self) -> Candle | None:
+        """The most recent bar this formation was shown, or `None` before the first one.
+
+        Published so that a trigger comparing the lines against a price cannot be handed the
+        wrong bar. `lines()` reflects the accumulation through exactly this candle, so the close
+        a level is measured against has to be this candle's — hand it the *next* bar and the
+        comparison silently becomes a level decided on N judged against a price from N+1, which
+        is lookahead with no symptom at all. Reading it from here rather than accepting it as an
+        argument is what makes that mistake unrepresentable instead of merely documented.
+        """
+        return self._last_bar
+
+    @property
     def bars_left(self) -> int:
         """Bars still available to the trigger. Zero unless the formation is anchored."""
         if self._state is not FormationState.ANCHORED:
@@ -185,6 +200,10 @@ class VwapFormation:
 
     def update(self, candle: Candle) -> None:
         """Advance the formation by one closed bar."""
+        # Recorded before anything else can return, because it means "the last bar this formation
+        # was shown" and that is true even of a bar it did nothing with. A trigger reading the
+        # lines has to compare them against *this* bar's close and no other — see `last_bar`.
+        self._last_bar = candle
         if self._state is FormationState.DEAD:
             return
 
@@ -411,14 +430,13 @@ class BotinhaTrigger:
     alive through every one of them — it is the *level* that is unusable on this bar, not the
     setup — and the next bar recomputes from scratch.
 
-    ⚠️ **The candle handed to `order_for` must be the last one the formation was fed, and nothing
-    here can check that.** The pairing is what makes the market-side guard honest: `lines()`
-    reflects the accumulation through bar N, so the close compared against it has to be N's. Hand
-    it N+1 — a caller that advanced its loop first, or one that keeps "the current bar" in a field
-    — and the guard silently compares a level decided on N against a price from N+1, which is
-    lookahead with no symptom at all. Pinning it is the integrating slice's job: either the
-    formation publishes the last bar it saw and this reads it from there, or the `Protocol` that
-    joins them makes the pair impossible to get wrong.
+    ⚠️ **It reads the bar off the formation rather than accepting one.** The market-side guard
+    only means anything when the close it compares against is the same bar the lines were
+    accumulated through; an argument would leave a caller free to hand over the next one, and the
+    guard would then judge a level decided on N against a price from N+1 — lookahead with no
+    symptom at all. The pairing was a documented obligation for exactly one review round before
+    it became an impossible mistake instead, which is the difference between a comment and a
+    design.
     """
 
     margin: Decimal = DEFAULT_ENTRY_MARGIN
@@ -432,10 +450,16 @@ class BotinhaTrigger:
                 f"the entry margin must lie strictly between 0 and 1, got {self.margin}"
             )
 
-    def order_for(
-        self, formation: VwapFormation, *, tick: Money, candle: Candle
-    ) -> BotinhaOrder | None:
+    def order_for(self, formation: VwapFormation, *, tick: Money) -> BotinhaOrder | None:
         """Where the order should rest at this bar's close, or `None` if none should.
+
+        ⚠️ **The bar is read off the formation, not passed in, and that is the whole point.** The
+        market-side guard below compares a level against a close, and the two are only comparable
+        when the close is the same bar the lines were accumulated through. Taking it as an
+        argument left a caller free to hand over the *next* bar — a loop that had already
+        advanced, or one keeping "the current candle" in a field — and the guard would then judge
+        a level decided on N against a price from N+1 with no symptom whatsoever. Read from the
+        formation, that mistake stops being a thing a reviewer has to notice.
 
         ⚠️ **The rounding is directional and it costs the trade, both times.** The entry is
         rounded *away* from the price it hoped for — up for a buy, down for a sell — so snapping
@@ -450,7 +474,13 @@ class BotinhaTrigger:
         dividing by nothing — so the failure mode is a skipped trade, not a division by zero.
         """
         lines = formation.lines()
-        if lines is None:
+        candle = formation.last_bar
+        # The second half of this test is for the type checker, not for a state that happens:
+        # `lines()` only answers when the formation is anchored, and it cannot anchor without
+        # having been fed, so a formation with lines always has a last bar. Written as one `or`
+        # rather than an `assert` because the honest answer to both is the same — nothing rests
+        # here — and an assertion would turn a state this object already handles into a crash.
+        if lines is None or candle is None:
             return None
 
         distance = abs(lines.vwap - lines.botinha)

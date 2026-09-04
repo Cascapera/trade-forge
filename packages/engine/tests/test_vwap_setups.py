@@ -608,7 +608,7 @@ def _order(
     with localcontext(ENGINE_CONTEXT):
         for candle in candles:
             formation.update(candle)
-        return (trigger or BotinhaTrigger()).order_for(formation, tick=TICK, candle=candles[-1])
+        return (trigger or BotinhaTrigger()).order_for(formation, tick=TICK)
 
 
 def test_the_order_lands_on_the_numbers_he_dictated() -> None:
@@ -665,7 +665,7 @@ def test_the_order_chases_the_botinha_and_the_risk_shrinks_behind_it() -> None:
     with localcontext(ENGINE_CONTEXT):
         for candle in chase:
             formation.update(candle)
-            order = trigger.order_for(formation, tick=TICK, candle=candle)
+            order = trigger.order_for(formation, tick=TICK)
             if order is not None:
                 placed.append((order.limit_price, order.stop_loss, order.risk))
 
@@ -693,7 +693,7 @@ def test_the_rounding_widens_the_risk_rather_than_shaving_the_stop() -> None:
         for candle in _INTO_DEMAND:
             formation.update(candle)
         lines = formation.lines()
-        order = BotinhaTrigger().order_for(formation, tick=TICK, candle=_INTO_DEMAND[-1])
+        order = BotinhaTrigger().order_for(formation, tick=TICK)
 
     assert lines is not None
     assert order is not None
@@ -736,7 +736,7 @@ def test_an_entry_that_came_out_above_the_close_places_nothing() -> None:
     formation = VwapFormation(_region(ZoneKind.DEMAND))
     with localcontext(ENGINE_CONTEXT):
         formation.update(spike)
-        order = BotinhaTrigger().order_for(formation, tick=TICK, candle=spike)
+        order = BotinhaTrigger().order_for(formation, tick=TICK)
 
     assert order is None
     state = formation.state
@@ -773,7 +773,7 @@ def test_a_formation_with_nothing_to_say_places_nothing() -> None:
     trigger = BotinhaTrigger()
     watching = VwapFormation(_region(ZoneKind.DEMAND))
     with localcontext(ENGINE_CONTEXT):
-        assert trigger.order_for(watching, tick=TICK, candle=_INTO_DEMAND[0]) is None
+        assert trigger.order_for(watching, tick=TICK) is None
 
     mute = [
         bar(1, open_="100.50", high="100.60", low="98.00", close="98.50"),
@@ -835,7 +835,7 @@ def test_two_lines_that_have_met_place_nothing() -> None:
         for candle in coincident:
             formation.update(candle)
         lines = formation.lines()
-        order = BotinhaTrigger().order_for(formation, tick=TICK, candle=coincident[-1])
+        order = BotinhaTrigger().order_for(formation, tick=TICK)
 
     # The formation is healthy and has something to say: it anchored, and both lines exist.
     state = formation.state
@@ -864,7 +864,7 @@ def test_an_entry_that_lands_exactly_on_the_close_places_nothing() -> None:
     with localcontext(ENGINE_CONTEXT):
         formation.update(lands_on_the_close)
         lines = formation.lines()
-        order = BotinhaTrigger().order_for(formation, tick=TICK, candle=lands_on_the_close)
+        order = BotinhaTrigger().order_for(formation, tick=TICK)
 
     assert lines is not None
     # The raw arithmetic really does land on the close: 100 + 10% of a band of ten.
@@ -891,7 +891,7 @@ def test_an_entry_through_zero_places_nothing_even_when_the_stop_is_fine() -> No
     with localcontext(ENGINE_CONTEXT):
         formation.update(negative)
         lines = formation.lines()
-        order = BotinhaTrigger().order_for(formation, tick=TICK, candle=negative)
+        order = BotinhaTrigger().order_for(formation, tick=TICK)
 
     assert lines is not None
     assert lines.vwap == Decimal("-6")
@@ -917,7 +917,7 @@ def test_an_entry_that_came_out_below_the_close_places_nothing_on_a_sale() -> No
     formation = VwapFormation(_region(ZoneKind.SUPPLY, top="200", bottom="190"))
     with localcontext(ENGINE_CONTEXT):
         formation.update(spike)
-        order = BotinhaTrigger().order_for(formation, tick=TICK, candle=spike)
+        order = BotinhaTrigger().order_for(formation, tick=TICK)
 
     assert order is None
     state = formation.state
@@ -936,7 +936,7 @@ def test_an_entry_that_lands_exactly_on_the_close_places_nothing_on_a_sale() -> 
     with localcontext(ENGINE_CONTEXT):
         formation.update(lands_on_the_close)
         lines = formation.lines()
-        order = BotinhaTrigger().order_for(formation, tick=TICK, candle=lands_on_the_close)
+        order = BotinhaTrigger().order_for(formation, tick=TICK)
 
     assert lines is not None
     assert lines.vwap == Decimal("90")
@@ -962,10 +962,47 @@ def test_a_level_that_lands_exactly_on_zero_places_nothing() -> None:
     with localcontext(ENGINE_CONTEXT):
         formation.update(negative)
         lines = formation.lines()
-        order = BotinhaTrigger().order_for(formation, tick=TICK, candle=negative)
+        order = BotinhaTrigger().order_for(formation, tick=TICK)
 
     assert lines is not None
     assert lines.vwap == Decimal("-9")
     assert lines.botinha == Decimal("1")
     # The entry is exactly the boundary, and the stop is nowhere near it.
     assert order is None
+
+
+def test_the_level_is_judged_against_the_last_bar_not_the_anchor() -> None:
+    """The close the guard compares against is the bar the lines end on, not the one they start on.
+
+    The two are the same bar in every single-bar fixture in this file, and in the multi-bar ones
+    the guard does not fire on either — so reading the *anchor's* close instead survives all of
+    them. That is the shape of "fields that tend to coincide", and it is worth a scenario built
+    to separate them, because the two closes answer different questions: the anchor's is where
+    the reaction bottomed, the last bar's is where the market actually is.
+
+    Here the anchor is a down bar closing on its own low at 95.05, and the confirming bar gaps up
+    and closes at 97.90. The entry comes out at 96.06 — *above* the anchor's close and well below
+    the market. Judged against the anchor it looks like a limit through the market and would be
+    suppressed; judged against the market, which is the only judgement that means anything, it is
+    an ordinary limit waiting a couple of points below.
+    """
+    anchor_low_market_high = [
+        bar(1, open_="99", high="99", low="95", close="95.05", tick_volume=1000),
+        bar(2, open_="97", high="98", low="96.90", close="97.90", tick_volume=1000),
+    ]
+    formation = VwapFormation(_region(ZoneKind.DEMAND))
+    with localcontext(ENGINE_CONTEXT):
+        for candle in anchor_low_market_high:
+            formation.update(candle)
+        order = BotinhaTrigger().order_for(formation, tick=TICK)
+
+    assert formation.anchor is not None
+    assert formation.last_bar is not None
+    # The two closes disagree about this level, which is what makes the scenario worth anything.
+    assert formation.anchor.close == Decimal("95.05")
+    assert formation.last_bar.close == Decimal("97.90")
+
+    assert order is not None
+    assert order.limit_price == Decimal("96.06")
+    assert order.limit_price > formation.anchor.close
+    assert order.limit_price < formation.last_bar.close

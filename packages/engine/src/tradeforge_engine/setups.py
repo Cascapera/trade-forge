@@ -64,8 +64,12 @@ from tradeforge_engine.structure import (
 )
 from tradeforge_engine.vwap_setups import (
     DEFAULT_BARS_TO_TRIGGER,
+    DEFAULT_BREAK_TICKS,
     DEFAULT_ENTRY_MARGIN,
+    DEFAULT_STOP_TICKS,
     BotinhaTrigger,
+    FffdLevels,
+    FffdTrigger,
     FormationState,
     VwapFormation,
 )
@@ -140,6 +144,7 @@ class ZoneEntryPoint(StrEnum):
     # string is a DSL value the schema publishes.
     RETURN_PASS = "return_pass"  # noqa: S105
     BOTINHA = "botinha"
+    FFFD = "fffd"
 
 
 ABANDON_AT_ZONE_HEIGHTS = Decimal(1)
@@ -509,6 +514,18 @@ class ZoneActivation(Protocol):
         """
         ...
 
+    def withdraws(self, block: OrderBlock, *, context: Context) -> bool:
+        """Should the resting order be taken back while the zone stays armed?
+
+        The question the other two could not ask. `entry_for` answering `None` leaves an
+        order resting — which is what a triggered entry needs on the bars price does not
+        reach it — and `expired` answering `True` gives the zone up altogether, which ends
+        the setup. This is the middle: the book is cleared and the region is still watched.
+
+        False for everything whose order lives exactly as long as its zone does.
+        """
+        ...
+
     @property
     def spent_by_mitigation(self) -> bool:
         """Does the first touch of the entry edge retire the region for this activation?
@@ -600,6 +617,10 @@ class EdgeActivation:
         it, and that is the strategy's book to keep (ADR-0015)."""
         return False
 
+    def withdraws(self, block: OrderBlock, *, context: Context) -> bool:  # noqa: ARG002
+        """Never: this order lives exactly as long as the zone that holds it."""
+        return False
+
     @property
     def spent_by_mitigation(self) -> bool:
         """Yes: this order waits *on* the region, so the touch is the event it was placed for."""
@@ -634,6 +655,10 @@ class MidpointActivation:
     def spent(self, block: OrderBlock) -> bool:  # noqa: ARG002 — the question is the protocol's
         """Never. A withdrawn order leaves its region free to be named again; only a fill spends
         it, and that is the strategy's book to keep (ADR-0015)."""
+        return False
+
+    def withdraws(self, block: OrderBlock, *, context: Context) -> bool:  # noqa: ARG002
+        """Never: this order lives exactly as long as the zone that holds it."""
         return False
 
     @property
@@ -719,6 +744,10 @@ class ReturnPassActivation:
         it, and that is the strategy's book to keep (ADR-0015)."""
         return False
 
+    def withdraws(self, block: OrderBlock, *, context: Context) -> bool:  # noqa: ARG002
+        """Never: this order lives exactly as long as the zone that holds it."""
+        return False
+
     @property
     def spent_by_mitigation(self) -> bool:
         """Yes: this order waits *on* the region, so the touch is the event it was placed for."""
@@ -765,6 +794,10 @@ class BotinhaActivation:
     _watching: OrderBlock | None = field(default=None, init=False, repr=False)
     _seen: datetime | None = field(default=None, init=False, repr=False)
     _spent: set[OrderBlock] = field(default_factory=set, init=False, repr=False)
+
+    def withdraws(self, block: OrderBlock, *, context: Context) -> bool:  # noqa: ARG002
+        """Never: this order lives exactly as long as the zone that holds it."""
+        return False
 
     @property
     def spent_by_mitigation(self) -> bool:
@@ -851,6 +884,192 @@ class BotinhaActivation:
         return self.spent(block)
 
 
+DEFAULT_BARS_TO_BREAK = 2
+"""How many bars the order has to be taken, counted from the bar after the trigger.
+
+His number: *"vale 2 barras: a seguinte ou a próxima"*. It is the inner of two nested clocks — the
+formation's seven bars are still running underneath — and nested clocks are where off-by-ones
+live, which is why both are injectable and both have a scenario that walks to their edge.
+"""
+
+
+@dataclass(slots=True)
+class FffdActivation:
+    """His chapter 11.2, the entry he named **FFFD**, as an activation.
+
+    The formation is the one every VWAP trigger shares. What this adds is the trigger bar and its
+    consequences, and there are **three of them**, which is one more than the botinha has:
+
+    | what happens | the order | the formation | the region |
+    | --- | --- | --- | --- |
+    | the high is broken | fills | done | spent by the fill (ADR-0015) |
+    | two bars pass, unfilled | **withdrawn** | **discarded — the reading resets** | **alive** |
+    | the trigger bar's low is lost | cancelled | done | **spent** |
+
+    ⚠️ **The middle row is why this activation needed a fourth question on the protocol.** The
+    strategy knew how to swap an order for a different one, and how to give a zone up entirely.
+    It had no way to say *take back what is on the book and keep watching this region* — and
+    neither of the two it had can stand in. Answering `None` from `entry_for` leaves the order
+    resting, which is exactly what `RETURN_PASS` needs on the bars price does not reach it;
+    answering `True` from `expired` drops the zone, and the qualifier that named it will not name
+    it again. So `withdraws` exists, with one implementation, because one rule needed it.
+
+    ⚠️ **And the two lower rows are his, distinguished by him.** Asked directly, he said the lost
+    low kills the region and the lapsed order only *"reseta a leitura ... tem que ocorrer uma nova
+    configuração"*. I had read those as the same outcome and they are not: a reading that resets
+    leaves the region free to form again from scratch — new anchor, new confirming bar, new window
+    — while a lost low ends it. Had he not distinguished them, this would have quietly traded a
+    region his method had finished with.
+    """
+
+    bars_to_trigger: int = DEFAULT_BARS_TO_TRIGGER
+    bars_to_break: int = DEFAULT_BARS_TO_BREAK
+    break_ticks: int = DEFAULT_BREAK_TICKS
+    stop_ticks: int = DEFAULT_STOP_TICKS
+    volume: str = "auto"
+
+    _formation: VwapFormation | None = field(default=None, init=False, repr=False)
+    _watching: OrderBlock | None = field(default=None, init=False, repr=False)
+    _seen: datetime | None = field(default=None, init=False, repr=False)
+    _levels: FffdLevels | None = field(default=None, init=False, repr=False)
+    _bars_since_trigger: int = field(default=0, init=False, repr=False)
+    _lapsed: bool = field(default=False, init=False, repr=False)
+    _spent: set[OrderBlock] = field(default_factory=set, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.bars_to_break < 1:
+            raise EngineError(f"the order lives at least one bar, got {self.bars_to_break}")
+
+    @property
+    def spent_by_mitigation(self) -> bool:
+        return False
+
+    def spent(self, block: OrderBlock) -> bool:
+        return block in self._spent
+
+    def withdraws(self, block: OrderBlock, *, context: Context) -> bool:  # noqa: ARG002
+        """True on the bar the order's two bars ran out without it being taken."""
+        return self._lapsed and self._watching == block
+
+    def expired(
+        self,
+        block: OrderBlock,
+        *,
+        context: Context,  # noqa: ARG002 — the formation already folded this bar in
+        zones: Sequence[TrackedZone],  # noqa: ARG002
+    ) -> bool:
+        return self.spent(block)
+
+    def entry_for(
+        self,
+        block: OrderBlock,
+        *,
+        context: Context,  # noqa: ARG002 — the levels were fixed when the trigger fired
+    ) -> ZoneEntry | None:
+        """The order above the trigger bar's high, while there is a trigger bar.
+
+        A **stop**, not a limit, and that is the inversion this entry is built on: the botinha
+        waits for price to come back down to a level, this one waits for it to break back up
+        through one. `None` on every bar with no live trigger, which is most of them.
+        """
+        if self._watching != block or self._levels is None:
+            return None
+        return ZoneEntry(
+            side=self._levels.side,
+            stop_price=self._levels.stop_price,
+            stop_loss=self._levels.stop_loss,
+        )
+
+    def observe(self, block: OrderBlock, *, context: Context) -> None:
+        """Fold this bar in: the formation, then the trigger, then the two clocks over it."""
+        formation = self._formation_for(block)
+        candle = context.candle
+        if self._seen == candle.time:
+            return
+        self._seen = candle.time
+        self._lapsed = False
+        formation.update(candle)
+
+        if self._levels is not None:
+            self._age_the_trigger(block, candle)
+            return
+
+        if formation.state is FormationState.DEAD:
+            # No trigger ever appeared and the formation is over — the window ran out, or a wick
+            # took the far edge. Either way his rule is that the region goes with it.
+            self._spend(block, "the formation ended before any trigger")
+            return
+
+        self._levels = FffdTrigger(
+            break_ticks=self.break_ticks, stop_ticks=self.stop_ticks
+        ).levels_for(formation, tick=context.instrument.tick_size)
+        if self._levels is not None:
+            self._bars_since_trigger = 0
+            logger.debug("fffd trigger on the bar at %s", candle.time)
+
+    def _age_the_trigger(self, block: OrderBlock, candle: Candle) -> None:
+        """One bar of the trigger's own clock, and the two ways it can end badly.
+
+        ⚠️ **The lost low is read before the clock**, because they can land on the same bar and
+        they are not the same outcome: one ends the region, the other only ends the order. A bar
+        that both breaks the low and exhausts the window has ended the region, and counting the
+        clock first would have recorded it as a reading that merely reset.
+        """
+        levels = self._levels
+        if levels is None:  # pragma: no cover - only called with a live trigger
+            return
+        lost = (
+            candle.low <= levels.annul_price
+            if levels.side is Side.LONG
+            else candle.high >= levels.annul_price
+        )
+        if lost:
+            self._spend(block, "the trigger bar's own extreme was lost")
+            return
+
+        self._bars_since_trigger += 1
+        if self._bars_since_trigger >= self.bars_to_break:
+            # His rule, and the one I first read as an annulment: the order comes back, the
+            # reading resets, and the region is free to configure itself again from nothing.
+            logger.debug(
+                "fffd order lapsed after %d bars; resetting the reading", self.bars_to_break
+            )
+            self._lapsed = True
+            self._levels = None
+            self._restart(block, candle)
+
+    def _spend(self, block: OrderBlock, why: str) -> None:
+        logger.debug("fffd spending the zone at %s: %s", block.time, why)
+        self._spent.add(block)
+        self._levels = None
+
+    def _restart(self, block: OrderBlock, candle: Candle) -> None:
+        """Throw the formation away and start one on this very bar.
+
+        ⚠️ **The bar that ended the order is the first bar of the new reading, not the one before
+        it.** It is a bar inside the region like any other, so it can perfectly well be the low a
+        new reaction anchors on — and dropping it would lose that anchor exactly the way the
+        hand-over bug did one slice ago. Same mistake, different door.
+        """
+        self._formation = VwapFormation(
+            block, bars_to_trigger=self.bars_to_trigger, volume=self.volume
+        )
+        self._formation.update(candle)
+
+    def _formation_for(self, block: OrderBlock) -> VwapFormation:
+        if self._watching != block:
+            self._formation = VwapFormation(
+                block, bars_to_trigger=self.bars_to_trigger, volume=self.volume
+            )
+            self._watching = block
+            self._seen = None
+            self._levels = None
+            self._bars_since_trigger = 0
+            self._lapsed = False
+        assert self._formation is not None  # noqa: S101 — assigned above; this is for mypy
+        return self._formation
+
+
 def activation_for(entry_point: ZoneEntryPoint, *, stop_buffer: Decimal) -> ZoneActivation:
     """The activation a `ZoneEntryPoint` names.
 
@@ -874,6 +1093,8 @@ def activation_for(entry_point: ZoneEntryPoint, *, stop_buffer: Decimal) -> Zone
         return ReturnPassActivation(stop_buffer=stop_buffer)
     if entry_point is ZoneEntryPoint.BOTINHA:
         return BotinhaActivation()
+    if entry_point is ZoneEntryPoint.FFFD:
+        return FffdActivation()
     raise EngineError(  # pragma: no cover - unreachable while the enum and the chain agree
         f"no activation for entry point {entry_point!r}"
     )
@@ -1221,6 +1442,25 @@ class StructureStrategy:
             # Fed again, for the zone that may have been armed a few lines above: on its first
             # bar it has had no `observe` yet, and a formation with no bars in it prices nothing.
             self._activation.observe(self._armed.block, context=context)
+
+            # ⚠️ **Clearing the book without giving up the zone**, which is the one thing the
+            # two older questions could not express: `entry_for` answering `None` leaves the
+            # order resting, and `expired` answering `True` drops the region. Chapter 11.2 needs
+            # the middle — an order whose two bars ran out comes back, and the region carries on
+            # being watched so it can configure itself again from nothing.
+            #
+            # The name is advanced here too. A cancelled id is free to reuse in the backtest, and
+            # reusing it is still the wrong thing to hand a venue: two orders a session apart
+            # under one name is an audit trail that cannot be read.
+            if self._armed.placed and self._activation.withdraws(
+                self._armed.block, context=context
+            ):
+                signals.append(self._withdraw(self._armed, candle))
+                self._armed.revision += 1
+                self._armed.client_id = f"{self._armed.stem}-r{self._armed.revision}"
+                self._armed.placed = False
+                self._armed.entry = None
+
             entry = self._activation.entry_for(self._armed.block, context=context)
             # ⚠️ **A level that has not moved is not a new order.** Three activations answer the
             # same thing on every bar, so this compares equal and nothing is sent — which is why

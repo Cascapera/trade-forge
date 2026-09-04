@@ -75,7 +75,7 @@ type PriceSource = Literal["open", "high", "low", "close"]
 # A directional setup trades one side; the two-sided version is two of them. The structure
 # family has no side at all — which way it trades follows the structure it reads.
 type SetupSide = Literal["long", "short"]
-type ZoneEntryPoint = Literal["edge", "midpoint", "return_pass", "botinha"]
+type ZoneEntryPoint = Literal["edge", "midpoint", "return_pass", "botinha", "fffd"]
 type AverageKind = Literal["EMA", "SMA"]
 
 # The same list, as a runtime value. The database needs it for a CHECK constraint
@@ -541,6 +541,18 @@ class StructureParams(_Node):
     **re-priced** on every close, because both averages move, and the region is **not** retired
     by price touching it — entering the region is where the setup begins, so a zone spent by its
     own first touch could never form one. What retires it instead is the window running out.
+
+    `fffd` is his other entry of the same chapter, and it inverts this one. The formation is the
+    same; what arms the order is a bar that **crosses the central line and closes beyond it** —
+    the seller pushing through and the push failing. The order is then a **stop** above that
+    bar's high rather than a limit below the market, it lives **two bars**, and the bar's own low
+    is a third level: losing it ends the region rather than the trade, while the stop sits three
+    ticks further out. Two bars passing unfilled take the order back and reset the reading — the
+    region survives and must configure itself again from nothing.
+
+    ⚠️ "Crosses" is read strictly: the bar has to have traded on the far side first. A bar that
+    lives entirely beyond the line and closes there arms nothing, because buying the break of its
+    high would be buying into a decline rather than the failure of a push.
 
     ⚠️ The stop buffer says nothing about `botinha`: its stop comes from the band, not from the
     region. Its own numbers — the window, the tenth, and which volume the averages use — are not

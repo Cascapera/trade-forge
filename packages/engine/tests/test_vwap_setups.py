@@ -24,6 +24,8 @@ from tradeforge_engine.testing import START, bar
 from tradeforge_engine.vwap_setups import (
     BotinhaOrder,
     BotinhaTrigger,
+    FffdLevels,
+    FffdTrigger,
     FormationState,
     VwapFormation,
     VwapLines,
@@ -1006,3 +1008,211 @@ def test_the_level_is_judged_against_the_last_bar_not_the_anchor() -> None:
     assert order.limit_price == Decimal("96.06")
     assert order.limit_price > formation.anchor.close
     assert order.limit_price < formation.last_bar.close
+
+
+# --------------------------------------------------------------------------- #
+# The FFFD trigger — his other entry of chapter 11.2                            #
+# --------------------------------------------------------------------------- #
+
+# The formation anchors at 95.00 on bar 13 and confirms on bar 14; bars 15 and 16 are the market
+# retaking upward, which is the state his rule is written for — price above the central line, the
+# seller about to push. Every bar carries volume, or none of the lines would exist.
+_RETAKES_UPWARD = [
+    bar(12, open_="105", close="99", high="106", low="98", tick_volume=1000),
+    bar(13, open_="99", close="96", high="99.5", low="95", tick_volume=1500),
+    bar(14, open_="96", close="97.5", high="98", low="95.5", tick_volume=1200),
+    bar(15, open_="97.5", close="98.6", high="98.8", low="97.3", tick_volume=1000),
+    bar(16, open_="98.6", close="99.2", high="99.5", low="98.4", tick_volume=1100),
+]
+
+
+def _levels(
+    candles: list[Candle],
+    kind: ZoneKind,
+    *,
+    trigger: FffdTrigger | None = None,
+    **bounds: str,
+) -> FffdLevels | None:
+    formation = VwapFormation(_region(kind, **bounds))
+    with localcontext(ENGINE_CONTEXT):
+        for candle in candles:
+            formation.update(candle)
+        return (trigger or FffdTrigger()).levels_for(formation, tick=TICK)
+
+
+def _reflected(candle: Candle) -> Candle:
+    """The same bar around 190, with high and low swapping roles."""
+    return bar(
+        candle.time.hour,
+        open_=str(Decimal(190) - candle.open),
+        close=str(Decimal(190) - candle.close),
+        high=str(Decimal(190) - candle.low),
+        low=str(Decimal(190) - candle.high),
+        tick_volume=candle.tick_volume,
+    )
+
+
+def test_the_trigger_bar_gives_all_three_of_its_levels() -> None:
+    """The seller pushes through the line and fails, and that bar hands over three prices.
+
+    With the lines at 97.70 the bar trades up to 99.60, well above, and closes at 97.00, below —
+    his *"cruza a VWAP e fecha abaixo dela"*. The order then waits above its high at 99.61, the
+    stop sits three ticks under its low at 96.77, and the low itself, 96.80, is what annuls the
+    setup rather than the trade.
+
+    ⚠️ **Two of those are one tick apart, and that is the point.** The level that says "this was
+    not the failed push I read it as" and the level that says "this trade is over" are neighbours
+    here — and the exact inverse of chapter 11.5, where the cancel and the stop are deliberately
+    the same number. Merging them would be one character and two different rules.
+    """
+    levels = _levels([*_RETAKES_UPWARD, _CROSSES_AND_CLOSES_BELOW], ZoneKind.DEMAND)
+
+    assert levels is not None
+    assert levels.side is Side.LONG
+    assert levels.stop_price == Decimal("99.61")
+    assert levels.stop_loss == Decimal("96.77")
+    assert levels.annul_price == Decimal("96.80")
+    assert levels.annul_price != levels.stop_loss
+    assert levels.risk == Decimal("2.84")
+
+
+def test_the_trigger_is_the_exact_mirror_over_a_supply_region() -> None:
+    """Reflected around 190, all three levels reflect with it — 90.39, 93.23 and 93.20.
+
+    The short is not "the same rule with a sign": the bar has to trade *below* the line and close
+    *above* it, the order waits under its low, and the stop sits over its high. An implementation
+    that mirrored two of the three would still produce a trade in the right direction, at one
+    price nobody chose.
+    """
+    levels = _levels(
+        [
+            *(_reflected(candle) for candle in _RETAKES_UPWARD),
+            _reflected(_CROSSES_AND_CLOSES_BELOW),
+        ],
+        ZoneKind.SUPPLY,
+    )
+
+    assert levels is not None
+    assert levels.side is Side.SHORT
+    assert levels.stop_price == Decimal("90.39")  # 190 - 99.61
+    assert levels.stop_loss == Decimal("93.23")  # 190 - 96.77
+    assert levels.annul_price == Decimal("93.20")  # 190 - 96.80
+
+
+def test_a_bar_that_never_traded_above_the_line_is_not_a_trigger() -> None:
+    """The strict reading of "crosses", and the one bar in the file that separates the two.
+
+    This bar lives entirely under the central line — high 97.30 against 97.47 — and closes there.
+    It satisfies "closed below" and crosses nothing. Under the loose reading it would arm a buy at
+    97.31: a level *below* the average, in a market already falling through it. That is not the
+    failed seller's push he described, it is a purchase in the middle of a decline — so the strict
+    reading is not a stricter count of the same signals, it keeps them the same kind of event.
+    """
+    entirely_below = bar(
+        17, open_="97.20", close="96.60", high="97.30", low="96.50", tick_volume=1400
+    )
+
+    assert _levels([*_RETAKES_UPWARD, entirely_below], ZoneKind.DEMAND) is None
+
+
+def test_a_bar_that_crossed_but_closed_back_above_is_not_a_trigger_either() -> None:
+    """The other half of the pair: the seller pushed and the bar recovered.
+
+    Same high as the real trigger, same low, and it closes at 99.00 — above the line. Nothing
+    failed here, so there is nothing to buy the failure of. Written because "crossed" and "closed
+    beyond" are two conditions and a test of only one of them proves half a rule.
+    """
+    recovered = bar(17, open_="99.2", close="99.0", high="99.6", low="96.8", tick_volume=1400)
+
+    assert _levels([*_RETAKES_UPWARD, recovered], ZoneKind.DEMAND) is None
+
+
+def test_neither_near_miss_is_a_trigger_on_the_sell_side_either() -> None:
+    """Both near misses, mirrored — because a guard proved on one side is a guard proved once.
+
+    The first bar never trades below the line; the second dips under it and closes back above.
+    Under a sell-side branch pasted from the buy side, at least one of them arms.
+    """
+    entirely_above = bar(
+        17, open_="97.20", close="96.60", high="97.30", low="96.50", tick_volume=1400
+    )
+    recovered = bar(17, open_="99.2", close="99.0", high="99.6", low="96.8", tick_volume=1400)
+    mirrored_base = [_reflected(candle) for candle in _RETAKES_UPWARD]
+
+    assert _levels([*mirrored_base, _reflected(entirely_above)], ZoneKind.SUPPLY) is None
+    assert _levels([*mirrored_base, _reflected(recovered)], ZoneKind.SUPPLY) is None
+
+
+def test_a_stop_that_would_fall_through_zero_is_no_trigger() -> None:
+    """Three ticks under a low of two ticks is below nothing, and `Signal` refuses that outright.
+
+    Caught here so a pathological instrument goes quiet instead of raising from inside a run —
+    the same treatment the botinha's levels get. The bar is a real trigger by every other test:
+    it crosses the line at 0.4483 and closes at 0.10.
+    """
+    levels = _levels(
+        [
+            bar(1, open_="0.05", high="0.90", low="0.02", close="0.80", tick_volume=1000),
+            bar(2, open_="0.80", high="0.85", low="0.02", close="0.10", tick_volume=1000),
+        ],
+        ZoneKind.DEMAND,
+        # ⚠️ The region has to hold these prices, or the formation dies on the first wick
+        # through its far edge and this test passes for the wrong reason — a silence from the
+        # guard above the one it means to exercise. It did, until coverage said so.
+        top="1",
+        bottom="0.01",
+    )
+
+    assert levels is None
+
+
+def test_a_formation_with_no_lines_has_no_trigger() -> None:
+    """No volume, no averages, no trigger — the same silence, for the same reason, and it has to
+    be asserted or every other assertion here could be passing vacuously."""
+    mute = [
+        bar(
+            candle.time.hour,
+            open_=str(candle.open),
+            close=str(candle.close),
+            high=str(candle.high),
+            low=str(candle.low),
+        )
+        for candle in [*_RETAKES_UPWARD, _CROSSES_AND_CLOSES_BELOW]
+    ]
+
+    assert _levels(mute, ZoneKind.DEMAND) is None
+    assert _levels([*_RETAKES_UPWARD, _CROSSES_AND_CLOSES_BELOW], ZoneKind.DEMAND) is not None
+
+
+def test_the_two_tick_counts_move_two_different_levels() -> None:
+    """The order's distance and the stop's are separate knobs, and each moves only its own.
+
+    Widened together they would keep the risk fixed while both levels travelled, which is a
+    different trade from the one he described — and easy to write, since both are a count of ticks
+    multiplied by the same tick.
+    """
+    wider = _levels(
+        [*_RETAKES_UPWARD, _CROSSES_AND_CLOSES_BELOW],
+        ZoneKind.DEMAND,
+        trigger=FffdTrigger(break_ticks=5, stop_ticks=10),
+    )
+
+    assert wider is not None
+    assert wider.stop_price == Decimal("99.65")  # 99.60 + 5 ticks
+    assert wider.stop_loss == Decimal("96.70")  # 96.80 - 10 ticks
+    assert wider.annul_price == Decimal("96.80")  # untouched: it is the bar's own low
+
+
+def test_a_distance_of_no_ticks_is_refused() -> None:
+    """Zero would put the order on the bar's own high and the stop on its own low — the first is
+    an order that is already triggered, the second is the annul level wearing a stop's name."""
+    with pytest.raises(EngineError, match="at least one tick past the bar"):
+        FffdTrigger(break_ticks=0)
+    with pytest.raises(EngineError, match="at least one tick past the bar"):
+        FffdTrigger(stop_ticks=0)
+
+
+_CROSSES_AND_CLOSES_BELOW = bar(
+    17, open_="99.2", close="97.00", high="99.60", low="96.80", tick_volume=1400
+)
+"""The seller's push, and the failure of it: up to 99.60 through a line at 97.70, back to 97.00."""

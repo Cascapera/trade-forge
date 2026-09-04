@@ -3274,3 +3274,219 @@ def test_three_refusals_in_a_row_do_retire_it() -> None:
         "demand-20240103T0200-2",
         "demand-20240103T0200-3",
     ], f"the cap did not retire a zone refused three times running: {names}"
+
+
+# --------------------------------------------------------------------------- #
+# The botinha activation — his chapter 11.2, through the whole machine          #
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class _LateMarked:
+    """Holds the first zone the detector marks and offers it only from a later bar.
+
+    Every other qualifier here names a zone the moment it is marked, which is *before* price has
+    come back to it — so whether a mitigated region may still be armed never comes up. Naming it
+    late is what makes that question reachable, and a qualifier reading a zone out of the past is
+    not a contrivance: it is how the continuation setup works.
+    """
+
+    after: int = 0
+    held: OrderBlock | None = None
+    bars: int = 0
+
+    def qualify(self, context: SetupContext) -> OrderBlock | None:
+        self.bars += 1
+        if self.held is None and context.marked:
+            self.held = context.marked[0]
+        return self.held if self.held is not None and self.bars >= self.after else None
+
+
+# Price comes back into the [90, 100] region his impulse marks, reacts down to 95, and turns.
+# ⚠️ **Every bar carries volume, and that is not decoration.** `AnchoredVWAP` skips a bar with
+# none, so the same bars without it produce no lines, no order and no trade — which is the pair
+# asserted below, and the reason a silence here would otherwise prove nothing.
+_REACTION_IN_THE_REGION = [
+    bar(10, open_="124", close="115", high="125", low="114", tick_volume=1000),
+    bar(11, open_="115", close="105", high="116", low="104", tick_volume=1000),
+    bar(12, open_="105", close="99", high="106", low="98", tick_volume=1000),  # takes the 100 edge
+    bar(13, open_="99", close="96", high="99.5", low="95", tick_volume=1500),  # down, low 95
+    bar(14, open_="96", close="97.5", high="98", low="95.5", tick_volume=1200),  # up: confirms
+]
+
+_DRIFTS_UP = [
+    bar(15, open_="97.5", close="97", high="98", low="96.5", tick_volume=900),
+    bar(16, open_="97", close="96.8", high="97.2", low="96.2", tick_volume=1100),
+]
+
+_QUIET = [
+    bar(15 + offset, open_="97.5", close="97.6", high="97.8", low="97.2", tick_volume=900)
+    for offset in range(8)
+]
+
+
+def _without_volume(candles: list[Candle]) -> list[Candle]:
+    return [
+        bar(
+            candle.time.hour,
+            open_=str(candle.open),
+            close=str(candle.close),
+            high=str(candle.high),
+            low=str(candle.low),
+        )
+        for candle in candles
+    ]
+
+
+def test_the_botinha_order_chases_its_band_bar_by_bar() -> None:
+    """The first activation whose resting order is re-priced, and this is what that looks like.
+
+    Bar 14 closes up and confirms the anchor, so the order goes on at 95.40 with its stop at
+    93.71. Every close after it moves both averages, so every bar withdraws what is resting and
+    places the new level — 95.69, then 95.82 — each under a name of its own, because the broker
+    refuses a `client_id` that is already resting.
+
+    ⚠️ **The risk shrinks while the entry climbs**: 1.69, 1.44, 1.23. `d` is a volume-weighted
+    mean of the bars' own shape, so quiet bars dilute the big one the anchor sits on. Nothing
+    about price *level* does that, which is why the two move in opposite directions.
+    """
+    signals = _drive_from_bullish(
+        StructureStrategy(qualifier=_Marked(), entry_point=ZoneEntryPoint.BOTINHA),
+        [*_IMPULSE, *_REACTION_IN_THE_REGION, *_DRIFTS_UP],
+    )
+
+    [placed] = signals[14]
+    assert placed.kind is SignalKind.ENTRY
+    assert placed.side is Side.LONG
+    assert placed.limit_price == Decimal("95.40")
+    assert placed.stop_loss == Decimal("93.71")
+    assert placed.client_id == "demand-20240101T0300-1"
+
+    withdrawn, replaced = signals[15]
+    assert withdrawn.kind is SignalKind.CANCEL
+    assert withdrawn.client_id == "demand-20240101T0300-1"
+    assert replaced.limit_price == Decimal("95.69")
+    assert replaced.stop_loss == Decimal("94.25")
+    assert replaced.client_id == "demand-20240101T0300-1-r1"
+
+    withdrawn, replaced = signals[16]
+    assert withdrawn.client_id == "demand-20240101T0300-1-r1"
+    assert replaced.limit_price == Decimal("95.82")
+    assert replaced.stop_loss == Decimal("94.59")
+    # ⚠️ The revision is a number on a stem, not a suffix on a suffix: seven bars of chasing would
+    # otherwise mint `...-r1-r2-r3-r4-r5-r6`.
+    assert replaced.client_id == "demand-20240101T0300-1-r2"
+
+
+def test_the_botinha_window_running_out_takes_the_order_back_for_good() -> None:
+    """Seven bars after the confirmation, and then the name is given up rather than re-priced.
+
+    The order is placed on bar 14 and chased through six more; bar 21 is the seventh bar of the
+    window, and it produces a withdrawal with nothing behind it. His rule: the window running out
+    does not merely retire the order, it spends the **region** — so nothing is armed again after.
+    """
+    signals = _drive_from_bullish(
+        StructureStrategy(qualifier=_Marked(), entry_point=ZoneEntryPoint.BOTINHA),
+        [*_IMPULSE, *_REACTION_IN_THE_REGION, *_QUIET],
+    )
+
+    assert [len(bar_signals) for bar_signals in signals[14:22]] == [1, 2, 2, 2, 2, 2, 2, 1]
+    [last] = signals[21]
+    assert last.kind is SignalKind.CANCEL
+    assert last.client_id == "demand-20240101T0300-1-r6"
+    assert all(bar_signals == [] for bar_signals in signals[22:])
+
+
+def test_the_same_bars_without_volume_place_no_botinha_order() -> None:
+    """The obligatory pair, and the whole reason the test helper knows about volume.
+
+    `AnchoredVWAP` skips a bar with no volume rather than dividing by zero, so a series without
+    it produces no lines for ever — no error, no order, and a report reading zero trades. The
+    same bars with volume place an order three bars in; the same bars without it place nothing at
+    all, and an assertion of silence that could not tell those two apart would pass for the wrong
+    reason.
+    """
+    with_volume = _drive_from_bullish(
+        StructureStrategy(qualifier=_Marked(), entry_point=ZoneEntryPoint.BOTINHA),
+        [*_IMPULSE, *_REACTION_IN_THE_REGION],
+    )
+    assert len(with_volume[14]) == 1
+
+    mute = _drive_from_bullish(
+        StructureStrategy(qualifier=_Marked(), entry_point=ZoneEntryPoint.BOTINHA),
+        [*_IMPULSE, *_without_volume(_REACTION_IN_THE_REGION)],
+    )
+    assert all(bar_signals == [] for bar_signals in mute)
+
+
+def test_an_older_entry_point_is_never_re_priced() -> None:
+    """The three region-arithmetic activations answer the same level on every bar, so the chase
+    never fires for them and nothing they do changes.
+
+    That is the whole reason the strategy may now ask every bar instead of once: the comparison
+    is what makes re-pricing opt-in, rather than a flag somebody has to remember to set. Driven
+    over the same bars that make the botinha replace its order five times, the midpoint entry
+    places once and is never withdrawn.
+    """
+    signals = _drive_from_bullish(
+        StructureStrategy(qualifier=_Marked(), entry_point=ZoneEntryPoint.MIDPOINT),
+        [*_IMPULSE, *_REACTION_IN_THE_REGION, *_DRIFTS_UP],
+    )
+
+    entries = [s for bar_signals in signals for s in bar_signals if s.kind is SignalKind.ENTRY]
+    cancels = [s for bar_signals in signals for s in bar_signals if s.kind is SignalKind.CANCEL]
+    assert len(entries) == 1
+    assert entries[0].limit_price == Decimal("95")
+    assert cancels == []
+
+
+def test_a_touched_region_is_refused_by_a_limit_entry_and_taken_by_the_botinha() -> None:
+    """The mitigation rule is the activation's, and this is the bar where the two answers differ.
+
+    The zone is offered late — after bar 12 has already taken its 100 edge — so it is mitigated
+    by the time anyone asks. For an order that waits *on* the region that touch was the event it
+    was placed for, and the zone is spent: the midpoint entry places nothing, ever. For a
+    formation the same touch is where the setup **begins**, so refusing there would refuse every
+    botinha that could ever exist.
+
+    Same bars, same qualifier, same region: only the activation differs, and one trades.
+    """
+    bars = [*_IMPULSE, *_REACTION_IN_THE_REGION, _DRIFTS_UP[0]]
+
+    limit = _drive_from_bullish(
+        StructureStrategy(qualifier=_LateMarked(after=22), entry_point=ZoneEntryPoint.MIDPOINT),
+        bars,
+    )
+    assert all(bar_signals == [] for bar_signals in limit)
+
+    formation = _drive_from_bullish(
+        StructureStrategy(qualifier=_LateMarked(after=22), entry_point=ZoneEntryPoint.BOTINHA),
+        bars,
+    )
+    [placed] = formation[14]
+    assert placed.kind is SignalKind.ENTRY
+    assert placed.limit_price == Decimal("95.40")
+
+
+def test_a_region_the_window_ran_out_on_is_never_offered_again() -> None:
+    """His rule, and it is the second way a zone can die.
+
+    Only a *fill* spends a region for the three older activations — an order withdrawn untouched
+    leaves it free to be named again (ADR-0015). The VWAP triggers add the other: a formation
+    whose seven bars ran out takes its region with it, and he said so in as many words when he
+    described the botinha.
+
+    Reaching it takes a qualifier that keeps offering the same zone, because every other one here
+    names a region once and would make the refusal unobservable. After bar 21 gives the order up,
+    the zone is offered on every remaining bar and armed on none of them.
+    """
+    signals = _drive_from_bullish(
+        StructureStrategy(qualifier=_LateMarked(after=0), entry_point=ZoneEntryPoint.BOTINHA),
+        [*_IMPULSE, *_REACTION_IN_THE_REGION, *_QUIET],
+    )
+
+    [given_up] = signals[21]
+    assert given_up.kind is SignalKind.CANCEL
+    # The qualifier is still naming the region on every one of these bars; the chokepoint is what
+    # says no. Without it the setup would re-arm and start a fresh seven-bar window for ever.
+    assert all(bar_signals == [] for bar_signals in signals[22:])

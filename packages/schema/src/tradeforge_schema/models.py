@@ -75,7 +75,7 @@ type PriceSource = Literal["open", "high", "low", "close"]
 # A directional setup trades one side; the two-sided version is two of them. The structure
 # family has no side at all — which way it trades follows the structure it reads.
 type SetupSide = Literal["long", "short"]
-type ZoneEntryPoint = Literal["edge", "midpoint", "return_pass"]
+type ZoneEntryPoint = Literal["edge", "midpoint", "return_pass", "botinha"]
 type AverageKind = Literal["EMA", "SMA"]
 
 # The same list, as a runtime value. The database needs it for a CHECK constraint
@@ -531,6 +531,20 @@ class StructureParams(_Node):
     side of the near edge, and it fills only if price then resumes its move and passes back out
     through the region. It carries the widest stop of the three, and its order is cancelled — not
     filled — if price instead reaches the level that stop would occupy.
+
+    `botinha` is his chapter 11.2, and the only one whose order is not arithmetic on the
+    region at all. The zone marks the territory; the entry comes from a *formation* inside it —
+    the reaction's extreme anchors two volume-weighted averages, one on the typical price and
+    one on the lows, and a bar closing in the trade's direction confirms them. The order then
+    rests a tenth of the way up the band from the lower line, with its stop a whole band below,
+    and it has seven bars to fill. Two things follow that no other value does: the level is
+    **re-priced** on every close, because both averages move, and the region is **not** retired
+    by price touching it — entering the region is where the setup begins, so a zone spent by its
+    own first touch could never form one. What retires it instead is the window running out.
+
+    ⚠️ The stop buffer says nothing about `botinha`: its stop comes from the band, not from the
+    region. Its own numbers — the window, the tenth, and which volume the averages use — are not
+    on this document yet and run on the engine's defaults.
 
     ⚠️ **Named values, not a fraction.** A free number would let an entry approach the far edge,
     where risk collapses to the stop buffer alone and position sizing divides by nearly nothing.

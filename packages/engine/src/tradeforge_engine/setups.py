@@ -30,8 +30,8 @@ price too, and the two rules run at once with the tighter one winning (`conducti
 """
 
 import logging
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Sequence
+from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from enum import StrEnum
@@ -61,6 +61,13 @@ from tradeforge_engine.structure import (
     StructureKind,
     TrackedZone,
     ZoneKind,
+)
+from tradeforge_engine.vwap_setups import (
+    DEFAULT_BARS_TO_TRIGGER,
+    DEFAULT_ENTRY_MARGIN,
+    BotinhaTrigger,
+    FormationState,
+    VwapFormation,
 )
 
 logger = logging.getLogger(__name__)
@@ -132,6 +139,7 @@ class ZoneEntryPoint(StrEnum):
     # security lint reads as a credential. It is a *passage* of price through a region, and the
     # string is a DSL value the schema publishes.
     RETURN_PASS = "return_pass"  # noqa: S105
+    BOTINHA = "botinha"
 
 
 ABANDON_AT_ZONE_HEIGHTS = Decimal(1)
@@ -483,6 +491,34 @@ class ZoneActivation(Protocol):
         """
         ...
 
+    def observe(self, block: OrderBlock, *, context: Context) -> None:
+        """Fold this bar into whatever state the activation keeps for this zone.
+
+        A no-op for every activation that is a pure function of the region and the bar in front
+        of it, which is three of the four. It exists because the fourth is not: a formation is
+        state crossing bars, and something has to feed it.
+        """
+        ...
+
+    def spent(self, block: OrderBlock) -> bool:
+        """Has this activation finished with this region for good?
+
+        False for the three that leave a withdrawn region free to be named again — only a *fill*
+        spends those (ADR-0015). True for an activation whose own machinery can end: his rule for
+        the VWAP triggers is that a window running out takes the region with it.
+        """
+        ...
+
+    @property
+    def spent_by_mitigation(self) -> bool:
+        """Does the first touch of the entry edge retire the region for this activation?
+
+        True for the three that wait *on* the region: the touch is the event they were placed
+        for. False where entering the region is not the trade but the *start* of the setup —
+        retiring the zone there would retire it on the very bar the formation begins.
+        """
+        ...
+
 
 def _zone_stop(block: OrderBlock, context: Context, stop_buffer: Decimal) -> Money | None:
     """The stop every activation shares, or `None` for a region that can carry no order.
@@ -556,6 +592,19 @@ class EdgeActivation:
     def expired(self, block: OrderBlock, *, context: Context, zones: Sequence[TrackedZone]) -> bool:
         return _ran_away(block, context.candle, zones)
 
+    def observe(self, block: OrderBlock, *, context: Context) -> None:
+        """Nothing to fold: this activation reads the region and the bar in front of it."""
+
+    def spent(self, block: OrderBlock) -> bool:  # noqa: ARG002 — the question is the protocol's
+        """Never. A withdrawn order leaves its region free to be named again; only a fill spends
+        it, and that is the strategy's book to keep (ADR-0015)."""
+        return False
+
+    @property
+    def spent_by_mitigation(self) -> bool:
+        """Yes: this order waits *on* the region, so the touch is the event it was placed for."""
+        return True
+
 
 @dataclass(frozen=True, slots=True)
 class MidpointActivation:
@@ -578,6 +627,19 @@ class MidpointActivation:
 
     def expired(self, block: OrderBlock, *, context: Context, zones: Sequence[TrackedZone]) -> bool:
         return _ran_away(block, context.candle, zones)
+
+    def observe(self, block: OrderBlock, *, context: Context) -> None:
+        """Nothing to fold: this activation reads the region and the bar in front of it."""
+
+    def spent(self, block: OrderBlock) -> bool:  # noqa: ARG002 — the question is the protocol's
+        """Never. A withdrawn order leaves its region free to be named again; only a fill spends
+        it, and that is the strategy's book to keep (ADR-0015)."""
+        return False
+
+    @property
+    def spent_by_mitigation(self) -> bool:
+        """Yes: this order waits *on* the region, so the touch is the event it was placed for."""
+        return True
 
 
 @dataclass(frozen=True, slots=True)
@@ -649,29 +711,172 @@ class ReturnPassActivation:
             return candle.low <= _beyond_edge(block, tick, buffer, upward=False)
         return candle.high >= _beyond_edge(block, tick, buffer, upward=True)
 
+    def observe(self, block: OrderBlock, *, context: Context) -> None:
+        """Nothing to fold: this activation reads the region and the bar in front of it."""
 
-_ACTIVATIONS: Mapping[
-    ZoneEntryPoint, type[EdgeActivation | MidpointActivation | ReturnPassActivation]
-] = {
-    ZoneEntryPoint.EDGE: EdgeActivation,
-    ZoneEntryPoint.MIDPOINT: MidpointActivation,
-    ZoneEntryPoint.RETURN_PASS: ReturnPassActivation,
-}
+    def spent(self, block: OrderBlock) -> bool:  # noqa: ARG002 — the question is the protocol's
+        """Never. A withdrawn order leaves its region free to be named again; only a fill spends
+        it, and that is the strategy's book to keep (ADR-0015)."""
+        return False
+
+    @property
+    def spent_by_mitigation(self) -> bool:
+        """Yes: this order waits *on* the region, so the touch is the event it was placed for."""
+        return True
+
+
+@dataclass(slots=True)
+class BotinhaActivation:
+    """His chapter 11.2 *Botinha*: the order rides the lower line of an anchored VWAP band.
+
+    The first activation that is not arithmetic on the region's two edges. The zone only says
+    which stretch of price is worth watching; the entry comes from a formation *inside* it — the
+    reaction's extreme anchors two VWAPs, a bar closing in the trade's direction confirms them,
+    and the order then rests a tenth of the band above the lower one for seven bars.
+
+    **Three things it needs that the other three do not**, and each is a member of this protocol
+    for exactly this one implementation:
+
+    * **It is fed.** `observe` folds every bar into the formation. The other three are pure
+      functions of the region and the bar in front of them and do nothing with it.
+    * **It spends the region.** A formation whose window ran out, or whose region was broken by a
+      wick, takes that region with it — his rule, and the reason `spent` exists. The other three
+      leave a region free to be named again after an untouched withdrawal.
+    * **Mitigation does not spend it.** Price entering the region *is* the formation, so a zone
+      retired by its first touch would be retired on the very bar the setup begins.
+
+    ⚠️ **The region's stop buffer says nothing here.** Every other activation puts its stop a
+    fraction of the region's width past the far edge; this one takes it from the band —
+    `entry - d`, where `d` is the gap between the two lines. So the knob is not passed to this
+    class rather than being passed and ignored, which is the difference between a parameter that
+    does nothing and a parameter that is not part of the rule.
+
+    ⚠️ **One formation at a time, matching the one resting order.** The strategy arms one zone at
+    a time and this follows it: naming a new zone starts a new formation and drops the old one.
+    Regions already spent are remembered by `spent`, which is membership-only — never iterated —
+    so it cannot leak set ordering into a result (`AGENTS.md §5.2`).
+    """
+
+    bars_to_trigger: int = DEFAULT_BARS_TO_TRIGGER
+    volume: str = "auto"
+    margin: Decimal = DEFAULT_ENTRY_MARGIN
+
+    _formation: VwapFormation | None = field(default=None, init=False, repr=False)
+    _watching: OrderBlock | None = field(default=None, init=False, repr=False)
+    _seen: datetime | None = field(default=None, init=False, repr=False)
+    _spent: set[OrderBlock] = field(default_factory=set, init=False, repr=False)
+
+    @property
+    def spent_by_mitigation(self) -> bool:
+        return False
+
+    def spent(self, block: OrderBlock) -> bool:
+        return block in self._spent
+
+    def _formation_for(self, block: OrderBlock) -> VwapFormation:
+        """This zone's formation, started if the zone is new to us.
+
+        ⚠️ **It always returns one, and that is what keeps the field out of `Optional`.** Both
+        public methods reach the formation through here, so there is no order in which one of
+        them can find nothing — and therefore no "this cannot happen" branch to write, leave
+        untested, and have a reviewer wonder about. The alternative was a guard no call order
+        could reach, which is a comment wearing an `if`.
+        """
+        if self._watching != block:
+            self._formation = VwapFormation(
+                block, bars_to_trigger=self.bars_to_trigger, volume=self.volume
+            )
+            self._watching = block
+            self._seen = None
+        assert self._formation is not None  # noqa: S101 — assigned above; this is for mypy
+        return self._formation
+
+    def observe(self, block: OrderBlock, *, context: Context) -> None:
+        """Fold this bar into the region's formation, starting one if this zone is new.
+
+        ⚠️ **Idempotent per bar, and it has to be.** The strategy asks this before deciding
+        whether a resting order has expired and again after arming, because a zone named on this
+        very bar has no formation at the first of those points and an order to price at the
+        second. Feeding twice would spend two bars of a seven-bar window on one candle and move
+        both lines with a bar counted double — so the bar's own time is what says it has been
+        seen. Candle times are unique within a run by construction.
+        """
+        formation = self._formation_for(block)
+        candle = context.candle
+        if self._seen == candle.time:
+            return
+        self._seen = candle.time
+        formation.update(candle)
+        if formation.state is FormationState.DEAD:
+            # His rule, and it is the region that dies rather than the break that revealed it: a
+            # formation expiring on a secondary zone leaves the primary free to arm its own.
+            logger.debug("botinha formation on the zone at %s is over; spending it", block.time)
+            self._spent.add(block)
+
+    def entry_for(self, block: OrderBlock, *, context: Context) -> ZoneEntry | None:
+        """Where the order should rest at this bar's close, or `None` if none should.
+
+        ⚠️ **The level moves, and that is what makes this the first activation whose order is
+        re-priced.** Both lines are cumulative, so every close shifts them and with them the
+        entry and the stop. The strategy compares this answer with what is resting and replaces
+        the order when the two differ — which is the mechanism the protocol already settled on
+        for a resting order's price: *"not a resting order's planned stop; that one is cancelled
+        and re-placed"* (ADR-0018). The three older activations return a constant here, so the
+        comparison never fires for them and nothing about them changes.
+        """
+        order = BotinhaTrigger(margin=self.margin).order_for(
+            self._formation_for(block), tick=context.instrument.tick_size
+        )
+        if order is None:
+            return None
+        return ZoneEntry(side=order.side, limit_price=order.limit_price, stop_loss=order.stop_loss)
+
+    def expired(
+        self,
+        block: OrderBlock,
+        *,
+        context: Context,  # noqa: ARG002 — the formation already folded this bar in
+        zones: Sequence[TrackedZone],  # noqa: ARG002
+    ) -> bool:
+        """The formation ending is what takes the order back, and there is no second rule.
+
+        `_ran_away` cannot serve: it fires when price leaves a region it visited, and this order
+        lives *because* price is inside the region working on a reaction. The window running out
+        and the far edge breaking are both the formation's own deaths, already counted by
+        `observe`, so this asks `spent` rather than reading the same set a second time. "Has
+        this activation finished with the region" and "should its order go" are one question
+        here, and writing the membership test twice would let one of the two be changed without
+        the other, with the suite still green — each is reachable through a different door.
+        """
+        return self.spent(block)
 
 
 def activation_for(entry_point: ZoneEntryPoint, *, stop_buffer: Decimal) -> ZoneActivation:
     """The activation a `ZoneEntryPoint` names.
 
+    ⚠️ **A chain rather than a mapping, because the constructors stopped agreeing.** The three
+    region-arithmetic activations take the zone's stop buffer; the botinha takes none of it — its
+    stop comes from the band rather than from the region, so handing it that number would be a
+    parameter that does nothing. A table keyed to one shared signature would have to pretend
+    otherwise.
+
     Loud rather than defaulting, the same doctrine as `build_indicator` and the cost-model
     builder: a value this engine does not know raises instead of quietly running the edge entry.
-    An enum makes that unreachable today — which is the argument for keeping the raise, not for
-    dropping it, because the mapping and the enum are two lists that a new member has to be added
-    to and only one of them is checked by the type system.
+    The enum makes that unreachable today — which is the argument for keeping the raise, not for
+    dropping it, because this chain and the enum are two lists a new member has to be added to
+    and only one of them is checked by the type system.
     """
-    try:
-        return _ACTIVATIONS[entry_point](stop_buffer=stop_buffer)
-    except KeyError:  # pragma: no cover - unreachable while the enum and the map agree
-        raise EngineError(f"no activation for entry point {entry_point!r}") from None
+    if entry_point is ZoneEntryPoint.EDGE:
+        return EdgeActivation(stop_buffer=stop_buffer)
+    if entry_point is ZoneEntryPoint.MIDPOINT:
+        return MidpointActivation(stop_buffer=stop_buffer)
+    if entry_point is ZoneEntryPoint.RETURN_PASS:
+        return ReturnPassActivation(stop_buffer=stop_buffer)
+    if entry_point is ZoneEntryPoint.BOTINHA:
+        return BotinhaActivation()
+    raise EngineError(  # pragma: no cover - unreachable while the enum and the chain agree
+        f"no activation for entry point {entry_point!r}"
+    )
 
 
 def _mitigated(block: OrderBlock, zones: Sequence[TrackedZone]) -> bool:
@@ -754,6 +959,27 @@ class _Armed:
     block: OrderBlock
     client_id: str
     placed: bool
+    entry: ZoneEntry | None = None
+    """The order currently resting, so a level that moved can be told from one that did not.
+
+    `None` until something is placed. Three of the four activations return the same level on
+    every bar, so this never changes for them and no order is ever re-priced; the botinha's
+    moves with its two lines, and comparing against it is the whole of the chase."""
+
+    stem: str = ""
+    """The name this zone was first armed under, kept so a re-price derives from it.
+
+    ⚠️ Appending to `client_id` instead would compound: seven bars of chasing turn one name into
+    `...-r1-r2-r3-r4-r5-r6`, which is unreadable in an audit row and grows without bound. The
+    revision is a number, so the name is the stem plus that number and nothing else."""
+
+    revision: int = 0
+    """How many times this zone's order has been re-priced.
+
+    ⚠️ **It exists because a name cannot be reused.** The broker refuses a `client_id` that is
+    already resting or has already filled, so a replacement needs its own — and the suffix only
+    appears from the first re-price, so every order that is placed once keeps exactly the id it
+    had before any of this existed."""
     confirmed_by: StructureBreak | None = None
     """The break that revealed this zone, kept for the entry's picture.
 
@@ -951,6 +1177,13 @@ class StructureStrategy:
         # abandonment. What kills it is price going the other way to the level its own stop would
         # have sat at: reach 89 on a [90, 100] demand and the order is taken back rather than
         # filled, so the setup never opens a trade that is already stopped.
+        # ⚠️ **Fed before it is questioned.** An activation that keeps state has to see this bar
+        # before anything asks whether its order still makes sense, because for the botinha the
+        # answer *is* the state: the window it counts and the region-break it watches are both
+        # folded in here. It is idempotent per bar, so the second call after arming is free.
+        if self._armed is not None:
+            self._activation.observe(self._armed.block, context=context)
+
         if self._armed is not None and (
             not self._tracked(self._armed.block)
             or self._activation.expired(
@@ -975,15 +1208,28 @@ class StructureStrategy:
             if self._armed is not None:
                 signals.extend(self._release(self._armed, candle))
             self._armed_count += 1
+            stem = f"{chosen.kind.value}-{chosen.time:%Y%m%dT%H%M}-{self._armed_count}"
             self._armed = _Armed(
                 block=chosen,
-                client_id=f"{chosen.kind.value}-{chosen.time:%Y%m%dT%H%M}-{self._armed_count}",
+                client_id=stem,
+                stem=stem,
                 placed=False,
                 confirmed_by=break_,
             )
 
-        if self._armed is not None and not self._armed.placed:
+        if self._armed is not None:
+            # Fed again, for the zone that may have been armed a few lines above: on its first
+            # bar it has had no `observe` yet, and a formation with no bars in it prices nothing.
+            self._activation.observe(self._armed.block, context=context)
             entry = self._activation.entry_for(self._armed.block, context=context)
+            # ⚠️ **A level that has not moved is not a new order.** Three activations answer the
+            # same thing on every bar, so this compares equal and nothing is sent — which is why
+            # asking them every bar instead of once changes nothing they do. The botinha answers
+            # differently as its band shifts, and the difference is the chase: the order resting
+            # at the old level is withdrawn and a new one placed at the new one, which is the
+            # mechanism the protocol already chose for a resting order's price (ADR-0018).
+            if entry is not None and entry == self._armed.entry:
+                entry = None
             # ⚠️ **The bar that did the whole move by itself.** A `RETURN_PASS` trigger is a wick
             # into the region, and the same bar can wick in and close back out past the level the
             # order would have waited at — 95 touched and 103 closed, on a [90, 100] demand. The
@@ -1005,7 +1251,16 @@ class StructureStrategy:
                 self._armed = None
                 entry = None
             if entry is not None and self._armed is not None:
+                if self._armed.placed:
+                    # The old order goes back before the new one goes on, and the replacement
+                    # carries its own name: the broker refuses a `client_id` that is already
+                    # resting, so re-using it would have the venue reject the very order the
+                    # re-price exists to send.
+                    signals.append(self._withdraw(self._armed, candle))
+                    self._armed.revision += 1
+                    self._armed.client_id = f"{self._armed.stem}-r{self._armed.revision}"
                 self._armed.placed = True
+                self._armed.entry = entry
                 signals.append(
                     Signal(
                         kind=SignalKind.ENTRY,
@@ -1216,7 +1471,9 @@ class StructureStrategy:
                 return None, block
         return None, None
 
-    def _may_arm(self, block: OrderBlock) -> bool:
+    def _may_arm(  # noqa: PLR0911 — one flat refusal per rule is the point of the chokepoint
+        self, block: OrderBlock
+    ) -> bool:
         """May an order be put on this zone at all?
 
         The single chokepoint, and it is deliberately not spread across the call sites that feed
@@ -1239,6 +1496,10 @@ class StructureStrategy:
           and it belongs here rather than beside the refusal that increments it, for the reason
           the rest of this list exists: every rule about whether a region may be traded is
           enforced at one chokepoint.
+        * **A zone the activation has finished with.** Only the VWAP triggers ever say yes:
+          his rule is that a formation whose window ran out takes its region with it, which is a
+          second way for a zone to die beside the fill below.
+
         * **A zone that has already given its trade.** Only a *fill* puts a zone in `_traded` —
           an order withdrawn untouched leaves its region free to be named again. Under his
           mitigation rule this check is currently unreachable, because the fill and the touch that
@@ -1254,7 +1515,31 @@ class StructureStrategy:
             return False
         if self._refused.get(block, 0) >= MAX_ARMING_ATTEMPTS:
             return False
-        return self._still_standing(block)
+        # ⚠️ **Subsumed today, and kept because of how it would fail.** A spent region is also a
+        # region whose formation is dead, and a dead formation prices nothing — so deleting this
+        # line leaves the suite green: the zone is re-armed on every bar the qualifier offers it
+        # and quietly places no order. The cost is invisible rather than absent. Each silent
+        # re-arm mints a fresh `client_id` and advances the counter every later order is named
+        # from, which is the audit noise `MAX_ARMING_ATTEMPTS` exists to stop.
+        #
+        # And the masking is an accident of one line elsewhere: `_formation_for` reuses the dead
+        # formation because the block has not changed. Anyone who later makes it start a fresh
+        # one on a re-arm — a reasonable thing to want — hands the region a second seven-bar
+        # window, and his rule that the window spends the region is gone with no test to say so.
+        # The rule belongs at this chokepoint; the silence is a coincidence.
+
+        if self._activation.spent(block):
+            return False
+        # ⚠️ **Whether the touch retires the region is the activation's answer, not this
+        # method's.** For the three that wait *on* the region it is: the wick that mitigates a
+        # zone is the event their order was placed for. For a formation it is the opposite —
+        # price entering the region is where the setup *begins* — so retiring the zone there
+        # would retire it on the very bar the reaction starts, and neither VWAP trigger could
+        # exist at all. What still holds for both is being dropped by the detector: a region
+        # nothing is watching any more takes whatever was waiting on it.
+        if self._activation.spent_by_mitigation:
+            return self._still_standing(block)
+        return self._tracked(block)
 
     # ----------------------------------------------------------------------- #
     # Order lifetime                                                           #

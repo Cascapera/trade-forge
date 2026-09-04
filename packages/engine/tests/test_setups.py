@@ -345,6 +345,46 @@ def test_the_authors_geometry_a_demand_zone_is_bought_at_its_top() -> None:
     assert signal.client_id is not None  # it has to be nameable to be withdrawable
 
 
+def test_the_stop_buffer_moves_the_stop_on_a_limit_entry_too() -> None:
+    """The knob, exercised where it was only ever assumed: the near-edge entry.
+
+    Region [90, 100], so the default tenth puts the stop at 89 and a half puts it at 85. The
+    order itself does not move — the buffer is a rule about the stop's clearance, not about where
+    the entry waits.
+
+    ⚠️ **It went unasserted for a reason worth remembering.** Every `EDGE` and `MIDPOINT` scenario
+    in this file runs on the default buffer; only the return-pass ones vary it. While all three
+    entry points read one `self._stop_buffer` inside one method, that was enough — a mutant
+    ignoring the knob broke the return-pass scenarios and died. Giving each activation its own
+    copy of the number is what made the buy-side knob independently observable, and the mutation
+    run is what noticed that nothing observed it.
+    """
+    strategy = StructureStrategy(qualifier=_Marked(), stop_buffer=Decimal("0.5"))
+    signals = _drive_from_bullish(strategy, _IMPULSE)
+
+    [signal] = signals[9]
+    assert signal.limit_price == Decimal("100")  # unchanged: the buffer is not about the entry
+    assert signal.stop_loss == Decimal("85")  # 90 - 0.5 * 10, against the default's 89
+
+
+def test_the_stop_buffer_moves_the_midpoint_entry_stop_as_well() -> None:
+    """The twin of the test above, and it exists because the first one alone was not enough.
+
+    `EDGE` and `MIDPOINT` read the same number through two objects now, so a knob honoured by
+    one and ignored by the other is two lines apart and invisible: the mutation run killed the
+    edge mutant on the test above and the midpoint one survived it. The entry moves to 95 and
+    the stop to 85 — the buffer widens the stop without touching where the order waits, on both.
+    """
+    strategy = StructureStrategy(
+        qualifier=_Marked(), entry_point=ZoneEntryPoint.MIDPOINT, stop_buffer=Decimal("0.5")
+    )
+    signals = _drive_from_bullish(strategy, _IMPULSE)
+
+    [signal] = signals[9]
+    assert signal.limit_price == Decimal("95")
+    assert signal.stop_loss == Decimal("85")
+
+
 def test_the_entry_records_the_region_it_is_waiting_at() -> None:
     """This setup enters *at the edge of a zone*, not at a price the decision bar names.
 
@@ -999,6 +1039,30 @@ def test_a_zone_with_no_width_arms_nothing() -> None:
     # A marking candle with no range: high == low, so top == bottom.
     candles[3] = bar(3, open_="100", close="100", high="100", low="100")
     signals = _drive_from_bullish(StructureStrategy(qualifier=_Marked()), candles)
+
+    assert all(bar_signals == [] for bar_signals in signals)
+
+
+def test_a_return_pass_zone_with_no_width_arms_nothing_either() -> None:
+    """The degenerate region, on the entry point that never had its own test for it.
+
+    Both edges at one price: the stop lands on the entry and the trade carries no risk at all,
+    which is a division by zero in sizing rather than a free trade. `EDGE` has refused that since
+    the guard was written, and `MIDPOINT` and `RETURN_PASS` were assumed to — but the assumption
+    was never asserted.
+
+    ⚠️ **It went untested because coverage could not see it.** All three entry points shared one
+    `if` inside one method, so the single `EDGE` scenario above lit that line for all of them and
+    the file read 99%. Splitting the three into their own activations is what separated the paths
+    and made the hole visible: same code, same behaviour, one fewer place to be wrong without
+    anyone noticing.
+    """
+    candles = [*_IMPULSE]
+    # A marking candle with no range: high == low, so top == bottom.
+    candles[3] = bar(3, open_="100", close="100", high="100", low="100")
+    signals = _drive_from_bullish(
+        StructureStrategy(qualifier=_Marked(), entry_point=ZoneEntryPoint.RETURN_PASS), candles
+    )
 
     assert all(bar_signals == [] for bar_signals in signals)
 

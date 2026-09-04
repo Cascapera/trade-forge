@@ -30,7 +30,7 @@ price too, and the two rules run at once with the tighter one winning (`conducti
 """
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
@@ -52,6 +52,7 @@ from tradeforge_engine.domain import (
     ZoneMark,
     to_tick,
 )
+from tradeforge_engine.errors import EngineError
 from tradeforge_engine.structure import (
     MarketStructure,
     OrderBlock,
@@ -439,6 +440,313 @@ class ZoneEntry:
             raise ValueError("a zone entry waits at a limit or a stop, not both and not neither")
 
 
+class ZoneActivation(Protocol):
+    """How a marked region turns into a resting order, and what takes that order back.
+
+    The setups already share one seam — a `SetupQualifier` answering *which zone is worth
+    trading*. This is the second, and it answers *how that zone becomes an order*. It was three
+    `if` statements on a `ZoneEntryPoint` for as long as every answer was arithmetic on the
+    region's two edges; chapter 11.2 needs one that is a different **shape** rather than a
+    different formula — state that crosses bars, and a level that moves while the order rests —
+    and a fourth branch on an enum is how a class ends up with four methods that disagree.
+
+    **Two questions, and they are asked at different moments.** `entry_for` is asked while the
+    zone holds no order; `expired` is asked on every bar the zone is armed, *placed or not*,
+    because a region can die while the book is still empty. Keeping them on one object is what
+    stops the pair from drifting: `RETURN_PASS` computes its cancel level with the very call
+    `entry_for` uses for the stop, and written on two objects those would agree on every zone
+    whose buffer lands on the grid and part company on the first one that does not.
+
+    ⚠️ **`stop_buffer` belongs to the activation, not to the strategy.** It is a number about
+    *where the order and its stop go*, which is exactly this seam's subject; leaving it on the
+    strategy would mean the one knob every implementation reads is owned by the object that no
+    longer knows what any of them do with it.
+    """
+
+    def entry_for(self, block: OrderBlock, *, context: Context) -> ZoneEntry | None:
+        """The order this zone should rest on this bar, or `None` if it should rest none.
+
+        `None` is not always a refusal. For the two limit entries it means the region cannot
+        carry an order at all — no width, or a stop through zero — and will not on any later bar.
+        For a triggered entry it is the ordinary state: the region is armed, the book is empty,
+        and the same question is asked again next bar.
+        """
+        ...
+
+    def expired(self, block: OrderBlock, *, context: Context, zones: Sequence[TrackedZone]) -> bool:
+        """Has this zone's order stopped making sense on this bar?
+
+        Asked on every bar the zone is armed, whether or not an order ever reached the book —
+        which is why it takes the tracked zones rather than reading a mitigation flag off
+        anything: the answer for a limit waiting inside the region depends on whether price has
+        *been* there, and that fact lives on the detector.
+        """
+        ...
+
+
+def _zone_stop(block: OrderBlock, context: Context, stop_buffer: Decimal) -> Money | None:
+    """The stop every activation shares, or `None` for a region that can carry no order.
+
+    Past the edge the trade is *not* travelling towards: below a demand region, above a supply
+    one. `_beyond_edge` owns the rounding — away from the zone, so the stop never ends up nearer
+    it than the buffer says.
+
+    Two regions answer `None`, and neither will ever answer differently on a later bar:
+
+    * **No width.** The two edges are one price, so the stop would land on the entry and the
+      trade would carry no risk at all — which is not a free trade, it is a division by zero in
+      position sizing.
+    * **A stop at or below zero.** A zone more than ten times as tall as its own floor pushes the
+      buffer past nothing, and a stop at a non-positive price is not a wide stop — it is *no
+      stop*, because `low <= stop` can never be true. Nothing downstream catches it: neither
+      `Signal` nor the broker's protective arming asks whether a stop is reachable. Unreachable
+      on a currency pair, reachable on a crypto flash crash.
+    """
+    size = block.top - block.bottom
+    if size <= ZERO:
+        logger.debug("zone at %s has no width; nothing to arm", block.time)
+        return None
+    demand = block.kind is ZoneKind.DEMAND
+    stop = _beyond_edge(block, context.instrument.tick_size, size * stop_buffer, upward=not demand)
+    if stop <= ZERO:
+        logger.debug("zone at %s would need a stop at %s; nothing to arm", block.time, stop)
+        return None
+    return stop
+
+
+def _side_of(block: OrderBlock) -> Side:
+    return Side.LONG if block.kind is ZoneKind.DEMAND else Side.SHORT
+
+
+def _limit_entry(
+    block: OrderBlock, context: Context, stop_buffer: Decimal, *, at: Money
+) -> ZoneEntry | None:
+    """A limit resting at `at`, with the shared stop — or `None` for a region that can carry no
+    order at all.
+
+    ⚠️ **One function because two activations must refuse the same regions.** `EDGE` and
+    `MIDPOINT` differ in exactly one expression, the level; everything else about them — the
+    side, the stop, and which zones are impossible — is the same rule. Written twice, the two
+    copies of "give up on a zone with no width" are two places to keep in step, and the suite
+    would still be green with one of them deleted. That is not hypothetical: extracting this
+    seam produced exactly that duplication first, and the coverage report is what caught it.
+    """
+    stop = _zone_stop(block, context, stop_buffer)
+    if stop is None:
+        return None
+    return ZoneEntry(side=_side_of(block), limit_price=at, stop_loss=stop)
+
+
+@dataclass(frozen=True, slots=True)
+class EdgeActivation:
+    """His model 1: the order on the near edge, the stop past the far one.
+
+    The near edge is the side price has to come back to, so it is where the order rests — a
+    demand zone is bought at its **top**, a supply zone sold at its **bottom**. He notes the cost
+    in as many words: *"o tamanho do stop acaba sendo maior, equivalente ao tamanho total da
+    região"*.
+    """
+
+    stop_buffer: Decimal = DEFAULT_STOP_BUFFER
+
+    def entry_for(self, block: OrderBlock, *, context: Context) -> ZoneEntry | None:
+        near = block.top if block.kind is ZoneKind.DEMAND else block.bottom
+        return _limit_entry(block, context, self.stop_buffer, at=near)
+
+    def expired(self, block: OrderBlock, *, context: Context, zones: Sequence[TrackedZone]) -> bool:
+        return _ran_away(block, context.candle, zones)
+
+
+@dataclass(frozen=True, slots=True)
+class MidpointActivation:
+    """His model 3, *"que considero o mais vantajoso"*: the order at 50%, the stop unchanged.
+
+    Roughly half the stop, so the same risk buys more size. Its cost is his too — *"muitas vezes
+    o preço não chega aos 50% e acaba indo em direção ao nosso alvo sem nos ativar, deixando-nos
+    na pedra"*.
+
+    The level is rounded so the tick never hands the trade a price better than the region
+    actually offers: a buy up, a sell down. Same doctrine as the stop, which is rounded away from
+    the region for the same reason — rounding is not allowed to flatter anything.
+    """
+
+    stop_buffer: Decimal = DEFAULT_STOP_BUFFER
+
+    def entry_for(self, block: OrderBlock, *, context: Context) -> ZoneEntry | None:
+        half = _midpoint(block, context.instrument.tick_size, _side_of(block))
+        return _limit_entry(block, context, self.stop_buffer, at=half)
+
+    def expired(self, block: OrderBlock, *, context: Context, zones: Sequence[TrackedZone]) -> bool:
+        return _ran_away(block, context.candle, zones)
+
+
+@dataclass(frozen=True, slots=True)
+class ReturnPassActivation:
+    """His chapter 11.5, *"passagem na volta"* — the only one that waits **outside** the region.
+
+    Nothing is placed when the zone is armed. What arms the *order* is price coming back and
+    reaching the 50% — his words, *"atinge o 50% onde o gatilho anterior ativaria o trade"* —
+    and the order is then a **stop**, not a limit (ADR-0016), on the near edge plus the same
+    buffer the stop already uses. It fills only if price resumes the move that made the region.
+
+    **Its stop and its cancel are the same level**, which is why both come from one
+    `_beyond_edge` call rather than two expressions for the same number: reach 89 on a [90, 100]
+    demand and the order is taken back rather than filled, so the setup never opens a trade that
+    would already be stopped.
+    """
+
+    stop_buffer: Decimal = DEFAULT_STOP_BUFFER
+
+    def entry_for(self, block: OrderBlock, *, context: Context) -> ZoneEntry | None:
+        stop = _zone_stop(block, context, self.stop_buffer)
+        if stop is None:
+            return None
+        tick = context.instrument.tick_size
+        if not _reached_midpoint(block, context.candle, tick):
+            return None
+        side = _side_of(block)
+        buffer = (block.top - block.bottom) * self.stop_buffer
+        # ⚠️ **The non-positive check is on the *trigger* here, not only on the stop.** For the
+        # two limit entries only a demand zone could push a level through zero, because only its
+        # stop sits below the region; a supply zone's stop is above it and safe by construction.
+        # This entry point inverts that — a supply zone's *order* is the level below the region —
+        # so the far edge of a very tall zone near zero can produce a sell stop at or below
+        # nothing, which `Signal` refuses outright.
+        trigger = _beyond_edge(block, tick, buffer, upward=side is Side.LONG)
+        if trigger <= ZERO:
+            logger.debug("zone at %s would trigger at %s; nothing to arm", block.time, trigger)
+            return None
+        return ZoneEntry(side=side, stop_price=trigger, stop_loss=stop)
+
+    def expired(
+        self,
+        block: OrderBlock,
+        *,
+        context: Context,
+        zones: Sequence[TrackedZone],  # noqa: ARG002
+    ) -> bool:
+        """Price reaching the level this order's own stop would occupy.
+
+        ⚠️ `_ran_away` cannot serve here, and that is why this method exists at all: it fires
+        when price *leaves* the region upward, and leaving upward is this order's fill.
+
+        No `size <= ZERO` guard, unlike `entry_for`, and the asymmetry is the point: a zone with
+        no width can never place an order, so the only question left about it is when to stop
+        holding the name. Giving it up on the first bar that reaches its collapsed edge is the
+        better of the two answers, and it costs nothing — `_release` sends no cancel for an order
+        that never reached the book.
+
+        ⚠️ **Asked on every bar an order is armed, placed or not.** The region can break downward
+        while the book is still empty, waiting for a 50% touch that a collapsing market delivers
+        on the way to somewhere far below. Answering only for placed orders would leave the name
+        armed on a region that is gone, and the next bar that clipped the midpoint would place an
+        order into the wreck.
+        """
+        tick = context.instrument.tick_size
+        buffer = (block.top - block.bottom) * self.stop_buffer
+        candle = context.candle
+        if block.kind is ZoneKind.DEMAND:
+            return candle.low <= _beyond_edge(block, tick, buffer, upward=False)
+        return candle.high >= _beyond_edge(block, tick, buffer, upward=True)
+
+
+_ACTIVATIONS: Mapping[
+    ZoneEntryPoint, type[EdgeActivation | MidpointActivation | ReturnPassActivation]
+] = {
+    ZoneEntryPoint.EDGE: EdgeActivation,
+    ZoneEntryPoint.MIDPOINT: MidpointActivation,
+    ZoneEntryPoint.RETURN_PASS: ReturnPassActivation,
+}
+
+
+def activation_for(entry_point: ZoneEntryPoint, *, stop_buffer: Decimal) -> ZoneActivation:
+    """The activation a `ZoneEntryPoint` names.
+
+    Loud rather than defaulting, the same doctrine as `build_indicator` and the cost-model
+    builder: a value this engine does not know raises instead of quietly running the edge entry.
+    An enum makes that unreachable today — which is the argument for keeping the raise, not for
+    dropping it, because the mapping and the enum are two lists that a new member has to be added
+    to and only one of them is checked by the type system.
+    """
+    try:
+        return _ACTIVATIONS[entry_point](stop_buffer=stop_buffer)
+    except KeyError:  # pragma: no cover - unreachable while the enum and the map agree
+        raise EngineError(f"no activation for entry point {entry_point!r}") from None
+
+
+def _mitigated(block: OrderBlock, zones: Sequence[TrackedZone]) -> bool:
+    """Has price already come back and taken this region's near edge?
+
+    The detector's own mark, read rather than recomputed — his indicator owns that rule
+    (`low <= top` for demand, `high >= bottom` for supply) and a second copy of it here would be
+    one to keep in step.
+
+    ⚠️ **False for a region the tracker has dropped**, which is deliberate but never load
+    bearing: the strategy asks `_tracked` first at the one call site, and a dropped region takes
+    its order with it regardless of what this would have said.
+    """
+    return any(tracked.block == block and tracked.mitigated for tracked in zones)
+
+
+def _ran_away(block: OrderBlock, candle: Candle, zones: Sequence[TrackedZone]) -> bool:
+    """Has price cleared the region by a full height, abandoning the order?
+
+    The author's rule (`ABANDON_AT_ZONE_HEIGHTS`), in his own example: a demand region [90, 100]
+    with the order at 95, price returns and touches 100, stops at 98 without ever trading 95, and
+    turns back up. The order is abandoned when price reaches 110 — one height above the near
+    edge. The supply mirror abandons at 80.
+
+    ⚠️ **Two conditions, and the first is the one that is easy to lose.** Price must have
+    *entered* the region, and then cleared it by a height. An order waiting on a region price has
+    never come back to is not abandoned however far the market travels — it is still waiting for
+    exactly the event it was placed for.
+
+    ⚠️ **Read off the bar's extreme, not its close.** The order is a level in the book and the
+    market reaching a level is a wick, not a settlement — the same reading his mitigation rule
+    uses. A close-based test would keep an order alive through a bar that traded a full height
+    clear of it and came back.
+
+    ⚠️ **The withdrawal it triggers takes effect on the next bar, and that is correct rather than
+    late.** `loop.py` fills before the strategy runs, so an order the market reached on this same
+    bar is already a trade by the time this is asked — and it should be: the abandonment rule is
+    about price *never coming to us*, so a bar that traded through the limit filled it, exactly
+    as a resting order at a broker would have.
+    """
+    # ⚠️ Nothing is abandoned before the region has been visited, and this guard is the whole rule
+    # rather than an optimisation. See `ABANDON_AT_ZONE_HEIGHTS`: counting from the arming bar
+    # abandons every order while price is still walking away from the impulse that marked the
+    # zone.
+    if not _mitigated(block, zones):
+        return False
+    height = block.top - block.bottom
+    clearance = height * ABANDON_AT_ZONE_HEIGHTS
+    if block.kind is ZoneKind.DEMAND:
+        return candle.high >= block.top + clearance
+    return candle.low <= block.bottom - clearance
+
+
+def _reached_midpoint(block: OrderBlock, candle: Candle, tick: Money) -> bool:
+    """Has price come back into the region as far as its 50% on this bar?
+
+    The trigger for `RETURN_PASS`, and it is deliberately **the same level `MIDPOINT` rests at**
+    rather than a second opinion about where half of a region is — his own sentence joins them:
+    *"atinge o 50% onde o gatilho anterior ativaria o trade"*. Sharing `_midpoint` is what keeps
+    that true: two expressions computing half a region would agree on [90, 100] and diverge on
+    the first zone whose midpoint falls between ticks, and the backtest would report a
+    `RETURN_PASS` that armed a bar earlier than the `MIDPOINT` it was defined against, with
+    nothing to say why.
+
+    ⚠️ **Read off the bar's extreme, not its close** — the same reading `_ran_away` and his
+    mitigation rule use. A touch of the 50% is price *trading* there; a bar that dipped to the
+    midpoint and closed back at the edge reached it, and a close-based test would ignore the wick
+    that is the entire event this setup waits for.
+    """
+    level = _midpoint(block, tick, Side.LONG if block.kind is ZoneKind.DEMAND else Side.SHORT)
+    if block.kind is ZoneKind.DEMAND:
+        return candle.low <= level
+    return candle.high >= level
+
+
 @dataclass(slots=True)
 class _Armed:
     """The one zone currently holding an order, and whether that order reached the book."""
@@ -531,6 +839,10 @@ class StructureStrategy:
         self._name = name
         self._allow_secondary = allow_secondary
         self._stop_buffer = stop_buffer
+        # The second seam: *how* a named zone becomes an order. Built from the entry point
+        # rather than branched on later, so a new way of entering is a new implementation
+        # instead of a fourth `if` in two methods that would then have to agree.
+        self._activation = activation_for(entry_point, stop_buffer=stop_buffer)
         # Where the order rests inside the region. `EDGE` is the default so that adding this
         # parameter changes no recorded result — see `ZoneEntryPoint`.
         self._entry_point = entry_point
@@ -640,7 +952,10 @@ class StructureStrategy:
         # have sat at: reach 89 on a [90, 100] demand and the order is taken back rather than
         # filled, so the setup never opens a trade that is already stopped.
         if self._armed is not None and (
-            not self._tracked(self._armed.block) or self._expired(self._armed.block, context)
+            not self._tracked(self._armed.block)
+            or self._activation.expired(
+                self._armed.block, context=context, zones=self._blocks.zones
+            )
         ):
             signals.extend(self._release(self._armed, candle))
             self._armed = None
@@ -668,7 +983,7 @@ class StructureStrategy:
             )
 
         if self._armed is not None and not self._armed.placed:
-            entry = self._entry_for(self._armed.block, context)
+            entry = self._activation.entry_for(self._armed.block, context=context)
             # ⚠️ **The bar that did the whole move by itself.** A `RETURN_PASS` trigger is a wick
             # into the region, and the same bar can wick in and close back out past the level the
             # order would have waited at — 95 touched and 103 closed, on a [90, 100] demand. The
@@ -942,134 +1257,6 @@ class StructureStrategy:
         return self._still_standing(block)
 
     # ----------------------------------------------------------------------- #
-    # Zone geometry                                                            #
-    # ----------------------------------------------------------------------- #
-
-    def _entry_for(self, block: OrderBlock, context: Context) -> ZoneEntry | None:
-        """The order this zone would place on this bar, or `None` if it cannot place one yet.
-
-        The near edge is the side price has to come back to, so it is where the order rests: a
-        demand zone is bought at its **top**, a supply zone sold at its **bottom**. The stop sits
-        past the far edge by a fraction of the zone's own width — the region is where price is
-        expected to turn, and a stop level *on* the edge is taken out by the turn itself.
-
-        ⚠️⚠️ **"Price is always clear of the region here" was an invariant of this method, and
-        `RETURN_PASS` ends it.** It is worth stating what it was, because the argument was sound
-        and it is the entry point that changed, not a mistake being corrected. Under `EDGE` and
-        `MIDPOINT` the order is a *limit*, so price inside the region would put a buy limit above
-        the market — the sign error `Signal` refuses (ADR-0014). That state could not arrive:
-        placing happened on the arming bar, and `_may_arm` refuses a region price has already
-        touched. Instrumented over 3480 real AAPL H1 candles the waiting branch was reached zero
-        times, which is why it was deleted rather than kept.
-
-        **`RETURN_PASS` reaches this method with price inside the region on purpose, and the
-        deleted branch is not what comes back.** That one waited for price to leave so a *limit*
-        could be placed below it. This one is a **stop** above the market, which is the side a
-        buy stop belongs on, so the very geometry that was illegal for a limit is the required
-        one here. The two `None` returns are no longer "functions of the block and the tick size
-        alone" either — see `_reached_midpoint`, which reads the bar.
-
-        Three bars where nothing is placed, all returning `None` rather than raising:
-
-        * **The zone has no width.** Its two edges are one price, so the stop would land on the
-          entry and the trade would carry no risk at all — which is not a free trade, it is a
-          division by zero in position sizing.
-        * **The stop would land at or below zero.** A zone more than ten times as tall as its own
-          floor pushes the buffer past nothing, and a stop at a non-positive price is not a wide
-          stop — it is *no stop*, because `low <= stop` can never be true. Nothing downstream
-          catches it: neither `Signal` nor the broker's protective arming asks whether a stop is
-          reachable. Unreachable on a currency pair, reachable on a crypto flash crash.
-        * **`RETURN_PASS`, and price has not reached the 50% yet.** The one `None` that is an
-          ordinary state rather than a refusal: the region is armed, the book is empty, and this
-          is asked again on every bar until price comes back for it. Unlike the two above it is
-          a function of the *bar*, so a zone that answers `None` today can answer an order
-          tomorrow — which is the whole mechanism.
-        """
-        size = block.top - block.bottom
-        if size <= ZERO:
-            logger.debug("zone at %s has no width; nothing to arm", block.time)
-            return None
-
-        tick = context.instrument.tick_size
-        buffer = size * self._stop_buffer
-
-        demand = block.kind is ZoneKind.DEMAND
-        side = Side.LONG if demand else Side.SHORT
-        # Past the edge the trade is *not* travelling towards: below a demand region, above a
-        # supply one. `_beyond_edge` owns the rounding — away from the zone, so the stop never
-        # ends up nearer it than the buffer says — and `_expired` asks that same function for
-        # this very level when it decides a `RETURN_PASS` order has been taken back.
-        stop = _beyond_edge(block, tick, buffer, upward=not demand)
-        if stop <= ZERO:
-            logger.debug("zone at %s would need a stop at %s; nothing to arm", block.time, stop)
-            return None
-
-        if self._entry_point is ZoneEntryPoint.RETURN_PASS:
-            return self._breakout_entry(block, context, side=side, stop_loss=stop, buffer=buffer)
-
-        # A buy rounded *up* to the grid and a sell *down*, so the tick never hands the trade a
-        # price better than the region actually offers. Same doctrine as the stop above: rounding
-        # is not allowed to flatter the entry.
-        if self._entry_point is ZoneEntryPoint.EDGE:
-            limit = block.top if demand else block.bottom
-        else:
-            limit = _midpoint(block, tick, side)
-        return ZoneEntry(side=side, limit_price=limit, stop_loss=stop)
-
-    def _breakout_entry(
-        self,
-        block: OrderBlock,
-        context: Context,
-        *,
-        side: Side,
-        stop_loss: Money,
-        buffer: Money,
-    ) -> ZoneEntry | None:
-        """The `RETURN_PASS` order, once price has come back for the 50% — otherwise `None`.
-
-        The trigger is the near edge plus the same buffer that sets the stop, so a demand
-        [90, 100] is bought at 101 and its supply mirror sold at 99, and it is rounded in the
-        direction that never hands the trade a level easier to break than the region says.
-
-        ⚠️ **The non-positive check is on the *trigger* here, not only on the stop.** For the two
-        limit entries only a demand zone could push a level through zero, because only its stop
-        sits below the region; a supply zone's stop is above it and safe by construction. This
-        entry point inverts that — a supply zone's *order* is the level below the region — so the
-        far edge of a very tall zone near zero can produce a sell stop at or below nothing, which
-        `Signal` refuses outright. Caught here so a pathological region is skipped, the same way
-        `_entry_for` skips one whose stop cannot exist.
-        """
-        tick = context.instrument.tick_size
-        if not self._reached_midpoint(block, context.candle, tick):
-            return None
-        trigger = _beyond_edge(block, tick, buffer, upward=side is Side.LONG)
-        if trigger <= ZERO:
-            logger.debug("zone at %s would trigger at %s; nothing to arm", block.time, trigger)
-            return None
-        return ZoneEntry(side=side, stop_price=trigger, stop_loss=stop_loss)
-
-    def _reached_midpoint(self, block: OrderBlock, candle: Candle, tick: Money) -> bool:
-        """Has price come back into the region as far as its 50% on this bar?
-
-        The trigger for `RETURN_PASS`, and it is deliberately **the same level `MIDPOINT` rests
-        at** rather than a second opinion about where half of a region is — his own sentence
-        joins them: *"atinge o 50% onde o gatilho anterior ativaria o trade"*. Sharing `_midpoint`
-        is what keeps that true: two expressions computing half a region would agree on [90, 100]
-        and diverge on the first zone whose midpoint falls between ticks, and the backtest would
-        report a `RETURN_PASS` that armed a bar earlier than the `MIDPOINT` it was defined
-        against, with nothing to say why.
-
-        ⚠️ **Read off the bar's extreme, not its close** — the same reading `_ran_away` and his
-        mitigation rule use. A touch of the 50% is price *trading* there; a bar that dipped to
-        the midpoint and closed back at the edge reached it, and a close-based test would ignore
-        the wick that is the entire event this setup waits for.
-        """
-        level = _midpoint(block, tick, Side.LONG if block.kind is ZoneKind.DEMAND else Side.SHORT)
-        if block.kind is ZoneKind.DEMAND:
-            return candle.low <= level
-        return candle.high >= level
-
-    # ----------------------------------------------------------------------- #
     # Order lifetime                                                           #
     # ----------------------------------------------------------------------- #
 
@@ -1090,19 +1277,6 @@ class StructureStrategy:
                 return tracked.usable
         return False
 
-    def _mitigated(self, block: OrderBlock) -> bool:
-        """Has price already come back and taken this region's near edge?
-
-        The detector's own mark, read rather than recomputed — his indicator owns that rule
-        (`low <= top` for demand, `high >= bottom` for supply) and a second copy of it here would
-        be one to keep in step.
-
-        ⚠️ **False for a region the tracker has dropped**, which is deliberate but never load
-        bearing: `_tracked` is asked first at the one call site, and a dropped region takes its
-        order with it regardless of what this would have said.
-        """
-        return any(tracked.block == block and tracked.mitigated for tracked in self._blocks.zones)
-
     def _tracked(self, block: OrderBlock) -> bool:
         """Is the detector still holding this region at all?
 
@@ -1112,77 +1286,6 @@ class StructureStrategy:
         an order left resting there fills off a level no longer being maintained.
         """
         return any(tracked.block == block for tracked in self._blocks.zones)
-
-    def _expired(self, block: OrderBlock, context: Context) -> bool:
-        """Has this zone's order stopped making sense on this bar?
-
-        One question, two rules, because the two order shapes die of opposite events and a single
-        expression covering both would have to mean "left the region" in two directions at once.
-
-        * `EDGE` and `MIDPOINT` wait *inside* the region for price to come back, so they are
-          abandoned when price leaves — `_ran_away`, a full height clear of the near edge.
-        * `RETURN_PASS` waits *outside* it for price to break out, so leaving upward is the fill.
-          It dies on the other side: price reaching the level its own stop would occupy — the
-          same `_beyond_edge` call `_entry_for` makes for the stop, not a second expression for
-          it, so the two cannot drift apart on a zone whose buffer falls between ticks.
-
-        ⚠️ **This is asked on every bar an order is armed, placed or not.** For `RETURN_PASS` that
-        matters more than it looks: the region can break downward while the book is still empty,
-        waiting for a 50% touch that a collapsing market delivers on the way to somewhere far
-        below. Answering only for placed orders would leave the name armed on a region that is
-        gone, and the next bar that clipped the midpoint would place an order into the wreck.
-        """
-        if self._entry_point is not ZoneEntryPoint.RETURN_PASS:
-            return self._ran_away(block, context.candle)
-
-        # No `size <= ZERO` guard, unlike `_entry_for`, and the asymmetry is the point: a zone with
-        # no width can never place an order, so the only question left about it is when to stop
-        # holding the name. Giving it up on the first bar that reaches its collapsed edge is the
-        # better of the two answers, and it costs nothing — `_release` sends no cancel for an
-        # order that never reached the book.
-        size = block.top - block.bottom
-        tick = context.instrument.tick_size
-        buffer = size * self._stop_buffer
-        candle = context.candle
-        if block.kind is ZoneKind.DEMAND:
-            return candle.low <= _beyond_edge(block, tick, buffer, upward=False)
-        return candle.high >= _beyond_edge(block, tick, buffer, upward=True)
-
-    def _ran_away(self, block: OrderBlock, candle: Candle) -> bool:
-        """Has price cleared the region by a full height, abandoning the order?
-
-        The author's rule (`ABANDON_AT_ZONE_HEIGHTS`), in his own example: a demand region
-        [90, 100] with the order at 95, price returns and touches 100, stops at 98 without ever
-        trading 95, and turns back up. The order is abandoned when price reaches 110 — one height
-        above the near edge. The supply mirror abandons at 80.
-
-        ⚠️ **Two conditions, and the first is the one that is easy to lose.** Price must have
-        *entered* the region, and then cleared it by a height. An order waiting on a region price
-        has never come back to is not abandoned however far the market travels — it is still
-        waiting for exactly the event it was placed for.
-
-        ⚠️ **Read off the bar's extreme, not its close.** The order is a level in the book and the
-        market reaching a level is a wick, not a settlement — the same reading his mitigation rule
-        uses one method away. A close-based test would keep an order alive through a bar that
-        traded a full height clear of it and came back.
-
-        ⚠️ **The withdrawal it triggers takes effect on the next bar, and that is correct rather
-        than late.** `loop.py` fills before the strategy runs, so an order the market reached on
-        this same bar is already a trade by the time this is asked — and it should be: the
-        abandonment rule is about price *never coming to us*, so a bar that traded through the
-        limit filled it, exactly as a resting order at a broker would have.
-        """
-        # ⚠️ Nothing is abandoned before the region has been visited, and this guard is the whole
-        # rule rather than an optimisation. See `ABANDON_AT_ZONE_HEIGHTS`: counting from the
-        # arming bar abandons every order while price is still walking away from the impulse that
-        # marked the zone.
-        if not self._mitigated(block):
-            return False
-        height = block.top - block.bottom
-        clearance = height * ABANDON_AT_ZONE_HEIGHTS
-        if block.kind is ZoneKind.DEMAND:
-            return candle.high >= block.top + clearance
-        return candle.low <= block.bottom - clearance
 
     def _release(self, armed: _Armed, candle: Candle) -> tuple[Signal, ...]:
         """Give up an armed zone: a cancel if its order reached the book, silence if it never did.

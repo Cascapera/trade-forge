@@ -1228,6 +1228,14 @@ class StructureStrategy:
             # differently as its band shifts, and the difference is the chase: the order resting
             # at the old level is withdrawn and a new one placed at the new one, which is the
             # mechanism the protocol already chose for a resting order's price (ADR-0018).
+            #
+            # ⚠️ **The comparison is numeric, because `Decimal` is.** `ZoneEntry` is a frozen
+            # dataclass of `Decimal`s, so `95.40` and `95.4000` compare equal and no order is
+            # sent. That is the right answer here — it is the same price, and re-placing would
+            # be churn for a level that did not move — but it is worth naming, because the same
+            # property is a trap one layer up: a *test* asserting a level has to compare the
+            # text, or it cannot see a precision that quietly changed. Right on this line, wrong
+            # in an assertion.
             if entry is not None and entry == self._armed.entry:
                 entry = None
             # ⚠️ **The bar that did the whole move by itself.** A `RETURN_PASS` trigger is a wick
@@ -1482,7 +1490,7 @@ class StructureStrategy:
         touches. Every rule about *whether a region may be traded* is therefore enforced here,
         once, on the zone actually about to be armed.
 
-        Five refusals, in the order they are cheapest to answer:
+        Six refusals, in the order they are cheapest to answer:
 
         * **The zone already armed.** Re-naming it is not a new setup; acting on the repeat would
           withdraw a resting order and put an identical one back a bar later, moving the fill to

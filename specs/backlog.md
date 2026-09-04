@@ -1438,6 +1438,38 @@ o mesmo mecanismo que torna o termo `not self._tracked(...)` (sem teste que o pr
 `_MAX_ZONES = 200`) deixar de ser teórico num backtest longo. Prendê-lo honestamente exige um
 `_MAX_ZONES` injetável, não um cenário de 200 zonas.
 
-⚠️ Ao escolher a série: [[dados-ohlcv-sao-sinteticos]] — `data/ohlcv` veio de `--source mock`, então
-medir ali prova encanamento, não mercado. É o número que eu pediria **antes** de rodar qualquer um
-dos dois em paper.
+É o número que eu pediria **antes** de rodar qualquer um dos dois em paper. E dá para medir: o
+`data/ohlcv` é dado real desde 06/08 (o sintético foi apagado; ver `dados-ohlcv-sao-sinteticos`,
+que registra a correção). ⚠️ Uma anotação anterior nesta seção dizia que a série era `--source
+mock` — **estava errada**, e foi corrigida aqui.
+
+## A VWAP se cala em silêncio quando o volume pedido não existe na série
+
+Medido em 03/09/2026 sobre os 144 Parquets de `data/ohlcv`, ao levantar o terreno do capítulo 11.2.
+
+| | `tick_volume == 0` | `real_volume == 0` |
+|---|---|---|
+| AAPL (D1, H1, H4, M15, M5) | 0 de 56.249 | 0 de 56.249 |
+| todo o resto (AUDCAD, BTCUSD, EURGBP, EURUSD, GBPJPY, GBPUSD, USDJPY, XAUUSD) | 0 | **100% das barras** |
+
+Ou seja: **`tick_volume` existe em toda barra da base**, e `real_volume` só existe no AAPL — que é
+exatamente o que o docstring do `vwap.py` prevê ("present on B3, zero on decentralised forex").
+
+⚠️ **A consequência é um modo de falha silencioso.** `AnchoredVWAP.update()` faz
+`if volume <= 0: return`, então uma série sem o volume pedido não produz erro: ela produz
+`value() is None` **para sempre**. Com `volume="auto"` (o default) nada quebra, porque ele cai para
+ticks. Mas com **`volume="real"` em qualquer símbolo que não seja o AAPL**, 100% das barras são
+puladas, o indicador nunca existe, nenhuma ordem é colocada — e o relatório do backtest diz
+**zero trades**, que se lê como "a estratégia não operou" em vez de "o indicador nunca existiu".
+
+Decisão do Guilherme (03/09): sem volume não há VWAP, e sem VWAP **não se coloca a ordem nem se
+executa o trade** — falha em silêncio, para o lado seguro. Fica então pendente **tornar o silêncio
+localizável**: uma linha de log quando o setup se cala por falta de indicador, para separar "não
+achou setup" de "não tinha volume". Ver [[nulo-e-zero-sao-afirmacoes-diferentes]] e
+[[nao-sei-nao-e-nao-tem-nada]].
+
+⚠️ E o mesmo buraco existe nos **testes**: o helper `bar()` de `tradeforge_engine.testing` não
+preenche volume e `Candle` tem `tick_volume: int = 0`, então **nenhum cenário de `test_setups.py`
+consegue produzir uma VWAP**. Um teste que afirme silêncio ali passa vacuosamente. O par
+obrigatório é: mesmas barras **com** volume produzem a ordem, mesmas barras **sem** volume ficam
+mudas.

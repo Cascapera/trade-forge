@@ -991,6 +991,19 @@ class FffdActivation:
         formation.update(candle)
 
         if self._levels is not None:
+            # ⚠️ **With a trigger live the formation is fed but its own state is never read**, so
+            # the outer seven bars can run out underneath the inner two. That is deliberate, and
+            # it produces no divergence either way:
+            #
+            # * a wick through the region's far edge is **subsumed** — the trigger bar cannot
+            #   have printed below the far edge, or the formation would already have been dead
+            #   and priced nothing, so the annul level sits at or above that edge and any wick
+            #   past it loses the low first;
+            # * the window running out ends in a reset, which is exactly where the lapse ends
+            #   too — *"reseta a leitura"* — so the two roads meet.
+            #
+            # Written down because it is the kind of thing a reader has to reconstruct, and the
+            # reconstruction is what a review has to spend a mutant on otherwise.
             self._age_the_trigger(block, candle)
             return
 
@@ -1452,6 +1465,12 @@ class StructureStrategy:
             # The name is advanced here too. A cancelled id is free to reuse in the backtest, and
             # reusing it is still the wrong thing to hand a venue: two orders a session apart
             # under one name is an audit trail that cannot be read.
+            # ⚠️ The `placed` half is equivalent by construction today and kept anyway: the one
+            # activation that answers `withdraws` only does so on the bar its order's window ran
+            # out, and an order with a window had to be placed to get one. What it guards against
+            # is the state that made this comment worth writing — a cancel naming an order the
+            # venue never received, which `_release` documents as noise on the one channel where
+            # a real race is reported.
             if self._armed.placed and self._activation.withdraws(
                 self._armed.block, context=context
             ):

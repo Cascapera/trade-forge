@@ -3665,6 +3665,16 @@ def test_a_lapsed_order_resets_the_reading_and_a_lost_low_ends_the_region() -> N
     annulled = _fffd([*_IMPULSE, *_UP_TO_THE_PUSH, *_LOSES_THE_LOW, *_CONFIGURES_AGAIN])
 
     # The lapse: taken back on 19, and the region configures itself again on 20 and again on 23.
+    #
+    # ⚠️ **The cancel bars are asserted, not just the entries.** Every trigger after the first
+    # inherits a counter that the previous one left at two, so a missing reset gives the second
+    # and every later order **one** bar instead of the two he gave it — and the entries alone do
+    # not show it: they come out at the same prices under the same names either way. What moves
+    # is where the withdrawal lands, 21 instead of 22, and the trade that would have been taken
+    # on the second bar of a re-read simply never happens.
+    assert [
+        index for index, day in enumerate(lapsed) if any(s.kind is SignalKind.CANCEL for s in day)
+    ] == [19, 22]
     reopened = [s for day in lapsed[20:] for s in day if s.kind is SignalKind.ENTRY]
     assert [s.stop_price for s in reopened] == [Decimal("97.81"), Decimal("98.01")]
     # Each replacement carries its own name: a cancelled id is free to reuse in a backtest, and
@@ -3835,3 +3845,71 @@ def test_touching_the_trigger_bars_high_exactly_ends_a_short_too() -> None:
     [ended] = signals[18]
     assert ended.kind is SignalKind.CANCEL
     assert all(day == [] for day in signals[19:])
+
+
+def test_a_live_trigger_does_not_follow_the_activation_to_another_region() -> None:
+    """The levels belong to the region that produced them, and switching zones must forget them.
+
+    An activation holds one formation at a time and follows whatever zone the strategy has armed.
+    Two ordinary paths change that zone while a trigger is live — the tracker dropping the region,
+    or a fresh block qualifying — and both happen on exactly the kind of bar that marks a region:
+    an impulse, which is what the two bars of a resting FFFD order are waiting for.
+
+    ⚠️ **Without the reset, region B is handed A's order whole.** Same entry, same stop, on a zone
+    that never formed anything and whose own arithmetic does not contain those prices — and worse,
+    B would then be ended by price losing the low of *A's* trigger bar. Nothing downstream could
+    tell: the order is well formed, the region is real, and the backtest simply trades something
+    nobody described.
+    """
+    produced_it = _zone_at("100", "90", hour=3)
+    never_formed = _zone_at("101", "91", hour=4)
+    activation = FffdActivation()
+
+    with localcontext(ENGINE_CONTEXT):
+        for candle in _UP_TO_THE_PUSH:
+            activation.observe(produced_it, context=_context(candle))
+        on_the_push = _context(_UP_TO_THE_PUSH[-1])
+        assert activation.entry_for(produced_it, context=on_the_push) is not None
+
+        next_bar = _context(
+            bar(18, open_="97.1", close="97.4", high="97.9", low="96.9", tick_volume=900)
+        )
+        activation.observe(never_formed, context=next_bar)
+
+        assert activation.entry_for(never_formed, context=next_bar) is None
+    # And it is not spent either: the new region is untouched, not condemned by the old one's bar.
+    assert activation.spent(never_formed) is False
+
+
+def _context(candle: Candle) -> Context:
+    return Context(candle=candle, instrument=AAPL, account=_ACCOUNT)
+
+
+def test_a_second_trigger_at_the_very_same_levels_still_reaches_the_book() -> None:
+    """The re-pricing guard compares levels, and a withdrawal has to forget what was resting.
+
+    Bar 20 repeats bar 17's high and low to the cent, so its order comes out at 99.61 and 96.77
+    again. The strategy suppresses an order equal to what is already resting — which is what makes
+    the botinha's chase free for every other entry point — and after a withdrawal nothing *is*
+    resting, so the comparison has to be against nothing.
+
+    ⚠️ **Otherwise the trade disappears without a trace.** The entry is deduplicated against an
+    order the venue gave back two bars ago, `placed` stays false, and the lapse that follows does
+    not even cancel, because there is nothing to cancel. No signal, no error, one trade fewer.
+    Implausible at a cent tick and perfectly ordinary on a coarse one, where two pushes a few bars
+    apart land on the same two prices.
+    """
+    repeats_the_levels = [
+        bar(20, open_="97.6", close="97.0", high="99.60", low="96.80", tick_volume=1300),
+        bar(21, open_="97.0", close="97.3", high="97.6", low="96.9", tick_volume=900),
+        bar(22, open_="97.3", close="97.5", high="97.8", low="97.1", tick_volume=900),
+    ]
+    signals = _fffd([*_IMPULSE, *_UP_TO_THE_PUSH, *_LAPSES, *repeats_the_levels])
+
+    [again] = signals[20]
+    assert again.kind is SignalKind.ENTRY
+    assert again.stop_price == Decimal("99.61")  # the same level as bar 17's order
+    assert again.client_id == "demand-20240101T0300-1-r1"  # under a name of its own
+    # And it lives its own two bars, taken back on 22 rather than never having existed.
+    [taken_back] = signals[22]
+    assert taken_back.kind is SignalKind.CANCEL

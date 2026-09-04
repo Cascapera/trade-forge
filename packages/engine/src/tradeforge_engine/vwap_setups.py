@@ -524,11 +524,157 @@ class BotinhaTrigger:
         return BotinhaOrder(side=side, limit_price=entry, stop_loss=stop)
 
 
+DEFAULT_BREAK_TICKS = 1
+"""How far past the trigger bar's extreme the order waits, in ticks.
+
+⚠️ **Assumed, not dictated.** His words are *"ordem de compra acima da máxima dessa barra"* — above
+it, with no distance given. One tick is the smallest thing "above" can mean, and it mirrors the
+three ticks he *did* give for the stop, so the two numbers at least come from the same unit. It is
+a knob rather than a literal for exactly that reason: the day he says two, it is a parameter and
+not a hunt through the file.
+"""
+
+DEFAULT_STOP_TICKS = 3
+"""How far past the trigger bar's other extreme the stop sits, in ticks. **His number.**
+
+⚠️ **Ticks, and that makes it the odd one out in this engine.** Every other stop here is a
+fraction of something the market drew — the region's width, the band between two averages — so it
+scales with the instrument and with volatility on its own. Three ticks does neither: it is three
+ticks on a five-digit pair and three cents on a share, and the same setup on two instruments risks
+wildly different fractions of its own bar. That is what he said, so that is what this does; it is
+named here so nobody reads it as an oversight.
+"""
+
+
+@dataclass(frozen=True, slots=True)
+class FffdLevels:
+    """The three prices the trigger bar gives, and they are three rather than two.
+
+    ⚠️ **The cancel and the stop are neighbours and must not be merged.** His rule, given in as
+    many words: the order is entered above the bar's high, the stop sits three ticks beyond its
+    low, and *losing the low itself* annuls the setup. So two of these are one tick apart on a
+    penny instrument, and collapsing them would be easy and wrong — the level that says "this was
+    not the failed push I thought it was" is not the level that says "this trade is over".
+
+    It is also the exact inverse of chapter 11.5, where the cancel and the stop are deliberately
+    the *same* number. Two setups, opposite answers, and the reason to keep them apart is that
+    each answer is his.
+    """
+
+    side: Side
+    stop_price: Money
+    """The entry: a stop past the trigger bar's extreme, on the side the move has to resume."""
+
+    stop_loss: Money
+    """Three ticks past the other extreme — beyond the level that annuls, never on it."""
+
+    annul_price: Money
+    """The trigger bar's own extreme. Reaching it ends the setup rather than the trade."""
+
+    @property
+    def risk(self) -> Money:
+        """The distance sizing measures, off the two levels as placed."""
+        return abs(self.stop_price - self.stop_loss)
+
+
+@dataclass(frozen=True, slots=True)
+class FffdTrigger:
+    """His chapter 11.2, the entry he named **FFFD** — *fechou fora, fechou dentro*.
+
+    ⚠️ **The name covers three entries and this automates one.** His own words: *"o nome não faz
+    jus exato, pois existe 3 formas de entrar neste gatilho mas para automatizar só vamos usar
+    esta"*. Written down so the absence reads as a decision rather than an omission — the same
+    treatment `ZoneEntryPoint` gives his model 2.
+
+    **The shape.** With the formation anchored and the market trying to resume, price is *above*
+    the central line. The seller pushes, one bar trades through that line and closes on the far
+    side of it, and the signal is that push **failing**: the order goes above that bar's high, and
+    the trade is the break of it.
+
+    ⚠️ **It is the inverse of what `vwap.py` used to describe.** That docstring called the trigger
+    price "grazing it and failing" from below. This is the other way round, and the author
+    discarded the grazing outright — the botinha took its place.
+
+    **Stateless on purpose.** Whether *this* bar is the trigger is a question about this bar; how
+    long its levels then stay live, and what happens when the market loses them, is state that
+    belongs to whatever holds the setup across bars. Keeping the two apart is what let the botinha
+    be checked against his arithmetic before anything owned a clock.
+    """
+
+    break_ticks: int = DEFAULT_BREAK_TICKS
+    stop_ticks: int = DEFAULT_STOP_TICKS
+
+    def __post_init__(self) -> None:
+        if self.break_ticks < 1:
+            raise EngineError(
+                f"the order waits at least one tick past the bar, got {self.break_ticks}"
+            )
+        if self.stop_ticks < 1:
+            raise EngineError(
+                f"the stop sits at least one tick past the bar, got {self.stop_ticks}"
+            )
+
+    def levels_for(self, formation: VwapFormation, *, tick: Money) -> FffdLevels | None:
+        """The three levels if this bar is the trigger, or `None` if it is not.
+
+        ⚠️ **"Crosses and closes beyond" is read strictly: the bar has to have traded on the
+        other side first.** His sentence is *"uma barra cruza a VWAP e fecha abaixo dela"*, and if
+        closing below were enough the word "cruza" would carry nothing. The step before it puts
+        the market *retaking upward* — price above the line — so in the state he describes the two
+        readings agree, which is precisely why the loose one is easy to write and impossible to
+        catch.
+
+        Where they part is a bar that lives entirely below the line and closes there. Under the
+        loose reading that arms a buy at a level **below** the average, in a market already
+        falling through it — not the failed seller's push he described, but a purchase in the
+        middle of a decline. So the strict reading is not merely the safer count of signals, it is
+        the one that keeps the signals the same *kind* of event.
+
+        How it fails if this is wrong: the setup arms less often than his method does, never more.
+        """
+        lines = formation.lines()
+        candle = formation.last_bar
+        if lines is None or candle is None:
+            return None
+
+        long = formation.side is Side.LONG
+        crossed = candle.high > lines.vwap if long else candle.low < lines.vwap
+        closed_beyond = candle.close < lines.vwap if long else candle.close > lines.vwap
+        if not (crossed and closed_beyond):
+            return None
+
+        # The bar gives both ends. A buy waits above its high and dies below its low; a sale
+        # mirrors that exactly, which is the whole of the short side.
+        entry_from, annul_from = (candle.high, candle.low) if long else (candle.low, candle.high)
+        step = self.break_ticks * tick
+        guard = self.stop_ticks * tick
+        stop_price = entry_from + step if long else entry_from - step
+        stop_loss = annul_from - guard if long else annul_from + guard
+
+        # ⚠️ A trigger bar low enough against its own tick size pushes the stop through nothing,
+        # and `Signal` refuses a non-positive level outright. Caught here so the setup goes quiet
+        # rather than raising from inside a run — the same treatment the botinha's levels get.
+        if stop_price <= ZERO or stop_loss <= ZERO:
+            logger.debug("fffd level at or below zero on the %s; no trigger", formation.side.value)
+            return None
+
+        return FffdLevels(
+            side=formation.side,
+            stop_price=stop_price,
+            stop_loss=stop_loss,
+            annul_price=annul_from,
+        )
+
+
 __all__ = [
     "DEFAULT_BARS_TO_TRIGGER",
+    "DEFAULT_BREAK_TICKS",
     "DEFAULT_ENTRY_MARGIN",
+    "DEFAULT_STOP_TICKS",
     "BotinhaOrder",
     "BotinhaTrigger",
+    "FffdLevels",
+    "FffdTrigger",
     "FormationState",
     "VwapFormation",
     "VwapLines",

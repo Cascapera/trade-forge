@@ -3,12 +3,21 @@
 Ordinary VWAP resets every session; the **anchored** version starts wherever you point it — and
 in this method the anchor is the candle that marked the high or low of the move being watched (a
 swing). From there it answers one question: what is the average price everyone who traded since
-that moment paid? That average is where the players who started the move tend to defend it, which
-is why price grazing it and failing ("roçadinha na VWAP") is a trigger.
+that moment paid? That average is where the players who started the move tend to defend it, and
+both of the author's triggers are built on watching someone fail against it.
+
+⚠️ **This used to say the trigger was price "grazing it and failing" — the *roçadinha* — and that
+is wrong twice over.** He discarded that pattern outright when he dictated chapter 11.2, and the
+two entries he kept read the other way round: price is *above* the line on the retake, and the
+signal is the **seller** getting through it and failing. Left uncorrected the sentence would send
+the next reader looking for a setup this engine does not have, which is what a docstring nobody
+tests eventually does. See `vwap_setups.py` for the two that exist.
 
 **A band, from three sources.** The same anchor and the same volume, priced three ways: `hlc3`
 (the typical price, the central line), `high` (an upper line) and `low` (a lower line). Together
-they bound a volume-weighted zone rather than a single line.
+they bound a volume-weighted zone rather than a single line — and the outer lines are not
+decoration: the *botinha* is that band's lower line under a demand region and its upper line over
+a supply one, which is why this indicator draws three and not one.
 
 **Volume.** `real_volume` is the exchange's traded quantity — present on B3, zero on decentralised
 forex; `tick_volume` counts price changes and is always there. The default, `auto`, takes real

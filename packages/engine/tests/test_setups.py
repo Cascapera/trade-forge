@@ -11,7 +11,7 @@ example: a demand zone of [90, 100], bought at 100 with the stop at 89.
 
 import datetime as dt
 from dataclasses import dataclass, field
-from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, localcontext
+from decimal import Decimal, localcontext
 
 import pytest
 
@@ -42,7 +42,6 @@ from tradeforge_engine.setups import (
     SetupContext,
     StructureStrategy,
     ZoneEntryPoint,
-    _to_tick,
 )
 from tradeforge_engine.structure import (
     OrderBlock,
@@ -487,18 +486,6 @@ def test_the_stop_is_rounded_onto_the_tick_grid_away_from_the_entry() -> None:
     ]
     assert short_signal.limit_price == Decimal("99.95")
     assert short_signal.stop_loss == Decimal("111.01")  # not 111.00
-
-
-def test_to_tick_rounds_in_the_direction_it_is_told() -> None:
-    """The helper on its own, both directions, so the two callers above cannot both be wrong in
-    the same way and still agree with each other."""
-    with localcontext(ENGINE_CONTEXT):
-        tick = Decimal("0.01")
-        assert _to_tick(Decimal("88.995"), tick, ROUND_FLOOR) == Decimal("88.99")
-        assert _to_tick(Decimal("111.005"), tick, ROUND_CEILING) == Decimal("111.01")
-        # already on the grid: rounding must not move it in either direction
-        assert _to_tick(Decimal("89"), tick, ROUND_FLOOR) == Decimal("89")
-        assert _to_tick(Decimal("89"), tick, ROUND_CEILING) == Decimal("89")
 
 
 # --------------------------------------------------------------------------- #

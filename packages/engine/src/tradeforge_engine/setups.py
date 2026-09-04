@@ -50,6 +50,7 @@ from tradeforge_engine.domain import (
     SnapshotLevel,
     SnapshotRegion,
     ZoneMark,
+    to_tick,
 )
 from tradeforge_engine.structure import (
     MarketStructure,
@@ -1242,16 +1243,6 @@ def _structure_levels(break_: StructureBreak | None) -> tuple[SnapshotLevel, ...
     )
 
 
-def _to_tick(price: Money, tick: Money, rounding: str) -> Money:
-    """Snap a computed level onto the instrument's price grid.
-
-    A stop is a price someone has to be able to place. Ten percent of a zone's width is not
-    generally a multiple of the tick, and a stop at 1.094375 on a five-digit pair is a level that
-    does not exist — it would fill in the backtest and be rejected by the venue.
-    """
-    return (price / tick).to_integral_value(rounding=rounding) * tick
-
-
 def _beyond_edge(block: OrderBlock, tick: Money, buffer: Money, *, upward: bool) -> Money:
     """One buffer clear of a region's edge, on the price grid, rounded away from the region.
 
@@ -1270,8 +1261,8 @@ def _beyond_edge(block: OrderBlock, tick: Money, buffer: Money, *, upward: bool)
     buffer says, nor hands a breakout a level easier to break than the region actually offers.
     """
     if upward:
-        return _to_tick(block.top + buffer, tick, ROUND_CEILING)
-    return _to_tick(block.bottom - buffer, tick, ROUND_FLOOR)
+        return to_tick(block.top + buffer, tick, ROUND_CEILING)
+    return to_tick(block.bottom - buffer, tick, ROUND_FLOOR)
 
 
 def _midpoint(block: OrderBlock, tick: Money, side: Side) -> Money:
@@ -1289,7 +1280,7 @@ def _midpoint(block: OrderBlock, tick: Money, side: Side) -> Money:
     the region actually offers.
     """
     half = block.bottom + (block.top - block.bottom) / 2
-    return _to_tick(half, tick, ROUND_CEILING if side is Side.LONG else ROUND_FLOOR)
+    return to_tick(half, tick, ROUND_CEILING if side is Side.LONG else ROUND_FLOOR)
 
 
 def _already_through(entry: ZoneEntry, candle: Candle) -> bool:

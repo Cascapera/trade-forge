@@ -1465,12 +1465,19 @@ class StructureStrategy:
             # The name is advanced here too. A cancelled id is free to reuse in the backtest, and
             # reusing it is still the wrong thing to hand a venue: two orders a session apart
             # under one name is an audit trail that cannot be read.
-            # ⚠️ The `placed` half is equivalent by construction today and kept anyway: the one
-            # activation that answers `withdraws` only does so on the bar its order's window ran
-            # out, and an order with a window had to be placed to get one. What it guards against
-            # is the state that made this comment worth writing — a cancel naming an order the
-            # venue never received, which `_release` documents as noise on the one channel where
-            # a real race is reported.
+            # ⚠️ **The `placed` half looks redundant and is not**, and the difference took a
+            # reviewer to find. Down the ordinary path it is: the one activation that answers
+            # `withdraws` does so on the bar its order's window ran out, and an order with a
+            # window had to be placed to get one. But a zone can be released while a trigger is
+            # still live and the *same* region re-armed before `observe` clears the residue —
+            # and then the fresh `_Armed` is born `placed=False` on exactly the bar the leftover
+            # lapse turns true. There this guard is the only thing between us and a cancel
+            # naming an order the venue never received, which `_release` documents as noise on
+            # the one channel where a real race is reported.
+            #
+            # No scenario here builds that state, and building it — two regions coinciding on a
+            # release and a re-arm — costs more than it proves. So it is untested rather than
+            # unnecessary, and the distinction is the whole point of writing this down.
             if self._armed.placed and self._activation.withdraws(
                 self._armed.block, context=context
             ):

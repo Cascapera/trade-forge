@@ -72,12 +72,20 @@ def bar(  # noqa: PLR0913 — not parameters, fields: this builds a `Candle`, wh
     high: str | None = None,
     low: str | None = None,
     spread: int = 0,
+    tick_volume: int = 0,
 ) -> Candle:
     """One candle, `index` hours after the start.
 
     `spread` defaults to `0`, the same default `Candle` itself carries — a hand-built bar
     makes no claim about what it cost to trade. `BarSpreadCostModel` refuses such a bar
     rather than pricing it as free, so a scenario that means to charge one has to say so.
+
+    `tick_volume` defaults to `0` for the same reason, and the default is load-bearing in the
+    opposite direction: `AnchoredVWAP.update` *skips* a bar with no volume rather than
+    dividing by zero, so every scenario built with this helper is a scenario in which no VWAP
+    can ever have a value. A test asserting that a VWAP-triggered setup stayed silent passes
+    vacuously unless it says a volume here — which is why the pair is obligatory: the same
+    bars **with** volume produce the order, the same bars **without** it stay mute.
     """
     body = [Decimal(open_), Decimal(close)]
     return Candle(
@@ -87,6 +95,7 @@ def bar(  # noqa: PLR0913 — not parameters, fields: this builds a `Candle`, wh
         low=Decimal(low) if low else min(body),
         close=Decimal(close),
         spread=spread,
+        tick_volume=tick_volume,
     )
 
 

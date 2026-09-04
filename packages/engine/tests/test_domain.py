@@ -2,11 +2,12 @@
 
 import dataclasses
 import datetime as dt
-from decimal import Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, localcontext
 
 import pytest
 
-from tradeforge_engine.domain import Candle, OrderRequest, Side, Signal, SignalKind
+from tradeforge_engine.domain import Candle, OrderRequest, Side, Signal, SignalKind, to_tick
+from tradeforge_engine.loop import ENGINE_CONTEXT
 from tradeforge_engine.testing import AAPL, EURUSD
 
 
@@ -170,3 +171,20 @@ def test_a_stop_modification_is_not_an_order() -> None:
             decided_at=dt.datetime(2024, 1, 1, tzinfo=dt.UTC),
             stop_loss=Decimal("1.09500"),
         )
+
+
+def test_to_tick_rounds_in_the_direction_it_is_told() -> None:
+    """The helper on its own, both directions, so no two callers can be wrong the same way and
+    still agree with each other.
+
+    It moved here from `setups.py` when a second module needed it. The rule it encodes is the
+    one thing every caller shares: the direction is asked for, never inferred, because
+    "nearest" is right for a measurement and wrong for a level.
+    """
+    with localcontext(ENGINE_CONTEXT):
+        tick = Decimal("0.01")
+        assert to_tick(Decimal("88.995"), tick, ROUND_FLOOR) == Decimal("88.99")
+        assert to_tick(Decimal("111.005"), tick, ROUND_CEILING) == Decimal("111.01")
+        # already on the grid: rounding must not move it in either direction
+        assert to_tick(Decimal("89"), tick, ROUND_FLOOR) == Decimal("89")
+        assert to_tick(Decimal("89"), tick, ROUND_CEILING) == Decimal("89")

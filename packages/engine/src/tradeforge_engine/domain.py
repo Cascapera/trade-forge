@@ -1031,3 +1031,24 @@ class EvalContext:
         if history is None or not (0 <= offset < len(history)):
             return None
         return history[offset]
+
+
+def to_tick(price: Money, tick: Money, rounding: str) -> Money:
+    """Snap a computed level onto the instrument's price grid.
+
+    A stop is a price someone has to be able to place. Ten percent of a zone's width is not
+    generally a multiple of the tick, and a stop at 1.094375 on a five-digit pair is a level
+    that does not exist — it would fill in the backtest and be rejected by the venue.
+
+    ⚠️ **The direction is the caller's, and it is never "nearest".** Every level in this system
+    is rounded the way that costs the trade rather than flatters it: an entry away from the
+    price it hoped for, a stop no nearer than the rule said. `ROUND_HALF_EVEN` would be right
+    for a measurement and wrong for a level, because a level is a promise about where money
+    changes hands.
+
+    It lives here, with `Money`, because two modules now ask for it and a third copy is how the
+    setups file's own warning comes true — *"written twice they agree on every round number and
+    part company on the first zone whose half falls between ticks, and nothing downstream would
+    report the disagreement"*.
+    """
+    return (price / tick).to_integral_value(rounding=rounding) * tick

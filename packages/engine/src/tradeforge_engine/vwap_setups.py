@@ -44,9 +44,10 @@ and the only thing owed is that it be *findable*, which is the warning `lines()`
 
 import logging
 from dataclasses import dataclass
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from enum import StrEnum
 
-from tradeforge_engine.domain import Candle, Money, Side
+from tradeforge_engine.domain import ZERO, Candle, Money, Side, to_tick
 from tradeforge_engine.errors import EngineError
 from tradeforge_engine.structure import OrderBlock, ZoneKind
 from tradeforge_engine.vwap import AnchoredVWAP
@@ -355,8 +356,149 @@ class VwapFormation:
         self._botinha.update(candle)
 
 
+DEFAULT_ENTRY_MARGIN = Decimal("0.10")
+"""How far above the *botinha* the order rests, as a fraction of the gap between the two lines.
+
+His number, and his own example fixes it: with the centre at 100 and the *botinha* at 90 the buy
+goes at **91**. So the order is not *on* the lower line, it is a tenth of the band above it — the
+band is where he expects the reaction, and an order on its very edge is filled by the noise of
+the reaction rather than by the reaction.
+
+⚠️ **The margin and the stop are read off the same gap, and that makes the risk ten times the
+margin.** Entry at `botinha + 10%·d` with the stop a whole `d` below it means the trade risks ten
+times the distance it waited for. That is his design, not an artefact: the band is the evidence,
+so being wrong means the whole band failed, not that the order missed by a tenth.
+"""
+
+
+@dataclass(frozen=True, slots=True)
+class BotinhaOrder:
+    """Where the order rests and where it dies, both already on the instrument's price grid.
+
+    `risk` is derived from these two rather than from the arithmetic that produced them, and the
+    difference is not cosmetic: both levels are snapped to the tick, in *opposite* directions, so
+    the unrounded `d` and the distance between the placed levels are different numbers. Sizing,
+    the ledger and any later "what did this setup risk?" must all read the gap that was actually
+    placed — see the ledger's own rule that a total is derived from the parts as recorded.
+    """
+
+    side: Side
+    limit_price: Money
+    stop_loss: Money
+
+    @property
+    def risk(self) -> Money:
+        """The distance the position is sized against: the levels as placed, not as computed."""
+        return abs(self.limit_price - self.stop_loss)
+
+
+@dataclass(frozen=True, slots=True)
+class BotinhaTrigger:
+    """His second entry of chapter 11.2: a limit between the two lines, riding the lower one.
+
+    **It arms the moment the formation anchors.** Unlike `FFFD`, nothing else has to happen — no
+    bar has to close on the wrong side of anything. The confirming bar closes, both lines exist,
+    and the order belongs on the book.
+
+    **The order chases.** Both lines are cumulative, so every bar that closes moves them, and with
+    them `d`, the entry and the stop. This object recomputes; turning a moved level into a cancel
+    and a fresh order is the strategy's job, because the protocol already decided how that is
+    done — *"not a resting order's planned stop; that one is cancelled and re-placed"* (ADR-0018).
+
+    **It answers `None` for four different reasons, and all four are the same answer: no order
+    rests here this bar.** No lines at all, the two lines coincident, a level that would fall at
+    or through zero, or an entry that has come out at or above the market. The formation stays
+    alive through every one of them — it is the *level* that is unusable on this bar, not the
+    setup — and the next bar recomputes from scratch.
+
+    ⚠️ **The candle handed to `order_for` must be the last one the formation was fed, and nothing
+    here can check that.** The pairing is what makes the market-side guard honest: `lines()`
+    reflects the accumulation through bar N, so the close compared against it has to be N's. Hand
+    it N+1 — a caller that advanced its loop first, or one that keeps "the current bar" in a field
+    — and the guard silently compares a level decided on N against a price from N+1, which is
+    lookahead with no symptom at all. Pinning it is the integrating slice's job: either the
+    formation publishes the last bar it saw and this reads it from there, or the `Protocol` that
+    joins them makes the pair impossible to get wrong.
+    """
+
+    margin: Decimal = DEFAULT_ENTRY_MARGIN
+
+    def __post_init__(self) -> None:
+        # Zero would rest the order exactly on the botinha, and one would rest it on the centre
+        # line with a stop a whole band below — the two ends where the entry stops being an entry
+        # and starts being one of the two lines it was measured from.
+        if not (ZERO < self.margin < Decimal(1)):
+            raise EngineError(
+                f"the entry margin must lie strictly between 0 and 1, got {self.margin}"
+            )
+
+    def order_for(
+        self, formation: VwapFormation, *, tick: Money, candle: Candle
+    ) -> BotinhaOrder | None:
+        """Where the order should rest at this bar's close, or `None` if none should.
+
+        ⚠️ **The rounding is directional and it costs the trade, both times.** The entry is
+        rounded *away* from the price it hoped for — up for a buy, down for a sell — so snapping
+        to the grid never hands the trade a better fill than the formula offered; the stop is
+        rounded *away from the entry*, so it is never nearer than a whole `d`. It is the rule
+        `_midpoint` and `_beyond_edge` already run on, and following it here costs up to two ticks
+        of extra risk rather than silently shaving the stop.
+
+        ⚠️ **The stop cannot be zero-width, and nothing here has to check it.** The entry is on
+        the grid and `d` is positive, so `entry - d` is strictly below the entry and floors to at
+        least one tick under it. Were it ever equal, the risk manager returns no size rather than
+        dividing by nothing — so the failure mode is a skipped trade, not a division by zero.
+        """
+        lines = formation.lines()
+        if lines is None:
+            return None
+
+        distance = abs(lines.vwap - lines.botinha)
+        if distance <= ZERO:
+            # The two lines have met. It happens on a run of bars with no range at all, and there
+            # is no band left to measure an entry against — the entry, the stop and the botinha
+            # would be one price.
+            return None
+
+        side = formation.side
+        offset = distance * self.margin
+        if side is Side.LONG:
+            entry = to_tick(lines.botinha + offset, tick, ROUND_CEILING)
+            stop = to_tick(entry - distance, tick, ROUND_FLOOR)
+        else:
+            entry = to_tick(lines.botinha - offset, tick, ROUND_FLOOR)
+            stop = to_tick(entry + distance, tick, ROUND_CEILING)
+
+        # ⚠️ A tall band near zero pushes a long's stop — or a short's entry — at or through
+        # nothing. `Signal` refuses a non-positive level outright, so this is caught either way;
+        # it is caught *here* so the setup goes quiet rather than raising out of a backtest.
+        if entry <= ZERO or stop <= ZERO:
+            logger.debug("botinha level at or below zero on the %s; no order", side.value)
+            return None
+
+        # ⚠️ **A limit that has come out on the wrong side of the market is not a limit.** A buy
+        # limit at or above the close is filled at once at whatever the market offers, which is
+        # the market order this entry exists to avoid: the whole point is to wait for price to
+        # come *back* to the band. It is reachable — a bar whose low drags the botinha up while
+        # closing near that low can put the recomputed entry above its own close — so it fails
+        # closed for this bar rather than being argued away.
+        crossed = entry >= candle.close if side is Side.LONG else entry <= candle.close
+        if crossed:
+            logger.debug(
+                "botinha entry %s is already through the close %s; no order this bar",
+                entry,
+                candle.close,
+            )
+            return None
+
+        return BotinhaOrder(side=side, limit_price=entry, stop_loss=stop)
+
+
 __all__ = [
     "DEFAULT_BARS_TO_TRIGGER",
+    "DEFAULT_ENTRY_MARGIN",
+    "BotinhaOrder",
+    "BotinhaTrigger",
     "FormationState",
     "VwapFormation",
     "VwapLines",

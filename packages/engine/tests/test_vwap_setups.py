@@ -16,20 +16,30 @@ from decimal import Decimal, localcontext
 
 import pytest
 
-from tradeforge_engine.domain import Candle, Side
+from tradeforge_engine.domain import Candle, Money, Side
 from tradeforge_engine.errors import EngineError
 from tradeforge_engine.loop import ENGINE_CONTEXT
 from tradeforge_engine.structure import OrderBlock, StructureKind, ZoneKind
 from tradeforge_engine.testing import START, bar
-from tradeforge_engine.vwap_setups import FormationState, VwapFormation, VwapLines
+from tradeforge_engine.vwap_setups import (
+    BotinhaOrder,
+    BotinhaTrigger,
+    FormationState,
+    VwapFormation,
+    VwapLines,
+)
 
 
-def _region(kind: ZoneKind) -> OrderBlock:
-    """The author's standing example region, [90, 100], on either side of the book."""
+def _region(kind: ZoneKind, *, top: str = "100", bottom: str = "90") -> OrderBlock:
+    """The author's standing example region, [90, 100], on either side of the book.
+
+    The bounds are overridable for one reason only: the guard against a level falling through
+    zero needs a band tall relative to its own price, which [90, 100] cannot produce.
+    """
     return OrderBlock(
         kind=kind,
-        top=Decimal("100"),
-        bottom=Decimal("90"),
+        top=Decimal(top),
+        bottom=Decimal(bottom),
         time=START,
         confirmed_at=START,
         break_kind=StructureKind.BOS,
@@ -574,3 +584,388 @@ def test_a_formation_that_is_not_anchored_yet_is_silent_without_complaining(
 
     assert formation.state is FormationState.WATCHING
     assert [record for record in caplog.records if record.levelno == logging.WARNING] == []
+
+
+# --------------------------------------------------------------------------- #
+# The Botinha trigger: where the order rests, and where it dies                #
+# --------------------------------------------------------------------------- #
+
+TICK = Decimal("0.01")
+
+# One bar that enters the region and confirms on its own, chosen so the two lines land exactly on
+# the numbers he used when he dictated the rule: hlc3 = (110 + 90 + 100)/3 = 100, low = 90.
+# Everything below is measured against a band of ten, which is his example's band.
+_HIS_EXAMPLE = bar(1, open_="91", high="110", low="90", close="100", tick_volume=1000)
+
+# The same bar reflected around 190: hlc3 = 90, high = 100, so the band is ten the other way up.
+_HIS_EXAMPLE_MIRRORED = bar(1, open_="99", high="100", low="80", close="90", tick_volume=1000)
+
+
+def _order(
+    candles: list[Candle], kind: ZoneKind, *, trigger: BotinhaTrigger | None = None, **bounds: str
+) -> BotinhaOrder | None:
+    formation = VwapFormation(_region(kind, **bounds))
+    with localcontext(ENGINE_CONTEXT):
+        for candle in candles:
+            formation.update(candle)
+        return (trigger or BotinhaTrigger()).order_for(formation, tick=TICK, candle=candles[-1])
+
+
+def test_the_order_lands_on_the_numbers_he_dictated() -> None:
+    """His own arithmetic, dictated on 04/09: the centre at 100, the botinha at 90, the buy at
+    91, and the stop at 81.
+
+    The fixture is built so the two lines come out at exactly those numbers rather than near
+    them, because the whole point is to check the arithmetic against the man who wrote it: ten
+    percent of a band of ten is one, and the stop is a whole band below the entry.
+    """
+    order = _order([_HIS_EXAMPLE], ZoneKind.DEMAND)
+
+    assert order is not None
+    assert order.side is Side.LONG
+    assert order.limit_price == Decimal("91.00")
+    assert order.stop_loss == Decimal("81.00")
+    assert order.risk == Decimal("10.00")
+
+
+def test_the_order_is_the_exact_mirror_of_his_numbers_over_a_supply_region() -> None:
+    """Reflect his example around 190 and both levels must reflect with it: 190 - 91 = 99 and
+    190 - 81 = 109.
+
+    A sell whose entry was still computed *upward* from the botinha would land at 101 with the
+    stop at 111 — a trade in the right direction, at prices nobody chose, and no state anywhere
+    would be wrong.
+    """
+    order = _order([_HIS_EXAMPLE_MIRRORED], ZoneKind.SUPPLY)
+
+    assert order is not None
+    assert order.side is Side.SHORT
+    assert order.limit_price == Decimal("99.00")
+    assert order.stop_loss == Decimal("109.00")
+    assert order.risk == Decimal("10.00")
+
+
+def test_the_order_chases_the_botinha_and_the_risk_shrinks_behind_it() -> None:
+    """His choice, asked directly and answered: the order chases the botinha.
+
+    Both lines are cumulative, so every close moves them. What that produces is not obvious and is
+    worth pinning: the entry creeps **up** while the risk falls, because `d` is a volume-weighted
+    mean of `(H + C - 2L)/3` — the *shape* of the bars, not the level of price — and quiet bars
+    dilute the big one the anchor sits on. Three bars take the risk from 1.44 to 1.02.
+    """
+    chase = [
+        *_INTO_DEMAND,
+        bar(4, open_="97.20", high="97.40", low="96.00", close="96.30", tick_volume=900),
+        bar(5, open_="96.30", high="96.50", low="95.60", close="95.80", tick_volume=1100),
+    ]
+    formation = VwapFormation(_region(ZoneKind.DEMAND))
+    trigger = BotinhaTrigger()
+    placed: list[tuple[Money, Money, Money]] = []
+
+    with localcontext(ENGINE_CONTEXT):
+        for candle in chase:
+            formation.update(candle)
+            order = trigger.order_for(formation, tick=TICK, candle=candle)
+            if order is not None:
+                placed.append((order.limit_price, order.stop_loss, order.risk))
+
+    assert placed == [
+        (Decimal("95.24"), Decimal("93.80"), Decimal("1.44")),
+        (Decimal("95.44"), Decimal("94.22"), Decimal("1.22")),
+        (Decimal("95.49"), Decimal("94.47"), Decimal("1.02")),
+    ]
+
+
+def test_the_rounding_widens_the_risk_rather_than_shaving_the_stop() -> None:
+    """Both levels are snapped away from the trade, so the placed risk is *wider* than `d`.
+
+    The unrounded arithmetic gives an entry of 95.2322 and a stop of 93.7989 — a distance of
+    exactly `d`, 1.43333. On the grid they become 95.24 and 93.80, and the distance becomes 1.44.
+    Rounding the other way would have handed the trade a better entry and a nearer stop, which is
+    the same lie twice: a fill it might not have got, sized against a risk it is not taking.
+
+    This is also why `risk` is read off the placed levels. Sizing against the unrounded `d` would
+    put the wrong amount of money behind every one of these orders, and the error would be
+    invisible — the two numbers agree to the second decimal.
+    """
+    formation = VwapFormation(_region(ZoneKind.DEMAND))
+    with localcontext(ENGINE_CONTEXT):
+        for candle in _INTO_DEMAND:
+            formation.update(candle)
+        lines = formation.lines()
+        order = BotinhaTrigger().order_for(formation, tick=TICK, candle=_INTO_DEMAND[-1])
+
+    assert lines is not None
+    assert order is not None
+    unrounded = lines.vwap - lines.botinha
+    assert str(unrounded) == "1.43333333333333333333333333"
+    assert order.limit_price == Decimal("95.24")  # 95.2322... rounded *up*, against the buyer
+    assert order.stop_loss == Decimal("93.80")  # 93.7989... rounded *down*, away from the entry
+    assert order.risk == Decimal("1.44")
+    assert order.risk > unrounded
+
+
+def test_the_rounding_is_mirrored_over_a_supply_region() -> None:
+    """The sell side rounds the other way, and the fixture is off-grid so it can tell.
+
+    Entry 94.7677 floors to 94.76 and the stop 96.1933 ceils to 96.20 — again a risk of 1.44,
+    wider than `d`. Mirrored wrongly the pair would be 94.77 and 96.19: a risk of 1.42, *narrower*
+    than the band it was measured from, which is the sell side quietly sizing bigger than the buy
+    side on identical geometry.
+    """
+    order = _order(_INTO_SUPPLY, ZoneKind.SUPPLY)
+
+    assert order is not None
+    assert order.limit_price == Decimal("94.76")
+    assert order.stop_loss == Decimal("96.20")
+    assert order.risk == Decimal("1.44")
+
+
+def test_an_entry_that_came_out_above_the_close_places_nothing() -> None:
+    """A buy limit at or above the market is not a limit — it is a market order wearing one.
+
+    Reachable, and this is the shape: a bar with a huge upper wick that closes near its own low
+    drags the botinha up to that low while leaving `d` enormous, so the entry lands above the
+    close. Here the lines are 133.37 and 100.00 with the bar closing at 100.10, and the entry
+    would be 103.34 — filled instantly at whatever the market offers, which is exactly the trade
+    this setup exists to avoid.
+
+    The formation stays alive: it is the level that is unusable on this bar, not the setup.
+    """
+    spike = bar(1, open_="100.05", high="200", low="100", close="100.10", tick_volume=1000)
+    formation = VwapFormation(_region(ZoneKind.DEMAND))
+    with localcontext(ENGINE_CONTEXT):
+        formation.update(spike)
+        order = BotinhaTrigger().order_for(formation, tick=TICK, candle=spike)
+
+    assert order is None
+    state = formation.state
+    assert state is FormationState.ANCHORED
+
+
+def test_a_level_that_falls_through_zero_places_nothing() -> None:
+    """A band tall against its own price puts a long's stop under nothing.
+
+    Lines at 1.3667 and 0.1000 give an entry of 0.23 and a stop of -1.04. `Signal` refuses a
+    non-positive level outright, so the run would end in an exception raised from inside a
+    backtest; caught here, the setup simply goes quiet.
+
+    ⚠️ This is the *stop* half of that guard, and it is the only half positive prices can reach:
+    an entry is `botinha ± 10%·d` with `d` at most two thirds of the botinha, so it never crosses
+    zero while prices are positive. The entry half needs prices that are not — see the test below.
+    """
+    order = _order(
+        [bar(1, open_="0.5", high="3", low="0.1", close="1", tick_volume=1000)],
+        ZoneKind.DEMAND,
+        top="3",
+        bottom="0.1",
+    )
+
+    assert order is None
+
+
+def test_a_formation_with_nothing_to_say_places_nothing() -> None:
+    """The three silences of the formation are one silence here, and all three are honest.
+
+    Not anchored, anchored over a series with no volume, and dead: none of them is a level, and
+    the trigger has no opinion the formation has not already formed.
+    """
+    trigger = BotinhaTrigger()
+    watching = VwapFormation(_region(ZoneKind.DEMAND))
+    with localcontext(ENGINE_CONTEXT):
+        assert trigger.order_for(watching, tick=TICK, candle=_INTO_DEMAND[0]) is None
+
+    mute = [
+        bar(1, open_="100.50", high="100.60", low="98.00", close="98.50"),
+        bar(2, open_="98.50", high="98.80", low="95.00", close="95.50"),
+        bar(3, open_="95.50", high="97.50", low="95.20", close="97.20"),
+    ]
+    assert _order(mute, ZoneKind.DEMAND) is None
+
+    killed = [*_INTO_DEMAND, bar(4, open_="95.00", high="95.10", low="89.00", close="94.00")]
+    assert _order(killed, ZoneKind.DEMAND) is None
+
+
+def test_a_margin_that_is_not_inside_the_band_is_refused() -> None:
+    """Zero rests the order on the botinha and one rests it on the centre line — the two ends at
+    which the entry stops being an entry and becomes one of the lines it was measured from."""
+    for margin in (Decimal(0), Decimal(1), Decimal("-0.1"), Decimal("1.5")):
+        with pytest.raises(EngineError, match="strictly between 0 and 1"):
+            BotinhaTrigger(margin=margin)
+
+
+def test_the_margin_moves_the_entry_and_leaves_the_stop_a_whole_band_behind() -> None:
+    """A wider margin walks the entry up the band; the stop follows it, a whole `d` behind.
+
+    Pinned because the two are computed from the same `d` and it would be easy to write a version
+    where the margin quietly widened the stop as well — leaving the risk fixed while the entry
+    moved, which is a different trade from the one he described.
+    """
+    order = _order([_HIS_EXAMPLE], ZoneKind.DEMAND, trigger=BotinhaTrigger(margin=Decimal("0.5")))
+
+    assert order is not None
+    assert order.limit_price == Decimal("95.00")  # halfway up the band of ten, not a tenth
+    assert order.stop_loss == Decimal("85.00")  # still a whole band below the entry
+    assert order.risk == Decimal("10.00")
+
+
+def test_two_lines_that_have_met_place_nothing() -> None:
+    """A band of zero width is no band, and reaching one takes both halves of this module.
+
+    I first argued this was unreachable: `d` is a volume-weighted mean of `(H + C - 2L)/3`, which
+    is zero only for a bar with no range at all, and a bar with no range cannot close up — so the
+    confirming bar always contributes something positive. The argument is sound and the conclusion
+    was wrong, because it forgot the other rule in this file: **a bar with no volume is skipped**.
+
+    So the reachable shape is a flat bar carrying volume, confirmed by a bar carrying none. The
+    confirmation is real — the formation anchors — but the average never sees it, and both lines
+    sit on the same price. The entry, the stop and the botinha would be one number, and the risk
+    manager would size a trade against a distance of zero.
+
+    Kept and tested rather than argued away, which is the difference between a guard and a
+    comment: the reasoning that says a branch cannot be reached is exactly the reasoning that
+    stops being true when someone adds a second way in.
+    """
+    coincident = [
+        bar(1, open_="95", high="95", low="95", close="95", tick_volume=1000),
+        bar(2, open_="95", high="96", low="95", close="96", tick_volume=0),
+    ]
+    formation = VwapFormation(_region(ZoneKind.DEMAND))
+    with localcontext(ENGINE_CONTEXT):
+        for candle in coincident:
+            formation.update(candle)
+        lines = formation.lines()
+        order = BotinhaTrigger().order_for(formation, tick=TICK, candle=coincident[-1])
+
+    # The formation is healthy and has something to say: it anchored, and both lines exist.
+    state = formation.state
+    assert state is FormationState.ANCHORED
+    assert lines is not None
+    assert lines.vwap == lines.botinha == Decimal("95")
+    # It is the trigger that has nothing to place.
+    assert order is None
+
+
+def test_an_entry_that_lands_exactly_on_the_close_places_nothing() -> None:
+    """The boundary of the crossed-limit guard, and nothing else in this file reaches it.
+
+    A buy limit *at* the close is not a limit either: the next bar opens at or around that price
+    and takes it immediately, which is the market order the whole entry exists to avoid. The
+    fixture is built to land on it exactly — lines at 110 and 100 over a bar closing at 101 put
+    the entry at 101.00, to the cent.
+
+    Written because `>=` and `>` are one character apart and every other scenario here is
+    comfortably on one side or the other, so both spellings agree everywhere but here.
+    """
+    lands_on_the_close = bar(
+        1, open_="100.50", high="129", low="100", close="101", tick_volume=1000
+    )
+    formation = VwapFormation(_region(ZoneKind.DEMAND))
+    with localcontext(ENGINE_CONTEXT):
+        formation.update(lands_on_the_close)
+        lines = formation.lines()
+        order = BotinhaTrigger().order_for(formation, tick=TICK, candle=lands_on_the_close)
+
+    assert lines is not None
+    # The raw arithmetic really does land on the close: 100 + 10% of a band of ten.
+    assert lines.vwap == Decimal("110")
+    assert lines.botinha == Decimal("100")
+    assert order is None
+
+
+def test_an_entry_through_zero_places_nothing_even_when_the_stop_is_fine() -> None:
+    """The entry half of the zero guard, which needs prices that are themselves negative.
+
+    Not a hypothetical: crude went below zero in April 2020, and an engine whose levels are
+    Decimal has no opinion about the sign of a price. Over a supply region of [-10, -1] the lines
+    come out at -6 and -1, so the entry is -1.50 while the stop is a healthy +3.50 — the one
+    shape where checking only the stop lets a non-positive level through, and `Signal` would then
+    raise from inside the run rather than the setup going quiet.
+
+    ⚠️ It is also the answer to "is this branch dead?", which is a different question from "can I
+    reach it today". With positive prices it is unreachable and provably so. That is an argument
+    for testing the case that reaches it, not for deleting the line.
+    """
+    negative = bar(1, open_="-2", high="-1", low="-9", close="-8", tick_volume=1000)
+    formation = VwapFormation(_region(ZoneKind.SUPPLY, top="-1", bottom="-10"))
+    with localcontext(ENGINE_CONTEXT):
+        formation.update(negative)
+        lines = formation.lines()
+        order = BotinhaTrigger().order_for(formation, tick=TICK, candle=negative)
+
+    assert lines is not None
+    assert lines.vwap == Decimal("-6")
+    assert lines.botinha == Decimal("-1")
+    assert order is None
+
+
+def test_an_entry_that_came_out_below_the_close_places_nothing_on_a_sale() -> None:
+    """The mirror of the crossed-limit guard, and it is a *different* bug from the pasted branch.
+
+    Pasting the buy branch over the sell one is caught by the mirrored goldens. **Deleting** the
+    sell half is not: with `else False` every scenario in this file still passes, because none of
+    them makes the guard fire on a short. The two mutants are one line apart and only one had a
+    test — the same shape that blocked #189 and #190.
+
+    The fixture is the exact reflection of the buy-side spike: a long wick *down* that closes near
+    its own high drags the botinha down to that high while `d` stays enormous, so
+    `botinha - 10%·d` lands at 196.66 with the market at 199.90. A sell limit *below* the market
+    is marketable — the next open takes it at whatever the venue offers, which is the market
+    order this entry exists to avoid, and the backtest would simply look better for it.
+    """
+    spike = bar(1, open_="199.95", high="200", low="100", close="199.90", tick_volume=1000)
+    formation = VwapFormation(_region(ZoneKind.SUPPLY, top="200", bottom="190"))
+    with localcontext(ENGINE_CONTEXT):
+        formation.update(spike)
+        order = BotinhaTrigger().order_for(formation, tick=TICK, candle=spike)
+
+    assert order is None
+    state = formation.state
+    assert state is FormationState.ANCHORED
+
+
+def test_an_entry_that_lands_exactly_on_the_close_places_nothing_on_a_sale() -> None:
+    """The boundary of that guard on the sell side: `<=` against `<`, one character apart.
+
+    Lines at 90 and 100 over a bar closing at 99 put the entry at exactly 99.00. The buy side has
+    had this test since the trigger was written; the sell side had the rule and no scenario that
+    reached its edge, which is what "one test per branch" does not buy you.
+    """
+    lands_on_the_close = bar(1, open_="99.5", high="100", low="71", close="99", tick_volume=1000)
+    formation = VwapFormation(_region(ZoneKind.SUPPLY))
+    with localcontext(ENGINE_CONTEXT):
+        formation.update(lands_on_the_close)
+        lines = formation.lines()
+        order = BotinhaTrigger().order_for(formation, tick=TICK, candle=lands_on_the_close)
+
+    assert lines is not None
+    assert lines.vwap == Decimal("90")
+    assert lines.botinha == Decimal("100")
+    assert order is None
+
+
+def test_a_level_that_lands_exactly_on_zero_places_nothing() -> None:
+    """`<=` and not `<`, and only a sale can show it.
+
+    On a buy the boundary is subsumed: an entry of exactly zero puts the stop at `-d`, so the
+    stop half of the guard fires anyway and the two spellings agree. On a sale the stop is
+    `entry + d`, comfortably positive, so a zero entry is the one level at which `<= 0` and `< 0`
+    part company — and `OrderRequest` refuses a non-positive limit with a `ValueError`, which is
+    the exception from inside a running backtest that this guard exists to prevent.
+
+    Lines at -9 and 1 over a region of [-5, 1] put the entry at 0.00 exactly, with the stop at a
+    healthy 10.00. The prices are negative because that is the only way to reach the edge, and
+    negative prices are not a thought experiment: crude traded there in April 2020.
+    """
+    negative = bar(1, open_="-7", high="1", low="-20", close="-8", tick_volume=1000)
+    formation = VwapFormation(_region(ZoneKind.SUPPLY, top="1", bottom="-5"))
+    with localcontext(ENGINE_CONTEXT):
+        formation.update(negative)
+        lines = formation.lines()
+        order = BotinhaTrigger().order_for(formation, tick=TICK, candle=negative)
+
+    assert lines is not None
+    assert lines.vwap == Decimal("-9")
+    assert lines.botinha == Decimal("1")
+    # The entry is exactly the boundary, and the stop is nowhere near it.
+    assert order is None

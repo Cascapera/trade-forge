@@ -325,12 +325,13 @@ def test_the_force_stop_is_measured_off_the_hammer_and_not_off_the_force_bar() -
 
 
 def test_the_force_entry_is_silent_when_the_force_bar_does_not_clear_the_hammer() -> None:
-    """⚠️ **The case his rule does not describe, and the reason it needs a decision.**
+    """His rule, given when the case was put to him: *"barra de força que não supera o martelo
+    cancela entrada"* (2026-09-06).
 
     A hammer may carry an upper shadow of nearly half its height, so a perfectly valid force bar
     can top out *below* the hammer's high. "Between the two highs" then names an empty interval,
     and thirty percent of a negative spread would put a **buy limit below the hammer** — an order
-    at a price his method never mentions. Refusing costs at worst a setup; arming invents one.
+    at a price his method never mentions.
     """
     lower = candle(1, open_="86.5", high="89", low="86", close="88.8")
     assert is_force_bar(lower, side=Side.LONG)

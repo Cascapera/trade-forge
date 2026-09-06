@@ -289,13 +289,19 @@ class HammerForceTrigger:
     ) -> HammerForceLevels | None:
         """The three levels if `hammer` is a hammer and `force` is a force bar behind it.
 
-        ⚠️ **`None` when the force bar's extreme does not clear the hammer's**, which his rule
-        does not mention because it does not describe a trade. A hammer may carry an upper shadow
-        of almost half its height, so a perfectly valid force bar can still close and top out
-        *below* the hammer's high — and then "between the two highs" names an empty interval, and
-        the 30% would put a buy limit **below** the hammer rather than above it. Refusing is the
-        failure that costs a setup he would have taken at worst; arming would place an order at a
-        price his rule never described.
+        ⚠️ **`None` when the force bar's extreme does not clear the hammer's, and that is his
+        rule rather than a conservative default of ours.** Asked directly, 2026-09-06: *"barra de
+        força que não supera o martelo cancela entrada"*. It was written here first as a refusal
+        we had chosen — a hammer may carry an upper shadow of almost half its height, so a
+        perfectly valid force bar can top out *below* the hammer's high, and then "between the two
+        highs" names an empty interval where thirty percent would put a buy limit **below** the
+        hammer. Same behaviour either way; the difference is who may change it, and a docstring
+        crediting the wrong author is an invitation to tune a method rule.
+
+        ⚠️ It says **cancel**, not "not yet". There is no second candidate anyway — the force bar
+        is the bar immediately after the hammer — so what the word decides is whether the region
+        may go on offering *another* hammer inside the same window. That belongs to the clock, not
+        here, and it is the open question this trigger hands upstairs.
         """
         if not is_hammer(hammer, side=side, shadow_fraction=self.shadow_fraction):
             return None

@@ -294,6 +294,11 @@ def _iter_run(  # noqa: PLR0913 — see run()
     # refusals belong to no candle, and inventing one to carry them would put a bar in the
     # equity curve that the market never produced.
     pending: tuple[Refusal, ...] = refusals
+    # What the last drain of the broker's mailbox produced, waiting to be put on a `BarOutcome`
+    # (ADR-0025). It is already inside `pending` — the strategy sees it through `Context` — and
+    # it is carried separately only because the *record* needs it and `pending` cannot say which
+    # half of itself came from where.
+    carried: tuple[Refusal, ...] = ()
     # The arming window. Holds the decision bar plus the bars before it, and no more — see
     # SNAPSHOT_BARS_BEFORE. The loop owns it because the loop is the only component that sees
     # the stream, in backtest and in live alike, and because it is here that `decided_at` is
@@ -312,7 +317,7 @@ def _iter_run(  # noqa: PLR0913 — see run()
             # below can decide an entry without it being the window's last bar.
             window.append(candle)
 
-            outcome = _step(
+            outcome, gates = _step(
                 index=index,
                 candle=candle,
                 window=window,
@@ -322,6 +327,7 @@ def _iter_run(  # noqa: PLR0913 — see run()
                 broker=broker,
                 risk=risk,
                 refusals=pending,
+                recorded=carried,
             )
 
         yield outcome
@@ -329,12 +335,29 @@ def _iter_run(  # noqa: PLR0913 — see run()
         previous = candle
         # ⚠️ Replaced, never accumulated. A refusal is news, and news delivered twice is a
         # strategy told its order was turned away on a bar when nothing was asked — which for
-        # `StructurePhase` would forget an order it had just successfully armed.
+        # `StructurePhase` would forget an order it had just successfully armed. That is why
+        # `gates` and not `outcome.refusals`: the outcome also carries the previous drain,
+        # which this bar's `Context` has already shown the strategy.
+        #
         # ⚠️ **Asked outside `localcontext`, and after the yield, deliberately.** This is a read
         # from another process's mailbox (ADR-0024), not arithmetic — and it must happen on every
         # bar, including the ones `_step` produced nothing on, or a refusal that arrives while
         # the strategy is quiet waits for the next order to be turned away before it is seen.
-        pending = (*outcome.refusals, *broker.refusals())
+        #
+        # ⚠️ **What is drained here is delivered on the very next bar, and the first version
+        # of ADR-0025 lost that by routing, not by timing.** It drained at the top of `_step`
+        # and put the result on that bar's outcome — from where `pending` carried it to the
+        # bar *after*. An executor's verdict lands milliseconds after `submit` (ADR-0024
+        # measured 8 ms), inside step 3 of this bar; measured on a fake that refuses inside
+        # `submit`, an order sent on bar 2 reached the strategy on bar 3 from here and on bar
+        # 4 that way. Fifteen minutes of a live M15 session believing in an order the venue
+        # never took. The drain itself could sit later still — the `for` above blocks on the
+        # next candle *after* this line, so the top of `_step` sees everything that lands in
+        # that wait too — but only if what it drains goes into the *same* bar's `Context`,
+        # which is not what `Context.refusals` means today. That is the backlog's decision to
+        # make, with the wider window as its prize; this PR restores the delivery it found.
+        carried = tuple(broker.refusals())
+        pending = (*gates, *carried)
 
 
 def _step(  # noqa: PLR0913 — one bar of the loop; every argument is a seam or the bar itself
@@ -348,7 +371,8 @@ def _step(  # noqa: PLR0913 — one bar of the loop; every argument is a seam or
     broker: Broker,
     risk: RiskManager,
     refusals: tuple[Refusal, ...] = (),
-) -> BarOutcome:
+    recorded: tuple[Refusal, ...] = (),
+) -> tuple[BarOutcome, tuple[Refusal, ...]]:
     """One bar, five ordered steps. The order is the anti-lookahead rule — see the module
     docstring. Runs inside `ENGINE_CONTEXT`; its caller is responsible for that.
 
@@ -362,6 +386,23 @@ def _step(  # noqa: PLR0913 — one bar of the loop; every argument is a seam or
         _reject_lookahead(fill, candle, timeframe)
         _reject_foreign_symbol(fill, instrument)
         born.append(fill)
+
+    # 1b. `recorded` is what `iter_run` drained from the broker's mailbox after the previous
+    #     bar — refusals nobody in this loop built, and until ADR-0025 the only ones that
+    #     reached no `BarOutcome` at all. They are put on this bar's outcome so that
+    #     `RunResult.refusals` — "every order the run intended and did not place" — can hold
+    #     them, and they are *also* in `refusals` above, which is how the strategy sees them.
+    #
+    # ⚠️ **Recorded here, one bar after the bar they belong to, and that is the price of
+    # keeping `Context.refusals` meaning "the previous bar's".** The first version of this PR
+    # drained at the top of this step and put the result on this bar's outcome; that dated
+    # them correctly and delivered them one bar late, because `pending` is built from the
+    # outcome. Draining here *and* showing the result in this bar's `Context` would fix both —
+    # it is the change the backlog holds — but it is a change to what a strategy is told a
+    # refusal in its `Context` means, not to this broker. Delivery beat provenance:
+    # `RunResult.refusals` is a flat list and does not care which bar recorded a refusal,
+    # while `StructurePhase` cares very much which bar it learns on.
+    turned_away: list[Refusal] = []
 
     # 2. Only now is the strategy allowed to look at this candle — and at nothing else.
     #    The account is read once: against a live terminal, two reads are two round
@@ -390,7 +431,6 @@ def _step(  # noqa: PLR0913 — one bar of the loop; every argument is a seam or
     # ghost ADR-0023 measured at four of five hand-over points, arriving through whichever of
     # these three doors happens to be open. `logger.debug` was not a channel; the strategy
     # cannot read a log.
-    turned_away: list[Refusal] = []
     for signal in strategy.on_bar(context):
         # A cancel is the one intent that never becomes an order — it withdraws one. It
         # skips sizing and the veto for the same reason an exit skips sizing: there is
@@ -475,12 +515,21 @@ def _step(  # noqa: PLR0913 — one bar of the loop; every argument is a seam or
     # ⚠️ `account` is the one read in step 2, deliberately — not a fresh one taken here. The
     # curve is meant to be what the strategy was looking at when it decided, and against a
     # live terminal a second read is a second round trip that can disagree with the first.
-    return BarOutcome(
-        index=index,
-        candle=candle,
-        fills=tuple(born),
-        equity=EquityPoint(time=candle.time, equity=account.equity),
-        refusals=tuple(turned_away),
+    # ⚠️ **Two values, and the second is not a convenience.** The outcome carries everything
+    # known on this bar, `recorded` included, because that is the record. `iter_run` needs the
+    # *gates alone* to build the next bar's `pending`: `recorded` was already delivered to the
+    # strategy in this bar's `Context`, and putting it back in `pending` would deliver the same
+    # news twice — which the comment there says is a phase forgetting an order it just armed.
+    # `_step` is private, so saying it in the return type costs nothing.
+    return (
+        BarOutcome(
+            index=index,
+            candle=candle,
+            fills=tuple(born),
+            equity=EquityPoint(time=candle.time, equity=account.equity),
+            refusals=(*recorded, *turned_away),
+        ),
+        tuple(turned_away),
     )
 
 

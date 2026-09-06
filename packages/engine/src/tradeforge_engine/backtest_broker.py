@@ -52,6 +52,7 @@ from tradeforge_engine.domain import (
     OrderResult,
     Position,
     Refusal,
+    RefusedBy,
     Side,
     SignalKind,
     _require_utc,
@@ -260,6 +261,11 @@ class BacktestBroker:
 
         # The open position's protective levels, or None when flat or holding an unstopped one.
         self._protection: _Protection | None = None
+
+        # Resting orders the market ended, waiting to be drained by `refusals()`. A list, not a
+        # counter: the strategy matches by `client_id`, and two zones can lose their order to
+        # the same gap. See ADR-0025.
+        self._market_ended: list[Refusal] = []
 
     # ----------------------------------------------------------------------- #
     # Broker protocol                                                          #
@@ -491,15 +497,46 @@ class BacktestBroker:
         return self._portfolio.trades
 
     def refusals(self) -> Sequence[Refusal]:
-        """Always empty, and that is an answer rather than a stub (ADR-0024).
+        """The resting orders this broker withdrew because the market left them. ADR-0025.
 
-        A refusal reaches a broker out of band only when the verdict on an order arrives after
-        `submit` returned — which needs another process. Here `submit` **is** the verdict: it
-        inspects the book and answers on the spot, so there is no window for one to arrive in.
-        An implementation of this that had something to say would be one whose `submit` was
-        lying about what it knew.
+        ⚠️ **Never a verdict on a `submit`, and that half of the old docstring still holds
+        (ADR-0024).** A refusal reaches a broker out of band only when the answer to an order
+        arrives after `submit` returned, which needs another process; here `submit` inspects
+        the book and answers on the spot. What this returns is the other thing entirely — an
+        order that *was* accepted, rested, and then stopped existing without anybody deciding
+        so. `submit` cannot have said that, because it had not happened yet.
+
+        Drained rather than read, matching `live.broker`: the loop asks once a bar, and news
+        delivered twice would tell a strategy its order was withdrawn on a bar when it holds a
+        perfectly good one (see `iter_run`, which replaces `pending` rather than accumulating).
         """
-        return ()
+        drained, self._market_ended = self._market_ended, []
+        return tuple(drained)
+
+    def _end_by_market(self, order: OrderRequest, detail: str) -> None:
+        """Record a resting order the market ended, for the next bar's `refusals()`.
+
+        ⚠️ **Until ADR-0025 this was a `logger.debug` and nothing else**, which made the
+        withdrawal invisible to the one component that needed it: the strategy goes on holding
+        the name, offers no other order for that zone, and eventually sends a cancel the book
+        cannot honour. Measured over 2025 on AAPL and EURUSD M15 — 19 orders, `refusals` empty
+        in all twenty runs, and `cancel` missing exactly as often as an order had been dropped.
+
+        The `reason` is the strategy's own name for the order and the `detail` is this broker's
+        account of the market, which is the split `Refusal` documents. `client_id` may be `None`
+        for a strategy that does not name its orders; that is a log line rather than a
+        correlation, and it is honest — see `Refusal`.
+        """
+        logger.debug("resting order %s withdrawn: %s", order.client_id, detail)
+        self._market_ended.append(
+            Refusal(
+                client_id=order.client_id,
+                intent=order.intent,
+                refused_by=RefusedBy.MARKET,
+                reason=order.reason,
+                detail=detail,
+            )
+        )
 
     # ----------------------------------------------------------------------- #
     # Fills                                                                    #
@@ -615,11 +652,9 @@ class BacktestBroker:
                 # because this order losing its reason to exist says nothing about the next
                 # one in the queue.
                 self._resting.remove(resting)
-                logger.debug(
-                    "resting order %s dropped: %s gapped past its stop %s",
-                    resting.name,
-                    price,
-                    resting.order.stop_loss,
+                self._end_by_market(
+                    resting.order,
+                    f"{price} gapped past its stop {resting.order.stop_loss}",
                 )
                 continue
             if not _survives_the_slip(resting.order, price):
@@ -628,11 +663,9 @@ class BacktestBroker:
                 # on the same terms as the gap above — the level is behind the market, so the
                 # order is gone rather than waiting, and the bar goes on to the next in the queue.
                 self._resting.remove(resting)
-                logger.debug(
-                    "resting order %s dropped: %s is too far past its trigger %s",
-                    resting.name,
-                    price,
-                    resting.order.stop_price,
+                self._end_by_market(
+                    resting.order,
+                    f"{price} is too far past its trigger {resting.order.stop_price}",
                 )
                 continue
 

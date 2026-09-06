@@ -720,7 +720,7 @@ class OrderResult:
 
 
 class RefusedBy(StrEnum):
-    """Which of the three gates between intent and the book turned an order away.
+    """Who ended an order the strategy believes in — a gate that turned it away, or the market.
 
     They are not interchangeable, and the difference is what a strategy would act on:
     `SIZING` and `RISK` are answers about *this account at this moment* and change on their own
@@ -728,7 +728,7 @@ class RefusedBy(StrEnum):
     "refused" would leave a strategy unable to tell "not with this much money" from "never this
     order", which are opposite instructions.
 
-    ⚠️ The last two arrive from **outside this process**, after `submit` already answered
+    ⚠️ `EXECUTOR` and `VENUE` arrive from **outside this process**, after `submit` already answered
     `accepted` (ADR-0024). They are separate members rather than one "downstream" because they
     behave oppositely: `EXECUTOR` refuses on a condition that changes on its own — a session that
     resumes beating, a volume cap the next size clears — while `VENUE` is usually the same answer
@@ -759,10 +759,33 @@ class RefusedBy(StrEnum):
     """The terminal itself refused. Carries the venue's own retcode in `detail`, because that
     number is the only thing that distinguishes "your stop is too close" from "trading is off"."""
 
+    MARKET = "market"
+    """Nobody refused: the order rested, and the market moved past the level it was waiting at.
+
+    ⚠️ **The only member where the order really did reach the book**, which is why the class
+    above says "or the market" rather than naming a third gate. A broker withdraws a resting
+    order when filling it would open a position already past its own exit (`_survives_the_gap`)
+    or carrying risk the manager never sized (`_survives_the_slip`, ADR-0016). The withdrawal is
+    correct; what was missing was anybody being told, and ADR-0025 is that.
+
+    ⚠️ **It must not count against an arming cap, and `setups._observe_refusal` is where that is
+    enforced.** A cap exists to retire a zone whose order keeps being turned away — evidence
+    about the order or the account, which retrying will not fix. A gap is evidence about neither:
+    it says the market left, and the next zone this strategy arms is a different question
+    entirely. Counting it would retire setups for having been open on a Monday."""
+
 
 @dataclass(frozen=True, slots=True)
 class Refusal:
-    """An order the strategy asked for that **never reached the book**, and why.
+    """An order the strategy believes rests somewhere, and it does not — and why.
+
+    ⚠️ **This used to read "never reached the book", and that was the whole of it until
+    ADR-0025.** The wording was not a summary of the six members, it was a description of the
+    only way it had happened so far — and `RefusedBy.MARKET` is an order that reached the book,
+    rested in it, and was withdrawn when the market moved past its level. What every member
+    actually shares is the instruction, not the history: *stop believing this order exists*.
+    Measured before it was widened: 19 orders left the book that way in one year of AAPL and
+    EURUSD M15, and `RunResult.refusals` reported zero for all of them.
 
     The sibling of `Fill`, and it exists for the sibling reason. `Context.fills` was added
     because a strategy that never learns its order became a trade goes on treating the order as

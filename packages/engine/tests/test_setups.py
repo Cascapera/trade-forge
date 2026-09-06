@@ -17,6 +17,7 @@ import pytest
 
 from tradeforge_engine import setups
 from tradeforge_engine.backtest_broker import BacktestBroker
+from tradeforge_engine.bar_setups import is_hammer
 from tradeforge_engine.costs import NoCostModel
 from tradeforge_engine.domain import (
     AccountState,
@@ -42,8 +43,10 @@ from tradeforge_engine.setups import (
     ChochQualifier,
     ContinuationQualifier,
     FffdActivation,
+    HammerBreakActivation,
     SetupContext,
     StructureStrategy,
+    ZoneEntry,
     ZoneEntryPoint,
 )
 from tradeforge_engine.structure import (
@@ -4029,3 +4032,450 @@ def test_a_second_trigger_at_the_very_same_levels_still_reaches_the_book() -> No
     # And it lives its own two bars, taken back on 22 rather than never having existed.
     [taken_back] = signals[22]
     assert taken_back.kind is SignalKind.CANCEL
+
+
+# --------------------------------------------------------------------------- #
+# The hammer, his chapter 11.1 variation 1, through the whole machine           #
+# --------------------------------------------------------------------------- #
+
+
+# Back down out of the impulse and into the region the golden marks, [90, 100].
+_FALLS_BACK = [
+    bar(10, open_="124", close="118", high="124.5", low="117.5"),
+    bar(11, open_="118", close="110", high="118.5", low="109"),
+    bar(12, open_="110", close="103", high="110.5", low="102"),
+]
+
+# Bar 13 both touches the region (low 98) and is the hammer: three points of tail on a
+# four-point bar, under a body of half a point up.
+_TOUCHES_AND_HAMMERS = [bar(13, open_="101", close="101.5", high="102", low="98")]
+
+
+# Bars that reach into the region and are **not** hammers -- they close down.
+def _touch_without_hammering(index: int) -> Candle:
+    return bar(index, open_="99.5", close="99.2", high="100.5", low="99")
+
+
+_QUIET_ABOVE = [
+    bar(index, open_="101.5", close="101.6", high="101.7", low="101.4") for index in (14, 15, 16)
+]
+
+
+def _hammer(index: int) -> Candle:
+    return bar(index, open_="101", close="101.5", high="102", low="98")
+
+
+def _martelo(candles: list[Candle]) -> list[list[Signal]]:
+    return _drive_from_bullish(
+        StructureStrategy(qualifier=_Marked(), entry_point=ZoneEntryPoint.MARTELO), candles
+    )
+
+
+def test_the_hammer_arms_a_stop_past_its_high_with_a_stop_off_its_own_height() -> None:
+    """His variation 1, end to end. The bar that touches the region is itself the hammer.
+
+    A four-point hammer topping at 102 puts the order at **102.01** -- one tick past it on a penny
+    instrument -- and the protective stop at **97.20**, which is twenty percent of the *bar* below
+    its low of 98. Neither number is arithmetic on the region: [90, 100] appears nowhere in them,
+    and that is the whole point of the stop he moved onto the bar.
+    """
+    [placed] = _martelo([*_IMPULSE, *_FALLS_BACK, *_TOUCHES_AND_HAMMERS])[13]
+
+    assert placed.kind is SignalKind.ENTRY
+    assert placed.side is Side.LONG
+    assert placed.stop_price == Decimal("102.01")
+    assert placed.stop_loss == Decimal("97.20")
+    assert placed.limit_price is None  # a stop entry: price has to break through, not come back
+
+
+def test_the_hammer_sell_is_the_exact_mirror_of_the_buy() -> None:
+    """Reflected around 200, both levels reflect: 97.99 and 102.80.
+
+    Four branches have to mirror at once -- which shadow makes a hammer, which way the body must
+    close, which side the order waits on, and which extreme the stop is measured from. A sell that
+    inherited any one of them from the buy side still produces a short, at a price nobody chose.
+    """
+    [placed] = _drive(
+        StructureStrategy(qualifier=_Marked(), entry_point=ZoneEntryPoint.MARTELO),
+        _mirror([*_IMPULSE, *_FALLS_BACK, *_TOUCHES_AND_HAMMERS]),
+    )[13]
+
+    assert placed.side is Side.SHORT
+    assert placed.stop_price == Decimal("97.99")  # 200 - 102.01
+    assert placed.stop_loss == Decimal("102.80")  # 200 - 97.20
+
+
+def test_a_hammer_whose_low_sits_inside_the_region_still_arms() -> None:
+    """His correction, and it reversed what he had said a message earlier.
+
+    Asked whether the hammer's low had to be *above* the region, he answered *"a minima do martelo
+    nao precisa estar acima da regiao, falei errado, so nao pode romper a minima da regiao"*. So a
+    hammer working entirely inside [90, 100] is a hammer this setup takes: low 92, order at 98.01,
+    stop at 90.80. Under the reading he corrected, this scenario would produce nothing at all.
+    """
+    inside = [bar(13, open_="97", close="97.5", high="98", low="92")]
+    [placed] = _martelo([*_IMPULSE, *_FALLS_BACK, *inside])[13]
+
+    assert placed.stop_price == Decimal("98.01")
+    assert placed.stop_loss == Decimal("90.80")
+
+
+def test_a_hammer_at_the_arming_ceiling_arms_and_one_past_it_does_not() -> None:
+    """His arithmetic: region [90, 100] is ten points, half is five, the ceiling is **105**.
+
+    A hammer topping exactly at 105 arms -- with its order at 105.01, *past* the ceiling, because
+    the ceiling measures the hammer and not the order. He said so in as many words. One penny
+    higher and nothing is armed at all.
+
+    The two scenarios differ in a single field of a single bar, so whatever separates them is the
+    ceiling and can be nothing else.
+    """
+    at_it = [bar(13, open_="103", close="103.5", high="105", low="99")]
+    past_it = [bar(13, open_="103", close="103.5", high="105.01", low="99")]
+
+    [placed] = _martelo([*_IMPULSE, *_FALLS_BACK, *at_it])[13]
+    assert placed.stop_price == Decimal("105.01")
+    assert placed.stop_loss == Decimal("97.80")
+
+    assert _martelo([*_IMPULSE, *_FALLS_BACK, *past_it])[13] == []
+
+
+def test_the_region_gets_the_touching_bar_and_four_more() -> None:
+    """*"na mesma barra ou nas proximas 4 barras"* -- so bar 17 is a chance and bar 18 is not.
+
+    ⚠️ The bars in between have to **reach into the region** and fail to be hammers, which is what
+    the first version of this scenario got wrong: quiet bars sitting at 100.8 never touched
+    [90, 100] at all, so the count had not started and a hammer on bar 18 armed as its own
+    touching bar. The scenario passed while testing nothing about the window.
+    """
+    waiting = [_touch_without_hammering(index) for index in (13, 14, 15, 16)]
+    inside_the_window = _martelo([*_IMPULSE, *_FALLS_BACK, *waiting, _hammer(17)])
+    assert inside_the_window[17] != []
+
+    one_bar_late = _martelo(
+        [*_IMPULSE, *_FALLS_BACK, *waiting, _touch_without_hammering(17), _hammer(18)]
+    )
+    assert one_bar_late[18] == []
+
+
+def test_losing_the_region_before_any_hammer_ends_it_even_if_one_follows() -> None:
+    """*"nao romper a minima da regiao o que anularia a possibilidade da entrada"*.
+
+    Bar 13 closes through the bottom of [90, 100]; bar 14 is a perfectly good hammer and arms
+    nothing. Without the second bar this test would only prove that a down bar arms no order,
+    which is true of every down bar.
+    """
+    breaks_then_hammers = [
+        bar(13, open_="95", close="92", high="96", low="89"),
+        bar(14, open_="93", close="93.5", high="94", low="90.5"),
+    ]
+    signals = _martelo([*_IMPULSE, *_FALLS_BACK, *breaks_then_hammers])
+
+    assert is_hammer(breaks_then_hammers[1], side=Side.LONG)
+    assert signals[14] == []
+
+
+def test_the_order_lives_two_bars_and_the_region_dies_with_it() -> None:
+    """⚠️ **The line that separates this setup from the FFFD, and both answers are his.**
+
+    Armed on 13, the order lives 14 and 15 and comes back on 15. There the region survives a lapse
+    -- *"reseta a leitura"* -- and can configure itself again; here it does not: *"desarma tudo e
+    tem que esperar um novo contexto"*. So the identical hammer on bar 17 arms **nothing**.
+
+    Both halves are asserted together on purpose. The cancel alone is satisfied by either rule.
+    """
+    signals = _martelo([*_IMPULSE, *_FALLS_BACK, *_TOUCHES_AND_HAMMERS, *_QUIET_ABOVE, _hammer(17)])
+
+    assert signals[14] == []
+    [taken_back] = signals[15]
+    assert taken_back.kind is SignalKind.CANCEL
+    assert signals[17] == [], "a second hammer re-armed a region his rule had finished with"
+
+
+def test_losing_the_hammer_s_own_low_cancels_before_the_clock_does() -> None:
+    """*"se nao consumir a ordem e perder a minima do martelo vamos cancelar o gatilho"*.
+
+    The order was armed on 13 with two bars to live; bar 14 takes out the hammer's low of 98 and
+    the cancel lands there rather than on 15. The stop-loss at 97.20 sits below that low and is
+    never reached — the level that ends the setup and the level that would end the trade are
+    different numbers, and this is the bar that tells them apart.
+    """
+    loses_it = [
+        bar(14, open_="101.5", close="98.5", high="101.6", low="97.9"),
+        bar(15, open_="98.5", close="99.0", high="99.5", low="98.0"),
+    ]
+    signals = _martelo([*_IMPULSE, *_FALLS_BACK, *_TOUCHES_AND_HAMMERS, *loses_it])
+
+    [taken_back] = signals[14]
+    assert taken_back.kind is SignalKind.CANCEL
+    assert signals[15] == []
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"bars_to_hammer": 0}, "at least the touching bar"),
+        ({"bars_to_fill": 0}, "at least one bar"),
+        ({"reach_fraction": Decimal("-0.1")}, "fraction of the region"),
+    ],
+)
+def test_the_hammer_activation_refuses_a_dial_that_would_not_be_his_setup(
+    kwargs: dict[str, object], message: str
+) -> None:
+    """Loud rather than defaulting, the same doctrine the VWAP activations follow.
+
+    A window of zero bars can never contain the touching bar, which his rule says is the first
+    chance; an order that lives no bars is cancelled on the bar it is armed and can never fill;
+    and a negative reach puts the arming ceiling *below* the region's own edge, so a hammer
+    reaching into the zone at all would be refused. Each of the three runs silently.
+    """
+    with pytest.raises(EngineError, match=message):
+        HammerBreakActivation(**kwargs)  # type: ignore[arg-type]
+
+
+def _hammer_block(kind: ZoneKind, top: str, bottom: str) -> OrderBlock:
+    return OrderBlock(
+        kind=kind,
+        top=Decimal(top),
+        bottom=Decimal(bottom),
+        time=_at(1),
+        confirmed_at=_at(2),
+        break_kind=StructureKind.BOS,
+        primary=True,
+    )
+
+
+def _watch(
+    block: OrderBlock, candles: list[Candle], activation: HammerBreakActivation | None = None
+) -> tuple[HammerBreakActivation, list[ZoneEntry | None]]:
+    """Drive one activation over hand-built bars, without a qualifier or a structure machine.
+
+    ⚠️ **Deliberately below the strategy**, because three of the rules below are about a *single
+    comparison* on a region's edge, and a scenario driven through the detector cannot put a bar's
+    low exactly on a boundary without also moving the region that boundary belongs to.
+    """
+    live = activation or HammerBreakActivation()
+    seen: list[ZoneEntry | None] = []
+    with localcontext(ENGINE_CONTEXT):
+        for candle in candles:
+            context = Context(candle=candle, instrument=AAPL, account=_ACCOUNT)
+            live.observe(block, context=context)
+            seen.append(live.entry_for(block, context=context))
+    return live, seen
+
+
+def test_a_bar_resting_exactly_on_the_near_edge_has_touched_the_region() -> None:
+    """The boundary of the touch, and `<` instead of `<=` survives every scenario above.
+
+    A hammer whose low is exactly 100 on the region [90, 100] has reached it — his count starts on
+    *"se tocar na borda da região"*, and a bar that stops precisely on the border has touched it.
+    One tick higher and it has not.
+    """
+    region = _hammer_block(ZoneKind.DEMAND, "100", "90")
+    _, on_the_edge = _watch(region, [bar(0, open_="101.5", close="101.8", high="102", low="100")])
+    assert on_the_edge[0] is not None
+    assert on_the_edge[0].stop_price == Decimal("102.01")
+    assert on_the_edge[0].stop_loss == Decimal("99.60")
+
+    _, just_above = _watch(region, [bar(0, open_="101.5", close="101.8", high="102", low="100.01")])
+    assert just_above[0] is None
+
+
+def test_a_hammer_resting_exactly_on_the_far_edge_has_not_broken_the_region() -> None:
+    """The other boundary, and the one his correction turns on.
+
+    *"a mínima do martelo não precisa estar acima da região, falei errado, só não pode romper a
+    mínima da região"* — so a hammer whose low is exactly 90 has not broken [90, 100] and arms;
+    one penny lower has, and ends the setup. `<=` in place of `<` swaps the two and no scenario
+    driven through the detector notices, because it cannot place a low on the number.
+    """
+    region = _hammer_block(ZoneKind.DEMAND, "100", "90")
+    _, on_the_edge = _watch(region, [bar(0, open_="93", close="93.5", high="94", low="90")])
+    assert on_the_edge[0] is not None
+    assert on_the_edge[0].stop_price == Decimal("94.01")
+    assert on_the_edge[0].stop_loss == Decimal("89.20")
+
+    _, through_it = _watch(region, [bar(0, open_="93", close="93.5", high="94", low="89.99")])
+    assert through_it[0] is None
+
+
+def test_bars_below_a_supply_region_have_not_touched_it() -> None:
+    """⚠️ **The sell half of the touch, and it needs six bars to be visible at all.**
+
+    A supply region is touched from *below*, so the test is on the bar's high against the region's
+    bottom. A mutant that keeps the buy comparison for both sides — low against the top — calls
+    every bar under the region a touch, which is not directly observable: what it does is start
+    the five-bar count early. So the fixture spends the whole window below [100, 110] and only
+    then prints a sell hammer. Under the correct reading the count starts there and the order is
+    armed; under the mutant it started six bars ago and the region is already spent.
+    """
+    region = _hammer_block(ZoneKind.SUPPLY, "110", "100")
+    beneath = [bar(0, open_="94", close="93.8", high="95", low="90")]
+    beneath += [
+        bar(index, open_="94", close="94.2", high="94.5", low="93.8") for index in range(1, 6)
+    ]
+    hammer = bar(6, open_="101", close="100.5", high="105", low="100.2")
+
+    _, seen = _watch(region, [*beneath, hammer])
+
+    assert all(entry is None for entry in seen[:-1])
+    assert seen[-1] is not None
+    assert seen[-1].side is Side.SHORT
+    assert seen[-1].stop_price == Decimal("100.19")  # one tick under the hammer's low
+    assert seen[-1].stop_loss == Decimal("105.96")  # 105 + 20% of 4.80
+
+
+def test_a_window_that_closes_empty_releases_the_region() -> None:
+    """The window running out has to *retire* the zone, not merely stop offering on it.
+
+    Both readings produce the same silence — no hammer, no order — so silence cannot tell them
+    apart. What separates them is `expired`: a zone that is only quiet is still held by the
+    strategy, and while it is held no other region can be armed. His rule ends this one.
+    """
+    region = _hammer_block(ZoneKind.DEMAND, "100", "90")
+    touching = [
+        bar(index, open_="99.5", close="99.2", high="100.5", low="99") for index in range(6)
+    ]
+
+    live, seen = _watch(region, touching)
+
+    assert all(entry is None for entry in seen)
+    context = Context(candle=touching[-1], instrument=AAPL, account=_ACCOUNT)
+    assert live.expired(region, context=context, zones=()) is True
+
+
+def test_the_hand_over_bar_reaches_the_new_regions_hammer() -> None:
+    """The same trap the botinha hit, arriving at this activation through the same door.
+
+    A zone named while another is armed is observed **twice on the same bar**: once before the
+    strategy asks whether the resting order has expired, and again after arming, because a zone
+    named on this very bar had had no `observe` at the first of those points. The idempotence
+    guard is keyed to the bar's time, so clearing it when a new region starts is the only thing
+    that lets the second call through.
+
+    Here the cost is total rather than subtle. The hand-over bar is the one that touches the new
+    region *and* prints the hammer, so a region blind to it never starts its count and the setup
+    arms nothing at all — while the suite stays green, because every other scenario watches a
+    single region from the start and never hands anything over.
+    """
+    given_up = _zone_at("210", "200", hour=1)
+    named_now = _zone_at("100", "90", hour=2)
+    hand_over = bar(5, open_="101", close="101.5", high="102", low="98")
+    context = Context(candle=hand_over, instrument=AAPL, account=_ACCOUNT)
+
+    activation = HammerBreakActivation()
+    with localcontext(ENGINE_CONTEXT):
+        activation.observe(given_up, context=context)  # the zone being released
+        activation.observe(named_now, context=context)  # the hand-over
+        entry = activation.entry_for(named_now, context=context)
+
+    assert entry is not None
+    assert entry.stop_price == Decimal("102.01")
+    assert entry.stop_loss == Decimal("97.20")
+
+
+def test_a_new_region_does_not_inherit_the_last_one_s_touch() -> None:
+    """The other half of the hand-over reset, and it needs a region the bar does **not** reach.
+
+    The count starts on a touch, and the touch belongs to the region it happened in. An
+    activation that carried `_touched` across a hand-over would open the window on a region price
+    has never been near, and then arm the first hammer it sees there — a setup whose first
+    condition never happened.
+
+    The same bar touches [90, 100] and misses [87, 97] by two cents. Its high of 102 is inside
+    the second region's arming ceiling of 102, so the ceiling cannot be what refuses it: the only
+    thing left is the touch.
+    """
+    touched = _zone_at("100", "90", hour=1)
+    never_reached = _zone_at("97", "87", hour=2)
+    hammer = bar(5, open_="101", close="101.5", high="102", low="98")
+    context = Context(candle=hammer, instrument=AAPL, account=_ACCOUNT)
+
+    activation = HammerBreakActivation()
+    with localcontext(ENGINE_CONTEXT):
+        activation.observe(touched, context=context)
+        armed_where_it_touched = activation.entry_for(touched, context=context)
+        activation.observe(never_reached, context=context)
+        armed_where_it_did_not = activation.entry_for(never_reached, context=context)
+
+    assert armed_where_it_touched is not None
+    assert armed_where_it_did_not is None
+
+
+def test_a_live_hammer_does_not_follow_the_activation_to_another_region() -> None:
+    """⚠️ **The leak the FFFD had one chapter ago, waiting at the same door.**
+
+    One activation follows whatever zone the strategy has armed, and two ordinary paths change
+    that zone while an order rests — the tracker dropping the region, or a fresh block qualifying.
+    Without clearing the levels on the way across, region B is handed A's order whole: a stop at a
+    price computed from a bar that happened somewhere else, on a zone that has formed nothing.
+
+    ⚠️ **It has to be handed over on a *later* bar to be visible at all**, which is why this is
+    not folded into the test above. A hammer's annul level is its own low, so on the hammer's bar
+    the ageing clock loses that low immediately and clears the levels by itself — the bug hides
+    behind a correct-looking `None`. Bar 6 keeps clear of 98, so A's trigger is genuinely alive
+    when B arrives.
+    """
+    armed_here = _zone_at("100", "90", hour=1)
+    never_reached = _zone_at("97", "87", hour=2)
+    hammer = bar(5, open_="101", close="101.5", high="102", low="98")
+    later = bar(6, open_="101.5", close="101.8", high="102", low="100")
+
+    activation = HammerBreakActivation()
+    with localcontext(ENGINE_CONTEXT):
+        first = Context(candle=hammer, instrument=AAPL, account=_ACCOUNT)
+        activation.observe(armed_here, context=first)
+        assert activation.entry_for(armed_here, context=first) is not None
+
+        second = Context(candle=later, instrument=AAPL, account=_ACCOUNT)
+        activation.observe(armed_here, context=second)
+        still_live = activation.entry_for(armed_here, context=second)
+        activation.observe(never_reached, context=second)
+        inherited = activation.entry_for(never_reached, context=second)
+
+    assert still_live is not None, "the fixture must hand over while the trigger is alive"
+    assert inherited is None
+
+
+def test_a_region_named_on_the_very_bar_that_hammers_still_sees_it() -> None:
+    """⚠️ **The hand-over bar, and it was the blocking finding one chapter ago.**
+
+    `observe` runs twice on the bar a zone is armed — once for the zone being let go and once for
+    the new one — and the activation's own "have I seen this bar?" guard would swallow the second
+    call. Clearing it when the watched region changes is three words, and without them a region
+    named on bar 13 never sees bar 13: exactly the bar that touched it and printed the hammer.
+    The whole suite stays green, and the setup silently never arms on its own first bar.
+
+    `_LateMarked(after=22)` offers the zone for the first time on bar 13, which is that bar.
+    """
+    late = _drive_from_bullish(
+        StructureStrategy(qualifier=_LateMarked(after=22), entry_point=ZoneEntryPoint.MARTELO),
+        [*_IMPULSE, *_FALLS_BACK, *_TOUCHES_AND_HAMMERS],
+    )
+
+    [placed] = late[13]
+    assert placed.stop_price == Decimal("102.01")
+
+
+def test_a_region_price_has_already_reached_is_still_armed() -> None:
+    """⚠️ **`spent_by_mitigation` is `False`, and this is the only test that says so.**
+
+    For the three activations that rest *on* the region, the touch that mitigates a zone is the
+    event their order was placed for, so a mitigated zone is finished. Here it is the opposite:
+    the touch is where the count **begins**. Answering `True` would retire the region on the very
+    bar the reaction starts, and this setup could never arm at all — which is precisely what the
+    scenario above proves it does.
+    """
+    activation = HammerBreakActivation()
+    assert activation.spent_by_mitigation is False
+    assert (
+        activation.withdraws(
+            _hammer_block(ZoneKind.DEMAND, "100", "90"),
+            context=Context(
+                candle=bar(0, open_="99", close="99.5", high="100", low="98"),
+                instrument=AAPL,
+                account=_ACCOUNT,
+            ),
+        )
+        is False
+    )

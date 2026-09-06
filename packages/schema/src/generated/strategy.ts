@@ -606,9 +606,29 @@ export interface StructureChochSetup {
  * lives entirely beyond the line and closes there arms nothing, because buying the break of its
  * high would be buying into a decline rather than the failure of a push.
  *
- * ⚠️ The stop buffer says nothing about `botinha`: its stop comes from the band, not from the
- * region. Its own numbers — the window, the tenth, and which volume the averages use — are not
- * on this document yet and run on the engine's defaults.
+ * `martelo` is his chapter 11.1, and it is the first entry point whose order is not priced off
+ * the region at all. Price touches the region and has **five bars** — the touching one and four
+ * more — to print a *martelo*: a bar whose shadow on the far side is more than half its height,
+ * under a body, however small, that closed the right way. The order is a **stop** one tick past
+ * that bar's extreme and the protective stop is **twenty percent of the bar's own height** past
+ * the other one, so a small hammer is a small stop and a large position.
+ *
+ * ⚠️ Two limits are the region's rather than the bar's. The hammer's extreme may reach past
+ * the near edge by at most **half the region's height** -- region [90, 100] gives a ceiling of
+ * 105, and a hammer topping there still arms with its order at 106, because the ceiling measures
+ * the hammer and not the order. And any bar losing the region's far edge before a hammer appears
+ * ends the setup.
+ *
+ * ⚠️ Every ending spends the region, which is the opposite of `fffd`. Two bars passing
+ * unfilled, the hammer's own extreme being lost, the window closing empty — all of them retire
+ * the zone, and a second hammer inside the same window does not re-arm. His words:
+ * *"desarma tudo e tem que esperar um novo contexto"*.
+ *
+ * ⚠️ The stop buffer says nothing about `botinha` or `martelo`: the first takes its stop
+ * from the band and the second from the hammer, neither from the region. Their own numbers —
+ * the botinha's window and tenth and which volume its averages use, the hammer's five bars, two
+ * bars, twenty percent and half a region — are not on this document yet and run on the engine's
+ * defaults.
  *
  * ⚠️ **Named values, not a fraction.** A free number would let an entry approach the far edge,
  * where risk collapses to the stop buffer alone and position sizing divides by nearly nothing.
@@ -618,7 +638,7 @@ export interface StructureChochSetup {
 export interface StructureParams {
   allow_secondary?: AllowSecondary;
   breakeven_at_r?: BreakevenAtR2;
-  entry_point?: "edge" | "midpoint" | "return_pass" | "botinha" | "fffd";
+  entry_point?: "edge" | "midpoint" | "return_pass" | "botinha" | "fffd" | "martelo";
   stop_buffer?: StopBuffer;
 }
 /**
@@ -637,7 +657,7 @@ export interface StructureContinuationSetup {
 export interface ContinuationParams {
   allow_secondary?: AllowSecondary1;
   breakeven_at_r?: BreakevenAtR3;
-  entry_point?: "edge" | "midpoint" | "return_pass" | "botinha" | "fffd";
+  entry_point?: "edge" | "midpoint" | "return_pass" | "botinha" | "fffd" | "martelo";
   max_bos?: MaxBos;
   stop_buffer?: StopBuffer1;
 }

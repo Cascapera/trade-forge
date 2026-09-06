@@ -17,7 +17,7 @@ import pytest
 
 from tradeforge_engine import setups
 from tradeforge_engine.backtest_broker import BacktestBroker
-from tradeforge_engine.bar_setups import is_hammer
+from tradeforge_engine.bar_setups import is_force_bar, is_hammer
 from tradeforge_engine.costs import NoCostModel
 from tradeforge_engine.domain import (
     AccountState,
@@ -44,6 +44,7 @@ from tradeforge_engine.setups import (
     ContinuationQualifier,
     FffdActivation,
     HammerBreakActivation,
+    HammerForceActivation,
     SetupContext,
     StructureStrategy,
     ZoneEntry,
@@ -4479,3 +4480,223 @@ def test_a_region_price_has_already_reached_is_still_armed() -> None:
         )
         is False
     )
+
+
+# --------------------------------------------------------------------------- #
+# Variation 2 — the hammer, then a bar of force, then the pullback              #
+# --------------------------------------------------------------------------- #
+
+
+# 70% body in the trade's direction, and its high of 104.50 clears the hammer's 102.
+_BAR_OF_FORCE = bar(14, open_="101.6", close="104", high="104.5", low="101.4")
+_QUIET_ABOVE_THE_FORCE = [
+    bar(index, open_="103", close="103.2", high="103.5", low="102.9") for index in (15, 16, 17)
+]
+
+
+def _martelo_forca(candles: list[Candle]) -> list[list[Signal]]:
+    return _drive_from_bullish(
+        StructureStrategy(qualifier=_Marked(), entry_point=ZoneEntryPoint.MARTELO_FORCA), candles
+    )
+
+
+def test_the_force_bar_turns_the_hammer_into_a_limit_below_the_market() -> None:
+    """His variation 2, end to end, and the order is the opposite kind from variation 1's.
+
+    The hammer tops at 102 and the force bar at 104.50, so the limit rests at **102.75** — thirty
+    percent of the way between the two — with the same stop off the hammer, **97.20**. It is a
+    *limit*: the force bar closed at 104, so the order sits below the market waiting for price to
+    come back, where `martelo` would be waiting above it for a break.
+
+    ⚠️ Nothing is placed on the hammer's own bar. That is the whole shape of this variation, and
+    asserting it here is what stops the two from being one setup with a dial.
+    """
+    signals = _martelo_forca([*_IMPULSE, *_FALLS_BACK, *_TOUCHES_AND_HAMMERS, _BAR_OF_FORCE])
+
+    assert signals[13] == [], "the hammer alone places nothing in this variation"
+    [placed] = signals[14]
+    assert placed.kind is SignalKind.ENTRY
+    assert placed.limit_price == Decimal("102.75")
+    assert placed.stop_loss == Decimal("97.20")
+    assert placed.stop_price is None
+
+
+def test_the_force_variation_sell_is_the_exact_mirror_of_the_buy() -> None:
+    """Reflected around 200: the limit at 97.25 and the stop at 102.80.
+
+    Five branches mirror at once here — the hammer's shadow, the force bar's body, which extreme
+    each is measured from, which way the limit is offset, and which side the stop goes. A sell
+    that inherited any of them still produces a short at a price nobody chose.
+    """
+    [placed] = _drive(
+        StructureStrategy(qualifier=_Marked(), entry_point=ZoneEntryPoint.MARTELO_FORCA),
+        _mirror([*_IMPULSE, *_FALLS_BACK, *_TOUCHES_AND_HAMMERS, _BAR_OF_FORCE]),
+    )[14]
+
+    assert placed.side is Side.SHORT
+    assert placed.limit_price == Decimal("97.25")  # 200 - 102.75
+    assert placed.stop_loss == Decimal("102.80")  # 200 - 97.20
+
+
+def test_a_bar_after_the_hammer_that_is_not_a_bar_of_force_ends_the_region() -> None:
+    """⚠️ **His ruling, and it is the reason this is not "wait for a better bar".**
+
+    Asked what happens when the bar after the hammer fails: *"se a barra de força falha a região
+    deixa de valer, tem que esperar configurar tudo de novo"*. So the second, perfectly good
+    hammer on bar 16 arms nothing — the region is finished, not merely quiet.
+
+    Without the second hammer this test would only prove that a weak bar places no order, which is
+    true of almost every bar.
+    """
+    weak = bar(14, open_="101.6", close="102", high="103", low="101")
+    signals = _martelo_forca(
+        [*_IMPULSE, *_FALLS_BACK, *_TOUCHES_AND_HAMMERS, weak, _hammer(15), _bar_of_force_at(16)]
+    )
+
+    assert not is_force_bar(weak, side=Side.LONG)
+    assert signals == [[] for _ in signals], "something armed after the force bar had failed"
+
+
+def test_a_force_bar_that_does_not_clear_the_hammer_ends_the_region_too() -> None:
+    """*"barra de força que não supera o martelo cancela entrada"* — his words, asked directly.
+
+    A perfectly good bar of force whose high stops under the hammer's leaves "between the two
+    extremes" naming an empty interval. It is the same ending as the bar not being a force bar at
+    all, which is why the activation cannot tell the caller *which* of the two happened — and does
+    not need to.
+    """
+    short_force = bar(14, open_="99", close="101.5", high="101.9", low="98.9")
+    signals = _martelo_forca([*_IMPULSE, *_FALLS_BACK, *_TOUCHES_AND_HAMMERS, short_force])
+
+    assert is_force_bar(short_force, side=Side.LONG)
+    assert short_force.high < _TOUCHES_AND_HAMMERS[0].high
+    assert signals[14] == []
+
+
+def test_a_close_beyond_the_force_bar_withdraws_the_order() -> None:
+    """*"se na barra seguinte da barra de força ocorrer de a barra fechar acima da máxima da barra
+    de força a entrada é anulada"*.
+
+    The market left without us: the limit was waiting at 102.75 for a pullback and bar 15 finished
+    at 105, above the force bar's 104.50. The cancel lands on 15, a bar before the clock would
+    have taken the order back anyway — which is what makes the rule observable at all.
+    """
+    ran_away = bar(15, open_="104", close="105", high="105.5", low="103.8")
+    signals = _martelo_forca(
+        [*_IMPULSE, *_FALLS_BACK, *_TOUCHES_AND_HAMMERS, _BAR_OF_FORCE, ran_away]
+    )
+
+    [taken_back] = signals[15]
+    assert taken_back.kind is SignalKind.CANCEL
+
+
+def test_the_force_order_lives_two_bars_from_the_force_bars_close() -> None:
+    """Armed on 14, so 15 and 16 are its chances and the withdrawal lands on 16.
+
+    ⚠️ The quiet bars close *below* the force bar's high on purpose. A bar that ran past it would
+    end the order through the cancel rule instead, and the test would pass while proving nothing
+    about the clock — the two endings are one bar apart.
+    """
+    signals = _martelo_forca(
+        [*_IMPULSE, *_FALLS_BACK, *_TOUCHES_AND_HAMMERS, _BAR_OF_FORCE, *_QUIET_ABOVE_THE_FORCE]
+    )
+
+    assert all(quiet.close < _BAR_OF_FORCE.high for quiet in _QUIET_ABOVE_THE_FORCE)
+    assert signals[15] == []
+    [taken_back] = signals[16]
+    assert taken_back.kind is SignalKind.CANCEL
+
+
+def test_the_arming_ceiling_governs_the_force_variation_as_well() -> None:
+    """The region's limits are shared, and sharing them is the point of `_RegionWatch`.
+
+    A hammer topping one penny past the ceiling of 105 is refused here exactly as it is in
+    variation 1, so no force bar is ever looked for. Without this the extraction could have
+    wired the ceiling into one activation and not the other, and only variation 1 would say so.
+    """
+    too_high = bar(13, open_="103", close="103.5", high="105.01", low="99")
+    signals = _martelo_forca(
+        [
+            *_IMPULSE,
+            *_FALLS_BACK,
+            too_high,
+            bar(14, open_="105", close="108", high="108.5", low="104.8"),
+        ]
+    )
+
+    assert is_hammer(too_high, side=Side.LONG)
+    assert signals == [[] for _ in signals]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"bars_to_hammer": 0}, "at least the touching bar"),
+        ({"bars_to_fill": 0}, "at least one bar"),
+        ({"reach_fraction": Decimal("-0.1")}, "fraction of the region"),
+    ],
+)
+def test_the_force_activation_refuses_a_dial_that_would_not_be_his_setup(
+    kwargs: dict[str, object], message: str
+) -> None:
+    """The same three dials the first variation refuses, and for the same reasons — they are the
+    region's rules, and both activations answer to them."""
+    with pytest.raises(EngineError, match=message):
+        HammerForceActivation(**kwargs)  # type: ignore[arg-type]
+
+
+def _bar_of_force_at(index: int) -> Candle:
+    """The same bar of force, on another index — for scenarios with two hammers."""
+    return bar(index, open_="101.6", close="104", high="104.5", low="101.4")
+
+
+def test_losing_the_region_ends_the_force_variation_before_any_hammer() -> None:
+    """The region's own edge governs both variations, and the wiring is per-activation.
+
+    Extracting the shared rules into one place makes them *possible* to share; it does not prove
+    both activations call them. Bar 13 closes through the bottom of [90, 100] and the perfectly
+    good hammer on bar 14 — with a real bar of force behind it on 15 — arms nothing.
+    """
+    breaks_it = bar(13, open_="95", close="92", high="96", low="89")
+    signals = _martelo_forca(
+        [
+            *_IMPULSE,
+            *_FALLS_BACK,
+            breaks_it,
+            bar(14, open_="93", close="93.5", high="94", low="90.5"),
+            bar(15, open_="93.6", close="96", high="96.5", low="93.4"),
+        ]
+    )
+
+    assert is_hammer(bar(14, open_="93", close="93.5", high="94", low="90.5"), side=Side.LONG)
+    assert signals == [[] for _ in signals]
+
+
+def test_a_pending_hammer_does_not_follow_the_activation_to_another_region() -> None:
+    """⚠️ **The same leak variation 1 has, one step earlier in the sequence.**
+
+    Here the dangerous state is not a resting order but a hammer *waiting for its bar of force*.
+    Carried across a hand-over, region B's next bar is read as the force bar for a hammer that
+    printed on region A — and B gets a limit priced off two bars that have nothing to do with it,
+    on a zone price has never even touched.
+
+    The force bar's low of 101.40 is well above B's top of 97, so B has had no touch and no window
+    at all. Anything it arms came from A.
+    """
+    armed_here = _zone_at("100", "90", hour=1)
+    never_reached = _zone_at("97", "87", hour=2)
+    hammer = bar(5, open_="101", close="101.5", high="102", low="98")
+    force = bar(6, open_="101.6", close="104", high="104.5", low="101.4")
+
+    activation = HammerForceActivation()
+    with localcontext(ENGINE_CONTEXT):
+        first = Context(candle=hammer, instrument=AAPL, account=_ACCOUNT)
+        activation.observe(armed_here, context=first)
+        assert activation.entry_for(armed_here, context=first) is None  # the hammer places nothing
+
+        second = Context(candle=force, instrument=AAPL, account=_ACCOUNT)
+        activation.observe(never_reached, context=second)
+        inherited = activation.entry_for(never_reached, context=second)
+
+    assert force.low > never_reached.top, "the fixture must leave the second region untouched"
+    assert inherited is None

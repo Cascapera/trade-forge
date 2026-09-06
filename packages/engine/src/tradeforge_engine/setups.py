@@ -37,12 +37,17 @@ from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from enum import StrEnum
 from typing import Protocol
 
-from tradeforge_engine.bar_setups import DEFAULT_BREAK_TICKS as HAMMER_BREAK_TICKS
 from tradeforge_engine.bar_setups import (
+    DEFAULT_BODY_FRACTION,
+    DEFAULT_ENTRY_FRACTION,
+    DEFAULT_HAMMER_BREAK_TICKS,
     DEFAULT_SHADOW_FRACTION,
     DEFAULT_STOP_FRACTION,
     HammerBreakLevels,
     HammerBreakTrigger,
+    HammerForceLevels,
+    HammerForceTrigger,
+    is_hammer,
 )
 from tradeforge_engine.conduction import StructuralTrail, breakeven_candidate, tighten
 from tradeforge_engine.domain import (
@@ -154,6 +159,7 @@ class ZoneEntryPoint(StrEnum):
     BOTINHA = "botinha"
     FFFD = "fffd"
     MARTELO = "martelo"
+    MARTELO_FORCA = "martelo_forca"
 
 
 ABANDON_AT_ZONE_HEIGHTS = Decimal(1)
@@ -933,7 +939,7 @@ class FffdActivation:
 
     bars_to_trigger: int = DEFAULT_BARS_TO_TRIGGER
     bars_to_break: int = DEFAULT_BARS_TO_BREAK
-    break_ticks: int = DEFAULT_BREAK_TICKS
+    break_ticks: int = DEFAULT_HAMMER_BREAK_TICKS
     stop_ticks: int = DEFAULT_STOP_TICKS
     volume: str = "auto"
 
@@ -1092,6 +1098,101 @@ class FffdActivation:
         return self._formation
 
 
+@dataclass(slots=True)
+class _RegionWatch:
+    """The half of a hammer setup that is about the **region**, shared by both variations.
+
+    His two hammer entries disagree about everything a bar does -- one breaks out on a stop, the
+    other waits for a pullback on a limit -- and agree about everything a region does: where the
+    count starts, how long it runs, how far past the near edge a hammer may reach, and the fact
+    that every ending retires the zone. Written twice, those are two copies of five rules to keep
+    in step, and the suite would stay green with one of them wrong. `_limit_entry` exists for the
+    same reason a few hundred lines above, and its docstring records that extracting it produced
+    exactly that duplication first.
+
+    ⚠️ **The three resets in `start` are the load-bearing part.** Each one was a surviving
+    mutant on the first variation, and each has a different cost: without the bar guard a region
+    named on the hand-over bar never sees the bar it was armed on (the FFFD's blocking finding,
+    one chapter earlier); without the touch a new region opens its window on a zone price has
+    never reached; and the trigger state each activation clears alongside is region B being handed
+    region A's order whole. Two activations sharing one correct copy is the point of this class.
+    """
+
+    reach_fraction: Decimal
+    bars_to_hammer: int
+    watching: OrderBlock | None = None
+    seen: datetime | None = None
+    touched: bool = False
+    bars_since_touch: int = 0
+    burned: set[OrderBlock] = field(default_factory=set)
+
+    def start(self, block: OrderBlock) -> bool:
+        """Move to `block`, and say whether that was a move -- the caller clears its own state."""
+        if self.watching == block:
+            return False
+        self.watching = block
+        self.seen = None
+        self.touched = False
+        self.bars_since_touch = 0
+        return True
+
+    def fresh(self, candle: Candle) -> bool:
+        """Is this the first look at this bar? `observe` is called twice on an arming bar."""
+        if self.seen == candle.time:
+            return False
+        self.seen = candle.time
+        return True
+
+    def spent(self, block: OrderBlock) -> bool:
+        return block in self.burned
+
+    def spend(self, block: OrderBlock, why: str) -> None:
+        logger.debug("hammer spending the zone at %s: %s", block.time, why)
+        self.burned.add(block)
+
+    def touches(self, block: OrderBlock, candle: Candle, side: Side) -> bool:
+        """Did this bar reach the region's near edge? Piercing counts, and so does stopping
+        exactly on it -- his count starts *"se tocar na borda da regiao"*."""
+        return candle.low <= block.top if side is Side.LONG else candle.high >= block.bottom
+
+    def broke(self, block: OrderBlock, candle: Candle, side: Side) -> bool:
+        """Did this bar lose the region's far edge? *"nao romper a minima da regiao o que anularia
+        a possibilidade da entrada"*.
+
+        Strictly past, so a bar resting exactly on the edge has not broken it -- which is what
+        lets a hammer whose low sits on the region's bottom still be one this setup takes. He
+        corrected me on precisely that: the hammer's low may be anywhere inside the region."""
+        return candle.low < block.bottom if side is Side.LONG else candle.high > block.top
+
+    def within_reach(self, block: OrderBlock, candle: Candle, side: Side) -> bool:
+        """Is the hammer's extreme inside the arming ceiling? Region [90, 100] and a half gives
+        105, and 105 itself arms -- the boundary is inclusive, which is his example exactly."""
+        reach = self.reach_fraction * (block.top - block.bottom)
+        if side is Side.LONG:
+            return candle.high <= block.top + reach
+        return candle.low >= block.bottom - reach
+
+    def open_window(self, block: OrderBlock, candle: Candle, side: Side) -> bool:
+        """Is this bar one of the five the region gets? Starts the count on the touch.
+
+        ⚠️ **The touching bar is bar zero and may itself be the hammer** -- *"na mesma barra ou
+        nas proximas 4 barras"* -- so the count is checked before this bar is examined, never
+        after it. Running out retires the region rather than merely going quiet: a zone still held
+        is a zone no other region can replace.
+        """
+        if not self.touched:
+            if not self.touches(block, candle, side):
+                return False
+            self.touched = True
+            self.bars_since_touch = 0
+            return True
+        self.bars_since_touch += 1
+        if self.bars_since_touch >= self.bars_to_hammer:
+            self.spend(block, "the window closed with no hammer in it")
+            return False
+        return True
+
+
 DEFAULT_BARS_TO_HAMMER = 5
 """How many bars a region has to produce a hammer, counting the one that touched it: *"na mesma
 barra ou nas proximas 4 barras"*."""
@@ -1146,17 +1247,13 @@ class HammerBreakActivation:
     bars_to_hammer: int = DEFAULT_BARS_TO_HAMMER
     bars_to_fill: int = DEFAULT_BARS_TO_FILL
     reach_fraction: Decimal = DEFAULT_REACH_FRACTION
-    break_ticks: int = HAMMER_BREAK_TICKS
+    break_ticks: int = DEFAULT_BREAK_TICKS
     stop_fraction: Decimal = DEFAULT_STOP_FRACTION
     shadow_fraction: Decimal = DEFAULT_SHADOW_FRACTION
 
-    _watching: OrderBlock | None = field(default=None, init=False, repr=False)
-    _seen: datetime | None = field(default=None, init=False, repr=False)
-    _touched: bool = field(default=False, init=False, repr=False)
-    _bars_since_touch: int = field(default=0, init=False, repr=False)
+    _region: _RegionWatch = field(init=False, repr=False)
     _levels: HammerBreakLevels | None = field(default=None, init=False, repr=False)
     _bars_since_trigger: int = field(default=0, init=False, repr=False)
-    _spent: set[OrderBlock] = field(default_factory=set, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.bars_to_hammer < 1:
@@ -1167,13 +1264,16 @@ class HammerBreakActivation:
             raise EngineError(f"the order lives at least one bar, got {self.bars_to_fill}")
         if self.reach_fraction < ZERO:
             raise EngineError(f"the reach is a fraction of the region, got {self.reach_fraction}")
+        self._region = _RegionWatch(
+            reach_fraction=self.reach_fraction, bars_to_hammer=self.bars_to_hammer
+        )
 
     @property
     def spent_by_mitigation(self) -> bool:
         return False
 
     def spent(self, block: OrderBlock) -> bool:
-        return block in self._spent
+        return self._region.spent(block)
 
     def withdraws(self, block: OrderBlock, *, context: Context) -> bool:  # noqa: ARG002
         """Never. Every way this order comes back also ends the region, so the withdrawal rides
@@ -1198,7 +1298,7 @@ class HammerBreakActivation:
     ) -> ZoneEntry | None:
         """The stop order past the hammer, while there is a live hammer. `None` otherwise, which
         is most bars -- a region spends most of its life with nothing on the book."""
-        if self._watching != block or self._levels is None:
+        if self._region.watching != block or self._levels is None:
             return None
         return ZoneEntry(
             side=self._levels.side,
@@ -1208,11 +1308,12 @@ class HammerBreakActivation:
 
     def observe(self, block: OrderBlock, *, context: Context) -> None:
         """Fold this bar in: the region's own limits first, then the hunt, then the clocks."""
-        self._start_watching(block)
+        if self._region.start(block):
+            self._levels = None
+            self._bars_since_trigger = 0
         candle = context.candle
-        if self._seen == candle.time:
+        if not self._region.fresh(candle):
             return
-        self._seen = candle.time
         if self.spent(block):  # pragma: no cover - `_may_arm` never offers a spent block back
             # ⚠️ **Unreachable today, kept for the failure it guards rather than for the odds.**
             # A spent region is released on the bar it is spent, and `_may_arm` refuses to name it
@@ -1227,31 +1328,12 @@ class HammerBreakActivation:
             return
 
         side = _side_of(block)
-        if self._broke_the_region(block, candle, side):
-            self._spend(block, "the region's own extreme was lost before any hammer")
+        if self._region.broke(block, candle, side):
+            self._region.spend(block, "the region's own extreme was lost before any hammer")
             return
-        if not self._open_window(candle, side, block=block):
+        if not self._region.open_window(block, candle, side):
             return
         self._look_for_a_hammer(block, candle, side, context)
-
-    def _open_window(self, candle: Candle, side: Side, *, block: OrderBlock) -> bool:
-        """Is this bar inside the five the region gets? Starts the count on the touch.
-
-        ⚠️ **The touching bar is bar zero and may itself be the hammer** -- *"na mesma barra
-        ou nas proximas 4 barras"* -- so the count is checked before this bar is examined, never
-        after it.
-        """
-        if not self._touched:
-            if not self._touches(block, candle, side):
-                return False
-            self._touched = True
-            self._bars_since_touch = 0
-            return True
-        self._bars_since_touch += 1
-        if self._bars_since_touch >= self.bars_to_hammer:
-            self._spend(block, "the window closed with no hammer in it")
-            return False
-        return True
 
     def _look_for_a_hammer(
         self, block: OrderBlock, candle: Candle, side: Side, context: Context
@@ -1270,7 +1352,7 @@ class HammerBreakActivation:
         ).levels_for(candle, side=side, tick=context.instrument.tick_size)
         if levels is None:
             return
-        if not self._within_reach(block, candle, side):
+        if not self._region.within_reach(block, candle, side):
             logger.debug("hammer at %s reaches past the region's arming ceiling", candle.time)
             return
         self._levels = levels
@@ -1288,60 +1370,204 @@ class HammerBreakActivation:
             else candle.high >= levels.annul_price
         )
         if lost:
-            self._spend(block, "the hammer's own extreme was lost")
+            self._levels = None
+            self._region.spend(block, "the hammer's own extreme was lost")
             return
         self._bars_since_trigger += 1
         if self._bars_since_trigger >= self.bars_to_fill:
-            self._spend(block, f"the order lived its {self.bars_to_fill} bars unfilled")
+            self._levels = None
+            self._region.spend(block, f"the order lived its {self.bars_to_fill} bars unfilled")
 
-    def _touches(self, block: OrderBlock, candle: Candle, side: Side) -> bool:
-        """Did this bar reach the region's near edge? Piercing counts -- going through is still
-        touching, the same reading `PontoContinuoStrategy` gives a moving average."""
-        return candle.low <= block.top if side is Side.LONG else candle.high >= block.bottom
 
-    def _broke_the_region(self, block: OrderBlock, candle: Candle, side: Side) -> bool:
-        """Did this bar lose the region's far edge? *"nao romper a minima da regiao o que anularia
-        a possibilidade da entrada"*.
+@dataclass(slots=True)
+class HammerForceActivation:
+    """His chapter 11.1, variation 2 -- the hammer, then a *barra de forca*, then the pullback.
 
-        Strictly past, so a bar resting exactly on the edge has not broken it -- which is what
-        lets a hammer whose low sits on the region's bottom still be a hammer this setup takes.
-        He corrected me on precisely that: the hammer's low may be inside the region, it only may
-        not break through the bottom of it."""
-        return candle.low < block.bottom if side is Side.LONG else candle.high > block.top
+    Same region, same hammer, **opposite order**. Variation 1 buys the break of the hammer's high
+    with a stop; this one waits for the bar after the hammer to close as a bar of force, and then
+    rests a **limit** thirty percent of the way from the hammer's extreme towards the force bar's
+    -- below the market, waiting for price to come back. Read as one setup with a dial, the cancel
+    rule makes no sense; read as a pullback entry it is the only thing that could cancel it.
 
-    def _within_reach(self, block: OrderBlock, candle: Candle, side: Side) -> bool:
-        """Is the hammer's extreme inside the arming ceiling? Region [90, 100] and a half gives
-        105, and 105 itself arms -- the boundary is inclusive, which is his example exactly."""
-        reach = self.reach_fraction * (block.top - block.bottom)
-        if side is Side.LONG:
-            return candle.high <= block.top + reach
-        return candle.low >= block.bottom - reach
+    | what happens | the order | the region |
+    | --- | --- | --- |
+    | price pulls back to the limit | fills | spent by the fill (ADR-0015) |
+    | the bar after the hammer is not a force bar clearing it | never placed | **spent** |
+    | the next bar closes beyond the force bar's extreme | cancelled | **spent** |
+    | two bars pass, unfilled | cancelled | **spent** |
+    | the region is broken, or the window closes empty | never placed | **spent** |
 
-    def _spend(self, block: OrderBlock, why: str) -> None:
-        logger.debug("hammer spending the zone at %s: %s", block.time, why)
-        self._spent.add(block)
-        self._levels = None
+    ⚠️ **The force bar is the bar immediately after the hammer, and failing it ends the region**
+    -- both are his, given directly: *"barra de forca imediatamente seguinte"*, and *"se a barra de
+    forca falha a regiao deixa de valer, tem que esperar configurar tudo de novo"*. So there is no
+    waiting for a better second bar and no second hammer inside the same window. That is the same
+    answer variation 1 gives to all of its endings, and the opposite of the FFFD's.
 
-    def _start_watching(self, block: OrderBlock) -> None:
-        """Move to a new region, and forget everything the last one taught.
+    ⚠️ **The annulment is read on a close, and only on the first bar after the force bar.** His
+    argument for the second is complete on its own: by then the order has either filled -- and a
+    trade is conducted, not cancelled -- or it has not, and the clock retires it regardless. So
+    the rule has work to do on exactly one bar, and writing it for both would be writing a branch
+    no market can reach.
+    """
 
-        ⚠️ **`_seen` is cleared here, and that is not tidiness.** `observe` runs twice on the
-        bar a zone is armed -- once for the zone being released and once for the new one -- and
-        without this the new region would never see the bar it was armed on, which is the very bar
-        that may have touched it. Three words, and deleting them leaves the whole suite green: it
-        was the blocking finding one chapter ago, arriving here through the same door.
-        """
-        if self._watching == block:
+    bars_to_hammer: int = DEFAULT_BARS_TO_HAMMER
+    bars_to_fill: int = DEFAULT_BARS_TO_FILL
+    reach_fraction: Decimal = DEFAULT_REACH_FRACTION
+    entry_fraction: Decimal = DEFAULT_ENTRY_FRACTION
+    stop_fraction: Decimal = DEFAULT_STOP_FRACTION
+    shadow_fraction: Decimal = DEFAULT_SHADOW_FRACTION
+    body_fraction: Decimal = DEFAULT_BODY_FRACTION
+
+    _region: _RegionWatch = field(init=False, repr=False)
+    _hammer: Candle | None = field(default=None, init=False, repr=False)
+    _levels: HammerForceLevels | None = field(default=None, init=False, repr=False)
+    _bars_since_order: int = field(default=0, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.bars_to_hammer < 1:
+            raise EngineError(
+                f"the region has at least the touching bar, got {self.bars_to_hammer}"
+            )
+        if self.bars_to_fill < 1:
+            raise EngineError(f"the order lives at least one bar, got {self.bars_to_fill}")
+        if self.reach_fraction < ZERO:
+            raise EngineError(f"the reach is a fraction of the region, got {self.reach_fraction}")
+        self._region = _RegionWatch(
+            reach_fraction=self.reach_fraction, bars_to_hammer=self.bars_to_hammer
+        )
+
+    @property
+    def spent_by_mitigation(self) -> bool:
+        return False
+
+    def spent(self, block: OrderBlock) -> bool:
+        return self._region.spent(block)
+
+    def withdraws(self, block: OrderBlock, *, context: Context) -> bool:  # noqa: ARG002
+        """Never. Every way this order comes back also ends the region, so the withdrawal
+        rides on `expired` instead."""
+        return False
+
+    def expired(
+        self,
+        block: OrderBlock,
+        *,
+        context: Context,  # noqa: ARG002 -- `observe` already folded this bar in
+        zones: Sequence[TrackedZone],  # noqa: ARG002
+    ) -> bool:
+        return self.spent(block)
+
+    def entry_for(
+        self,
+        block: OrderBlock,
+        *,
+        context: Context,  # noqa: ARG002 -- the levels were fixed when the force bar closed
+    ) -> ZoneEntry | None:
+        """The limit between the two extremes, while there is one. `None` on the hammer's own bar:
+        the hammer alone places nothing here, which is the whole difference from variation 1."""
+        if self._region.watching != block or self._levels is None:
+            return None
+        return ZoneEntry(
+            side=self._levels.side,
+            limit_price=self._levels.limit_price,
+            stop_loss=self._levels.stop_loss,
+        )
+
+    def observe(self, block: OrderBlock, *, context: Context) -> None:
+        if self._region.start(block):
+            self._hammer = None
+            self._levels = None
+            self._bars_since_order = 0
+        candle = context.candle
+        if not self._region.fresh(candle):
             return
-        self._watching = block
-        self._seen = None
-        self._touched = False
-        self._bars_since_touch = 0
-        self._levels = None
-        self._bars_since_trigger = 0
+        if self.spent(block):  # pragma: no cover - `_may_arm` never offers a spent block back
+            return
+
+        if self._levels is not None:
+            self._age_the_order(block, candle)
+            return
+
+        side = _side_of(block)
+        if self._hammer is not None:
+            self._confirm_or_end(block, candle, side, context)
+            return
+        if self._region.broke(block, candle, side):
+            self._region.spend(block, "the region's own extreme was lost before any hammer")
+            return
+        if not self._region.open_window(block, candle, side):
+            return
+        if is_hammer(candle, side=side, shadow_fraction=self.shadow_fraction) and (
+            self._region.within_reach(block, candle, side)
+        ):
+            self._hammer = candle
+            logger.debug("hammer at %s, waiting for the bar of force", candle.time)
+
+    def _confirm_or_end(
+        self, block: OrderBlock, candle: Candle, side: Side, context: Context
+    ) -> None:
+        """This bar is the one after the hammer, so it is the force bar or the setup is over.
+
+        ⚠️ **One bar, one chance, and `None` here means cancel rather than wait.** There is no
+        second candidate by construction, and he ruled on the region too: it stops being valid.
+        `HammerForceTrigger` answers `None` for either of two reasons -- the bar is not a bar of
+        force, or its extreme does not clear the hammer's -- and both are the same ending.
+        """
+        hammer = self._hammer
+        if hammer is None:  # pragma: no cover - only called while a hammer waits
+            return
+        # ⚠️ **Clearing `_hammer` below is hygiene, not a rule, and a mutant deleting it
+        # survives.** Either branch that follows makes it unreadable: a failure spends the region
+        # and every later `observe` returns at the spent guard, and a success sets `_levels`,
+        # which `observe` reads first from then on. It stays because a stale bar left in a field
+        # is a trap for whoever adds the next path that reads it, and the line costs nothing --
+        # the same standing `_traded` in `_may_arm` documents for itself.
+        levels = HammerForceTrigger(
+            entry_fraction=self.entry_fraction,
+            stop_fraction=self.stop_fraction,
+            shadow_fraction=self.shadow_fraction,
+            body_fraction=self.body_fraction,
+        ).levels_for(hammer, candle, side=side, tick=context.instrument.tick_size)
+        self._hammer = None
+        if levels is None:
+            self._region.spend(block, "the bar after the hammer did not carry it forward")
+            return
+        self._levels = levels
+        self._bars_since_order = 0
+        logger.debug("force bar at %s; the limit rests at %s", candle.time, levels.limit_price)
+
+    def _age_the_order(self, block: OrderBlock, candle: Candle) -> None:
+        """One bar of the order's clock, and the two ways it ends. Both retire the region."""
+        levels = self._levels
+        if levels is None:  # pragma: no cover - only called with a live order
+            return
+        self._bars_since_order += 1
+        # ⚠️ **`== 1` and `>= 1` are the same engine, and that is his argument made mechanical.**
+        # Asked whether the cancel applies on the second bar too, he answered that it cannot
+        # matter: by then the order has either filled -- and a trade is conducted, not withdrawn,
+        # so this activation is no longer observed at all -- or it has not, and the clock below
+        # retires the region on that very bar. A mutant widening this to `>= 1` therefore survives
+        # the suite, and no fixture can kill it. The narrow form is kept because it says what the
+        # rule *is*; the note is here so a reviewer does not spend a mutant rediscovering that it
+        # has no work to do.
+        if self._bars_since_order == 1:
+            gone = (
+                candle.close > levels.annul_close
+                if levels.side is Side.LONG
+                else candle.close < levels.annul_close
+            )
+            if gone:
+                self._levels = None
+                self._region.spend(block, "a bar closed beyond the force bar; no pullback came")
+                return
+        if self._bars_since_order >= self.bars_to_fill:
+            self._levels = None
+            self._region.spend(block, f"the order lived its {self.bars_to_fill} bars unfilled")
 
 
-def activation_for(entry_point: ZoneEntryPoint, *, stop_buffer: Decimal) -> ZoneActivation:
+def activation_for(  # noqa: PLR0911 - one flat branch per value, which the docstring argues for
+    entry_point: ZoneEntryPoint, *, stop_buffer: Decimal
+) -> ZoneActivation:
     """The activation a `ZoneEntryPoint` names.
 
     ⚠️ **A chain rather than a mapping, because the constructors stopped agreeing.** The three
@@ -1368,6 +1594,8 @@ def activation_for(entry_point: ZoneEntryPoint, *, stop_buffer: Decimal) -> Zone
         return FffdActivation()
     if entry_point is ZoneEntryPoint.MARTELO:
         return HammerBreakActivation()
+    if entry_point is ZoneEntryPoint.MARTELO_FORCA:
+        return HammerForceActivation()
     raise EngineError(  # pragma: no cover - unreachable while the enum and the chain agree
         f"no activation for entry point {entry_point!r}"
     )

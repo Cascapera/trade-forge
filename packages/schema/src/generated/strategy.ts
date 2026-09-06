@@ -624,8 +624,26 @@ export interface StructureChochSetup {
  * the zone, and a second hammer inside the same window does not re-arm. His words:
  * *"desarma tudo e tem que esperar um novo contexto"*.
  *
- * ⚠️ The stop buffer says nothing about `botinha` or `martelo`: the first takes its stop
- * from the band and the second from the hammer, neither from the region. Their own numbers —
+ * `martelo_forca` is his second variation on the same hammer, and it is the same setup wearing
+ * the opposite order. The region, the five bars and the arming ceiling are unchanged; what
+ * differs is that the hammer alone places nothing. The bar **immediately after** it has to close
+ * as a *barra de forca* — at least seventy percent body in the trade's direction — whose extreme
+ * clears the hammer's, and the order is then a **limit** thirty percent of the way from the
+ * hammer's extreme towards the force bar's. Below the market, waiting for the pullback, where
+ * `martelo` waits above it for a break.
+ *
+ * ⚠️ Its cancel reads on a **close**, not a touch, and only on the bar after the force bar: a
+ * bar finishing beyond the force bar's extreme is the market saying the pullback is not coming.
+ * On the bar after that the question cannot arise — either the limit filled and there is a trade
+ * to conduct, or the two bars ran out and the order is withdrawn regardless.
+ *
+ * ⚠️ Every ending retires the region here too, and the force bar failing is one of them. There
+ * is no waiting for a better second bar and no second hammer inside the window: *"se a barra de
+ * forca falha a regiao deixa de valer, tem que esperar configurar tudo de novo"*.
+ *
+ * ⚠️ The stop buffer says nothing about `botinha`, `martelo` or `martelo_forca`: the first
+ * takes its stop from the band and the other two from the hammer, none of them from the
+ * region. Their own numbers —
  * the botinha's window and tenth and which volume its averages use, the hammer's five bars, two
  * bars, twenty percent and half a region — are not on this document yet and run on the engine's
  * defaults.
@@ -638,7 +656,7 @@ export interface StructureChochSetup {
 export interface StructureParams {
   allow_secondary?: AllowSecondary;
   breakeven_at_r?: BreakevenAtR2;
-  entry_point?: "edge" | "midpoint" | "return_pass" | "botinha" | "fffd" | "martelo";
+  entry_point?: "edge" | "midpoint" | "return_pass" | "botinha" | "fffd" | "martelo" | "martelo_forca";
   stop_buffer?: StopBuffer;
 }
 /**
@@ -657,7 +675,7 @@ export interface StructureContinuationSetup {
 export interface ContinuationParams {
   allow_secondary?: AllowSecondary1;
   breakeven_at_r?: BreakevenAtR3;
-  entry_point?: "edge" | "midpoint" | "return_pass" | "botinha" | "fffd" | "martelo";
+  entry_point?: "edge" | "midpoint" | "return_pass" | "botinha" | "fffd" | "martelo" | "martelo_forca";
   max_bos?: MaxBos;
   stop_buffer?: StopBuffer1;
 }

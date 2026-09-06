@@ -64,15 +64,15 @@ DEFAULT_ENTRY_FRACTION = Decimal("0.30")
 entre a máxima do martelo e a máxima da barra de força ... 30% então só spread entre as
 máximas"*. Hammer high 90 and force bar high 100 put the order at **93**, which is his number."""
 
-DEFAULT_BREAK_TICKS = 1
+DEFAULT_HAMMER_BREAK_TICKS = 1
 """How far past the hammer's extreme the breakout order waits: *"a ordem vai na máxima dele 1
 tick"*."""
 
 
 __all__ = [
     "DEFAULT_BODY_FRACTION",
-    "DEFAULT_BREAK_TICKS",
     "DEFAULT_ENTRY_FRACTION",
+    "DEFAULT_HAMMER_BREAK_TICKS",
     "DEFAULT_SHADOW_FRACTION",
     "DEFAULT_STOP_FRACTION",
     "HammerBreakLevels",
@@ -194,7 +194,7 @@ class HammerBreakTrigger:
     the module docstring.
     """
 
-    break_ticks: int = DEFAULT_BREAK_TICKS
+    break_ticks: int = DEFAULT_HAMMER_BREAK_TICKS
     stop_fraction: Decimal = DEFAULT_STOP_FRACTION
     shadow_fraction: Decimal = DEFAULT_SHADOW_FRACTION
 

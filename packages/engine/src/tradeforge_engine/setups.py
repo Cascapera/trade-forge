@@ -44,6 +44,7 @@ from tradeforge_engine.domain import (
     Context,
     Money,
     Position,
+    RefusedBy,
     Side,
     Signal,
     SignalKind,
@@ -1658,11 +1659,18 @@ class StructureStrategy:
             self._fill_bar = context.candle.time
 
     def _observe_refusal(self, context: Context) -> None:
-        """Stop believing in an order that never reached the book.
+        """Stop believing in an order that does not exist.
 
         A refusal arrives one bar after the order was asked for — it cannot arrive sooner, see
         `Context.refusals` — and what it means here is narrow and specific: the name this phase
         is holding does not exist anywhere. Not at the broker, not in a book, nowhere.
+
+        ⚠️ **Two ways to get there, and they part company at the cap (ADR-0025).** Six of the
+        seven `RefusedBy` members are gates: the order never reached the book, and something about
+        the order or the account is the reason. `MARKET` is the seventh — the order reached the
+        book, rested, and the broker withdrew it because price moved past the level. The
+        instruction is identical (stop believing) and the accounting is opposite (a gap teaches
+        nothing about the next attempt). The branch below is where that is spent.
 
         ⚠️ **Forgotten, not withdrawn, and the difference is the whole method.** `_withdraw`
         emits a CANCEL because it takes back an order that *is* resting; there is nothing to
@@ -1700,7 +1708,26 @@ class StructureStrategy:
         armed = self._armed
         if armed is None or not armed.placed:
             return
-        if not any(refusal.client_id == armed.client_id for refusal in context.refusals):
+        mine = [refusal for refusal in context.refusals if refusal.client_id == armed.client_id]
+        gated = [refusal for refusal in mine if refusal.refused_by is not RefusedBy.MARKET]
+        if mine and not gated:
+            # ⚠️ **The market ended it, so the belief is dropped and the cap is not touched**
+            # (ADR-0025). Both halves are the rule, and only the first is obvious.
+            #
+            # `_armed = None` for the same reason as below: the order does not exist, and a
+            # phase still holding the name would eventually send a cancel the book cannot
+            # honour — which is exactly what the 2025 census caught, `cancel` missing once for
+            # every order the broker had dropped.
+            #
+            # The streak is **broken**, not incremented, and that is not leniency: the cap
+            # counts refusals in a row, and the line below says what breaks a streak is an
+            # order that simply rested. A withdrawn order *did* rest — reaching the book is
+            # the whole difference between `MARKET` and the six gates. So whatever had been
+            # turning this zone away has demonstrably gone, and the count starts over.
+            self._refused.pop(armed.block, None)
+            self._armed = None
+            return
+        if not gated:
             # ⚠️ **The streak is broken by an order that simply rested**, and this line is the
             # difference between two rules that are easy to confuse. The cap is on refusals *in a
             # row*: a zone whose order was turned away, re-armed, and then sat healthily in the

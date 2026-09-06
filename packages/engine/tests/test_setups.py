@@ -3195,7 +3195,9 @@ def test_the_cap_is_what_stops_it_and_not_the_market(monkeypatch: pytest.MonkeyP
     assert sum(lifted.values()) == 50
 
 
-def _entries_when_refused_on(bars: set[int]) -> list[tuple[int, str | None]]:
+def _entries_when_refused_on(
+    bars: set[int], refused_by: RefusedBy = RefusedBy.EXECUTOR
+) -> list[tuple[int, str | None]]:
     """Every entry the phase emits when the name it is *currently holding* is refused on `bars`.
 
     ⚠️ **Refuses the held name, not the one emitted on that bar**, which is the ADR-0024 path and
@@ -3203,6 +3205,10 @@ def _entries_when_refused_on(bars: set[int]) -> list[tuple[int, str | None]]:
     answered `accepted`, and the verdict arrives later from another process. `_drive_with_a_refusal`
     refuses on the bar of the arming, so every refusal it makes is consecutive with the last —
     a scenario in which "three in a row" and "three ever" cannot be told apart.
+
+    `refused_by` is a parameter so that the *only* thing separating the market tests below from
+    the cap tests above is that field. Same bars, same series, same phase: whatever they report
+    differently is the branch in `_observe_refusal` and nothing else (ADR-0025).
     """
     phase = build_setup({"type": "structure_choch"})
     account = AccountState(balance=Decimal("10000"), equity=Decimal("10000"))
@@ -3227,7 +3233,7 @@ def _entries_when_refused_on(bars: set[int]) -> list[tuple[int, str | None]]:
                     Refusal(
                         client_id=held,
                         intent=SignalKind.ENTRY,
-                        refused_by=RefusedBy.EXECUTOR,
+                        refused_by=refused_by,
                         reason="entry.choch",
                         detail="volume 0.11 is above the cap of 0.10",
                     ),
@@ -3277,6 +3283,116 @@ def test_three_refusals_in_a_row_do_retire_it() -> None:
         "demand-20240103T0200-2",
         "demand-20240103T0200-3",
     ], f"the cap did not retire a zone refused three times running: {names}"
+
+
+def test_three_market_withdrawals_in_a_row_do_not_retire_a_zone() -> None:
+    """ADR-0025, and the separating half of the test directly above it.
+
+    **Identical bars, identical series, identical phase — one field differs.** The test above
+    refuses on 61, 62 and 63 with `EXECUTOR` and the zone is retired after the third; this one
+    refuses on the same three bars with `MARKET` and it is not. So whatever produces the
+    difference is the branch in `_observe_refusal` and can be nothing else, which is what a
+    scenario built separately could never claim.
+
+    The rule it pins: a gap is evidence about the market, not about the order or the account.
+    A cap exists to stop retrying something that will keep being turned away; retrying is not
+    what happened here, and counting it would retire a setup for having had an order open on a
+    Monday morning.
+
+    ⚠️ It also pins that the phase **stops holding the name**: the run re-arms as `-2`, `-3` and
+    `-4`. A branch that spared the cap but left `_armed` in place would emit `-1` and then go
+    quiet for ever, and the list would be one name long.
+    """
+    withdrawn = _entries_when_refused_on({61, 62, 63}, RefusedBy.MARKET)
+
+    names = [name for _bar, name in withdrawn if name and name.startswith("demand-")]
+    assert names == [
+        "demand-20240103T0200-1",
+        "demand-20240103T0200-2",
+        "demand-20240103T0200-3",
+        "demand-20240103T0200-4",
+    ], f"the market ending an order three times retired the zone: {names}"
+
+
+def test_a_market_withdrawal_between_two_refusals_breaks_the_streak() -> None:
+    """The reason the branch **pops** the count rather than merely skipping it.
+
+    ⚠️ **Three bars could not tell the two apart, and the first version of this test used
+    three.** Refused on 61 and 63 by a gate with the market ending the order on 62: popping
+    counts 1, gone, 1; skipping counts 1, 1, 2. Both stay under a cap of 3, both keep the zone,
+    both emit four names — and the mutant that deletes the `pop` survived the whole of
+    `test_setups.py`. A fourth gate refusal on 64 is what separates them: skipping reaches 3
+    there and retires the zone at four names, popping reaches 2 and arms a fifth.
+
+    The rule being pinned: what breaks a streak is an order that **reached the book**, and a
+    withdrawn order did reach it. That is the same evidence as an order that simply rested,
+    which the consecutive rule already treats as a reset.
+
+    ⚠️ Honest about its own standing: driven through the real loop, `pop` and skip are
+    equivalent, because a `MARKET` refusal for an order armed on N is delivered on N+2 at the
+    earliest, and `_observe_refusal` has already popped the count on N+1 by falling through the
+    `not gated` branch. This pins the intention where a `Context` built by hand can reach it —
+    the day delivery moves to the same bar (backlog), it stops being unreachable.
+    """
+    phase = build_setup({"type": "structure_choch"})
+    account = AccountState(balance=Decimal("10000"), equity=Decimal("10000"))
+    entries: list[str | None] = []
+    pending: tuple[Refusal, ...] = ()
+    held: str | None = None
+    by = {
+        61: RefusedBy.EXECUTOR,
+        62: RefusedBy.MARKET,
+        63: RefusedBy.EXECUTOR,
+        64: RefusedBy.EXECUTOR,
+    }
+
+    with localcontext(ENGINE_CONTEXT):
+        for index, candle in enumerate(arms_a_resting_limit()):
+            for signal in phase.on_bar(
+                Context(candle=candle, instrument=EURUSD, account=account, refusals=pending)
+            ):
+                if signal.kind is SignalKind.ENTRY:
+                    entries.append(signal.client_id)
+                    held = signal.client_id
+            pending = ()
+            if index in by and held is not None:
+                pending = (
+                    Refusal(
+                        client_id=held,
+                        intent=SignalKind.ENTRY,
+                        refused_by=by[index],
+                        reason="entry.choch",
+                        detail="",
+                    ),
+                )
+
+    names = [name for name in entries if name and name.startswith("demand-")]
+    assert names == [
+        "demand-20240103T0200-1",
+        "demand-20240103T0200-2",
+        "demand-20240103T0200-3",
+        "demand-20240103T0200-4",
+        "demand-20240103T0200-5",
+    ], f"a withdrawal between gate refusals did not reset the streak: {names}"
+
+
+def test_four_gate_refusals_in_a_row_retire_the_zone_the_same_fixture_keeps() -> None:
+    """The control for the test above, on the same four bars with the market taken out.
+
+    Without it, "five names" could be read as a cap that stopped firing at four refusals rather
+    than as the withdrawal resetting the count. Refused by a gate on 61, 62, 63 and 64: the zone
+    is retired after the third and only three names exist.
+    """
+    names = [
+        name
+        for _bar, name in _entries_when_refused_on({61, 62, 63, 64})
+        if name and name.startswith("demand-")
+    ]
+    assert names == [
+        "demand-20240103T0200-1",
+        "demand-20240103T0200-2",
+        "demand-20240103T0200-3",
+    ], f"four gate refusals in a row did not retire the zone: {names}"
 
 
 # --------------------------------------------------------------------------- #

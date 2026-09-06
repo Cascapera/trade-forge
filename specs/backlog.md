@@ -1427,21 +1427,222 @@ oferece só `edge` e `midpoint` com o terceiro valor chegando apenas por JSON cr
 uma lista menor que o union continua sendo atribuível. [[completude-provada-no-compilador]] tem a
 forma que provaria (`Exclude<...> extends never`), e ela não está aplicada aqui.
 
-## Nenhuma medição agregada de `MIDPOINT` nem de `RETURN_PASS`
+## ~~Nenhuma medição agregada dos pontos de entrada~~ — MEDIDO em 06/09/2026
 
-Anotado na #189 e **piorado** pela #190. Ninguém rodou os dois pontos de entrada novos contra
-dados reais: quantas ordens passam a existir, por quanto tempo, quantos trades novos aparecem.
+Aberto na #189 quando eram dois pontos de entrada, piorado pela #190 e depois pelas #191–#193, que
+construíram mais três. **Corrida solta, nada commitado além desta nota**: os cinco `entry_point`
+sobre barras reais de M15, ano-calendário de 2025, dois ativos.
 
-⚠️ A #190 aumenta a urgência porque a passagem na volta segura o **nome** da zona sem nada no book
-por quantas barras o preço levar para voltar — é o entry point que vive mais tempo dos três. E é
-o mesmo mecanismo que torna o termo `not self._tracked(...)` (sem teste que o prenda, expiração em
-`_MAX_ZONES = 200`) deixar de ser teórico num backtest longo. Prendê-lo honestamente exige um
-`_MAX_ZONES` injetável, não um cenário de 200 zonas.
+Como a corrida foi montada — importa para ler os números: `structure_choch` e
+`structure_continuation` com `allow_secondary: true`, `percent_risk` 1%, capital 100 000, **custo
+zero e slippage zero**, sem `take_profit`. Custo zero porque a pergunta é *censo de população*
+("este ponto de entrada tem o que fazer no mundo real?"), não P&L; ver
+[[degradacao-cresce-com-a-busca]] para o que o spread faria com o segundo. AAPL: 6 470 barras
+(02/01 → 31/12). EURUSD: 24 674 barras (01/01 → 31/12). Duas corridas idênticas conferidas —
+determinismo verificado, não assumido.
 
-É o número que eu pediria **antes** de rodar qualquer um dos dois em paper. E dá para medir: o
-`data/ohlcv` é dado real desde 06/08 (o sintético foi apagado; ver `dados-ohlcv-sao-sinteticos`,
-que registra a correção). ⚠️ Uma anotação anterior nesta seção dizia que a série era `--source
-mock` — **estava errada**, e foi corrigida aqui.
+**A resposta principal: nenhum dos cinco produz zero.** Todos armam, todos preenchem e todos
+fecham trade nos dois ativos. 725 trades no total.
+
+| ativo | setup | entry | zonas | ordens | cancel | fills | trades | equity final |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| AAPL | choch | `edge` | 51 | 51 | 18 | 33 | 33 | 102 691 |
+| AAPL | choch | `midpoint` | 56 | 56 | 37 | 19 | 19 | 84 283 |
+| AAPL | choch | `return_pass` | 4 | 4 | 3 | 1 | 1 | 100 000 |
+| AAPL | choch | `botinha` | 6 | 17 | 11 | 6 | 6 | 94 435 |
+| AAPL | choch | `fffd` | 7 | 7 | 5 | 2 | 2 | 98 010 |
+| AAPL | contin. | `edge` | 47 | 47 | 18 | 29 | 29 | 98 156 |
+| AAPL | contin. | `midpoint` | 53 | 53 | 37 | 16 | 16 | 90 438 |
+| AAPL | contin. | `return_pass` | 4 | 4 | 0 | 4 | 4 | 109 103 |
+| AAPL | contin. | `botinha` | 12 | 48 | 42 | 6 | 6 | 105 011 |
+| AAPL | contin. | `fffd` | 5 | 5 | 4 | 1 | 1 | 99 000 |
+| EURUSD | choch | `edge` | 201 | 201 | 67 | 134 | 134 | 89 540 |
+| EURUSD | choch | `midpoint` | 213 | 213 | 138 | 75 | 75 | 101 420 |
+| EURUSD | choch | `return_pass` | 30 | 30 | 15 | 15 | 15 | 128 692 |
+| EURUSD | choch | `botinha` | 48 | 167 | 129 | 38 | 38 | 87 224 |
+| EURUSD | choch | `fffd` | 38 | 39 | 29 | 10 | 10 | 104 700 |
+| EURUSD | contin. | `edge` | 202 | 202 | 64 | 138 | 137 | 115 671 |
+| EURUSD | contin. | `midpoint` | 253 | 253 | 161 | 92 | 91 | 74 026 |
+| EURUSD | contin. | `return_pass` | 46 | 46 | 13 | 33 | 32 | 112 467 |
+| EURUSD | contin. | `botinha` | 76 | 246 | 185 | 61 | 61 | 96 719 |
+| EURUSD | contin. | `fffd` | 55 | 56 | 41 | 15 | 15 | 89 431 |
+
+"Zonas" é `client_id` distinto com o sufixo `-rN` removido — isto é, a zona, não a recolocação.
+
+**O achado com mais força estatística é a taxa de conversão zona → fill**, porque ela se repete
+em dois mercados que não têm nada em comum:
+
+| entry | AAPL choch | AAPL contin. | EURUSD choch | EURUSD contin. |
+|---|---:|---:|---:|---:|
+| `edge` | 65% | 62% | 67% | 68% |
+| `midpoint` | 34% | 30% | 35% | 36% |
+| `fffd` | 29% | 20% | 26% | 27% |
+| `botinha` | 100% | 50% | 79% | 80% |
+| `return_pass` | 25% | 100% | 50% | 72% |
+
+As três primeiras linhas são faixas apertadas num ativo de bolsa e num par de forex — é
+geometria, não regime de mercado: a ordem na borda enche em dois de cada três toques, a do meio
+em um de cada três, porque o meio exige penetrar metade da região. `botinha` e `return_pass` têm
+n pequeno demais no AAPL (6 e 4 zonas) para a linha significar coisa alguma.
+
+⚠️ **As populações não são comparáveis entre colunas de uma mesma linha da tabela grande.** Uma
+zona queima no FILL ([[smc-uma-entrada-por-regiao]]), então um `entry_point` que enche mais muda
+quais zonas existem depois. `edge` marca 51 e `midpoint` 56 sobre a **mesma** série pelo mesmo
+motivo. Comparar "quantos trades cada um dá" é legítimo; comparar "qual acha mais setup" não é.
+
+**A perseguição do botinha, medida:** 7 nomes por zona no máximo — exatamente o número que a lição
+da #192 previu, agora confirmado em dois ativos. Mediana de 2 a 3. O `fffd` chega a 2 nomes (a
+releitura sem matar a região, da #193); os outros três ficam em 1 sempre.
+
+⚠️⚠️ **A equity desta tabela não é critério de nada, e a decisão é dele (06/09/2026):** *"o
+resultado ainda não importa pois vamos ligar os pontos ainda, a estratégia global ainda não está
+pronta, estamos adicionando os blocos para fazer a parede final."* O que esta corrida valida é a
+**configuração no código** — os cinco pontos de entrada existem, são alcançáveis por dado real e
+produzem ordem. Nenhum deles foi projetado para operar sozinho, e comparar o P&L de tijolos
+soltos é comparar coisa que não vai existir na forma medida. Não usar estes números para escolher,
+podar ou ajustar entry point.
+
+**Sobre a equity da tabela: leia com cuidado.** Todas as 725 saídas são `sl`, porque não há
+`take_profit` e a condução da MME9 aperta o stop ([[swing-conducao-mme9]]) — "saiu no stop" inclui
+os ganhos. A distribuição é de seguidor de tendência: no primeiro trimestre do AAPL/`edge` foram 9
+perdas de 1R, 2 no zero e **um** ganho de +14,6R, e é esse trade sozinho que faz o ano. Com 1 a 15
+vencedores por célula, nenhuma dessas equities separa um ponto de entrada de outro; elas estão
+aqui como ordem de grandeza e como prova de que a corrida chega ao fim, não como resultado.
+
+### ⚠️ A afirmação sobre o `RETURN_PASS` que estava aqui era falsa
+
+A versão anterior desta seção dizia: *"a passagem na volta segura o nome da zona sem nada no book
+por quantas barras o preço levar para voltar — é o entry point que vive mais tempo dos três"*.
+Medindo a vida da zona em barras, da origem da região (que está gravada no próprio `client_id`)
+até o fill ou o cancelamento:
+
+| ativo/setup | `edge` med/máx | `midpoint` med/máx | `return_pass` med/máx |
+|---|---:|---:|---:|
+| AAPL choch | 67 / **2 017** | 63 / 2 017 | 42 / 166 |
+| AAPL contin. | 40 / 1 305 | 39 / 1 305 | 23 / 96 |
+| EURUSD choch | 56 / 1 217 | 56 / 1 217 | 37 / 258 |
+| EURUSD contin. | 26 / 565 | 27 / 565 | 25 / 121 |
+
+`edge` e `midpoint` vivem mais em toda célula, e por uma ordem de grandeza no extremo: uma zona do
+AAPL segurou o nome por **2 017 barras**, quase um terço do ano de pregão.
+
+⚠️ **E o mais importante: a afirmação original não é falsificável por esta medição, e isso é o
+achado.** O `return_pass` só chega ao book quando o preço volta e passa; a zona que espera para
+sempre **nunca submete ordem nenhuma** e portanto é invisível para qualquer sonda do lado do
+broker — que é exatamente a população sobre a qual a frase falava. As 4 zonas do AAPL e 30 do
+EURUSD são os *sobreviventes*. Medir a frase de verdade exige uma costura do lado da estratégia
+(quando a zona é armada), que hoje não existe. Ver [[cenario-que-nao-separa]]: o número que eu
+tinha medido primeiro era o tempo **no book**, não o tempo segurando o nome, e as duas coisas só
+coincidem para `edge` e `midpoint`.
+
+O termo `not self._tracked(...)` e o `_MAX_ZONES = 200` continuam sem teste que os prenda. O maior
+número de zonas numa corrida foi **253** (EURUSD, continuação, `midpoint`) — acima do teto, mas ao
+longo de um ano, não simultâneas. Prendê-lo honestamente continua exigindo um `_MAX_ZONES`
+injetável, não um cenário de 200 zonas.
+
+## Recolher a ordem antes do fechamento e repor na abertura seguinte
+
+Ideia dele, 06/09/2026, olhando os três descartes por gap do AAPL — todos gap de abertura de ação
+(última barra 19:45, gap às 13:30; o pior em 03/04/2025: limite 218,19, stop 216,70, abertura
+205,53). A regra: **a ordem pendurada não atravessa a noite.** Cancela
+antes do fechamento da sessão e recoloca na abertura, se a região ainda estiver de pé.
+
+**Por que vale a pena, e não é só evitar o gap:** ela move a decisão para a camada certa. Hoje
+quem salva a situação é o *broker* — `_survives_the_gap` recusando um fill que abriria já estopado.
+Com a regra, quem decide é a *estratégia*, na abertura, olhando a estrutura. No caso de 03/04/2025
+ela simplesmente não recolocaria, porque o gap de 6% rompeu a estrutura: vira um não-trade por
+decisão em vez de um resgate do encanamento.
+
+⚠️ **1. Precisa de calendário de sessão, e NÃO pode ser deduzido da série.** A heurística óbvia —
+*"se a próxima barra está a mais de 15 minutos, a sessão fechou"* — funciona no backtest e **é
+lookahead**: às 19:45 a engine só sabe que aquela foi a última barra do dia quando a próxima
+chega, e o live não tem essa informação. Deduzir da série quebra a invariante 1 (anti-lookahead) e
+a 3 (estratégia única) do `AGENTS.md` de uma vez só. Tem que ser fato conhecido de antemão, no
+`InstrumentSpec`, idêntico nos dois modos. É esse o custo real da ideia, e ele é maior do que
+parece: feriado, meio-pregão, DST, e a diferença entre a sessão da bolsa e o horário em que a
+corretora cota.
+
+⚠️ **2. Colide com uma guarda que já existe.** A 1ª recusa do `_may_arm` foi escrita exatamente
+contra *"retirar e repor idêntica uma barra depois"*. O ciclo noturno é literalmente isso, uma vez
+por dia. Quem implementar tem que ensinar a guarda a separar "retirei porque mudei de ideia" de
+"retirei porque a bolsa fechou" — senão a zona é aposentada pela própria regra que devia
+protegê-la. Ver [[duas-guardas-se-confundem]].
+
+**3. Não substitui `_survives_the_gap`.** O fim de semana do forex (2 descartes medidos no EURUSD)
+e a primeira barra depois de qualquer halt continuam existindo. As duas são complementares.
+
+**4. Efeito colateral bom:** a ordem reposta na abertura carrega `decided_at` da barra de abertura,
+não o da noite anterior. Melhora a postura anti-lookahead em vez de piorar.
+
+## ~~Uma ordem em repouso descartada por gap sai do book sem virar `Refusal`~~ — FECHADO (PR-194, ADR-0025)
+
+Medido em 06/09/2026 na corrida acima, e foi ela que tornou o buraco visível: `zonas` menos
+`fills` menos `cancelamentos que acertaram` não fechava em três casos.
+
+`backtest_broker._fill_resting` tem dois caminhos que **removem** uma ordem em repouso sem fill e
+sem cancelamento — `_survives_the_gap` (o preço abriu através do nível *e* do stop medido a partir
+dele) e `_survives_the_slip` (ADR-0016, o stop dispararia longe demais do gatilho). A remoção é
+correta e está justificada no docstring. O que não existe é o **registro**: o único vestígio é um
+`logger.debug`, e `RunResult.refusals` devolve `0`.
+
+No ano de 2025, nos 20 cenários: **18 descartes por gap e 1 por slip**, e `refusals: 0` em todos
+os 20. Exemplo, AAPL/choch/`edge`:
+
+```
+resting order supply-20250116T1645-3  dropped: 232.10 gapped past its stop 231.28
+resting order demand-20250310T1900-19 dropped: 223.75 gapped past its stop 224.22
+resting order demand-20250331T1345-22 dropped: 205.53 gapped past its stop 216.70
+```
+
+⚠️ **É a promessa do próprio docstring de `RunResult.refusals`** — *"o registro de toda ordem que
+foi pretendida e não aconteceu"*, e *"a pergunta que ele responde é a que um backtest não podia:
+por que isto não tomou trade nenhum?"*. Uma ordem descartada por gap é precisamente isso e não
+está lá. Do lado da estratégia é o fantasma do ADR-0023 por uma porta nova: ela segue acreditando
+que a ordem descansa, até a própria expiração soltar a zona — e é isso que produz os
+`cancel` que erram (18 pedidos, 15 acertos no cenário acima, os 3 que faltam são estes).
+
+**Resolvido no PR-194 com a opção (B) do ADR-0025**: membro novo `RefusedBy.MARKET`, que não
+conta contra o `MAX_ARMING_ATTEMPTS`. O ADR guarda por que (A) — reusar `BROKER` — teria
+aposentado zonas por causa de um gap, e por que (C) — tipo de desfecho novo — custava um contrato
+atravessando o fio inteiro do ADR-0024 para uma diferença que nenhum consumidor lê.
+
+⚠️ **E o conserto revelou um segundo buraco, maior**, também fechado ali: `iter_run` drenava
+`broker.refusals()` **depois do `yield`**, direto para o `Context` seguinte, sem nunca tocar num
+`BarOutcome` — e `run()` é um acumulador de `BarOutcome`. O que o broker reportava chegava à
+estratégia e nunca ao registro da corrida. Em live isso valia igual para `EXECUTOR` e `VENUE`.
+
+## A retirada pelo mercado podia ser entregue na própria barra, e não é
+
+Aberto no PR-194, e é o trade-off nº 2 do ADR-0025 assumido conscientemente.
+
+A retirada nasce no passo 1 de `_step` — `broker.on_bar()` — que é **antes** de o passo 2 montar
+o `Context`. Diferente de toda recusa de portão, ela poderia ser mostrada à estratégia na mesma
+barra. Não é: `Context.refusals` significa "a da barra anterior" para os outros seis membros, e
+uma regra de entrega que a estratégia consegue enunciar valeu mais do que uma barra de frescor.
+
+O custo está medido: dos 19 descartes de 2025, o conserto eliminou **4** cancelamentos fantasma.
+Os outros aconteciam dentro dessa uma barra de atraso — a fase decidia soltar a zona antes de
+saber que a ordem já não existia. Entregar na própria barra fecharia esses.
+
+⚠️ **O que ela custa, e o que ela compra — corrigido depois da conferência da lição.** A
+primeira versão da #194 drenou a caixa de correio no topo de `_step` e o guardian mediu que todo
+veredito assíncrono passou a chegar uma barra depois (barra 3 → barra 4). Eu escrevi aqui que
+era a *posição* da drenagem; era o **roteamento**: o que se drena no topo ia para o `BarOutcome`
+daquela barra e só daí para `pending`. Uma drenagem no topo **roteada para o `Context` da mesma
+barra** entrega igual ao `develop` para o que chega durante o `submit` — e entrega **uma barra
+antes** para o que chega na espera pela vela seguinte, porque o `for` de `iter_run` bloqueia
+depois da drenagem atual. Uma leitura só, janela maior, e a retirada pelo mercado na própria
+barra. O preço é o contrato: `Context.refusals` deixa de ser "a da barra anterior", o que reprende
+`carrying == [1]` em `test_loop` e o "não pode chegar antes" do docstring de `_observe_refusal`.
+
+⚠️ É uma decisão sobre `Context` **mais** uma sobre o custo da leitura, e mexe no live junto: o
+`hand_over` do aquecimento e o fio do ADR-0024 leem a mesma regra. Ver
+[[protocolo-decidido-antes-do-problema]] e [[duas-guardas-se-confundem]].
+
+⚠️ **`_survives_the_slip` disparou 1 vez em 725 trades e 20 corridas de ano inteiro.** A guarda do
+ADR-0016 é quase inexercitada por dado real — o que não a torna removível ([[guarda-inalcancavel-como-falha]]
+diz que o critério é o modo de falha, não a alcançabilidade), mas diz que ela vive de teste
+sintético e vai continuar assim.
 
 ## A VWAP se cala em silêncio quando o volume pedido não existe na série
 

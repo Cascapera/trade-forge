@@ -11,6 +11,7 @@ from decimal import Decimal
 
 import pytest
 
+from tradeforge_engine.backtest_broker import BacktestBroker
 from tradeforge_engine.domain import (
     Candle,
     OrderRequest,
@@ -19,6 +20,7 @@ from tradeforge_engine.domain import (
     Refusal,
     RefusedBy,
     Side,
+    Signal,
     SignalKind,
 )
 from tradeforge_engine.errors import EngineError, LookaheadError
@@ -29,6 +31,7 @@ from tradeforge_engine.testing import (
     FixedRisk,
     ImmediateFillBroker,
     ScriptedStrategy,
+    bar,
     close_out,
     entry,
     rising,
@@ -715,3 +718,159 @@ def test_the_loop_asks_the_broker_for_refusals_that_arrived_out_of_band() -> Non
     [refusal] = strategy.refusals_seen[1]
     assert refusal.refused_by is RefusedBy.VENUE
     assert refusal.client_id == "zone-7"
+
+
+def test_a_refusal_from_the_brokers_mailbox_reaches_the_runs_record() -> None:
+    """ADR-0025. Reaching the *strategy* was never the whole promise.
+
+    ⚠️ **This is the bug the 2025 census found, and the test above cannot see it.** The mailbox
+    was drained straight into the next bar's `Context`, so a strategy learned of the refusal and
+    `RunResult.refusals` — *"every order the run intended and did not place"*, and the field that
+    exists to answer "why did this take no trades?" — never held it. It was invisible for as
+    long as the only backtest broker returned the empty tuple; the day one started answering,
+    19 orders left the book across a year of AAPL and EURUSD and the run reported none.
+
+    Pinned on `BarOutcome` too, not only on the total: `run()` is an accumulator over outcomes,
+    so a mutant that reported the mailbox anywhere else would still leave a live session — which
+    consumes `iter_run` bar by bar and never builds a `RunResult` — with nothing to record.
+    """
+
+    class RefusesOutOfBand(ImmediateFillBroker):
+        def __init__(self) -> None:
+            super().__init__()
+            self._mailbox = [
+                Refusal(
+                    client_id="zone-7",
+                    intent=SignalKind.ENTRY,
+                    refused_by=RefusedBy.MARKET,
+                    reason="entry.test",
+                    detail="1.09200 gapped past its stop 1.09300",
+                )
+            ]
+
+        def refusals(self) -> Sequence[Refusal]:
+            drained, self._mailbox = self._mailbox, []
+            return tuple(drained)
+
+    outcomes = list(
+        iter_run(
+            timeframe=HOUR,
+            candles=rising(4),
+            instrument=EURUSD,
+            strategy=ScriptedStrategy(script={}),
+            broker=RefusesOutOfBand(),
+            risk=FixedRisk(),
+        )
+    )
+    carrying = [index for index, outcome in enumerate(outcomes) if outcome.refusals]
+    assert carrying == [1], (
+        f"the mailbox landed on outcomes {carrying}; it is drained after bar 0 and recorded on "
+        "the outcome of bar 1, which is also the bar it is delivered on"
+    )
+
+    result = run(
+        timeframe=HOUR,
+        candles=rising(4),
+        instrument=EURUSD,
+        strategy=ScriptedStrategy(script={}),
+        broker=RefusesOutOfBand(),
+        risk=FixedRisk(),
+    )
+    assert [refusal.refused_by for refusal in result.refusals] == [RefusedBy.MARKET], (
+        "the run finished reporting no refusals while an order had been ended by the market"
+    )
+
+
+def test_a_verdict_that_lands_during_submit_still_reaches_the_next_bar() -> None:
+    """⚠️ **The window every other test here misses, and it cost this PR a blocking review.**
+
+    `test_the_loop_asks_the_broker_for_refusals_that_arrived_out_of_band` fills the mailbox in
+    `__init__` — *before* the run — which is the one arrival window no drain point treats
+    differently. The window that matters is the one ADR-0024 actually measured: `submit`
+    answers `accepted` and the executor's verdict lands 8 ms later, which is **inside step 3 of
+    the same bar**. The first version drained at the top of `_step` and put the result on that
+    bar's outcome — from where `pending` carried it to the bar after — and every such refusal
+    arrived one bar late: fifteen minutes, in a live M15 session, of a phase believing in an
+    order the venue never took. Not the drain's position, its **routing**: what is drained has
+    to reach the very next `Context`.
+
+    Measured while this test did not exist: order sent on bar 2, seen on bar 3 by `develop`
+    and on bar **4** by that version. Nothing was red.
+    """
+
+    class RefusesDuringSubmit(ImmediateFillBroker):
+        """The verdict arrives while `submit` is still on the stack — the live shape."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self._mailbox: list[Refusal] = []
+
+        def submit(self, order: OrderRequest) -> OrderResult:
+            result = super().submit(order)
+            self._mailbox.append(
+                Refusal(
+                    client_id=order.client_id,
+                    intent=SignalKind.ENTRY,
+                    refused_by=RefusedBy.VENUE,
+                    reason="entry.test",
+                    detail="the venue would not take it (retcode 10027)",
+                )
+            )
+            return result
+
+        def refusals(self) -> Sequence[Refusal]:
+            drained, self._mailbox = self._mailbox, []
+            return tuple(drained)
+
+    strategy = ScriptedStrategy(script={2: [entry(client_id="zone-7")]})
+    result = run(
+        timeframe=HOUR,
+        candles=rising(6),
+        instrument=EURUSD,
+        strategy=strategy,
+        broker=RefusesDuringSubmit(),
+        risk=FixedRisk(),
+    )
+
+    carrying = [index for index, seen in enumerate(strategy.refusals_seen) if seen]
+    assert carrying == [3], (
+        f"a verdict that landed during the submit on bar 2 reached the strategy on {carrying}; "
+        "it belongs on bar 3, the very next one"
+    )
+    assert [refusal.refused_by for refusal in result.refusals] == [RefusedBy.VENUE]
+
+
+def test_the_market_ends_a_resting_order_and_the_run_says_so_end_to_end() -> None:
+    """The whole path with the real broker in it, because the two tests above both use a fake.
+
+    ⚠️ **A fake that agrees with the right answer agrees with the wrong one too.** Everything
+    above pins the loop given a broker that reports; nothing yet pins that the broker in this
+    repo *does* report through a `run()`, which is the arrangement the census actually measured.
+    A buy limit at 1.09500 stopped at 1.09300, and a bar that opens at 1.09200 — through the
+    level and through the stop.
+    """
+    resting = Signal(
+        kind=SignalKind.ENTRY,
+        side=Side.LONG,
+        reference_price=Decimal("1.09750"),
+        stop_loss=Decimal("1.09300"),
+        limit_price=Decimal("1.09500"),
+        reason="entry.test",
+        client_id="zone-9",
+    )
+    result = run(
+        timeframe=HOUR,
+        candles=[
+            bar(0, open_="1.09800", close="1.09750", high="1.09850", low="1.09700"),
+            bar(1, open_="1.09200", close="1.09100", high="1.09250", low="1.09000"),
+            bar(2, open_="1.09150", close="1.09180", high="1.09200", low="1.09100"),
+        ],
+        instrument=EURUSD,
+        strategy=ScriptedStrategy(script={0: [resting]}),
+        broker=BacktestBroker(instrument=EURUSD, initial_capital=Decimal(10_000)),
+        risk=FixedRisk(),
+    )
+    assert result.trades == ()
+    [refusal] = result.refusals
+    assert refusal.refused_by is RefusedBy.MARKET
+    assert refusal.client_id == "zone-9"

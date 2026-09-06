@@ -22,6 +22,7 @@ from tradeforge_engine.domain import (
     OrderRequest,
     OrderResult,
     Position,
+    RefusedBy,
     Side,
     Signal,
     SignalKind,
@@ -65,6 +66,7 @@ def _limit(  # noqa: PLR0913 — keyword-only; each names one axis of a resting 
     stop: str | None = None,
     client_id: str = "zone-1",
     decided_at: dt.datetime = DECIDED,
+    reason: str = "",
 ) -> OrderResult:
     return broker.submit(
         OrderRequest(
@@ -76,6 +78,7 @@ def _limit(  # noqa: PLR0913 — keyword-only; each names one axis of a resting 
             stop_loss=Decimal(stop) if stop is not None else None,
             limit_price=Decimal(limit),
             client_id=client_id,
+            reason=reason,
         )
     )
 
@@ -845,6 +848,114 @@ def test_a_dead_order_does_not_cost_the_next_one_its_fill() -> None:
     assert fill.order.client_id == "alive"
     assert fill.price == Decimal("1.09200")  # the open: it gapped through this level too
     assert broker.resting() == ()
+
+
+# --------------------------------------------------------------------------- #
+# A dropped order is reported, not only logged (ADR-0025)                       #
+# --------------------------------------------------------------------------- #
+
+
+def test_a_gapped_order_is_reported_as_refused_by_the_market() -> None:
+    """The drop above, read from the strategy's side: it has to be *told*.
+
+    Until ADR-0025 the only trace was a `logger.debug`, which no strategy can read, so a phase
+    went on holding a name for an order that no longer existed anywhere. `MARKET` rather than
+    `BROKER` because nothing refused it — it was accepted, it rested, and the market left.
+    """
+    broker = _broker()
+    _limit(broker, limit="1.09500", stop="1.09300", client_id="zone-9", reason="entry.gap")
+    assert (
+        broker.on_bar(bar(1, open_="1.09200", close="1.09100", high="1.09250", low="1.09000")) == []
+    )
+
+    [refusal] = broker.refusals()
+    assert refusal.client_id == "zone-9"
+    assert refusal.refused_by is RefusedBy.MARKET
+    assert refusal.intent is SignalKind.ENTRY
+    # ⚠️ Both halves of the split `_end_by_market` documents, because only `detail` was asserted
+    # at first and dropping `reason` left the whole suite green: `reason` is what the *strategy*
+    # called the order ("entry.choch" in a real run), `detail` is this broker's account of the
+    # market. The record that answers "why did this take no trades?" needs the first to say
+    # which setup, and the second to say what happened.
+    assert refusal.reason == "entry.gap"
+    assert "1.09300" in refusal.detail  # the stop it gapped past, so a human can see which one
+
+
+def test_a_stop_dropped_for_slipping_too_far_is_reported_too() -> None:
+    """The mirror path, and it needs its own test rather than its own assertion.
+
+    `_survives_the_gap` and `_survives_the_slip` are two `continue`s in one loop, and a change
+    that reports one and not the other leaves a suite green: the gap test above passes, and the
+    order still disappears here. Both were dropped in silence, and the census that found this
+    saw 18 of the first and **1** of the second in a year — the rare one is exactly the one a
+    scenario-shaped suite forgets.
+    """
+    broker = _broker()
+    _stop(broker, stop_price="1.10500", stop="1.10000", client_id="zone-slip")
+    assert (
+        broker.on_bar(bar(1, open_="1.15000", close="1.15100", high="1.15200", low="1.14900")) == []
+    )
+
+    [refusal] = broker.refusals()
+    assert refusal.client_id == "zone-slip"
+    assert refusal.refused_by is RefusedBy.MARKET
+    assert "1.10500" in refusal.detail  # the trigger, not the stop: this is the other guard
+
+
+def test_an_order_that_simply_fills_is_not_reported_as_refused() -> None:
+    """The negative case, without which every assertion above is satisfied by "always report".
+
+    Same order, same shape of bar, gapping *toward* the limit but nowhere near the stop: it
+    fills, and nothing was ended by anybody.
+    """
+    broker = _broker()
+    _limit(broker, limit="1.09500", stop="1.08000")
+    [fill] = broker.on_bar(bar(1, open_="1.09200", close="1.09300", high="1.09350", low="1.09150"))
+    assert fill.price == Decimal("1.09200")
+    assert broker.refusals() == ()
+
+
+def test_a_strategy_cancelling_its_own_order_is_not_the_market_ending_it() -> None:
+    """`cancel` empties the book too, and it must not come back as a refusal.
+
+    The two are opposite instructions to the phase that hears them: a cancel is the strategy's
+    own decision and spends nothing, while a refusal says the order it believes in is gone. A
+    broker that reported both would tell a strategy it was turned away every time it changed
+    its mind — and `setups._observe_refusal` reads exactly that field to decide.
+    """
+    broker = _broker()
+    _limit(broker, limit="1.09500", stop="1.09300", client_id="mine")
+    assert broker.cancel("mine") is True
+    assert broker.refusals() == ()
+
+
+def test_the_refusals_are_drained_not_republished() -> None:
+    """Asked once a bar by the loop, and news delivered twice is a strategy told its order was
+    ended on a bar where it holds a perfectly good one.
+
+    ⚠️ The second read only proves anything because the first one returned something: a broker
+    that never reported would pass the `== ()` line on its own.
+    """
+    broker = _broker()
+    _limit(broker, limit="1.09500", stop="1.09300", client_id="zone-9")
+    broker.on_bar(bar(1, open_="1.09200", close="1.09100", high="1.09250", low="1.09000"))
+
+    assert len(broker.refusals()) == 1
+    assert broker.refusals() == ()
+
+
+def test_two_orders_ended_by_one_gap_are_both_reported() -> None:
+    """A list, not a slot. One overnight gap can pass the level of every order in the book, and
+    a phase matches refusals by `client_id` — so a report that kept only the last one would
+    leave the other zone believing in an order forever."""
+    broker = _broker()
+    _limit(broker, limit="1.09500", stop="1.09300", client_id="zone-a")
+    _limit(broker, limit="1.09450", stop="1.09250", client_id="zone-b")
+    assert (
+        broker.on_bar(bar(1, open_="1.09200", close="1.09100", high="1.09250", low="1.09000")) == []
+    )
+
+    assert sorted(refusal.client_id or "" for refusal in broker.refusals()) == ["zone-a", "zone-b"]
 
 
 def test_the_target_is_measured_from_the_fill_not_from_the_level() -> None:

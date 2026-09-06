@@ -284,7 +284,7 @@ class HammerForceTrigger:
         if self.stop_fraction <= ZERO:
             raise EngineError(f"the stop sits past the hammer, got {self.stop_fraction}")
 
-    def levels_for(
+    def levels_for(  # noqa: PLR0911 - one flat refusal per way the pair fails to be his setup
         self, hammer: Candle, force: Candle, *, side: Side, tick: Money
     ) -> HammerForceLevels | None:
         """The three levels if `hammer` is a hammer and `force` is a force bar behind it.
@@ -302,6 +302,23 @@ class HammerForceTrigger:
         is the bar immediately after the hammer — so what the word decides is whether the region
         may go on offering *another* hammer inside the same window. That belongs to the clock, not
         here, and it is the open question this trigger hands upstairs.
+
+        ⚠️ **And `None` again when the limit would not sit below the force bar's close** --
+        for a long; above it for a short. A force bar owes only seventy percent of itself to its
+        body, so the other thirty can be a wick through the hammer's high with a close back under
+        the thirty-percent level: the most ordinary bar there is, a strong candle spiking
+        resistance and finishing on it. The arithmetic then puts a **buy limit above the market**,
+        which is not a pullback entry at all, and `Signal` refuses it as the sign error it usually
+        is -- taking the whole backtest down with a `ValueError`, because nothing in the loop
+        catches one.
+
+        Measured on the bar that found it: hammer high 102, force bar 99.20/102.10/99.00/102.00
+        at ninety percent body, limit 102.03 against a close of 102.00.
+
+        Refusing is the same ending the two refusals above give, and it is the conservative one:
+        his rule describes an entry *between* two extremes that price comes back to, and a level
+        the market has already closed below is not that trade. **Whether he wants something else
+        there -- a stop entry, or at market -- is a question for him**, and it is in the backlog.
         """
         if not is_hammer(hammer, side=side, shadow_fraction=self.shadow_fraction):
             return None
@@ -313,20 +330,24 @@ class HammerForceTrigger:
             spread = force.high - hammer.high
             if spread <= ZERO:
                 return None
+            limit = to_tick(hammer.high + self.entry_fraction * spread, tick, ROUND_CEILING)
+            if limit > force.close:
+                return None
             return HammerForceLevels(
                 side=side,
-                limit_price=to_tick(
-                    hammer.high + self.entry_fraction * spread, tick, ROUND_CEILING
-                ),
+                limit_price=limit,
                 stop_loss=stop_loss,
                 annul_close=force.high,
             )
         spread = hammer.low - force.low
         if spread <= ZERO:
             return None
+        limit = to_tick(hammer.low - self.entry_fraction * spread, tick, ROUND_FLOOR)
+        if limit < force.close:
+            return None
         return HammerForceLevels(
             side=side,
-            limit_price=to_tick(hammer.low - self.entry_fraction * spread, tick, ROUND_FLOOR),
+            limit_price=limit,
             stop_loss=stop_loss,
             annul_close=force.low,
         )

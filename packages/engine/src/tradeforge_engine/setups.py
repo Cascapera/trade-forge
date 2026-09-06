@@ -939,7 +939,12 @@ class FffdActivation:
 
     bars_to_trigger: int = DEFAULT_BARS_TO_TRIGGER
     bars_to_break: int = DEFAULT_BARS_TO_BREAK
-    break_ticks: int = DEFAULT_HAMMER_BREAK_TICKS
+    # ⚠️ **`vwap_setups.DEFAULT_BREAK_TICKS`, not the hammer's, and nothing can catch a
+    # swap.** The two constants both equal 1, so exchanging them changes no number any test
+    # could read — which is how they came to be exchanged here in the first place, by a
+    # rename whose `count=1` replace landed on the wrong one of two identical lines. The
+    # guardian found it by reading. If either default ever moves, this is the line to check.
+    break_ticks: int = DEFAULT_BREAK_TICKS
     stop_ticks: int = DEFAULT_STOP_TICKS
     volume: str = "auto"
 
@@ -1247,7 +1252,8 @@ class HammerBreakActivation:
     bars_to_hammer: int = DEFAULT_BARS_TO_HAMMER
     bars_to_fill: int = DEFAULT_BARS_TO_FILL
     reach_fraction: Decimal = DEFAULT_REACH_FRACTION
-    break_ticks: int = DEFAULT_BREAK_TICKS
+    # ⚠️ The hammer's own, not the FFFD's -- see the note on `FffdActivation.break_ticks`.
+    break_ticks: int = DEFAULT_HAMMER_BREAK_TICKS
     stop_fraction: Decimal = DEFAULT_STOP_FRACTION
     shadow_fraction: Decimal = DEFAULT_SHADOW_FRACTION
 
@@ -1542,14 +1548,18 @@ class HammerForceActivation:
         if levels is None:  # pragma: no cover - only called with a live order
             return
         self._bars_since_order += 1
-        # ⚠️ **`== 1` and `>= 1` are the same engine, and that is his argument made mechanical.**
-        # Asked whether the cancel applies on the second bar too, he answered that it cannot
-        # matter: by then the order has either filled -- and a trade is conducted, not withdrawn,
-        # so this activation is no longer observed at all -- or it has not, and the clock below
-        # retires the region on that very bar. A mutant widening this to `>= 1` therefore survives
-        # the suite, and no fixture can kill it. The narrow form is kept because it says what the
-        # rule *is*; the note is here so a reviewer does not spend a mutant rediscovering that it
-        # has no work to do.
+        # ⚠️ **`== 1` and `>= 1` agree at the default of two bars, and only there.** His
+        # argument for the second bar is sound and mechanical: by then the order has either
+        # filled -- a trade is conducted, not withdrawn, and this activation is no longer
+        # observed -- or it has not, and the clock below retires the region on that bar.
+        #
+        # ⚠️ **An earlier version of this comment claimed no fixture could kill the
+        # widening, and that was false.** `bars_to_fill` is a public dial: at three bars there
+        # is a bar +2 on which the order is still live, and there the two readings diverge --
+        # `>= 1` withdraws on a close beyond the force bar, `== 1` leaves the order resting
+        # for its last chance. His rule names *"a barra seguinte"*, so the narrow reading is
+        # the rule, and the test driving `bars_to_fill=3` is what holds it. The guardian
+        # contested the equivalence claim and was right to.
         if self._bars_since_order == 1:
             gone = (
                 candle.close > levels.annul_close

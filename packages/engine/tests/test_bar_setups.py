@@ -447,3 +447,49 @@ def test_the_thresholds_are_dials_rather_than_constants_in_the_comparison() -> N
     )
     assert levels is not None
     assert HammerBreakTrigger().levels_for(halved, side=Side.LONG, tick=TICK) is None
+
+
+def test_the_force_entry_is_silent_when_the_limit_would_be_above_the_market() -> None:
+    """⚠️ **The blocking finding, and it took the whole backtest down rather than moving a number.**
+
+    A force bar owes only seventy percent of itself to its body; the other thirty can be a wick
+    through the hammer's high with a close back *under* the thirty-percent level. Here the hammer
+    tops at 102 and the force bar wicks to 102.10 and closes at 102.00 — ninety percent body, a
+    perfectly ordinary strong candle spiking resistance and finishing on it. Thirty percent of the
+    ten-cent spread puts the limit at **102.03, above the close it would rest against**.
+
+    That is not a pullback entry. `Signal` refuses a buy limit above the market as the sign error
+    it almost always is, and nothing in `loop.py` catches a `ValueError` — so the session dies on
+    an ordinary bar. Refusing here is the same ending the two refusals above give.
+    """
+    hammer = candle(0, open_="101", high="102", low="98", close="101.5")
+    spikes_and_closes_back = candle(1, open_="99.20", high="102.10", low="99.00", close="102.00")
+
+    assert is_force_bar(spikes_and_closes_back, side=Side.LONG)
+    assert spikes_and_closes_back.high > hammer.high  # it does clear the hammer
+    # 102 + 0.30 x 0.10 = 102.03, which is past the 102.00 the bar closed at.
+    assert (
+        HammerForceTrigger().levels_for(hammer, spikes_and_closes_back, side=Side.LONG, tick=PENNY)
+        is None
+    )
+    assert (
+        HammerForceTrigger().levels_for(
+            flip(hammer), flip(spikes_and_closes_back), side=Side.SHORT, tick=PENNY
+        )
+        is None
+    )
+
+
+def test_a_force_bar_that_closes_clear_of_the_limit_still_arms() -> None:
+    """The other side of the guard, so "wrong side of the market" cannot quietly become "never".
+
+    Same hammer, a force bar that closes at 104 with the limit at 102.75 — a real pullback entry,
+    well below where the market finished.
+    """
+    hammer = candle(0, open_="101", high="102", low="98", close="101.5")
+    force = candle(1, open_="101.6", high="104.5", low="101.4", close="104")
+
+    levels = HammerForceTrigger().levels_for(hammer, force, side=Side.LONG, tick=PENNY)
+    assert levels is not None
+    assert levels.limit_price == Decimal("102.75")
+    assert levels.limit_price < force.close

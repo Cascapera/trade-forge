@@ -4247,8 +4247,10 @@ def _hammer_block(kind: ZoneKind, top: str, bottom: str) -> OrderBlock:
 
 
 def _watch(
-    block: OrderBlock, candles: list[Candle], activation: HammerBreakActivation | None = None
-) -> tuple[HammerBreakActivation, list[ZoneEntry | None]]:
+    block: OrderBlock,
+    candles: list[Candle],
+    activation: HammerBreakActivation | HammerForceActivation | None = None,
+) -> tuple[HammerBreakActivation | HammerForceActivation, list[ZoneEntry | None]]:
     """Drive one activation over hand-built bars, without a qualifier or a structure machine.
 
     ⚠️ **Deliberately below the strategy**, because three of the rules below are about a *single
@@ -4700,3 +4702,110 @@ def test_a_pending_hammer_does_not_follow_the_activation_to_another_region() -> 
 
     assert force.low > never_reached.top, "the fixture must leave the second region untouched"
     assert inherited is None
+
+
+def test_a_bar_that_spikes_past_the_force_bar_but_closes_short_leaves_the_order() -> None:
+    """⚠️ **"Fecha acima" is a close, and this is the only fixture that says so.**
+
+    Bar 15 trades to 105, past the force bar's 104.50, and finishes at 103 — a rejection wick,
+    the most ordinary thing to happen right after a bar of force. His rule reads the **close**, so
+    the limit at 102.75 is still waiting and the withdrawal comes from the clock on bar 16.
+
+    The existing cancel test uses a bar that closes *and* trades beyond, where the two readings
+    coincide — the shape this project keeps getting caught by. A mutant reading `candle.high` here
+    survives that test and dies on this one.
+
+    ⚠️ It is also the exact opposite of variation 1's annulment, which **is** a touch: there the
+    hammer's low being *reached* ends the setup. Two neighbouring rules, opposite answers, and now
+    both have proof.
+    """
+    rejection = bar(15, open_="104", close="103", high="105", low="102.8")
+    signals = _martelo_forca(
+        [
+            *_IMPULSE,
+            *_FALLS_BACK,
+            *_TOUCHES_AND_HAMMERS,
+            _BAR_OF_FORCE,
+            rejection,
+            bar(16, open_="103", close="103.2", high="103.5", low="102.9"),
+        ]
+    )
+
+    assert rejection.high > _BAR_OF_FORCE.high
+    assert rejection.close < _BAR_OF_FORCE.high
+    assert signals[15] == [], "a wick past the force bar withdrew an order his rule keeps"
+    [taken_back] = signals[16]
+    assert taken_back.kind is SignalKind.CANCEL
+
+
+def test_the_cancel_reads_only_the_bar_after_the_force_bar() -> None:
+    """The narrow reading of *"na barra seguinte"*, held by the one dial that can reach bar +2.
+
+    ⚠️ **This test exists because a comment claimed it could not.** At the default of two bars the
+    difference between "the bar after" and "any bar" is genuinely unobservable — his own argument,
+    and correct. But `bars_to_fill` is public: at three bars there is a bar +2 on which the order
+    is still live, and a close beyond the force bar there withdraws it under the wide reading and
+    leaves it alone under his. The guardian contested the equivalence claim and was right.
+    """
+    region = _hammer_block(ZoneKind.DEMAND, "100", "90")
+    sequence = [
+        bar(0, open_="101", close="101.5", high="102", low="98"),
+        _BAR_OF_FORCE,
+        bar(15, open_="103", close="103.2", high="103.5", low="102.9"),
+        bar(16, open_="104", close="109", high="109.5", low="103.8"),
+    ]
+
+    _, seen = _watch(region, sequence, HammerForceActivation(bars_to_fill=3))
+
+    assert sequence[-1].close > _BAR_OF_FORCE.high, "bar +2 must close beyond the force bar"
+    assert seen[-1] is not None, "the wide reading withdrew the order on a bar his rule keeps"
+    assert seen[-1].limit_price == Decimal("102.75")
+
+
+def test_a_bar_stopping_exactly_on_a_supply_regions_edge_has_touched_it() -> None:
+    """The sell half of the touch boundary. ⚠️ Fifth engine PR running where only the buy side of
+    an edge comparison was pinned — the mirror of
+    `test_a_bar_resting_exactly_on_the_near_edge_has_touched_the_region`.
+
+    A supply region is reached from below, so the comparison is the bar's high against the
+    region's bottom, and 100.00 exactly is a touch.
+    """
+    region = _hammer_block(ZoneKind.SUPPLY, "110", "100")
+    on_the_edge = bar(0, open_="97", close="96.5", high="100", low="96")
+    short_of_it = bar(0, open_="97", close="96.5", high="99.99", low="96")
+
+    _, touched = _watch(region, [on_the_edge])
+    assert touched[0] is not None
+    assert touched[0].stop_price == Decimal("95.99")  # one tick under the hammer's low
+    assert touched[0].stop_loss == Decimal("100.80")  # 100 + 20% of 4
+
+    _, missed = _watch(region, [short_of_it])
+    assert missed[0] is None
+
+
+def test_a_sell_hammer_topping_exactly_on_the_far_edge_has_not_broken_the_region() -> None:
+    """The sell half of the break boundary: strictly past, so 110.00 on a [100, 110] supply is a
+    hammer this setup takes and 110.01 ends the region."""
+    region = _hammer_block(ZoneKind.SUPPLY, "110", "100")
+
+    _, on_the_edge = _watch(region, [bar(0, open_="106", close="105.5", high="110", low="104")])
+    assert on_the_edge[0] is not None
+    assert on_the_edge[0].stop_price == Decimal("103.99")
+    assert on_the_edge[0].stop_loss == Decimal("111.20")
+
+    _, through_it = _watch(region, [bar(0, open_="106", close="105.5", high="110.01", low="104")])
+    assert through_it[0] is None
+
+
+def test_the_sell_arming_ceiling_is_inclusive_too() -> None:
+    """The sell half of the ceiling: [100, 110] is ten points, so the ceiling is 100 - 5 = **95**,
+    and a hammer bottoming exactly there arms. One penny lower and it does not."""
+    region = _hammer_block(ZoneKind.SUPPLY, "110", "100")
+
+    _, at_it = _watch(region, [bar(0, open_="98", close="97.5", high="103", low="95")])
+    assert at_it[0] is not None
+    assert at_it[0].stop_price == Decimal("94.99")
+    assert at_it[0].stop_loss == Decimal("104.60")
+
+    _, past_it = _watch(region, [bar(0, open_="98", close="97.5", high="103", low="94.99")])
+    assert past_it[0] is None

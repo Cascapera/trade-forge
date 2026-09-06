@@ -334,10 +334,17 @@ def _iter_run(  # noqa: PLR0913 — see run()
 
         previous = candle
         # ⚠️ Replaced, never accumulated. A refusal is news, and news delivered twice is a
-        # strategy told its order was turned away on a bar when nothing was asked — which for
-        # `StructurePhase` would forget an order it had just successfully armed. That is why
+        # strategy told its order was turned away on a bar when nothing was asked. That is why
         # `gates` and not `outcome.refusals`: the outcome also carries the previous drain,
         # which this bar's `Context` has already shown the strategy.
+        #
+        # ⚠️ **Who that actually hurts, corrected.** This comment used to name `StructurePhase`
+        # — "would forget an order it had just successfully armed" — and that has not been true
+        # since it started matching by name: `_observe_refusal` keeps only the refusals carrying
+        # the `client_id` it is holding, and a re-delivered one names an order it has already
+        # let go of. What the rule protects is the **contract** — `Context.refusals` is news,
+        # delivered once — and any strategy that does not key by name. A `ScriptedStrategy` with
+        # a fixed name is the one in this repo that would see the same refusal on two bars.
         #
         # ⚠️ **Asked outside `localcontext`, and after the yield, deliberately.** This is a read
         # from another process's mailbox (ADR-0024), not arithmetic — and it must happen on every
@@ -519,7 +526,7 @@ def _step(  # noqa: PLR0913 — one bar of the loop; every argument is a seam or
     # known on this bar, `recorded` included, because that is the record. `iter_run` needs the
     # *gates alone* to build the next bar's `pending`: `recorded` was already delivered to the
     # strategy in this bar's `Context`, and putting it back in `pending` would deliver the same
-    # news twice — which the comment there says is a phase forgetting an order it just armed.
+    # news twice, which the contract above forbids.
     # `_step` is private, so saying it in the return type costs nothing.
     return (
         BarOutcome(

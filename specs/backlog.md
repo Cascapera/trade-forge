@@ -1540,6 +1540,41 @@ número de zonas numa corrida foi **253** (EURUSD, continuação, `midpoint`) �
 longo de um ano, não simultâneas. Prendê-lo honestamente continua exigindo um `_MAX_ZONES`
 injetável, não um cenário de 200 zonas.
 
+## A barra de força que fecha abaixo do preço de entrada — pergunta para ele
+
+Aberto no PR-195 (06/09/2026), achado pelo `engine-guardian` como **bloqueante**, e a parte de
+engenharia já está fechada. O que sobra é regra de método.
+
+O `martelo_forca` entra a 30% do caminho entre a máxima do martelo e a da barra de força. Nada na
+regra dele exige que esse nível fique **abaixo do fechamento** da barra de força — e uma barra de
+força deve só **70%** de si ao corpo, então os outros 30% podem ser pavio. Quando a barra fura a
+máxima do martelo e volta a fechar por baixo do nível dos 30%, a conta produz uma **compra limite
+acima do mercado**: `Signal` recusa como erro de sinal e **nada no loop captura `ValueError`**, ou
+seja a sessão inteira morre. Medido: martelo H 102, barra de força 99,20/102,10/99,00/102,00 (90%
+de corpo), limite 102,03 contra fechamento 102,00.
+
+**O que foi feito, e é conservador de propósito:** `HammerForceTrigger.levels_for` devolve `None`
+— mesmo desfecho de "a barra de força não superou o martelo", região aposentada, com razão logada.
+A regra dele descreve uma entrada *entre dois extremos aos quais o preço volta*, e um nível que o
+mercado já fechou abaixo não é esse trade.
+
+⚠️ **A recusa é mais larga do que só o caso patológico**, e isso é o que precisa da decisão dele.
+A condição é `fechamento < 30% do que a barra superou`. Com martelo em 100 e barra de força
+topando em 101:
+
+| fechamento da barra de força | limite bruto | hoje |
+|---|---|---|
+| 100,50 (metade do que superou) | 100,30 | **arma** em 100,30 |
+| 100,20 (rente à máxima do martelo) | 100,30 | **recusa** |
+
+Os dois são barras de força válidas pelo critério de 70%. A segunda é uma barra forte que superou
+o martelo por um ponto e fechou vinte centavos acima dele.
+
+**Decidir com ele:** cancela mesmo (é o que está), ou nesse caso a entrada vira **stop** no
+rompimento da máxima da barra de força, ou entra **a mercado** no fechamento dela? Ver
+[[martelo-gatilho-de-barra]] e [[decidir-vs-traduzir-com-numero-contaminado]] — o número está
+contaminado para um `if`, e por isso ele falha fechado até ele responder.
+
 ## Recolher a ordem antes do fechamento e repor na abertura seguinte
 
 Ideia dele, 06/09/2026, olhando os três descartes por gap do AAPL — todos gap de abertura de ação

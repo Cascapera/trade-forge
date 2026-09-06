@@ -606,9 +606,47 @@ export interface StructureChochSetup {
  * lives entirely beyond the line and closes there arms nothing, because buying the break of its
  * high would be buying into a decline rather than the failure of a push.
  *
- * ⚠️ The stop buffer says nothing about `botinha`: its stop comes from the band, not from the
- * region. Its own numbers — the window, the tenth, and which volume the averages use — are not
- * on this document yet and run on the engine's defaults.
+ * `martelo` is his chapter 11.1, and it is the first entry point whose order is not priced off
+ * the region at all. Price touches the region and has **five bars** — the touching one and four
+ * more — to print a *martelo*: a bar whose shadow on the far side is more than half its height,
+ * under a body, however small, that closed the right way. The order is a **stop** one tick past
+ * that bar's extreme and the protective stop is **twenty percent of the bar's own height** past
+ * the other one, so a small hammer is a small stop and a large position.
+ *
+ * ⚠️ Two limits are the region's rather than the bar's. The hammer's extreme may reach past
+ * the near edge by at most **half the region's height** -- region [90, 100] gives a ceiling of
+ * 105, and a hammer topping there still arms with its order at 106, because the ceiling measures
+ * the hammer and not the order. And any bar losing the region's far edge before a hammer appears
+ * ends the setup.
+ *
+ * ⚠️ Every ending spends the region, which is the opposite of `fffd`. Two bars passing
+ * unfilled, the hammer's own extreme being lost, the window closing empty — all of them retire
+ * the zone, and a second hammer inside the same window does not re-arm. His words:
+ * *"desarma tudo e tem que esperar um novo contexto"*.
+ *
+ * `martelo_forca` is his second variation on the same hammer, and it is the same setup wearing
+ * the opposite order. The region, the five bars and the arming ceiling are unchanged; what
+ * differs is that the hammer alone places nothing. The bar **immediately after** it has to close
+ * as a *barra de forca* — at least seventy percent body in the trade's direction — whose extreme
+ * clears the hammer's, and the order is then a **limit** thirty percent of the way from the
+ * hammer's extreme towards the force bar's. Below the market, waiting for the pullback, where
+ * `martelo` waits above it for a break.
+ *
+ * ⚠️ Its cancel reads on a **close**, not a touch, and only on the bar after the force bar: a
+ * bar finishing beyond the force bar's extreme is the market saying the pullback is not coming.
+ * On the bar after that the question cannot arise — either the limit filled and there is a trade
+ * to conduct, or the two bars ran out and the order is withdrawn regardless.
+ *
+ * ⚠️ Every ending retires the region here too, and the force bar failing is one of them. There
+ * is no waiting for a better second bar and no second hammer inside the window: *"se a barra de
+ * forca falha a regiao deixa de valer, tem que esperar configurar tudo de novo"*.
+ *
+ * ⚠️ The stop buffer says nothing about `botinha`, `martelo` or `martelo_forca`: the first
+ * takes its stop from the band and the other two from the hammer, none of them from the
+ * region. Their own numbers —
+ * the botinha's window and tenth and which volume its averages use, the hammer's five bars, two
+ * bars, twenty percent and half a region — are not on this document yet and run on the engine's
+ * defaults.
  *
  * ⚠️ **Named values, not a fraction.** A free number would let an entry approach the far edge,
  * where risk collapses to the stop buffer alone and position sizing divides by nearly nothing.
@@ -618,7 +656,7 @@ export interface StructureChochSetup {
 export interface StructureParams {
   allow_secondary?: AllowSecondary;
   breakeven_at_r?: BreakevenAtR2;
-  entry_point?: "edge" | "midpoint" | "return_pass" | "botinha" | "fffd";
+  entry_point?: "edge" | "midpoint" | "return_pass" | "botinha" | "fffd" | "martelo" | "martelo_forca";
   stop_buffer?: StopBuffer;
 }
 /**
@@ -637,7 +675,7 @@ export interface StructureContinuationSetup {
 export interface ContinuationParams {
   allow_secondary?: AllowSecondary1;
   breakeven_at_r?: BreakevenAtR3;
-  entry_point?: "edge" | "midpoint" | "return_pass" | "botinha" | "fffd";
+  entry_point?: "edge" | "midpoint" | "return_pass" | "botinha" | "fffd" | "martelo" | "martelo_forca";
   max_bos?: MaxBos;
   stop_buffer?: StopBuffer1;
 }

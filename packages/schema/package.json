@@ -25,6 +25,6 @@
     "json-schema-to-typescript": "^16.0.0",
     "typescript": "^7.0.2",
     "typescript-eslint": "^8.68.0",
-    "vitest": "^4.1.11"
+    "vitest": "^5.0.0"
   }
 }

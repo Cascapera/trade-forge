@@ -259,11 +259,13 @@ export type Type12 = "ponto_continuo";
 export type AllowSecondary = boolean;
 export type BreakevenAtR2 = number | null;
 export type StopBuffer = number;
+export type VolumeFilter = boolean;
 export type Type13 = "structure_choch";
 export type AllowSecondary1 = boolean;
 export type BreakevenAtR3 = number | null;
 export type MaxBos = number | null;
 export type StopBuffer1 = number;
+export type VolumeFilter1 = boolean;
 export type Type14 = "structure_continuation";
 export type Timeframe = "M1" | "M5" | "M15" | "M30" | "H1" | "H4" | "D1" | "W1";
 
@@ -641,12 +643,36 @@ export interface StructureChochSetup {
  * is no waiting for a better second bar and no second hammer inside the window: *"se a barra de
  * forca falha a regiao deixa de valer, tem que esperar configurar tudo de novo"*.
  *
- * ⚠️ The stop buffer says nothing about `botinha`, `martelo` or `martelo_forca`: the first
- * takes its stop from the band and the other two from the hammer, none of them from the
- * region. Their own numbers —
+ * `gift` and `barra_ignorada` (2026-09-07) are the *barra de forca* off the region with no
+ * hammer required — one before it is welcome — and the **bar after it** deciding the entry.
+ * While bars keep touching the region a force bar may come on any of them; once a whole bar
+ * trades above it, the force bar must be that bar or the next. If the bar after the force bar
+ * is a **gift** — at most a third of the force bar's height, sitting entirely in its upper
+ * third — or a **barra ignorada** — a body over a third of the force bar that did not break its
+ * low — a **stop** order goes one tick past the higher of the two highs when that bar closes,
+ * and lives two bars, or until price reaches the force bar's low, whichever comes first. The
+ * entry may sit at most **two region heights** above the near edge:
+ * region [90, 100] puts the ceiling at 120, measured on the entry rather than on the bar.
+ *
+ * ⚠️ Every failure after the force bar spends the region — the wrong follower, a follower
+ * louder than the filter allows, an entry past the ceiling, and the region's low being lost
+ * even by a wick, at any moment, resting order included. His words: *"cancelou, região não
+ * vale"*. A region price merely wandered away from is not spent; it waits for the next touch.
+ *
+ * `gift_stop` is the gift's choice of protective stop, his two alternatives: twenty percent of
+ * the **gift's** height under its low, or twenty percent of the **force bar's** height under
+ * its low. The ignored bar always uses the force bar's, and no other entry point reads this.
+ * `volume_filter` switches on his optional volume rule for both: the follower may carry at
+ * most seventy percent of the force bar's volume, real volume where the venue reports it and
+ * ticks elsewhere. With the filter on, a force bar reporting no volume at all fails it rather
+ * than passing it, so a feed without volume shows as a setup that never arms.
+ *
+ * ⚠️ The stop buffer says nothing about `botinha`, `martelo`, `martelo_forca`, `gift` or
+ * `barra_ignorada`: the first takes its stop from the band and the others from a bar, none of
+ * them from the region. Their own numbers —
  * the botinha's window and tenth and which volume its averages use, the hammer's five bars, two
- * bars, twenty percent and half a region — are not on this document yet and run on the engine's
- * defaults.
+ * bars, twenty percent and half a region, the gift's thirds and the seventy percent of volume —
+ * are not on this document yet and run on the engine's defaults.
  *
  * ⚠️ **Named values, not a fraction.** A free number would let an entry approach the far edge,
  * where risk collapses to the stop buffer alone and position sizing divides by nearly nothing.
@@ -656,8 +682,11 @@ export interface StructureChochSetup {
 export interface StructureParams {
   allow_secondary?: AllowSecondary;
   breakeven_at_r?: BreakevenAtR2;
-  entry_point?: "edge" | "midpoint" | "return_pass" | "botinha" | "fffd" | "martelo" | "martelo_forca";
+  entry_point?:
+    "edge" | "midpoint" | "return_pass" | "botinha" | "fffd" | "martelo" | "martelo_forca" | "gift" | "barra_ignorada";
+  gift_stop?: "gift" | "forca";
   stop_buffer?: StopBuffer;
+  volume_filter?: VolumeFilter;
 }
 /**
  * Trade the zone a break in the trend's favour leaves behind, after a change of character.
@@ -675,7 +704,10 @@ export interface StructureContinuationSetup {
 export interface ContinuationParams {
   allow_secondary?: AllowSecondary1;
   breakeven_at_r?: BreakevenAtR3;
-  entry_point?: "edge" | "midpoint" | "return_pass" | "botinha" | "fffd" | "martelo" | "martelo_forca";
+  entry_point?:
+    "edge" | "midpoint" | "return_pass" | "botinha" | "fffd" | "martelo" | "martelo_forca" | "gift" | "barra_ignorada";
+  gift_stop?: "gift" | "forca";
   max_bos?: MaxBos;
   stop_buffer?: StopBuffer1;
+  volume_filter?: VolumeFilter1;
 }

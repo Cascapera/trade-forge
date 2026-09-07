@@ -240,10 +240,15 @@ describe('the one document that comes back spelled out', () => {
     // ⚠️ Pinned by value, not waved at. If this list ever grows, a save has started adding
     // something new to the author's document and somebody has to decide whether it should.
     const rebuilt = once() as unknown as { setup: { params: Record<string, unknown> } }
+    // `volume_filter` joined the list on 2026-09-07 with the gift: a flag is written whichever way
+    // it is set, the rule `allow_secondary` has followed since the form existed, so a structure
+    // document now spells out two of them. It is meaningful only under `entry_point: "gift"` or
+    // `"barra_ignorada"`; on every other entry point it is a key the engine ignores.
     expect(rebuilt.setup.params).toEqual({
       allow_secondary: false,
       breakeven_at_r: null,
       max_bos: null,
+      volume_filter: false,
     })
   })
 

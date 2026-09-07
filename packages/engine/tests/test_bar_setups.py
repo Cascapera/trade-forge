@@ -18,12 +18,19 @@ import pytest
 from tradeforge_engine.bar_setups import (
     DEFAULT_BODY_FRACTION,
     DEFAULT_SHADOW_FRACTION,
+    ForceFollowLevels,
+    GiftStop,
+    GiftTrigger,
     HammerBreakLevels,
     HammerBreakTrigger,
     HammerForceLevels,
     HammerForceTrigger,
+    IgnoredBarTrigger,
     is_force_bar,
+    is_gift,
     is_hammer,
+    is_ignored_bar,
+    volume_of,
 )
 from tradeforge_engine.domain import Candle, Side
 from tradeforge_engine.errors import EngineError
@@ -493,3 +500,427 @@ def test_a_force_bar_that_closes_clear_of_the_limit_still_arms() -> None:
     assert levels is not None
     assert levels.limit_price == Decimal("102.75")
     assert levels.limit_price < force.close
+
+
+# --------------------------------------------------------------------------- #
+# The gift and the ignored bar                                                 #
+# --------------------------------------------------------------------------- #
+
+# His force bar off a demand region, and the two followers he dictated on it (2026-09-07).
+# The force bar is 6.50 tall with a 5.50 body; a third of it is 2.1666..., which is exactly the
+# number a `Decimal` fraction cannot hold — see `DEFAULT_GIFT_RANGE_DIVISOR`.
+GIFT_FORCE = candle(0, open_="100", high="106", low="99.50", close="105.50")
+GIFT = candle(1, open_="105.20", high="105.60", low="104.40", close="105.00")
+IGNORED = candle(1, open_="105.50", high="105.80", low="102.00", close="102.50")
+
+
+def loud(bar: Candle, *, ticks: int = 0, real: int = 0) -> Candle:
+    """The same bar carrying volume — the fixtures above carry none, on purpose, so that the
+    filter's answer to "no volume" is a separate assertion rather than an accident."""
+    return Candle(
+        time=bar.time,
+        open=bar.open,
+        high=bar.high,
+        low=bar.low,
+        close=bar.close,
+        tick_volume=ticks,
+        real_volume=real,
+    )
+
+
+def test_a_gift_is_a_small_bar_in_the_force_bar_s_upper_third() -> None:
+    assert is_gift(GIFT_FORCE, GIFT, side=Side.LONG)
+    assert is_gift(flip(GIFT_FORCE), flip(GIFT), side=Side.SHORT)
+
+
+def test_a_gift_may_close_either_way() -> None:
+    """He gave the gift's size and its place, and nothing about its colour. A small red bar in
+    the upper third is a gift — the mutant demanding `close > open` here would be inventing a
+    rule he did not."""
+    red = candle(1, open_="105.50", high="105.60", low="104.40", close="104.60")
+    assert red.close < red.open
+    assert is_gift(GIFT_FORCE, red, side=Side.LONG)
+    assert is_gift(flip(GIFT_FORCE), flip(red), side=Side.SHORT)
+
+
+def test_a_bar_taller_than_a_third_of_the_force_bar_is_not_a_gift() -> None:
+    """2.20 against a third of 6.50 — over by a few ticks, and in the upper third."""
+    tall = candle(1, open_="105.20", high="106.00", low="103.80", close="105.00")
+    assert (tall.high - tall.low) * 3 > (GIFT_FORCE.high - GIFT_FORCE.low)
+    assert not is_gift(GIFT_FORCE, tall, side=Side.LONG)
+    assert not is_gift(flip(GIFT_FORCE), flip(tall), side=Side.SHORT)
+
+
+def test_a_small_bar_in_the_middle_of_the_force_bar_is_not_a_gift() -> None:
+    """*"Nunca no meio ou na mínima."* Small enough, wrong place: a bar that would be a gift by
+    size sits with its low at 102.50, below the line a third down from 106 (103.83)."""
+    middle = candle(1, open_="103", high="103.50", low="102.50", close="103.20")
+    assert not is_gift(GIFT_FORCE, middle, side=Side.LONG)
+    assert not is_gift(flip(GIFT_FORCE), flip(middle), side=Side.SHORT)
+
+
+def test_a_gift_of_exactly_a_third_with_its_low_exactly_on_the_line_is_a_gift() -> None:
+    """⚠️ **The boundary the `Decimal` fraction gets wrong, on both edges at once.**
+
+    A three-point force bar makes a third exactly one point. A gift one point tall whose low sits
+    exactly one point under the force bar's high is *no máximo um terço* and *no terço superior*
+    — both by his words — and `Decimal(1) / Decimal(3)` would refuse it on both counts, because
+    `0.3333… x 3 < 1`. Written as a multiplication there is no rounding to lose it to.
+    """
+    force = candle(0, open_="100", high="103", low="100", close="102.50")
+    on_the_line = candle(1, open_="102.20", high="103", low="102", close="102.50")
+    assert (on_the_line.high - on_the_line.low) * 3 == force.high - force.low
+    assert is_gift(force, on_the_line, side=Side.LONG)
+    assert is_gift(flip(force), flip(on_the_line), side=Side.SHORT)
+
+
+def test_a_gift_straddling_the_line_of_the_third_is_not_a_gift() -> None:
+    """⚠️ **The fixture that separates "gift inteiro" from "the gift's high".** Asked whether the
+    upper third holds the whole gift or only its top, he answered *"gift inteiro"*. Every other
+    gift fixture here either sits wholly above the line or wholly below it, so a reading that
+    tested the **high** against the line passed the suite on both sides — the guardian's finding.
+
+    Small enough (1.10 against a third of 6.50), its high at 104.60 above the line at 103.83 and
+    its low at 103.50 under it: the high-only reading arms a stop order at 106.01 that his method
+    does not recognise, and the backtest simply becomes more active.
+    """
+    straddles = candle(1, open_="103.60", high="104.60", low="103.50", close="104.40")
+    line = GIFT_FORCE.high - (GIFT_FORCE.high - GIFT_FORCE.low) / 3
+    assert straddles.low < line < straddles.high
+    assert not is_gift(GIFT_FORCE, straddles, side=Side.LONG)
+    assert not is_gift(flip(GIFT_FORCE), flip(straddles), side=Side.SHORT)
+
+
+def test_a_gift_may_reach_above_the_force_bar_s_high() -> None:
+    """The upper third has a floor and no ceiling: a gift topping above the force bar is still
+    entirely in the upper third, and its high is then where the entry measures from."""
+    higher = candle(1, open_="105.60", high="106.30", low="105.20", close="105.90")
+    assert higher.high > GIFT_FORCE.high
+    assert is_gift(GIFT_FORCE, higher, side=Side.LONG)
+    assert is_gift(flip(GIFT_FORCE), flip(higher), side=Side.SHORT)
+
+
+def test_an_ignored_bar_is_a_real_body_that_kept_the_force_bar_s_low() -> None:
+    assert is_ignored_bar(GIFT_FORCE, IGNORED, side=Side.LONG)
+    assert is_ignored_bar(flip(GIFT_FORCE), flip(IGNORED), side=Side.SHORT)
+
+
+def test_an_ignored_bar_may_close_either_way() -> None:
+    """The rule as given is a body over a third that kept the low. Whether the colour should be
+    held is an open question in the backlog; until he answers, a green bar qualifies too."""
+    green = candle(1, open_="102.50", high="105.80", low="102.00", close="105.50")
+    assert green.close > green.open
+    assert is_ignored_bar(GIFT_FORCE, green, side=Side.LONG)
+    assert is_ignored_bar(flip(GIFT_FORCE), flip(green), side=Side.SHORT)
+
+
+def test_a_body_of_exactly_a_third_is_not_an_ignored_bar() -> None:
+    """*"Corpo maior que 1/3"* — strictly. A three-point force bar and a one-point body: not an
+    ignored bar, and not a gift either if its range is over a point. The gap between the two is
+    real and this bar is in it."""
+    force = candle(0, open_="100", high="103", low="100", close="102.50")
+    a_third = candle(1, open_="102", high="102.50", low="100.80", close="101")
+    assert abs(a_third.close - a_third.open) * 3 == force.high - force.low
+    assert not is_ignored_bar(force, a_third, side=Side.LONG)
+    assert not is_ignored_bar(flip(force), flip(a_third), side=Side.SHORT)
+    assert not is_gift(force, a_third, side=Side.LONG)
+
+    over = candle(1, open_="102.01", high="102.50", low="100.80", close="101")
+    assert is_ignored_bar(force, over, side=Side.LONG)
+    assert is_ignored_bar(flip(force), flip(over), side=Side.SHORT)
+
+
+def test_a_bar_that_broke_the_force_bar_s_low_is_not_an_ignored_bar() -> None:
+    """One tick under 99.50 is broken; sitting exactly on it is not — the same reading the
+    region's own edge gets in `_RegionWatch.broke`."""
+    broke = candle(1, open_="105.50", high="105.80", low="99.49", close="102.50")
+    assert not is_ignored_bar(GIFT_FORCE, broke, side=Side.LONG)
+    assert not is_ignored_bar(flip(GIFT_FORCE), flip(broke), side=Side.SHORT)
+
+    on_it = candle(1, open_="105.50", high="105.80", low="99.50", close="102.50")
+    assert is_ignored_bar(GIFT_FORCE, on_it, side=Side.LONG)
+    assert is_ignored_bar(flip(GIFT_FORCE), flip(on_it), side=Side.SHORT)
+
+
+def test_no_bar_is_both_a_gift_and_an_ignored_bar() -> None:
+    """A gift is at most a third tall, so its body is at most a third; an ignored bar's body is
+    over a third. His two followers are each exactly one of the two."""
+    assert not is_ignored_bar(GIFT_FORCE, GIFT, side=Side.LONG)
+    assert not is_gift(GIFT_FORCE, IGNORED, side=Side.LONG)
+
+
+def test_the_gift_entry_waits_one_tick_past_the_higher_high_and_stops_off_the_chosen_bar() -> None:
+    """His example, read off the trigger: order at 106.01; the stop 104.16 off the gift (a fifth
+    of its 1.20 under 104.40) or 98.20 off the force bar (a fifth of its 6.50 under 99.50)."""
+    off_gift = GiftTrigger().levels_for(GIFT_FORCE, GIFT, side=Side.LONG, tick=PENNY)
+    assert off_gift == ForceFollowLevels(
+        side=Side.LONG,
+        stop_price=Decimal("106.01"),
+        stop_loss=Decimal("104.16"),
+        annul_price=Decimal("99.50"),
+    )
+    assert off_gift.risk == Decimal("1.85")
+
+    off_force = GiftTrigger(stop_at=GiftStop.FORCA).levels_for(
+        GIFT_FORCE, GIFT, side=Side.LONG, tick=PENNY
+    )
+    assert off_force == ForceFollowLevels(
+        side=Side.LONG,
+        stop_price=Decimal("106.01"),
+        stop_loss=Decimal("98.20"),
+        annul_price=Decimal("99.50"),
+    )
+
+
+def test_the_gift_entry_is_mirrored_for_a_sell() -> None:
+    off_gift = GiftTrigger().levels_for(flip(GIFT_FORCE), flip(GIFT), side=Side.SHORT, tick=PENNY)
+    assert off_gift == ForceFollowLevels(
+        side=Side.SHORT,
+        stop_price=Decimal("83.99"),
+        stop_loss=Decimal("85.84"),
+        annul_price=Decimal("90.50"),
+    )
+    off_force = GiftTrigger(stop_at=GiftStop.FORCA).levels_for(
+        flip(GIFT_FORCE), flip(GIFT), side=Side.SHORT, tick=PENNY
+    )
+    assert off_force == ForceFollowLevels(
+        side=Side.SHORT,
+        stop_price=Decimal("83.99"),
+        stop_loss=Decimal("91.80"),
+        annul_price=Decimal("90.50"),
+    )
+
+
+def test_the_annulment_is_the_force_bar_s_low_whichever_bar_the_stop_is_measured_from() -> None:
+    """His second dictation, when asked what takes the resting order back: *"se o preço perder a
+    mínima da barra de força anula"*. Both triggers, both stops, both sides: the level is the force
+    bar's extreme and never the gift's — and with the stop off the gift it sits **below** the stop,
+    so the two are not the same kind of number even when the force-bar stop puts them a fifth of a
+    bar apart."""
+    for trigger in (GiftTrigger(), GiftTrigger(stop_at=GiftStop.FORCA)):
+        buy = trigger.levels_for(GIFT_FORCE, GIFT, side=Side.LONG, tick=PENNY)
+        assert buy is not None
+        assert buy.annul_price == GIFT_FORCE.low
+        assert buy.annul_price != GIFT.low
+        assert buy.annul_price != buy.stop_loss
+        sell = trigger.levels_for(flip(GIFT_FORCE), flip(GIFT), side=Side.SHORT, tick=PENNY)
+        assert sell is not None
+        assert sell.annul_price == flip(GIFT_FORCE).high
+
+    ignored = IgnoredBarTrigger().levels_for(GIFT_FORCE, IGNORED, side=Side.LONG, tick=PENNY)
+    assert ignored is not None
+    assert ignored.annul_price == GIFT_FORCE.low
+    assert ignored.annul_price != IGNORED.low
+
+
+def test_the_two_gift_stops_are_different_numbers_on_his_own_example() -> None:
+    """⚠️ The separating fixture for the dial: the gift is 1.20 tall and the force bar 6.50, so
+    reaching for the wrong bar lands on the other plausible number rather than on an error."""
+    off_gift = GiftTrigger(stop_at=GiftStop.GIFT).levels_for(
+        GIFT_FORCE, GIFT, side=Side.LONG, tick=PENNY
+    )
+    off_force = GiftTrigger(stop_at=GiftStop.FORCA).levels_for(
+        GIFT_FORCE, GIFT, side=Side.LONG, tick=PENNY
+    )
+    assert off_gift is not None
+    assert off_force is not None
+    assert off_gift.stop_loss == GIFT.low - Decimal("0.20") * (GIFT.high - GIFT.low)
+    assert off_force.stop_loss == GIFT_FORCE.low - Decimal("0.20") * (
+        GIFT_FORCE.high - GIFT_FORCE.low
+    )
+    assert off_gift.stop_loss != off_force.stop_loss
+
+
+def test_the_entry_measures_from_the_gift_when_the_gift_is_the_higher_bar() -> None:
+    """*"A máxima mais alta entre a barra de força e o gift."* Gift topping at 106.30 over the
+    force bar's 106: the order at 106.31, not 106.01."""
+    higher = candle(1, open_="105.60", high="106.30", low="105.20", close="105.90")
+    buy = GiftTrigger().levels_for(GIFT_FORCE, higher, side=Side.LONG, tick=PENNY)
+    assert buy is not None
+    assert buy.stop_price == Decimal("106.31")
+    sell = GiftTrigger().levels_for(flip(GIFT_FORCE), flip(higher), side=Side.SHORT, tick=PENNY)
+    assert sell is not None
+    assert sell.stop_price == Decimal("83.69")
+
+
+def test_the_gift_levels_land_on_the_grid_the_costly_way_on_both_sides() -> None:
+    """Force bar topping at 10.33 on a nickel grid: the order at 10.38 raw goes **up** to 10.40;
+    the gift stop at 10.238 raw goes **down** to 10.20. The sell mirror rounds the other way, and
+    is asserted because the buy assertion alone has never once caught the sell bug."""
+    force = candle(0, open_="10.10", high="10.33", low="10.05", close="10.30")
+    gift = candle(1, open_="10.27", high="10.31", low="10.25", close="10.29")
+    nickel = Decimal("0.05")
+
+    buy = GiftTrigger().levels_for(force, gift, side=Side.LONG, tick=nickel)
+    assert buy == ForceFollowLevels(
+        side=Side.LONG,
+        stop_price=Decimal("10.40"),
+        stop_loss=Decimal("10.20"),
+        annul_price=Decimal("10.05"),  # the force bar's low, as traded: never snapped to the grid
+    )
+    off_force = GiftTrigger(stop_at=GiftStop.FORCA).levels_for(
+        force, gift, side=Side.LONG, tick=nickel
+    )
+    assert off_force is not None
+    assert off_force.stop_loss == Decimal("9.95")  # 10.05 - 0.20 x 0.28 = 9.994, down
+
+    sell = GiftTrigger().levels_for(flip(force), flip(gift), side=Side.SHORT, tick=nickel)
+    assert sell == ForceFollowLevels(
+        side=Side.SHORT,
+        stop_price=Decimal("179.60"),
+        stop_loss=Decimal("179.80"),
+        annul_price=Decimal("179.95"),
+    )
+
+
+def test_the_ignored_bar_entry_waits_past_the_higher_high_and_stops_off_the_force_bar() -> None:
+    """His example: order at 106.01, stop at 98.20 — the force bar's, the only one it has."""
+    buy = IgnoredBarTrigger().levels_for(GIFT_FORCE, IGNORED, side=Side.LONG, tick=PENNY)
+    assert buy == ForceFollowLevels(
+        side=Side.LONG,
+        stop_price=Decimal("106.01"),
+        stop_loss=Decimal("98.20"),
+        annul_price=Decimal("99.50"),
+    )
+    sell = IgnoredBarTrigger().levels_for(
+        flip(GIFT_FORCE), flip(IGNORED), side=Side.SHORT, tick=PENNY
+    )
+    assert sell == ForceFollowLevels(
+        side=Side.SHORT,
+        stop_price=Decimal("83.99"),
+        stop_loss=Decimal("91.80"),
+        annul_price=Decimal("90.50"),
+    )
+
+
+def test_the_ignored_bar_entry_measures_from_the_follower_when_it_is_higher() -> None:
+    taller = candle(1, open_="105.50", high="106.40", low="102.00", close="102.50")
+    buy = IgnoredBarTrigger().levels_for(GIFT_FORCE, taller, side=Side.LONG, tick=PENNY)
+    assert buy is not None
+    assert buy.stop_price == Decimal("106.41")
+    sell = IgnoredBarTrigger().levels_for(
+        flip(GIFT_FORCE), flip(taller), side=Side.SHORT, tick=PENNY
+    )
+    assert sell is not None
+    assert sell.stop_price == Decimal("83.59")
+
+
+def test_each_follower_trigger_is_silent_on_the_other_s_bar_and_on_a_missing_force_bar() -> None:
+    """Four `None`s, each reachable on real data: the gift handed an ignored bar, the ignored bar
+    handed a gift, and either handed a first bar that is not a bar of force."""
+    assert GiftTrigger().levels_for(GIFT_FORCE, IGNORED, side=Side.LONG, tick=PENNY) is None
+    assert IgnoredBarTrigger().levels_for(GIFT_FORCE, GIFT, side=Side.LONG, tick=PENNY) is None
+    assert GiftTrigger().levels_for(GIFT, GIFT, side=Side.LONG, tick=PENNY) is None
+    assert IgnoredBarTrigger().levels_for(IGNORED, IGNORED, side=Side.LONG, tick=PENNY) is None
+
+
+# --------------------------------------------------------------------------- #
+# The volume filter                                                            #
+# --------------------------------------------------------------------------- #
+
+
+def test_the_volume_filter_admits_a_follower_at_seventy_percent_and_refuses_one_tick_over() -> None:
+    """*"No máximo 70% do volume da barra de força"* — 700 against 1000 passes, 701 does not,
+    and the same line holds for the ignored bar (*"idem"*)."""
+    force = loud(GIFT_FORCE, ticks=1000)
+    trigger = GiftTrigger(volume_fraction=Decimal("0.70"))
+    assert trigger.levels_for(force, loud(GIFT, ticks=700), side=Side.LONG, tick=PENNY)
+    assert trigger.levels_for(force, loud(GIFT, ticks=701), side=Side.LONG, tick=PENNY) is None
+
+    ignored = IgnoredBarTrigger(volume_fraction=Decimal("0.70"))
+    assert ignored.levels_for(force, loud(IGNORED, ticks=700), side=Side.LONG, tick=PENNY)
+    assert ignored.levels_for(force, loud(IGNORED, ticks=701), side=Side.LONG, tick=PENNY) is None
+
+
+def test_the_volume_ceiling_is_the_dial_and_not_the_constant() -> None:
+    """At half instead of seventy percent, 600 against 1000 is refused. A test at the default
+    value alone cannot tell "the dial arrived" from "the constant was used"."""
+    force = loud(GIFT_FORCE, ticks=1000)
+    half = GiftTrigger(volume_fraction=Decimal("0.50"))
+    assert half.levels_for(force, loud(GIFT, ticks=600), side=Side.LONG, tick=PENNY) is None
+    assert half.levels_for(force, loud(GIFT, ticks=500), side=Side.LONG, tick=PENNY)
+
+
+def test_the_filter_off_ignores_volume_entirely() -> None:
+    """A gift louder than its force bar arms with the filter off — the fixtures at the top of
+    this section carry no volume at all and arm, which is the same fact from the other side."""
+    force = loud(GIFT_FORCE, ticks=100)
+    assert GiftTrigger().levels_for(force, loud(GIFT, ticks=5000), side=Side.LONG, tick=PENNY)
+
+
+def test_the_filter_on_fails_closed_when_the_force_bar_reports_no_volume() -> None:
+    """⚠️ Zero against zero must not pass. With the filter on and a feed that carries no volume,
+    the arithmetic says the follower's nothing is within seventy percent of the force bar's
+    nothing, and the filter would be on and rejecting nobody. Refusing makes the missing feed
+    show up as a setup that never arms."""
+    silent = GiftTrigger(volume_fraction=Decimal("0.70"))
+    assert silent.levels_for(GIFT_FORCE, GIFT, side=Side.LONG, tick=PENNY) is None
+    assert (
+        IgnoredBarTrigger(volume_fraction=Decimal("0.70")).levels_for(
+            GIFT_FORCE, IGNORED, side=Side.LONG, tick=PENNY
+        )
+        is None
+    )
+
+
+def test_the_filter_reads_real_volume_where_the_venue_reports_it_and_ticks_elsewhere() -> None:
+    """The VWAP's `auto` rule, so a document carrying both reads one number for volume. A bar
+    with real volume is judged on it even when its tick count would say the opposite."""
+    assert volume_of(loud(GIFT, ticks=900, real=0)) == 900
+    assert volume_of(loud(GIFT, ticks=900, real=300)) == 300
+
+    force = loud(GIFT_FORCE, ticks=1000, real=1000)
+    trigger = GiftTrigger(volume_fraction=Decimal("0.70"))
+    # Ticks would refuse this gift (900 > 700); real volume admits it (300 <= 700).
+    assert trigger.levels_for(force, loud(GIFT, ticks=900, real=300), side=Side.LONG, tick=PENNY)
+    # And the other way round: quiet in ticks, loud in real volume, refused.
+    assert (
+        trigger.levels_for(force, loud(GIFT, ticks=100, real=800), side=Side.LONG, tick=PENNY)
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"range_divisor": 0}, "whole divisions"),
+        ({"upper_divisor": 0}, "whole divisions"),
+        ({"volume_fraction": Decimal(0)}, "positive fraction"),
+        ({"break_ticks": 0}, "at least one tick"),
+        ({"stop_fraction": Decimal(0)}, "sits past the bar"),
+    ],
+)
+def test_a_gift_trigger_refuses_a_dial_that_would_not_be_a_setup(
+    kwargs: dict[str, object], message: str
+) -> None:
+    with pytest.raises(EngineError, match=message):
+        GiftTrigger(**kwargs)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"body_divisor": 0}, "whole divisions"),
+        ({"volume_fraction": Decimal("-0.1")}, "positive fraction"),
+        ({"break_ticks": 0}, "at least one tick"),
+        ({"stop_fraction": Decimal(0)}, "sits past the bar"),
+    ],
+)
+def test_an_ignored_bar_trigger_refuses_a_dial_that_would_not_be_a_setup(
+    kwargs: dict[str, object], message: str
+) -> None:
+    with pytest.raises(EngineError, match=message):
+        IgnoredBarTrigger(**kwargs)  # type: ignore[arg-type]
+
+
+def test_the_follower_thresholds_are_dials_rather_than_constants_in_the_comparison() -> None:
+    """A gift two-fifths tall passes at a divisor of 2 and fails at 3; an ignored bar with a
+    quarter body passes at a divisor of 5 and fails at 3. Same bars, different answers, so the
+    number in the comparison is the one that arrived."""
+    two_fifths = candle(1, open_="105.20", high="106.00", low="103.40", close="105.00")
+    assert not is_gift(GIFT_FORCE, two_fifths, side=Side.LONG)
+    assert is_gift(GIFT_FORCE, two_fifths, side=Side.LONG, range_divisor=2, upper_divisor=2)
+
+    quarter = candle(1, open_="105.50", high="105.80", low="103.00", close="103.90")
+    assert not is_ignored_bar(GIFT_FORCE, quarter, side=Side.LONG)
+    assert is_ignored_bar(GIFT_FORCE, quarter, side=Side.LONG, body_divisor=5)

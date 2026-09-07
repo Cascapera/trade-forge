@@ -22,6 +22,7 @@ from collections.abc import Mapping
 from decimal import Decimal
 from typing import Any
 
+from tradeforge_engine.bar_setups import GiftStop
 from tradeforge_engine.domain import Side
 from tradeforge_engine.errors import EngineError
 from tradeforge_engine.protocols import Strategy
@@ -145,6 +146,16 @@ def _structure_kwargs(params: Mapping[str, object]) -> dict[str, Any]:
             allowed = ", ".join(repr(point.value) for point in ZoneEntryPoint)
             raise EngineError(f"setup entry_point must be one of {allowed}, got {raw!r}")
         kwargs["entry_point"] = ZoneEntryPoint(raw)
+    if "gift_stop" in params:
+        # The same gate as `entry_point`, for the same reason: the allowed set is the enum's, so a
+        # value the engine does not have is refused with the alternatives rather than run as the
+        # default and reported as the stop the document asked for.
+        raw = params["gift_stop"]
+        if not isinstance(raw, str) or raw not in {choice.value for choice in GiftStop}:
+            allowed = ", ".join(repr(choice.value) for choice in GiftStop)
+            raise EngineError(f"setup gift_stop must be one of {allowed}, got {raw!r}")
+        kwargs["gift_stop"] = GiftStop(raw)
+    _flag(params, "volume_filter", kwargs)
     return kwargs
 
 

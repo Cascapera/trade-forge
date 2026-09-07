@@ -26,10 +26,27 @@ order can disagree about:
 Read as one setup with a dial, the second one's cancel rule — a bar closing beyond the force
 bar's high — is incomprehensible. Read as a pullback entry, it is the only thing that could
 cancel it: the market left without you.
+
+**The gift and the ignored bar, dictated 2026-09-07, are the force bar without the hammer.** A
+*barra de força* comes off a region — a hammer before it is welcome and not required — and the
+bar **after** it decides everything. If that bar is small and sits in the force bar's upper third
+it is a *gift*; if it is a real bar that nevertheless fails to take the force bar's low it is a
+*barra ignorada*, the market ignoring the seller. Either way the entry is a **stop** one tick
+past the higher of the two highs, placed when the follower closes, and the difference between
+the two is one line of geometry and one line of stop placement:
+
+* `GiftTrigger` — the follower is at most a third of the force bar and sits entirely in its
+  upper third. The stop is the gift's low **or** the force bar's: his two alternatives, and the
+  user's dial.
+* `IgnoredBarTrigger` — the follower carries a body over a third of the force bar and did not
+  break its low. The stop is always the force bar's low.
+
+Twenty percent of the chosen bar's own height past its low, the same proportion the hammer uses.
 """
 
 from dataclasses import dataclass
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
+from enum import StrEnum
 
 from tradeforge_engine.domain import ZERO, Candle, Money, Side, to_tick
 from tradeforge_engine.errors import EngineError
@@ -68,19 +85,58 @@ DEFAULT_HAMMER_BREAK_TICKS = 1
 """How far past the hammer's extreme the breakout order waits: *"a ordem vai na máxima dele 1
 tick"*."""
 
+DEFAULT_GIFT_RANGE_DIVISOR = 3
+"""The gift is at most a third of the force bar, high to low: *"o range de máxima e mínima deste
+candle tem que ter no máximo 1/3 do tamanho da barra anterior"*.
+
+⚠️ **A divisor, not a fraction, because a third does not exist as a `Decimal`.** `Decimal(1) /
+Decimal(3)` is `0.3333…` cut at twenty-eight places, a hair *under* a third, so a gift measuring
+exactly one third of its force bar — which he allows, *no máximo* — would fail the comparison on
+any grid where the two ranges are both whole ticks. Multiplying the gift by three and comparing
+against the force bar asks the same question with no division in it."""
+
+DEFAULT_GIFT_UPPER_DIVISOR = 3
+"""Which part of the force bar the gift must sit in: the top third, entirely. *"Ele tem que
+ocorrer no terço superior da barra de força, nunca no meio ou na mínima"* — and asked whether
+that means the whole gift or its close, he answered *"gift inteiro"*, so it is the gift's **low**
+that is held to the line. Its high is free to reach above the force bar's; when it does, the
+entry sits above it, which is what *"a máxima mais alta entre as duas"* says."""
+
+DEFAULT_IGNORED_BODY_DIVISOR = 3
+"""The ignored bar's body is *more* than a third of the force bar's height: *"ao invés do gift a
+barra após a barra de força tem corpo maior que 1/3 da barra de força"*. Strictly more — at
+exactly a third it is neither this nor a gift, and the region is spent. Measured against the
+force bar's **range**, by his answer: *"range da força"*."""
+
+DEFAULT_VOLUME_FRACTION = Decimal("0.70")
+"""When the volume filter is on, the follower may carry at most seventy percent of the force
+bar's volume: *"o gift, quando levando em consideração o volume da barra de força, tem que ter no
+máximo 70% do volume da barra de força, idem para a barra ignorada"*."""
+
 
 __all__ = [
     "DEFAULT_BODY_FRACTION",
     "DEFAULT_ENTRY_FRACTION",
+    "DEFAULT_GIFT_RANGE_DIVISOR",
+    "DEFAULT_GIFT_UPPER_DIVISOR",
     "DEFAULT_HAMMER_BREAK_TICKS",
+    "DEFAULT_IGNORED_BODY_DIVISOR",
     "DEFAULT_SHADOW_FRACTION",
     "DEFAULT_STOP_FRACTION",
+    "DEFAULT_VOLUME_FRACTION",
+    "ForceFollowLevels",
+    "GiftStop",
+    "GiftTrigger",
     "HammerBreakLevels",
     "HammerBreakTrigger",
     "HammerForceLevels",
     "HammerForceTrigger",
+    "IgnoredBarTrigger",
     "is_force_bar",
+    "is_gift",
     "is_hammer",
+    "is_ignored_bar",
+    "volume_of",
 ]
 
 
@@ -90,6 +146,17 @@ def _body(candle: Candle) -> Money:
 
 def _range(candle: Candle) -> Money:
     return candle.high - candle.low
+
+
+def volume_of(candle: Candle) -> int:
+    """The bar's volume as the filter reads it: the exchange's real volume where the venue
+    reports one, ticks where it does not — the same `auto` rule the VWAP runs on, so a strategy
+    carrying both reads one number for volume rather than two.
+
+    ⚠️ On this project's own data that is ticks everywhere but the AAPL, where `real_volume` is
+    present. A bar that reports neither returns zero, and the filter treats zero as *unmeasured*
+    rather than as *quiet* — see `_volume_passes`."""
+    return candle.real_volume or candle.tick_volume
 
 
 def is_hammer(
@@ -350,4 +417,275 @@ class HammerForceTrigger:
             limit_price=limit,
             stop_loss=stop_loss,
             annul_close=force.low,
+        )
+
+
+# --------------------------------------------------------------------------- #
+# The gift and the ignored bar — the bar after a bar of force                  #
+# --------------------------------------------------------------------------- #
+
+
+def is_gift(
+    force: Candle,
+    follower: Candle,
+    *,
+    side: Side,
+    range_divisor: int = DEFAULT_GIFT_RANGE_DIVISOR,
+    upper_divisor: int = DEFAULT_GIFT_UPPER_DIVISOR,
+) -> bool:
+    """Is `follower` a gift on the back of `force`? Small, and in the force bar's upper third.
+
+        long:   (high - low)             * 3 <= force.high - force.low      -- small
+                (force.high - low)       * 3 <= force.high - force.low      -- entirely up top
+        short:  the same with the extremes exchanged
+
+    ⚠️ **Both `<=`.** *No máximo um terço* admits a gift exactly a third tall, and a gift whose
+    low sits exactly on the line a third down from the force bar's high is in the upper third,
+    not below it. Written with multiplication so the boundary is reachable — see
+    `DEFAULT_GIFT_RANGE_DIVISOR`.
+
+    The gift's colour is not a condition. He gave two numbers — its size and where it sits —
+    and nothing about which way it closed; a small bar is small whichever way its body points.
+    """
+    span = _range(force)
+    if _range(follower) * range_divisor > span:
+        return False
+    if side is Side.LONG:
+        return (force.high - follower.low) * upper_divisor <= span
+    return (follower.high - force.low) * upper_divisor <= span
+
+
+def is_ignored_bar(
+    force: Candle,
+    follower: Candle,
+    *,
+    side: Side,
+    body_divisor: int = DEFAULT_IGNORED_BODY_DIVISOR,
+) -> bool:
+    """Is `follower` a *barra ignorada* on the back of `force`? A real body that failed to take
+    the force bar's low.
+
+        long:   |close - open| * 3 > force.high - force.low    and   low  >= force.low
+        short:  |close - open| * 3 > force.high - force.low    and   high <= force.high
+
+    ⚠️ **Strictly more than a third, against the gift's at-most-a-third**, so no bar is both.
+    Between the two there is a gap — a bar with a body over a third whose *range* is under a
+    third cannot exist, but a bar with a small body and a big range can, and it is neither: not
+    a gift by size, not an ignored bar by body. That bar cancels the entry, which is his rule for
+    anything that is not one of the two.
+
+    ⚠️ **The low is held to `>=`, not `>`.** *"Não pode romper a mínima"* — sitting on it is not
+    breaking it, the same reading `_RegionWatch.broke` gives the region's own edge.
+
+    Colour is not a condition here either. The word *ignorada* pictures a seller's bar the market
+    shrugs off, but the rule as given is a body over a third that kept the low, and a bar closing
+    up satisfies it too. Whether he wants the colour held is an open question, in the backlog.
+    """
+    if _body(follower) * body_divisor <= _range(force):
+        return False
+    if side is Side.LONG:
+        return follower.low >= force.low
+    return follower.high <= force.high
+
+
+def _volume_passes(force: Candle, follower: Candle, fraction: Decimal | None) -> bool:
+    """The optional volume filter: the follower at most `fraction` of the force bar's volume.
+
+    ⚠️ **A force bar with no volume at all fails the filter rather than passing it.** With the
+    filter on, zero against zero would read as "seventy percent of nothing is nothing, and the
+    follower has nothing, so it passes" — a filter that never rejects on a feed that never
+    reports volume. The project has met that silence before: a `volume="real"` VWAP outside the
+    AAPL skipped every bar and nobody heard. Failing closed turns a missing feed into a setup that
+    never arms, which is visible in a census, instead of a filter that is on and doing nothing.
+    """
+    if fraction is None:
+        return True
+    reference = volume_of(force)
+    if reference == 0:
+        return False
+    return Decimal(volume_of(follower)) <= fraction * reference
+
+
+class GiftStop(StrEnum):
+    """Where the gift's protective stop is taken from — his two alternatives, the user's choice.
+
+    * `GIFT` — twenty percent of the gift's own height below the gift's low. The tighter of the
+      two by construction, since a gift is at most a third of the force bar: same risk, larger
+      size, and a stop that a normal retest of the force bar's body would take out.
+    * `FORCA` — twenty percent of the force bar's height below the force bar's low. The wider
+      one, and the only one the ignored bar has.
+
+    The default is the gift's own low, the alternative he named first. It is a method choice
+    rather than an engineering one, and it is on the document so a study can hold the rest of
+    the setup still and vary only this.
+    """
+
+    GIFT = "gift"
+    FORCA = "forca"
+
+
+@dataclass(frozen=True, slots=True)
+class ForceFollowLevels:
+    """The three prices a gift or an ignored bar gives.
+
+    The third was not in the first dictation. Asked what takes the resting order back before its
+    two bars run out, he answered (2026-09-07): *"se o preço perder a mínima da barra de força
+    anula"*. So the force bar's low is the annulment for both followers — the gift's own low is
+    never a level, whichever bar the stop is measured from.
+
+    ⚠️ **`annul_price` and `stop_loss` are neighbours and must not be merged**, the same trap
+    `HammerBreakLevels` documents. With the stop off the force bar the two are twenty percent of
+    its height apart; with the stop off the gift the annulment sits *below* the stop, so a resting
+    order can outlive its own stop level being traded through and still be cancelled at the force
+    bar's low. Neither is a losing trade in the ledger, and collapsing them would make one.
+    """
+
+    side: Side
+    stop_price: Money
+    """The entry: one tick past the higher of the force bar's high and the follower's, on the
+    side the move has to resume."""
+
+    stop_loss: Money
+    """Twenty percent of the chosen bar's height past its low — the gift's or the force bar's."""
+
+    annul_price: Money
+    """The force bar's own extreme. **Reaching** it while the order rests ends the setup rather
+    than the trade — read the way the hammer reads its own low, and only while resting: once
+    filled, the low being lost is a trade walking toward its stop."""
+
+    @property
+    def risk(self) -> Money:
+        """The distance sizing measures, off the two levels as placed. See `HammerBreakLevels`."""
+        return abs(self.stop_price - self.stop_loss)
+
+
+def _entry_past(
+    force: Candle, follower: Candle, *, side: Side, tick: Money, break_ticks: int
+) -> Money:
+    """The entry: `break_ticks` past the higher high (lower low) of the pair, on the grid,
+    rounded away from the market the way every entry in this engine is."""
+    offset = break_ticks * tick
+    if side is Side.LONG:
+        return to_tick(max(force.high, follower.high) + offset, tick, ROUND_CEILING)
+    return to_tick(min(force.low, follower.low) - offset, tick, ROUND_FLOOR)
+
+
+def _check_follow_dials(
+    *, volume_fraction: Decimal | None, break_ticks: int, stop_fraction: Decimal
+) -> None:
+    if volume_fraction is not None and volume_fraction <= ZERO:
+        raise EngineError(f"the volume ceiling is a positive fraction, got {volume_fraction}")
+    if break_ticks < 1:
+        raise EngineError(f"the order waits at least one tick past the high, got {break_ticks}")
+    if stop_fraction <= ZERO:
+        raise EngineError(f"the stop sits past the bar, got {stop_fraction}")
+
+
+@dataclass(frozen=True, slots=True)
+class GiftTrigger:
+    """A bar of force, then a gift, and a stop order past the higher of their two highs.
+
+    His numbers, to check this against: force bar 100/106/99.50/105.50, gift
+    105.20/105.60/104.40/105.00 — the order at **106.01** on a penny grid, the stop at **104.16**
+    off the gift (20% of its 1.20 range below 104.40) or **98.20** off the force bar (20% of its
+    6.50 below 99.50). Read off the trigger before being written here, not worked out on paper.
+
+    **Stateless, like the hammer triggers.** Whether these two bars are a force bar and a gift is
+    a question about the two bars. How the force bar had to relate to a region, how many bars
+    the order then lives, and what cancels it are the clock's — `ForceFollowActivation`.
+    """
+
+    stop_at: GiftStop = GiftStop.GIFT
+    volume_fraction: Decimal | None = None
+    """`None` is the filter off. A number is the ceiling on the gift's volume as a fraction of
+    the force bar's — see `_volume_passes`."""
+    range_divisor: int = DEFAULT_GIFT_RANGE_DIVISOR
+    upper_divisor: int = DEFAULT_GIFT_UPPER_DIVISOR
+    break_ticks: int = DEFAULT_HAMMER_BREAK_TICKS
+    stop_fraction: Decimal = DEFAULT_STOP_FRACTION
+    body_fraction: Decimal = DEFAULT_BODY_FRACTION
+
+    def __post_init__(self) -> None:
+        if self.range_divisor < 1 or self.upper_divisor < 1:
+            raise EngineError("the gift is measured in whole divisions of the force bar")
+        _check_follow_dials(
+            volume_fraction=self.volume_fraction,
+            break_ticks=self.break_ticks,
+            stop_fraction=self.stop_fraction,
+        )
+
+    def levels_for(
+        self, force: Candle, follower: Candle, *, side: Side, tick: Money
+    ) -> ForceFollowLevels | None:
+        """The two levels if `force` is a force bar and `follower` a gift on it, else `None`.
+
+        `None` is one answer for three refusals — not a force bar, not a gift, a gift too loud
+        for the filter — and the clock treats them all the same way, by his rule: *"se alguns
+        destes critérios não ocorrer cancela a entrada e espera uma nova oportunidade"*.
+        """
+        if not is_force_bar(force, side=side, body_fraction=self.body_fraction):
+            return None
+        if not is_gift(
+            force,
+            follower,
+            side=side,
+            range_divisor=self.range_divisor,
+            upper_divisor=self.upper_divisor,
+        ):
+            return None
+        if not _volume_passes(force, follower, self.volume_fraction):
+            return None
+        stop_bar = follower if self.stop_at is GiftStop.GIFT else force
+        return ForceFollowLevels(
+            side=side,
+            stop_price=_entry_past(
+                force, follower, side=side, tick=tick, break_ticks=self.break_ticks
+            ),
+            stop_loss=_stop_loss(stop_bar, side=side, fraction=self.stop_fraction, tick=tick),
+            annul_price=force.low if side is Side.LONG else force.high,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class IgnoredBarTrigger:
+    """A bar of force, then a *barra ignorada*, and a stop order past the higher of the two
+    highs — the gift's entry with a different follower and no choice of stop.
+
+    His numbers: the same force bar 100/106/99.50/105.50, then 105.50/105.80/102.00/102.50 — a
+    three-point body against a 6.50 force bar, low 102 above 99.50. The order at **106.01**, the
+    stop at **98.20** off the force bar, which is the only stop this trigger has.
+    """
+
+    volume_fraction: Decimal | None = None
+    body_divisor: int = DEFAULT_IGNORED_BODY_DIVISOR
+    break_ticks: int = DEFAULT_HAMMER_BREAK_TICKS
+    stop_fraction: Decimal = DEFAULT_STOP_FRACTION
+    body_fraction: Decimal = DEFAULT_BODY_FRACTION
+
+    def __post_init__(self) -> None:
+        if self.body_divisor < 1:
+            raise EngineError("the ignored bar is measured in whole divisions of the force bar")
+        _check_follow_dials(
+            volume_fraction=self.volume_fraction,
+            break_ticks=self.break_ticks,
+            stop_fraction=self.stop_fraction,
+        )
+
+    def levels_for(
+        self, force: Candle, follower: Candle, *, side: Side, tick: Money
+    ) -> ForceFollowLevels | None:
+        """The two levels if `force` is a force bar and `follower` an ignored bar on it."""
+        if not is_force_bar(force, side=side, body_fraction=self.body_fraction):
+            return None
+        if not is_ignored_bar(force, follower, side=side, body_divisor=self.body_divisor):
+            return None
+        if not _volume_passes(force, follower, self.volume_fraction):
+            return None
+        return ForceFollowLevels(
+            side=side,
+            stop_price=_entry_past(
+                force, follower, side=side, tick=tick, break_ticks=self.break_ticks
+            ),
+            stop_loss=_stop_loss(force, side=side, fraction=self.stop_fraction, tick=tick),
+            annul_price=force.low if side is Side.LONG else force.high,
         )

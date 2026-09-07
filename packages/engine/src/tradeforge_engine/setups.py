@@ -43,10 +43,16 @@ from tradeforge_engine.bar_setups import (
     DEFAULT_HAMMER_BREAK_TICKS,
     DEFAULT_SHADOW_FRACTION,
     DEFAULT_STOP_FRACTION,
+    DEFAULT_VOLUME_FRACTION,
+    ForceFollowLevels,
+    GiftStop,
+    GiftTrigger,
     HammerBreakLevels,
     HammerBreakTrigger,
     HammerForceLevels,
     HammerForceTrigger,
+    IgnoredBarTrigger,
+    is_force_bar,
     is_hammer,
 )
 from tradeforge_engine.conduction import StructuralTrail, breakeven_candidate, tighten
@@ -148,6 +154,14 @@ class ZoneEntryPoint(StrEnum):
     So it is the widest stop of the three — 12 against the edge's 11 and the midpoint's 6 — and
     that is the price of what it buys: it is the only one of the three that does not need price
     to turn while sitting inside the region. It needs price to have already turned.
+
+    `GIFT` and `BARRA_IGNORADA` — dictated 2026-09-07 — are the bar of force off a region with
+    no hammer required, and the **bar after it** deciding the entry: a stop past the higher of
+    the two highs, placed when that bar closes. They share one activation,
+    `ForceFollowActivation`, and differ in the follower alone — a small bar in the force bar's
+    upper third, or a real body that failed to take its low. The gift also carries a choice of
+    stop (`GiftStop`) and both carry an optional volume filter; those are the two parameters
+    `StructureStrategy` takes beside this one, and they are ignored by every other value here.
     """
 
     EDGE = "edge"
@@ -160,6 +174,8 @@ class ZoneEntryPoint(StrEnum):
     FFFD = "fffd"
     MARTELO = "martelo"
     MARTELO_FORCA = "martelo_forca"
+    GIFT = "gift"
+    BARRA_IGNORADA = "barra_ignorada"
 
 
 ABANDON_AT_ZONE_HEIGHTS = Decimal(1)
@@ -1103,6 +1119,11 @@ class FffdActivation:
         return self._formation
 
 
+DEFAULT_BARS_TO_HAMMER = 5
+"""How many bars a region has to produce a hammer, counting the one that touched it: *"na mesma
+barra ou nas proximas 4 barras"*."""
+
+
 @dataclass(slots=True)
 class _RegionWatch:
     """The half of a hammer setup that is about the **region**, shared by both variations.
@@ -1124,7 +1145,7 @@ class _RegionWatch:
     """
 
     reach_fraction: Decimal
-    bars_to_hammer: int
+    bars_to_hammer: int = DEFAULT_BARS_TO_HAMMER
     watching: OrderBlock | None = None
     seen: datetime | None = None
     touched: bool = False
@@ -1177,6 +1198,14 @@ class _RegionWatch:
             return candle.high <= block.top + reach
         return candle.low >= block.bottom - reach
 
+    def price_within_reach(self, block: OrderBlock, price: Money, side: Side) -> bool:
+        """Is this **price** inside the ceiling? The gift's rule measures the entry rather than
+        the bar: region [90, 100] at two heights gives 120, and 120 itself arms."""
+        reach = self.reach_fraction * (block.top - block.bottom)
+        if side is Side.LONG:
+            return price <= block.top + reach
+        return price >= block.bottom - reach
+
     def open_window(self, block: OrderBlock, candle: Candle, side: Side) -> bool:
         """Is this bar one of the five the region gets? Starts the count on the touch.
 
@@ -1197,10 +1226,6 @@ class _RegionWatch:
             return False
         return True
 
-
-DEFAULT_BARS_TO_HAMMER = 5
-"""How many bars a region has to produce a hammer, counting the one that touched it: *"na mesma
-barra ou nas proximas 4 barras"*."""
 
 DEFAULT_BARS_TO_FILL = 2
 """How long the armed order lives: *"se ate o fechamento em ate duas barras apos a armacao da
@@ -1575,8 +1600,249 @@ class HammerForceActivation:
             self._region.spend(block, f"the order lived its {self.bars_to_fill} bars unfilled")
 
 
+DEFAULT_BARS_OFF_REGION = 1
+"""How many whole bars may sit between the last bar that touched the region and the bar of force,
+for the gift and the ignored bar.
+
+His rule in two halves. While bars keep touching the region — a low on or under its top — a bar
+of force may come on any of them, with no count running: *"enquanto os candles tiverem mínima que
+toca na região a barra de força ainda pode ser válida"*. Once a bar trades entirely above the
+region, the force bar has to come at once: *"a barra de força tem que acontecer imediatamente após
+esta barra"*, and asked to fix the count — the bar that left being N — he answered **N+1**. So the
+force bar may be the bar that left, or the one after it, and no later; one whole bar off the
+region is the most the setup tolerates. The force bar's own low may touch the region again — *"a
+mínima da barra de força pode tocar na região mesmo que a anterior não toque"* — which the count
+handles by itself, since a touching bar resets it.
+
+⚠️ **A bar past the count does not spend the region; it closes the window until price touches
+again.** Nothing has failed — no force bar was found — and his cancel rule is for a setup that
+began and broke, not for a region price wandered away from. What does end a region that is never
+revisited is the structure itself, through `_still_standing`.
+"""
+
+DEFAULT_ENTRY_REACH_FRACTION = Decimal(2)
+"""How far above the region's near edge the gift's or the ignored bar's **entry** may sit, in
+multiples of the region's height: *"vamos usar um range de 2x a região pra cima, 90-100 a região
+o teto de entrada é 120"*. Ten points of region, twenty above the top.
+
+⚠️ **Measured on the entry, not on the force bar** — his words are *teto de entrada*, where the
+hammer's ceiling measured the hammer and he said so. The two rules are neighbours in this file and
+disagree on exactly this, and each answer is his."""
+
+
+class FollowerTrigger(Protocol):
+    """What `ForceFollowActivation` needs from the bar arithmetic: the force-bar threshold it hunts
+    with, and the levels once the follower has closed. `GiftTrigger` and `IgnoredBarTrigger` both
+    satisfy it, and the activation is the same class for both — the two setups differ in the
+    follower and nowhere in the clock, which is what he said: *"a barra ignorada é diferente em
+    apenas 1 aspecto"*."""
+
+    @property
+    def body_fraction(self) -> Decimal: ...
+
+    def levels_for(
+        self, force: Candle, follower: Candle, *, side: Side, tick: Money
+    ) -> ForceFollowLevels | None: ...
+
+
+@dataclass(slots=True)
+class ForceFollowActivation:
+    """The gift and the *barra ignorada*, hosted by a region. Dictated 2026-09-07.
+
+    The bar arithmetic is `bar_setups`; this is the region's say and the clocks. No hammer is
+    needed — *"não precisa ter o martelo antes, mas se tiver não tem problema"* — so what the
+    region waits for is a **bar of force** off it, and then judges the one bar after that.
+
+    | what happens | the order | the region |
+    | --- | --- | --- |
+    | the higher high is broken | fills | spent by the fill (ADR-0015) |
+    | two bars pass, unfilled | cancelled | **spent** |
+    | the force bar's low is reached while the order rests | cancelled | **spent** |
+    | the region's low is broken, even by a wick, at any time | cancelled if resting | **spent** |
+    | the bar after the force bar is not a gift / ignored bar | never placed | **spent** |
+    | the follower is louder than the filter allows | never placed | **spent** |
+    | the entry would sit above the ceiling | never placed | **spent** |
+    | a whole bar leaves the region and no force bar follows | none | still standing, window shut |
+
+    ⚠️ **Every failure after a force bar is found spends the region** — *"cancela a entrada e
+    espera uma nova oportunidade"*, and asked whether the region lives on for that new opportunity:
+    *"cancelou, região não vale"*. The same answer the hammer gives and the opposite of the
+    FFFD's. Before a force bar is found nothing has failed, and the region simply waits.
+
+    ⚠️ **The region's low is watched on every bar, including while the order rests.** His words
+    are *"em nenhum momento"*, and the hammer's `_RegionWatch.broke` is only consulted before a
+    hammer exists. Here it is the first question on every bar, which is what lets it take back a
+    resting order. The force bar's low is the other early ending, and it came in a second
+    dictation: *"se o preço perder a mínima da barra de força anula"* — read on a touch, like
+    the hammer's own low, and only while the order rests.
+    """
+
+    trigger: FollowerTrigger
+    bars_to_fill: int = DEFAULT_BARS_TO_FILL
+    bars_off_region: int = DEFAULT_BARS_OFF_REGION
+    reach_fraction: Decimal = DEFAULT_ENTRY_REACH_FRACTION
+
+    _region: _RegionWatch = field(init=False, repr=False)
+    _off: int = field(default=0, init=False, repr=False)
+    _force: Candle | None = field(default=None, init=False, repr=False)
+    _levels: ForceFollowLevels | None = field(default=None, init=False, repr=False)
+    _bars_since_order: int = field(default=0, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.bars_to_fill < 1:
+            raise EngineError(f"the order lives at least one bar, got {self.bars_to_fill}")
+        if self.bars_off_region < 0:
+            raise EngineError(f"bars off the region is a count, got {self.bars_off_region}")
+        if self.reach_fraction < ZERO:
+            raise EngineError(f"the reach is a fraction of the region, got {self.reach_fraction}")
+        # The hammer's window is not consulted here -- `open_window` is never called -- so the
+        # watch is built on its default count and only `start`, `fresh`, the two edges, the
+        # ceiling and the spending are used.
+        self._region = _RegionWatch(reach_fraction=self.reach_fraction)
+
+    @property
+    def spent_by_mitigation(self) -> bool:
+        """`False`, as for the hammer: the touch is where this setup begins."""
+        return False
+
+    def spent(self, block: OrderBlock) -> bool:
+        return self._region.spent(block)
+
+    def withdraws(self, block: OrderBlock, *, context: Context) -> bool:  # noqa: ARG002
+        """Never. Every way this order comes back also ends the region, so the withdrawal rides
+        on `expired`."""
+        return False
+
+    def expired(
+        self,
+        block: OrderBlock,
+        *,
+        context: Context,  # noqa: ARG002 -- `observe` already folded this bar in
+        zones: Sequence[TrackedZone],  # noqa: ARG002
+    ) -> bool:
+        return self.spent(block)
+
+    def entry_for(
+        self,
+        block: OrderBlock,
+        *,
+        context: Context,  # noqa: ARG002 -- the levels were fixed when the follower closed
+    ) -> ZoneEntry | None:
+        """The stop order past the higher high, while there is one. `None` on the force bar's
+        own bar: the force bar alone places nothing, the follower decides."""
+        if self._region.watching != block or self._levels is None:
+            return None
+        return ZoneEntry(
+            side=self._levels.side,
+            stop_price=self._levels.stop_price,
+            stop_loss=self._levels.stop_loss,
+        )
+
+    def observe(self, block: OrderBlock, *, context: Context) -> None:
+        """Fold this bar in: the region's low first, then whichever stage the setup is at."""
+        if self._region.start(block):
+            self._off = 0
+            self._force = None
+            self._levels = None
+            self._bars_since_order = 0
+        candle = context.candle
+        if not self._region.fresh(candle):
+            return
+        if self.spent(block):  # pragma: no cover - `_may_arm` never offers a spent block back
+            return
+
+        side = _side_of(block)
+        if self._region.broke(block, candle, side):
+            self._force = None
+            self._levels = None
+            self._region.spend(block, "the region's own extreme was lost")
+            return
+        if self._levels is not None:
+            self._age_the_order(block, candle)
+            return
+        if self._force is not None:
+            self._judge_the_follower(block, candle, side, context)
+            return
+        self._look_for_a_force_bar(block, candle, side)
+
+    def _look_for_a_force_bar(self, block: OrderBlock, candle: Candle, side: Side) -> None:
+        """Is this bar a bar of force the region may still claim?
+
+        The count is of whole bars *before* this one that did not touch, since the last one
+        that did. A touching bar is zero and resets; the bar that leaves is still zero -- it may
+        itself be the force bar, *"na fuga ou saída da região"* -- and the one after it is one.
+        """
+        if self._region.touches(block, candle, side):
+            self._region.touched = True
+            self._off = 0
+            gap = 0
+        elif not self._region.touched:
+            return
+        else:
+            gap = self._off
+            self._off += 1
+        if gap > self.bars_off_region:
+            return
+        if is_force_bar(candle, side=side, body_fraction=self.trigger.body_fraction):
+            self._force = candle
+            logger.debug("force bar at %s off the region; judging the next bar", candle.time)
+
+    def _judge_the_follower(
+        self, block: OrderBlock, candle: Candle, side: Side, context: Context
+    ) -> None:
+        """This bar is the one after the force bar: a gift, an ignored bar, or the end.
+
+        ⚠️ **The ceiling is read here, on the entry the trigger computed**, and failing it spends
+        the region like any other failed criterion. It is not the hammer's "does not arm, window
+        stays open": there the bar was too far out and the region had other bars to offer; here
+        the setup is complete and one of its criteria is not met.
+        """
+        force = self._force
+        if force is None:  # pragma: no cover - only called while a force bar waits
+            return
+        self._force = None
+        levels = self.trigger.levels_for(
+            force, candle, side=side, tick=context.instrument.tick_size
+        )
+        if levels is None:
+            self._region.spend(block, "the bar after the force bar was not the follower")
+            return
+        if not self._region.price_within_reach(block, levels.stop_price, side):
+            self._region.spend(block, "the entry would sit above the region's ceiling")
+            return
+        self._levels = levels
+        self._bars_since_order = 0
+        logger.debug("follower at %s; the stop order waits at %s", candle.time, levels.stop_price)
+
+    def _age_the_order(self, block: OrderBlock, candle: Candle) -> None:
+        """One bar of the order's clock, and the two ways it ends here. Both spend the region,
+        so the order of the two reads changes a log line and nothing else — the same standing
+        the hammer's `_age_the_trigger` documents. The region's low, the third ending, was read
+        before this was reached."""
+        levels = self._levels
+        if levels is None:  # pragma: no cover - only called with a live order
+            return
+        lost = (
+            candle.low <= levels.annul_price
+            if levels.side is Side.LONG
+            else candle.high >= levels.annul_price
+        )
+        if lost:
+            self._levels = None
+            self._region.spend(block, "the force bar's own extreme was lost")
+            return
+        self._bars_since_order += 1
+        if self._bars_since_order >= self.bars_to_fill:
+            self._levels = None
+            self._region.spend(block, f"the order lived its {self.bars_to_fill} bars unfilled")
+
+
 def activation_for(  # noqa: PLR0911 - one flat branch per value, which the docstring argues for
-    entry_point: ZoneEntryPoint, *, stop_buffer: Decimal
+    entry_point: ZoneEntryPoint,
+    *,
+    stop_buffer: Decimal,
+    gift_stop: GiftStop = GiftStop.GIFT,
+    volume_filter: bool = False,
 ) -> ZoneActivation:
     """The activation a `ZoneEntryPoint` names.
 
@@ -1584,7 +1850,8 @@ def activation_for(  # noqa: PLR0911 - one flat branch per value, which the docs
     region-arithmetic activations take the zone's stop buffer; the botinha takes none of it — its
     stop comes from the band rather than from the region, so handing it that number would be a
     parameter that does nothing. A table keyed to one shared signature would have to pretend
-    otherwise.
+    otherwise. The gift and the ignored bar widen the disagreement: they are the only two that
+    read `gift_stop` and `volume_filter`, and the gift alone reads the first.
 
     Loud rather than defaulting, the same doctrine as `build_indicator` and the cost-model
     builder: a value this engine does not know raises instead of quietly running the edge entry.
@@ -1606,6 +1873,15 @@ def activation_for(  # noqa: PLR0911 - one flat branch per value, which the docs
         return HammerBreakActivation()
     if entry_point is ZoneEntryPoint.MARTELO_FORCA:
         return HammerForceActivation()
+    # The filter is a switch on the document and a fraction in the engine: on means his seventy
+    # percent, and the number stays with the other method constants rather than on the DSL.
+    volume_fraction = DEFAULT_VOLUME_FRACTION if volume_filter else None
+    if entry_point is ZoneEntryPoint.GIFT:
+        return ForceFollowActivation(
+            trigger=GiftTrigger(stop_at=gift_stop, volume_fraction=volume_fraction)
+        )
+    if entry_point is ZoneEntryPoint.BARRA_IGNORADA:
+        return ForceFollowActivation(trigger=IgnoredBarTrigger(volume_fraction=volume_fraction))
     raise EngineError(  # pragma: no cover - unreachable while the enum and the chain agree
         f"no activation for entry point {entry_point!r}"
     )
@@ -1778,7 +2054,7 @@ class StructureStrategy:
     position opened and died inside a single bar, invisible to both.
     """
 
-    def __init__(  # noqa: PLR0913 — one qualifier and five knobs, every one keyword-only
+    def __init__(  # noqa: PLR0913 — one qualifier and seven knobs, every one keyword-only
         self,
         *,
         qualifier: SetupQualifier,
@@ -1787,6 +2063,8 @@ class StructureStrategy:
         stop_buffer: Decimal = DEFAULT_STOP_BUFFER,
         entry_point: ZoneEntryPoint = ZoneEntryPoint.EDGE,
         breakeven_at_r: Decimal | None = Decimal(2),
+        gift_stop: GiftStop = GiftStop.GIFT,
+        volume_filter: bool = False,
     ) -> None:
         if stop_buffer < ZERO:
             raise ValueError(f"stop buffer is a fraction of the zone width, got {stop_buffer}")
@@ -1800,7 +2078,12 @@ class StructureStrategy:
         # The second seam: *how* a named zone becomes an order. Built from the entry point
         # rather than branched on later, so a new way of entering is a new implementation
         # instead of a fourth `if` in two methods that would then have to agree.
-        self._activation = activation_for(entry_point, stop_buffer=stop_buffer)
+        self._activation = activation_for(
+            entry_point,
+            stop_buffer=stop_buffer,
+            gift_stop=gift_stop,
+            volume_filter=volume_filter,
+        )
         # Where the order rests inside the region. `EDGE` is the default so that adding this
         # parameter changes no recorded result — see `ZoneEntryPoint`.
         self._entry_point = entry_point

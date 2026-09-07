@@ -16,7 +16,9 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
+from tradeforge_engine.average_setups import AverageEntryPoint
 from tradeforge_engine.backtest_broker import BacktestBroker
+from tradeforge_engine.bar_setups import GiftStop
 from tradeforge_engine.domain import (
     ZERO,
     Candle,
@@ -63,8 +65,11 @@ def _run(  # noqa: PLR0913 — keyword-only; each names one axis of a backtest
     percent: str = "1",
     period: int = 3,
     stop_buffer_ticks: int = 0,
+    strategy: Mme9BreakoutStrategy | None = None,
 ) -> RunResult:
-    strategy = Mme9BreakoutStrategy(side=side, period=period, stop_buffer_ticks=stop_buffer_ticks)
+    strategy = strategy or Mme9BreakoutStrategy(
+        side=side, period=period, stop_buffer_ticks=stop_buffer_ticks
+    )
     broker = BacktestBroker(
         instrument=AAPL,
         initial_capital=Decimal(100_000),
@@ -1576,3 +1581,285 @@ def test_the_curve_has_no_value_until_the_average_has_warmed_up() -> None:
 
     assert seen[:8] == [None] * 8
     assert seen[8] is not None
+
+
+# --------------------------------------------------------------------------- #
+# His bar patterns on the average — the 9.1 entered by a hammer, a gift ...     #
+# --------------------------------------------------------------------------- #
+
+# The turn: bar 3 closes at 101 above the MME3 (100), the same bar every classic scenario arms
+# on. With a pattern chosen it arms nothing — the pattern has to print on the touch.
+_TURN_UP = bar(3, open_="98", close="101", high="101.3", low="97.9")
+# Bar 4 touches the MME3 (100.35) with its low of 99.20 and is a hammer: a 1.20 tail on a 1.70
+# bar under a body that closed up. Order 100.91, stop 98.86 — read off the strategy.
+_HAMMER_ON_THE_MME = bar(4, open_="100.4", close="100.7", high="100.9", low="99.2")
+_QUIET_ABOVE_THE_MME = [
+    bar(5, open_="100.75", close="100.8", high="100.85", low="100.5"),
+    bar(6, open_="100.8", close="100.9", high="100.95", low="100.6"),
+]
+
+
+def _mme9_with(entry_point: AverageEntryPoint, **kwargs: object) -> Mme9BreakoutStrategy:
+    return Mme9BreakoutStrategy(period=3, entry_point=entry_point, **kwargs)  # type: ignore[arg-type]
+
+
+def test_the_hammer_replaces_the_classic_entry_on_the_mme9() -> None:
+    """*"Substitui: a entrada tem que seguir o gatilho escolhido."* The turn bar arms nothing;
+    the hammer touching the average on bar 4 arms the pattern's own order: one tick past its
+    high, the stop twenty percent of the bar under its low. Neither is the classic's number
+    (101.3 and 97.9 on this same stream)."""
+    signals = _drive(_mme9_with(AverageEntryPoint.MARTELO), [*_SEED, _TURN_UP, _HAMMER_ON_THE_MME])
+
+    assert signals[3] == [], "the classic reference arms nothing under a pattern entry"
+    [placed] = signals[4]
+    assert placed.kind is SignalKind.ENTRY
+    assert placed.stop_price == Decimal("100.91")
+    assert placed.stop_loss == Decimal("98.86")
+    assert placed.limit_price is None
+    assert placed.reason == "entry.mme9.martelo"
+    assert placed.context == {"average": Decimal("100.35")}
+
+
+def test_the_stop_buffer_says_nothing_about_a_pattern_s_stop() -> None:
+    """The pattern's stop is the bar's own twenty percent, by his rule for every host. A buffer
+    of ten ticks moves the classic stop and leaves the hammer's exactly where it was."""
+    [placed] = _drive(
+        _mme9_with(AverageEntryPoint.MARTELO, stop_buffer_ticks=10),
+        [*_SEED, _TURN_UP, _HAMMER_ON_THE_MME],
+    )[4]
+    assert placed.stop_loss == Decimal("98.86")
+
+    [classic] = _drive(Mme9BreakoutStrategy(period=3, stop_buffer_ticks=10), [*_SEED, _TURN_UP])[3]
+    assert classic.stop_loss == Decimal("97.80")  # 97.90 less ten pennies
+
+
+def test_the_pattern_order_fills_on_the_break_and_is_conducted_by_the_mme9() -> None:
+    """End to end through the real loop. The hammer's order at 100.91 fills on bar 5's break;
+    the trade is then the 9.1's to conduct — *"a condução segue o padrão do setup, não do
+    gatilho"* — so the bar that closes back under the average tightens the stop to its low, and
+    the stop is what ends the trade. Sized against the pattern's own risk."""
+    candles = [
+        *_SEED,
+        _TURN_UP,
+        _HAMMER_ON_THE_MME,
+        bar(5, open_="100.8", close="101.5", high="101.8", low="100.7"),  # breaks 100.91
+        bar(
+            6, open_="101.4", close="100.2", high="101.5", low="100.1"
+        ),  # closes under -> stop 100.1
+        bar(7, open_="100.2", close="99.5", high="100.3", low="99.4"),  # takes 100.1
+    ]
+    result = _run(candles, strategy=_mme9_with(AverageEntryPoint.MARTELO), rr=None)
+    [entry] = _entries(result)
+    assert entry.price == Decimal("100.91")
+    assert entry.order.stop_loss == Decimal("98.86")
+    [exit_fill] = [f for f in result.fills if f.order.intent is SignalKind.EXIT]
+    assert exit_fill.order.reason == "sl"
+    assert exit_fill.price == Decimal("100.1")
+
+
+def test_a_close_back_across_the_average_withdraws_the_pattern_order() -> None:
+    """His fourth answer: *"só desarma se fechar abaixo da média"*. Armed on 4; bar 5 closes at
+    98 under the MME3 and the order comes back that bar.
+
+    ⚠️ And the bar that crosses back above is the **turn**, not a touch. Bar 6 is a hammer whose
+    range spans the average — every crossing bar's does — and it arms nothing; the hammer on bar
+    7, coming back to the line from above, is the first touch of the new turn and arms. The
+    reading is ours (`_arm_pattern`), and it is in the backlog for him.
+    """
+    closes_under = bar(5, open_="100.5", close="98", high="100.6", low="97.9")
+    hammer_crossing_back = bar(6, open_="99.8", close="100.3", high="100.5", low="98.6")
+    hammer_touching = bar(7, open_="100.4", close="100.7", high="100.9", low="99.5")
+    signals = _drive(
+        _mme9_with(AverageEntryPoint.MARTELO),
+        [*_SEED, _TURN_UP, _HAMMER_ON_THE_MME, closes_under, hammer_crossing_back, hammer_touching],
+    )
+    [taken_back] = signals[5]
+    assert taken_back.kind is SignalKind.CANCEL
+    assert signals[6] == [], "the crossing bar is the turn, not a touch"
+    [rearmed] = signals[7]
+    assert rearmed.kind is SignalKind.ENTRY
+    assert rearmed.stop_price == Decimal("100.91")
+
+
+def test_a_new_turn_is_needed_before_a_touch_counts_again() -> None:
+    """The half of the sixth answer the scenario above cannot show: after bar 5 closes under,
+    bar 6 is a hammer that touches the average but **closes under it too** — no new turn, and
+    nothing arms. Bar 7 closes back above without touching (a new turn, no pattern), and the
+    hammer on bar 8 that touches the average arms."""
+    closes_under = bar(5, open_="100.5", close="98", high="100.6", low="97.9")
+    hammer_still_under = bar(6, open_="98.2", close="98.5", high="98.7", low="97.4")
+    turns_up = bar(7, open_="98.5", close="100.4", high="100.6", low="98.4")
+    signals = _drive(
+        _mme9_with(AverageEntryPoint.MARTELO),
+        [
+            *_SEED,
+            _TURN_UP,
+            _HAMMER_ON_THE_MME,
+            closes_under,
+            hammer_still_under,
+            turns_up,
+            bar(8, open_="100", close="100.3", high="100.5", low="99.2"),
+        ],
+    )
+    assert signals[6] == []
+    assert signals[7] == []
+    [rearmed] = signals[8]
+    assert rearmed.kind is SignalKind.ENTRY
+
+
+def test_the_pattern_order_lives_two_bars_and_the_turn_is_not_spent_by_lapsing() -> None:
+    """Armed on 4, resting through 5, taken back on 6 — and nothing is spent: the turn stands,
+    and a hammer touching the average on bar 7 arms again. On a region the lapse retires the
+    zone; on the average only the close across does."""
+    signals = _drive(
+        _mme9_with(AverageEntryPoint.MARTELO),
+        [
+            *_SEED,
+            _TURN_UP,
+            _HAMMER_ON_THE_MME,
+            *_QUIET_ABOVE_THE_MME,
+            bar(7, open_="100.9", close="101.1", high="101.3", low="99.5"),
+        ],
+    )
+    assert signals[5] == []
+    [taken_back] = signals[6]
+    assert taken_back.kind is SignalKind.CANCEL
+    [rearmed] = signals[7]
+    assert rearmed.kind is SignalKind.ENTRY
+
+
+def test_a_filled_pattern_spends_the_turn_like_the_classic_does() -> None:
+    """One trade per turn is the host's rule and the pattern inherits it: after the fill on bar 5
+    and a stop-out on 7 that closed *above* the average, the hammer touching the average on bar
+    8 arms nothing — the turn is spent until price closes back across and crosses again."""
+    candles = [
+        *_SEED,
+        _TURN_UP,
+        _HAMMER_ON_THE_MME,
+        bar(5, open_="100.8", close="101.5", high="101.8", low="100.7"),  # fill 100.91
+        bar(6, open_="101.4", close="101.2", high="101.5", low="101"),
+        bar(
+            7, open_="101.2", close="101.4", high="101.6", low="98.5"
+        ),  # stop 98.86 hit, closes above
+        bar(8, open_="101.3", close="101.6", high="101.8", low="100.3"),  # hammer touching, spent
+    ]
+    result = _run(candles, strategy=_mme9_with(AverageEntryPoint.MARTELO), rr=None)
+    assert len(_entries(result)) == 1
+
+
+def test_the_hammer_sell_is_the_exact_mirror_on_a_short_mme9() -> None:
+    """The reflection of the whole stream around 200, on a short instance: order 99.09, stop
+    101.14 — every branch the long took, mirrored at once."""
+    mirrored = [_flip(candle) for candle in [*_SEED, _TURN_UP, _HAMMER_ON_THE_MME]]
+    [placed] = _drive(
+        Mme9BreakoutStrategy(period=3, side=Side.SHORT, entry_point=AverageEntryPoint.MARTELO),
+        mirrored,
+    )[4]
+    assert placed.side is Side.SHORT
+    assert placed.stop_price == Decimal("99.09")
+    assert placed.stop_loss == Decimal("101.14")
+
+
+def _flip(candle: Candle) -> Candle:
+    return Candle(
+        time=candle.time,
+        open=Decimal(200) - candle.open,
+        high=Decimal(200) - candle.low,
+        low=Decimal(200) - candle.high,
+        close=Decimal(200) - candle.close,
+    )
+
+
+def test_the_force_variation_rests_a_limit_on_the_mme9() -> None:
+    """The one pattern whose order is a limit, through a host that only ever placed stops. Hammer
+    on 4, bar of force on 5 topping at 103.20: the limit at 101.59, the stop the hammer's 98.86."""
+    force = bar(5, open_="100.8", close="103", high="103.2", low="100.6")
+    signals = _drive(
+        _mme9_with(AverageEntryPoint.MARTELO_FORCA), [*_SEED, _TURN_UP, _HAMMER_ON_THE_MME, force]
+    )
+    assert signals[4] == []
+    [placed] = signals[5]
+    assert placed.limit_price == Decimal("101.59")
+    assert placed.stop_price is None
+    assert placed.stop_loss == Decimal("98.86")
+    assert placed.reason == "entry.mme9.martelo_forca"
+
+
+def test_the_force_variation_limit_fills_through_the_real_loop() -> None:
+    """⚠️ **The one order shape this host had never placed, taken to a fill by `run()`.**
+
+    Every other pattern rests a stop, which is what the 9.1 has always sent; `martelo_forca` rests
+    a **limit**, and the tests above only ever read it off `_drive`. A level nobody fills is a
+    level whose plumbing is unproven — the strategy could name it correctly and the broker still
+    never match it. Here the pullback on bar 6 reaches 101.59 and the fill carries the pattern's
+    own name, which is also what `_observe_fill` matches on to spend the turn.
+
+    The lesson's review of this PR asked for it: the proof existed for the region's limits and
+    for this host's stops, and nowhere for the two together.
+    """
+    force = bar(5, open_="100.8", close="103", high="103.2", low="100.6")
+    pullback = bar(6, open_="102.8", close="102", high="102.9", low="101.4")
+    result = _run(
+        [*_SEED, _TURN_UP, _HAMMER_ON_THE_MME, force, pullback],
+        strategy=_mme9_with(AverageEntryPoint.MARTELO_FORCA),
+        rr=None,
+    )
+    [entry] = _entries(result)
+    assert entry.price == Decimal("101.59")
+    assert entry.order.stop_loss == Decimal("98.86")
+    assert entry.order.reason == "entry.mme9.martelo_forca"
+
+
+def test_the_gift_and_the_ignored_bar_enter_the_mme9_off_a_bar_of_force_on_the_average() -> None:
+    """Bar 4 touches the MME3 (101.50) and is a bar of force; the gift on 5 arms at 103.21 with
+    the stop 102.38 off the gift or 98.52 off the force bar; the ignored bar on 5 arms the same
+    entry with the force bar's stop. Nothing on the force bar's own bar."""
+    force = bar(4, open_="99.5", close="103", high="103.2", low="99.3")
+    gift = bar(5, open_="102.9", close="102.8", high="103.1", low="102.5")
+    ignored = bar(5, open_="103", close="101.6", high="103.1", low="101.2")
+
+    signals = _drive(_mme9_with(AverageEntryPoint.GIFT), [*_SEED, _TURN_UP, force, gift])
+    assert signals[4] == []
+    [placed] = signals[5]
+    assert placed.stop_price == Decimal("103.21")
+    assert placed.stop_loss == Decimal("102.38")
+
+    [off_force] = _drive(
+        _mme9_with(AverageEntryPoint.GIFT, gift_stop=GiftStop.FORCA),
+        [*_SEED, _TURN_UP, force, gift],
+    )[5]
+    assert off_force.stop_loss == Decimal("98.52")
+
+    [ignored_entry] = _drive(
+        _mme9_with(AverageEntryPoint.BARRA_IGNORADA), [*_SEED, _TURN_UP, force, ignored]
+    )[5]
+    assert ignored_entry.stop_price == Decimal("103.21")
+    assert ignored_entry.stop_loss == Decimal("98.52")
+    assert ignored_entry.reason == "entry.mme9.barra_ignorada"
+
+
+def test_the_volume_filter_is_a_switch_on_the_mme9_too() -> None:
+    force = bar(4, open_="99.5", close="103", high="103.2", low="99.3", tick_volume=1000)
+    loud_gift = bar(5, open_="102.9", close="102.8", high="103.1", low="102.5", tick_volume=701)
+    assert (
+        _drive(
+            _mme9_with(AverageEntryPoint.GIFT, volume_filter=True),
+            [*_SEED, _TURN_UP, force, loud_gift],
+        )[5]
+        == []
+    )
+    assert _drive(_mme9_with(AverageEntryPoint.GIFT), [*_SEED, _TURN_UP, force, loud_gift])[5] != []
+
+
+def test_the_classic_entry_is_untouched_by_the_new_dials() -> None:
+    """The default is `classic`, and on it the two gift dials do nothing: the same stream gives
+    the same reference order it always gave, whatever the dials say."""
+    plain = _drive(Mme9BreakoutStrategy(period=3), [*_SEED, _TURN_UP])
+    dialled = _drive(
+        Mme9BreakoutStrategy(period=3, gift_stop=GiftStop.FORCA, volume_filter=True),
+        [*_SEED, _TURN_UP],
+    )
+    assert plain == dialled
+    [placed] = plain[3]
+    assert placed.stop_price == Decimal("101.3")
+    assert placed.reason == "entry.mme9"

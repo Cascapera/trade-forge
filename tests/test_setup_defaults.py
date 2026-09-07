@@ -36,6 +36,7 @@ from typing import Any, get_args
 import pytest
 
 from tradeforge_engine import setup_factory
+from tradeforge_engine.average_setups import AverageEntryPoint
 from tradeforge_engine.bar_setups import GiftStop
 from tradeforge_engine.domain import Side
 from tradeforge_engine.setup_factory import _BUILDERS, build_setup
@@ -102,6 +103,10 @@ _PROBES: dict[str, dict[str, tuple[Any, Any]]] = {
         "period": (21, 21),
         "stop_buffer_ticks": (3, 3),
         "breakeven_at_r": (3.3, Decimal("3.3")),
+        # The bar patterns on the average (2026-09-07), off their defaults.
+        "entry_point": ("martelo", AverageEntryPoint.MARTELO),
+        "gift_stop": ("forca", GiftStop.FORCA),
+        "volume_filter": (True, True),
     },
     "ponto_continuo": {
         "side": ("short", Side.SHORT),

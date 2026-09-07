@@ -12,11 +12,16 @@ describe('axesFor', () => {
 
     // Required first — `side` has no default, so it is the one that must be answered — and the
     // schema's own order after that.
+    // `entry_point`, `gift_stop` and `volume_filter` joined on 2026-09-07 with the bar patterns
+    // on the average — and a study can now grid over the entry point itself.
     expect(paths).toEqual([
       'setup.params.side',
       'setup.params.breakeven_at_r',
+      'setup.params.entry_point',
+      'setup.params.gift_stop',
       'setup.params.period',
       'setup.params.stop_buffer_ticks',
+      'setup.params.volume_filter',
     ])
   })
 

@@ -1809,3 +1809,27 @@ E o efeito colateral já conhecido: `volume_filter: false` passa a aparecer em t
 `mme9_breakout` re-salvo pelo web (regra do booleano), e o eixo de estudo do 9.1 agora oferece
 `entry_point`, `gift_stop` e `volume_filter` — o teste `axes.test.ts` existe para acusar isso e
 acusou.
+
+## Três leituras minhas no ponto contínuo hospedando os padrões (PR-203) — confirmar com ele
+
+Aberto em 07/09/2026. Ele autorizou seguir sem responder as três perguntas (*"pode fazer"*), então
+escolhi a leitura que segue do que ele já decidiu para o 9.1 e registro aqui.
+
+**1. As duas correções continuam exigidas antes de o padrão poder armar.** O `entry_point`
+substitui a regra 3 (a barra que toca e fecha acima) e deixa as regras 1, 2, 4 e 5 de pé. Sem as
+correções o setup entraria em qualquer encostada com martelo, que é a regra do 9.1 e não a deste —
+as duas correções são o que faz dele o ponto contínuo. Teste
+`test_the_two_corrections_are_still_required_before_a_pattern_may_arm`.
+
+**2. O relógio recebe toda barra que não fechou abaixo da média.** O gatilho clássico exige fechar
+**acima**; o padrão não, porque a barra que importa nele é a que **encosta**. Uma barra que fecha
+exatamente **em cima** da média não é evento nenhum pela regra 4 dele, então também é alimentada.
+
+**3. Posição aberta fecha o portão e reseta o relógio.** A regra 5 (um trade por vez) já valia para
+a entrada clássica; estendi ao padrão, e o reset evita que uma barra de força de antes do trade
+receba um gift de depois dele.
+
+E um mutante **declarado equivalente**: apagar o `self._watch.reset()` do ramo `closed_short_of`
+não muda nada observável, porque aquele ramo também zera `_qualified` e a barra seguinte encontra o
+portão do item 3, que reseta. Fica no código com o comentário, pelo mesmo motivo do `crossing` do
+PR-202: as duas linhas respondem perguntas diferentes.

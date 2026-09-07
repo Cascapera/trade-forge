@@ -19,7 +19,9 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
+from tradeforge_engine.average_setups import AverageEntryPoint
 from tradeforge_engine.backtest_broker import BacktestBroker
+from tradeforge_engine.bar_setups import GiftStop, is_gift, is_hammer, is_ignored_bar
 from tradeforge_engine.domain import (
     ZERO,
     Candle,
@@ -71,10 +73,15 @@ def _run(  # noqa: PLR0913 — keyword-only; each names one axis of a backtest
     period: int = 3,
     average: AverageKind = "EMA",
     stop_buffer_ticks: int = 0,
+    entry_point: AverageEntryPoint = AverageEntryPoint.CLASSIC,
 ) -> RunResult:
     """The setup through the real loop. `rr=5` is the author's own target multiple."""
     strategy = PontoContinuoStrategy(
-        side=side, period=period, average=average, stop_buffer_ticks=stop_buffer_ticks
+        side=side,
+        period=period,
+        average=average,
+        stop_buffer_ticks=stop_buffer_ticks,
+        entry_point=entry_point,
     )
     broker = BacktestBroker(
         instrument=AAPL,
@@ -102,6 +109,9 @@ def _drive(  # noqa: PLR0913 — keyword-only; each names one axis of a driven r
     position_on: frozenset[int] = frozenset(),
     held: Position | None = None,
     fills_on: dict[int, list[Fill]] | None = None,
+    entry_point: AverageEntryPoint = AverageEntryPoint.CLASSIC,
+    gift_stop: GiftStop = GiftStop.GIFT,
+    volume_filter: bool = False,
 ) -> list[list[Signal]]:
     """Feed candles one at a time and collect the signals each bar produced.
 
@@ -117,6 +127,9 @@ def _drive(  # noqa: PLR0913 — keyword-only; each names one axis of a driven r
         average=average,
         stop_buffer_ticks=stop_buffer_ticks,
         breakeven_at_r=breakeven_at_r,
+        entry_point=entry_point,
+        gift_stop=gift_stop,
+        volume_filter=volume_filter,
     )
     out: list[list[Signal]] = []
     with localcontext(ENGINE_CONTEXT):
@@ -1435,3 +1448,339 @@ def test_the_average_is_the_same_whether_or_not_the_bars_produced_trades() -> No
 
     assert flat is not None
     assert flat == walk(positioned=True)
+
+
+# --------------------------------------------------------------------------- #
+# His bar patterns hosted by the Ponto Contínuo                                 #
+# --------------------------------------------------------------------------- #
+
+# The golden's first six bars are the pullback: bar 3 the reference, bars 4 and 5 the two
+# corrections. What follows replaces rule 3 — the touch-and-close-above bar — with one of his four
+# patterns, which is his instruction of 2026-09-07: *"e no ponto contínuo também"*.
+#
+# ⚠️ The EMA3 on bar 6 depends on the bar the scenario puts there, because an EMA3 has alpha 1/2
+# and bar 6 is exactly the bar every scenario below replaces: **112.875** behind the hammer and
+# **113.375** behind the bar of force. (112.625 is the *golden's* own bar 6, which none of these
+# streams contains — the number this comment carried at first, and the one the next reader would
+# have used to draw the next fixture.) Every low below reaches both readings.
+#
+# The figures were read off the strategy before they were written here.
+_QUALIFIED = [*_BULLISH_WARM, *_GOLDEN[:6]]
+
+# A hammer whose low of 111.50 reaches the average: a 2.10 tail on a 2.70 bar, closing up.
+_HAMMER_ON_THE_AVERAGE = bar(6, open_="113.6", close="114", high="114.2", low="111.5")
+# A bar of force touching it, and the gift that follows.
+_FORCE_ON_THE_AVERAGE = bar(6, open_="112", close="115", high="115.2", low="111.8")
+_GIFT_AFTER = bar(7, open_="114.9", close="114.8", high="115.1", low="114.5")
+
+
+def _pattern(
+    entry_point: AverageEntryPoint, tail: list[Candle], **kwargs: object
+) -> list[list[Signal]]:
+    return _drive([*_QUALIFIED, *tail], entry_point=entry_point, **kwargs)  # type: ignore[arg-type]
+
+
+def test_a_hammer_on_the_average_replaces_the_touch_and_close_above() -> None:
+    """His first answer for the MME9, applied here: the pattern **substitutes** rule 3's own bar.
+
+    The classic entry on this very bar rests at 114.20 with the stop at 111.50 — the bar's high
+    and its low. The hammer rests at **114.21**, one tick past the high, with the stop at
+    **110.96**: twenty percent of the bar's own 2.70 below it. Neither number is the other's, so a
+    host that fell back to the classic entry would be visible here rather than plausible.
+    """
+    signals = _pattern(AverageEntryPoint.MARTELO, [_HAMMER_ON_THE_AVERAGE])
+    [(index, trigger, stop)] = _arms(signals)
+    assert index == 6
+    assert trigger == Decimal("114.21")
+    assert stop == Decimal("110.96")
+
+    # The bar's own close, not the level the order rests at. Nothing downstream sizes from it —
+    # `PercentRiskManager` measures entry against stop — but `Signal.__post_init__` compares the
+    # two to refuse a buy stop resting *below* the market, and with the level in both places that
+    # comparison is `x > x` and the guard is vacuous forever.
+    [placed] = signals[6]
+    assert placed.reference_price == _HAMMER_ON_THE_AVERAGE.close
+    # And the average's own curve rides along, as it does on the classic entry: a pattern entry
+    # drawn without it shows a bar breaking out of nothing in particular.
+    assert placed.series != ()
+    assert placed.series[0].points[-1].value == Decimal("112.875")
+
+    [(_, classic_trigger, classic_stop)] = _arms(_drive([*_QUALIFIED, _HAMMER_ON_THE_AVERAGE]))
+    assert (classic_trigger, classic_stop) == (Decimal("114.2"), Decimal("111.50"))
+
+
+def test_the_gift_arms_the_ponto_continuo_off_a_bar_of_force_on_the_average() -> None:
+    """The two-bar patterns work the same way: the force bar touches the average on 6, the gift
+    closes on 7, and the order goes one tick past the higher of the two highs — 115.21 — with the
+    stop 114.38 off the gift's own 0.60. Nothing is placed on the force bar's own bar."""
+    signals = _pattern(AverageEntryPoint.GIFT, [_FORCE_ON_THE_AVERAGE, _GIFT_AFTER])
+    assert signals[6] == [], "the bar of force alone places nothing"
+    [(index, trigger, stop)] = _arms(signals)
+    assert index == 7
+    assert trigger == Decimal("115.21")
+    assert stop == Decimal("114.38")
+
+
+def test_the_two_corrections_are_still_required_before_a_pattern_may_arm() -> None:
+    """⚠️ **The line that keeps this the Ponto Contínuo instead of a slower 9.1.**
+
+    Rule 3 is what `entry_point` replaces; rules 1 and 2 stand. Driven from the warm-up straight
+    into the hammer — no reference, no corrections, so nothing has qualified — the very same bar
+    that arms above arms nothing at all. Without this the setup would enter on any touch of the
+    average that printed a hammer, which is the MME9's rule and not this one's.
+    """
+    unqualified = [*_BULLISH_WARM, *_WARM, _HAMMER_ON_THE_AVERAGE]
+    assert _arms(_drive(unqualified, entry_point=AverageEntryPoint.MARTELO)) == []
+
+
+def test_a_close_below_the_average_erases_the_pattern_and_the_qualification_together() -> None:
+    """His rule 4, and his answer of 2026-09-07 that it is the *only* thing that disarms.
+
+    The hammer arms on 6; bar 7 closes at 110 under the average and the order comes back that bar.
+    And the qualification goes with it: the identical hammer on bar 8 arms nothing, because two
+    fresh corrections are owed first — which is exactly what rule 4 already said about the classic
+    entry, now proven for the pattern.
+    """
+    closes_below = bar(7, open_="113", close="110", high="113.5", low="109.5")
+    again = bar(8, open_="113.6", close="114", high="114.2", low="111.5")
+    signals = _pattern(AverageEntryPoint.MARTELO, [_HAMMER_ON_THE_AVERAGE, closes_below, again])
+
+    assert _cancels(signals) == [7]
+    assert [index for index, _, _ in _arms(signals)] == [6]
+
+
+def test_a_pattern_that_fails_leaves_the_qualification_standing() -> None:
+    """*"Correto"*: on an average a failed pattern spends nothing — there is no region to spend,
+    and only a close below disarms.
+
+    The bar of force touches on 6; bar 7 is neither gift nor ignored bar, so nothing arms. Bar 8
+    touches again with a force bar and the gift on 9 arms at 115.21 — inside the *same*
+    qualification, with no new corrections. On a region this same failure would have retired the
+    zone: two hosts, opposite answers, both his.
+    """
+    neither = bar(7, open_="115.1", close="115.4", high="116.6", low="115")
+    force_again = bar(8, open_="112", close="115", high="115.2", low="111.8")
+    gift_again = bar(9, open_="114.9", close="114.8", high="115.1", low="114.5")
+    signals = _pattern(
+        AverageEntryPoint.GIFT, [_FORCE_ON_THE_AVERAGE, neither, force_again, gift_again]
+    )
+
+    assert signals[7] == []
+    [(index, trigger, _)] = _arms(signals)
+    assert index == 9
+    assert trigger == Decimal("115.21")
+
+
+def test_the_pattern_order_fills_and_the_trade_is_conducted_structurally() -> None:
+    """*"A condução segue o padrão do setup, não do gatilho"* — so the trade a hammer opened is
+    trailed by structure, exactly as rule 3's own entry is. The fill happens through the real
+    loop at 114.21, and the first break of structure in the trade's favour takes the stop to the
+    entry price, which is the `StructuralTrail`'s rule and has nothing to do with the average.
+    """
+    takes_it = bar(7, open_="114", close="115.5", high="116", low="113.9")
+    result = _run(
+        [*_QUALIFIED, _HAMMER_ON_THE_AVERAGE, takes_it],
+        entry_point=AverageEntryPoint.MARTELO,
+        rr=None,
+    )
+    [entry] = _entries(result)
+    assert entry.price == Decimal("114.21")
+    assert entry.order.stop_loss == Decimal("110.96")
+    assert entry.order.reason == "entry.ponto-continuo.martelo"
+
+
+def test_an_open_trade_closes_the_gate_and_the_clock_with_it() -> None:
+    """Rule 5 — one trade at a time — reaches the pattern too. With a position held from bar 6,
+    the hammer arms nothing; and the clock is reset while the gate is shut, so the touch it saw
+    is not remembered into the bar the trade ends on."""
+    held = frozenset({6, 7})
+    signals = _pattern(
+        AverageEntryPoint.MARTELO,
+        [_HAMMER_ON_THE_AVERAGE, bar(7, open_="114", close="114.5", high="115", low="113.5")],
+        position_on=held,
+    )
+    assert _arms(signals) == []
+
+
+def test_the_bar_that_completes_the_second_correction_cannot_itself_arm_a_pattern() -> None:
+    """⚠️ **The qualification is read as it stood *coming into* the bar, and this is what proves
+    it on the pattern's path.**
+
+    The classic trigger has had that proof since it was written; the pattern's copy of the guard
+    did not, and reading `self._qualified` — the value *after* this bar's correction is counted —
+    survives the whole suite. Here bar 5 is remade into the bar that **completes** the second
+    correction and is also a hammer touching the EMA3 at 111.75. The post-bar reading arms on it,
+    at 113.01 with the stop at 103.40: an entry one bar early, at the very low of the pullback,
+    with a stop nine points wider — and the backtest that results looks *better*.
+
+    His rule puts that bar inside the pullback, not at the end of it: the bar that completes the
+    correction is part of the move, and the setup is what comes after. The same ordering the BOS
+    uses, and the reason `qualified` is snapshotted before `_track_correction` runs.
+    """
+    completes_and_hammers = bar(5, open_="110", close="112.5", high="113", low="105")
+    assert is_hammer(completes_and_hammers, side=Side.LONG)
+
+    signals = _drive(
+        [*_BULLISH_WARM, *_GOLDEN[:5], completes_and_hammers],
+        entry_point=AverageEntryPoint.MARTELO,
+    )
+    assert _arms(signals) == []
+
+
+def test_a_bar_closing_exactly_on_the_average_still_feeds_the_pattern_s_clock() -> None:
+    """⚠️ **The tie is neither event, so the clock still sees the bar** — and nothing proved it.
+
+    Rule 4 is written with strict words in both directions: a close *above* triggers the classic
+    entry, a close *below* cancels everything, and a close *on* the mean does neither. For a
+    pattern the bar that matters is the one that **touches**, not the one that closes anywhere in
+    particular, so the tie bar is fed like any other. Requiring a close above instead — the
+    obvious reading, and a mutant that survives the whole suite — would make the clock skip it.
+
+    What that costs is visible here. The hammer arms on bar 6 at 114.21 with its own low of 111.50
+    as the annulment. Bar 7 closes exactly on the average and trades down to 111.50: the hammer's
+    rule annuls the order, and the cancel lands on **7**. Skipping the bar leaves the order resting
+    past the level his own rule retired it at — and bar 8 could fill it.
+
+    The tie is pinned the way the classic entry's own tie test does it: an EMA3 has alpha 1/2, so
+    a close equal to the previous reading reproduces it exactly.
+    """
+    qualified = [*_BULLISH_WARM, *_GOLDEN[:6]]
+    hammer = bar(6, open_="113.6", close="114", high="114.2", low="111.5")
+    # The EMA3 stands at 112.875 after the hammer; closing there again leaves it unmoved.
+    ties = bar(7, open_="114", close="112.875", high="114.1", low="111.5")
+
+    signals = _drive([*qualified, hammer, ties], entry_point=AverageEntryPoint.MARTELO)
+    assert [index for index, _, _ in _arms(signals)] == [6]
+    assert _cancels(signals) == [7], "the tie bar is neither event, and the clock still saw it"
+
+
+def test_a_pattern_half_built_before_a_trade_does_not_survive_it() -> None:
+    """⚠️ **The reset behind the gate, and the only scenario that can see it.**
+
+    Bar 6 is a bar of force touching the average: the clock is now holding it, waiting for the
+    follower. Bar 7 opens a trade, which shuts the gate — rule 5, one at a time. Bar 8 is flat
+    again and is a perfectly good *gift of bar 6*: without the reset the clock hands it the force
+    bar it was still holding and arms at 115.21, off two bars separated by a trade.
+
+    That is the same leak the region setups have met twice (the FFFD's, then the hammer's), and it
+    is why the gate resets rather than merely returning. Bar 8 must arm nothing: the force bar is
+    gone, and bar 8 is judged only as a possible *first* bar, which it is not.
+    """
+    trade = bar(7, open_="115", close="115.5", high="116", low="114.8")
+    gift_of_the_old_force = bar(8, open_="114.9", close="114.8", high="115.1", low="114.5")
+    signals = _pattern(
+        AverageEntryPoint.GIFT,
+        [_FORCE_ON_THE_AVERAGE, trade, gift_of_the_old_force],
+        position_on=frozenset({7}),
+    )
+
+    assert is_gift(_FORCE_ON_THE_AVERAGE, gift_of_the_old_force, side=Side.LONG), (
+        "the fixture only proves anything while bar 8 really is bar 6's gift"
+    )
+    assert _arms(signals) == []
+
+
+def _limits(signals: list[list[Signal]]) -> list[tuple[int, Money | None, Money | None]]:
+    """Every bar that armed a **limit**, as `(bar, limit, protective stop)`.
+
+    `_arms` reads `stop_price`, which is every order this file has ever seen — the whole swing
+    family enters on breakouts. `martelo_forca` is the exception and the reason this exists: a
+    helper that cannot see an order is a helper that reports it as absent.
+    """
+    return [
+        (index, s.limit_price, s.stop_loss)
+        for index, per_bar in enumerate(signals)
+        for s in per_bar
+        if s.kind is SignalKind.ENTRY
+    ]
+
+
+def test_the_force_variation_rests_a_limit_on_the_ponto_continuo() -> None:
+    """⚠️ **The only one of the four that rests a limit here, and it had no scenario.**
+
+    Every other pattern — and every entry this setup has ever placed — is a stop order. The
+    hammer arms on bar 6 and the bar of force on 7 turns it into a limit at **114.88**, thirty
+    percent of the way from the hammer's 114.20 to the force bar's 116.45 (114.875 raw, rounded
+    *up* because a buy never gets a better price than the rule asked for), with the stop still the
+    hammer's **110.96**. Reaching it through the factory alone proved the wiring and not the
+    order, which is the gap the lesson's review of this PR named.
+    """
+    force = bar(7, open_="114.4", close="116.2", high="116.45", low="114.3")
+    signals = _pattern(AverageEntryPoint.MARTELO_FORCA, [_HAMMER_ON_THE_AVERAGE, force])
+
+    assert signals[6] == [], "the hammer alone places nothing in this variation"
+    [(index, limit, stop)] = _limits(signals)
+    assert index == 7
+    assert limit == Decimal("114.88")
+    assert stop == Decimal("110.96")
+    assert _arms(signals) == [(7, None, Decimal("110.96"))], "a limit, not a stop"
+
+
+def test_the_ignored_bar_arms_the_ponto_continuo_with_the_force_bar_s_stop() -> None:
+    """The fourth pattern, driven rather than merely wired: the same bar of force on 6, and a
+    real body on 7 that kept its low. The order goes one tick past the higher high — **115.21** —
+    with the stop off the **force bar**, which is the only stop this pattern has: 111.12, a fifth
+    of its 3.40 below 111.80.
+
+    ⚠️ **And the follower must not close below the average, which is this host's rule and not the
+    pattern's.** The first version of this fixture closed at 112.50 — a perfectly good *barra
+    ignorada* by `is_ignored_bar`, and on a region it would have armed. Here rule 4 fires first:
+    the close is under the EMA3, so the order, the pattern and the qualification are all erased
+    before the follower is ever judged. The two rules are stacked, not merged, and the host's runs
+    first. Closing at 113.50 keeps it above and the same bar arms.
+    """
+    ignored = bar(7, open_="115", close="113.5", high="115.1", low="112")
+    [(index, trigger, stop)] = _arms(
+        _pattern(AverageEntryPoint.BARRA_IGNORADA, [_FORCE_ON_THE_AVERAGE, ignored])
+    )
+    assert index == 7
+    assert trigger == Decimal("115.21")
+    assert stop == Decimal("111.12")
+
+    closes_under = bar(7, open_="115", close="112.5", high="115.1", low="112")
+    assert is_ignored_bar(_FORCE_ON_THE_AVERAGE, closes_under, side=Side.LONG)
+    assert (
+        _arms(_pattern(AverageEntryPoint.BARRA_IGNORADA, [_FORCE_ON_THE_AVERAGE, closes_under]))
+        == []
+    )
+
+
+def test_the_sell_side_of_the_pattern_is_driven_too() -> None:
+    """The mirror, and it is a separate test because every comparison the pattern makes has a
+    sign: the correction count, the touch, the hammer's shadow and the order's side. A short
+    Ponto Contínuo whose pullback qualifies and whose bar prints a hammer downward arms below."""
+    mirrored = [_flip(candle) for candle in [*_QUALIFIED, _HAMMER_ON_THE_AVERAGE]]
+    [(index, trigger, stop)] = _arms(
+        _drive(mirrored, side=Side.SHORT, entry_point=AverageEntryPoint.MARTELO)
+    )
+    assert index == 6
+    assert trigger == Decimal("115.79")  # 230 - 114.21
+    assert stop == Decimal("119.04")  # 230 - 110.96
+
+
+def _flip(candle: Candle) -> Candle:
+    """The bar reflected around 230 — high enough that every price in these streams stays above
+    zero, which `Candle` and the sizing both require."""
+    return Candle(
+        time=candle.time,
+        open=Decimal(230) - candle.open,
+        high=Decimal(230) - candle.low,
+        low=Decimal(230) - candle.high,
+        close=Decimal(230) - candle.close,
+    )
+
+
+def test_the_classic_entry_is_untouched_by_the_new_dials() -> None:
+    """The default is `classic`, and on it the two gift dials do nothing: the golden's own entry
+    is the golden's own entry whatever they say."""
+    plain = _arms(_drive(_GOLDEN_STREAM))
+    dialled = _arms(_drive(_GOLDEN_STREAM, gift_stop=GiftStop.FORCA, volume_filter=True))
+    assert plain == dialled
+    # Spelled out rather than merely compared: two runs of the same wrong thing agree too. These
+    # are the golden's own three arms — bar 6 places the order, and 7 and 8 re-price it upward as
+    # the setup's *"vale sempre a última barra"* moves the reference.
+    assert plain == [
+        (6, Decimal("114"), Decimal("111.00")),
+        (7, Decimal("116"), Decimal("113.00")),
+        (8, Decimal("117"), Decimal("115.00")),
+    ]

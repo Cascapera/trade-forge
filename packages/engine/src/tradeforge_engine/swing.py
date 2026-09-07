@@ -174,6 +174,72 @@ class _AverageTrail:
         return (SnapshotSeries(label=self._label, points=tuple(self._points)),)
 
 
+def _reconcile_pattern(  # noqa: PLR0913 — one host's whole identity, passed field by field
+    watch: PatternWatch,
+    context: Context,
+    *,
+    average: Money,
+    side: Side,
+    name: str,
+    entry_point: AverageEntryPoint,
+    armed: _Armed | None,
+    count: int,
+    series: tuple[SnapshotSeries, ...],
+) -> tuple[list[Signal], _Armed | None, int]:
+    """Fold this bar into the pattern's clock and reconcile the book with what it wants resting.
+
+    Three answers, and the clock gives them by returning an order or `None`: the order already
+    resting (nothing to send), a different one (withdraw, then place), or none at all (withdraw).
+    `PatternOrder` is a frozen dataclass of `Decimal`s, so the comparison is numeric and a level
+    that did not move is never re-sent — the rule the structure machine applies to its own
+    activations, arriving here for the same reason.
+
+    **Shared by the two hosts because the reconciliation is the one thing they agree on.** They
+    disagree about everything before it — when a turn begins, whether two corrections are needed,
+    what ends the setup — and about nothing after. Written twice it would be two copies of the
+    withdraw-compare-place dance to keep in step, and the suite would stay green with one of them
+    wrong; `_breakout_entry` a few lines above exists for the same reason and says so.
+
+    ⚠️ **The fields are passed rather than the host**, which is why the signature is long. A
+    `Protocol` covering `_armed`, `_armed_count`, `_name`, `_side` and the rest would describe a
+    client nobody else could ever implement, and it would put five private attributes into a
+    published shape. Returning the two mutated values instead keeps the ownership where it is: the
+    strategy still holds its own order and its own counter, and this function only says what to do.
+
+    ⚠️ **Only the classic entries re-price by re-reading the bar.** A pattern's levels are fixed
+    when its decisive bar closes, and the clock only offers a new one once the previous order is
+    gone, so `armed.order != wanted` is false while both exist. The branch stays for the day a
+    pattern that chases arrives — the botinha, on an average — which is where it would land.
+    """
+    wanted = watch.observe(context.candle, average, tick=context.instrument.tick_size)
+    candle = context.candle
+    signals: list[Signal] = []
+    if armed is not None and wanted != armed.order:
+        signals.append(_withdraw(armed, candle, side=side, name=name))
+        armed = None
+    if wanted is None or armed is not None:
+        return signals, armed, count
+
+    count += 1
+    client_id = f"{name}-{candle.time:%Y%m%dT%H%M}-{count}"
+    armed = _Armed(reference=candle, client_id=client_id, order=wanted)
+    signals.append(
+        Signal(
+            kind=SignalKind.ENTRY,
+            side=side,
+            reference_price=candle.close,
+            stop_loss=wanted.stop_loss,
+            stop_price=wanted.stop_price,
+            limit_price=wanted.limit_price,
+            reason=f"entry.{name}.{entry_point.value}",
+            client_id=client_id,
+            context={"average": average},
+            series=series,
+        )
+    )
+    return signals, armed, count
+
+
 def _withdraw(armed: _Armed, candle: Candle, *, side: Side, name: str) -> Signal:
     """Take back a named order. Harmless if it never reached the book — a cancel for an order the
     broker does not hold is answered `False`, not raised (a live race, not a bug)."""
@@ -342,7 +408,7 @@ class Mme9BreakoutStrategy:
             return () if conducted is None else (conducted,)
 
         if self._watch is not None:
-            return self._arm_pattern(self._watch, candle, average, context, crossing=crossing)
+            return self._arm_pattern(self._watch, average, context, crossing=crossing)
 
         entry = self._entry_for(candle, context.instrument)
         if entry is None:
@@ -386,15 +452,12 @@ class Mme9BreakoutStrategy:
         return tuple(signals)
 
     def _arm_pattern(
-        self,
-        watch: PatternWatch,
-        candle: Candle,
-        average: Money,
-        context: Context,
-        *,
-        crossing: bool,
+        self, watch: PatternWatch, average: Money, context: Context, *, crossing: bool
     ) -> tuple[Signal, ...]:
-        """Reconcile the book with what the pattern's clock says should be resting.
+        """This bar's turn at the pattern's clock, once the turn itself has been judged.
+
+        The reconciliation is `_reconcile_pattern`, shared with the Ponto Contínuo. What belongs
+        here is the one question this host answers on its own:
 
         ⚠️ **The bar that crosses the average is the turn, not a touch.** Its range spans the
         average by construction — it opened on one side and closed on the other — so read as a
@@ -406,17 +469,6 @@ class Mme9BreakoutStrategy:
         low reaches the average is the first touch. Put to him with the scenario, and confirmed
         the same day: *"pode, a barra da virada não conta"*.
 
-        Three answers, and the clock gives them by returning an order or `None`: the order it
-        already has (nothing to do), a different one (withdraw, then place), or none at all
-        (withdraw). A `PatternOrder` is a frozen dataclass of `Decimal`s, so the comparison is
-        numeric and a level that did not move is never re-sent — the same rule the structure
-        machine applies to its own activations.
-
-        ⚠️ **Only the classic entry re-prices by re-reading the bar.** A pattern's levels are fixed
-        when its decisive bar closes; the only way they change is a new pattern arming, which the
-        clock only does after the previous order is gone. So `_Armed.order` never differs from
-        `wanted` while both exist — and the branch is kept, because the day a pattern that
-        re-prices arrives (the botinha, on an average), this is where it lands.
         """
         if crossing:
             # ⚠️ **The reset here is redundant and stays.** A mutant deleting it survives the
@@ -429,30 +481,16 @@ class Mme9BreakoutStrategy:
             # the same standing `bar_setups` gives its own inseparable pair.
             watch.reset()
             return ()
-        wanted = watch.observe(candle, average, tick=context.instrument.tick_size)
-        signals: list[Signal] = []
-        if self._armed is not None and wanted != self._armed.order:
-            signals.append(self._withdraw(self._armed, candle))
-            self._armed = None
-        if wanted is None or self._armed is not None:
-            return tuple(signals)
-
-        self._armed_count += 1
-        client_id = f"{self._name}-{candle.time:%Y%m%dT%H%M}-{self._armed_count}"
-        self._armed = _Armed(reference=candle, client_id=client_id, order=wanted)
-        signals.append(
-            Signal(
-                kind=SignalKind.ENTRY,
-                side=self._side,
-                reference_price=candle.close,
-                stop_loss=wanted.stop_loss,
-                stop_price=wanted.stop_price,
-                limit_price=wanted.limit_price,
-                reason=f"entry.{self._name}.{self._entry_point.value}",
-                client_id=client_id,
-                context={"average": average},
-                series=self._trail_of_the_average.series(),
-            )
+        signals, self._armed, self._armed_count = _reconcile_pattern(
+            watch,
+            context,
+            average=average,
+            side=self._side,
+            name=self._name,
+            entry_point=self._entry_point,
+            armed=self._armed,
+            count=self._armed_count,
+            series=self._trail_of_the_average.series(),
         )
         return tuple(signals)
 
@@ -604,7 +642,22 @@ class PontoContinuoStrategy:
     on.** That guard exists because a *limit* order fills where price came back to, so the bar's
     favourable excursion can be entirely before the fill. A stop order fills going *through* its
     level in the direction of travel: the favourable extreme of that bar is necessarily after the
-    fill, so reading it credits nothing the trade did not live through.
+    fill, so reading it credits nothing the trade did not live through. ⚠️ `martelo_forca` **does**
+    rest a limit here, and the guard is still not added: it is the structure family's own, written
+    against its own conduction, and inventing it for this setup would be a rule he never gave.
+
+    **`entry_point` replaces rule 3 and leaves the other four standing** (2026-09-07). His four bar
+    patterns may enter this setup too — *"e no ponto contínuo também"* — and when one is chosen it
+    is the pattern, not the touch-and-close-above bar, that places the order. Everything around it
+    is untouched: the two corrections still qualify the pullback, the latch still latches, a close
+    **below** the average still erases the order and the qualification together, and the trade is
+    still conducted structurally (*"a condução segue o padrão do setup, não do gatilho"*).
+
+    ⚠️ **What the pattern sees is every bar that did not close below the average, once qualified.**
+    Rule 3's own trigger demands a close *above*; a pattern does not, because the bar he cares about
+    there is the one that touches, and a bar closing exactly *on* the mean is neither event by rule
+    4. The window is the touching bar or the next; there is no ceiling; and a pattern that fails
+    spends nothing — the next touch starts over inside the same qualification. See `PatternWatch`.
     """
 
     _MIN_CORRECTION: Final = 2
@@ -618,6 +671,9 @@ class PontoContinuoStrategy:
         name: str = "ponto-continuo",
         stop_buffer_ticks: int = 0,
         breakeven_at_r: Decimal | None = Decimal(2),
+        entry_point: AverageEntryPoint = AverageEntryPoint.CLASSIC,
+        gift_stop: GiftStop = GiftStop.GIFT,
+        volume_filter: bool = False,
     ) -> None:
         if period < 1:
             raise ValueError(f"average period must be >= 1, got {period}")
@@ -645,6 +701,20 @@ class PontoContinuoStrategy:
         self._period = period
         self._average_kind = average
         self._trail_of_the_average = _AverageTrail()
+
+        self._entry_point = entry_point
+        # The pattern's clock, or nothing for the classic entry — the same seam the MME9 has, and
+        # the same object: what differs between the two hosts is who feeds it, not what it counts.
+        self._watch: PatternWatch | None = (
+            None
+            if entry_point is AverageEntryPoint.CLASSIC
+            else PatternWatch(
+                entry_point=entry_point,
+                side=side,
+                gift_stop=gift_stop,
+                volume_filter=volume_filter,
+            )
+        )
 
         self._previous: Candle | None = None
         self._corrections = 0
@@ -692,6 +762,19 @@ class PontoContinuoStrategy:
                 signals.append(self._withdraw(self._armed, candle))
                 self._armed = None
             self._corrections, self._qualified = 0, False
+            # And the pattern's clock goes with them. His rule 4 covers both entries: *"só desarma
+            # se fechar abaixo da média"*, and here that erases the qualification too, so a pattern
+            # half-built on the old pullback must not survive into the next one.
+            #
+            # ⚠️ **Redundant, and declared rather than removed.** A mutant deleting these two lines
+            # survives the suite, provably: this branch also clears `_qualified`, so the next bar
+            # meets the gate in `_arm_pattern` and is reset there before the clock can be read. The
+            # difference is one bar of stale state that nothing looks at. It stays because the two
+            # resets answer different questions — *"the pullback is over"* here, *"this bar may not
+            # arm"* there — and the day the gate moves or learns an exception, the rule he actually
+            # stated would leave with it. Same standing as the MME9's `crossing` reset.
+            if self._watch is not None:
+                self._watch.reset()
             return tuple(signals)
 
         # The qualification as it stood *coming into* this bar is what lets this bar trigger; a
@@ -700,6 +783,10 @@ class PontoContinuoStrategy:
         # completes the pullback is part of it, not the reversal out of it.
         qualified = self._qualified
         self._track_correction(candle, previous)
+
+        if self._watch is not None:
+            signals.extend(self._arm_pattern(self._watch, average, context, qualified=qualified))
+            return tuple(signals)
 
         if (
             context.position is not None
@@ -745,6 +832,35 @@ class PontoContinuoStrategy:
             )
         )
         return tuple(signals)
+
+    def _arm_pattern(
+        self, watch: PatternWatch, average: Money, context: Context, *, qualified: bool
+    ) -> list[Signal]:
+        """This bar's turn at the pattern's clock, once the pullback has been judged.
+
+        ⚠️ **The qualification gates the clock, and the clock is reset while it is missing.**
+        Feeding a pullback that has not qualified would let a hammer on any touch of the average
+        arm this setup — which is the MME9's rule, not this one's. Here two corrections come
+        first, and they are what makes it the Ponto Contínuo rather than a slower 9.1. A trade in
+        flight closes the gate for the reason rule 5 already gives: one at a time.
+
+        The reconciliation itself is `_reconcile_pattern`, shared with the MME9.
+        """
+        if context.position is not None or not qualified:
+            watch.reset()
+            return []
+        placed, self._armed, self._armed_count = _reconcile_pattern(
+            watch,
+            context,
+            average=average,
+            side=self._side,
+            name=self._name,
+            entry_point=self._entry_point,
+            armed=self._armed,
+            count=self._armed_count,
+            series=self._trail_of_the_average.series(),
+        )
+        return placed
 
     def _touches(self, candle: Candle, average: Money) -> bool:
         """Did this bar reach the average? Piercing it counts — going through is still touching."""

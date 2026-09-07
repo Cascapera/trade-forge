@@ -532,13 +532,32 @@ class Mme9BreakoutSetup(_Node):
 
 
 class PontoContinuoParams(_Node):
-    """Two corrections back to the average, then the bar that touches it and closes back."""
+    """Two corrections back to the average, then the bar that touches it and closes back.
+
+    `entry_point` replaces that last bar and leaves the rest of the setup standing (2026-09-07).
+    `classic` is the rule as always: the bar that touches the average and closes back above it is
+    the whole setup, entering at its high and protected at its low. The other four are the
+    author's bar patterns — the same values the MME9 carries, and the same meanings — and when one
+    is chosen the touching bar (or the one after it) has to print the pattern, whose own levels
+    then place the order.
+
+    ⚠️ What does **not** change: the two corrections still qualify the pullback first, and without
+    them nothing arms; a bar closing **below** the average still erases the order and the
+    qualification together; and the trade is still conducted structurally, never by the average.
+    `stop_buffer_ticks` says nothing about a pattern's stop, which is twenty percent of its own bar.
+
+    `gift_stop` and `volume_filter` are the gift's dials, read only under `gift` (both) or
+    `barra_ignorada` (the filter alone).
+    """
 
     side: SetupSide
     period: Annotated[int, Field(ge=1, le=1000)] = 20
     average: AverageKind = "EMA"
     stop_buffer_ticks: Annotated[int, Field(ge=0, le=10_000)] = 0
     breakeven_at_r: Annotated[float | None, Field(gt=0, le=100)] = 2.0
+    entry_point: AverageEntryPoint = "classic"
+    gift_stop: GiftStop = "gift"
+    volume_filter: bool = False
 
 
 class PontoContinuoSetup(_Node):

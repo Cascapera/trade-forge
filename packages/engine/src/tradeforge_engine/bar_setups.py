@@ -368,7 +368,9 @@ class HammerForceTrigger:
         ⚠️ It says **cancel**, not "not yet". There is no second candidate anyway — the force bar
         is the bar immediately after the hammer — so what the word decides is whether the region
         may go on offering *another* hammer inside the same window. That belongs to the clock, not
-        here, and it is the open question this trigger hands upstairs.
+        here, and the two clocks answer it differently: on a region `HammerForceActivation` spends
+        the zone (*"a região deixa de valer"*), on an average `PatternWatch` spends nothing and the
+        next touch starts over (*"só desarma se fechar abaixo da média"*). Both are his.
 
         ⚠️ **And `None` again when the limit would not sit below the force bar's close** --
         for a long; above it for a short. A force bar owes only seventy percent of itself to its
@@ -384,8 +386,10 @@ class HammerForceTrigger:
 
         Refusing is the same ending the two refusals above give, and it is the conservative one:
         his rule describes an entry *between* two extremes that price comes back to, and a level
-        the market has already closed below is not that trade. **Whether he wants something else
-        there -- a stop entry, or at market -- is a question for him**, and it is in the backlog.
+        the market has already closed below is not that trade. **Put to him with the three
+        alternatives -- cancel, a stop on the break of the force bar's high, or at market on its
+        close -- and answered on 2026-09-07: "cancela".** So the refusal is his rule now, not our
+        conservative default, and it is not a knob to loosen.
         """
         if not is_hammer(hammer, side=side, shadow_fraction=self.shadow_fraction):
             return None
@@ -477,9 +481,10 @@ def is_ignored_bar(
     ⚠️ **The low is held to `>=`, not `>`.** *"Não pode romper a mínima"* — sitting on it is not
     breaking it, the same reading `_RegionWatch.broke` gives the region's own edge.
 
-    Colour is not a condition here either. The word *ignorada* pictures a seller's bar the market
-    shrugs off, but the rule as given is a body over a third that kept the low, and a bar closing
-    up satisfies it too. Whether he wants the colour held is an open question, in the backlog.
+    Colour is not a condition here either, and that is his answer rather than our reading of a
+    silence: asked directly on 2026-09-07, *"sem cor"*. The word *ignorada* pictures a seller's bar
+    the market shrugs off, but the rule is a body over a third that kept the low, and a bar closing
+    up satisfies it.
     """
     if _body(follower) * body_divisor <= _range(force):
         return False

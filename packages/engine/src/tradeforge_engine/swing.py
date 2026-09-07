@@ -57,6 +57,8 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Final, Literal
 
+from tradeforge_engine.average_setups import AverageEntryPoint, PatternOrder, PatternWatch
+from tradeforge_engine.bar_setups import GiftStop
 from tradeforge_engine.conduction import StructuralTrail, breakeven_candidate, tighten
 from tradeforge_engine.domain import (
     SNAPSHOT_BARS_BEFORE,
@@ -95,6 +97,9 @@ class _Armed:
 
     reference: Candle
     client_id: str
+    order: PatternOrder | None = None
+    """What a pattern entry has resting, so a level that moved can be told from one that did
+    not. `None` for the classic breakout, whose order is re-priced by replacing the reference."""
 
 
 def _breakout_entry(
@@ -207,9 +212,18 @@ class Mme9BreakoutStrategy:
     winner to breakeven is a known way to turn it into a scratch, and "what would this setup earn
     without that" has to be askable for the answer to mean anything. The average's rule has no
     such knob, because it is not a number — it is the event that defines the conduction.
+
+    **`entry_point` chooses how the turn is entered, and his four bar patterns replace the
+    classic breakout rather than joining it** (2026-09-07: *"substitui, a entrada tem que seguir
+    o gatilho escolhido"*). With a pattern, the bar that touches the average — or the one after
+    it — has to print the pattern, the order is the pattern's own (its stop twenty percent of the
+    bar, not the reference's low, so `stop_buffer_ticks` says nothing about it), and it lives two
+    bars. What does **not** change is everything the turn already owned: the close across the
+    average that ends it and withdraws whatever rests, the fill that spends it, and the conduction
+    — *"a condução segue o padrão do setup, não do gatilho"*. See `average_setups.PatternWatch`.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 — keyword-only; each names one knob of the setup
         self,
         *,
         side: Side = Side.LONG,
@@ -217,6 +231,9 @@ class Mme9BreakoutStrategy:
         name: str = "mme9",
         stop_buffer_ticks: int = 0,
         breakeven_at_r: Decimal | None = Decimal(2),
+        entry_point: AverageEntryPoint = AverageEntryPoint.CLASSIC,
+        gift_stop: GiftStop = GiftStop.GIFT,
+        volume_filter: bool = False,
     ) -> None:
         if period < 1:
             raise ValueError(f"MME period must be >= 1, got {period}")
@@ -229,6 +246,20 @@ class Mme9BreakoutStrategy:
         self._name = name
         self._stop_buffer_ticks = Decimal(stop_buffer_ticks)
         self._breakeven_at_r = breakeven_at_r
+        self._entry_point = entry_point
+        # The pattern's clock, or nothing for the classic entry — which needs none, because its
+        # reference is re-read on every bar of the turn. Built here rather than branched on later,
+        # so the two ways of entering are two objects and not a flag inside `on_bar`.
+        self._watch: PatternWatch | None = (
+            None
+            if entry_point is AverageEntryPoint.CLASSIC
+            else PatternWatch(
+                entry_point=entry_point,
+                side=side,
+                gift_stop=gift_stop,
+                volume_filter=volume_filter,
+            )
+        )
         self._ema = EMA(period=period, source="close")
         # Kept for the chart's label. The indicator does not expose its own period, and a label
         # rebuilt from the setup's JSON elsewhere would be a second place holding this number.
@@ -241,6 +272,9 @@ class Mme9BreakoutStrategy:
         # the average and crosses again. Set when a fill is observed, cleared by the first bar
         # that closes on the wrong side of the average — which is exactly a turn ending.
         self._spent = False
+        # Which side the previous bar closed on, so the bar that *crosses* can be told from the
+        # bars that follow it. Only the pattern entry reads it — see `_arm_pattern`.
+        self._was_on_side = False
 
     def overlays(self) -> Mapping[str, Indicator]:
         """The average this setup is defined by — see `protocols.Charted`."""
@@ -263,6 +297,15 @@ class Mme9BreakoutStrategy:
 
         # Which side of the average did this bar close on — the setup's, or against it?
         on_side = candle.close > average if self._side is Side.LONG else candle.close < average
+        # ⚠️ **`_was_on_side` starts `False`, so the first bar the average can judge at all is
+        # read as a crossing.** Deliberate: before it there is no turn to belong to — the average
+        # was warming up, and a bar that finds itself on the setup's side without having crossed
+        # anything is the beginning of the record, not the middle of a move. The pattern entry
+        # therefore skips that one bar (the classic entry does not, because it needs no touch).
+        # Same shape as `aquecimento-e-backtest-descartado`: what the warmup produces is not a
+        # setup, it is the absence of history.
+        crossing = on_side and not self._was_on_side
+        self._was_on_side = on_side
 
         # The open trade's stop, if either rule tightened it on this bar. Computed before the
         # branches below because both of them owe it: a bar that closes back across the average
@@ -282,17 +325,24 @@ class Mme9BreakoutStrategy:
                 signals.append(self._withdraw(self._armed, candle))
                 self._armed = None
             self._spent = False
+            # The pattern's clock ends with the turn: *"depois de fechar abaixo, precisa de virada
+            # nova"*. The next bar on the setup's side is that new turn, and a touch on it counts.
+            if self._watch is not None:
+                self._watch.reset()
             return tuple(signals)
 
-        if context.position is not None:
+        if context.position is not None or self._spent:
             # Nothing arms beside an open trade, and nothing is resting either: `_observe_fill`
             # drops the armed name on any bar that shows a position. What this bar can still owe
             # is a tightening — the 2R touch does not care which side of the average we closed on.
+            # And a spent turn — still on the setup's side, its trade already given — waits for
+            # the cross; with no position there is nothing to conduct, so it returns nothing.
+            if self._watch is not None:
+                self._watch.reset()
             return () if conducted is None else (conducted,)
 
-        if self._spent:
-            # Still on the setup's side, but this turn already gave its trade. Wait for the cross.
-            return ()
+        if self._watch is not None:
+            return self._arm_pattern(self._watch, candle, average, context, crossing=crossing)
 
         entry = self._entry_for(candle, context.instrument)
         if entry is None:
@@ -330,6 +380,77 @@ class Mme9BreakoutStrategy:
                 # And the same average as the curve it actually is. The scalar above is what a
                 # later "does this only fire far from the average?" aggregates; this is what
                 # gets drawn. Neither can be derived from the other.
+                series=self._trail_of_the_average.series(),
+            )
+        )
+        return tuple(signals)
+
+    def _arm_pattern(
+        self,
+        watch: PatternWatch,
+        candle: Candle,
+        average: Money,
+        context: Context,
+        *,
+        crossing: bool,
+    ) -> tuple[Signal, ...]:
+        """Reconcile the book with what the pattern's clock says should be resting.
+
+        ⚠️ **The bar that crosses the average is the turn, not a touch.** Its range spans the
+        average by construction — it opened on one side and closed on the other — so read as a
+        touch it would open the window on every turn, and a bar of force crossing upward followed
+        by any large bar would arm an "ignored bar" the method never pictured. His third answer,
+        *"qualquer encostada vale, inclusive a primeira depois de um cruzamento"*, names the touch
+        that comes **after** the crossing: price on the setup's side coming back to the line. So
+        the crossing bar begins the turn and feeds the clock nothing; the first bar after it whose
+        low reaches the average is the first touch. Put to him with the scenario, and confirmed
+        the same day: *"pode, a barra da virada não conta"*.
+
+        Three answers, and the clock gives them by returning an order or `None`: the order it
+        already has (nothing to do), a different one (withdraw, then place), or none at all
+        (withdraw). A `PatternOrder` is a frozen dataclass of `Decimal`s, so the comparison is
+        numeric and a level that did not move is never re-sent — the same rule the structure
+        machine applies to its own activations.
+
+        ⚠️ **Only the classic entry re-prices by re-reading the bar.** A pattern's levels are fixed
+        when its decisive bar closes; the only way they change is a new pattern arming, which the
+        clock only does after the previous order is gone. So `_Armed.order` never differs from
+        `wanted` while both exist — and the branch is kept, because the day a pattern that
+        re-prices arrives (the botinha, on an average), this is where it lands.
+        """
+        if crossing:
+            # ⚠️ **The reset here is redundant and stays.** A mutant deleting it survives the
+            # whole suite, and provably so: to be `crossing` this bar's predecessor closed off
+            # side, which already ran `reset` through the branch above — or there was no
+            # predecessor at all and the watch has never been fed. Kept because it makes this
+            # branch true on its own terms ("a crossing bar starts an empty turn") instead of
+            # true because of what another branch happens to do, which is the property that
+            # breaks silently the day the other branch moves. Declared rather than papered over,
+            # the same standing `bar_setups` gives its own inseparable pair.
+            watch.reset()
+            return ()
+        wanted = watch.observe(candle, average, tick=context.instrument.tick_size)
+        signals: list[Signal] = []
+        if self._armed is not None and wanted != self._armed.order:
+            signals.append(self._withdraw(self._armed, candle))
+            self._armed = None
+        if wanted is None or self._armed is not None:
+            return tuple(signals)
+
+        self._armed_count += 1
+        client_id = f"{self._name}-{candle.time:%Y%m%dT%H%M}-{self._armed_count}"
+        self._armed = _Armed(reference=candle, client_id=client_id, order=wanted)
+        signals.append(
+            Signal(
+                kind=SignalKind.ENTRY,
+                side=self._side,
+                reference_price=candle.close,
+                stop_loss=wanted.stop_loss,
+                stop_price=wanted.stop_price,
+                limit_price=wanted.limit_price,
+                reason=f"entry.{self._name}.{self._entry_point.value}",
+                client_id=client_id,
+                context={"average": average},
                 series=self._trail_of_the_average.series(),
             )
         )

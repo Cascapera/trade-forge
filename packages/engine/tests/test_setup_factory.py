@@ -15,6 +15,7 @@ from decimal import Decimal
 
 import pytest
 
+from tradeforge_engine.average_setups import AverageEntryPoint, PatternWatch
 from tradeforge_engine.bar_setups import GiftStop, GiftTrigger, IgnoredBarTrigger
 from tradeforge_engine.domain import Side
 from tradeforge_engine.errors import EngineError
@@ -262,6 +263,29 @@ def test_an_unknown_gift_stop_is_refused_rather_than_defaulted() -> None:
     moved it onto the bar — and defaulting it would run the document at the gift's own low."""
     with pytest.raises(EngineError, match="setup gift_stop must be one of 'gift', 'forca'"):
         _built("structure_choch", entry_point="gift", gift_stop="region")
+
+
+def test_the_mme9_s_entry_point_and_the_gift_dials_reach_the_watch() -> None:
+    """The three parameters the average host gained, carried to the object that reads them, on
+    their non-default values. The classic entry keeps no watch at all, which is the other half."""
+    setup = _built(
+        "mme9_breakout", side="long", entry_point="gift", gift_stop="forca", volume_filter=True
+    )
+    assert isinstance(setup, Mme9BreakoutStrategy)
+    watch = setup._watch
+    assert isinstance(watch, PatternWatch)
+    assert watch.entry_point is AverageEntryPoint.GIFT
+    assert watch.gift_stop is GiftStop.FORCA
+    assert watch.volume_filter is True
+
+    classic = _built("mme9_breakout", side="long")
+    assert classic._watch is None  # type: ignore[attr-defined]
+
+
+def test_an_unknown_mme9_entry_point_is_refused_rather_than_defaulted() -> None:
+    """`"edge"` is a real entry point one setup over, and the likeliest wrong value here."""
+    with pytest.raises(EngineError, match="setup entry_point must be one of 'classic', 'martelo'"):
+        _built("mme9_breakout", side="long", entry_point="edge")
 
 
 def test_the_volume_filter_must_be_a_boolean() -> None:

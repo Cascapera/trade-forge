@@ -87,6 +87,7 @@ type ZoneEntryPoint = Literal[
     "barra_ignorada",
 ]
 type GiftStop = Literal["gift", "forca"]
+type AverageEntryPoint = Literal["classic", "martelo", "martelo_forca", "gift", "barra_ignorada"]
 type AverageKind = Literal["EMA", "SMA"]
 
 # The same list, as a runtime value. The database needs it for a CHECK constraint
@@ -496,12 +497,33 @@ class Exit(_Node):
 
 
 class Mme9BreakoutParams(_Node):
-    """The break of the candle that closed across the MME9 (ADR-0016)."""
+    """The break of the candle that closed across the MME9 (ADR-0016).
+
+    `entry_point` chooses how the turn is entered. `classic` is the breakout as it has always
+    been: the bar that closed across the average is the reference, the order rests at its high and
+    the stop at its low (plus `stop_buffer_ticks`). The other four are the author's bar patterns
+    (2026-09-07) and they **replace** that entry: the bar that touches the average, or the one
+    after it, has to print a *martelo* (stop past its high), a *martelo* followed by a *barra de
+    força* (limit thirty percent between their highs), a *barra de força* followed by a *gift*, or
+    one followed by a *barra ignorada* (stop past the higher of the two highs). The stop is then
+    the pattern's own — twenty percent of the bar — and `stop_buffer_ticks` says nothing about it.
+
+    ⚠️ No ceiling, and nothing is spent: the only thing that ends a pattern before its order fills
+    is a bar closing across the average, which ends the turn as it always did. A pattern that fails
+    simply waits for the next touch. The order lives two bars. Conduction is the 9.1's own — the
+    average tightening the stop, `breakeven_at_r` — whichever entry was chosen.
+
+    `gift_stop` and `volume_filter` are the gift's dials, the same as on the structure setups, and
+    are read only when `entry_point` is `gift` (both) or `barra_ignorada` (the filter alone).
+    """
 
     side: SetupSide
     period: Annotated[int, Field(ge=1, le=1000)] = 9
     stop_buffer_ticks: Annotated[int, Field(ge=0, le=10_000)] = 0
     breakeven_at_r: Annotated[float | None, Field(gt=0, le=100)] = 2.0
+    entry_point: AverageEntryPoint = "classic"
+    gift_stop: GiftStop = "gift"
+    volume_filter: bool = False
 
 
 class Mme9BreakoutSetup(_Node):

@@ -97,6 +97,16 @@
       "title": "AnyOf",
       "type": "object"
     },
+    "AverageEntryPoint": {
+      "enum": [
+        "classic",
+        "martelo",
+        "martelo_forca",
+        "gift",
+        "barra_ignorada"
+      ],
+      "type": "string"
+    },
     "AverageKind": {
       "enum": [
         "EMA",
@@ -571,7 +581,7 @@
     },
     "Mme9BreakoutParams": {
       "additionalProperties": false,
-      "description": "The break of the candle that closed across the MME9 (ADR-0016).",
+      "description": "The break of the candle that closed across the MME9 (ADR-0016).\n\n`entry_point` chooses how the turn is entered. `classic` is the breakout as it has always\nbeen: the bar that closed across the average is the reference, the order rests at its high and\nthe stop at its low (plus `stop_buffer_ticks`). The other four are the author's bar patterns\n(2026-09-07) and they **replace** that entry: the bar that touches the average, or the one\nafter it, has to print a *martelo* (stop past its high), a *martelo* followed by a *barra de\nforça* (limit thirty percent between their highs), a *barra de força* followed by a *gift*, or\none followed by a *barra ignorada* (stop past the higher of the two highs). The stop is then\nthe pattern's own — twenty percent of the bar — and `stop_buffer_ticks` says nothing about it.\n\n⚠️ No ceiling, and nothing is spent: the only thing that ends a pattern before its order fills\nis a bar closing across the average, which ends the turn as it always did. A pattern that fails\nsimply waits for the next touch. The order lives two bars. Conduction is the 9.1's own — the\naverage tightening the stop, `breakeven_at_r` — whichever entry was chosen.\n\n`gift_stop` and `volume_filter` are the gift's dials, the same as on the structure setups, and\nare read only when `entry_point` is `gift` (both) or `barra_ignorada` (the filter alone).",
       "properties": {
         "breakeven_at_r": {
           "anyOf": [
@@ -586,6 +596,14 @@
           ],
           "default": 2.0,
           "title": "Breakeven At R"
+        },
+        "entry_point": {
+          "$ref": "#/$defs/AverageEntryPoint",
+          "default": "classic"
+        },
+        "gift_stop": {
+          "$ref": "#/$defs/GiftStop",
+          "default": "gift"
         },
         "period": {
           "default": 9,
@@ -603,6 +621,11 @@
           "minimum": 0,
           "title": "Stop Buffer Ticks",
           "type": "integer"
+        },
+        "volume_filter": {
+          "default": false,
+          "title": "Volume Filter",
+          "type": "boolean"
         }
       },
       "required": [

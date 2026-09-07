@@ -1540,10 +1540,13 @@ número de zonas numa corrida foi **253** (EURUSD, continuação, `midpoint`) �
 longo de um ano, não simultâneas. Prendê-lo honestamente continua exigindo um `_MAX_ZONES`
 injetável, não um cenário de 200 zonas.
 
-## A barra de força que fecha abaixo do preço de entrada — pergunta para ele
+## ~~A barra de força que fecha abaixo do preço de entrada~~ — RESPONDIDO em 07/09/2026: **cancela**
 
-Aberto no PR-195 (06/09/2026), achado pelo `engine-guardian` como **bloqueante**, e a parte de
-engenharia já está fechada. O que sobra é regra de método.
+Aberto no PR-195 (06/09/2026), achado pelo `engine-guardian` como **bloqueante**. Posto a ele com
+as três alternativas — cancelar, virar stop no rompimento da máxima da força, ou entrar a mercado
+no fechamento dela — e a resposta foi ***"cancela"***: o comportamento que já estava no código
+deixa de ser default conservador nosso e passa a ser regra dele. `HammerForceTrigger.levels_for`
+credita a resposta. O texto abaixo fica como registro do que estava em dúvida.
 
 O `martelo_forca` entra a 30% do caminho entre a máxima do martelo e a da barra de força. Nada na
 regra dele exige que esse nível fique **abaixo do fechamento** da barra de força — e uma barra de
@@ -1767,3 +1770,42 @@ builder mostrar e gravar `gift_stop` e `volume_filter` só quando `entry_point` 
 `barra_ignorada`** — parâmetros condicionais a outro parâmetro, coisa que o `SchemaParam` de hoje
 não expressa. Enquanto isso, os dois aparecem no formulário de todo setup de estrutura, e o
 usuário pode ligar um filtro que não faz nada.
+
+## ~~Leituras minhas nos padrões de barra sobre a MME9 (PR-202)~~ — TODAS CONFIRMADAS em 07/09/2026
+
+Aberto em 07/09/2026, no PR que leva martelo, martelo+força, gift e barra ignorada para o 9.1. As
+sete respostas dele fecharam o relógio (substitui a entrada; janela = a barra que encosta ou a
+seguinte; qualquer encostada vale; sem teto, só fechar abaixo desarma; duas barras; virada nova;
+condução do setup). Três lugares ficaram com mais de uma leitura e eu escolhi uma:
+
+**1. ~~A barra da virada não é uma encostada.~~ CONFIRMADO por ele em 07/09/2026: *"pode, a barra da
+virada não conta"*.** A barra que cruza a média de baixo para cima sempre
+"encosta" nela — o range dela atravessa a linha por construção. Lida como toque, ela abriria a
+janela em toda virada, e a sonda mostrou o efeito: a barra da virada com 88% de corpo virou "barra
+de força" e a barra grande seguinte virou "barra ignorada", com stop seis pontos abaixo. Li o
+*"inclusive a primeira depois de um cruzamento"* como a encostada que vem **depois** da barra do
+cruzamento: o preço já do lado do setup voltando à linha. Está em `Mme9BreakoutStrategy._arm_pattern`
+(`crossing`) e no teste `test_a_close_back_across_the_average_withdraws_the_pattern_order`. Se ele
+quiser que a própria barra do cruzamento conte, é apagar duas linhas.
+
+**2. ~~Um padrão que falha não gasta nada.~~ CONFIRMADO (*"correto"*).** Na região, a barra seguinte que não é gift/ignorada, ou a
+força que não supera o martelo, gasta a região. Na média não existe região para gastar, e a resposta
+4 diz *"só desarma se fechar abaixo"*. Então o relógio limpa o padrão e lê a mesma barra como
+possível primeira barra de um padrão novo; a próxima encostada recomeça. `PatternWatch` documenta.
+
+**3. ~~Depois do fill, a virada fica gasta até a próxima virada~~ CONFIRMADO (*"correto"*)** — a regra do 9.1 de hoje ("one trade
+per turn"), herdada pelo padrão sem pergunta. Um trade que sai no alvo com o preço ainda acima da
+média não rearma até uma barra fechar abaixo e outra fechar acima. Teste
+`test_a_filled_pattern_spends_the_turn_like_the_classic_does`.
+
+**4. ~~A barra que anula ou expira a ordem não é relida como primeira barra~~ CONFIRMADO
+(*"n+2 arma"*)** — achado do guardian, não bloqueante, agora documentado em `PatternWatch.observe`. `PatternWatch.observe` devolve cedo na barra em que a ordem morre; já a segunda
+barra que falha **é** relida como possível primeira barra. Consequência: martelo arma em N; N+1 toca
+a mínima do martelo (anula) e é ela própria um martelo encostado — não arma; um martelo em N+2 arma
+(janela da encostada de N+1). "A próxima encostada recomeça" admite as duas leituras. Se ele quiser
+que a barra da anulação já conte, é tirar um `return`.
+
+E o efeito colateral já conhecido: `volume_filter: false` passa a aparecer em todo documento de
+`mme9_breakout` re-salvo pelo web (regra do booleano), e o eixo de estudo do 9.1 agora oferece
+`entry_point`, `gift_stop` e `volume_filter` — o teste `axes.test.ts` existe para acusar isso e
+acusou.

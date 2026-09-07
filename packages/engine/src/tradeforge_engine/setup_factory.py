@@ -20,8 +20,10 @@ and the one that silently disagrees.
 
 from collections.abc import Mapping
 from decimal import Decimal
+from enum import StrEnum
 from typing import Any
 
+from tradeforge_engine.average_setups import AverageEntryPoint
 from tradeforge_engine.bar_setups import GiftStop
 from tradeforge_engine.domain import Side
 from tradeforge_engine.errors import EngineError
@@ -111,11 +113,32 @@ def _optional_int(params: Mapping[str, object], key: str, into: dict[str, Any]) 
     _int(params, key, into)
 
 
+def _choice(
+    params: Mapping[str, object], key: str, choices: type[StrEnum], into: dict[str, Any]
+) -> None:
+    """Copy an enumerated parameter across as its enum, or refuse it with the alternatives.
+
+    Raised rather than defaulted, the same doctrine as the average kind: a document naming a value
+    this engine does not have is asking for a method it will not get, and falling back to the
+    default would run it silently as something else.
+    """
+    if key not in params:
+        return
+    raw = params[key]
+    if not isinstance(raw, str) or raw not in {choice.value for choice in choices}:
+        allowed = ", ".join(repr(choice.value) for choice in choices)
+        raise EngineError(f"setup {key} must be one of {allowed}, got {raw!r}")
+    into[key] = choices(raw)
+
+
 def _mme9(params: Mapping[str, object]) -> Strategy:
     kwargs: dict[str, Any] = {"side": _side(params)}
     _int(params, "period", kwargs)
     _int(params, "stop_buffer_ticks", kwargs)
     _optional_decimal(params, "breakeven_at_r", kwargs)
+    _choice(params, "entry_point", AverageEntryPoint, kwargs)
+    _choice(params, "gift_stop", GiftStop, kwargs)
+    _flag(params, "volume_filter", kwargs)
     return Mme9BreakoutStrategy(**kwargs)
 
 
@@ -137,24 +160,11 @@ def _structure_kwargs(params: Mapping[str, object]) -> dict[str, Any]:
     _flag(params, "allow_secondary", kwargs)
     _decimal(params, "stop_buffer", kwargs)
     _optional_decimal(params, "breakeven_at_r", kwargs)
-    if "entry_point" in params:
-        # Raised rather than defaulted, like the average above. A document naming an entry point
-        # this engine does not have is asking for a method it will not get, and falling back to
-        # the edge would run it silently at the widest stop of the two.
-        raw = params["entry_point"]
-        if not isinstance(raw, str) or raw not in {point.value for point in ZoneEntryPoint}:
-            allowed = ", ".join(repr(point.value) for point in ZoneEntryPoint)
-            raise EngineError(f"setup entry_point must be one of {allowed}, got {raw!r}")
-        kwargs["entry_point"] = ZoneEntryPoint(raw)
-    if "gift_stop" in params:
-        # The same gate as `entry_point`, for the same reason: the allowed set is the enum's, so a
-        # value the engine does not have is refused with the alternatives rather than run as the
-        # default and reported as the stop the document asked for.
-        raw = params["gift_stop"]
-        if not isinstance(raw, str) or raw not in {choice.value for choice in GiftStop}:
-            allowed = ", ".join(repr(choice.value) for choice in GiftStop)
-            raise EngineError(f"setup gift_stop must be one of {allowed}, got {raw!r}")
-        kwargs["gift_stop"] = GiftStop(raw)
+    # Raised rather than defaulted, like the average above. A document naming an entry point this
+    # engine does not have is asking for a method it will not get, and falling back to the edge
+    # would run it silently at the widest stop of the two.
+    _choice(params, "entry_point", ZoneEntryPoint, kwargs)
+    _choice(params, "gift_stop", GiftStop, kwargs)
     _flag(params, "volume_filter", kwargs)
     return kwargs
 

@@ -1,7 +1,7 @@
 """Architecture invariants, enforced as tests.
 
 A rule that lives only in a document is a rule that gets broken on a Friday. The
-two invariants below are the load-bearing ones from AGENTS.md §5 — the ones whose
+invariants below are the load-bearing ones from AGENTS.md §5 — the ones whose
 violation would quietly dissolve the design — so they are asserted on every run.
 """
 
@@ -22,6 +22,15 @@ APP_IMPORT = re.compile(
 
 # The engine is pure. Persistence is somebody else's problem (ADR-0009).
 DB_IMPORT = re.compile(r"^\s*(?:import|from)\s+tradeforge_db\b", re.MULTILINE)
+
+# The swing family and the structure machine are separate setups, by the author's own
+# words. The modules that may not know each other, and the one module that legitimately
+# knows both because it is the seam the DSL names.
+SWING_MODULES = (
+    "packages/engine/src/tradeforge_engine/swing.py",
+    "packages/engine/src/tradeforge_engine/average_setups.py",
+)
+STRUCTURE_IMPORT = re.compile(r"^\s*(?:import|from)\s+tradeforge_engine\.setups\b", re.MULTILINE)
 
 
 def _source_files(*roots: str) -> list[Path]:
@@ -100,4 +109,29 @@ def test_the_engine_never_reaches_for_the_database(source: Path) -> None:
     assert not DB_IMPORT.search(source.read_text(encoding="utf-8")), (
         f"{relative} imports tradeforge_db. The engine takes its inputs as arguments; "
         f"a core that queries a database is a core that cannot be replayed (ADR-0009)."
+    )
+
+
+@pytest.mark.parametrize("relative", SWING_MODULES)
+def test_the_swing_family_never_imports_the_structure_machine(relative: str) -> None:
+    """The MME9 and the Ponto Contínuo do not know what a zone is.
+
+    The author's own words, asked whether the Ponto Contínuo's two corrections were the
+    structure setup's: *"MME9 e BOS não têm nada a ver — são setups distintos"*. The
+    geometries coincide in places; the coupling must not exist.
+
+    The rule earns a test because the temptation is concrete and recent. When the bar
+    patterns moved onto the average (2026-09-07), the obvious shortcut was to reuse
+    `setups.ZoneEntry` for "a limit or a stop, never both" — one import away, and it would
+    have dragged the region's vocabulary into a module about a moving average. `PatternOrder`
+    exists instead. A docstring saying so is a docstring; this is the guard.
+
+    `setup_factory` is deliberately not covered: naming both families is its whole job.
+    """
+    source = REPO_ROOT / relative
+    match = STRUCTURE_IMPORT.search(source.read_text(encoding="utf-8"))
+    assert match is None, (
+        f"{relative} imports tradeforge_engine.setups. The swing setups and the structure "
+        f"machine are separate setups ('não têm nada a ver'); share the bar arithmetic in "
+        f"bar_setups.py instead of the region's own vocabulary."
     )

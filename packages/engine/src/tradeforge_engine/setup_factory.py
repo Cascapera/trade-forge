@@ -147,6 +147,9 @@ def _ponto_continuo(params: Mapping[str, object]) -> Strategy:
     _int(params, "period", kwargs)
     _int(params, "stop_buffer_ticks", kwargs)
     _optional_decimal(params, "breakeven_at_r", kwargs)
+    _choice(params, "entry_point", AverageEntryPoint, kwargs)
+    _choice(params, "gift_stop", GiftStop, kwargs)
+    _flag(params, "volume_filter", kwargs)
     if "average" in params:
         average = params["average"]
         if average not in ("EMA", "SMA"):

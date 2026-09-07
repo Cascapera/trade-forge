@@ -282,6 +282,43 @@ def test_the_mme9_s_entry_point_and_the_gift_dials_reach_the_watch() -> None:
     assert classic._watch is None  # type: ignore[attr-defined]
 
 
+def test_the_ponto_continuo_takes_the_same_three_dials() -> None:
+    """The second host of the same clock, and the assertion is that the *watch* was built — not
+    merely that the constructor accepted the words."""
+    setup = _built(
+        "ponto_continuo",
+        side="long",
+        entry_point="gift",
+        gift_stop="forca",
+        volume_filter=True,
+    )
+    assert isinstance(setup, PontoContinuoStrategy)
+    watch = setup._watch
+    assert isinstance(watch, PatternWatch)
+    assert watch.entry_point is AverageEntryPoint.GIFT
+    # ⚠️ **The line the first version of this test dropped**, and the root sweep cannot cover it:
+    # `test_setup_defaults` swaps the strategy for a recorder, so it proves the keyword reached
+    # `__init__` and never that `__init__` passed it on. A constructor pinning `GiftStop.GIFT` here
+    # survives both suites, and the document that asked for the force bar's stop is run with the
+    # gift's — tighter, so the position is larger and the backtest answers a question nobody put.
+    assert watch.gift_stop is GiftStop.FORCA
+    assert watch.volume_filter is True
+
+    ignored = _built("ponto_continuo", side="long", entry_point="barra_ignorada")
+    assert isinstance(ignored, PontoContinuoStrategy)
+    assert ignored._watch is not None
+    assert ignored._watch.entry_point is AverageEntryPoint.BARRA_IGNORADA
+
+    classic = _built("ponto_continuo", side="long")
+    assert classic._watch is None  # type: ignore[attr-defined]
+
+
+def test_an_unknown_ponto_continuo_entry_point_is_refused_rather_than_defaulted() -> None:
+    """`"midpoint"` is a real entry point on the structure setups and means nothing here."""
+    with pytest.raises(EngineError, match="setup entry_point must be one of 'classic', 'martelo'"):
+        _built("ponto_continuo", side="long", entry_point="midpoint")
+
+
 def test_an_unknown_mme9_entry_point_is_refused_rather_than_defaulted() -> None:
     """`"edge"` is a real entry point one setup over, and the likeliest wrong value here."""
     with pytest.raises(EngineError, match="setup entry_point must be one of 'classic', 'martelo'"):

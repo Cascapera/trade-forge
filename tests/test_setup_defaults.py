@@ -114,6 +114,10 @@ _PROBES: dict[str, dict[str, tuple[Any, Any]]] = {
         "average": ("SMA", "SMA"),
         "stop_buffer_ticks": (4, 4),
         "breakeven_at_r": (1.1, Decimal("1.1")),
+        # The bar patterns, hosted here too (2026-09-07), each off its default.
+        "entry_point": ("martelo", AverageEntryPoint.MARTELO),
+        "gift_stop": ("forca", GiftStop.FORCA),
+        "volume_filter": (True, True),
     },
     "structure_choch": {
         "allow_secondary": (True, True),

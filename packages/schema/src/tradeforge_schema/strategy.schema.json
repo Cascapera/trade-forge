@@ -753,7 +753,7 @@
     },
     "PontoContinuoParams": {
       "additionalProperties": false,
-      "description": "Two corrections back to the average, then the bar that touches it and closes back.",
+      "description": "Two corrections back to the average, then the bar that touches it and closes back.\n\n`entry_point` replaces that last bar and leaves the rest of the setup standing (2026-09-07).\n`classic` is the rule as always: the bar that touches the average and closes back above it is\nthe whole setup, entering at its high and protected at its low. The other four are the\nauthor's bar patterns — the same values the MME9 carries, and the same meanings — and when one\nis chosen the touching bar (or the one after it) has to print the pattern, whose own levels\nthen place the order.\n\n⚠️ What does **not** change: the two corrections still qualify the pullback first, and without\nthem nothing arms; a bar closing **below** the average still erases the order and the\nqualification together; and the trade is still conducted structurally, never by the average.\n`stop_buffer_ticks` says nothing about a pattern's stop, which is twenty percent of its own bar.\n\n`gift_stop` and `volume_filter` are the gift's dials, read only under `gift` (both) or\n`barra_ignorada` (the filter alone).",
       "properties": {
         "average": {
           "$ref": "#/$defs/AverageKind",
@@ -773,6 +773,14 @@
           "default": 2.0,
           "title": "Breakeven At R"
         },
+        "entry_point": {
+          "$ref": "#/$defs/AverageEntryPoint",
+          "default": "classic"
+        },
+        "gift_stop": {
+          "$ref": "#/$defs/GiftStop",
+          "default": "gift"
+        },
         "period": {
           "default": 20,
           "maximum": 1000,
@@ -789,6 +797,11 @@
           "minimum": 0,
           "title": "Stop Buffer Ticks",
           "type": "integer"
+        },
+        "volume_filter": {
+          "default": false,
+          "title": "Volume Filter",
+          "type": "boolean"
         }
       },
       "required": [

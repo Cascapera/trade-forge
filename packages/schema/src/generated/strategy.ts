@@ -256,17 +256,18 @@ export type Type11 = "mme9_breakout";
 export type BreakevenAtR1 = number | null;
 export type Period4 = number;
 export type StopBufferTicks1 = number;
+export type VolumeFilter1 = boolean;
 export type Type12 = "ponto_continuo";
 export type AllowSecondary = boolean;
 export type BreakevenAtR2 = number | null;
 export type StopBuffer = number;
-export type VolumeFilter1 = boolean;
+export type VolumeFilter2 = boolean;
 export type Type13 = "structure_choch";
 export type AllowSecondary1 = boolean;
 export type BreakevenAtR3 = number | null;
 export type MaxBos = number | null;
 export type StopBuffer1 = number;
-export type VolumeFilter2 = boolean;
+export type VolumeFilter3 = boolean;
 export type Type14 = "structure_continuation";
 export type Timeframe = "M1" | "M5" | "M15" | "M30" | "H1" | "H4" | "D1" | "W1";
 
@@ -573,13 +574,31 @@ export interface PontoContinuoSetup {
 }
 /**
  * Two corrections back to the average, then the bar that touches it and closes back.
+ *
+ * `entry_point` replaces that last bar and leaves the rest of the setup standing (2026-09-07).
+ * `classic` is the rule as always: the bar that touches the average and closes back above it is
+ * the whole setup, entering at its high and protected at its low. The other four are the
+ * author's bar patterns — the same values the MME9 carries, and the same meanings — and when one
+ * is chosen the touching bar (or the one after it) has to print the pattern, whose own levels
+ * then place the order.
+ *
+ * ⚠️ What does **not** change: the two corrections still qualify the pullback first, and without
+ * them nothing arms; a bar closing **below** the average still erases the order and the
+ * qualification together; and the trade is still conducted structurally, never by the average.
+ * `stop_buffer_ticks` says nothing about a pattern's stop, which is twenty percent of its own bar.
+ *
+ * `gift_stop` and `volume_filter` are the gift's dials, read only under `gift` (both) or
+ * `barra_ignorada` (the filter alone).
  */
 export interface PontoContinuoParams {
   average?: "EMA" | "SMA";
   breakeven_at_r?: BreakevenAtR1;
+  entry_point?: "classic" | "martelo" | "martelo_forca" | "gift" | "barra_ignorada";
+  gift_stop?: "gift" | "forca";
   period?: Period4;
   side: SetupSide;
   stop_buffer_ticks?: StopBufferTicks1;
+  volume_filter?: VolumeFilter1;
 }
 /**
  * Trade the zone the change of character left behind.
@@ -707,7 +726,7 @@ export interface StructureParams {
     "edge" | "midpoint" | "return_pass" | "botinha" | "fffd" | "martelo" | "martelo_forca" | "gift" | "barra_ignorada";
   gift_stop?: "gift" | "forca";
   stop_buffer?: StopBuffer;
-  volume_filter?: VolumeFilter1;
+  volume_filter?: VolumeFilter2;
 }
 /**
  * Trade the zone a break in the trend's favour leaves behind, after a change of character.
@@ -730,5 +749,5 @@ export interface ContinuationParams {
   gift_stop?: "gift" | "forca";
   max_bos?: MaxBos;
   stop_buffer?: StopBuffer1;
-  volume_filter?: VolumeFilter2;
+  volume_filter?: VolumeFilter3;
 }

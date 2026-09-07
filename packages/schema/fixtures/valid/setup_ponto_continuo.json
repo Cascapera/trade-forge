@@ -10,7 +10,8 @@
       "period": 20,
       "average": "EMA",
       "stop_buffer_ticks": 0,
-      "breakeven_at_r": 2
+      "breakeven_at_r": 2,
+      "volume_filter": false
     }
   },
   "exit": {

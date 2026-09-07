@@ -483,6 +483,11 @@ describe('buildSetupStrategy', () => {
   it('produces a valid Ponto Contínuo document from the template', () => {
     const document = buildSetupStrategy(pontoContinuoForm())
     expect(validateStrategy(document).valid).toBe(true)
+    // ⚠️ Pinned by value. `entry_point`, `gift_stop` and `volume_filter` joined on 2026-09-07,
+    // when the bar patterns reached this setup: the template offers every parameter the schema
+    // declares, so a document built from it carries all three at their defaults. If this list
+    // grows again, the builder has started writing something new and somebody has to decide
+    // whether it should — which is the whole point of spelling it out.
     expect(document.setup).toEqual({
       type: 'ponto_continuo',
       params: {
@@ -491,6 +496,9 @@ describe('buildSetupStrategy', () => {
         average: 'EMA',
         stop_buffer_ticks: 0,
         breakeven_at_r: 2,
+        entry_point: 'classic',
+        gift_stop: 'gift',
+        volume_filter: false,
       },
     })
   })

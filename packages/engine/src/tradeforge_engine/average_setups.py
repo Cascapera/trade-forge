@@ -130,10 +130,18 @@ _Levels = HammerBreakLevels | HammerForceLevels | ForceFollowLevels
 class PatternWatch:
     """The clock a moving average keeps for one of his four bar patterns.
 
-    Fed one bar at a time by `observe`, **only bars that closed on the setup's side** — the host
-    decides that — and answering with the order that should be resting after this bar, or `None`
-    when nothing should. The host compares the answer with what it has on the book: a new order
-    replaces a different one, the same order is left alone, `None` withdraws.
+    Fed one bar at a time by `observe`, **only the bars the host judged eligible**, and answering
+    with the order that should be resting after this bar, or `None` when nothing should. The host
+    compares the answer with what it has on the book: a new order replaces a different one, the
+    same order is left alone, `None` withdraws.
+
+    ⚠️ **"Eligible" is the host's word and it is not the same word twice.** The MME9 feeds bars
+    that closed on the setup's side, because there the side of the average *is* the signal. The
+    Ponto Contínuo feeds every bar that did not close **against** it — including a bar closing
+    exactly *on* the mean, which by its rule 4 is neither trigger nor cancel. This docstring said
+    "closed on the setup's side" until the lesson's review of PR-203 measured the second host
+    against it: a sentence that describes one caller is a sentence the other caller silently
+    contradicts.
 
     The machine has three stages and the pattern decides how many it visits:
 

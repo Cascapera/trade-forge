@@ -15,6 +15,7 @@ from decimal import Decimal
 
 import pytest
 
+from tradeforge_engine.bar_setups import GiftStop, GiftTrigger, IgnoredBarTrigger
 from tradeforge_engine.domain import Side
 from tradeforge_engine.errors import EngineError
 from tradeforge_engine.setup_factory import build_setup
@@ -225,3 +226,44 @@ def test_the_return_pass_entry_point_reaches_the_engine() -> None:
         setup = _built(kind, entry_point="return_pass")
         assert isinstance(setup, StructureStrategy)
         assert setup._entry_point is ZoneEntryPoint.RETURN_PASS
+
+
+def test_the_gift_s_stop_and_the_volume_filter_reach_the_trigger() -> None:
+    """The two parameters the gift added, carried from a raw document to the object that reads
+    them — and read off the trigger the activation was built with, because `StructureStrategy`
+    keeps neither as a field of its own.
+
+    ⚠️ Both on their non-default value. `gift_stop="gift"` and `volume_filter=False` are what
+    the class does when nothing arrives, so asserting them would hold for a factory that dropped
+    both keys on the floor.
+    """
+    for kind in ("structure_choch", "structure_continuation"):
+        setup = _built(kind, entry_point="gift", gift_stop="forca", volume_filter=True)
+        assert isinstance(setup, StructureStrategy)
+        trigger = setup._activation.trigger  # type: ignore[attr-defined]
+        assert isinstance(trigger, GiftTrigger)
+        assert trigger.stop_at is GiftStop.FORCA
+        assert trigger.volume_fraction == Decimal("0.70")
+
+
+def test_the_ignored_bar_reads_the_filter_and_has_no_stop_to_choose() -> None:
+    setup = _built("structure_choch", entry_point="barra_ignorada", volume_filter=True)
+    assert isinstance(setup, StructureStrategy)
+    trigger = setup._activation.trigger  # type: ignore[attr-defined]
+    assert isinstance(trigger, IgnoredBarTrigger)
+    assert trigger.volume_fraction == Decimal("0.70")
+
+    quiet = _built("structure_choch", entry_point="barra_ignorada")
+    assert quiet._activation.trigger.volume_fraction is None  # type: ignore[attr-defined]
+
+
+def test_an_unknown_gift_stop_is_refused_rather_than_defaulted() -> None:
+    """`"region"` is the likeliest wrong value — it is where the hammer's stop sat before he
+    moved it onto the bar — and defaulting it would run the document at the gift's own low."""
+    with pytest.raises(EngineError, match="setup gift_stop must be one of 'gift', 'forca'"):
+        _built("structure_choch", entry_point="gift", gift_stop="region")
+
+
+def test_the_volume_filter_must_be_a_boolean() -> None:
+    with pytest.raises(EngineError, match="setup volume_filter must be true or false"):
+        _built("structure_choch", entry_point="gift", volume_filter="on")

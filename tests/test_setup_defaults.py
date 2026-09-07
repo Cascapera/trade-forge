@@ -36,6 +36,7 @@ from typing import Any, get_args
 import pytest
 
 from tradeforge_engine import setup_factory
+from tradeforge_engine.bar_setups import GiftStop
 from tradeforge_engine.domain import Side
 from tradeforge_engine.setup_factory import _BUILDERS, build_setup
 from tradeforge_engine.setups import (
@@ -117,6 +118,10 @@ _PROBES: dict[str, dict[str, tuple[Any, Any]]] = {
         # the two compare equal, which is exactly why the probe is `midpoint` and not `edge`: on
         # the default the assertion would hold whether the factory routed the field or dropped it.
         "entry_point": ("midpoint", ZoneEntryPoint.MIDPOINT),
+        # The gift's two dials (2026-09-07). Both probed off their defaults for the reason above:
+        # `"gift"` and `False` are what the class answers when nothing arrives.
+        "gift_stop": ("forca", GiftStop.FORCA),
+        "volume_filter": (True, True),
     },
     "structure_continuation": {
         "allow_secondary": (True, True),
@@ -124,6 +129,8 @@ _PROBES: dict[str, dict[str, tuple[Any, Any]]] = {
         "breakeven_at_r": (4.7, Decimal("4.7")),
         "max_bos": (7, 7),
         "entry_point": ("midpoint", ZoneEntryPoint.MIDPOINT),
+        "gift_stop": ("forca", GiftStop.FORCA),
+        "volume_filter": (True, True),
     },
 }
 

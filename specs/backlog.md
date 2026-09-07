@@ -1709,3 +1709,61 @@ preenche volume e `Candle` tem `tick_volume: int = 0`, então **nenhum cenário 
 consegue produzir uma VWAP**. Um teste que afirme silêncio ali passa vacuosamente. O par
 obrigatório é: mesmas barras **com** volume produzem a ordem, mesmas barras **sem** volume ficam
 mudas.
+
+
+## ~~Três leituras minhas no gift e na barra ignorada que ele ainda não confirmou~~ — RESPONDIDO em 07/09/2026
+
+Aberto e fechado no mesmo dia do PR-196. As quatro respostas dele, na ordem: *"1 - pode /
+2 - se o preço perder a mínima da barra de força anula / 3 - a entrada / 4 sem cor"*. Três
+confirmaram o que já estava escrito; a **segunda mudou código**: `ForceFollowLevels` ganhou
+`annul_price` (a mínima da barra de força, nas duas variações, independente de onde o stop é
+medido) e `ForceFollowActivation._age_the_order` lê o toque nela antes do relógio, igual ao
+martelo. Coberto por quatro testes novos e cinco mutantes mortos. O texto abaixo fica como registro
+do que estava em dúvida.
+
+**1. A barra da fuga pode ser a própria barra de força.** A pergunta foi "sendo N a primeira barra
+com mínima acima da região, a força pode ser N, N+1 ou N+2?" e a resposta foi *"n+1"*. Li como
+"até N+1": a barra que sai inteira da região **pode** ser a força (ele disse antes *"a barra de
+força pode ocorrer na fuga ou saída da região"*), e a seguinte também; a segunda depois da saída
+não. Está em `DEFAULT_BARS_OFF_REGION = 1` e no teste
+`test_the_bar_that_leaves_the_region_may_itself_be_the_force_bar`. Se ele quis dizer **só** N+1,
+é uma linha: a barra que sai não pode ser a força.
+
+**2. Nada nas barras anula a ordem pendurada; só a mínima da região.** Perguntei o que anula a
+ordem depois de armada e ele respondeu com a validade (*"válida por duas barras"*), não com um
+nível. O martelo perde a própria mínima e cancela; aqui não há regra equivalente, então uma barra
+que rompe a mínima do gift (ou da força) e depois rompe a máxima preenche a ordem normalmente. A
+mínima da **região** continua matando tudo, a qualquer momento, mesmo por pavio — isso ele disse
+com todas as letras. Se ele quiser que perder a mínima da força (ou do gift) cancele, é um
+`annul_price` em `ForceFollowLevels`, igual ao do `HammerBreakLevels`.
+
+**3. O teto de 2× mede a entrada, não a barra.** *"Teto de entrada é 120"* — medi a ordem
+(`levels.stop_price <= top + 2 × altura`), ao contrário do martelo, cujo teto mede o martelo e
+não a ordem (e ele disse isso em palavras naquele dia). Diferença de um tick, mas são duas regras
+vizinhas no mesmo arquivo com respostas opostas.
+
+**E uma quarta, menor: a cor da barra ignorada.** A regra dada é "corpo maior que 1/3 da força e
+não rompe a mínima da força". O nome — *ignorada*, o mercado ignora o vendedor — sugere uma barra
+de baixa, mas a regra como ditada admite uma barra de alta com corpo grande, e o código segue a
+regra, não o nome (`is_ignored_bar` não olha a cor; teste
+`test_an_ignored_bar_may_close_either_way`). Se ele quiser a cor, é uma comparação a mais.
+
+## `volume_filter: false` agora aparece em todo documento de estrutura salvo pelo web
+
+Achado no PR-196 pelo teste `writes what the document left to the engine, and nothing else`, que
+existe exatamente para isto: *"if this list ever grows, a save has started adding something new
+to the author's document and somebody has to decide whether it should"*.
+
+O builder do web grava **todo** parâmetro booleano no documento, no valor que estiver, inclusive
+o default — é a regra que `allow_secondary` segue desde o #69 (`foldParams`:
+`folded[param.name] = raw === true`). `volume_filter` é o segundo booleano do setup de estrutura,
+então um documento `entry_point: "edge"` re-salvo pelo web ganha `volume_filter: false`, chave
+que o engine ignora nesse entry point. `gift_stop` não sofre disso: é enum, e o builder omite enum
+vazio.
+
+Decidi seguir a regra existente (fixture `setup_structure_choch.json` e lista pinada do teste
+atualizadas) em vez de mudar o builder dentro de um PR de engine. O conserto de verdade é **o
+builder mostrar e gravar `gift_stop` e `volume_filter` só quando `entry_point` for `gift` ou
+`barra_ignorada`** — parâmetros condicionais a outro parâmetro, coisa que o `SchemaParam` de hoje
+não expressa. Enquanto isso, os dois aparecem no formulário de todo setup de estrutura, e o
+usuário pode ligar um filtro que não faz nada.

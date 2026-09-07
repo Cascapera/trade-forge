@@ -17,7 +17,13 @@ import pytest
 
 from tradeforge_engine import setups
 from tradeforge_engine.backtest_broker import BacktestBroker
-from tradeforge_engine.bar_setups import is_force_bar, is_hammer
+from tradeforge_engine.bar_setups import (
+    GiftStop,
+    GiftTrigger,
+    IgnoredBarTrigger,
+    is_force_bar,
+    is_hammer,
+)
 from tradeforge_engine.costs import NoCostModel
 from tradeforge_engine.domain import (
     AccountState,
@@ -43,6 +49,7 @@ from tradeforge_engine.setups import (
     ChochQualifier,
     ContinuationQualifier,
     FffdActivation,
+    ForceFollowActivation,
     HammerBreakActivation,
     HammerForceActivation,
     SetupContext,
@@ -4246,11 +4253,14 @@ def _hammer_block(kind: ZoneKind, top: str, bottom: str) -> OrderBlock:
     )
 
 
+_BarActivation = HammerBreakActivation | HammerForceActivation | ForceFollowActivation
+
+
 def _watch(
     block: OrderBlock,
     candles: list[Candle],
-    activation: HammerBreakActivation | HammerForceActivation | None = None,
-) -> tuple[HammerBreakActivation | HammerForceActivation, list[ZoneEntry | None]]:
+    activation: _BarActivation | None = None,
+) -> tuple[_BarActivation, list[ZoneEntry | None]]:
     """Drive one activation over hand-built bars, without a qualifier or a structure machine.
 
     ⚠️ **Deliberately below the strategy**, because three of the rules below are about a *single
@@ -4809,3 +4819,649 @@ def test_the_sell_arming_ceiling_is_inclusive_too() -> None:
 
     _, past_it = _watch(region, [bar(0, open_="98", close="97.5", high="103", low="94.99")])
     assert past_it[0] is None
+
+
+# --------------------------------------------------------------------------- #
+# The gift and the ignored bar -- the bar of force off the region, then one bar #
+# --------------------------------------------------------------------------- #
+
+
+# His force bar, touching [90, 100] with its low of 99.50: 6.50 tall, 5.50 of body. And his two
+# followers on it, dictated 2026-09-07. The numbers below were read off the strategy before they
+# were written here.
+_FORCE_OFF_THE_REGION = bar(13, open_="100", close="105.5", high="106", low="99.5")
+_GIFT = bar(14, open_="105.2", close="105", high="105.6", low="104.4")
+_IGNORED_BAR = bar(14, open_="105.5", close="102.5", high="105.8", low="102")
+_QUIET_UNDER_THE_ENTRY = [
+    bar(index, open_="105", close="105.1", high="105.4", low="104.8") for index in (15, 16, 17)
+]
+
+
+def _force_at(index: int) -> Candle:
+    """The same force bar on another index, its low still touching the region."""
+    return bar(index, open_="100", close="105.5", high="106", low="99.5")
+
+
+def _gift_at(index: int) -> Candle:
+    return bar(index, open_="105.2", close="105", high="105.6", low="104.4")
+
+
+def _touch_without_force(index: int) -> Candle:
+    """Reaches into the region and is not a bar of force: a small red bar."""
+    return bar(index, open_="100.5", close="100.2", high="101", low="99.5")
+
+
+def _off_the_region(index: int) -> Candle:
+    """A whole bar above [90, 100] that is not a bar of force."""
+    return bar(index, open_="101.5", close="101.3", high="102", low="100.5")
+
+
+def _force_off_the_region_at(index: int) -> Candle:
+    """A bar of force whose low of 100.50 does **not** reach [90, 100] -- for the scenarios about
+    the count, where a force bar that touched would reset it and prove nothing."""
+    return bar(index, open_="101", close="105.5", high="106", low="100.5")
+
+
+def _gift_setup(candles: list[Candle], **kwargs: object) -> list[list[Signal]]:
+    return _drive_from_bullish(
+        StructureStrategy(qualifier=_Marked(), entry_point=ZoneEntryPoint.GIFT, **kwargs),  # type: ignore[arg-type]
+        candles,
+    )
+
+
+def _ignored_setup(candles: list[Candle], **kwargs: object) -> list[list[Signal]]:
+    return _drive_from_bullish(
+        StructureStrategy(
+            qualifier=_Marked(),
+            entry_point=ZoneEntryPoint.BARRA_IGNORADA,
+            **kwargs,  # type: ignore[arg-type]
+        ),
+        candles,
+    )
+
+
+def test_the_gift_arms_a_stop_past_the_higher_high_when_the_gift_closes() -> None:
+    """His setup end to end: the force bar off the region on 13, the gift on 14, and the order
+    on the gift's close -- **106.01**, one tick past the force bar's 106, with the stop at
+    **104.16**, twenty percent of the gift's own 1.20 under its low of 104.40.
+
+    ⚠️ Nothing is placed on the force bar's own bar. The force bar starts the setup; the bar
+    after it decides, and asserting the silence on 13 is what keeps that shape.
+    """
+    signals = _gift_setup([*_IMPULSE, *_FALLS_BACK, _FORCE_OFF_THE_REGION, _GIFT])
+
+    assert signals[13] == [], "the force bar alone places nothing"
+    [placed] = signals[14]
+    assert placed.kind is SignalKind.ENTRY
+    assert placed.side is Side.LONG
+    assert placed.stop_price == Decimal("106.01")
+    assert placed.stop_loss == Decimal("104.16")
+    assert placed.limit_price is None
+
+
+def test_the_gift_s_stop_may_be_taken_off_the_force_bar_instead() -> None:
+    """His second alternative, chosen on the strategy: the same order at 106.01, the stop at
+    **98.20** -- twenty percent of the force bar's 6.50 under its low of 99.50. The two stops
+    are 5.96 apart on his own example, so the wrong bar is a different number, not an error."""
+    [placed] = _gift_setup(
+        [*_IMPULSE, *_FALLS_BACK, _FORCE_OFF_THE_REGION, _GIFT], gift_stop=GiftStop.FORCA
+    )[14]
+
+    assert placed.stop_price == Decimal("106.01")
+    assert placed.stop_loss == Decimal("98.20")
+
+
+def test_the_gift_sell_is_the_exact_mirror_of_the_buy() -> None:
+    """Reflected around 200: the order at 93.99 and the stop at 95.84. The force bar's body,
+    the gift's place in its lower third, which extreme the entry passes and which the stop is
+    measured from all mirror at once, and a sell inheriting any one of them from the buy still
+    produces a short at a price nobody chose."""
+    [placed] = _drive(
+        StructureStrategy(qualifier=_Marked(), entry_point=ZoneEntryPoint.GIFT),
+        _mirror([*_IMPULSE, *_FALLS_BACK, _FORCE_OFF_THE_REGION, _GIFT]),
+    )[14]
+
+    assert placed.side is Side.SHORT
+    assert placed.stop_price == Decimal("93.99")  # 200 - 106.01
+    assert placed.stop_loss == Decimal("95.84")  # 200 - 104.16
+
+
+def test_the_ignored_bar_arms_the_same_entry_with_the_force_bar_s_stop() -> None:
+    """His other follower on the same force bar: a three-point body that kept the low. The order
+    at **106.01** again, the stop at **98.20** -- the force bar's, the only one this setup has."""
+    signals = _ignored_setup([*_IMPULSE, *_FALLS_BACK, _FORCE_OFF_THE_REGION, _IGNORED_BAR])
+
+    assert signals[13] == []
+    [placed] = signals[14]
+    assert placed.kind is SignalKind.ENTRY
+    assert placed.stop_price == Decimal("106.01")
+    assert placed.stop_loss == Decimal("98.20")
+    assert placed.limit_price is None
+
+
+def test_the_ignored_bar_sell_is_the_exact_mirror_of_the_buy() -> None:
+    [placed] = _drive(
+        StructureStrategy(qualifier=_Marked(), entry_point=ZoneEntryPoint.BARRA_IGNORADA),
+        _mirror([*_IMPULSE, *_FALLS_BACK, _FORCE_OFF_THE_REGION, _IGNORED_BAR]),
+    )[14]
+
+    assert placed.side is Side.SHORT
+    assert placed.stop_price == Decimal("93.99")
+    assert placed.stop_loss == Decimal("101.80")  # 200 - 98.20
+
+
+def test_each_setup_is_silent_on_the_other_s_follower_and_the_region_is_spent() -> None:
+    """The gift setup handed an ignored bar, and the other way round: nothing on 14 -- and by his
+    rule the region is finished, so a textbook force bar and gift on 16 and 17 arm nothing.
+
+    ⚠️ The second half is the half that says *cancelled*, not *not yet*. Asked whether the
+    region lives on for the next opportunity: *"cancelou, região não vale"*.
+    """
+    another_chance = [_force_at(16), _gift_at(17)]
+    gift_given_ignored = _gift_setup(
+        [
+            *_IMPULSE,
+            *_FALLS_BACK,
+            _FORCE_OFF_THE_REGION,
+            _IGNORED_BAR,
+            _off_the_region(15),
+            *another_chance,
+        ]
+    )
+    assert gift_given_ignored[14] == []
+    assert gift_given_ignored[17] == [], "a failed follower did not spend the region"
+
+    ignored_given_gift = _ignored_setup(
+        [
+            *_IMPULSE,
+            *_FALLS_BACK,
+            _FORCE_OFF_THE_REGION,
+            _GIFT,
+            _off_the_region(15),
+            _force_at(16),
+            bar(17, open_="105.5", close="102.5", high="105.8", low="102"),
+        ]
+    )
+    assert ignored_given_gift[14] == []
+    assert ignored_given_gift[17] == []
+
+
+def test_a_hammer_before_the_force_bar_is_welcome_and_not_required() -> None:
+    """*"Não precisa ter o martelo antes, mas se tiver não tem problema."* The hammer on 13
+    touches the region and is not a bar of force; the force bar on 14 leaves the region (low
+    101.40) and is still inside the count; the gift on 15 arms at 104.61 with the stop at 103.52
+    off the gift's own 0.90."""
+    hammer = bar(13, open_="101", close="101.5", high="102", low="98")
+    force = bar(14, open_="101.6", close="104", high="104.5", low="101.4")
+    gift = bar(15, open_="104.1", close="104.3", high="104.6", low="103.7")
+    signals = _gift_setup([*_IMPULSE, *_FALLS_BACK, hammer, force, gift])
+
+    assert signals[13] == []
+    assert signals[14] == []
+    [placed] = signals[15]
+    assert placed.stop_price == Decimal("104.61")
+    assert placed.stop_loss == Decimal("103.52")
+
+
+def test_the_gift_order_lives_two_bars_and_the_region_dies_with_it() -> None:
+    """Armed on 14, the order lives 15 and 16 and is taken back on 16. And the region is done:
+    the identical force bar and gift on 17 and 18 arm **nothing**. Both halves asserted together,
+    because the cancel alone is satisfied by the FFFD's rule too."""
+    signals = _gift_setup(
+        [
+            *_IMPULSE,
+            *_FALLS_BACK,
+            _FORCE_OFF_THE_REGION,
+            _GIFT,
+            *_QUIET_UNDER_THE_ENTRY[:2],
+            _force_at(17),
+            _gift_at(18),
+        ]
+    )
+
+    assert signals[15] == []
+    [taken_back] = signals[16]
+    assert taken_back.kind is SignalKind.CANCEL
+    assert signals[17] == []
+    assert signals[18] == [], "a second force bar and gift re-armed a region his rule finished"
+
+
+def test_losing_the_force_bar_s_low_cancels_before_the_clock_does() -> None:
+    """*"Se o preço perder a mínima da barra de força anula"* — his answer to the one question the
+    first dictation left open. Armed on 14 with two bars to live; bar 15 reaches the force bar's
+    low of 99.50 and the cancel lands there rather than on 16. And by his rule the region is
+    spent with it: the same force bar and gift on 16 and 17 arm nothing.
+
+    ⚠️ The bar that cancels stays well inside [90, 100], so this is not the region's low doing
+    the work — that rule has its own test, and both spend, so only a level between the two can
+    separate them.
+    """
+    reaches_the_low = bar(15, open_="105", close="104", high="105.2", low="99.5")
+    signals = _gift_setup(
+        [
+            *_IMPULSE,
+            *_FALLS_BACK,
+            _FORCE_OFF_THE_REGION,
+            _GIFT,
+            reaches_the_low,
+            _force_at(16),
+            _gift_at(17),
+        ]
+    )
+
+    [taken_back] = signals[15]
+    assert taken_back.kind is SignalKind.CANCEL
+    assert signals[17] == []
+
+
+def test_the_annulment_is_read_on_a_touch_of_the_force_bar_s_low_on_both_sides() -> None:
+    """The boundary: a low exactly on 99.50 has reached the force bar's low and cancels; 99.51
+    has not, and the order rests on. Driven at the activation, where a bar can be put on the
+    number, and mirrored on a supply region because the sell comparison is its own line."""
+    region = _zone_at("100", "90", hour=1)
+    on_it = bar(2, open_="105", close="104", high="105.2", low="99.5")
+    short_of_it = bar(2, open_="105", close="104", high="105.2", low="99.51")
+
+    live, seen = _watch(
+        region, [_force_at(0), _gift_at(1), on_it], ForceFollowActivation(trigger=GiftTrigger())
+    )
+    assert seen[1] is not None
+    assert seen[2] is None
+    assert live.spent(region)
+
+    live, seen = _watch(
+        region,
+        [_force_at(0), _gift_at(1), short_of_it],
+        ForceFollowActivation(trigger=GiftTrigger()),
+    )
+    assert seen[2] is not None
+    assert not live.spent(region)
+
+    supply = _hammer_block(ZoneKind.SUPPLY, "110", "100")
+    force = bar(0, open_="100", close="94.5", high="100.5", low="94")  # touches 100; high 100.5
+    gift = bar(1, open_="94.8", close="95", high="95.6", low="94.4")
+    live, seen = _watch(
+        supply,
+        [force, gift, bar(2, open_="95", close="96", high="100.5", low="94.8")],
+        ForceFollowActivation(trigger=GiftTrigger()),
+    )
+    assert seen[1] is not None
+    assert seen[1].side is Side.SHORT
+    assert seen[2] is None
+    assert live.spent(supply)
+
+    live, seen = _watch(
+        supply,
+        [force, gift, bar(2, open_="95", close="96", high="100.49", low="94.8")],
+        ForceFollowActivation(trigger=GiftTrigger()),
+    )
+    assert seen[2] is not None
+    assert not live.spent(supply)
+
+
+def test_a_gift_stop_order_outlives_its_own_stop_level_and_dies_at_the_force_bar_s_low() -> None:
+    """The two levels are different kinds of number, and with the stop off the gift the order
+    of them inverts: the stop sits at 104.16 and the annulment at 99.50, below it. Bar 15 trades
+    through 104.16 and stops at 103 — a resting stop order has no position to lose, so it rests
+    on; bar 16 reaches 99.50 and it is taken back. A rule that read the stop as the annulment
+    would cancel a bar early."""
+    region = _zone_at("100", "90", hour=1)
+    through_the_stop = bar(2, open_="105", close="103.5", high="105.2", low="103")
+    to_the_force_low = bar(3, open_="103.5", close="101", high="104", low="99.5")
+    live, seen = _watch(
+        region,
+        [_force_at(0), _gift_at(1), through_the_stop, to_the_force_low],
+        ForceFollowActivation(trigger=GiftTrigger(), bars_to_fill=3),
+    )
+    assert seen[1] is not None
+    assert seen[1].stop_loss == Decimal("104.16")
+    assert through_the_stop.low < seen[1].stop_loss
+    assert seen[2] is not None, "a resting stop order has no position to lose at its stop level"
+    assert seen[3] is None
+    assert live.spent(region)
+
+
+def test_losing_the_region_s_low_by_a_wick_takes_the_resting_order_back() -> None:
+    """*"Desde que o preço em nenhum momento rompa a mínima da região, mesmo que somente por
+    pavio."* Armed on 14 with two bars to live; bar 15 wicks to 89.99 under [90, 100] and closes
+    back at 104. The cancel lands on 15, not on 16 -- and the region is spent with it.
+
+    ⚠️ The hammer reads the region's low only *before* a hammer exists. This setup reads it on
+    every bar, which is the only early ending its order has.
+    """
+    wicks_through = bar(15, open_="105", close="104", high="105.2", low="89.99")
+    signals = _gift_setup(
+        [
+            *_IMPULSE,
+            *_FALLS_BACK,
+            _FORCE_OFF_THE_REGION,
+            _GIFT,
+            wicks_through,
+            _force_at(16),
+            _gift_at(17),
+        ]
+    )
+
+    [taken_back] = signals[15]
+    assert taken_back.kind is SignalKind.CANCEL
+    assert signals[17] == []
+
+
+def test_losing_the_region_before_any_force_bar_ends_it_even_if_one_follows() -> None:
+    """Bar 13 closes through the bottom of [90, 100]; the perfectly good force bar on 14 and gift
+    on 15 arm nothing."""
+    breaks_it = bar(13, open_="95", close="92", high="96", low="89")
+    signals = _gift_setup([*_IMPULSE, *_FALLS_BACK, breaks_it, _force_at(14), _gift_at(15)])
+
+    assert signals == [[] for _ in signals]
+
+
+def test_the_force_bar_may_come_on_any_bar_while_price_keeps_touching_the_region() -> None:
+    """*"Enquanto os candles tiverem mínima que toca na região a barra de força ainda pode ser
+    válida."* Six touching bars that are not force bars -- one more than the hammer's whole
+    window -- and the force bar on 19 with its gift on 20 still arms. No count runs while price
+    is in the region, which is the line between this clock and the hammer's."""
+    waiting = [_touch_without_force(index) for index in range(13, 19)]
+    signals = _gift_setup([*_IMPULSE, *_FALLS_BACK, *waiting, _force_at(19), _gift_at(20)])
+
+    [placed] = signals[20]
+    assert placed.stop_price == Decimal("106.01")
+
+
+def test_once_a_whole_bar_leaves_the_region_the_force_bar_has_one_more_bar_to_come() -> None:
+    """His count, fixed when asked: the bar that leaves being N, the force bar may be **N+1**.
+
+    Bar 13 touches; 14 is the first whole bar above the region. A force bar on 15 (one bar off
+    the region before it) arms with its gift on 16. A force bar on 16 (two bars off) is one late
+    and arms nothing, gift or no gift.
+
+    ⚠️ The force bars here do **not** touch the region. The first version of this scenario used
+    one whose low of 99.50 did, which reset the count on the bar under test and armed the "late"
+    case too: a scenario that passed while testing nothing about the count.
+    """
+    in_time = _gift_setup(
+        [
+            *_IMPULSE,
+            *_FALLS_BACK,
+            _touch_without_force(13),
+            _off_the_region(14),
+            _force_off_the_region_at(15),
+            _gift_at(16),
+        ]
+    )
+    assert in_time[16] != []
+
+    one_late = _gift_setup(
+        [
+            *_IMPULSE,
+            *_FALLS_BACK,
+            _touch_without_force(13),
+            _off_the_region(14),
+            _off_the_region(15),
+            _force_off_the_region_at(16),
+            _gift_at(17),
+        ]
+    )
+    assert one_late[17] == []
+
+
+def test_the_bar_that_leaves_the_region_may_itself_be_the_force_bar() -> None:
+    """*"A barra de força pode ocorrer na fuga ou saída da região."* Bar 13 touches without
+    force; bar 14 is a bar of force whose low of 101 never reaches the region; the gift on 15
+    arms."""
+    signals = _gift_setup(
+        [
+            *_IMPULSE,
+            *_FALLS_BACK,
+            _touch_without_force(13),
+            _force_off_the_region_at(14),
+            _gift_at(15),
+        ]
+    )
+
+    [placed] = signals[15]
+    assert placed.stop_price == Decimal("106.01")
+
+
+def test_a_shut_window_reopens_when_price_touches_the_region_again() -> None:
+    """Three whole bars above the region close the window; nothing has failed and nothing is
+    spent. Bar 17 comes back to touch, the force bar on 18 and the gift on 19 arm."""
+    signals = _gift_setup(
+        [*_IMPULSE, *_FALLS_BACK, _touch_without_force(13)]
+        + [_off_the_region(index) for index in (14, 15, 16)]
+        + [_touch_without_force(17), _force_at(18), _gift_at(19)]
+    )
+
+    assert signals[16] == []
+    [placed] = signals[19]
+    assert placed.stop_price == Decimal("106.01")
+
+
+def test_a_reopened_window_forgets_the_bars_spent_away_from_the_region() -> None:
+    """⚠️ **The touch resets the count, and the scenario above cannot see it.** There the force
+    bar's own low touches the region, so the count is never read for it. Here the force bar on
+    18 is the bar that *leaves* the region again (low 100.50) after three bars away and one bar
+    back: his rule 3 lets it be the force bar, so the gift on 19 arms. A count that the retouch
+    on 17 did not clear still reads three, refuses the force bar, and every revisited region
+    silently under-arms — the guardian's mutant, surviving the whole suite."""
+    signals = _gift_setup(
+        [
+            *_IMPULSE,
+            *_FALLS_BACK,
+            _touch_without_force(13),
+            *[_off_the_region(index) for index in (14, 15, 16)],
+            _touch_without_force(17),
+            _force_off_the_region_at(18),
+            _gift_at(19),
+        ]
+    )
+
+    [placed] = signals[19]
+    assert placed.stop_price == Decimal("106.01")
+
+
+def test_the_volume_filter_is_a_switch_on_the_strategy_and_reads_the_force_bar() -> None:
+    """*"Vamos dar opção do volume ser um filtro."* The same bars, the same numbers: a gift at
+    700 against a force bar at 1000 arms with the filter on, one at 701 does not -- and spends
+    the region. With the filter off, 701 arms.
+
+    ⚠️ The refusal and the acceptance are on adjacent counts on purpose: a filter reading the
+    wrong bar's volume, or comparing against a constant, cannot land on 700 and not on 701.
+    """
+    force = bar(13, open_="100", close="105.5", high="106", low="99.5", tick_volume=1000)
+
+    def gift_with(volume: int) -> Candle:
+        return bar(14, open_="105.2", close="105", high="105.6", low="104.4", tick_volume=volume)
+
+    quiet_enough = _gift_setup([*_IMPULSE, *_FALLS_BACK, force, gift_with(700)], volume_filter=True)
+    [placed] = quiet_enough[14]
+    assert placed.stop_price == Decimal("106.01")
+
+    too_loud = _gift_setup(
+        [
+            *_IMPULSE,
+            *_FALLS_BACK,
+            force,
+            gift_with(701),
+            _off_the_region(15),
+            _force_at(16),
+            _gift_at(17),
+        ],
+        volume_filter=True,
+    )
+    assert too_loud[14] == []
+    assert too_loud[17] == [], "a follower refused by the filter did not spend the region"
+
+    filter_off = _gift_setup([*_IMPULSE, *_FALLS_BACK, force, gift_with(701)])
+    assert filter_off[14] != []
+
+
+def test_a_region_named_on_the_very_bar_of_force_still_sees_it() -> None:
+    """The hand-over bar, the FFFD's blocking finding and the hammer's third reset. `observe`
+    runs twice on the bar a zone is armed; `_LateMarked(after=22)` names the region for the first
+    time on bar 13, which is the force bar, and the gift on 14 has to find it remembered."""
+    late = _drive_from_bullish(
+        StructureStrategy(qualifier=_LateMarked(after=22), entry_point=ZoneEntryPoint.GIFT),
+        [*_IMPULSE, *_FALLS_BACK, _FORCE_OFF_THE_REGION, _GIFT],
+    )
+
+    [placed] = late[14]
+    assert placed.stop_price == Decimal("106.01")
+
+
+def test_a_pending_force_bar_does_not_follow_the_activation_to_another_region() -> None:
+    """The hammer's leak, one step earlier: a bar of force *waiting for its follower*, carried
+    across a hand-over, would have region B's first bar read as the gift of a force bar that
+    printed on region A. B's top is 97; the force bar's low of 99.50 never reached it."""
+    armed_here = _zone_at("100", "90", hour=1)
+    never_reached = _zone_at("97", "87", hour=2)
+
+    activation = ForceFollowActivation(trigger=GiftTrigger())
+    with localcontext(ENGINE_CONTEXT):
+        first = Context(candle=_FORCE_OFF_THE_REGION, instrument=AAPL, account=_ACCOUNT)
+        activation.observe(armed_here, context=first)
+        assert activation.entry_for(armed_here, context=first) is None
+
+        second = Context(candle=_GIFT, instrument=AAPL, account=_ACCOUNT)
+        activation.observe(never_reached, context=second)
+        assert activation.entry_for(never_reached, context=second) is None
+        assert not activation.spent(never_reached)
+
+
+def test_the_entry_may_sit_at_the_ceiling_and_not_a_tick_past_it() -> None:
+    """*"Vamos usar um range de 2x a região pra cima: 90-100 a região, o teto de entrada é 120."*
+
+    The ceiling measures the **entry**, by his words, where the hammer's measured the bar. Bar 0
+    touches; the force bar on 1 runs from 110 to 119.50; a gift topping at 119.99 puts the order
+    at exactly 120.00 and arms. One topping at 120.00 puts it at 120.01, arms nothing -- and
+    spends the region, because a setup that completed and failed a criterion is a cancelled one.
+    """
+    region = _zone_at("100", "90", hour=1)
+    touch = bar(0, open_="100.5", close="100.2", high="101", low="99.5")
+    force = bar(1, open_="110", close="119", high="119.5", low="110")
+
+    _, at_the_ceiling = _watch(
+        region,
+        [touch, force, bar(2, open_="119.5", close="119.7", high="119.99", low="119.2")],
+        ForceFollowActivation(trigger=GiftTrigger()),
+    )
+    assert at_the_ceiling[2] is not None
+    assert at_the_ceiling[2].stop_price == Decimal("120.00")
+
+    past_it, seen = _watch(
+        region,
+        [touch, force, bar(2, open_="119.5", close="119.7", high="120", low="119.2")],
+        ForceFollowActivation(trigger=GiftTrigger()),
+    )
+    assert seen[2] is None
+    assert past_it.spent(region)
+
+
+def test_the_sell_entry_may_sit_at_the_floor_and_not_a_tick_past_it() -> None:
+    """The mirror of the ceiling, on its own boundary — the `_mirror` scenarios land at 93.99
+    against a floor of 80 and never reach it, so `>=` against `>` on the sell side survived the
+    suite. Supply [100, 110], two heights below the near edge is **80.00**: an entry there arms;
+    one at 79.99 arms nothing and spends the region."""
+    region = _hammer_block(ZoneKind.SUPPLY, "110", "100")
+    touch = bar(0, open_="99", close="99.5", high="100.5", low="98")
+    force = bar(1, open_="90", close="81", high="90", low="80.5")
+    assert is_force_bar(force, side=Side.SHORT)
+
+    _, at_the_floor = _watch(
+        region,
+        [touch, force, bar(2, open_="80.5", close="80.3", high="80.8", low="80.01")],
+        ForceFollowActivation(trigger=GiftTrigger()),
+    )
+    assert at_the_floor[2] is not None
+    assert at_the_floor[2].side is Side.SHORT
+    assert at_the_floor[2].stop_price == Decimal("80.00")
+
+    past_it, seen = _watch(
+        region,
+        [touch, force, bar(2, open_="80.5", close="80.3", high="80.8", low="80")],
+        ForceFollowActivation(trigger=GiftTrigger()),
+    )
+    assert seen[2] is None
+    assert past_it.spent(region)
+
+
+def test_a_force_bar_resting_exactly_on_the_near_edge_has_touched_the_region() -> None:
+    """The boundary of the touch: a force bar with its low exactly on 100 has reached [90, 100]
+    and arms with its gift; one at 100.01, with no touch before it, has not."""
+    region = _zone_at("100", "90", hour=1)
+    on_the_edge = bar(0, open_="100.5", close="105.5", high="106", low="100")
+    _, seen = _watch(
+        region, [on_the_edge, _gift_at(1)], ForceFollowActivation(trigger=GiftTrigger())
+    )
+    assert seen[1] is not None
+    assert seen[1].stop_price == Decimal("106.01")
+
+    just_above = bar(0, open_="100.5", close="105.5", high="106", low="100.01")
+    _, seen = _watch(
+        region, [just_above, _gift_at(1)], ForceFollowActivation(trigger=GiftTrigger())
+    )
+    assert seen[1] is None
+
+
+def test_a_bar_resting_exactly_on_the_far_edge_has_not_broken_the_region() -> None:
+    """*"Mesmo que somente por pavio"* -- but a wick that stops exactly on 90 has not broken
+    [90, 100]. The force bar on 1 wicks to 90 and arms with its gift; wicking to 89.99 spends."""
+    region = _zone_at("100", "90", hour=1)
+    to_the_edge = bar(0, open_="92", close="105", high="105.5", low="90")
+    assert is_force_bar(to_the_edge, side=Side.LONG)
+    gift = bar(1, open_="104.8", close="105.2", high="105.4", low="104")
+
+    live, seen = _watch(region, [to_the_edge, gift], ForceFollowActivation(trigger=GiftTrigger()))
+    assert seen[1] is not None
+    assert not live.spent(region)
+
+    through = bar(0, open_="92", close="105", high="105.5", low="89.99")
+    live, seen = _watch(region, [through, gift], ForceFollowActivation(trigger=GiftTrigger()))
+    assert seen[1] is None
+    assert live.spent(region)
+
+
+def test_the_order_s_life_is_the_dial_and_not_the_constant() -> None:
+    """At three bars the cancel lands on the third bar after the gift rather than the second."""
+    region = _zone_at("100", "90", hour=1)
+    sequence = [
+        _force_at(0),
+        _gift_at(1),
+        *[bar(index, open_="105", close="105.1", high="105.4", low="104.8") for index in (2, 3, 4)],
+    ]
+    _, two = _watch(region, sequence, ForceFollowActivation(trigger=GiftTrigger()))
+    assert two[2] is not None
+    assert two[3] is None
+
+    _, three = _watch(
+        region, sequence, ForceFollowActivation(trigger=GiftTrigger(), bars_to_fill=3)
+    )
+    assert three[3] is not None
+    assert three[4] is None
+
+
+def test_the_touch_begins_this_setup_so_mitigation_does_not_end_it() -> None:
+    activation = ForceFollowActivation(trigger=IgnoredBarTrigger())
+    assert activation.spent_by_mitigation is False
+    assert (
+        activation.withdraws(
+            _zone_at("100", "90", hour=1),
+            context=Context(candle=_FORCE_OFF_THE_REGION, instrument=AAPL, account=_ACCOUNT),
+        )
+        is False
+    )
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"bars_to_fill": 0}, "at least one bar"),
+        ({"bars_off_region": -1}, "is a count"),
+        ({"reach_fraction": Decimal("-1")}, "fraction of the region"),
+    ],
+)
+def test_the_follow_activation_refuses_a_dial_that_would_not_be_a_setup(
+    kwargs: dict[str, object], message: str
+) -> None:
+    with pytest.raises(EngineError, match=message):
+        ForceFollowActivation(trigger=GiftTrigger(), **kwargs)  # type: ignore[arg-type]

@@ -797,6 +797,14 @@ def test_the_regions_served_are_the_ones_the_author_s_example_marks(
         ("demand", Decimal(100), Decimal(98), True),
         ("demand", Decimal(117), Decimal(110), False),
     ]
+    # ⚠️ **And which series each belongs to — here, both the run's own.** This run declares no
+    # higher-timeframe filter, so this line does *not* prove the field is carried: the value it
+    # expects is also the schema's default, and the handler could stop copying it with nothing
+    # failing ([[probe-igual-ao-default]]; the guardian caught exactly that). What it does hold is
+    # the shape an unfiltered run answers with, which is what every chart drawn before the filter
+    # existed depends on. The wire itself is `tests/test_overlays.py`, where a stand-in publishes
+    # one region of each label and only a carried field can tell them apart.
+    assert [z["label"] for z in zones] == ["zone", "zone"]
     # Strings on the wire like every other price here — a float would round the rectangle's
     # edges, and an edge is where a limit order rests.
     assert all(isinstance(z["top"], str) and isinstance(z["bottom"], str) for z in zones)

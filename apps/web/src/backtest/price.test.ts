@@ -2,6 +2,7 @@ import type { Candle, OverlaySeries, Trade, Zone } from '../api/types'
 import type { DrawableZone, View } from './price'
 import {
   CURVE_COLORS,
+  OWN_TIMEFRAME,
   toBars,
   toCurves,
   toMarkers,
@@ -413,6 +414,7 @@ describe('toZones', () => {
       fromTime: toSeconds('2024-08-01T14:00:00Z'),
       mitigatedAt: toSeconds('2024-08-01T18:00:00Z'),
       primary: true,
+      label: OWN_TIMEFRAME,
     })
   })
 
@@ -420,6 +422,36 @@ describe('toZones', () => {
     const [drawable] = toZones([zone({ mitigated_at: null })])
 
     expect(drawable?.mitigatedAt).toBeNull()
+  })
+
+  it('names the run\'s own timeframe exactly as the engine spells it', () => {
+    // ⚠️ Every other assertion here compares against `OWN_TIMEFRAME`, so the constant and the
+    // expectation move together and neither pins the value on the wire. The engine fills this
+    // field explicitly on every region (`_zone_mark`), so a constant that drifted would make an
+    // *unfiltered* run draw thick outlines, write "zone" inside every rectangle, and caption a
+    // filter that never ran. The literal is the only thing that holds the line.
+    expect(OWN_TIMEFRAME).toBe('zone')
+    expect(toZones([zone({ label: 'zone' })])[0]?.label).toBe(OWN_TIMEFRAME)
+  })
+
+  it('reads a region from a higher timeframe by the name of its own bar', () => {
+    // A filtered run marks regions on two charts at once. The label is what tells them apart,
+    // and it is the bar's name rather than a flag so the legend can say which one.
+    const [drawable] = toZones([zone({ label: 'H4' })])
+
+    expect(drawable?.label).toBe('H4')
+  })
+
+  it('reads a run older than the filter as the timeframe the run itself used', () => {
+    // ⚠️ Every backtest recorded before the higher-timeframe filter existed answers with no
+    // `label` at all. Defaulted here, in one place, rather than at each drawing site: read as
+    // `undefined` further down, those regions would fall into whatever branch handles "not the
+    // run's own" and every old chart would sprout labels for a filter that never ran.
+    // `zone()` builds exactly that document: the fixture predates the field and does not carry it.
+    expect(zone()).not.toHaveProperty('label')
+    const [drawable] = toZones([zone()])
+
+    expect(drawable?.label).toBe(OWN_TIMEFRAME)
   })
 })
 
@@ -449,6 +481,7 @@ describe('zoneRects', () => {
       fromTime: NOON + 2 * HOUR,
       mitigatedAt: NOON + 6 * HOUR,
       primary: true,
+      label: OWN_TIMEFRAME,
       ...over,
     }
   }

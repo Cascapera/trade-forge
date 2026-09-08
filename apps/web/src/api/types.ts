@@ -272,6 +272,12 @@ export interface Zone {
   confirmed_at: string
   mitigated_at: string | null
   primary: boolean
+  /**
+   * Which series the region belongs to: `zone` for the run's own timeframe, or the name of a
+   * higher one (`H4`) for the regions a filtered setup was released by. Optional because every
+   * run recorded before the filter existed answers without it.
+   */
+  label?: string
 }
 
 /** Every curve the run's strategy was reading. Empty for a setup whose overlay is zones. */

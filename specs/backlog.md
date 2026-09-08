@@ -1907,12 +1907,15 @@ para os dois setups, e o filtro é opcional.
 - **A grade de estudo varia o período do filtro, mas não sabe pedir "desligado"** — `null` não é
   um dos valores que um eixo enumera, então comparar "com filtro × sem filtro" continua sendo duas
   corridas. É a mesma pendência que o `htf` já tinha (PR-205), agora com dois parâmetros.
-- **O filtro não é desenhado no front**, e só isso. O caminho de dados está inteiro: a entrada
-  carrega `long_average` no `context` e a curva `long EMA N` no `series`, `overlays()` devolve as
-  duas médias, e o endpoint de overlays da API (`apps/api/.../backtests.py`) já dirige `overlays()`
-  e devolve toda série com valor — ou seja, a média longa **já chega ao front**. Falta a tela
-  desenhar a segunda curva. ⚠️ A versão anterior desta linha dizia que o filtro "não aparece no
-  gráfico da corrida inteira", que é mais forte do que o código: o guardian pegou.
+- ~~O filtro de média longa não é desenhado no front~~ — **a curva já era desenhada**: `overlays()`
+  devolve `long EMA N`, o endpoint entrega e o `PriceChart` dá cor e legenda próprias. O que
+  faltava eram as **regiões do H4**, feito na PR-210. Fica só o retrato da entrada
+  (`TradeSnapshot`), onde todas as curvas saem na mesma cor e todos os retângulos no mesmo azul —
+  com o filtro ligado são duas linhas douradas indistinguíveis e dois retângulos iguais.
+  ⚠️ Esta linha já foi escrita errada **duas vezes**, cada vez mais forte que o código, e as duas
+  correções vieram de revisão: primeiro dizia que o filtro "não aparece no gráfico da corrida
+  inteira" (o guardian pegou: a curva já era desenhada), depois ficou um segundo marcador
+  contradizendo o primeiro (a lição pegou). O estado real é o do parágrafo acima.
 
 ## O relógio do broker (PR-208) — o que fica
 
@@ -1952,3 +1955,30 @@ o `backfill` mede).
   e não no schema.
 - `packages/schema/src/tradeforge_schema/semantic.py:293` é uma guarda de narrowing não exercida —
   gêmea da linha 324, que é anterior e igual. Só o `mypy` a exige.
+
+## O que a UI ainda não faz (levantado em 09/09/2026, antes da PR-210)
+
+Solicitar backtests com os gatilhos e filtros novos **já funciona**: o construtor e os eixos do
+estudo são derivados do JSON Schema, sem lista escrita à mão, então todo parâmetro novo aparece
+sozinho. O que falta é retorno visual e expressividade da grade, em ordem de valor:
+
+1. ~~As regiões do H4 não aparecem no gráfico~~ — **feito na PR-210**.
+2. **No retrato da entrada, a região do H4 é indistinguível da zona base** (`TradeSnapshot.tsx`
+   pinta todo retângulo do mesmo azul tracejado e nunca lê `region.label`), e **todas as curvas
+   saem na mesma cor**, sem legenda — com o filtro de média longa são duas linhas iguais.
+3. **A grade não sabe pedir "desligado".** `AxisValues` ignora `param.nullable` no ramo de enum e
+   `parseValues` não tem token para nulo, então `htf`, `long_average_period`, `breakeven_at_r` e
+   `max_bos` não podem ter "off" num eixo. O servidor já aceita `null`. É o que destrava o
+   experimento "com filtro × sem filtro" numa corrida só.
+4. **A regra cruzada `htf` ⇄ `htf_offset` não existe no navegador** — o botão fica habilitado e o
+   422 só chega depois de submeter. Idem a exigência de o `htf` ser mais grosso que o `timeframe`:
+   a grade oferece os oito timeframes crus.
+5. **Oito métricas calculadas e nunca exibidas**: `gross_profit`, `gross_loss`, `long_trades`,
+   `short_trades`, `max_drawdown_abs`, `max_dd_duration_days`, `cagr`, `avg_trade_duration`
+   (`sortino` só aparece na lista de corridas). Zero trabalho de backend.
+6. Menores: a seta do `htf_offset` começa em **-14** (o `startingPoint` cai no `param.min` quando o
+   default é nulo) e o exemplo de eixo sugere `0.5, 1, 1.5`, que não são offsets plausíveis.
+
+⚠️ **O endpoint `/overlays` não tem teste de integração para o campo `zones`** — os que existem
+asseguram só `series`. Pré-existente; a PR-210 fixou o contrato do `ZoneOut` em teste unitário e a
+publicação em teste de engine, mas o caminho HTTP inteiro segue sem cobertura.

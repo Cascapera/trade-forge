@@ -165,6 +165,25 @@ TIMEFRAME_DELTAS: Final[dict[str, dt.timedelta]] = {
     "W1": dt.timedelta(weeks=1),
 }
 
+# The same table read backwards, for the one direction that needs it: a strategy holding a
+# duration has to be able to say which bar the reader knows it by. Built from the table rather
+# than written out, so a timeframe added above arrives here on its own.
+#
+# ⚠️ **Only while the durations stay distinct.** A comprehension keeps the *last* of a repeated
+# key silently, so an `"H24"` beside `"D1"` would not go missing — it would rename every daily
+# chart, which is worse. The check below is what makes that a startup failure instead.
+#
+# ⚠️ **A `raise`, not an `assert`.** Every other assertion in this engine narrows a type for
+# `mypy` and is free to vanish under `python -O`; this one is an invariant about data, and an
+# invariant that disappears when somebody optimises the interpreter was never one.
+TIMEFRAME_NAMES: Final[dict[dt.timedelta, str]] = {
+    delta: name for name, delta in TIMEFRAME_DELTAS.items()
+}
+if len(TIMEFRAME_NAMES) != len(TIMEFRAME_DELTAS):  # pragma: no cover — a module invariant
+    raise RuntimeError(
+        "two timeframes share a duration, so one of them has no name to be charted under"
+    )
+
 
 @dataclass(frozen=True, slots=True)
 class Candle:
@@ -376,6 +395,20 @@ class ZoneMark:
     mitigated_at: dt.datetime | None
     primary: bool
     """First gap event of the impulse. Secondaries are only tradable with `allow_secondary`."""
+
+    label: str = "zone"
+    """Which series of regions this one belongs to — `zone` for the setup's own timeframe.
+
+    A setup filtered by a higher timeframe marks regions on **two** charts at once, and they mean
+    opposite things: the small ones are where the order rests, the big ones are what released the
+    side at all. Drawn without saying which is which, a run under the filter shows entries that
+    did not happen and rectangles that explain nothing.
+
+    The higher timeframe's regions carry the **bar's own name** — `H4`, `D1` — rather than a fixed
+    word, because a chart draws many of both at once and its legend has to name them. That is the
+    one place this differs from `SnapshotRegion.label`, which is a fixed `htf`: a snapshot is one
+    trade and carries at most one region of each kind, so there is nothing to tell apart.
+    """
 
     def __post_init__(self) -> None:
         _require_utc(self.from_time, "ZoneMark.from_time")

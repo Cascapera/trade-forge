@@ -17,7 +17,7 @@ from typing import Any
 
 import pytest
 
-from tradeforge_api.schemas import SnapshotOut, TradeOut
+from tradeforge_api.schemas import SnapshotOut, TradeOut, ZoneOut
 
 START = dt.datetime(2024, 1, 1, tzinfo=dt.UTC)
 HOUR = dt.timedelta(hours=1)
@@ -149,3 +149,38 @@ def test_regions_default_to_empty_rather_than_missing() -> None:
     payload = a_snapshot_payload()
     del payload["regions"]
     assert SnapshotOut.model_validate(payload).regions == []
+
+
+# --------------------------------------------------------------------------- #
+# The regions the chart draws over a whole run                                  #
+# --------------------------------------------------------------------------- #
+
+
+def _a_zone(**over: Any) -> dict[str, Any]:
+    return {
+        "kind": "demand",
+        "top": "1.10200",
+        "bottom": "1.10000",
+        "from_time": "2023-12-31T19:00:00+00:00",
+        "confirmed_at": "2023-12-31T21:00:00+00:00",
+        "mitigated_at": None,
+        "primary": True,
+        **over,
+    }
+
+
+def test_a_region_says_which_timeframe_it_came_from() -> None:
+    """A run under the higher-timeframe filter marks regions on two charts at once, and they mean
+    opposite things: the small ones are where the order rests, the big ones are what released the
+    side at all. The label is what a chart tells them apart by, and it is the bar's own name —
+    `H4` — because the legend has to name it."""
+    assert ZoneOut.model_validate(_a_zone(label="H4")).label == "H4"
+
+
+def test_a_region_recorded_before_the_filter_existed_reads_as_the_run_s_own() -> None:
+    """⚠️ Every backtest run before 2026-09 answers with no label at all, and it has to keep
+    reading as a region of the run's own timeframe. Defaulted rather than required, or the
+    endpoint would start failing on rows nobody is going to rewrite."""
+    payload = _a_zone()
+    assert "label" not in payload
+    assert ZoneOut.model_validate(payload).label == "zone"

@@ -1810,10 +1810,14 @@ E o efeito colateral já conhecido: `volume_filter: false` passa a aparecer em t
 `entry_point`, `gift_stop` e `volume_filter` — o teste `axes.test.ts` existe para acusar isso e
 acusou.
 
-## Três leituras minhas no ponto contínuo hospedando os padrões (PR-203) — confirmar com ele
+## Três leituras minhas no ponto contínuo hospedando os padrões (PR-203) — ✅ CONFIRMADAS
 
 Aberto em 07/09/2026. Ele autorizou seguir sem responder as três perguntas (*"pode fazer"*), então
 escolhi a leitura que segue do que ele já decidiu para o 9.1 e registro aqui.
+
+**Fechado em 08/09/2026: *"1 - sim / 2 - sim / 3 - sim"*.** Nada mudou no comportamento; os
+docstrings de `PontoContinuoStrategy` e `_arm_pattern` passaram a creditar a resposta dele. As três
+abaixo ficam como registro do que foi perguntado.
 
 **1. As duas correções continuam exigidas antes de o padrão poder armar.** O `entry_point`
 substitui a regra 3 (a barra que toca e fecha acima) e deixa as regras 1, 2, 4 e 5 de pé. Sem as

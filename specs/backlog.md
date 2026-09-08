@@ -1838,22 +1838,24 @@ não muda nada observável, porque aquele ramo também zera `_qualified` e a bar
 portão do item 3, que reseta. Fica no código com o comentário, pelo mesmo motivo do `crossing` do
 PR-202: as duas linhas respondem perguntas diferentes.
 
-## Filtro de time frame superior (PR-205) — leituras minhas e pendências conhecidas
+## Filtro de time frame superior (PR-205) — ✅ leituras CONFIRMADAS, pendências abertas
 
 Aberto em 08/09/2026. A definição dele está fechada (sete respostas, todas creditadas em
-`higher_timeframe.py`). O que segue são **leituras minhas** em bordas que ele não ditou, e
+`higher_timeframe.py`). O que segue eram **leituras minhas** em bordas que ele não ditou, e
 pendências técnicas da forma como o H4 é montado (ADR-0026).
 
-**Leituras a confirmar com ele (uma linha cada):**
+**Fechado em 09/09/2026: *"1 - correto / 2 - correto / 3 - correto / 4 - sim"*.** Nada mudou de
+comportamento; os docstrings passaram a creditar a resposta dele. As quatro ficam como registro do
+que foi perguntado. **As pendências técnicas continuam abertas.**
 
-1. **A referência é a região mais funda que a barra alcançou.** Uma barra que cai através da
+1. ✅ **A referência é a região mais funda que a barra alcançou.** Uma barra que cai através da
    secundária [110, 117] até a primária [80, 100] gasta as duas e mede o 2x e o rompimento pela
    primária. Medido, não raciocinado: com a mais nova como referência, o primeiro cenário sondado
    liberava e encerrava na mesma barra (fechou abaixo de 110 no caminho até 92).
-2. **Região alcançada e rompida na mesma barra gasta-se e não libera nada.**
-3. **Rompimento é fechamento, não pavio** — lido do exemplo dele (*"fecha em 85"*), não perguntado.
+2. ✅ **Região alcançada e rompida na mesma barra gasta-se e não libera nada.**
+3. ✅ **Rompimento é fechamento, não pavio** — lido do exemplo dele (*"fecha em 85"*), não perguntado.
    Fechar exatamente na borda de baixo não rompe (mesma leitura da regra 4 das médias).
-4. **O CHoCH confirmado na própria barra do toque conta** (*"a partir dessa barra"*); um confirmado
+4. ✅ **O CHoCH confirmado na própria barra do toque conta** (*"a partir dessa barra"*); um confirmado
    na barra anterior não.
 5. ~~A liberação é gasta ao ARMAR a zona~~ — **confirmado por ele em 08/09** (*"como está tá
    bom"*), junto com a devolução da liberação quando o venue recusa no portão (*"1 ok"*).

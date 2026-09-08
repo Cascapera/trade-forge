@@ -27,10 +27,16 @@ above it — and it says nothing about *how* the entry is made, only *whether it
 5. The break that qualifies the M15 zone has to confirm **after** the touch: a change of character
    from before price reached the region is not the reaction to it (*"a partir dali"*).
 6. Price closing through the region ends the search, on his own example: released, no entry, a
-   bar closes at 85 under [90, 100] — stop looking for the buy. **Close**, not wick; read off the
-   example rather than asked, and recorded as such.
+   bar closes at 85 under [90, 100] — stop looking for the buy. **Close**, not wick: read off that
+   example rather than asked, and confirmed on 2026-09-09 (*"3 - correto"*).
 7. The same rule serves the continuation setup — it is the structure family's filter, not the
    CHoCH's.
+
+**And four more he confirmed on 2026-09-09**, having been readings of ours when this shipped
+(*"1 - correto / 2 - correto / 3 - correto / 4 - sim"*): the reference is the deepest region the
+bar reached; a region reached and closed through on one bar spends itself and releases nothing;
+the break may confirm on the touching bar itself; and the close, above. Each is credited where it
+runs, because a rule that says it is ours is the rule somebody loosens later.
 
 **Where the H4 comes from.** The engine hands a strategy one stream of bars (`Context` carries
 one candle, and that is the anti-lookahead rule made structural). So the higher timeframe is
@@ -210,7 +216,8 @@ class HigherTimeframeGate:
     Measured, not reasoned: with the newer region as the reference the very first scenario probed
     released and ended on the same bar, because that bar had closed through the secondary on its
     way down to the primary. A region reached and closed through on the same bar spends itself
-    and releases nothing. Readings rather than rules of his, and recorded in the backlog as such.
+    and releases nothing. Both were readings of ours, and both are his answers since 2026-09-09
+    (*"1 - correto / 2 - correto"*).
     """
 
     def __init__(self, *, base: dt.timedelta, target: dt.timedelta) -> None:
@@ -280,7 +287,8 @@ class HigherTimeframeGate:
         Yes only while its side is released, and only for a zone whose break confirmed on or after
         the bar that released it (his answer 5). `confirmed_at` is the opening time of the bar
         whose close broke structure; `opened_at` the opening time of the bar that touched the
-        region. A break on the touching bar itself counts — *from that bar on*.
+        region. A break on the touching bar itself counts — *from that bar on*, and he confirmed
+        the boundary reading on 2026-09-09 (*"4 - sim"*): the touching bar yes, the one before no.
         """
         release = self._releases.get(block.side)
         return release is not None and block.confirmed_at >= release.opened_at
@@ -353,8 +361,9 @@ def _search_over(block: OrderBlock, candle: Candle) -> bool:
     """Has the market left this region behind — two heights past it, or closed through it?
 
     Both his: *"atinge 120 paramos de procurar"* on the wick, and the close at 85 under [90, 100]
-    on his own example. A close exactly on the far edge is neither — the same reading his rule 4
-    on the averages gives a close exactly on the line.
+    on his own example — the close and not the wick, confirmed 2026-09-09. A close exactly on the
+    far edge is neither, the same reading his rule 4 on the averages gives a close exactly on the
+    line.
     """
     height = block.top - block.bottom
     clearance = height * GIVE_UP_AT_REGION_HEIGHTS

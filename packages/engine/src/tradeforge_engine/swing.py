@@ -174,6 +174,95 @@ class _AverageTrail:
         return (SnapshotSeries(label=self._label, points=tuple(self._points)),)
 
 
+def _long_label(period: int) -> str:
+    """The filter's curve name. One function so the trail and the property cannot drift."""
+    return f"long EMA {period}"
+
+
+class LongAverageFilter:
+    """His optional direction filter: enter only on one side of a long average (2026-09-09).
+
+    Dictated the day after the higher-timeframe filter, for the same two setups: *"como filtro ele
+    só compraria acima da média longa ou venderia abaixo da média longa, o período da média o
+    usuário pode escolher"*. Exponential, like the averages the setups themselves are defined by,
+    and off unless a period is named — *"os filtros são opcionais"*.
+
+    ⚠️ **What is compared is the price the order would ENTER at, not the bar's close**, and that is
+    his answer rather than the obvious reading. Put to him with the case that separates the two — a
+    bar closing at 99 under a long average of 100, whose high breaks at 101 — he chose the entry:
+    *"a barra que fecha a mme9 pra cima, se a entrada ocorre acima da média longa já conta neste
+    caso mesmo o fechamento sendo abaixo"*. The rule is about where the trade begins, so a bar that
+    is still under the line but whose break carries price over it is a buy above the long average.
+    Read on the close instead, this setup would skip exactly the entries that cross it.
+
+    ⚠️ **It gates placing an order; it never withdraws one.** *"ela fica, só retira se o setup
+    desconfigurar"* — losing the long average is not the setup coming apart, and what already
+    ended an order goes on ending it (a close back across the setup's own average, a pattern's
+    window running out). So a blocked bar leaves whatever rests exactly where it is, which for the
+    classic entry means the order stops chasing the newest bar until the filter allows again.
+
+    ⚠️ **An open trade is not touched.** *"trade aberto conduz independente da média longa"*: the
+    conduction is the setup's, as it is for every trigger he has added.
+
+    **`allows` is false while the average is warming up**, and that is a reading of ours rather
+    than his rule (`specs/backlog.md`). With no value there is nothing to be above, so a filter
+    that let the entry through would be answering a question it cannot answer — and a period of
+    200 on a short backtest would then trade its first 199 bars unfiltered, which is the silent
+    version of the mistake. What it costs is visible instead: a run that arms nothing early on.
+    """
+
+    def __init__(self, *, period: int, side: Side) -> None:
+        if period < 1:
+            raise ValueError(f"long average period must be >= 1, got {period}")
+        self._period = period
+        self._side = side
+        self._ema = EMA(period=period, source="close")
+        self._trail = _AverageTrail(label=_long_label(period))
+
+    @property
+    def label(self) -> str:
+        """How the curve is named on a chart and in an entry's snapshot.
+
+        ⚠️ **"long" is in the name so the two curves cannot collide.** A setup filtered by an
+        average of its own period — `Mme9BreakoutStrategy(period=9, long_average_period=9)`, which
+        is a legal thing to ask for and a reasonable first experiment — would otherwise offer
+        `overlays()` two entries under one key, and a chart would draw one curve where two were
+        meant. The curves happen to be identical in that case, so nothing would look wrong.
+        """
+        return _long_label(self._period)
+
+    @property
+    def indicator(self) -> Indicator:
+        """The live average, for `Charted.overlays` — the caller must not drive it."""
+        return self._ema
+
+    def update(self, candle: Candle) -> None:
+        """Fold one closed bar in. Call on **every** bar, before any branch can return early: an
+        average fed only on the bars that reached it is a different average."""
+        self._ema.update(candle)
+        self._trail.record(candle, self._ema.value())
+
+    def value(self) -> Money | None:
+        return self._ema.value()
+
+    def series(self) -> tuple[SnapshotSeries, ...]:
+        """The long average as a curve, for the entry's picture. Empty while it is warming up."""
+        return self._trail.series()
+
+    def allows(self, entry: Money) -> bool:
+        """May an order entering at this price be placed?
+
+        Strictly beyond the average on the setup's side — a reading of ours, and the one the rest
+        of this module already uses for "above the average" (`candle.close > average`). An entry
+        landing exactly on the line is neither above nor below it, and the strictness costs a
+        trade nobody would notice either way.
+        """
+        average = self._ema.value()
+        if average is None:
+            return False
+        return entry > average if self._side is Side.LONG else entry < average
+
+
 def _reconcile_pattern(  # noqa: PLR0913 — one host's whole identity, passed field by field
     watch: PatternWatch,
     context: Context,
@@ -185,6 +274,7 @@ def _reconcile_pattern(  # noqa: PLR0913 — one host's whole identity, passed f
     armed: _Armed | None,
     count: int,
     series: tuple[SnapshotSeries, ...],
+    long_average: LongAverageFilter | None = None,
 ) -> tuple[list[Signal], _Armed | None, int]:
     """Fold this bar into the pattern's clock and reconcile the book with what it wants resting.
 
@@ -219,6 +309,17 @@ def _reconcile_pattern(  # noqa: PLR0913 — one host's whole identity, passed f
         armed = None
     if wanted is None or armed is not None:
         return signals, armed, count
+    if long_average is not None and not long_average.allows(wanted.price):
+        # His filter, on the price the order would enter at (`LongAverageFilter`). Placed here
+        # rather than in each host because the hosts disagree about everything *before* the
+        # order and about nothing after — the same argument this function exists for.
+        #
+        # ⚠️ **After the withdrawal above, not before it.** A pattern whose order the clock has
+        # given up on is withdrawn whether or not the filter would allow a new one: that
+        # withdrawal is the pattern's own two-bar window running out, which is the setup coming
+        # apart in his words, and the filter has no opinion about it.
+        logger.debug("%s wants %s, which the long average does not allow", name, wanted.price)
+        return signals, armed, count
 
     count += 1
     client_id = f"{name}-{candle.time:%Y%m%dT%H%M}-{count}"
@@ -233,11 +334,36 @@ def _reconcile_pattern(  # noqa: PLR0913 — one host's whole identity, passed f
             limit_price=wanted.limit_price,
             reason=f"entry.{name}.{entry_point.value}",
             client_id=client_id,
-            context={"average": average},
-            series=series,
+            context=_entry_context(average, long_average),
+            series=series + _long_series(long_average),
         )
     )
     return signals, armed, count
+
+
+def _entry_context(average: Money, long_average: "LongAverageFilter | None") -> dict[str, Money]:
+    """The levels this decision was judged against, as scalars for the entry's record.
+
+    The setup's own average always; the long one only when the filter is on, because a key that
+    is present and empty says something different from a key that is absent — and what a later
+    "does this only work far from the long average?" aggregates over is the pair.
+    """
+    if long_average is None:
+        return {"average": average}
+    value = long_average.value()
+    # Reachable only in principle: the filter refuses every entry while it has no value, so an
+    # order that got this far has one. Written as a total function anyway, because the caller
+    # that eventually asks for the context on a bar with no order would otherwise crash here.
+    return {"average": average} if value is None else {"average": average, "long_average": value}
+
+
+def _long_series(long_average: "LongAverageFilter | None") -> tuple[SnapshotSeries, ...]:
+    """The long average as a second curve on the entry's picture, when the filter is on.
+
+    A scalar cannot show what the filter did: the whole question a reader has is whether price was
+    running away from the long average or curling back to it, and that is a shape.
+    """
+    return () if long_average is None else long_average.series()
 
 
 def _withdraw(armed: _Armed, candle: Candle, *, side: Side, name: str) -> Signal:
@@ -287,6 +413,11 @@ class Mme9BreakoutStrategy:
     bars. What does **not** change is everything the turn already owned: the close across the
     average that ends it and withdraws whatever rests, the fill that spends it, and the conduction
     — *"a condução segue o padrão do setup, não do gatilho"*. See `average_setups.PatternWatch`.
+
+    **`long_average_period` is his optional direction filter** (2026-09-09): with it set, an order
+    is only placed when the price it would *enter* at is beyond a long exponential average — above
+    it for a buy, below it for a sell. It gates placing and never withdraws, and an open trade is
+    conducted exactly as before. `LongAverageFilter` carries the rule and his answers.
     """
 
     def __init__(  # noqa: PLR0913 — keyword-only; each names one knob of the setup
@@ -300,6 +431,7 @@ class Mme9BreakoutStrategy:
         entry_point: AverageEntryPoint = AverageEntryPoint.CLASSIC,
         gift_stop: GiftStop = GiftStop.GIFT,
         volume_filter: bool = False,
+        long_average_period: int | None = None,
     ) -> None:
         if period < 1:
             raise ValueError(f"MME period must be >= 1, got {period}")
@@ -327,6 +459,13 @@ class Mme9BreakoutStrategy:
             )
         )
         self._ema = EMA(period=period, source="close")
+        # His direction filter, or nothing. Built here rather than branched on later, so "the
+        # filter is off" is an object that does not exist instead of a flag read in three places.
+        self._long: LongAverageFilter | None = (
+            None
+            if long_average_period is None
+            else LongAverageFilter(period=long_average_period, side=side)
+        )
         # Kept for the chart's label. The indicator does not expose its own period, and a label
         # rebuilt from the setup's JSON elsewhere would be a second place holding this number.
         self._period = period
@@ -343,10 +482,19 @@ class Mme9BreakoutStrategy:
         self._was_on_side = False
 
     def overlays(self) -> Mapping[str, Indicator]:
-        """The average this setup is defined by — see `protocols.Charted`."""
-        return {f"EMA {self._period}": self._ema}
+        """The averages this setup reads — see `protocols.Charted`.
 
-    def on_bar(self, context: Context) -> tuple[Signal, ...]:
+        The one it is defined by, and the long one when the filter is on: a chart that drew only
+        the MME9 would show entries being skipped with nothing on it to say why.
+        """
+        overlays: dict[str, Indicator] = {f"EMA {self._period}": self._ema}
+        if self._long is not None:
+            overlays[self._long.label] = self._long.indicator
+        return overlays
+
+    def on_bar(  # noqa: PLR0911 — one flat return per rule of the setup, like `_may_arm`
+        self, context: Context
+    ) -> tuple[Signal, ...]:
         candle = context.candle
         # The average tracks every bar, open position or not: the turn that ends a trade and the
         # cross that starts the next one are both read off a live MME9.
@@ -354,6 +502,10 @@ class Mme9BreakoutStrategy:
         average = self._ema.value()
         # Recorded on every bar, before any branch below can return early — see `_AverageTrail`.
         self._trail_of_the_average.record(candle, average)
+        # And the filter's own average, on every bar for the same reason: one fed only on the
+        # bars that reached it is a different average, and its curve would be drawn compressed.
+        if self._long is not None:
+            self._long.update(candle)
 
         self._observe_fill(context)
 
@@ -417,6 +569,15 @@ class Mme9BreakoutStrategy:
             # wait for a bar that has a range.
             return ()
 
+        if self._long is not None and not self._long.allows(entry.stop_price):
+            # His filter, on the price the break would enter at rather than on this bar's close
+            # (`LongAverageFilter`). Returning early is what makes it *place* nothing: the
+            # withdrawal below never runs, so an order already resting stays where it is — *"ela
+            # fica, só retira se o setup desconfigurar"*. The cost is that this turn stops
+            # chasing the newest bar while the filter says no, and that is the same rule read
+            # from the other side.
+            return ()
+
         # This bar is the reference (the cross, or a rearm that follows it). Replace any resting
         # order — the trigger tracks the latest bar, up or down.
         signals = []
@@ -438,15 +599,16 @@ class Mme9BreakoutStrategy:
                 stop_price=entry.stop_price,
                 reason=f"entry.{self._name}",
                 client_id=client_id,
-                # The level that made this bar a reference. The trigger and the stop are on the
-                # order already; the average is the one number in the decision that no column
+                # The levels that made this bar a reference. The trigger and the stop are on
+                # the order already; the average is the one number in the decision that no column
                 # downstream would otherwise carry, and without it a chart of this entry shows
-                # a bar breaking out of nothing in particular.
-                context={"average": average},
-                # And the same average as the curve it actually is. The scalar above is what a
-                # later "does this only fire far from the average?" aggregates; this is what
-                # gets drawn. Neither can be derived from the other.
-                series=self._trail_of_the_average.series(),
+                # a bar breaking out of nothing in particular. The long average joins it when the
+                # filter is on, because then it is half of why this entry was allowed.
+                context=_entry_context(average, self._long),
+                # And the same averages as the curves they actually are. The scalars above are
+                # what a later "does this only fire far from the average?" aggregates; this is
+                # what gets drawn. Neither can be derived from the other.
+                series=self._trail_of_the_average.series() + _long_series(self._long),
             )
         )
         return tuple(signals)
@@ -491,6 +653,7 @@ class Mme9BreakoutStrategy:
             armed=self._armed,
             count=self._armed_count,
             series=self._trail_of_the_average.series(),
+            long_average=self._long,
         )
         return tuple(signals)
 
@@ -659,6 +822,11 @@ class PontoContinuoStrategy:
     4. The window is the touching bar or the next; there is no ceiling; and a pattern that fails
     spends nothing — the next touch starts over inside the same qualification. See `PatternWatch`.
 
+    **`long_average_period` is his optional direction filter** (2026-09-09): with it set, an order
+    is only placed when the price it would *enter* at is beyond a long exponential average — above
+    it for a buy, below it for a sell. It gates placing and never withdraws, and an open trade is
+    conducted exactly as before. `LongAverageFilter` carries the rule and his answers.
+
     Three of these were our readings when #203 shipped, and he confirmed all three on 2026-09-08
     (*"1 - sim / 2 - sim / 3 - sim"*): the two corrections are still required before a pattern may
     arm; the clock is fed every bar that did not close below the average; an open position closes
@@ -679,6 +847,7 @@ class PontoContinuoStrategy:
         entry_point: AverageEntryPoint = AverageEntryPoint.CLASSIC,
         gift_stop: GiftStop = GiftStop.GIFT,
         volume_filter: bool = False,
+        long_average_period: int | None = None,
     ) -> None:
         if period < 1:
             raise ValueError(f"average period must be >= 1, got {period}")
@@ -721,6 +890,13 @@ class PontoContinuoStrategy:
             )
         )
 
+        # His direction filter, or nothing — the same seam the MME9 has, and the same object.
+        self._long: LongAverageFilter | None = (
+            None
+            if long_average_period is None
+            else LongAverageFilter(period=long_average_period, side=side)
+        )
+
         self._previous: Candle | None = None
         self._corrections = 0
         # The latch: two corrections have happened and no close below the average has undone them.
@@ -733,12 +909,25 @@ class PontoContinuoStrategy:
         self._trail = StructuralTrail()
 
     def overlays(self) -> Mapping[str, Indicator]:
-        """The average the corrections are counted against — see `protocols.Charted`."""
-        return {f"{self._average_kind} {self._period}": self._average}
+        """The averages this setup reads — see `protocols.Charted`.
 
-    def on_bar(self, context: Context) -> tuple[Signal, ...]:
+        The one the corrections are counted against, and the long one when the filter is on: a
+        chart with only the first would show entries being skipped and nothing saying why.
+        """
+        overlays: dict[str, Indicator] = {f"{self._average_kind} {self._period}": self._average}
+        if self._long is not None:
+            overlays[self._long.label] = self._long.indicator
+        return overlays
+
+    def on_bar(  # noqa: PLR0911 — one flat return per rule of the setup, like `_may_arm`
+        self, context: Context
+    ) -> tuple[Signal, ...]:
         candle = context.candle
         self._average.update(candle)
+        # The filter's own average, on every bar — one fed only on the bars that reached it is a
+        # different average, and its curve would be drawn compressed. Same rule as the trail.
+        if self._long is not None:
+            self._long.update(candle)
         average = self._average.value()
         # Recorded on every bar, before any branch below can return early — see `_AverageTrail`.
         self._trail_of_the_average.record(candle, average)
@@ -810,6 +999,13 @@ class PontoContinuoStrategy:
             # this bar failed to be a setup, it did not destroy one.
             return tuple(signals)
 
+        if self._long is not None and not self._long.allows(entry.stop_price):
+            # His filter, on the entry price (`LongAverageFilter`). Like the bar with no range
+            # above, this bar failed to be a setup and destroyed nothing: the two corrections and
+            # the qualification stand, whatever rests stays resting, and the next touch asks
+            # again. Placing is gated; withdrawing is not.
+            return tuple(signals)
+
         if self._armed is not None:
             signals.append(self._withdraw(self._armed, candle))
         # The counter, not the timestamp, makes the name unique: below M1 two references share a
@@ -828,12 +1024,15 @@ class PontoContinuoStrategy:
                 reason=f"entry.{self._name}",
                 client_id=client_id,
                 # The average this bar touched and closed back above — the pullback's own
-                # definition, and the level a reader needs to see the touch happen.
-                context={"average": average},
+                # definition, and the level a reader needs to see the touch happen. The long
+                # average joins it when the filter is on: it is half of why this entry was
+                # allowed, and nothing else downstream would carry it.
+                context=_entry_context(average, self._long),
                 # And the curve it belongs to. In this setup the shape is the point: the whole
                 # rule is price running away, coming *back* to the line, and turning off it —
-                # which a single horizontal level cannot show.
-                series=self._trail_of_the_average.series(),
+                # which a single horizontal level cannot show. And the long average beside it,
+                # for the same reason, when the filter is on.
+                series=self._trail_of_the_average.series() + _long_series(self._long),
             )
         )
         return tuple(signals)
@@ -864,6 +1063,7 @@ class PontoContinuoStrategy:
             entry_point=self._entry_point,
             armed=self._armed,
             count=self._armed_count,
+            long_average=self._long,
             series=self._trail_of_the_average.series(),
         )
         return placed

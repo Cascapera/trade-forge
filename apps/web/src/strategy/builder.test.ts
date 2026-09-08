@@ -484,10 +484,11 @@ describe('buildSetupStrategy', () => {
     const document = buildSetupStrategy(pontoContinuoForm())
     expect(validateStrategy(document).valid).toBe(true)
     // ⚠️ Pinned by value. `entry_point`, `gift_stop` and `volume_filter` joined on 2026-09-07,
-    // when the bar patterns reached this setup: the template offers every parameter the schema
-    // declares, so a document built from it carries all three at their defaults. If this list
-    // grows again, the builder has started writing something new and somebody has to decide
-    // whether it should — which is the whole point of spelling it out.
+    // when the bar patterns reached this setup; `long_average_period` on 2026-09-09 with his
+    // direction filter, and it is written as `null` — the rule switched off — by the same rule
+    // `breakeven_at_r` follows. The template offers every parameter the schema declares, so a
+    // document built from it carries all of them. If this list grows again, the builder has
+    // started writing something new and somebody has to decide whether it should.
     expect(document.setup).toEqual({
       type: 'ponto_continuo',
       params: {
@@ -499,6 +500,7 @@ describe('buildSetupStrategy', () => {
         entry_point: 'classic',
         gift_stop: 'gift',
         volume_filter: false,
+        long_average_period: null,
       },
     })
   })

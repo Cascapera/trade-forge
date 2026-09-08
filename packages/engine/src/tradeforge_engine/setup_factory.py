@@ -107,7 +107,13 @@ def _optional_decimal(params: Mapping[str, object], key: str, into: dict[str, An
 
 
 def _optional_int(params: Mapping[str, object], key: str, into: dict[str, Any]) -> None:
-    """`max_bos: null` means uncapped, which is not the same as omitting the key."""
+    """Present-and-null is a setting; absent is not, and the two must not be confused.
+
+    What the `null` *means* is each parameter's own business: `max_bos: null` is uncapped, and
+    `long_average_period: null` is his direction filter switched off. What they share is only
+    that reading either as absent would put the class default back — and the day one of those
+    defaults stops being the same thing as "off", that would be a silent change of question.
+    """
     if key in params and params[key] is None:
         into[key] = None
         return
@@ -159,6 +165,7 @@ def _mme9(params: Mapping[str, object], _timeframe: dt.timedelta | None) -> Stra
     _choice(params, "entry_point", AverageEntryPoint, kwargs)
     _choice(params, "gift_stop", GiftStop, kwargs)
     _flag(params, "volume_filter", kwargs)
+    _optional_int(params, "long_average_period", kwargs)
     return Mme9BreakoutStrategy(**kwargs)
 
 
@@ -170,6 +177,7 @@ def _ponto_continuo(params: Mapping[str, object], _timeframe: dt.timedelta | Non
     _choice(params, "entry_point", AverageEntryPoint, kwargs)
     _choice(params, "gift_stop", GiftStop, kwargs)
     _flag(params, "volume_filter", kwargs)
+    _optional_int(params, "long_average_period", kwargs)
     if "average" in params:
         average = params["average"]
         if average not in ("EMA", "SMA"):

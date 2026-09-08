@@ -1862,10 +1862,13 @@ que foi perguntado. **As pendências técnicas continuam abertas.**
 
 **Pendências técnicas:**
 
-- **O relógio do H4 é UTC, não o do servidor do MetaTrader.** A barra de H4 da engine fecha em
-  00h/04h/08h UTC; a do MT5 fecha no horário do servidor da corretora. As regiões podem diferir
-  pelo deslocamento. Primeiro suspeito quando o gráfico dele e o backtest discordarem; o âncora
-  vira parâmetro no dia em que isso aparecer num backtest real.
+- ⚠️ **O relógio do H4 é UTC e tem que ser o do servidor MT5 — DECIDIDO por ele em 09/09/2026**
+  (*"sempre levar em consideração o horário do mt5"*), aguardando implementação. A barra de H4 da
+  engine fecha em 00h/04h/08h UTC; a do MT5 fecha no horário do servidor da corretora, e o coletor
+  já converteu tudo para UTC ao gravar. Com um broker em UTC+3 toda região de H4 sai deslocada
+  três horas do que ele vê no gráfico. O `_ANCHOR` do `BarAggregator` precisa receber o offset do
+  broker — o mesmo `--server-offset` que o coletor exige — e o documento precisa carregá-lo. Não é
+  mais "no dia em que aparecer": é a regra dele.
 - **As regiões de H4 não são desenhadas no gráfico.** `Zoned.zones()` devolve só as da base; o
   portão expõe `HigherTimeframeGate.zones`, mas nada as lê. A entrada carrega a região que a
   liberou (`htf_top`/`htf_bottom` no `context`, retângulo `htf` no snapshot), então o retrato de
@@ -1876,3 +1879,35 @@ que foi perguntado. **As pendências técnicas continuam abertas.**
   com a tabela atual (M1…W1), todo par mais grosso é múltiplo. Fica porque o modo de falha sem
   ela é um `ValueError` do `BarAggregator` em tempo de construção (500) em vez de um 422 na
   validação, no dia em que entrar H2/H6/H8. Só a metade da ordem tem teste.
+
+## Filtro de média longa no 9.1 e no ponto contínuo (PR-207) — leituras e pendências
+
+Aberto em 09/09/2026. A definição dele está fechada (cinco respostas, creditadas em
+`LongAverageFilter`): só compra acima / vende abaixo, o que conta é o **preço de entrada** e não o
+fechamento, a ordem pendurada **fica**, trade aberto conduz independente, média exponencial, vale
+para os dois setups, e o filtro é opcional.
+
+**Leituras minhas (uma linha cada):**
+
+1. **"Acima" é estritamente acima.** Uma entrada exatamente **em cima** da média longa é recusada,
+   nos dois lados. É a convenção que o resto do módulo já usa (`close > average`), e o custo é um
+   trade que ninguém notaria.
+2. **Enquanto a média longa está aquecendo, nada arma.** Sem valor não dá para afirmar que a
+   entrada está acima dela. A alternativa — deixar passar — faria um filtro de 200 períodos operar
+   as primeiras 199 barras sem filtro nenhum, em silêncio. Do jeito que está, o custo aparece: a
+   corrida arma menos no começo.
+3. **A média do filtro é sempre exponencial, mesmo no ponto contínuo com `average: "SMA"`.** O
+   `average` é a média contra a qual as *correções* são contadas; o filtro é uma segunda pergunta,
+   sobre direção, e a resposta dele nomeou uma exponencial. Os dois não compartilham botão.
+
+**Pendências técnicas:**
+
+- **A grade de estudo varia o período do filtro, mas não sabe pedir "desligado"** — `null` não é
+  um dos valores que um eixo enumera, então comparar "com filtro × sem filtro" continua sendo duas
+  corridas. É a mesma pendência que o `htf` já tinha (PR-205), agora com dois parâmetros.
+- **O filtro não é desenhado no front**, e só isso. O caminho de dados está inteiro: a entrada
+  carrega `long_average` no `context` e a curva `long EMA N` no `series`, `overlays()` devolve as
+  duas médias, e o endpoint de overlays da API (`apps/api/.../backtests.py`) já dirige `overlays()`
+  e devolve toda série com valor — ou seja, a média longa **já chega ao front**. Falta a tela
+  desenhar a segunda curva. ⚠️ A versão anterior desta linha dizia que o filtro "não aparece no
+  gráfico da corrida inteira", que é mais forte do que o código: o guardian pegou.

@@ -658,6 +658,11 @@ class PontoContinuoStrategy:
     there is the one that touches, and a bar closing exactly *on* the mean is neither event by rule
     4. The window is the touching bar or the next; there is no ceiling; and a pattern that fails
     spends nothing — the next touch starts over inside the same qualification. See `PatternWatch`.
+
+    Three of these were our readings when #203 shipped, and he confirmed all three on 2026-09-08
+    (*"1 - sim / 2 - sim / 3 - sim"*): the two corrections are still required before a pattern may
+    arm; the clock is fed every bar that did not close below the average; an open position closes
+    the gate and resets the clock. They are his rules now, not conservative defaults of ours.
     """
 
     _MIN_CORRECTION: Final = 2
@@ -842,7 +847,8 @@ class PontoContinuoStrategy:
         Feeding a pullback that has not qualified would let a hammer on any touch of the average
         arm this setup — which is the MME9's rule, not this one's. Here two corrections come
         first, and they are what makes it the Ponto Contínuo rather than a slower 9.1. A trade in
-        flight closes the gate for the reason rule 5 already gives: one at a time.
+        flight closes the gate for the reason rule 5 already gives: one at a time. Both halves of
+        this gate — the corrections and the open position — are his, confirmed 2026-09-08.
 
         The reconciliation itself is `_reconcile_pattern`, shared with the MME9.
         """

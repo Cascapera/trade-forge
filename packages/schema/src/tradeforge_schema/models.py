@@ -515,6 +515,14 @@ class Mme9BreakoutParams(_Node):
 
     `gift_stop` and `volume_filter` are the gift's dials, the same as on the structure setups, and
     are read only when `entry_point` is `gift` (both) or `barra_ignorada` (the filter alone).
+
+    `long_average_period` is his direction filter (2026-09-09), and `null` — the default — is the
+    filter off (*"os filtros são opcionais"*). Named, an order is placed only when the price it
+    would **enter** at is beyond an exponential average of that period: above it for a buy, below
+    it for a sell. ⚠️ The entry price, not the bar's close, and that is his answer rather than the
+    obvious reading — a bar closing under the long average whose break carries price over it is a
+    buy above the long average. It gates placing and never withdraws (*"ela fica, só retira se o
+    setup desconfigurar"*), and an open trade is conducted exactly as before.
     """
 
     side: SetupSide
@@ -524,6 +532,7 @@ class Mme9BreakoutParams(_Node):
     entry_point: AverageEntryPoint = "classic"
     gift_stop: GiftStop = "gift"
     volume_filter: bool = False
+    long_average_period: Annotated[int | None, Field(ge=1, le=1000)] = None
 
 
 class Mme9BreakoutSetup(_Node):
@@ -548,6 +557,18 @@ class PontoContinuoParams(_Node):
 
     `gift_stop` and `volume_filter` are the gift's dials, read only under `gift` (both) or
     `barra_ignorada` (the filter alone).
+
+    `long_average_period` is his direction filter (2026-09-09), and `null` — the default — is the
+    filter off (*"os filtros são opcionais"*). Named, an order is placed only when the price it
+    would **enter** at is beyond an exponential average of that period: above it for a buy, below
+    it for a sell. ⚠️ The entry price, not the bar's close, and that is his answer rather than the
+    obvious reading — a bar closing under the long average whose break carries price over it is a
+    buy above the long average. It gates placing and never withdraws (*"ela fica, só retira se o
+    setup desconfigurar"*), and an open trade is conducted exactly as before.
+
+    ⚠️ The filter's average is always exponential, whatever `average` says: `average` is the mean
+    the *corrections* are counted against, which is the setup, and the filter is a second question
+    about direction. His answer named an exponential one for it.
     """
 
     side: SetupSide
@@ -558,6 +579,7 @@ class PontoContinuoParams(_Node):
     entry_point: AverageEntryPoint = "classic"
     gift_stop: GiftStop = "gift"
     volume_filter: bool = False
+    long_average_period: Annotated[int | None, Field(ge=1, le=1000)] = None
 
 
 class PontoContinuoSetup(_Node):

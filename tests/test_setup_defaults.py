@@ -108,6 +108,8 @@ _PROBES: dict[str, dict[str, tuple[Any, Any]]] = {
         "entry_point": ("martelo", AverageEntryPoint.MARTELO),
         "gift_stop": ("forca", GiftStop.FORCA),
         "volume_filter": (True, True),
+        # His long-average direction filter (2026-09-09), off by default.
+        "long_average_period": (200, 200),
     },
     "ponto_continuo": {
         "side": ("short", Side.SHORT),
@@ -119,6 +121,7 @@ _PROBES: dict[str, dict[str, tuple[Any, Any]]] = {
         "entry_point": ("martelo", AverageEntryPoint.MARTELO),
         "gift_stop": ("forca", GiftStop.FORCA),
         "volume_filter": (True, True),
+        "long_average_period": (200, 200),
     },
     "structure_choch": {
         "allow_secondary": (True, True),

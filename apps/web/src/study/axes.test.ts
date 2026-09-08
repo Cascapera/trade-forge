@@ -14,11 +14,15 @@ describe('axesFor', () => {
     // schema's own order after that.
     // `entry_point`, `gift_stop` and `volume_filter` joined on 2026-09-07 with the bar patterns
     // on the average — and a study can now grid over the entry point itself.
+    // `long_average_period` joined on 2026-09-09 with his direction filter. ⚠️ A grid can vary
+    // the period but cannot ask for the filter *off*: `null` is not one of the values an axis
+    // enumerates, so "filtered against unfiltered" is still two runs. In `specs/backlog.md`.
     expect(paths).toEqual([
       'setup.params.side',
       'setup.params.breakeven_at_r',
       'setup.params.entry_point',
       'setup.params.gift_stop',
+      'setup.params.long_average_period',
       'setup.params.period',
       'setup.params.stop_buffer_ticks',
       'setup.params.volume_filter',

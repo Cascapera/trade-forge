@@ -248,12 +248,14 @@ export type Type10 = "percent_risk";
 export type SchemaVersion = "1.0";
 export type Setup = Mme9BreakoutSetup | PontoContinuoSetup | StructureChochSetup | StructureContinuationSetup;
 export type BreakevenAtR = number | null;
+export type LongAveragePeriod = number | null;
 export type Period3 = number;
 export type SetupSide = "long" | "short";
 export type StopBufferTicks = number;
 export type VolumeFilter = boolean;
 export type Type11 = "mme9_breakout";
 export type BreakevenAtR1 = number | null;
+export type LongAveragePeriod1 = number | null;
 export type Period4 = number;
 export type StopBufferTicks1 = number;
 export type VolumeFilter1 = boolean;
@@ -558,11 +560,20 @@ export interface Mme9BreakoutSetup {
  *
  * `gift_stop` and `volume_filter` are the gift's dials, the same as on the structure setups, and
  * are read only when `entry_point` is `gift` (both) or `barra_ignorada` (the filter alone).
+ *
+ * `long_average_period` is his direction filter (2026-09-09), and `null` — the default — is the
+ * filter off (*"os filtros são opcionais"*). Named, an order is placed only when the price it
+ * would **enter** at is beyond an exponential average of that period: above it for a buy, below
+ * it for a sell. ⚠️ The entry price, not the bar's close, and that is his answer rather than the
+ * obvious reading — a bar closing under the long average whose break carries price over it is a
+ * buy above the long average. It gates placing and never withdraws (*"ela fica, só retira se o
+ * setup desconfigurar"*), and an open trade is conducted exactly as before.
  */
 export interface Mme9BreakoutParams {
   breakeven_at_r?: BreakevenAtR;
   entry_point?: "classic" | "martelo" | "martelo_forca" | "gift" | "barra_ignorada";
   gift_stop?: "gift" | "forca";
+  long_average_period?: LongAveragePeriod;
   period?: Period3;
   side: SetupSide;
   stop_buffer_ticks?: StopBufferTicks;
@@ -589,12 +600,25 @@ export interface PontoContinuoSetup {
  *
  * `gift_stop` and `volume_filter` are the gift's dials, read only under `gift` (both) or
  * `barra_ignorada` (the filter alone).
+ *
+ * `long_average_period` is his direction filter (2026-09-09), and `null` — the default — is the
+ * filter off (*"os filtros são opcionais"*). Named, an order is placed only when the price it
+ * would **enter** at is beyond an exponential average of that period: above it for a buy, below
+ * it for a sell. ⚠️ The entry price, not the bar's close, and that is his answer rather than the
+ * obvious reading — a bar closing under the long average whose break carries price over it is a
+ * buy above the long average. It gates placing and never withdraws (*"ela fica, só retira se o
+ * setup desconfigurar"*), and an open trade is conducted exactly as before.
+ *
+ * ⚠️ The filter's average is always exponential, whatever `average` says: `average` is the mean
+ * the *corrections* are counted against, which is the setup, and the filter is a second question
+ * about direction. His answer named an exponential one for it.
  */
 export interface PontoContinuoParams {
   average?: "EMA" | "SMA";
   breakeven_at_r?: BreakevenAtR1;
   entry_point?: "classic" | "martelo" | "martelo_forca" | "gift" | "barra_ignorada";
   gift_stop?: "gift" | "forca";
+  long_average_period?: LongAveragePeriod1;
   period?: Period4;
   side: SetupSide;
   stop_buffer_ticks?: StopBufferTicks1;

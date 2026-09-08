@@ -5,7 +5,13 @@
   "timeframe": "H1",
   "setup": {
     "type": "mme9_breakout",
-    "params": { "side": "short", "period": 9, "breakeven_at_r": 2, "volume_filter": false }
+    "params": {
+      "side": "short",
+      "period": 9,
+      "breakeven_at_r": 2,
+      "volume_filter": false,
+      "long_average_period": null
+    }
   },
   "risk": {
     "sizing": { "type": "percent_risk", "params": { "percent": 1 } }

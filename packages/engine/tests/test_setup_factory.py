@@ -373,3 +373,40 @@ def test_a_higher_timeframe_that_is_not_higher_is_refused_by_the_class() -> None
         build_setup(
             {"type": "structure_choch", "params": {"htf": "M15"}}, timeframe=dt.timedelta(hours=1)
         )
+
+
+# --------------------------------------------------------------------------- #
+# The long-average direction filter (2026-09-09)                                #
+# --------------------------------------------------------------------------- #
+
+
+def test_the_long_average_period_reaches_both_swing_setups() -> None:
+    """Both hosts take the filter — his answer 5 — and `_optional_int` is what routes it. The
+    probe is a period that is not either setup's own, so a factory handing the setup's `period`
+    through by mistake would fail here rather than agree by coincidence."""
+    for kind, cls in (
+        ("mme9_breakout", Mme9BreakoutStrategy),
+        ("ponto_continuo", PontoContinuoStrategy),
+    ):
+        setup = _built(kind, side="long", long_average_period=200)
+        assert isinstance(setup, cls)
+        assert setup._long is not None
+        assert setup._long.label == "long EMA 200"
+
+
+def test_a_null_long_average_period_is_the_filter_off() -> None:
+    """Present-and-null is the setting *off*, and it must not be read as absent — which happens
+    to mean the same thing today, and would stop meaning it the day a default is given."""
+    setup = _built("mme9_breakout", side="long", long_average_period=None)
+    assert isinstance(setup, Mme9BreakoutStrategy)
+    assert setup._long is None
+
+
+def test_a_long_average_period_that_is_not_an_integer_is_refused() -> None:
+    with pytest.raises(EngineError, match="setup long_average_period must be an integer"):
+        _built("ponto_continuo", side="long", long_average_period="200")
+
+
+def test_a_long_average_period_the_class_rejects_still_raises() -> None:
+    with pytest.raises(ValueError, match="long average period must be >= 1"):
+        _built("mme9_breakout", side="long", long_average_period=0)

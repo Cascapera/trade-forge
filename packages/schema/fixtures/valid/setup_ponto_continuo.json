@@ -11,7 +11,8 @@
       "average": "EMA",
       "stop_buffer_ticks": 0,
       "breakeven_at_r": 2,
-      "volume_filter": false
+      "volume_filter": false,
+      "long_average_period": null
     }
   },
   "exit": {

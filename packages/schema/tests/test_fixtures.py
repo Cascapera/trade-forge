@@ -46,6 +46,7 @@ SEMANTIC_ERRORS = {
     "multi_output_indicator_without_a_component.json": "has several outputs",
     # The two timeframes are each fine on their own; only their order is wrong.
     "htf_finer_than_the_timeframe.json": "coarser than H1",
+    "htf_without_the_broker_clock.json": "hours its server runs ahead of UTC",
     # ⚠️ Here rather than in `invalid-schema/`, and that placement is the finding. `price.clsoe`
     # became well-formed the moment the grammar gained `id.component`, and the pattern cannot take
     # it back: Pydantic compiles `pattern=` with Rust's `regex`, which has no look-around, so

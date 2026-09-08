@@ -258,6 +258,7 @@ def _validate_setup_document(strategy: Strategy) -> list[SemanticError]:
     htf_error = _higher_timeframe_error(strategy)
     if htf_error is not None:
         errors.append(htf_error)
+    errors.extend(_broker_clock_errors(strategy))
     return errors
 
 
@@ -274,6 +275,40 @@ _TIMEFRAME_MINUTES: dict[str, int] = {
     "D1": 1440,
     "W1": 10080,
 }
+
+
+def _broker_clock_errors(strategy: Strategy) -> list[SemanticError]:
+    """A higher-timeframe filter has to say which clock its bars close on, and only then.
+
+    The engine assembles those bars from the document's own, and the stored candles are UTC while
+    a MetaTrader chart closes its H4 on the *server's* clock — so without the offset every region
+    would come out displaced by it, and nothing would look wrong (2026-09-09, his rule). Demanded
+    rather than defaulted, the same way the collector demands `--server-offset`.
+
+    And refused the other way round: an offset with no filter above it configures nothing, and a
+    number that does nothing is one somebody later reads as if it did.
+    """
+    setup = strategy.setup
+    if setup is None:
+        return []
+    htf = getattr(setup.params, "htf", None)
+    offset = getattr(setup.params, "htf_offset", None)
+    if htf is not None and offset is None:
+        return [
+            SemanticError(
+                "setup.params.htf_offset",
+                "a higher timeframe needs the broker's clock: give htf_offset, the hours its "
+                "server runs ahead of UTC (the collector's --server-offset)",
+            )
+        ]
+    if htf is None and offset is not None:
+        return [
+            SemanticError(
+                "setup.params.htf_offset",
+                "there is no higher timeframe for this clock to place; set htf or drop the offset",
+            )
+        ]
+    return []
 
 
 def _higher_timeframe_error(strategy: Strategy) -> SemanticError | None:

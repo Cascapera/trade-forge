@@ -157,6 +157,25 @@ def _optional_timeframe(params: Mapping[str, object], key: str, into: dict[str, 
     into[key] = delta
 
 
+def _optional_hours(params: Mapping[str, object], key: str, into: dict[str, Any]) -> None:
+    """Copy a clock offset across as a duration; an explicit `null` means it was not stated.
+
+    The document says hours ahead of UTC — `3`, `-5.5`, the same vocabulary the collector's
+    `--server-offset` takes — and the engine reasons in `timedelta`. Half hours are real
+    timezones, so this is a float rather than an int, and it goes through `str` for the same
+    reason every other fraction here does: a JSONB float carries binary dust.
+    """
+    if key in params and params[key] is None:
+        into[key] = None
+        return
+    if key not in params:
+        return
+    raw = params[key]
+    if isinstance(raw, bool) or not isinstance(raw, int | float | str):
+        raise EngineError(f"setup {key} must be hours ahead of UTC, got {raw!r}")
+    into[key] = dt.timedelta(hours=float(Decimal(str(raw))))
+
+
 def _mme9(params: Mapping[str, object], _timeframe: dt.timedelta | None) -> Strategy:
     kwargs: dict[str, Any] = {"side": _side(params)}
     _int(params, "period", kwargs)
@@ -203,6 +222,7 @@ def _structure_kwargs(
     # when the document set a filter: the class accepts it unused, but a keyword the document
     # never asked for is a third place a default could hide (see the module docstring).
     _optional_timeframe(params, "htf", kwargs)
+    _optional_hours(params, "htf_offset", kwargs)
     if kwargs.get("htf") is not None:
         kwargs["timeframe"] = timeframe
     return kwargs

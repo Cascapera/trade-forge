@@ -247,10 +247,13 @@ describe('the one document that comes back spelled out', () => {
     // `htf` joined on 2026-09-08, by the rule `max_bos` already followed: a cleared nullable
     // field is the rule switched off and is written as `null` — the first nullable *enum*, and
     // the same decision, so that a blank timeframe above cannot be mistaken for a forgotten one.
+    // `htf_offset` joined on 2026-09-09 with the broker's clock, which the semantic layer demands
+    // beside `htf` and refuses without it — so `null` here is the pair being off together.
     expect(rebuilt.setup.params).toEqual({
       allow_secondary: false,
       breakeven_at_r: null,
       htf: null,
+      htf_offset: null,
       max_bos: null,
       volume_filter: false,
     })

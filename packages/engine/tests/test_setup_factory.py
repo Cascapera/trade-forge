@@ -342,7 +342,8 @@ def test_the_higher_timeframe_reaches_both_structure_setups_as_a_duration() -> N
     is the one a test written against the choch alone would leave unproven."""
     for kind in ("structure_choch", "structure_continuation"):
         setup = build_setup(
-            {"type": kind, "params": {"htf": "H4"}}, timeframe=dt.timedelta(minutes=15)
+            {"type": kind, "params": {"htf": "H4", "htf_offset": 3}},
+            timeframe=dt.timedelta(minutes=15),
         )
         assert isinstance(setup, StructureStrategy)
         assert setup._gate is not None
@@ -371,7 +372,29 @@ def test_a_higher_timeframe_without_the_document_s_own_is_refused_by_the_class()
 def test_a_higher_timeframe_that_is_not_higher_is_refused_by_the_class() -> None:
     with pytest.raises(ValueError, match="coarser"):
         build_setup(
-            {"type": "structure_choch", "params": {"htf": "M15"}}, timeframe=dt.timedelta(hours=1)
+            {"type": "structure_choch", "params": {"htf": "M15", "htf_offset": 0}},
+            timeframe=dt.timedelta(hours=1),
+        )
+
+
+def test_the_broker_s_clock_reaches_the_engine_as_a_duration_half_hours_included() -> None:
+    """The document says hours ahead of UTC; the engine reasons in durations. Half hours are real
+    timezones, so the probe is one — and it is not zero, or the assertion would hold for a factory
+    that dropped the field and let the aggregator's own arithmetic answer."""
+    setup = build_setup(
+        {"type": "structure_choch", "params": {"htf": "H4", "htf_offset": -5.5}},
+        timeframe=dt.timedelta(minutes=15),
+    )
+    assert isinstance(setup, StructureStrategy)
+    assert setup._gate is not None
+    assert setup._gate.offset == dt.timedelta(hours=-5, minutes=-30)
+
+
+def test_a_clock_that_is_not_a_number_of_hours_is_refused() -> None:
+    with pytest.raises(EngineError, match="setup htf_offset must be hours ahead of UTC"):
+        build_setup(
+            {"type": "structure_choch", "params": {"htf": "H4", "htf_offset": True}},
+            timeframe=dt.timedelta(minutes=15),
         )
 
 

@@ -390,12 +390,30 @@ def test_the_broker_s_clock_reaches_the_engine_as_a_duration_half_hours_included
     assert setup._gate.offset == dt.timedelta(hours=-5, minutes=-30)
 
 
-def test_a_clock_that_is_not_a_number_of_hours_is_refused() -> None:
+@pytest.mark.parametrize("offset", [True, "abc", [3], {"hours": 3}])
+def test_a_clock_that_is_not_a_number_of_hours_is_refused(offset: object) -> None:
+    """Every shape that is not a number, and `"abc"` is the one that took a second look: the type
+    check lets a `str` through — `"3"` is a perfectly good number on a hand-built document — so
+    only the conversion can refuse it, and it has to refuse with a sentence. `compile_strategy`
+    promises a malformed document fails with one rather than a traceback, and a bare `ValueError`
+    from `float` would break that promise on this one field."""
     with pytest.raises(EngineError, match="setup htf_offset must be hours ahead of UTC"):
         build_setup(
-            {"type": "structure_choch", "params": {"htf": "H4", "htf_offset": True}},
+            {"type": "structure_choch", "params": {"htf": "H4", "htf_offset": offset}},
             timeframe=dt.timedelta(minutes=15),
         )
+
+
+def test_a_clock_written_as_a_string_of_digits_is_read() -> None:
+    """The other half of letting `str` through: `"3"` is the number three, and refusing it would
+    make the type check the rule instead of the value."""
+    setup = build_setup(
+        {"type": "structure_choch", "params": {"htf": "H4", "htf_offset": "-5.5"}},
+        timeframe=dt.timedelta(minutes=15),
+    )
+    assert isinstance(setup, StructureStrategy)
+    assert setup._gate is not None
+    assert setup._gate.offset == dt.timedelta(hours=-5, minutes=-30)
 
 
 # --------------------------------------------------------------------------- #

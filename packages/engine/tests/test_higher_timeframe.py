@@ -359,7 +359,7 @@ def test_a_bucket_still_open_is_never_returned() -> None:
         ),
     ],
 )
-def test_buckets_close_on_the_utc_clock(
+def test_buckets_close_on_whole_units_of_the_target(
     target: dt.timedelta, moment: dt.datetime, bucket: dt.datetime
 ) -> None:
     assert (

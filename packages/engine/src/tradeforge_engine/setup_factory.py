@@ -162,8 +162,15 @@ def _optional_hours(params: Mapping[str, object], key: str, into: dict[str, Any]
 
     The document says hours ahead of UTC — `3`, `-5.5`, the same vocabulary the collector's
     `--server-offset` takes — and the engine reasons in `timedelta`. Half hours are real
-    timezones, so this is a float rather than an int, and it goes through `str` for the same
-    reason every other fraction here does: a JSONB float carries binary dust.
+    timezones, so this is a float rather than an int.
+
+    ⚠️ **No trip through `Decimal` here, unlike `_decimal` above, and the difference is the return
+    type.** That helper exists because its value stays a `Decimal` all the way into a stop price,
+    where a JSONB float's binary dust would survive; this one becomes a `timedelta`, which is
+    microseconds and rounds the dust away regardless. An earlier version wrote
+    `float(Decimal(str(raw)))` and claimed the same protection — measured, `float(Decimal(str(x)))`
+    is `float(x)` for every value this field takes, so the claim was decoration on a no-op. A
+    docstring is an assertion, and this one was false.
     """
     if key in params and params[key] is None:
         into[key] = None
@@ -173,7 +180,14 @@ def _optional_hours(params: Mapping[str, object], key: str, into: dict[str, Any]
     raw = params[key]
     if isinstance(raw, bool) or not isinstance(raw, int | float | str):
         raise EngineError(f"setup {key} must be hours ahead of UTC, got {raw!r}")
-    into[key] = dt.timedelta(hours=float(Decimal(str(raw))))
+    try:
+        hours = float(raw)
+    except ValueError:
+        # A string that is not a number reaches here only from a hand-built document — the DSL
+        # types the field as `number | null`. It still gets a sentence rather than the bare
+        # `ValueError` traceback `compile_strategy` promises never to raise.
+        raise EngineError(f"setup {key} must be hours ahead of UTC, got {raw!r}") from None
+    into[key] = dt.timedelta(hours=hours)
 
 
 def _mme9(params: Mapping[str, object], _timeframe: dt.timedelta | None) -> Strategy:

@@ -50,8 +50,10 @@ consideração o horário do MT5"* (2026-09-09). A MetaTrader chart closes its H
 aggregator anchored on UTC cuts the bars somewhere else entirely, and with a broker three hours
 ahead every region comes out three hours displaced from the one he is looking at. Plausible, and
 wrong. `offset` is how far the broker's clock runs ahead of UTC, the same number and the same
-vocabulary the collector already demands as `--server-offset`, and it is required rather than
-guessed for exactly the reason stated there: a measured clock is a nondeterministic one.
+vocabulary the collector takes as `--server-offset`, and it is required rather than guessed for
+exactly the reason its `catalogue` command gives for demanding it: a measured clock is a
+nondeterministic one. (Its `backfill` measures instead, and guards the measurement with
+`offset_is_plausible` — the two commands differ, and the doctrine quoted here is `catalogue`'s.)
 """
 
 import datetime as dt

@@ -31,7 +31,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Final
 
-from tradeforge_engine.domain import Candle, Money
+from tradeforge_engine.domain import Candle, Money, Side
 
 
 class SwingKind(StrEnum):
@@ -1028,6 +1028,11 @@ class OrderBlock:
     confirmed_at: datetime
     break_kind: StructureKind
     primary: bool
+
+    @property
+    def side(self) -> Side:
+        """The side a trade from this region faces: demand is bought, supply is sold."""
+        return Side.LONG if self.kind is ZoneKind.DEMAND else Side.SHORT
 
 
 @dataclass(slots=True)

@@ -17,8 +17,12 @@ export type SchemaParam =
       name: string
       kind: 'enum'
       required: boolean
-      /** `null` when the schema gives none, which means the user has to choose. */
+      /** `null` when the schema gives none — which means the user has to choose, unless the
+       *  parameter is `nullable`, in which case `null` *is* the default: the rule switched off. */
       default: string | null
+      /** Whether an explicit `null` is a legal value — "off", not "unset". `htf` on the structure
+       *  setups is the first: no timeframe above is a setting, not a forgotten choice. */
+      nullable: boolean
       options: readonly string[]
     }
   | {
@@ -106,6 +110,7 @@ export function describeParam(
       kind: 'enum',
       required,
       default: typeof fallback === 'string' ? fallback : null,
+      nullable,
       options: branch.enum,
     }
   }

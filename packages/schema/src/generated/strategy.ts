@@ -260,6 +260,7 @@ export type VolumeFilter1 = boolean;
 export type Type12 = "ponto_continuo";
 export type AllowSecondary = boolean;
 export type BreakevenAtR2 = number | null;
+export type Timeframe = "M1" | "M5" | "M15" | "M30" | "H1" | "H4" | "D1" | "W1";
 export type StopBuffer = number;
 export type VolumeFilter2 = boolean;
 export type Type13 = "structure_choch";
@@ -269,7 +270,6 @@ export type MaxBos = number | null;
 export type StopBuffer1 = number;
 export type VolumeFilter3 = boolean;
 export type Type14 = "structure_continuation";
-export type Timeframe = "M1" | "M5" | "M15" | "M30" | "H1" | "H4" | "D1" | "W1";
 
 /**
  * A complete, self-contained strategy definition.
@@ -718,6 +718,18 @@ export interface StructureChochSetup {
  * where risk collapses to the stop buffer alone and position sizing divides by nearly nothing.
  * His model 2 — the marking candle's body limit — is absent for a different reason: the region
  * records only that candle's high and low, so the body is not there to read.
+ *
+ * `htf` is his higher-timeframe filter (2026-09-08), and `null` — the default — is the filter
+ * off. Named, the setup runs his structure and region detectors on bars of that timeframe too,
+ * assembled from its own, and may arm nothing until price reaches a region above that nobody
+ * has touched. That touch releases **one** entry on this timeframe: the first zone armed spends
+ * it, whatever becomes of the order, and the side is shut until price reaches another untouched
+ * region above. Released and still without an entry, the search ends when price runs two
+ * heights past the region or closes through it. The zone traded may sit outside the region
+ * above; the break that qualifies it must confirm after the touch. Serves the change of
+ * character and the continuation alike. The value must be coarser than the document's own
+ * `timeframe` and a whole number of its bars — `semantic.py` refuses the rest — and the bars
+ * above close on the UTC clock, which is not the MetaTrader server's.
  */
 export interface StructureParams {
   allow_secondary?: AllowSecondary;
@@ -725,6 +737,7 @@ export interface StructureParams {
   entry_point?:
     "edge" | "midpoint" | "return_pass" | "botinha" | "fffd" | "martelo" | "martelo_forca" | "gift" | "barra_ignorada";
   gift_stop?: "gift" | "forca";
+  htf?: Timeframe | null;
   stop_buffer?: StopBuffer;
   volume_filter?: VolumeFilter2;
 }
@@ -747,6 +760,7 @@ export interface ContinuationParams {
   entry_point?:
     "edge" | "midpoint" | "return_pass" | "botinha" | "fffd" | "martelo" | "martelo_forca" | "gift" | "barra_ignorada";
   gift_stop?: "gift" | "forca";
+  htf?: Timeframe | null;
   max_bos?: MaxBos;
   stop_buffer?: StopBuffer1;
   volume_filter?: VolumeFilter3;

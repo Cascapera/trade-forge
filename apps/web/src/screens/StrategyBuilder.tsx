@@ -586,8 +586,11 @@ function ParamField(props: {
         >
           {/* A required parameter with no schema default starts unanswered, and the blank option is
               how it stays that way until the user chooses. Pre-selecting `long` would turn a
-              forgotten choice into a whole long-only backtest read as the setup's result. */}
-          {param.default === null && <option value="">choose…</option>}
+              forgotten choice into a whole long-only backtest read as the setup's result. A
+              *nullable* enum is the other case: blank is an answer — the rule is off — and the
+              option says so, or `htf` would look like a question every CHoCH had forgotten. */}
+          {param.nullable && <option value="">off</option>}
+          {param.default === null && !param.nullable && <option value="">choose…</option>}
           {param.options.map((option) => (
             <option key={option} value={option}>
               {option}

@@ -255,7 +255,50 @@ def _validate_setup_document(strategy: Strategy) -> list[SemanticError]:
                 "a setup conducts its own exit; the position leaves at a level, never on a rule",
             ),
         )
+    htf_error = _higher_timeframe_error(strategy)
+    if htf_error is not None:
+        errors.append(htf_error)
     return errors
+
+
+# Minutes per bar, for the one comparison below. The engine reasons in `timedelta`s from its own
+# table; this package cannot import it (`tests/test_architecture.py`), and a rule about *which*
+# timeframe is coarser needs only the ordering, which both tables agree on by construction.
+_TIMEFRAME_MINUTES: dict[str, int] = {
+    "M1": 1,
+    "M5": 5,
+    "M15": 15,
+    "M30": 30,
+    "H1": 60,
+    "H4": 240,
+    "D1": 1440,
+    "W1": 10080,
+}
+
+
+def _higher_timeframe_error(strategy: Strategy) -> SemanticError | None:
+    """A higher-timeframe filter has to be *higher*, and a whole number of the document's bars.
+
+    The engine assembles those bars from the document's own, so an `htf` equal to or finer than
+    `timeframe` has nothing to build from, and one that is not a multiple — an H4 over an M30 is,
+    a D1 over a W1 is not — would close its bars mid-way through one of the base bars. Both are
+    refused here, where the two fields can be read together; the schema sees each on its own.
+    """
+    setup = strategy.setup
+    if setup is None:
+        return None
+    htf = getattr(setup.params, "htf", None)
+    if htf is None:
+        return None
+    base = _TIMEFRAME_MINUTES[strategy.timeframe]
+    above = _TIMEFRAME_MINUTES[htf]
+    if above <= base or above % base != 0:
+        return SemanticError(
+            "setup.params.htf",
+            f"the higher timeframe must be coarser than {strategy.timeframe} and a whole number "
+            f"of its bars; {htf} is not",
+        )
+    return None
 
 
 def validate_semantics(strategy: Strategy) -> list[SemanticError]:

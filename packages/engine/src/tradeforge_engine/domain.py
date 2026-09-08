@@ -26,6 +26,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import StrEnum
+from typing import Final
 
 # An amount of money, or a price. Exact decimal arithmetic: an equity curve is a sum of
 # thousands of these, and binary floating point drifts through exactly that path.
@@ -146,6 +147,23 @@ class InstrumentSpec:
         Same formula, entirely different numbers, and no `if asset_class ==` anywhere.
         """
         return (price_move / self.tick_size) * self.tick_value * volume
+
+
+# The DSL names a timeframe; the loop needs its duration to police the lookahead ceiling
+# (PR-103), and a setup that reads a higher timeframe needs both durations to build its bars.
+# Deriving every one of them from this table means a strategy and the engine that runs it
+# never disagree about how long a bar is. It lives here, with the types it describes, because
+# `setup_factory` needs it and `strategy` imports the factory — the other way round is a cycle.
+TIMEFRAME_DELTAS: Final[dict[str, dt.timedelta]] = {
+    "M1": dt.timedelta(minutes=1),
+    "M5": dt.timedelta(minutes=5),
+    "M15": dt.timedelta(minutes=15),
+    "M30": dt.timedelta(minutes=30),
+    "H1": dt.timedelta(hours=1),
+    "H4": dt.timedelta(hours=4),
+    "D1": dt.timedelta(days=1),
+    "W1": dt.timedelta(weeks=1),
+}
 
 
 @dataclass(frozen=True, slots=True)

@@ -570,7 +570,10 @@ export function foldParams(
     }
     const text = typeof raw === 'string' ? raw.trim() : ''
     if (text === '') {
-      if (param.kind !== 'enum' && param.nullable) folded[param.name] = null
+      // A cleared nullable field is the rule switched off, spelled out — for an enum as much as
+      // for a number: `htf: null` says "no timeframe above", where an absent key would say only
+      // "whatever the class defaults to", and the two happen to agree today.
+      if (param.nullable) folded[param.name] = null
       continue
     }
     folded[param.name] = param.kind === 'enum' ? text : Number(text)

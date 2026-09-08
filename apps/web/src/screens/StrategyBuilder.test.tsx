@@ -104,6 +104,20 @@ describe('the strategy picker', () => {
     expect(screen.getByLabelText('take profit rr')).toHaveValue(5)
   })
 
+  it('offers the timeframe above as off rather than as a question left unanswered', () => {
+    // `htf` is nullable with a null default: blank is the filter off, a real setting, and the
+    // blank option has to say so. "choose…" here would make every CHoCH look like a form with a
+    // field the author forgot — and a required-looking blank is what a person fills in.
+    renderWithProviders(<StrategyBuilder />)
+    fireEvent.change(screen.getByLabelText('strategy'), { target: { value: 'structure_choch' } })
+
+    const htf = screen.getByLabelText('setup htf')
+    expect(htf).toHaveValue('')
+    expect(within(htf).getByRole('option', { name: 'off' })).toBeInTheDocument()
+    expect(within(htf).queryByRole('option', { name: 'choose…' })).not.toBeInTheDocument()
+    expect(within(htf).getByRole('option', { name: 'H4' })).toBeInTheDocument()
+  })
+
   it('stamps a fresh name every time a strategy is picked', () => {
     // Picking a strategy is the act that starts a new lineage, so it is the act that mints a new
     // name. Two picks a minute apart must not collide — that collision is the 409 this replaces.

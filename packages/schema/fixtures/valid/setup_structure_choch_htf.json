@@ -1,0 +1,28 @@
+{
+  "schema_version": "1.0",
+  "name": "SMC — mudança de caráter filtrada pelo H4",
+  "description": "A mesma entrada de CHoCH, só liberada quando o preço toca uma região de H4 ainda não mitigada. Uma entrada por região; a busca acaba duas alturas acima ou no rompimento.",
+  "timeframe": "M15",
+  "setup": {
+    "type": "structure_choch",
+    "params": {
+      "htf": "H4"
+    }
+  },
+  "exit": {
+    "take_profit": {
+      "type": "risk_multiple",
+      "params": {
+        "rr": 3
+      }
+    }
+  },
+  "risk": {
+    "sizing": {
+      "type": "percent_risk",
+      "params": {
+        "percent": 0.5
+      }
+    }
+  }
+}

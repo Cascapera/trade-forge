@@ -9,7 +9,8 @@
       "allow_secondary": false,
       "stop_buffer": 0.1,
       "breakeven_at_r": 2,
-      "volume_filter": false
+      "volume_filter": false,
+      "htf": null
     }
   },
   "exit": {

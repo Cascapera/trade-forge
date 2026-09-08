@@ -244,9 +244,13 @@ describe('the one document that comes back spelled out', () => {
     // it is set, the rule `allow_secondary` has followed since the form existed, so a structure
     // document now spells out two of them. It is meaningful only under `entry_point: "gift"` or
     // `"barra_ignorada"`; on every other entry point it is a key the engine ignores.
+    // `htf` joined on 2026-09-08, by the rule `max_bos` already followed: a cleared nullable
+    // field is the rule switched off and is written as `null` — the first nullable *enum*, and
+    // the same decision, so that a blank timeframe above cannot be mistaken for a forgotten one.
     expect(rebuilt.setup.params).toEqual({
       allow_secondary: false,
       breakeven_at_r: null,
+      htf: null,
       max_bos: null,
       volume_filter: false,
     })

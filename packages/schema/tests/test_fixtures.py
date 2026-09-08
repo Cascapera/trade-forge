@@ -44,6 +44,8 @@ SEMANTIC_ERRORS = {
     # on every bar of every run — a clean backtest of a rule that was never evaluated.
     "component_of_a_single_valued_indicator.json": "answers with a single value",
     "multi_output_indicator_without_a_component.json": "has several outputs",
+    # The two timeframes are each fine on their own; only their order is wrong.
+    "htf_finer_than_the_timeframe.json": "coarser than H1",
     # ⚠️ Here rather than in `invalid-schema/`, and that placement is the finding. `price.clsoe`
     # became well-formed the moment the grammar gained `id.component`, and the pattern cannot take
     # it back: Pydantic compiles `pattern=` with Rust's `regex`, which has no look-around, so

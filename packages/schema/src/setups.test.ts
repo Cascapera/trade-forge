@@ -57,8 +57,24 @@ describe('the defaults the form shows', () => {
       kind: 'enum',
       required: false,
       default: 'EMA',
+      nullable: false,
       options: ['EMA', 'SMA'],
     })
+  })
+
+  it('reads htf as a nullable enum of the timeframes, off by default', () => {
+    // `null` is the filter off — a setting, not an unanswered question — so the form must offer
+    // "off" rather than "choose…", and fold a blank back to `null` rather than drop it.
+    for (const type of ['structure_choch', 'structure_continuation'] as const) {
+      expect(param(type, 'htf')).toEqual({
+        name: 'htf',
+        kind: 'enum',
+        required: false,
+        default: null,
+        nullable: true,
+        options: ['M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1', 'W1'],
+      })
+    }
   })
 
   it('reads allow_secondary as a flag that is off by default', () => {
@@ -81,6 +97,7 @@ describe('the parameters a form has to treat specially', () => {
       kind: 'enum',
       required: true,
       default: null,
+      nullable: false,
       options: ['long', 'short'],
     })
   })

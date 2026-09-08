@@ -377,3 +377,43 @@ def test_a_document_that_is_neither_a_setup_nor_a_strategy_is_refused() -> None:
     model = strategy(entry={})
 
     assert "at least one side" in messages(model)
+
+
+# --------------------------------------------------------------------------- #
+# The timeframe above a structure setup (2026-09-08)                            #
+# --------------------------------------------------------------------------- #
+
+
+def _filtered(timeframe: str, htf: str) -> Strategy:
+    return setup_strategy(
+        timeframe=timeframe, setup={"type": "structure_choch", "params": {"htf": htf}}
+    )
+
+
+def test_a_higher_timeframe_above_the_document_s_own_is_sound() -> None:
+    assert validate_semantics(_filtered("M15", "H4")) == []
+    assert validate_semantics(_filtered("D1", "W1")) == []
+
+
+def test_the_filter_off_is_sound_on_every_timeframe() -> None:
+    model = setup_strategy(
+        timeframe="W1", setup={"type": "structure_choch", "params": {"htf": None}}
+    )
+    assert validate_semantics(model) == []
+
+
+@pytest.mark.parametrize(("timeframe", "htf"), [("H1", "M15"), ("H4", "H4"), ("W1", "D1")])
+def test_a_higher_timeframe_that_is_not_higher_is_refused(timeframe: str, htf: str) -> None:
+    """The engine assembles the bars above from the document's own, so a filter on a finer or
+    equal timeframe has nothing to build from. The schema sees each field alone; only here can
+    the two be read together, and the error names the field the form has to point at."""
+    errors = validate_semantics(_filtered(timeframe, htf))
+    assert [error.path for error in errors] == ["setup.params.htf"]
+    assert f"coarser than {timeframe}" in messages(_filtered(timeframe, htf))
+
+
+def test_the_continuation_setup_is_held_to_the_same_rule() -> None:
+    model = setup_strategy(
+        timeframe="H4", setup={"type": "structure_continuation", "params": {"htf": "H1"}}
+    )
+    assert "coarser than H4" in messages(model)

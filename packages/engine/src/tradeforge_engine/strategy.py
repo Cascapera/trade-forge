@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from typing import Final
 
 from tradeforge_engine.domain import (
+    TIMEFRAME_DELTAS,
     Candle,
     Context,
     EvalContext,
@@ -48,20 +49,6 @@ from tradeforge_engine.protocols import CompositeIndicator, Indicator, Strategy
 from tradeforge_engine.setup_factory import build_setup
 
 SUPPORTED_SCHEMA_VERSION: Final = "1.0"
-
-# The DSL names a timeframe; the loop needs its duration to police the lookahead ceiling
-# (PR-103). Deriving one from the other here means a strategy and the engine that runs it
-# never disagree about how long a bar is.
-TIMEFRAME_DELTAS: Final[dict[str, dt.timedelta]] = {
-    "M1": dt.timedelta(minutes=1),
-    "M5": dt.timedelta(minutes=5),
-    "M15": dt.timedelta(minutes=15),
-    "M30": dt.timedelta(minutes=30),
-    "H1": dt.timedelta(hours=1),
-    "H4": dt.timedelta(hours=4),
-    "D1": dt.timedelta(days=1),
-    "W1": dt.timedelta(weeks=1),
-}
 
 
 def _max_lookback(condition: Condition) -> int:
@@ -329,22 +316,24 @@ def compile_strategy(document: Mapping[str, object]) -> Strategy:
             f"this engine interprets {SUPPORTED_SCHEMA_VERSION!r}"
         )
 
-    setup = document.get("setup")
-    if setup is not None:
-        # The version gate above is deliberately shared: a setup document is a strategy document,
-        # and an engine that refuses to interpret one must refuse to interpret the other.
-        return build_setup(_require_mapping(setup, "setup"))
-
-    name = document.get("name")
-    if not isinstance(name, str):
-        raise EngineError(f"strategy name must be a string, got {name!r}")
-
     timeframe_key = document.get("timeframe")
     timeframe = TIMEFRAME_DELTAS.get(str(timeframe_key))
     if timeframe is None:
         raise EngineError(
             f"unknown timeframe {timeframe_key!r}; this engine knows {sorted(TIMEFRAME_DELTAS)}"
         )
+
+    setup = document.get("setup")
+    if setup is not None:
+        # The version gate above is deliberately shared: a setup document is a strategy document,
+        # and an engine that refuses to interpret one must refuse to interpret the other. The
+        # timeframe is handed over because a setup may read a *higher* one, and it can only build
+        # those bars knowing how long its own are.
+        return build_setup(_require_mapping(setup, "setup"), timeframe=timeframe)
+
+    name = document.get("name")
+    if not isinstance(name, str):
+        raise EngineError(f"strategy name must be a string, got {name!r}")
 
     indicators: dict[str, Indicator | CompositeIndicator] = {}
     raw_indicators = document.get("indicators", [])

@@ -554,6 +554,23 @@ describe('buildSetupStrategy', () => {
     expect(validateStrategy(off).valid).toBe(true)
   })
 
+  it('reads a cleared nullable enum as null too — the timeframe above switched off', () => {
+    // `htf` is the first nullable enum. Folding it like a non-nullable one — dropping the key —
+    // would say the same thing to the engine today, and would leave the form unable to say
+    // "off" on the day the class default stops being "off".
+    const form = setupForm('structure_choch', PICKED_AT)
+    const off = buildSetupStrategy(form)
+    expect(off.setup.params).toMatchObject({ htf: null })
+    expect(validateStrategy(off).valid).toBe(true)
+
+    const filtered = buildSetupStrategy({
+      ...form,
+      setup: { ...form.setup, values: { ...form.setup.values, htf: 'H4' } },
+    })
+    expect(filtered.setup.params).toMatchObject({ htf: 'H4' })
+    expect(validateStrategy(filtered).valid).toBe(true)
+  })
+
   it('drops a cleared non-nullable field so the engine default applies', () => {
     const form = pontoContinuoForm()
     const document = buildSetupStrategy({

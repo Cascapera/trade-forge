@@ -1,0 +1,20 @@
+{
+  "schema_version": "1.0",
+  "name": "Filtro num tempo mais fino que o próprio",
+  "description": "O filtro de time frame superior precisa ser superior: as barras dele são montadas a partir das do documento. Um H1 filtrado por M15 não tem de onde montar nada — o schema aceita, só a semântica recusa.",
+  "timeframe": "H1",
+  "setup": {
+    "type": "structure_choch",
+    "params": {
+      "htf": "M15"
+    }
+  },
+  "risk": {
+    "sizing": {
+      "type": "percent_risk",
+      "params": {
+        "percent": 1.0
+      }
+    }
+  }
+}

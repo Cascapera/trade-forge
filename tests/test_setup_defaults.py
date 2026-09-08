@@ -29,6 +29,7 @@ is the invariant `tests/test_architecture.py` enforces — and precisely why not
 level would otherwise notice the drift.
 """
 
+import datetime as dt
 import inspect
 from decimal import Decimal
 from typing import Any, get_args
@@ -131,6 +132,8 @@ _PROBES: dict[str, dict[str, tuple[Any, Any]]] = {
         # `"gift"` and `False` are what the class answers when nothing arrives.
         "gift_stop": ("forca", GiftStop.FORCA),
         "volume_filter": (True, True),
+        # The timeframe above (2026-09-08): the document names a bar, the class takes a duration.
+        "htf": ("H4", dt.timedelta(hours=4)),
     },
     "structure_continuation": {
         "allow_secondary": (True, True),
@@ -140,6 +143,7 @@ _PROBES: dict[str, dict[str, tuple[Any, Any]]] = {
         "entry_point": ("midpoint", ZoneEntryPoint.MIDPOINT),
         "gift_stop": ("forca", GiftStop.FORCA),
         "volume_filter": (True, True),
+        "htf": ("H4", dt.timedelta(hours=4)),
     },
 }
 

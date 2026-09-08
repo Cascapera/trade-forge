@@ -11,6 +11,7 @@ attributes to do it. That is deliberate: the parameters are the entire contract 
 a test that only checked the class name would pass for every one of the bugs above.
 """
 
+import datetime as dt
 from decimal import Decimal
 
 import pytest
@@ -328,3 +329,47 @@ def test_an_unknown_mme9_entry_point_is_refused_rather_than_defaulted() -> None:
 def test_the_volume_filter_must_be_a_boolean() -> None:
     with pytest.raises(EngineError, match="setup volume_filter must be true or false"):
         _built("structure_choch", entry_point="gift", volume_filter="on")
+
+
+# --------------------------------------------------------------------------- #
+# The timeframe above (2026-09-08)                                              #
+# --------------------------------------------------------------------------- #
+
+
+def test_the_higher_timeframe_reaches_both_structure_setups_as_a_duration() -> None:
+    """The document names a bar; the class takes how long one lasts. Both setups of the family
+    take it, because the filter is the family's (his answer 7), and `structure_continuation`
+    is the one a test written against the choch alone would leave unproven."""
+    for kind in ("structure_choch", "structure_continuation"):
+        setup = build_setup(
+            {"type": kind, "params": {"htf": "H4"}}, timeframe=dt.timedelta(minutes=15)
+        )
+        assert isinstance(setup, StructureStrategy)
+        assert setup._gate is not None
+        assert setup._gate.timeframe == dt.timedelta(hours=4)
+
+
+def test_an_unknown_higher_timeframe_is_refused_with_the_alternatives() -> None:
+    with pytest.raises(EngineError, match=r"setup htf must be one of .*'H4'.*got 'H3'"):
+        build_setup(
+            {"type": "structure_choch", "params": {"htf": "H3"}}, timeframe=dt.timedelta(minutes=15)
+        )
+
+
+def test_a_null_higher_timeframe_is_the_filter_off() -> None:
+    setup = build_setup({"type": "structure_choch", "params": {"htf": None}})
+    assert isinstance(setup, StructureStrategy)
+    assert setup._gate is None
+
+
+def test_a_higher_timeframe_without_the_document_s_own_is_refused_by_the_class() -> None:
+    """`build_setup` alone cannot know the base bar; the class says so rather than guessing."""
+    with pytest.raises(ValueError, match="own timeframe"):
+        _built("structure_choch", htf="H4")
+
+
+def test_a_higher_timeframe_that_is_not_higher_is_refused_by_the_class() -> None:
+    with pytest.raises(ValueError, match="coarser"):
+        build_setup(
+            {"type": "structure_choch", "params": {"htf": "M15"}}, timeframe=dt.timedelta(hours=1)
+        )

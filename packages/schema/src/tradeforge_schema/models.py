@@ -676,6 +676,18 @@ class StructureParams(_Node):
     where risk collapses to the stop buffer alone and position sizing divides by nearly nothing.
     His model 2 — the marking candle's body limit — is absent for a different reason: the region
     records only that candle's high and low, so the body is not there to read.
+
+    `htf` is his higher-timeframe filter (2026-09-08), and `null` — the default — is the filter
+    off. Named, the setup runs his structure and region detectors on bars of that timeframe too,
+    assembled from its own, and may arm nothing until price reaches a region above that nobody
+    has touched. That touch releases **one** entry on this timeframe: the first zone armed spends
+    it, whatever becomes of the order, and the side is shut until price reaches another untouched
+    region above. Released and still without an entry, the search ends when price runs two
+    heights past the region or closes through it. The zone traded may sit outside the region
+    above; the break that qualifies it must confirm after the touch. Serves the change of
+    character and the continuation alike. The value must be coarser than the document's own
+    `timeframe` and a whole number of its bars — `semantic.py` refuses the rest — and the bars
+    above close on the UTC clock, which is not the MetaTrader server's.
     """
 
     allow_secondary: bool = False
@@ -684,6 +696,7 @@ class StructureParams(_Node):
     breakeven_at_r: Annotated[float | None, Field(gt=0, le=100)] = 2.0
     gift_stop: GiftStop = "gift"
     volume_filter: bool = False
+    htf: Timeframe | None = None
 
 
 class StructureChochSetup(_Node):

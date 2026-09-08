@@ -18,6 +18,7 @@ test constructs each class to prove the two agree. A default restated here would
 and the one that silently disagrees.
 """
 
+import datetime as dt
 from collections.abc import Mapping
 from decimal import Decimal
 from enum import StrEnum
@@ -25,7 +26,7 @@ from typing import Any
 
 from tradeforge_engine.average_setups import AverageEntryPoint
 from tradeforge_engine.bar_setups import GiftStop
-from tradeforge_engine.domain import Side
+from tradeforge_engine.domain import TIMEFRAME_DELTAS, Side
 from tradeforge_engine.errors import EngineError
 from tradeforge_engine.protocols import Strategy
 from tradeforge_engine.setups import (
@@ -131,7 +132,26 @@ def _choice(
     into[key] = choices(raw)
 
 
-def _mme9(params: Mapping[str, object]) -> Strategy:
+def _optional_timeframe(params: Mapping[str, object], key: str, into: dict[str, Any]) -> None:
+    """Copy a timeframe name across as its duration; an explicit `null` switches the rule off.
+
+    The document names a bar (`"H4"`), the engine reasons in durations, and `TIMEFRAME_DELTAS`
+    is the one table both read — so a name this engine does not know is refused with the
+    alternatives, like an unknown entry point, rather than run as no filter at all.
+    """
+    if key in params and params[key] is None:
+        into[key] = None
+        return
+    if key not in params:
+        return
+    raw = params[key]
+    delta = TIMEFRAME_DELTAS.get(raw) if isinstance(raw, str) else None
+    if delta is None:
+        raise EngineError(f"setup {key} must be one of {sorted(TIMEFRAME_DELTAS)}, got {raw!r}")
+    into[key] = delta
+
+
+def _mme9(params: Mapping[str, object], _timeframe: dt.timedelta | None) -> Strategy:
     kwargs: dict[str, Any] = {"side": _side(params)}
     _int(params, "period", kwargs)
     _int(params, "stop_buffer_ticks", kwargs)
@@ -142,7 +162,7 @@ def _mme9(params: Mapping[str, object]) -> Strategy:
     return Mme9BreakoutStrategy(**kwargs)
 
 
-def _ponto_continuo(params: Mapping[str, object]) -> Strategy:
+def _ponto_continuo(params: Mapping[str, object], _timeframe: dt.timedelta | None) -> Strategy:
     kwargs: dict[str, Any] = {"side": _side(params)}
     _int(params, "period", kwargs)
     _int(params, "stop_buffer_ticks", kwargs)
@@ -158,7 +178,9 @@ def _ponto_continuo(params: Mapping[str, object]) -> Strategy:
     return PontoContinuoStrategy(**kwargs)
 
 
-def _structure_kwargs(params: Mapping[str, object]) -> dict[str, Any]:
+def _structure_kwargs(
+    params: Mapping[str, object], timeframe: dt.timedelta | None
+) -> dict[str, Any]:
     kwargs: dict[str, Any] = {}
     _flag(params, "allow_secondary", kwargs)
     _decimal(params, "stop_buffer", kwargs)
@@ -169,20 +191,30 @@ def _structure_kwargs(params: Mapping[str, object]) -> dict[str, Any]:
     _choice(params, "entry_point", ZoneEntryPoint, kwargs)
     _choice(params, "gift_stop", GiftStop, kwargs)
     _flag(params, "volume_filter", kwargs)
+    # The timeframe above, and this setup's own for it to build on. The base is passed only
+    # when the document set a filter: the class accepts it unused, but a keyword the document
+    # never asked for is a third place a default could hide (see the module docstring).
+    _optional_timeframe(params, "htf", kwargs)
+    if kwargs.get("htf") is not None:
+        kwargs["timeframe"] = timeframe
     return kwargs
 
 
-def _structure_choch(params: Mapping[str, object]) -> Strategy:
-    return StructureStrategy(qualifier=ChochQualifier(), name="choch", **_structure_kwargs(params))
+def _structure_choch(params: Mapping[str, object], timeframe: dt.timedelta | None) -> Strategy:
+    return StructureStrategy(
+        qualifier=ChochQualifier(), name="choch", **_structure_kwargs(params, timeframe)
+    )
 
 
-def _structure_continuation(params: Mapping[str, object]) -> Strategy:
+def _structure_continuation(
+    params: Mapping[str, object], timeframe: dt.timedelta | None
+) -> Strategy:
     continuation: dict[str, Any] = {}
     _optional_int(params, "max_bos", continuation)
     return StructureStrategy(
         qualifier=ContinuationQualifier(**continuation),
         name="continuation",
-        **_structure_kwargs(params),
+        **_structure_kwargs(params, timeframe),
     )
 
 
@@ -194,19 +226,24 @@ _BUILDERS = {
 }
 
 
-def build_setup(node: Mapping[str, object]) -> Strategy:
+def build_setup(node: Mapping[str, object], *, timeframe: dt.timedelta | None = None) -> Strategy:
     """Build the named setup, or raise. `node` is the document's `setup` block.
 
     The name reaching here has already been through the schema's discriminated union, so an
     unknown one means the two lists have drifted — which is precisely why this raises with both
     the name and the alternatives rather than returning `None` and letting the run proceed
     strategy-less.
+
+    `timeframe` is the document's own bar, which `compile_strategy` always has and hands over.
+    Only a setup reading a *higher* timeframe needs it — its bars are assembled from this one —
+    and the class refuses such a filter without it, so a caller that builds a filtered setup by
+    hand cannot get one that silently reads nothing.
     """
     kind = node.get("type")
     build = _BUILDERS.get(kind) if isinstance(kind, str) else None
     if build is None:
         raise EngineError(f"unknown setup type {kind!r}; this engine builds {sorted(_BUILDERS)}")
-    return build(_params(node))
+    return build(_params(node), timeframe)
 
 
 __all__ = ["build_setup"]

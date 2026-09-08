@@ -29,6 +29,7 @@ be *proven*, not merely feared. Touching a multiple of the initial risk brings i
 price too, and the two rules run at once with the tighter one winning (`conduction.py`).
 """
 
+import datetime as dt
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -72,6 +73,7 @@ from tradeforge_engine.domain import (
     to_tick,
 )
 from tradeforge_engine.errors import EngineError
+from tradeforge_engine.higher_timeframe import HigherTimeframeGate, Release
 from tradeforge_engine.structure import (
     MarketStructure,
     OrderBlock,
@@ -599,7 +601,7 @@ def _zone_stop(block: OrderBlock, context: Context, stop_buffer: Decimal) -> Mon
 
 
 def _side_of(block: OrderBlock) -> Side:
-    return Side.LONG if block.kind is ZoneKind.DEMAND else Side.SHORT
+    return block.side
 
 
 def _limit_entry(
@@ -1997,6 +1999,14 @@ class _Armed:
     on is gone from every object still in scope. The zone remembers what revealed it, or nothing
     downstream can say why the zone was worth entering."""
 
+    released_by: Release | None = None
+    """The release above that let this zone be armed, when the filter is on.
+
+    Kept for the same reason as `confirmed_by`: the release is spent the moment the zone is
+    armed, so by the time the order is placed the gate no longer remembers which region it was.
+    The entry's picture wants it — it is the whole reason this trade was allowed to exist — and
+    a refusal at the venue's gate hands it back (`HigherTimeframeGate.restore`)."""
+
 
 class StructureStrategy:
     """A `Strategy` that arms one limit order on the zone its qualifier names.
@@ -2052,9 +2062,20 @@ class StructureStrategy:
     from `Context.fills` (ADR-0015), with the open position as a fallback — never inferred from
     the strategy's own bookkeeping, because the one fill that matters most is the one whose
     position opened and died inside a single bar, invisible to both.
+
+    **A higher timeframe above it releases one entry at a time** (2026-09-08). With `htf` set,
+    nothing here may be armed until price reaches a region of that timeframe nobody has touched,
+    and once one zone is armed on the strength of that touch the side is shut again until price
+    reaches another. The rule and his seven answers on its edges are `HigherTimeframeGate`; what
+    this class adds is *where* it bites — `_may_arm`, the one chokepoint every rule about whether
+    a region may be traded already goes through — and *when* the release is spent: on the arming,
+    because his line is that an order placed and withdrawn unfilled has used the region's one
+    chance, so nothing later than choosing the entry can be the event. The gate is fed on every
+    bar, position or not, before anything else runs: a region above touched during a trade has to
+    be able to release the bar after the trade ends.
     """
 
-    def __init__(  # noqa: PLR0913 — one qualifier and seven knobs, every one keyword-only
+    def __init__(  # noqa: PLR0913 — one qualifier and nine knobs, every one keyword-only
         self,
         *,
         qualifier: SetupQualifier,
@@ -2065,11 +2086,24 @@ class StructureStrategy:
         breakeven_at_r: Decimal | None = Decimal(2),
         gift_stop: GiftStop = GiftStop.GIFT,
         volume_filter: bool = False,
+        htf: dt.timedelta | None = None,
+        timeframe: dt.timedelta | None = None,
     ) -> None:
         if stop_buffer < ZERO:
             raise ValueError(f"stop buffer is a fraction of the zone width, got {stop_buffer}")
         if breakeven_at_r is not None and breakeven_at_r <= ZERO:
             raise ValueError(f"breakeven R multiple must be positive, got {breakeven_at_r}")
+        # The filter's own bars are assembled from this setup's, so it has to know how long one
+        # of its own lasts. `timeframe` alone is accepted and unused — a document always carries
+        # one — but a higher timeframe without it has nothing to build on, and refusing here is
+        # better than guessing the base from the spacing of the first two candles.
+        if htf is not None and timeframe is None:
+            raise ValueError("a higher-timeframe filter needs the setup's own timeframe")
+        self._gate = (
+            None
+            if htf is None or timeframe is None
+            else HigherTimeframeGate(base=timeframe, target=htf)
+        )
 
         self._qualifier = qualifier
         self._name = name
@@ -2138,6 +2172,12 @@ class StructureStrategy:
 
     def on_bar(self, context: Context) -> tuple[Signal, ...]:
         candle = context.candle
+        # The timeframe above reads this bar first, and on every bar. It answers `_may_arm`
+        # later on this same call, and a region above reached while a position is open has to
+        # be a release by the time the trade ends — so this runs ahead of the position branch
+        # below, which returns before anything else is asked.
+        if self._gate is not None:
+            self._gate.observe(candle)
         break_ = self._structure.update(candle)
         marked = self._blocks.update(candle, break_)
 
@@ -2222,15 +2262,7 @@ class StructureStrategy:
         if chosen is not None and self._may_arm(chosen):
             if self._armed is not None:
                 signals.extend(self._release(self._armed, candle))
-            self._armed_count += 1
-            stem = f"{chosen.kind.value}-{chosen.time:%Y%m%dT%H%M}-{self._armed_count}"
-            self._armed = _Armed(
-                block=chosen,
-                client_id=stem,
-                stem=stem,
-                placed=False,
-                confirmed_by=break_,
-            )
+            self._arm(chosen, break_)
 
         if self._armed is not None:
             # Fed again, for the zone that may have been armed a few lines above: on its first
@@ -2334,6 +2366,7 @@ class StructureStrategy:
                         context={
                             "zone_top": self._armed.block.top,
                             "zone_bottom": self._armed.block.bottom,
+                            **_released_by_context(self._armed.released_by),
                         },
                         regions=(
                             SnapshotRegion(
@@ -2346,6 +2379,10 @@ class StructureStrategy:
                                 # as younger than it is, and hide the impulse that made it.
                                 from_time=self._armed.block.time,
                             ),
+                            # And the region above that let this one be traded at all, when
+                            # there is one. Without it the picture shows a zone and an order
+                            # and nothing that says why *this* zone and not the three before.
+                            *_released_by_region(self._armed.released_by),
                         ),
                         # The structure that broke, drawn from the bar that set it to the bar
                         # that crossed it. It is the event that made the zone worth anything,
@@ -2356,6 +2393,26 @@ class StructureStrategy:
                 )
 
         return tuple(signals)
+
+    def _arm(self, chosen: OrderBlock, break_: StructureBreak | None) -> None:
+        """Take the zone the qualifier named: mint its name, remember what revealed it.
+
+        And spend the release above it, when there is one. Choosing the entry is the event —
+        his answer 3, and the class docstring says why nothing later can be — so the region that
+        released this side is read into the record *before* the gate forgets it on the next line.
+        """
+        self._armed_count += 1
+        stem = f"{chosen.kind.value}-{chosen.time:%Y%m%dT%H%M}-{self._armed_count}"
+        self._armed = _Armed(
+            block=chosen,
+            client_id=stem,
+            stem=stem,
+            placed=False,
+            confirmed_by=break_,
+            released_by=None if self._gate is None else self._gate.release_for(chosen),
+        )
+        if self._gate is not None:
+            self._gate.spend(chosen.side)
 
     def _conduct(
         self, position: Position, context: Context, break_: StructureBreak | None
@@ -2528,6 +2585,13 @@ class StructureStrategy:
             self._refused[armed.block],
             MAX_ARMING_ATTEMPTS,
         )
+        # ⚠️ **The release above comes back, on this branch only.** An order turned away at the
+        # gate was never placed, so his rule that a placed-and-withdrawn order spends the region
+        # does not reach it — and without this line the hand-over order of every paper and live
+        # session, which is always refused, would burn the session's first release on an order
+        # nobody saw. The `MARKET` branch above deliberately does not do this: that order rested.
+        if self._gate is not None and armed.released_by is not None:
+            self._gate.restore(armed.released_by, context.candle)
         self._armed = None
 
     def _trade_outcome(self, context: Context) -> tuple[OrderBlock | None, OrderBlock | None]:
@@ -2563,13 +2627,18 @@ class StructureStrategy:
         touches. Every rule about *whether a region may be traded* is therefore enforced here,
         once, on the zone actually about to be armed.
 
-        Six refusals, in the order they are cheapest to answer:
+        Seven refusals, in the order they are cheapest to answer:
 
         * **The zone already armed.** Re-naming it is not a new setup; acting on the repeat would
           withdraw a resting order and put an identical one back a bar later, moving the fill to
           whichever bar the qualifier last repeated itself.
         * **A secondary zone while `allow_secondary` is off.** The flag is a rule about which
           regions may be traded, so it has to bite where the trade is decided.
+        * **A zone the timeframe above has not released** (only with the filter on) — price has
+          not reached an untouched region above, that region's one entry is spent, the search
+          ended (two heights past the region, or a close through it), or this zone's break
+          confirmed before the touch. All four are `HigherTimeframeGate.allows`; here is only
+          where the answer bites, for the reason the rest of this list exists.
         * **A zone that no longer stands** — mitigated, or dropped by the tracker. Checking this
           only at the top of the bar would be a bar too late: the broker fills before the strategy
           runs (`loop.py`), so an order armed on a dead zone fills before its cancel is ever sent.
@@ -2591,6 +2660,8 @@ class StructureStrategy:
         if self._armed is not None and block == self._armed.block:
             return False
         if not block.primary and not self._allow_secondary:
+            return False
+        if self._gate is not None and not self._gate.allows(block):
             return False
         if block in self._traded:
             return False
@@ -2694,6 +2765,25 @@ class StructureStrategy:
             reason=f"cancel.{self._name}",
             client_id=armed.client_id,
         )
+
+
+def _released_by_context(release: Release | None) -> dict[str, Money]:
+    """The region above as scalars for the entry's context, or nothing when the filter is off.
+
+    Two keys rather than a nested object because `Signal.context` is flat by contract — it is
+    what a later "does this only work under wide H4 regions?" aggregates over.
+    """
+    if release is None:
+        return {}
+    return {"htf_top": release.block.top, "htf_bottom": release.block.bottom}
+
+
+def _released_by_region(release: Release | None) -> tuple[SnapshotRegion, ...]:
+    """The same region as a rectangle for the picture, drawn from the bar that marked it."""
+    if release is None:
+        return ()
+    block = release.block
+    return (SnapshotRegion(label="htf", top=block.top, bottom=block.bottom, from_time=block.time),)
 
 
 def _structure_levels(break_: StructureBreak | None) -> tuple[SnapshotLevel, ...]:

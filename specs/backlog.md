@@ -1837,3 +1837,40 @@ E um mutante **declarado equivalente**: apagar o `self._watch.reset()` do ramo `
 não muda nada observável, porque aquele ramo também zera `_qualified` e a barra seguinte encontra o
 portão do item 3, que reseta. Fica no código com o comentário, pelo mesmo motivo do `crossing` do
 PR-202: as duas linhas respondem perguntas diferentes.
+
+## Filtro de time frame superior (PR-205) — leituras minhas e pendências conhecidas
+
+Aberto em 08/09/2026. A definição dele está fechada (sete respostas, todas creditadas em
+`higher_timeframe.py`). O que segue são **leituras minhas** em bordas que ele não ditou, e
+pendências técnicas da forma como o H4 é montado (ADR-0026).
+
+**Leituras a confirmar com ele (uma linha cada):**
+
+1. **A referência é a região mais funda que a barra alcançou.** Uma barra que cai através da
+   secundária [110, 117] até a primária [80, 100] gasta as duas e mede o 2x e o rompimento pela
+   primária. Medido, não raciocinado: com a mais nova como referência, o primeiro cenário sondado
+   liberava e encerrava na mesma barra (fechou abaixo de 110 no caminho até 92).
+2. **Região alcançada e rompida na mesma barra gasta-se e não libera nada.**
+3. **Rompimento é fechamento, não pavio** — lido do exemplo dele (*"fecha em 85"*), não perguntado.
+   Fechar exatamente na borda de baixo não rompe (mesma leitura da regra 4 das médias).
+4. **O CHoCH confirmado na própria barra do toque conta** (*"a partir dessa barra"*); um confirmado
+   na barra anterior não.
+5. ~~A liberação é gasta ao ARMAR a zona~~ — **confirmado por ele em 08/09** (*"como está tá
+   bom"*), junto com a devolução da liberação quando o venue recusa no portão (*"1 ok"*).
+
+**Pendências técnicas:**
+
+- **O relógio do H4 é UTC, não o do servidor do MetaTrader.** A barra de H4 da engine fecha em
+  00h/04h/08h UTC; a do MT5 fecha no horário do servidor da corretora. As regiões podem diferir
+  pelo deslocamento. Primeiro suspeito quando o gráfico dele e o backtest discordarem; o âncora
+  vira parâmetro no dia em que isso aparecer num backtest real.
+- **As regiões de H4 não são desenhadas no gráfico.** `Zoned.zones()` devolve só as da base; o
+  portão expõe `HigherTimeframeGate.zones`, mas nada as lê. A entrada carrega a região que a
+  liberou (`htf_top`/`htf_bottom` no `context`, retângulo `htf` no snapshot), então o retrato de
+  cada trade a mostra — o que falta é o desenho na série inteira.
+- **A grade de estudo não sabe variar `htf` incluindo "off".** `axes.ts` oferece as opções do
+  enum; `null` não é uma delas. Comparar "com filtro × sem filtro" numa grade exige duas corridas.
+- **A cláusula "múltiplo inteiro" de `semantic._higher_timeframe_error` é inalcançável hoje**:
+  com a tabela atual (M1…W1), todo par mais grosso é múltiplo. Fica porque o modo de falha sem
+  ela é um `ValueError` do `BarAggregator` em tempo de construção (500) em vez de um 422 na
+  validação, no dia em que entrar H2/H6/H8. Só a metade da ordem tem teste.

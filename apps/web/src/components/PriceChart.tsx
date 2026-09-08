@@ -15,6 +15,7 @@ import {
 import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 
 import type { Candle, OverlaySeries, Trade, Zone } from '../api/types'
+import { OWN_TIMEFRAME } from '../backtest/price'
 import type { CurveStroke, View, ZoneRect } from '../backtest/price'
 import { toBars, toCurves, toMarkers, toZones, visibleRangeFor, zoneRects } from '../backtest/price'
 
@@ -89,11 +90,17 @@ interface Props {
  *   the strategy sat out — without competing with the regions that are still in play.
  * * **Primary or secondary** is a solid against a dashed border. Without it there is no way to
  *   see the effect of the `allow_secondary` flag the run was launched with.
+ * * **Which timeframe it belongs to** is a thicker outline *and* the bar's name written at its
+ *   left edge. A run under the higher-timeframe filter draws two families of region at once and
+ *   they mean opposite things — the small ones are where the order rests, the big ones are what
+ *   released the side at all — so this one is not encoded by any styling that could be mistaken
+ *   for the three above. The text is the encoding; the width only helps at a glance.
  */
 function ZoneShape({ rect }: { rect: ZoneRect }): React.JSX.Element {
   const hue = rect.kind === 'demand' ? UP : DOWN
   // The side price must come back to: a demand region's top, a supply region's bottom.
   const entryEdgeY = rect.kind === 'demand' ? rect.y : rect.y + rect.height
+  const fromAbove = rect.label !== OWN_TIMEFRAME
   return (
     <g>
       <rect
@@ -105,9 +112,22 @@ function ZoneShape({ rect }: { rect: ZoneRect }): React.JSX.Element {
         fillOpacity={rect.live ? 0.1 : 0}
         stroke={hue}
         strokeOpacity={rect.live ? 0.55 : 0.28}
-        strokeWidth={1}
+        strokeWidth={fromAbove ? 2 : 1}
         strokeDasharray={rect.primary ? undefined : '4 3'}
       />
+      {/* Only where the rectangle was not clipped: the name belongs at the region's own left
+          edge, and printed at x=0 on a clipped one it would claim the region starts on screen. */}
+      {fromAbove && !rect.clippedLeft && (
+        <text
+          x={rect.x + 4}
+          y={rect.y + 12}
+          fill={hue}
+          fillOpacity={rect.live ? 0.9 : 0.5}
+          fontSize={10}
+        >
+          {rect.label}
+        </text>
+      )}
       <line
         x1={rect.x}
         x2={rect.x + rect.width}
@@ -143,6 +163,11 @@ export function PriceChart({
   const marks = useMemo(() => toMarkers(trades, selectedTradeId), [trades, selectedTradeId])
   const curves = useMemo(() => toCurves(overlays), [overlays])
   const regions = useMemo(() => toZones(zones), [zones])
+  // The higher timeframes present on this chart, in the order they first appear, for the legend.
+  const above = useMemo(
+    () => [...new Set(regions.map((zone) => zone.label))].filter((l) => l !== OWN_TIMEFRAME),
+    [regions],
+  )
   // Recomputed on every pan and zoom, because the rectangles live in pixel space. `null` while
   // the chart has not reported a view yet — an empty layer, not a layer of nothing at 0,0.
   const [rects, setRects] = useState<ZoneRect[] | null>(null)
@@ -327,6 +352,14 @@ export function PriceChart({
             {curve.label}
           </li>
         ))}
+        {/* Named only when there is one on the chart: a legend line for a family of region the
+            run never marked is a question the reader has to answer before ignoring it. */}
+        {above.length > 0 && (
+          <li className="flex items-center gap-2">
+            <span aria-hidden className="w-4 shrink-0 border-t-2 border-slate-400" />
+            {above.join(', ')} — the region above that released the entry
+          </li>
+        )}
         <li className="flex items-center gap-2">
           <span aria-hidden style={{ color: '#5F8AD2' }}>
             ▲▼

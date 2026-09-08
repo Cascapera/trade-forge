@@ -273,6 +273,9 @@ function indexAtOrBefore(bars: readonly Bar[], time: number): number {
 // Regions                                                                       //
 // --------------------------------------------------------------------------- //
 
+/** The series a region belongs to: the run's own timeframe, or a higher one by name. */
+export const OWN_TIMEFRAME = 'zone'
+
 /** A region with its numbers parsed: seconds on the axis, floats for the price band. */
 export interface DrawableZone {
   kind: 'demand' | 'supply'
@@ -281,6 +284,14 @@ export interface DrawableZone {
   fromTime: number
   mitigatedAt: number | null
   primary: boolean
+  /**
+   * `zone` for the run's own timeframe, or the higher one's name (`H4`).
+   *
+   * A run older than the filter answers without the field at all, and it reads as the run's own
+   * — which is what it was. Defaulted here rather than at the drawing site so there is one place
+   * that decides what a missing label means.
+   */
+  label: string
 }
 
 export function toZones(zones: readonly Zone[]): DrawableZone[] {
@@ -291,6 +302,7 @@ export function toZones(zones: readonly Zone[]): DrawableZone[] {
     fromTime: toSeconds(zone.from_time),
     mitigatedAt: zone.mitigated_at === null ? null : toSeconds(zone.mitigated_at),
     primary: zone.primary,
+    label: zone.label ?? OWN_TIMEFRAME,
   }))
 }
 
@@ -312,6 +324,8 @@ export interface ZoneRect {
   width: number
   height: number
   kind: 'demand' | 'supply'
+  /** The series it belongs to — `zone`, or a higher timeframe's name. See `DrawableZone`. */
+  label: string
   /**
    * Still standing when the run ended — never merely when the visible window ends.
    *
@@ -364,6 +378,7 @@ export function zoneRects(zones: readonly DrawableZone[], view: View): ZoneRect[
       width: Math.max(right - left, 1),
       height: Math.max(bottom - top, 1),
       kind: zone.kind,
+      label: zone.label,
       live: ends === null,
       primary: zone.primary,
       clippedLeft,

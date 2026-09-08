@@ -523,6 +523,7 @@ def _zones_of(read: _Window) -> list[ZoneOut]:
                 confirmed_at=zone.confirmed_at,
                 mitigated_at=zone.mitigated_at,
                 primary=zone.primary,
+                label=zone.label,
             )
             for zone in marking.zones()
         ]

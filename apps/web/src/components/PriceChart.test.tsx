@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from '@testing-library/react'
+import { cleanup, render, screen, within } from '@testing-library/react'
 
 import type { Candle, Trade, Zone } from '../api/types'
 
@@ -364,6 +364,58 @@ describe('PriceChart — the regions the strategy marked', () => {
 
     expect(primary?.getAttribute('stroke-dasharray')).toBeNull()
     expect(secondary?.getAttribute('stroke-dasharray')).toBe('4 3')
+  })
+
+  it('writes the name of the higher timeframe on the region that came from it', () => {
+    // ⚠️ The encoding is the text, not the width. Side, live-or-taken and primary-or-secondary
+    // already use hue, fill and dash; a fourth family told apart by any of those would be read
+    // as one of the first three. The two families mean opposite things — the small region is
+    // where the order rests, the big one is what released the side at all — so the label says
+    // which in words.
+    const view = draw({ zones: [zone({ label: 'H4' }), zone()] })
+
+    const labels = [...view.container.querySelectorAll('svg text')].map((t) => t.textContent)
+    expect(labels).toEqual(['H4'])
+    const [above, own] = drawn(view.container)
+    expect(above?.getAttribute('stroke-width')).toBe('2')
+    expect(own?.getAttribute('stroke-width')).toBe('1')
+  })
+
+  it('names the higher timeframe in the legend', () => {
+    const view = draw({ zones: [zone({ label: 'H4' })] })
+
+    expect(view.getByText(/H4 — the region above/)).toBeInTheDocument()
+  })
+
+  it('says nothing about a timeframe above when the run had none', () => {
+    // A legend line for a family of region the run never marked is a question the reader has to
+    // answer before ignoring it. Two renders would share one document, so this is its own test.
+    const view = draw({ zones: [zone()] })
+
+    expect(within(view.container).queryByText(/the region above/)).not.toBeInTheDocument()
+  })
+
+  it('fades the name of a region above that has already been taken', () => {
+    // The fixture is mitigated by default, so without this the live branch of the label's own
+    // opacity was never drawn — and a region above that is *still standing* is the interesting
+    // one: it is the band price has not reached yet, which is what explains a stretch with no
+    // entries at all.
+    const live = draw({ zones: [zone({ label: 'H4', mitigated_at: null })] })
+    const taken = draw({ zones: [zone({ label: 'H4' })] })
+
+    const opacity = (view: ReturnType<typeof draw>): string | null =>
+      view.container.querySelector('svg text')?.getAttribute('fill-opacity') ?? null
+    expect(opacity(live)).toBe('0.9')
+    expect(opacity(taken)).toBe('0.5')
+  })
+
+  it('leaves the name off a region whose left edge is not on screen', () => {
+    // Printed at the clipped edge it would claim the region begins where the window does, which
+    // is the one thing the rectangle's left edge is for.
+    const view = draw({ zones: [zone({ label: 'H4', from_time: '2000-01-01T00:00:00Z' })] })
+
+    expect(view.container.querySelector('svg text')).toBeNull()
+    expect(drawn(view.container)).toHaveLength(1)
   })
 
   it('thickens the edge price has to come back to, which differs by side', () => {

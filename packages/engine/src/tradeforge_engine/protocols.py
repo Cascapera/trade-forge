@@ -310,7 +310,19 @@ class Zoned(Protocol):
     """
 
     def zones(self) -> Sequence[ZoneMark]:
-        """The regions the strategy still holds, oldest first. Empty is a valid answer.
+        """The regions the strategy still holds. Empty is a valid answer.
+
+        **Grouped by series, and each group oldest first.** A strategy that reads a second
+        timeframe marks regions on two charts at once, and they are published one series after
+        the other — the coarser ones ahead of the finer, so a reader drawing in order leaves the
+        big rectangles behind the small ones instead of over them. `ZoneMark.label` is what says
+        which series a region belongs to.
+
+        ⚠️ It is therefore **not** oldest-first across the whole answer, which is what this said
+        before regions from a second timeframe existed: the first region of the second group is
+        routinely older than the last of the first — measured at 26 hours on this project's own
+        fixture. A reader that needs chronology has to sort, and a reader that needs the drawing
+        order has to not.
 
         ⚠️ **Still holds, not "every one it ever marked".** A detector keeps a bounded history
         — `OrderBlockDetector` drops the oldest past `_MAX_ZONES` — so a long run's earliest

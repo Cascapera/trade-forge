@@ -58,6 +58,8 @@ from tradeforge_engine.bar_setups import (
 )
 from tradeforge_engine.conduction import StructuralTrail, breakeven_candidate, tighten
 from tradeforge_engine.domain import (
+    TIMEFRAME_DELTAS,
+    TIMEFRAME_NAMES,
     ZERO,
     Candle,
     Context,
@@ -2111,6 +2113,16 @@ class StructureStrategy:
                 "a higher-timeframe filter needs the broker's clock: pass htf_offset, the hours "
                 "its server runs ahead of UTC"
             )
+        # ⚠️ **A timeframe with no name is refused here rather than at the chart.** `zones()`
+        # labels the regions above with the bar's own name, and a duration outside the table has
+        # none — built by hand, such a setup ran a whole backtest and then raised a bare
+        # `KeyError` when the API asked for the picture, which is the worst possible moment. The
+        # factory already only passes durations from the table; this is for everyone else.
+        if htf is not None and htf not in TIMEFRAME_NAMES:
+            raise ValueError(
+                f"a higher timeframe has to be a bar this engine can name, got {htf}; "
+                f"this engine knows {sorted(TIMEFRAME_DELTAS)}"
+            )
         # ⚠️ **The last two clauses are unreachable at runtime and are not dead code.** The two
         # refusals above already guarantee that a filter has both, so no test can distinguish this
         # from `if htf is None`; what needs them is `mypy --strict`, which narrows `timeframe` and
@@ -2163,29 +2175,44 @@ class StructureStrategy:
         self._fill_bar: datetime | None = None
 
     def zones(self) -> Sequence[ZoneMark]:
-        """The regions the detector is still holding, as records — see `protocols.Zoned`.
+        """The regions this setup is still holding, as records — see `protocols.Zoned`.
 
         Translated here rather than handed over: `TrackedZone` is the detector's live
         bookkeeping, and a reader holding it could advance the very machinery it is describing.
         `mitigated_at` is `None` while a region still stands, which is what tells a chart to
         extend the rectangle to its own edge instead of closing it somewhere arbitrary.
 
-        ⚠️ Bounded by the detector's own `_MAX_ZONES`, so a long enough run has marked regions
+        ⚠️ Bounded by each detector's own `_MAX_ZONES`, so a long enough run has marked regions
         this no longer returns. Faithful rather than complete, and faithful is the right one: it
         is exactly the set the setup itself could still have traded.
+
+        **With the filter on, the regions above come too**, labelled by their own timeframe, and
+        they come **first** so a chart drawing them in order puts the big ones behind. Without
+        them a filtered run is unreadable: the entries that were refused look like entries the
+        setup simply did not find, and the one thing that would explain them — the region price
+        had not reached yet — is the thing not on the chart.
+
+        ⚠️ **Their `mitigated_at` is on the higher timeframe's own clock**, and it is that H4 bar's
+        **opening** instant — the time a `Candle` carries. So the value sits *before* the wick
+        that took the region, and the *knowledge* of it arrives after, when that H4 bar closes.
+        Both distances are the same one bar short of the ratio: on M15 under H4, fifteen bars
+        either way; on H1 under H4, three. The two point opposite ways, and a reader who takes
+        the later of them as the *value* draws the rectangle ending in the wrong place.
+
+        It is deliberately *not* the bar that released the base timeframe, which the gate tracks
+        separately and at base resolution (`HigherTimeframeGate`). The two agree about whether a
+        region was taken and disagree about when, and a rectangle is a picture of the higher
+        timeframe rather than of the release.
         """
-        return tuple(
-            ZoneMark(
-                kind=str(tracked.block.kind),
-                top=tracked.block.top,
-                bottom=tracked.block.bottom,
-                from_time=tracked.block.time,
-                confirmed_at=tracked.block.confirmed_at,
-                mitigated_at=tracked.mitigated_at,
-                primary=tracked.block.primary,
+        above = (
+            ()
+            if self._gate is None
+            else tuple(
+                _zone_mark(tracked, label=TIMEFRAME_NAMES[self._gate.timeframe])
+                for tracked in self._gate.zones
             )
-            for tracked in self._blocks.zones
         )
+        return above + tuple(_zone_mark(tracked) for tracked in self._blocks.zones)
 
     def on_bar(self, context: Context) -> tuple[Signal, ...]:
         candle = context.candle
@@ -2782,6 +2809,20 @@ class StructureStrategy:
             reason=f"cancel.{self._name}",
             client_id=armed.client_id,
         )
+
+
+def _zone_mark(tracked: TrackedZone, *, label: str = "zone") -> ZoneMark:
+    """One tracked region as the immutable record a reader gets (`ZoneMark`)."""
+    return ZoneMark(
+        kind=str(tracked.block.kind),
+        top=tracked.block.top,
+        bottom=tracked.block.bottom,
+        from_time=tracked.block.time,
+        confirmed_at=tracked.block.confirmed_at,
+        mitigated_at=tracked.mitigated_at,
+        primary=tracked.block.primary,
+        label=label,
+    )
 
 
 def _released_by_context(release: Release | None) -> dict[str, Money]:

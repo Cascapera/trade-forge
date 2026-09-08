@@ -886,9 +886,90 @@ def test_the_short_side_releases_end_to_end() -> None:
     assert (str(entry.context["htf_bottom"]), str(entry.context["htf_top"])) == ("100", "120")
 
 
+def test_the_regions_above_are_published_for_the_chart_named_by_their_timeframe() -> None:
+    """⚠️ Without this a filtered run is unreadable. `zones()` is the one channel a chart has, and
+    a setup under the filter marks regions on two charts at once: the small ones are where the
+    order rests, the big ones are what released the side at all. Drawn without the second set,
+    every refused entry looks like an entry the setup did not find.
+
+    They come **first**, so a reader drawing in order puts the big ones behind, and each carries
+    the name of the bar it belongs to — `H4` — because the legend has to name them.
+    """
+    strategy = StructureStrategy(
+        qualifier=_Marked(), htf=H4, htf_offset=_UTC_BROKER, timeframe=HOUR
+    )
+    _drive(strategy, STREAM)
+
+    marks = list(strategy.zones())
+    assert [(mark.label, str(mark.bottom), str(mark.top)) for mark in marks[:2]] == [
+        ("H4", "80", "100"),
+        ("H4", "110", "117"),
+    ]
+    assert {mark.label for mark in marks[2:]} == {"zone"}
+    assert len(marks) > 2, "the base timeframe's own regions still come"
+
+
+def test_the_regions_above_end_on_the_higher_timeframe_s_clock_not_on_the_release() -> None:
+    """⚠️ **Two instants that are easy to confuse, and this is the one bar where they differ.**
+
+    A region above is *reached* by a base bar — that is what releases the side, and the gate
+    records it at base resolution. It is *marked mitigated* by the higher timeframe's own
+    detector, which cannot know until the H4 bar holding that touch has closed. On hour 74 the
+    side has been released for two bars and the region above still reads as standing.
+
+    The rectangle follows the second, because a rectangle is a picture of the higher timeframe
+    and that is where his chart ends it. Driving to the end of the stream would prove nothing:
+    the fixture's touch falls on hour 72, which opens an H4 bucket, so there the release instant,
+    the bucket's opening and the detector's stamp are all the same number and four different
+    implementations agree. Found by the guardian on exactly that reading.
+    """
+    strategy = StructureStrategy(
+        qualifier=_Marked(), htf=H4, htf_offset=_UTC_BROKER, timeframe=HOUR
+    )
+    _drive(strategy, _through(TOUCH + 2))
+
+    gate = strategy._gate
+    assert gate is not None
+    assert gate.reference(_demand(_at(ARMS))) is not None, "the side is released by now"
+    [above, *_] = strategy.zones()
+    assert above.label == "H4"
+    assert above.mitigated_at is None, "the H4 bar holding the touch has not closed"
+
+    # The bar that closes it. The stamp is that H4 bar's **own time**, which is its opening — hour
+    # 72 — so the rectangle ends where the higher timeframe says the region died, not where the
+    # engine found out.
+    _drive(strategy, [STREAM[TOUCH + 3]])
+    [closed, *_] = strategy.zones()
+    assert closed.mitigated_at == _at(TOUCH)
+
+
+def test_without_the_filter_only_the_setup_s_own_regions_are_published() -> None:
+    """A key that is absent says something a key that is present and empty does not — and here it
+    is a whole series. Nothing about the unfiltered chart changes."""
+    strategy = StructureStrategy(qualifier=_Marked())
+    _drive(strategy, STREAM)
+
+    assert {mark.label for mark in strategy.zones()} == {"zone"}
+
+
 def test_the_filter_needs_the_setup_s_own_timeframe() -> None:
     with pytest.raises(ValueError, match="own timeframe"):
         StructureStrategy(qualifier=_Marked(), htf=H4, htf_offset=_UTC_BROKER)
+
+
+def test_a_higher_timeframe_the_engine_cannot_name_is_refused_at_construction() -> None:
+    """⚠️ Refused where it is built, not where it is drawn. `zones()` labels the regions above
+    with the bar's own name, and a duration outside the table has none — so before this guard a
+    hand-built setup ran a whole backtest and then raised a bare `KeyError` when the API asked for
+    the picture, which is the worst possible moment to find out. The factory only ever passes
+    durations from the table; this is for every other caller."""
+    with pytest.raises(ValueError, match="bar this engine can name"):
+        StructureStrategy(
+            qualifier=_Marked(),
+            htf=dt.timedelta(hours=5),
+            htf_offset=_UTC_BROKER,
+            timeframe=HOUR,
+        )
 
 
 def test_a_timeframe_alone_builds_no_gate() -> None:

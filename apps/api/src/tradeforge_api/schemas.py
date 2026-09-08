@@ -685,6 +685,17 @@ class ZoneOut(BaseModel):
     primary: bool
     """First gap event of the impulse; the rest are secondary and need `allow_secondary`."""
 
+    label: str = "zone"
+    """Which series this region belongs to: `zone` for the run's own timeframe, or the name of a
+    higher one — `H4` — for the regions a filtered setup was released by.
+
+    A run under the higher-timeframe filter marks regions on two charts at once, and they mean
+    opposite things: the small ones are where the order rests, the big ones are what allowed an
+    entry to be looked for at all. A chart that drew them alike would show a stretch of refused
+    entries with nothing on it to explain them. Default `zone`, so every run without the filter
+    reads exactly as before.
+    """
+
 
 class OverlaysOut(BaseModel):
     """Every curve the run's strategy was reading, over the window the run read.

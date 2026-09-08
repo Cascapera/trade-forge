@@ -1,12 +1,13 @@
 {
   "schema_version": "1.0",
   "name": "SMC — mudança de caráter filtrada pelo H4",
-  "description": "A mesma entrada de CHoCH, só liberada quando o preço toca uma região de H4 ainda não mitigada. Uma entrada por região; a busca acaba duas alturas acima ou no rompimento.",
+  "description": "A mesma entrada de CHoCH, só liberada quando o preço toca uma região de H4 ainda não mitigada. Uma entrada por região; a busca acaba duas alturas acima ou no rompimento. O H4 é cortado no relógio do servidor da corretora (UTC+3), não no UTC.",
   "timeframe": "M15",
   "setup": {
     "type": "structure_choch",
     "params": {
-      "htf": "H4"
+      "htf": "H4",
+      "htf_offset": 3
     }
   },
   "exit": {

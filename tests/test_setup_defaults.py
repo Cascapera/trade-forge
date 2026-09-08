@@ -137,6 +137,8 @@ _PROBES: dict[str, dict[str, tuple[Any, Any]]] = {
         "volume_filter": (True, True),
         # The timeframe above (2026-09-08): the document names a bar, the class takes a duration.
         "htf": ("H4", dt.timedelta(hours=4)),
+        # And the broker's clock beside it (2026-09-09), demanded whenever `htf` is named.
+        "htf_offset": (3, dt.timedelta(hours=3)),
     },
     "structure_continuation": {
         "allow_secondary": (True, True),
@@ -147,6 +149,8 @@ _PROBES: dict[str, dict[str, tuple[Any, Any]]] = {
         "gift_stop": ("forca", GiftStop.FORCA),
         "volume_filter": (True, True),
         "htf": ("H4", dt.timedelta(hours=4)),
+        # And the broker's clock beside it (2026-09-09), demanded whenever `htf` is named.
+        "htf_offset": (3, dt.timedelta(hours=3)),
     },
 }
 

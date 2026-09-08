@@ -3,6 +3,7 @@
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 from tradeforge_schema.generate import main
 from tradeforge_schema.models import Strategy
@@ -385,8 +386,15 @@ def test_a_document_that_is_neither_a_setup_nor_a_strategy_is_refused() -> None:
 
 
 def _filtered(timeframe: str, htf: str) -> Strategy:
+    """A filtered document that is sound apart from whatever the caller is testing.
+
+    The broker's clock is always stated: since 2026-09-09 a document that names a higher timeframe
+    and no offset is unrunnable for that reason alone, and a fixture missing it would make every
+    assertion below pass for the wrong error.
+    """
     return setup_strategy(
-        timeframe=timeframe, setup={"type": "structure_choch", "params": {"htf": htf}}
+        timeframe=timeframe,
+        setup={"type": "structure_choch", "params": {"htf": htf, "htf_offset": 3}},
     )
 
 
@@ -397,7 +405,8 @@ def test_a_higher_timeframe_above_the_document_s_own_is_sound() -> None:
 
 def test_the_filter_off_is_sound_on_every_timeframe() -> None:
     model = setup_strategy(
-        timeframe="W1", setup={"type": "structure_choch", "params": {"htf": None}}
+        timeframe="W1",
+        setup={"type": "structure_choch", "params": {"htf": None, "htf_offset": None}},
     )
     assert validate_semantics(model) == []
 
@@ -414,6 +423,68 @@ def test_a_higher_timeframe_that_is_not_higher_is_refused(timeframe: str, htf: s
 
 def test_the_continuation_setup_is_held_to_the_same_rule() -> None:
     model = setup_strategy(
-        timeframe="H4", setup={"type": "structure_continuation", "params": {"htf": "H1"}}
+        timeframe="H4",
+        setup={"type": "structure_continuation", "params": {"htf": "H1", "htf_offset": 3}},
     )
     assert "coarser than H4" in messages(model)
+
+
+# --------------------------------------------------------------------------- #
+# The broker's clock beside the higher timeframe (2026-09-09)                   #
+# --------------------------------------------------------------------------- #
+
+
+def test_a_higher_timeframe_needs_the_broker_s_clock() -> None:
+    """His rule: *"sempre levar em consideração o horário do MT5"*. The stored candles are UTC and
+    a MetaTrader chart cuts its H4 on the server's clock, so a filter that did not say which clock
+    would mark every region displaced by the broker's offset — and look entirely reasonable."""
+    model = setup_strategy(
+        timeframe="M15", setup={"type": "structure_choch", "params": {"htf": "H4"}}
+    )
+    errors = validate_semantics(model)
+
+    assert [error.path for error in errors] == ["setup.params.htf_offset"]
+    assert "hours its server runs ahead of UTC" in messages(model)
+
+
+def test_a_clock_with_no_higher_timeframe_to_place_is_refused() -> None:
+    """The other direction, and the reason it is not merely ignored: a number that configures
+    nothing is one somebody later reads as if it did."""
+    model = setup_strategy(
+        timeframe="M15", setup={"type": "structure_choch", "params": {"htf_offset": 3}}
+    )
+    assert "no higher timeframe for this clock to place" in messages(model)
+
+
+@pytest.mark.parametrize("offset", [15, -15, 100, -100])
+def test_a_clock_no_terminal_could_have_is_refused_by_the_schema(offset: float) -> None:
+    """The shape layer's own bound, and it needs a document to be observable at all.
+
+    ⚠️ Both signs. `Field(ge=-14, le=14)` is two numbers, and a fixture that only ever carries
+    `3` proves neither — the engine's own guard is the same story from the other side. A `-19`
+    here is a real confusion rather than a typo: the offset of a UTC+5 broker written the wrong
+    way round. It has to fail at the API, with the field named, rather than inside a backtest.
+    """
+    with pytest.raises(ValidationError):
+        setup_strategy(
+            timeframe="M15",
+            setup={"type": "structure_choch", "params": {"htf": "H4", "htf_offset": offset}},
+        )
+
+
+def test_the_pair_together_is_sound_and_a_half_hour_clock_is_a_clock() -> None:
+    # ±14 exactly: Kiritimati and Baker Island, the two ends of the inhabited world, and the two
+    # values the bound has to admit or the schema and the engine stop agreeing about one number.
+    for offset in (3, -5.5, 0, 14, -14):
+        model = setup_strategy(
+            timeframe="M15",
+            setup={"type": "structure_choch", "params": {"htf": "H4", "htf_offset": offset}},
+        )
+        assert validate_semantics(model) == []
+
+
+def test_the_continuation_setup_is_held_to_the_clock_rule_too() -> None:
+    model = setup_strategy(
+        timeframe="M15", setup={"type": "structure_continuation", "params": {"htf": "H4"}}
+    )
+    assert "hours its server runs ahead of UTC" in messages(model)

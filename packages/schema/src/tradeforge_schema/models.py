@@ -708,8 +708,16 @@ class StructureParams(_Node):
     heights past the region or closes through it. The zone traded may sit outside the region
     above; the break that qualifies it must confirm after the touch. Serves the change of
     character and the continuation alike. The value must be coarser than the document's own
-    `timeframe` and a whole number of its bars — `semantic.py` refuses the rest — and the bars
-    above close on the UTC clock, which is not the MetaTrader server's.
+    `timeframe` and a whole number of its bars, and it needs `htf_offset` beside it — `semantic.py`
+    refuses the rest.
+
+    `htf_offset` is how far the broker's clock runs ahead of UTC, in hours (`3`, `-5.5`) — the
+    same number the collector takes as `--server-offset`, and **required whenever `htf` is named**
+    (2026-09-09: *"sempre levar em consideração o horário do mt5"*). A MetaTrader chart closes its
+    H4 at 00:00, 04:00 and 08:00 *server* time while the stored candles are UTC, so an engine that
+    assumed UTC would mark every region displaced by the broker's offset and every number would
+    still look reasonable. Demanded rather than defaulted, for the reason the collector already
+    gives: a clock that is measured instead of stated is a nondeterministic one.
     """
 
     allow_secondary: bool = False
@@ -719,6 +727,7 @@ class StructureParams(_Node):
     gift_stop: GiftStop = "gift"
     volume_filter: bool = False
     htf: Timeframe | None = None
+    htf_offset: Annotated[float | None, Field(ge=-14, le=14)] = None
 
 
 class StructureChochSetup(_Node):

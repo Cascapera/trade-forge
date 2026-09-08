@@ -10,7 +10,8 @@
       "stop_buffer": 0.1,
       "breakeven_at_r": 2,
       "volume_filter": false,
-      "htf": null
+      "htf": null,
+      "htf_offset": null
     }
   },
   "exit": {

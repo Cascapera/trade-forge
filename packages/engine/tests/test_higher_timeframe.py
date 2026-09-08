@@ -36,8 +36,10 @@ from tradeforge_engine.domain import (
     Signal,
     SignalKind,
 )
+from tradeforge_engine.errors import EngineError
 from tradeforge_engine.higher_timeframe import (
     GIVE_UP_AT_REGION_HEIGHTS,
+    MAX_SERVER_OFFSET,
     BarAggregator,
     HigherTimeframeGate,
 )
@@ -55,6 +57,14 @@ from tradeforge_engine.testing import (
 )
 
 H4 = 4 * HOUR
+_UTC_BROKER = dt.timedelta(0)
+"""The clock every scenario in this file runs on.
+
+Zero is a claim, not a default: these fixtures were written against buckets that open at 00:00,
+04:00 and 08:00 UTC, and they keep that meaning only for a broker whose server keeps UTC. What a
+*different* clock does to the same bars is `test_the_buckets_follow_the_broker_s_clock` and the
+scenario below it — and that they change at all is the whole point of the parameter.
+"""
 _ACCOUNT = ImmediateFillBroker(instrument=AAPL).account()
 _TICK = Decimal("0.01")
 
@@ -245,8 +255,13 @@ def _demand(confirmed_at: dt.datetime) -> OrderBlock:
     )
 
 
-def _fed(candles: list[Candle], *, target: dt.timedelta = H4) -> HigherTimeframeGate:
-    gate = HigherTimeframeGate(base=HOUR, target=target)
+def _fed(
+    candles: list[Candle],
+    *,
+    target: dt.timedelta = H4,
+    offset: dt.timedelta = _UTC_BROKER,
+) -> HigherTimeframeGate:
+    gate = HigherTimeframeGate(base=HOUR, target=target, offset=offset)
     with localcontext(ENGINE_CONTEXT):
         for candle in candles:
             gate.observe(candle)
@@ -263,7 +278,7 @@ def _through(hour: int) -> list[Candle]:
 
 
 def test_four_hourly_bars_make_one_h4_bar_with_the_widest_extremes() -> None:
-    bars = BarAggregator(base=HOUR, target=H4)
+    bars = BarAggregator(base=HOUR, target=H4, offset=_UTC_BROKER)
     hourly = [
         bar(0, open_="100", close="101", high="102", low="99", tick_volume=5),
         bar(1, open_="101", close="103", high="105", low="100", tick_volume=7),
@@ -287,7 +302,7 @@ def test_four_hourly_bars_make_one_h4_bar_with_the_widest_extremes() -> None:
 def test_the_h4_bar_is_returned_on_the_hourly_bar_that_ends_it_and_only_then() -> None:
     """The 03:00 bar closes at 04:00, the bucket's edge — the H4 is complete on that bar's own
     update, not one bar later. And the next hourly bar returns nothing again."""
-    bars = BarAggregator(base=HOUR, target=H4)
+    bars = BarAggregator(base=HOUR, target=H4, offset=_UTC_BROKER)
     assert [bars.update(bar(i, open_="1", close="1")) for i in range(3)] == [(), (), ()]
     (h4,) = bars.update(bar(3, open_="1", close="1"))
     assert h4.time == _at(0)
@@ -297,7 +312,7 @@ def test_the_h4_bar_is_returned_on_the_hourly_bar_that_ends_it_and_only_then() -
 def test_a_bucket_left_open_is_flushed_by_the_first_bar_of_a_later_one() -> None:
     """A session ends and the bar that would have closed the bucket never comes. The next bucket's
     first bar returns the partial one — one bar late, which is the only honest timing."""
-    bars = BarAggregator(base=HOUR, target=H4)
+    bars = BarAggregator(base=HOUR, target=H4, offset=_UTC_BROKER)
     assert bars.update(bar(4, open_="10", close="11", high="12", low="9")) == ()
     assert bars.update(bar(5, open_="11", close="13", high="14", low="10")) == ()
     (partial,) = bars.update(bar(12, open_="20", close="21"))
@@ -311,14 +326,14 @@ def test_a_bucket_left_open_is_flushed_by_the_first_bar_of_a_later_one() -> None
 
 
 def test_one_bar_can_flush_the_old_bucket_and_end_its_own() -> None:
-    bars = BarAggregator(base=HOUR, target=H4)
+    bars = BarAggregator(base=HOUR, target=H4, offset=_UTC_BROKER)
     bars.update(bar(4, open_="10", close="11"))
     completed = bars.update(bar(15, open_="20", close="21"))
     assert [done.time for done in completed] == [_at(4), _at(12)]
 
 
 def test_a_bucket_still_open_is_never_returned() -> None:
-    bars = BarAggregator(base=HOUR, target=H4)
+    bars = BarAggregator(base=HOUR, target=H4, offset=_UTC_BROKER)
     assert [bars.update(bar(i, open_="1", close="1")) for i in range(3)] == [(), (), ()]
 
 
@@ -347,7 +362,121 @@ def test_a_bucket_still_open_is_never_returned() -> None:
 def test_buckets_close_on_the_utc_clock(
     target: dt.timedelta, moment: dt.datetime, bucket: dt.datetime
 ) -> None:
-    assert BarAggregator(base=dt.timedelta(minutes=15), target=target).bucket_of(moment) == bucket
+    assert (
+        BarAggregator(base=dt.timedelta(minutes=15), target=target, offset=_UTC_BROKER).bucket_of(
+            moment
+        )
+        == bucket
+    )
+
+
+@pytest.mark.parametrize(
+    ("hours", "bucket"),
+    [
+        # The broker keeps UTC: 05:30 falls in the bucket that opened at 04:00, as it always did.
+        (0, dt.datetime(2024, 1, 1, 4, tzinfo=dt.UTC)),
+        # Three hours ahead: 05:30 UTC is 08:30 on his chart, inside the bar that opened at 08:00
+        # server — 05:00 UTC. His H4 bars close at 21:00, 01:00, 05:00 and 09:00 UTC.
+        (3, dt.datetime(2024, 1, 1, 5, tzinfo=dt.UTC)),
+        # Behind UTC, and by a half hour, because both are real: 05:30 UTC is 00:00 server, which
+        # opens a bucket exactly.
+        (-5.5, dt.datetime(2024, 1, 1, 5, 30, tzinfo=dt.UTC)),
+    ],
+)
+def test_the_buckets_follow_the_broker_s_clock(hours: float, bucket: dt.datetime) -> None:
+    """His rule of 2026-09-09. A MetaTrader chart cuts its H4 at midnight, 04:00 and 08:00 *server*
+    time; the stored candles are UTC. Anchoring on UTC marks every region displaced by the broker's
+    offset — and nothing about the result looks wrong, which is what makes it expensive."""
+    bars = BarAggregator(base=HOUR, target=H4, offset=dt.timedelta(hours=hours))
+
+    assert bars.offset == dt.timedelta(hours=hours)
+    assert bars.bucket_of(dt.datetime(2024, 1, 1, 5, 30, tzinfo=dt.UTC)) == bucket
+
+
+def test_a_different_clock_reads_different_regions_out_of_the_same_bars() -> None:
+    """⚠️ The reason the offset is demanded rather than defaulted, end to end and on the same
+    stream. One hour of broker offset groups the hourly bars into different H4 bars, so the
+    structure above breaks elsewhere and leaves a region of [99, 105] where the UTC reading leaves
+    [80, 100] — and the M15 below, released by neither, takes no trade at all.
+
+    Two clocks, one set of candles, two different backtests. Nothing raises, nothing looks odd,
+    and only one of them is the chart he is reading."""
+    utc = _fed(STREAM)
+    ahead = _fed(STREAM, offset=HOUR)
+
+    assert [(str(zone.block.bottom), str(zone.block.top)) for zone in utc.zones] == [
+        ("80", "100"),
+        ("110", "117"),
+    ]
+    assert [(str(zone.block.bottom), str(zone.block.top)) for zone in ahead.zones] == [
+        ("99", "105"),
+        ("110", "117"),
+    ]
+    # And the difference reaches the trade, which is the only place it matters.
+    assert (
+        list(
+            _entries(
+                _drive(
+                    StructureStrategy(qualifier=_Marked(), htf=H4, htf_offset=HOUR, timeframe=HOUR),
+                    STREAM,
+                )
+            )
+        )
+        == []
+    )
+
+
+def test_a_bar_that_straddles_a_boundary_is_refused_rather_than_folded_in() -> None:
+    """An offset that does not describe the clock the candles were collected under puts the
+    boundaries inside the bars. Folding such a bar into whichever bucket its opening instant fell
+    in is the quiet failure — buckets closing a little late, regions displaced a little — so it
+    raises on the first bar instead.
+
+    Ten minutes against hourly bars: the H4 boundaries land at 03:50, and the 03:00 bar runs past
+    them."""
+    bars = BarAggregator(base=HOUR, target=H4, offset=dt.timedelta(minutes=10))
+    # The 00:00, 01:00 and 02:00 bars sit inside the bucket that opened at 23:50; the 03:00 one
+    # would run ten minutes past its close at 03:50.
+    for index in range(3):
+        bars.update(bar(index, open_="1", close="1"))
+    straddles = bar(3, open_="1", close="1")
+
+    with pytest.raises(EngineError, match="spans the boundary"):
+        bars.update(straddles)
+
+
+@pytest.mark.parametrize("hours", [15, -15, 100, -100])
+def test_a_clock_no_terminal_could_have_is_refused(hours: int) -> None:
+    """The same bound the collector uses, and for the same reason: past fourteen hours the number
+    being stated is not a timezone.
+
+    ⚠️ **Both signs, because the guard is written on the magnitude.** Tested on the positive side
+    alone it holds for `offset > MAX` just as well — and that mutant is the plausible refactor,
+    somebody simplifying the `abs` away. A document then carrying `-19` (a real confusion: the
+    offset of a UTC+5 broker written the wrong way round, or a number pasted in minutes) builds an
+    aggregator anchored nineteen hours out of place. With M15 bars the straddle guard says nothing
+    either, because nineteen hours is a whole number of them: every region comes out displaced,
+    the run finishes, and no number looks wrong. Which is the failure this whole PR exists for.
+    """
+    with pytest.raises(ValueError, match="within 14:00:00 of UTC"):
+        BarAggregator(base=HOUR, target=H4, offset=dt.timedelta(hours=hours))
+
+
+@pytest.mark.parametrize("offset", [MAX_SERVER_OFFSET, -MAX_SERVER_OFFSET])
+def test_the_furthest_real_clock_is_accepted(offset: dt.timedelta) -> None:
+    """Fourteen hours exactly is Kiritimati, and it is a place. The bound is inclusive, and only a
+    value that must pass proves it: refused here, the engine would reject a document the schema's
+    own `maximum: 14` had just accepted — two layers disagreeing about one number, which the API
+    reports as a 500 on a strategy it validated ([[limite-exclusivo-colapsado]])."""
+    assert BarAggregator(base=HOUR, target=H4, offset=offset).offset == offset
+    assert dt.timedelta(hours=14) == MAX_SERVER_OFFSET
+
+
+def test_the_filter_demands_the_broker_s_clock() -> None:
+    """A default of UTC would be a claim about a real terminal — and the wrong one for most of
+    them. The document has to say it, exactly as the collector demands `--server-offset`."""
+    with pytest.raises(ValueError, match="needs the broker's clock"):
+        StructureStrategy(qualifier=_Marked(), htf=H4, timeframe=HOUR)
 
 
 @pytest.mark.parametrize(
@@ -362,7 +491,7 @@ def test_the_higher_timeframe_must_be_coarser_and_a_whole_number_of_bars(
     base: dt.timedelta, target: dt.timedelta
 ) -> None:
     with pytest.raises(ValueError, match="higher timeframe"):
-        BarAggregator(base=base, target=target)
+        BarAggregator(base=base, target=target, offset=_UTC_BROKER)
 
 
 # --------------------------------------------------------------------------- #
@@ -572,13 +701,17 @@ def test_without_the_filter_the_stream_arms_five_times() -> None:
 
 
 def test_nothing_is_armed_before_price_reaches_a_region_above() -> None:
-    strategy = StructureStrategy(qualifier=_Marked(), htf=H4, timeframe=HOUR)
+    strategy = StructureStrategy(
+        qualifier=_Marked(), htf=H4, htf_offset=_UTC_BROKER, timeframe=HOUR
+    )
     signals = _drive(strategy, _through(TOUCH - 1))
     assert all(bar_signals == [] for bar_signals in signals.values())
 
 
 def test_the_touch_releases_one_entry_and_the_entry_carries_the_region_above() -> None:
-    strategy = StructureStrategy(qualifier=_Marked(), htf=H4, timeframe=HOUR)
+    strategy = StructureStrategy(
+        qualifier=_Marked(), htf=H4, htf_offset=_UTC_BROKER, timeframe=HOUR
+    )
     entries = _entries(_drive(strategy, STREAM))
 
     assert list(entries) == [ARMS]
@@ -612,7 +745,13 @@ def test_the_arming_spends_the_release_and_a_later_zone_is_refused() -> None:
     assert [signal.kind for signal in plain[ARMS + 1]] == [SignalKind.CANCEL, SignalKind.ENTRY]
 
     filtered = _drive(
-        StructureStrategy(qualifier=_Names(picks), allow_secondary=True, htf=H4, timeframe=HOUR),
+        StructureStrategy(
+            qualifier=_Names(picks),
+            allow_secondary=True,
+            htf=H4,
+            htf_offset=_UTC_BROKER,
+            timeframe=HOUR,
+        ),
         tail,
     )
     assert filtered[ARMS + 1] == []
@@ -632,7 +771,13 @@ def test_the_short_side_spends_its_own_release() -> None:
     assert [signal.kind for signal in plain[ARMS + 1]] == [SignalKind.CANCEL, SignalKind.ENTRY]
 
     filtered = _drive(
-        StructureStrategy(qualifier=_Names(picks), allow_secondary=True, htf=H4, timeframe=HOUR),
+        StructureStrategy(
+            qualifier=_Names(picks),
+            allow_secondary=True,
+            htf=H4,
+            htf_offset=_UTC_BROKER,
+            timeframe=HOUR,
+        ),
         tail,
     )
     assert filtered[ARMS + 1] == []
@@ -652,7 +797,9 @@ def test_an_order_the_venue_turned_away_hands_the_release_back() -> None:
     assert [signal.kind for signal in plain[ARMS + 1]] == [SignalKind.ENTRY]
 
     filtered = _drive(
-        StructureStrategy(qualifier=_Names(picks), htf=H4, timeframe=HOUR), tail, refused_on=refused
+        StructureStrategy(qualifier=_Names(picks), htf=H4, htf_offset=_UTC_BROKER, timeframe=HOUR),
+        tail,
+        refused_on=refused,
     )
     entries = _entries(filtered)
     assert list(entries) == [ARMS, ARMS + 1]
@@ -673,7 +820,9 @@ def test_an_order_the_market_withdrew_keeps_the_release_spent() -> None:
     assert [signal.kind for signal in plain[ARMS + 1]] == [SignalKind.ENTRY]
 
     filtered = _drive(
-        StructureStrategy(qualifier=_Names(picks), htf=H4, timeframe=HOUR), tail, refused_on=refused
+        StructureStrategy(qualifier=_Names(picks), htf=H4, htf_offset=_UTC_BROKER, timeframe=HOUR),
+        tail,
+        refused_on=refused,
     )
     assert filtered[ARMS + 1] == []
 
@@ -690,7 +839,9 @@ def test_a_refusal_that_lands_after_the_search_ended_hands_nothing_back() -> Non
     assert [signal.kind for signal in plain[ARMS + 1]] == [SignalKind.ENTRY]
 
     filtered = _drive(
-        StructureStrategy(qualifier=_Names(picks), htf=H4, timeframe=HOUR), tail, refused_on=refused
+        StructureStrategy(qualifier=_Names(picks), htf=H4, htf_offset=_UTC_BROKER, timeframe=HOUR),
+        tail,
+        refused_on=refused,
     )
     assert filtered[ARMS + 1] == []
 
@@ -699,7 +850,9 @@ def test_a_region_above_reached_while_a_position_is_open_still_releases() -> Non
     """Every bar that touches [80, 100] — 72 through 88 — is spent inside a trade, and the trade
     ends just before the break that marks the zone. The gate has to have been reading those bars
     from behind the position branch, or nothing is released when it matters."""
-    strategy = StructureStrategy(qualifier=_Marked(), htf=H4, timeframe=HOUR)
+    strategy = StructureStrategy(
+        qualifier=_Marked(), htf=H4, htf_offset=_UTC_BROKER, timeframe=HOUR
+    )
     entries = _entries(_drive(strategy, STREAM, position_on=frozenset(range(TOUCH, ARMS))))
     assert list(entries) == [ARMS]
 
@@ -713,13 +866,16 @@ def test_a_zone_from_a_break_before_the_touch_is_not_armed_under_the_release() -
     assert [signal.kind for signal in plain[73]] == [SignalKind.ENTRY]
 
     filtered = _drive(
-        StructureStrategy(qualifier=_Names(picks), htf=H4, timeframe=HOUR), _through(73)
+        StructureStrategy(qualifier=_Names(picks), htf=H4, htf_offset=_UTC_BROKER, timeframe=HOUR),
+        _through(73),
     )
     assert filtered[73] == []
 
 
 def test_the_short_side_releases_end_to_end() -> None:
-    strategy = StructureStrategy(qualifier=_Marked(), htf=H4, timeframe=HOUR)
+    strategy = StructureStrategy(
+        qualifier=_Marked(), htf=H4, htf_offset=_UTC_BROKER, timeframe=HOUR
+    )
     entries = _entries(_drive(strategy, _mirror(STREAM)))
 
     assert list(entries) == [ARMS]
@@ -732,7 +888,7 @@ def test_the_short_side_releases_end_to_end() -> None:
 
 def test_the_filter_needs_the_setup_s_own_timeframe() -> None:
     with pytest.raises(ValueError, match="own timeframe"):
-        StructureStrategy(qualifier=_Marked(), htf=H4)
+        StructureStrategy(qualifier=_Marked(), htf=H4, htf_offset=_UTC_BROKER)
 
 
 def test_a_timeframe_alone_builds_no_gate() -> None:

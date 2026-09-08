@@ -263,11 +263,13 @@ export type Type12 = "ponto_continuo";
 export type AllowSecondary = boolean;
 export type BreakevenAtR2 = number | null;
 export type Timeframe = "M1" | "M5" | "M15" | "M30" | "H1" | "H4" | "D1" | "W1";
+export type HtfOffset = number | null;
 export type StopBuffer = number;
 export type VolumeFilter2 = boolean;
 export type Type13 = "structure_choch";
 export type AllowSecondary1 = boolean;
 export type BreakevenAtR3 = number | null;
+export type HtfOffset1 = number | null;
 export type MaxBos = number | null;
 export type StopBuffer1 = number;
 export type VolumeFilter3 = boolean;
@@ -752,8 +754,16 @@ export interface StructureChochSetup {
  * heights past the region or closes through it. The zone traded may sit outside the region
  * above; the break that qualifies it must confirm after the touch. Serves the change of
  * character and the continuation alike. The value must be coarser than the document's own
- * `timeframe` and a whole number of its bars — `semantic.py` refuses the rest — and the bars
- * above close on the UTC clock, which is not the MetaTrader server's.
+ * `timeframe` and a whole number of its bars, and it needs `htf_offset` beside it — `semantic.py`
+ * refuses the rest.
+ *
+ * `htf_offset` is how far the broker's clock runs ahead of UTC, in hours (`3`, `-5.5`) — the
+ * same number the collector takes as `--server-offset`, and **required whenever `htf` is named**
+ * (2026-09-09: *"sempre levar em consideração o horário do mt5"*). A MetaTrader chart closes its
+ * H4 at 00:00, 04:00 and 08:00 *server* time while the stored candles are UTC, so an engine that
+ * assumed UTC would mark every region displaced by the broker's offset and every number would
+ * still look reasonable. Demanded rather than defaulted, for the reason the collector already
+ * gives: a clock that is measured instead of stated is a nondeterministic one.
  */
 export interface StructureParams {
   allow_secondary?: AllowSecondary;
@@ -762,6 +772,7 @@ export interface StructureParams {
     "edge" | "midpoint" | "return_pass" | "botinha" | "fffd" | "martelo" | "martelo_forca" | "gift" | "barra_ignorada";
   gift_stop?: "gift" | "forca";
   htf?: Timeframe | null;
+  htf_offset?: HtfOffset;
   stop_buffer?: StopBuffer;
   volume_filter?: VolumeFilter2;
 }
@@ -785,6 +796,7 @@ export interface ContinuationParams {
     "edge" | "midpoint" | "return_pass" | "botinha" | "fffd" | "martelo" | "martelo_forca" | "gift" | "barra_ignorada";
   gift_stop?: "gift" | "forca";
   htf?: Timeframe | null;
+  htf_offset?: HtfOffset1;
   max_bos?: MaxBos;
   stop_buffer?: StopBuffer1;
   volume_filter?: VolumeFilter3;

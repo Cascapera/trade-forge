@@ -1862,13 +1862,15 @@ que foi perguntado. **As pendências técnicas continuam abertas.**
 
 **Pendências técnicas:**
 
-- ⚠️ **O relógio do H4 é UTC e tem que ser o do servidor MT5 — DECIDIDO por ele em 09/09/2026**
-  (*"sempre levar em consideração o horário do mt5"*), aguardando implementação. A barra de H4 da
-  engine fecha em 00h/04h/08h UTC; a do MT5 fecha no horário do servidor da corretora, e o coletor
-  já converteu tudo para UTC ao gravar. Com um broker em UTC+3 toda região de H4 sai deslocada
-  três horas do que ele vê no gráfico. O `_ANCHOR` do `BarAggregator` precisa receber o offset do
-  broker — o mesmo `--server-offset` que o coletor exige — e o documento precisa carregá-lo. Não é
-  mais "no dia em que aparecer": é a regra dele.
+- ~~O relógio do H4 é UTC e tem que ser o do servidor MT5~~ — **FEITO na PR-208.** O
+  `BarAggregator` recebe `offset` (horas à frente do UTC, meias horas incluídas), o documento
+  carrega `htf_offset`, e a semântica **exige** os dois juntos: `htf` sem relógio é recusado, e
+  relógio sem `htf` também. Barra que atravessa fronteira levanta `EngineError` em vez de ser
+  dobrada no balde errado. ⚠️ **O que fica:** o offset é **um número fixo** para a corrida
+  inteira, e broker que muda com horário de verão desloca metade de um backtest de dois anos. O
+  coletor tem a mesma limitação (`infer_server_offset` mede uma vez), então é uma pendência do
+  pipeline, não deste filtro — e a barra que atravessa a fronteira **não** denuncia esse caso,
+  porque um offset de uma hora continua alinhado à grade.
 - **As regiões de H4 não são desenhadas no gráfico.** `Zoned.zones()` devolve só as da base; o
   portão expõe `HigherTimeframeGate.zones`, mas nada as lê. A entrada carrega a região que a
   liberou (`htf_top`/`htf_bottom` no `context`, retângulo `htf` no snapshot), então o retrato de
@@ -1911,3 +1913,20 @@ para os dois setups, e o filtro é opcional.
   e devolve toda série com valor — ou seja, a média longa **já chega ao front**. Falta a tela
   desenhar a segunda curva. ⚠️ A versão anterior desta linha dizia que o filtro "não aparece no
   gráfico da corrida inteira", que é mais forte do que o código: o guardian pegou.
+
+## O relógio do broker (PR-208) — o que fica
+
+- **Um número fixo para a corrida inteira.** `htf_offset` não muda no meio de um backtest, então
+  uma corretora que segue horário de verão desloca metade de uma corrida de dois anos. O coletor
+  tem exatamente a mesma limitação (`infer_server_offset` mede uma vez), então é pendência do
+  pipeline e não deste filtro. ⚠️ A guarda da barra que atravessa a fronteira **não** denuncia
+  esse caso: uma hora de erro continua alinhada à grade de M15.
+- **`_optional_hours` e `_decimal` explodem com `Decimal("abc")` em vez de frase.** Os dois em
+  `setup_factory.py` aceitam `str` no `isinstance` e caem em `decimal.InvalidOperation` com
+  traceback nu, contra a promessa do `compile_strategy` de sempre falhar com uma sentença. Dívida
+  **pré-existente e idêntica** nos dois (o `_decimal` é de muito antes); a camada Pydantic bloqueia
+  o caso real, porque o campo é `number | null`. Achado pelo guardian na PR-208.
+- **A fábrica levanta `EngineError` para valor de vocabulário errado e deixa a classe levantar
+  `ValueError` para valor fora de faixa** (`htf` mais fino que o `timeframe`, `htf_offset` além de
+  ±14h). É deliberado — a classe é quem conhece a regra —, mas a assimetria com `_choice` merece
+  ficar escrita antes que alguém a "conserte".

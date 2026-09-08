@@ -44,11 +44,14 @@ one candle, and that is the anti-lookahead rule made structural). So the higher 
 close of the H4 bar that revealed it — the moment his chart would draw it, and never earlier.
 ADR-0026 has the alternatives.
 
-⚠️ **The H4 bars close on the UTC clock.** A four-hour bucket ends at 00:00, 04:00, 08:00 UTC;
-a daily one at midnight UTC; a weekly one on Monday. The MetaTrader chart closes its H4 on the
-*server's* clock, which may be hours off, so a region the engine marks and one his chart marks
-can differ by that offset. Known and recorded in `specs/backlog.md`; the first suspect when the
-two disagree.
+⚠️ **The bars close on the broker's clock, and it has to be stated.** *"Sempre levar em
+consideração o horário do MT5"* (2026-09-09). A MetaTrader chart closes its H4 at 00:00, 04:00 and
+08:00 **server** time, and the collector converts everything to UTC before storing it — so an
+aggregator anchored on UTC cuts the bars somewhere else entirely, and with a broker three hours
+ahead every region comes out three hours displaced from the one he is looking at. Plausible, and
+wrong. `offset` is how far the broker's clock runs ahead of UTC, the same number and the same
+vocabulary the collector already demands as `--server-offset`, and it is required rather than
+guessed for exactly the reason stated there: a measured clock is a nondeterministic one.
 """
 
 import datetime as dt
@@ -57,6 +60,7 @@ from decimal import Decimal
 from typing import Final
 
 from tradeforge_engine.domain import Candle, Money, Side
+from tradeforge_engine.errors import EngineError
 from tradeforge_engine.structure import (
     MarketStructure,
     OrderBlock,
@@ -73,14 +77,20 @@ for the buy when price reaches 120, the top plus two heights. Read off the bar's
 *"atingir"* is price trading there, not settling there.
 """
 
-# A Monday at midnight UTC. Every bucket is a whole number of `target` from here, so an H1, H4 or
-# D1 bucket starts on the hour, on a four-hour boundary or at midnight, and a W1 bucket on a
-# Monday. The epoch itself (a Thursday) would put the week's edge on the wrong day.
+# A Monday at midnight. Every bucket is a whole number of `target` from here, so an H1, H4 or D1
+# bucket starts on the hour, on a four-hour boundary or at midnight, and a W1 bucket on a Monday.
+# The epoch itself (a Thursday) would put the week's edge on the wrong day. Read as an instant on
+# the **broker's** clock, not on UTC — `BarAggregator` shifts it by the offset.
 _ANCHOR: Final = dt.datetime(1970, 1, 5, tzinfo=dt.UTC)
+
+# A clock is a timezone, and the furthest any inhabited place sits from UTC is +14. The same bound
+# `collector.mt5_source.offset_is_plausible` uses, and for the same reason: beyond it the number
+# being stated is not a clock at all.
+MAX_SERVER_OFFSET: Final = dt.timedelta(hours=14)
 
 
 class BarAggregator:
-    """Folds bars of one timeframe into bars of a coarser one, closing each on the UTC clock.
+    """Folds bars of one timeframe into bars of a coarser one, closing each on the broker's clock.
 
     A bar of the target timeframe is **complete** on the base bar that ends exactly at its
     boundary, and it is returned from that base bar's `update` — so a strategy reading the H4 on
@@ -97,17 +107,38 @@ class BarAggregator:
 
     A partial bucket is never returned: the run ends, and whatever was accumulating is simply not
     a closed bar. Reading it would be reading a bar that has not closed.
+
+    ⚠️ **`offset` is where the broker's day starts**, in hours ahead of UTC — his rule, and the
+    module docstring says why. Every boundary is measured from midnight on *that* clock, so a
+    broker three hours ahead closes its H4 bars at 21:00, 01:00 and 05:00 UTC. Zero means the
+    broker keeps UTC, which is a claim about a real terminal rather than a convenient default,
+    and that is why nothing here supplies one.
+
+    ⚠️ **A base bar that straddles a boundary raises**, rather than being folded into whichever
+    bucket its opening instant fell in. It cannot happen when the offset describes the clock the
+    candles were actually collected under; it happens immediately when it does not — an offset of
+    ten minutes against M15 bars, say — and the failure it prevents is the expensive one: buckets
+    that close a little late, regions displaced by a little, and every number still plausible.
     """
 
-    def __init__(self, *, base: dt.timedelta, target: dt.timedelta) -> None:
+    def __init__(self, *, base: dt.timedelta, target: dt.timedelta, offset: dt.timedelta) -> None:
         if base <= dt.timedelta(0):
             raise ValueError(f"the base timeframe must be positive, got {base}")
         if target <= base:
             raise ValueError(f"the higher timeframe must be coarser than {base}, got {target}")
         if target % base != dt.timedelta(0):
             raise ValueError(f"the higher timeframe {target} is not a whole number of {base} bars")
+        if abs(offset) > MAX_SERVER_OFFSET:
+            raise ValueError(
+                f"a broker's clock sits within {MAX_SERVER_OFFSET} of UTC, got {offset}"
+            )
         self._base = base
         self._target = target
+        # Midnight on the broker's clock, expressed in UTC — the instant every boundary counts
+        # from. Computed once: the alternative is adding and subtracting the offset on both sides
+        # of every comparison, which is the same arithmetic written three times.
+        self._origin = _ANCHOR - offset
+        self._offset = offset
         self._bucket: dt.datetime | None = None
         self._open: Money = Decimal(0)
         self._high: Money = Decimal(0)
@@ -121,14 +152,29 @@ class BarAggregator:
     def target(self) -> dt.timedelta:
         return self._target
 
+    @property
+    def offset(self) -> dt.timedelta:
+        """How far the broker's clock runs ahead of UTC."""
+        return self._offset
+
     def bucket_of(self, moment: dt.datetime) -> dt.datetime:
-        """The opening instant of the target bar `moment` falls in."""
-        return _ANCHOR + ((moment - _ANCHOR) // self._target) * self._target
+        """The opening instant, in UTC, of the target bar `moment` falls in.
+
+        Counted from midnight on the broker's clock, so with a broker three hours ahead an H4
+        bucket opens at 21:00, 01:00 and 05:00 UTC — the instants his chart draws.
+        """
+        return self._origin + ((moment - self._origin) // self._target) * self._target
 
     def update(self, candle: Candle) -> tuple[Candle, ...]:
         """Fold in one closed base bar; return the target bars it completed, oldest first."""
         completed: list[Candle] = []
         bucket = self.bucket_of(candle.time)
+        if candle.time + self._base > bucket + self._target:
+            raise EngineError(
+                f"the bar at {candle.time} spans the boundary at {bucket + self._target}: "
+                f"a {self._base} bar cannot belong to one {self._target} bucket under a broker "
+                f"offset of {self._offset}"
+            )
         if self._bucket is not None and bucket != self._bucket:
             completed.append(self._flush())
         if self._bucket is None:
@@ -220,8 +266,8 @@ class HigherTimeframeGate:
     (*"1 - correto / 2 - correto"*).
     """
 
-    def __init__(self, *, base: dt.timedelta, target: dt.timedelta) -> None:
-        self._bars = BarAggregator(base=base, target=target)
+    def __init__(self, *, base: dt.timedelta, target: dt.timedelta, offset: dt.timedelta) -> None:
+        self._bars = BarAggregator(base=base, target=target, offset=offset)
         self._structure = MarketStructure()
         self._blocks = OrderBlockDetector()
         self._touched: set[OrderBlock] = set()
@@ -231,6 +277,11 @@ class HigherTimeframeGate:
     def timeframe(self) -> dt.timedelta:
         """How long one bar of the higher timeframe lasts."""
         return self._bars.target
+
+    @property
+    def offset(self) -> dt.timedelta:
+        """How far the broker's clock runs ahead of UTC — where its bars are cut."""
+        return self._bars.offset
 
     @property
     def zones(self) -> tuple[TrackedZone, ...]:
@@ -374,6 +425,7 @@ def _search_over(block: OrderBlock, candle: Candle) -> bool:
 
 __all__ = [
     "GIVE_UP_AT_REGION_HEIGHTS",
+    "MAX_SERVER_OFFSET",
     "BarAggregator",
     "HigherTimeframeGate",
     "Release",

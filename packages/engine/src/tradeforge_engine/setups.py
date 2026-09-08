@@ -2087,6 +2087,7 @@ class StructureStrategy:
         gift_stop: GiftStop = GiftStop.GIFT,
         volume_filter: bool = False,
         htf: dt.timedelta | None = None,
+        htf_offset: dt.timedelta | None = None,
         timeframe: dt.timedelta | None = None,
     ) -> None:
         if stop_buffer < ZERO:
@@ -2099,10 +2100,20 @@ class StructureStrategy:
         # better than guessing the base from the spacing of the first two candles.
         if htf is not None and timeframe is None:
             raise ValueError("a higher-timeframe filter needs the setup's own timeframe")
+        # ⚠️ **The broker's clock is demanded, never assumed** — his rule of 2026-09-09, and the
+        # same doctrine the collector already applies to `--server-offset`. A default of UTC would
+        # be a claim about a real terminal, and the one it makes is wrong for most of them: the
+        # regions would come out displaced by the broker's offset and every number would still
+        # look reasonable. Refusing costs one field on the document.
+        if htf is not None and htf_offset is None:
+            raise ValueError(
+                "a higher-timeframe filter needs the broker's clock: pass htf_offset, the hours "
+                "its server runs ahead of UTC"
+            )
         self._gate = (
             None
-            if htf is None or timeframe is None
-            else HigherTimeframeGate(base=timeframe, target=htf)
+            if htf is None or timeframe is None or htf_offset is None
+            else HigherTimeframeGate(base=timeframe, target=htf, offset=htf_offset)
         )
 
         self._qualifier = qualifier

@@ -1930,3 +1930,25 @@ para os dois setups, e o filtro é opcional.
   `ValueError` para valor fora de faixa** (`htf` mais fino que o `timeframe`, `htf_offset` além de
   ±14h). É deliberado — a classe é quem conhece a regra —, mas a assimetria com `_choice` merece
   ficar escrita antes que alguém a "conserte".
+
+## Achados da lição da PR-208 (conserto na PR-209)
+
+Consertados: o ADR-0026 afirmava o contrário do código depois da PR-208 (ganhou seção de revisão);
+o docstring de `_optional_hours` afirmava uma proteção inexistente (`float(Decimal(str(x)))` é
+`float(x)`, medido — a viagem pelo `Decimal` só protege quando o retorno **é** `Decimal`, como no
+`_decimal`); um teste chamado `..._on_the_utc_clock` que a PR-208 tinha deixado dizendo o oposto do
+que faz; e a atribuição errada de qual comando do coletor exige `--server-offset` (é o `catalogue`;
+o `backfill` mede).
+
+**Fica aberto:**
+
+- ⚠️ **Documento que a API aceita e que morre na primeira barra.** `timeframe: H1` + `htf: H4` +
+  `htf_offset: -5.5` passa por `validate_semantics` e levanta `EngineError ... spans the boundary`
+  na corrida. A regra estática ingênua (`offset % timeframe == 0`) **não** serve, e isso foi
+  medido: as velas D1 reais em `data/ohlcv` estão carimbadas às **21:00 UTC** (servidor +3), então
+  D1 → W1 roda com `offset: 3` e levanta com `offset: 0` — a regra ingênua recusaria justamente o
+  caso que funciona. O que falta é a semântica saber onde as velas **daquele instrumento** caem, e
+  ela não tem acesso a candle nenhum. Provavelmente vira uma checagem na API, ao montar a corrida,
+  e não no schema.
+- `packages/schema/src/tradeforge_schema/semantic.py:293` é uma guarda de narrowing não exercida —
+  gêmea da linha 324, que é anterior e igual. Só o `mypy` a exige.

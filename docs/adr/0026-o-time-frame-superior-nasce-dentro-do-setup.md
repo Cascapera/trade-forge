@@ -31,16 +31,41 @@ revelou, nunca antes. O loop, o `Context`, o broker e o live não mudam uma linh
 |-------------|------|---------|
 | **(a) Segundo fluxo no loop**: `Context` ganha a barra de H4 corrente e o `run()` recebe duas séries | O agregador some; o H4 vem do venue, alinhado ao relógio do servidor | Muda o contrato do loop, do `Context`, do `iter_run`, do splice do live e do aquecimento para **todos** os setups, por causa de um filtro de dois; duas séries que precisam estar alinhadas no tempo são uma nova classe de bug de lookahead (a barra de H4 "corrente" ainda não fechou) |
 | **(b) A API pré-calcula as regiões de H4** e entrega como dado ao setup | Engine não sabe o que é H4 | A regra (mitigação, rompimento, 2x) passa a viver **fora** da engine, e no live teria que ser recalculada por outro processo — a invariante §5.3 (estratégia única, backtest = live) quebra silenciosamente |
-| **(c) Montar o H4 dentro do setup** a partir do fluxo base | Um fluxo, uma engine, mesmo código em backtest e live; anti-lookahead por construção; os detectores dele reutilizados sem cópia | As barras fecham no relógio **UTC**, não no do servidor do MetaTrader; a estrutura de H4 precisa de aquecimento 16× mais longo em barras de M15 |
+| **(c) Montar o H4 dentro do setup** a partir do fluxo base | Um fluxo, uma engine, mesmo código em backtest e live; anti-lookahead por construção; os detectores dele reutilizados sem cópia | ~~As barras fecham no relógio **UTC**~~ (resolvido na PR-208, ver a revisão); a estrutura de H4 precisa de aquecimento 16× mais longo em barras de M15 |
 
 ## Trade-off aceito
 
-O relógio. Um H4 do MetaTrader fecha em 00h/04h/08h **do servidor da corretora**, que pode estar
-deslocado do UTC em horas; o nosso fecha em 00h/04h/08h UTC. A região de H4 que a engine marca
-pode diferir da que ele vê no gráfico por esse deslocamento. Fica registrado em `specs/backlog.md`
-como pendência conhecida, com o âncora como candidato a parâmetro no dia em que a diferença
-aparecer num backtest real. O aquecimento não é problema hoje: o live aquece sobre **todo** o
-histórico (39 mil barras na última medição), o que dá mais de 2 mil barras de H4.
+O relógio — **e ele durou um dia**. Ver a revisão abaixo antes de ler este parágrafo como estado
+atual do código.
+
+Um H4 do MetaTrader fecha em 00h/04h/08h **do servidor da corretora**, que pode estar deslocado do
+UTC em horas; o nosso fechava em 00h/04h/08h UTC. A região de H4 que a engine marcava podia diferir
+da que ele vê no gráfico por esse deslocamento. Ficou registrado em `specs/backlog.md` como
+pendência conhecida, com o âncora como candidato a parâmetro *no dia em que a diferença aparecesse
+num backtest real*. O aquecimento não é problema: o live aquece sobre **todo** o histórico (39 mil
+barras na última medição), o que dá mais de 2 mil barras de H4.
+
+## Revisão — 2026-09-09 (PR-208)
+
+⚠️ **O trade-off acima foi recusado por ele no dia seguinte**, antes de qualquer backtest expor a
+diferença: *"sempre levar em consideração o horario do mt5"*. Não era um custo aceitável, era um
+resultado errado esperando para acontecer — o modo de falha é um backtest inteiro com todas as
+regiões deslocadas e nenhum número parecendo errado.
+
+O que mudou: `BarAggregator` recebe `offset`, e conta cada fronteira a partir da meia-noite **no
+relógio do broker**; o documento carrega `htf_offset` (horas à frente do UTC, meias horas
+incluídas) e a semântica **exige** os dois juntos, recusando também o relógio sem `htf`. Não há
+default: zero seria afirmar que o servidor da corretora usa UTC, o que é falso para a maioria
+delas. Barra que atravessa a fronteira de um balde levanta `EngineError` em vez de ser dobrada no
+balde errado — a guarda pega **desalinhamento, não mentira**.
+
+A decisão principal deste ADR — montar as barras de cima **dentro** do setup, em vez de um segundo
+fluxo no loop ou de a API pré-calcular — não mudou, e a alternativa (a) continua recusada pelos
+mesmos motivos. O que a revisão remove é a linha da tabela que dava "as barras fecham no relógio
+UTC" como contra da opção (c): não fecham mais.
+
+O que fica: o offset é **um número fixo** por corrida, então horário de verão desloca metade de um
+backtest longo. O coletor tem a mesma limitação. Está em `specs/backlog.md`.
 
 ## Consequências
 

@@ -2101,8 +2101,9 @@ class StructureStrategy:
         if htf is not None and timeframe is None:
             raise ValueError("a higher-timeframe filter needs the setup's own timeframe")
         # ⚠️ **The broker's clock is demanded, never assumed** — his rule of 2026-09-09, and the
-        # same doctrine the collector already applies to `--server-offset`. A default of UTC would
-        # be a claim about a real terminal, and the one it makes is wrong for most of them: the
+        # doctrine the collector's `catalogue` command already applies to `--server-offset` (its
+        # `backfill` measures instead, so the precedent is that one command's). A default of UTC
+        # would be a claim about a real terminal, and the one it makes is wrong for most: the
         # regions would come out displaced by the broker's offset and every number would still
         # look reasonable. Refusing costs one field on the document.
         if htf is not None and htf_offset is None:
@@ -2110,6 +2111,11 @@ class StructureStrategy:
                 "a higher-timeframe filter needs the broker's clock: pass htf_offset, the hours "
                 "its server runs ahead of UTC"
             )
+        # ⚠️ **The last two clauses are unreachable at runtime and are not dead code.** The two
+        # refusals above already guarantee that a filter has both, so no test can distinguish this
+        # from `if htf is None`; what needs them is `mypy --strict`, which narrows `timeframe` and
+        # `htf_offset` to non-`None` only where it can see the check. Deleting them is a type
+        # error, not a green suite — which is the one form of "untested" that cannot rot.
         self._gate = (
             None
             if htf is None or timeframe is None or htf_offset is None

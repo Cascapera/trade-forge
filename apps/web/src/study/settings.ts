@@ -9,8 +9,30 @@
 import { ApiError } from '../api/client'
 import type { CreateStudyRequest } from '../api/types'
 
-/** Values a grid may try. Anything the DSL accepts for a parameter — a number, a flag, a name. */
-export type AxisValue = number | boolean | string
+/** Values a grid may try. Anything the DSL accepts for a parameter — a number, a flag, a name,
+ *  or `null` for a rule switched off. */
+export type AxisValue = number | boolean | string | null
+
+/**
+ * How "the rule switched off" is written on an axis.
+ *
+ * ⚠️ **A word, because a grid line is text and `null` has no spelling in it.** The values of an
+ * axis travel as `2, 3, 4` — comma-separated, typed by hand or built by a control — and an empty
+ * slot there already means "a trailing comma somebody is still typing". So the absence of a value
+ * needs a name of its own, and `off` is the one the strategy builder's own select already shows
+ * for these parameters.
+ *
+ * It is safe against the DSL's vocabulary today: no enum in the schema has a member called `off`
+ * — the entry points, the sides, the gift's stops, the timeframes are all other words. A schema
+ * that ever added one would collide, which is why the token lives here, named, rather than being
+ * spelled out at each of the four places that need it.
+ */
+export const OFF = 'off'
+
+/** One axis value as it is written on a line — the inverse of `parseValues` for a single value. */
+export function textOf(value: AxisValue): string {
+  return value === null ? OFF : String(value)
+}
 
 export interface Axis {
   /** A dotted path into the strategy document: `setup.params.period`. */
@@ -52,7 +74,8 @@ export const MAX_POINTS = 500
  * ⚠️ Blank entries are dropped rather than kept as empty strings. A trailing comma is what a
  * half-finished line looks like, and turning it into a value would send the server a parameter
  * of `""` — refused there, but refused with a message about a strategy rather than about a
- * comma.
+ * comma. `off` is therefore a **word** rather than that blank: it is a value somebody asked for,
+ * and it has to survive a line the blank is being stripped out of.
  */
 export function parseValues(raw: string): AxisValue[] {
   return raw
@@ -60,6 +83,7 @@ export function parseValues(raw: string): AxisValue[] {
     .map((piece) => piece.trim())
     .filter((piece) => piece.length > 0)
     .map((piece) => {
+      if (piece === OFF) return null
       if (piece === 'true') return true
       if (piece === 'false') return false
       // `Number('')` is 0 and `Number('  ')` is 0, which is why the blanks are gone by now.

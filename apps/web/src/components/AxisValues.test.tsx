@@ -70,6 +70,30 @@ describe('an axis over a set of names', () => {
     expect(line()).toBe('short')
   })
 
+  it('offers off beside the schema values when the rule can be switched off', () => {
+    // ⚠️ **The point of the axis, not a nicety.** Varying `htf` over `off, H4` is the one grid
+    // that answers whether the region above earns its keep, and a cross product cannot express
+    // it any other way — so without this box the comparison is two studies whose numbers never
+    // land on the same chart.
+    const htf = option('structure_choch', 'htf')
+    const { line } = show(htf)
+
+    const boxes = screen.getAllByRole('checkbox').map((box) => box.getAttribute('aria-label'))
+    expect(boxes[0]).toBe(`${LABEL} off`)
+    expect(boxes).toContain(`${LABEL} H4`)
+
+    fireEvent.click(screen.getByLabelText(`${LABEL} off`))
+    fireEvent.click(screen.getByLabelText(`${LABEL} H4`))
+    expect(line()).toBe('off, H4')
+  })
+
+  it('leaves off out of an axis whose rule cannot be switched off', () => {
+    // `side` is required: a setup with no side is not a setup with the side turned off.
+    show(option('mme9_breakout', 'side'))
+
+    expect(screen.queryByLabelText(`${LABEL} off`)).toBeNull()
+  })
+
   it('offers a flag as its two values rather than as one box that is either ticked or not', () => {
     // ⚠️ A grid over `allow_secondary` searches **both** settings; a single checkbox would mean
     // "vary it or don't", which is one run either way and not a grid at all.
@@ -158,6 +182,33 @@ describe('an axis over a number', () => {
 
     expect(screen.getByLabelText(`${LABEL} up`)).toBeDisabled()
     expect(screen.getByLabelText(`${LABEL} down`)).toBeDisabled()
+  })
+
+  it('offers off on a nullable number, which the stepper cannot reach', () => {
+    // `breakeven_at_r` is `> 0`, so no arrow and no typed number gets to "no breakeven" — and
+    // that is the run every other point on the axis is being compared against.
+    const breakeven = option('mme9_breakout', 'breakeven_at_r')
+    const { line } = show(breakeven, '2')
+
+    fireEvent.click(screen.getByLabelText(`${LABEL} off`))
+
+    // Off first: it is the control, and it has no place on a number line to be sorted onto.
+    expect(line()).toBe('off, 2')
+  })
+
+  it('takes off back off the axis', () => {
+    const { line } = show(option('mme9_breakout', 'breakeven_at_r'), 'off, 2')
+
+    fireEvent.click(screen.getByLabelText(`${LABEL} off`))
+
+    expect(line()).toBe('2')
+  })
+
+  it('leaves off out of a number that has no off', () => {
+    // `period` is required and `>= 1`: there is no such thing as a moving average of none.
+    show(option('mme9_breakout', 'period'))
+
+    expect(screen.queryByLabelText(`${LABEL} off`)).toBeNull()
   })
 
   it('offers the generated example one value at a time', () => {

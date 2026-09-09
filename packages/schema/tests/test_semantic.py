@@ -447,13 +447,20 @@ def test_a_higher_timeframe_needs_the_broker_s_clock() -> None:
     assert "hours its server runs ahead of UTC" in messages(model)
 
 
-def test_a_clock_with_no_higher_timeframe_to_place_is_refused() -> None:
-    """The other direction, and the reason it is not merely ignored: a number that configures
-    nothing is one somebody later reads as if it did."""
+def test_a_clock_with_no_higher_timeframe_is_sound_because_a_grid_needs_it() -> None:
+    """⚠️ **The asymmetry, and it is deliberate.** `htf` without a clock is refused above,
+    because it produces a wrong backtest with nothing looking odd. A clock without `htf` produces
+    nothing at all: no gate is built and the number is never read.
+
+    It *was* refused too, until a study grid needed it. Varying `htf` over `[off, H4]` is the
+    experiment the whole filter exists to justify, and a grid is a cross product — so the clock
+    has to hold still at one value while the filter moves, which means the unfiltered point
+    necessarily carries a clock that configures nothing. Refusing it made the comparison
+    impossible to ask for."""
     model = setup_strategy(
         timeframe="M15", setup={"type": "structure_choch", "params": {"htf_offset": 3}}
     )
-    assert "no higher timeframe for this clock to place" in messages(model)
+    assert validate_semantics(model) == []
 
 
 @pytest.mark.parametrize("offset", [15, -15, 100, -100])

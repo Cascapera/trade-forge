@@ -1,7 +1,7 @@
 import { useState } from 'react'
 
 import type { AxisOption } from '../study/axes'
-import { type AxisValue, parseValues } from '../study/settings'
+import { OFF, parseValues, textOf, type AxisValue } from '../study/settings'
 
 import type { NumericParam } from '../strategy/stepping'
 
@@ -20,18 +20,25 @@ const inputClass =
  * `toStudyRequest` are untouched by any of this.
  */
 function lineOf(values: readonly AxisValue[]): string {
-  return values.join(', ')
+  // Through `textOf`, so a switched-off point is written as the word rather than as the empty
+  // string `join` would give it — which `parseValues` drops as a half-typed comma.
+  return values.map(textOf).join(', ')
 }
 
 /** Numeric axes read in ascending order, whatever order they were clicked in.
  *
  *  Not tidiness: the grid's axis order is the order a heatmap lays its cells out and the order
  *  `grid.coordinates` breaks ties by, so an axis of `20, 5, 9` draws a chart whose rows climb,
- *  fall and climb again over a parameter that only goes one way. */
+ *  fall and climb again over a parameter that only goes one way.
+ *
+ *  ⚠️ **Off comes first**, ahead of every number. It is the control the rest of the axis is being
+ *  compared against — "does this rule earn its keep?" reads down the chart from the run without
+ *  it — and it has no place on a number line to be sorted onto. */
 function sorted(values: readonly AxisValue[]): AxisValue[] {
-  return [...values].sort((left, right) =>
-    typeof left === 'number' && typeof right === 'number' ? left - right : 0,
-  )
+  return [...values].sort((left, right) => {
+    if (left === null || right === null) return Number(left !== null) - Number(right !== null)
+    return typeof left === 'number' && typeof right === 'number' ? left - right : 0
+  })
 }
 
 function Choices(props: {
@@ -46,13 +53,13 @@ function Choices(props: {
       {options.map((option) => {
         const on = chosen.includes(option)
         return (
-          <label key={String(option)} className="flex items-center gap-1 text-sm text-slate-300">
+          <label key={textOf(option)} className="flex items-center gap-1 text-sm text-slate-300">
             <input
               type="checkbox"
               // Named with the axis in front of the value: two axes over `side` would otherwise
               // put two controls called "long" on one screen, which is a defect in the page and
               // not merely in a test's ability to find them.
-              aria-label={`${label} ${String(option)}`}
+              aria-label={`${label} ${textOf(option)}`}
               checked={on}
               onChange={() => {
                 // Rebuilt from the declared order rather than appended in click order, so the
@@ -60,7 +67,7 @@ function Choices(props: {
                 onChange(options.filter((each) => (each === option ? !on : chosen.includes(each))))
               }}
             />
-            {String(option)}
+            {textOf(option)}
           </label>
         )
       })}
@@ -108,7 +115,11 @@ export function AxisValues(props: {
     return (
       <Choices
         label={label}
-        options={param.options}
+        // ⚠️ `off` joins the schema's own options when the parameter is nullable, and it is the
+        // point of the axis rather than a nicety: varying `htf` over `off, H4` is the one grid
+        // that answers whether the region above earns its keep, and without this box the
+        // comparison is two studies whose numbers are not on the same chart.
+        options={param.nullable ? [null, ...param.options] : param.options}
         chosen={chosen}
         onChange={(next) => {
           onChange(lineOf(next))
@@ -169,13 +180,13 @@ export function AxisValues(props: {
 
       {chosen.map((each) => (
         <span
-          key={String(each)}
+          key={textOf(each)}
           className="inline-flex items-center gap-1 rounded bg-slate-800 px-2 py-1 text-xs text-slate-200"
         >
-          {String(each)}
+          {textOf(each)}
           <button
             type="button"
-            aria-label={`${label} remove ${String(each)}`}
+            aria-label={`${label} remove ${textOf(each)}`}
             className="text-slate-400 hover:text-red-400"
             onClick={() => {
               onChange(lineOf(chosen.filter((value) => value !== each)))
@@ -185,6 +196,30 @@ export function AxisValues(props: {
           </button>
         </span>
       ))}
+
+      {/* ⚠️ **Off, for a rule that can be switched off.** A nullable number — `breakeven_at_r`,
+          `max_bos`, `long_average_period` — has one value the stepper cannot reach, and it is the
+          most interesting point on the axis: the run without the rule, which everything else is
+          being compared against. Offered as a toggle rather than as a suggestion because it is
+          not a number somebody might have meant to type. */}
+      {numeric.nullable && (
+        <button
+          type="button"
+          aria-label={`${label} ${OFF}`}
+          aria-pressed={chosen.includes(null)}
+          className={
+            chosen.includes(null)
+              ? 'rounded bg-slate-800 px-2 py-1 text-xs text-slate-200'
+              : 'rounded border border-dashed border-slate-700 px-2 py-1 text-xs text-slate-400 hover:text-sky-300'
+          }
+          onClick={() => {
+            if (chosen.includes(null)) onChange(lineOf(chosen.filter((each) => each !== null)))
+            else add(null)
+          }}
+        >
+          {OFF}
+        </button>
+      )}
 
       {/* The generated example, one value at a time: it is built around the parameter's own
           default and clamped to its bounds, so every one of these is a value that will run. */}

@@ -54,7 +54,8 @@ regiões deslocadas e nenhum número parecendo errado.
 
 O que mudou: `BarAggregator` recebe `offset`, e conta cada fronteira a partir da meia-noite **no
 relógio do broker**; o documento carrega `htf_offset` (horas à frente do UTC, meias horas
-incluídas) e a semântica **exige** os dois juntos, recusando também o relógio sem `htf`. Não há
+incluídas) e a semântica **exige** os dois juntos, recusando também o relógio sem `htf`
+(⚠️ *esta segunda metade durou um dia — ver a revisão da PR-213 abaixo*). Não há
 default: zero seria afirmar que o servidor da corretora usa UTC, o que é falso para a maioria
 delas. Barra que atravessa a fronteira de um balde levanta `EngineError` em vez de ser dobrada no
 balde errado — a guarda pega **desalinhamento, não mentira**.
@@ -82,5 +83,30 @@ backtest longo. O coletor tem a mesma limitação. Está em `specs/backlog.md`.
 - DSL: `StructureParams.htf: Timeframe | None = None`; a semântica recusa um `htf` que não seja
   mais grosso que o `timeframe` do documento. Primeiro enum anulável da DSL: a web aprendeu a
   desenhar "off" em vez de "choose…", e o formulário grava `htf: null` como já gravava `max_bos`.
-- O que fica em aberto (backlog): o âncora do relógio; desenhar as regiões de H4 no gráfico; a
-  grade de estudo não sabe variar `htf` incluindo "off".
+- O que fica em aberto (backlog): o âncora do relógio. ~~Desenhar as regiões de H4 no gráfico~~
+  (PR-210); ~~a grade de estudo não sabe variar `htf` incluindo "off"~~ (PR-213, revisão abaixo).
+
+## Revisão — 2026-09-09 (PR-213): a regra ficou assimétrica
+
+⚠️ **Metade da regra que a revisão da PR-208 tinha acabado de escrever foi retirada no mesmo
+dia.** A semântica continua recusando `htf` sem `htf_offset`; deixou de recusar `htf_offset` sem
+`htf`.
+
+O motivo é um uso concreto. A grade de estudo é um **produto cartesiano**: para perguntar "a
+região de cima se paga?" o eixo varia `htf` entre `off` e `H4`, e todo o resto do documento tem
+que ficar parado — inclusive o relógio. Então o ponto sem filtro carrega, necessariamente, um
+relógio que não configura nada. A recusa tornava impossível **pedir** a comparação que justifica
+o filtro, e o ponto que ela barrava é justamente o controle contra o qual os outros são medidos.
+
+A assimetria é o argumento, e não um descuido. Os dois lados têm modos de falha de tamanhos
+diferentes:
+
+| Documento | O que acontece | Veredito |
+|-----------|----------------|----------|
+| `htf` sem `htf_offset` | O portão é montado e as barras de cima fecham no relógio errado: **todas** as regiões deslocadas, backtest inteiro errado, nenhum número parecendo estranho | **recusado** |
+| `htf_offset` sem `htf` | Nenhum portão é montado e o número nunca é lido — `setups.py` só o consulta dentro do `else` de `if htf is None` | **aceito** |
+
+O que se perde: um eixo de estudo sobre `htf_offset` num documento com `htf: null` passa a ser
+aceito e produz N backtests idênticos — um mapa de calor chapado, que é o modo de falha que a
+própria API classifica como o único totalmente silencioso. Está em `specs/backlog.md`, junto com
+o resto da validação semântica que o navegador ainda não faz.

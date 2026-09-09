@@ -9,6 +9,8 @@
 
 import { setupSpec, type SchemaParam, type SetupType } from '@tradeforge/schema'
 
+import { OFF } from './settings'
+
 export interface AxisOption {
   /** The dotted path the request carries: `setup.params.period`. */
   path: string
@@ -58,8 +60,16 @@ export function axesFor(setup: string | null): AxisOption[] {
 
 /** What to type in the values field, in the parameter's own terms. */
 function hintFor(param: SchemaParam): string {
+  // ⚠️ Said out loud, because `off` is the one value on these axes that is not on the parameter's
+  // own list and cannot be guessed from it — and it is the point of the axis: the run without the
+  // rule, which every other point is being compared against.
+  // ⚠️ Booleans are left out even if one were ever nullable, and it is not tidiness: `AxisValues`
+  // draws a boolean as the two boxes `true` and `false`, with no third one. A hint promising a
+  // word the control beside it cannot produce is the failure this function already has a scar
+  // from — it once said zero was legal on `breakeven_at_r`, and the study came back 422.
+  const off = param.kind !== 'boolean' && param.nullable ? `, or ${OFF} for none` : ''
   if (param.kind === 'enum') {
-    return `one or more of ${param.options.join(', ')}, separated by commas`
+    return `one or more of ${param.options.join(', ')}${off}, separated by commas`
   }
   if (param.kind === 'boolean') {
     return 'true, false — separated by commas'
@@ -81,7 +91,7 @@ function hintFor(param: SchemaParam): string {
         : `at most ${String(param.max)}`
   const bounds = [lower, upper].filter((part) => part !== null).join(' and ')
   const whole = param.kind === 'integer' ? 'whole numbers' : 'numbers'
-  return `${whole}${bounds === '' ? '' : ` ${bounds}`}, separated by commas`
+  return `${whole}${bounds === '' ? '' : ` ${bounds}`}${off}, separated by commas`
 }
 
 /**

@@ -76,11 +76,21 @@ export const OP_GROUPS = [
  * Python and left out of a group makes `Missing` non-empty and this file stop compiling. A
  * runtime test could only check the lists against each other, which is the tautology; this
  * checks them against the contract.
+ *
+ * ⚠️ Written as a bare `satisfies` and not as a named constant. The constant needed a `void`
+ * beside it to stop being "assigned but never used", and `typescript-eslint` 8.69 starts refusing
+ * that `void` as meaningless — leaving no version of this source that satisfies both rules, the
+ * same shape as the ruff conflict recorded in `.pre-commit-config.yaml`. An expression has no
+ * name to be unused, so neither rule has anything to say about it. Changed ahead of the bump
+ * rather than under it, since the linter here is still 8.68: see the PR for why.
+ *
+ * The proof itself is unchanged, and better. Verified by deleting a group from `OP_GROUPS`: the
+ * compiler still refuses the file, and now names the operator that went missing —
+ * `Type 'true' does not satisfy the expected type '"between"'`.
  */
 type OfferedOp = (typeof OP_GROUPS)[number]['ops'][number]
 type MissingOp = Exclude<RowOp, OfferedOp>
-const _everyOperatorIsOffered: MissingOp extends never ? true : MissingOp = true
-void _everyOperatorIsOffered
+true satisfies MissingOp extends never ? true : MissingOp
 
 /** The shape an operator belongs to. Derived from `OP_GROUPS`, so the two can never disagree. */
 export function shapeOf(op: RowOp): RowShape {

@@ -2,6 +2,7 @@ import type { Candle, OverlaySeries, Trade, Zone } from '../api/types'
 import type { DrawableZone, View } from './price'
 import {
   CURVE_COLORS,
+  curveStyles,
   OWN_TIMEFRAME,
   toBars,
   toCurves,
@@ -452,6 +453,52 @@ describe('toZones', () => {
     const [drawable] = toZones([zone()])
 
     expect(drawable?.label).toBe(OWN_TIMEFRAME)
+  })
+})
+
+describe('curveStyles', () => {
+  it('gives one hue per indicator and one stroke per reading of it', () => {
+    // The rule both charts share: `bb.upper` and `bb.lower` are two readings of one `bb`, so
+    // they get one colour and are told apart by the line — colour is the *entity*.
+    const styles = curveStyles(['bb.upper', 'bb.middle', 'bb.lower', 'sma'])
+
+    expect(styles.get('bb.upper')).toEqual({ color: CURVE_COLORS[0], stroke: 'solid' })
+    expect(styles.get('bb.middle')).toEqual({ color: CURVE_COLORS[0], stroke: 'dashed' })
+    expect(styles.get('bb.lower')).toEqual({ color: CURVE_COLORS[0], stroke: 'dotted' })
+    expect(styles.get('sma')).toEqual({ color: CURVE_COLORS[1], stroke: 'solid' })
+  })
+
+  it('leaves a curve past the palette out rather than repeating a hue', () => {
+    // ⚠️ Absent, not defaulted: two curves in one colour is a chart that lies about which is
+    // which, and each caller decides what to do about a fourth. Both of them today draw three.
+    const styles = curveStyles(['a', 'b', 'c', 'd'])
+
+    expect([...styles.keys()]).toEqual(['a', 'b', 'c'])
+    expect(styles.has('d')).toBe(false)
+  })
+
+  it('keeps a fourth reading of the same indicator, dotted', () => {
+    // A four-output indicator is a legend problem, not a reason to drop a line — and it is a
+    // *reading*, not a fourth entity, so the palette is not what runs out.
+    const styles = curveStyles(['x.a', 'x.b', 'x.c', 'x.d'])
+
+    expect(styles.get('x.d')).toEqual({ color: CURVE_COLORS[0], stroke: 'dotted' })
+  })
+})
+
+describe('toCurves keeps an indicator together', () => {
+  it('groups the readings of one indicator, whatever order the document declared them in', () => {
+    // ⚠️ Pinned because a refactor moved it and nothing noticed. Walking the series and looking
+    // each style up reads better than walking the palette, and it hands back input order — so a
+    // document interleaving `bb.upper`, `sma`, `bb.lower` would caption the two Bollinger rails
+    // either side of an unrelated average, and draw them that way too.
+    const labels = toCurves([
+      { label: 'bb.upper', points: [] },
+      { label: 'sma', points: [] },
+      { label: 'bb.lower', points: [] },
+    ]).map((curve) => curve.label)
+
+    expect(labels).toEqual(['bb.upper', 'bb.lower', 'sma'])
   })
 })
 

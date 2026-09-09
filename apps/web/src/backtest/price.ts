@@ -109,57 +109,112 @@ function entityOf(label: string): string {
   return dot === -1 ? label : label.slice(0, dot)
 }
 
+/** How one curve is drawn: its family's hue, and its position within that family. */
+export interface CurveStyle {
+  color: string
+  stroke: CurveStroke
+}
+
 /**
- * Overlay series off the wire, ready to draw.
+ * The hue and stroke every named curve gets, keyed by label.
  *
- * ⚠️ **The palette is spent per indicator, not per curve, and that is the whole reason this
- * function has to group.** A Bollinger is one declaration with three readings, so colouring by
- * position would hand its bands three unrelated hues — the reader sees three indicators — and
- * exhaust a three-hue palette on a single `bb`, dropping every other curve the strategy declared.
- * Hue therefore follows the *entity*: the three bands share one, and are told apart by stroke and
- * by where they sit on the chart. Same principle the run-comparison chart needed a seating chart
- * for: colour follows the thing, never the slot it arrived in.
+ * ⚠️ **One function, because two charts draw the same curves.** The price chart draws them over
+ * a whole run and the trade snapshot draws the handful the entry carried, and a reader moves
+ * between the two expecting the MME9 to be the same colour in both. Two copies of this would
+ * agree on the day they were written and drift on the day a third curve arrives — which is the
+ * day the long average arrived, and the snapshot went on painting every line one colour.
  *
- * Within a family, the **first component is solid and the rest are dashed then dotted**. Nothing
+ * ⚠️ **The palette is spent per indicator, not per curve, and that is why this groups.** A
+ * Bollinger is one declaration with three readings, so colouring by position would hand its bands
+ * three unrelated hues — the reader sees three indicators — and exhaust a three-hue palette on a
+ * single `bb`, dropping every other curve the strategy declared. Hue follows the *entity*: the
+ * three bands share one and are told apart by stroke. Same principle the run-comparison chart
+ * needed a seating chart for: colour follows the thing, never the slot it arrived in.
+ *
+ * Within a family the **first component is solid and the rest are dashed then dotted**. Nothing
  * here knows what a band is — the order comes from the engine, which declares components primary
  * first precisely so a drawing routine can make this call without knowing.
  *
- * Indicators past the palette are **dropped, not recycled**. A fourth hue repeating the first
- * would be two indicators the reader is invited to read as one, and a legend naming both in the
- * same swatch says nothing. Losing a line visibly beats lying about the ones that are kept.
+ * Indicators past the palette are **dropped, not recycled**, and a label with no entry in the
+ * returned map is exactly that: a fourth hue repeating the first would be two indicators the
+ * reader is invited to read as one. ⚠️ Every caller therefore has to decide what to do with a
+ * curve it cannot style, and the honest answer on both charts is *not to draw it* — a fallback
+ * colour would be the recycling this refuses, since `CURVE_COLORS[0]` is also the trade levels'
+ * `average` hue.
+ *
+ * ⚠️ **Keyed by label, which assumes labels are unique.** They are: an overlay set is a
+ * `Mapping` in the engine (`protocols.Charted`), so two curves cannot share a name. Written down
+ * because the version this replaced walked a list and did not need the assumption — a reader
+ * comparing them would not otherwise see that one was traded for the other.
  */
-export function toCurves(series: readonly OverlaySeries[]): Curve[] {
+export function curveStyles(labels: readonly string[]): Map<string, CurveStyle> {
   const families: string[] = []
-  const grouped = new Map<string, OverlaySeries[]>()
-  for (const one of series) {
-    const entity = entityOf(one.label)
+  const grouped = new Map<string, string[]>()
+  for (const label of labels) {
+    const entity = entityOf(label)
     const family = grouped.get(entity)
     if (family === undefined) {
       families.push(entity)
-      grouped.set(entity, [one])
+      grouped.set(entity, [label])
     } else {
-      family.push(one)
+      family.push(label)
     }
   }
 
+  const styles = new Map<string, CurveStyle>()
   // Walking the palette rather than the families is what makes the cap structural: there is no
   // index here the palette does not have, so no assertion is needed to say so.
-  return CURVE_COLORS.flatMap((color, index) => {
+  CURVE_COLORS.forEach((color, index) => {
     const entity = families[index]
-    if (entity === undefined) return []
-    const family = grouped.get(entity) ?? []
-    return family.map((one, position) => ({
-      label: one.label,
-      color,
+    if (entity === undefined) return
+    for (const [position, label] of (grouped.get(entity) ?? []).entries()) {
       // Past the third component every further reading stays dotted rather than dropping out:
       // an indicator with four outputs is a legend problem, not a reason to hide a line.
-      stroke: STROKES[position] ?? 'dotted',
-      points: one.points.map(([time, value]) => ({
-        time: toSeconds(time),
-        value: Number(value),
-      })),
-    }))
+      styles.set(label, { color, stroke: STROKES[position] ?? 'dotted' })
+    }
   })
+  return styles
+}
+
+/**
+ * Every series as a drawable curve, **grouped by indicator** rather than left in the order they
+ * arrived.
+ *
+ * ⚠️ The grouping is the legend's, and it survived a refactor by one probe. Splitting the palette
+ * decision out into `curveStyles` made it natural to walk `series` and look each label up, which
+ * reads better and quietly reordered the output: a document declaring `bb.upper`, `sma`,
+ * `bb.lower` used to draw the two Bollinger rails side by side in the caption and would have
+ * started drawing them either side of an unrelated average. Nothing failed — no test pinned the
+ * order — and a `console.log` of the real output is what found it. `price.test.ts` pins it now.
+ */
+export function toCurves(series: readonly OverlaySeries[]): Curve[] {
+  const styles = curveStyles(series.map((one) => one.label))
+  const byFamily = [...series].sort(
+    (a, b) => familyIndex(series, a.label) - familyIndex(series, b.label),
+  )
+  return byFamily.flatMap((one) => {
+    const style = styles.get(one.label)
+    if (style === undefined) return []
+    return [
+      {
+        label: one.label,
+        color: style.color,
+        stroke: style.stroke,
+        points: one.points.map(([time, value]) => ({
+          time: toSeconds(time),
+          value: Number(value),
+        })),
+      },
+    ]
+  })
+}
+
+/** Where a label's indicator first appears, so a sort keeps each family together and in the
+ *  order the document declared them. `Array.prototype.sort` is stable, so readings of one
+ *  indicator keep their own order within the family. */
+function familyIndex(series: readonly OverlaySeries[], label: string): number {
+  const entity = entityOf(label)
+  return series.findIndex((one) => entityOf(one.label) === entity)
 }
 
 /** `+2.30R`, or `—` when the run recorded no R multiple for the trade. */

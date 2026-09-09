@@ -1982,3 +1982,20 @@ sozinho. O que falta é retorno visual e expressividade da grade, em ordem de va
 ⚠️ **O endpoint `/overlays` não tem teste de integração para o campo `zones`** — os que existem
 asseguram só `series`. Pré-existente; a PR-210 fixou o contrato do `ZoneOut` em teste unitário e a
 publicação em teste de engine, mas o caminho HTTP inteiro segue sem cobertura.
+
+## O rótulo da média no retrato não é o do gráfico (achado na PR-211)
+
+`swing.py` nomeia a média do próprio setup de **`average`** no `series` da entrada
+(`_AverageTrail()` sem rótulo) e de **`EMA 9`** no `overlays()` do gráfico da corrida. A curva do
+filtro é `long EMA N` nos dois. Consequência agora que o retrato tem legenda: ela escreve
+**"average"** na tela, que é a palavra da engine para "a média que define este setup" e não uma
+boa palavra para mostrar a quem lê.
+
+⚠️ E a cor coincidir entre as duas telas é **coincidência estrutural, não garantia**: `curveStyles`
+atribui matiz por **posição da família**, e as duas listas declaram a média do setup primeiro. No
+dia em que uma delas mudar de ordem, a mesma curva troca de cor entre o gráfico e o retrato sem
+nada falhar.
+
+Conserto é na engine (`_AverageTrail(label=...)` no `swing.py`, para os dois hospedeiros), então
+sai num PR que passa pelo guardian. A fixtura de `TradeSnapshot.test.tsx` usa os rótulos de
+produção de propósito, para que a tela do teste seja a tela de verdade.

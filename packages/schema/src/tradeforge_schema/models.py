@@ -727,7 +727,15 @@ class StructureParams(_Node):
     gift_stop: GiftStop = "gift"
     volume_filter: bool = False
     htf: Timeframe | None = None
-    htf_offset: Annotated[float | None, Field(ge=-14, le=14)] = None
+    # ⚠️ `requiredWith` publishes the *other half* of this field's nullability, because `null`
+    # here is not a setting the way every other nullable in this model is. `breakeven_at_r: null`
+    # is "no break-even"; `htf_offset: null` is only legal while `htf` is null too, and a screen
+    # that offered it as a choice would be offering the one value `semantic.py` refuses. Said in
+    # the schema rather than in a form, so the fact reaches a frontend with no Python runtime —
+    # and `test_semantic.py` holds this key to the rule it describes, or the two would drift.
+    htf_offset: Annotated[
+        float | None, Field(ge=-14, le=14, json_schema_extra={"requiredWith": "htf"})
+    ] = None
 
 
 class StructureChochSetup(_Node):

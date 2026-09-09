@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { useState } from 'react'
 import { describe, expect, it } from 'vitest'
 
@@ -209,6 +209,20 @@ describe('an axis over a number', () => {
     show(option('mme9_breakout', 'period'))
 
     expect(screen.queryByLabelText(`${LABEL} off`)).toBeNull()
+  })
+
+  it('leaves off out of a nullable number the schema marks as required with another', () => {
+    // ⚠️ **The difference `nullable` alone cannot see.** `htf_offset` takes `null`, and its
+    // `null` is not a setting: the semantics refuse it wherever `htf` is named, so this button
+    // was one click from a 422 that takes a whole study with it. Both parameters are checked in
+    // one test because they are the two halves of the distinction — a rule applied to every
+    // nullable, and a rule applied to none, each pass one of these assertions alone.
+    show(option('structure_choch', 'htf_offset'))
+    expect(screen.queryByLabelText(`${LABEL} off`)).toBeNull()
+
+    cleanup()
+    show(option('structure_choch', 'breakeven_at_r'))
+    expect(screen.getByLabelText(`${LABEL} off`)).toBeInTheDocument()
   })
 
   it('offers the generated example one value at a time', () => {

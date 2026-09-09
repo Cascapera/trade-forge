@@ -1,5 +1,7 @@
 import { useState } from 'react'
 
+import { offIsASetting } from '@tradeforge/schema'
+
 import type { AxisOption } from '../study/axes'
 import { OFF, parseValues, textOf, type AxisValue } from '../study/settings'
 
@@ -115,11 +117,11 @@ export function AxisValues(props: {
     return (
       <Choices
         label={label}
-        // ⚠️ `off` joins the schema's own options when the parameter is nullable, and it is the
-        // point of the axis rather than a nicety: varying `htf` over `off, H4` is the one grid
-        // that answers whether the region above earns its keep, and without this box the
+        // ⚠️ `off` joins the schema's own options where the schema says it is a setting, and it
+        // is the point of the axis rather than a nicety: varying `htf` over `off, H4` is the one
+        // grid that answers whether the region above earns its keep, and without this box the
         // comparison is two studies whose numbers are not on the same chart.
-        options={param.nullable ? [null, ...param.options] : param.options}
+        options={offIsASetting(param) ? [null, ...param.options] : param.options}
         chosen={chosen}
         onChange={(next) => {
           onChange(lineOf(next))
@@ -201,8 +203,12 @@ export function AxisValues(props: {
           `max_bos`, `long_average_period` — has one value the stepper cannot reach, and it is the
           most interesting point on the axis: the run without the rule, which everything else is
           being compared against. Offered as a toggle rather than as a suggestion because it is
-          not a number somebody might have meant to type. */}
-      {numeric.nullable && (
+          not a number somebody might have meant to type.
+
+          ⚠️ `offIsASetting`, never `nullable`: `htf_offset` is nullable and its `null` is not a
+          choice — the semantics refuse it wherever `htf` is named, so this button used to be one
+          click from a 422 that takes a whole study with it. */}
+      {offIsASetting(numeric) && (
         <button
           type="button"
           aria-label={`${label} ${OFF}`}

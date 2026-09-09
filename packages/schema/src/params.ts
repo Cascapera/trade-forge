@@ -23,6 +23,9 @@ export type SchemaParam =
       /** Whether an explicit `null` is a legal value — "off", not "unset". `htf` on the structure
        *  setups is the first: no timeframe above is a setting, not a forgotten choice. */
       nullable: boolean
+      /** The parameter whose presence makes this one required — so this `null` is not a setting
+       *  a form may offer. See the numeric variant, where the whole reason is written out. */
+      requiredWith?: string
       options: readonly string[]
     }
   | {
@@ -32,6 +35,17 @@ export type SchemaParam =
       default: number | null
       /** Whether an explicit `null` is a legal value — "off", not "unset". */
       nullable: boolean
+      /**
+       * The parameter whose presence makes this one required, when the schema names one.
+       *
+       * ⚠️ **`nullable` alone does not mean a form may offer "off".** `breakeven_at_r: null` is a
+       * setting somebody chooses; `htf_offset: null` is legal only while `htf` is null too, and
+       * the semantics refuse it otherwise. A screen reading `nullable` on its own offered the
+       * second as a button, one click from a 422 that fails a whole study — the same shape of
+       * defect as `minimum ?? exclusiveMinimum` below, and for the same reason: a fact the schema
+       * had was flattened away before the form could see it.
+       */
+      requiredWith?: string
       min?: number
       /** The bound is `> min`, not `>= min`. A form that ignores this offers a refused value. */
       minExclusive?: boolean
@@ -40,6 +54,25 @@ export type SchemaParam =
       maxExclusive?: boolean
     }
   | { name: string; kind: 'boolean'; required: boolean; default: boolean }
+
+/**
+ * Whether a form may offer this parameter's `null` as a value somebody chooses.
+ *
+ * ⚠️ **Four controls asked this question and three of them got it wrong**, because each read
+ * `nullable` on its own: the study grid's axis hint, the grid's `off` button — one click from a
+ * 422 over a whole study — and the builder's caption on the empty box. Only the builder's `off`
+ * option on a nullable enum was right, and it was right by luck: no enum declares `requiredWith`
+ * yet. The rule is one sentence and it now has one address, which all four read.
+ *
+ * A boolean is never offered `off` even were one nullable: the controls beside the caption are
+ * the two boxes `true` and `false`, with no third. And a parameter the schema marks
+ * `requiredWith` has a `null` the semantics refuse whenever its companion is named — legal only
+ * in the document where the companion is off too, which is never a document worth offering it in.
+ */
+export function offIsASetting(param: SchemaParam): boolean {
+  if (param.kind === 'boolean') return false
+  return param.nullable && param.requiredWith === undefined
+}
 
 // A JSON Schema node, in the narrow shape this file reads. Deliberately not exhaustive — anything
 // unrecognised makes `describe` throw rather than produce a field the form would render wrong.
@@ -55,6 +88,8 @@ export interface SchemaNode {
   maximum?: number
   exclusiveMinimum?: number
   exclusiveMaximum?: number
+  /** The parameter this one must accompany, published by the model that owns the rule. */
+  requiredWith?: string
   properties?: Record<string, SchemaNode>
   required?: readonly string[]
   components?: readonly unknown[]
@@ -111,6 +146,7 @@ export function describeParam(
       required,
       default: typeof fallback === 'string' ? fallback : null,
       nullable,
+      ...(node.requiredWith === undefined ? {} : { requiredWith: node.requiredWith }),
       options: branch.enum,
     }
   }
@@ -131,6 +167,10 @@ export function describeParam(
       required,
       default: typeof fallback === 'number' ? fallback : null,
       nullable,
+      // ⚠️ Off the **outer** node, not the branch. Pydantic emits `float | None` as an `anyOf`
+      // and hangs the field's own keywords beside it, so `requiredWith` sits next to `default`
+      // — reading it off `branch` would find nothing and say nothing, silently.
+      ...(node.requiredWith === undefined ? {} : { requiredWith: node.requiredWith }),
       ...(min === undefined ? {} : { min }),
       ...(branch.minimum === undefined && branch.exclusiveMinimum !== undefined
         ? { minExclusive: true }

@@ -378,6 +378,7 @@
             }
           ],
           "default": null,
+          "requiredWith": "htf",
           "title": "Htf Offset"
         },
         "max_bos": {
@@ -1152,6 +1153,7 @@
             }
           ],
           "default": null,
+          "requiredWith": "htf",
           "title": "Htf Offset"
         },
         "stop_buffer": {

@@ -1,6 +1,6 @@
 import { describe, expect, expectTypeOf, it } from 'vitest'
 
-import type { SchemaParam } from './params.js'
+import { offIsASetting, type SchemaParam } from './params.js'
 import { readSetups, SETUP_TYPES, SETUPS, setupSpec, type SetupType } from './setups.js'
 
 function param(type: SetupType, name: string): SchemaParam {
@@ -130,6 +130,39 @@ describe('the parameters a form has to treat specially', () => {
       min: 1,
       max: 100,
     })
+  })
+
+  it('carries requiredWith off the schema, and only where the schema puts it', () => {
+    // ⚠️ **Read off the outer node, and that is where it could have vanished.** Pydantic emits
+    // `float | None` as an `anyOf`, so a reader looking inside the non-null branch finds nothing
+    // and says nothing — no error, no key, and every form back to treating this `null` as a
+    // setting somebody may pick.
+    expect(param('structure_choch', 'htf_offset')).toMatchObject({
+      kind: 'number',
+      nullable: true,
+      requiredWith: 'htf',
+    })
+
+    // The mirror: nullable, and nothing required with it. Without this, a reader that stamped
+    // every nullable with the key would pass the assertion above.
+    // `not.toHaveProperty` rather than reading the field: a boolean parameter has no such key at
+    // all, so the union does not offer it to read. And it separates absent from
+    // present-and-`undefined`, which `toEqual` does not — a spread that carried the key along
+    // with an `undefined` value would pass that one.
+    expect(param('structure_choch', 'breakeven_at_r')).not.toHaveProperty('requiredWith')
+    expect(param('structure_choch', 'htf')).not.toHaveProperty('requiredWith')
+  })
+
+  it('answers whether off is a setting a form may offer, per parameter', () => {
+    // The one sentence three screens were each deciding for themselves — the grid's hint, the
+    // grid's button and the builder's caption — and two of them were reading `nullable` alone.
+    expect(offIsASetting(param('structure_choch', 'htf'))).toBe(true)
+    expect(offIsASetting(param('structure_choch', 'breakeven_at_r'))).toBe(true)
+    expect(offIsASetting(param('structure_choch', 'htf_offset'))).toBe(false)
+    // Required, so its absence is a forgotten answer rather than a rule switched off.
+    expect(offIsASetting(param('mme9_breakout', 'period'))).toBe(false)
+    // A flag is drawn as its two boxes, with no third for a value it could never hold.
+    expect(offIsASetting(param('structure_choch', 'volume_filter'))).toBe(false)
   })
 
   it('carries the bounds the schema declares, so the form can refuse out-of-range input', () => {

@@ -1980,16 +1980,23 @@ sozinho. O que falta é retorno visual e expressividade da grade, em ordem de va
    mais dói: o eixo `off, H4, H1` parece razoável e o `H1` derruba o estudo inteiro (nada é
    escrito se um ponto falhar).
    ⚠️ **Duas entradas novas, achadas na conferência da lição da PR-213:**
-   (a) o botão `off` é oferecido também em **`htf_offset`**, porque ele é derivado de
-   `param.nullable` e o `htf_offset` é anulável — mas essa é justamente a direção que a semântica
-   **continua** recusando. Num documento com `htf: "H4"`, um clique no `off` do eixo `htf_offset`
-   derruba o estudo inteiro com 422. É o mesmo modo de falha que o comentário do `hintFor` já
-   registra ter acontecido com o `breakeven_at_r` ("a tela sugeriu o que a API recusa"), agora com
-   um clique em vez de uma digitação. O `null` do `htf_offset` **nunca** é útil: com `htf` ligado
-   é recusado, e com `htf` desligado o eixo inteiro é inerte (ver (b)). O conserto honesto é o
-   schema publicar que este anulável não é escolhível sozinho — via `json_schema_extra`, ao lado
-   do modelo Pydantic onde a regra mora — e não uma lista à mão em `axes.ts`, que existe
-   exatamente para não ter lista à mão.
+   (a) ~~o botão `off` é oferecido também em **`htf_offset`**~~ — **resolvido na PR-214.** O
+   modelo publica `json_schema_extra={"requiredWith": "htf"}`, o `SchemaParam` carrega a chave e
+   `offIsASetting` responde a pergunta uma vez só para os **quatro** controles (dica do eixo,
+   botão do eixo, legenda do construtor e a opção `off` do `select` anulável — a legenda dizia
+   "empty = off" desde a #208, mesmo furo). ⚠️ O quarto, o `select`, é **inobservável hoje**:
+   `htf` é o único enum anulável e nada é exigido junto com ele, então `offIsASetting` e
+   `nullable` concordam. Fica pelo modo de falha — no dia em que um enum ganhar a chave, o mesmo
+   `label` mostraria "empty only if X is" e a opção `off` quatro linhas abaixo.
+   Um teste parametrizado em `test_semantic.py` amarra a chave à regra: para todo campo com
+   `requiredWith: X`, documento com X nomeado e o campo nulo **tem** que ser recusado, e com X
+   ausente **tem** que passar. ⚠️ O `requiredWith` **não** resolve o resto deste item: ele é um
+   fato por parâmetro e a exigência de `htf` mais grosso que o `timeframe` do documento é uma
+   relação entre dois campos, que nenhum fato estático expressa. Candidato para isso: um endpoint
+   de ensaio (`POST /studies/preview`) que expande e valida cada ponto e devolve **todas** as
+   recusas, em vez de o navegador imitar a semântica. ⚠️ Ele **não** pode reusar o `points_for`:
+   aquele decide e falha fechado no primeiro ponto ruim, este relata e precisa continuar — as
+   duas políticas de falha não se fatoram numa função só.
    (b) um eixo sobre `htf_offset` num documento com `htf: null` passa em `expand` +
    `assert_executable` e produz N backtests **idênticos** (portão `None` em todos), ou seja um
    mapa de calor chapado — o modo de falha que `grid.py` classifica como o único totalmente

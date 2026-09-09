@@ -1,5 +1,6 @@
 import {
   indicatorSpec,
+  offIsASetting,
   SETUPS,
   setupSpec,
   takesSource,
@@ -538,6 +539,15 @@ function ConditionRows(props: {
  *  otherwise, and it is the difference between two different experiments. */
 function emptyHint(param: SchemaParam): string | null {
   if (param.kind === 'boolean' || !('nullable' in param) || !param.nullable) return null
+  // ⚠️ A parameter the schema marks `requiredWith` is nullable and its empty box is **not** off:
+  // `htf_offset` blank is legal only while `htf` is blank too. This said `empty = off` since the
+  // filter shipped, which is the screen promising a document the API refuses.
+  //
+  // Phrased as a condition on the blank rather than as "required with htf", which is the sentence
+  // this caption first carried and is false in half the states of this screen: with `htf` empty
+  // the clock is not required at all. The neighbours all say what an empty box means, and so does
+  // this one.
+  if (param.requiredWith !== undefined) return `empty only if ${param.requiredWith} is`
   return param.name === 'max_bos' ? 'empty = uncapped' : 'empty = off'
 }
 
@@ -588,8 +598,15 @@ function ParamField(props: {
               how it stays that way until the user chooses. Pre-selecting `long` would turn a
               forgotten choice into a whole long-only backtest read as the setup's result. A
               *nullable* enum is the other case: blank is an answer — the rule is off — and the
-              option says so, or `htf` would look like a question every CHoCH had forgotten. */}
-          {param.nullable && <option value="">off</option>}
+              option says so, or `htf` would look like a question every CHoCH had forgotten.
+
+              ⚠️ Through `offIsASetting` like the other three controls, and **no test separates
+              this one today**: `htf` is the only nullable enum and nothing is required with it,
+              so the answer here is the same either way. Kept for the failure mode, not for the
+              coverage — the day an enum declares `requiredWith`, this label would print
+              "empty only if X is" and offer `off` four lines below it, which is the screen
+              contradicting itself and handing over a document the API refuses. */}
+          {offIsASetting(param) && <option value="">off</option>}
           {param.default === null && !param.nullable && <option value="">choose…</option>}
           {param.options.map((option) => (
             <option key={option} value={option}>

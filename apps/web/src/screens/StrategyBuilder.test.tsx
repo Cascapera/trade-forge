@@ -175,6 +175,32 @@ describe('the strategy picker', () => {
     // `max_bos` defaults to null, which is uncapped — an empty box, not a zero.
     expect(screen.getByLabelText('setup max_bos')).toHaveValue('')
   })
+
+  it('says when an empty clock is allowed, not that it is the filter switched off', () => {
+    // ⚠️ **Two empty boxes, two different meanings, and the screen said "off" to both.**
+    // `max_bos` empty is a setting: uncapped. `htf_offset` empty is legal only while `htf` is
+    // empty too — the semantics refuse it the moment a timeframe above is named — so captioning
+    // it `empty = off` promised a document the API sends back as a 422. Both are asserted here
+    // because a caption applied to every nullable, and one applied to none, each satisfy half.
+    renderWithProviders(<StrategyBuilder />)
+    fireEvent.change(screen.getByLabelText('strategy'), {
+      target: { value: 'structure_continuation' },
+    })
+
+    // Scoped to each field's own label, because several parameters here carry a caption and a
+    // page-wide search would only prove that *some* box says "off".
+    const clock = screen.getByLabelText('setup htf_offset').closest('label')
+    expect(clock).toHaveTextContent('empty only if htf is')
+    expect(clock).not.toHaveTextContent('empty = off')
+
+    // The two that keep their own caption, and they are what makes this a distinction rather
+    // than a caption applied to everything: `htf` empty really is the filter off, and `max_bos`
+    // empty really is uncapped.
+    expect(screen.getByLabelText('setup htf').closest('label')).toHaveTextContent('empty = off')
+    expect(screen.getByLabelText('setup max_bos').closest('label')).toHaveTextContent(
+      'empty = uncapped',
+    )
+  })
 })
 
 describe('running the backtest', () => {

@@ -2036,6 +2036,27 @@ sozinho. O que falta é retorno visual e expressividade da grade, em ordem de va
 asseguram só `series`. Pré-existente; a PR-210 fixou o contrato do `ZoneOut` em teste unitário e a
 publicação em teste de engine, mas o caminho HTTP inteiro segue sem cobertura.
 
+## ⚠️ A suíte e2e está morta e ninguém percebeu (achado em 09/09/2026)
+
+`apps/web/e2e/` tem dois specs — `happy-path.spec.ts` e `screenshot.spec.ts` — e **nenhum
+workflow do CI roda playwright**. O resultado previsível: eles drifaram da tela.
+
+Medido ao subir `@playwright/test` para 1.63.0 e rodar contra o stack do Docker: o
+`happy-path` falha na primeira asserção, esperando um heading `Build a strategy` que **não existe
+em nenhum lugar de `apps/web/src`** — a tela do construtor diz `Run a backtest`. Ele também
+procura um botão `save & configure`. Não conferi o resto nem o `screenshot.spec.ts`.
+
+⚠️ **A distinção que importa:** o playwright em si funciona — subiu o Chromium, carregou o app e
+executou asserções. O que está podre é o conteúdo dos specs, não a ferramenta. Por isso o bump
+foi mergeado com o e2e vermelho, e isso está dito na PR.
+
+Duas decisões para tomar juntas, e a segunda depende da primeira:
+1. **Consertar os specs** para a UI de hoje — trabalho pequeno, mas eles cobrem o caminho
+   construir → rodar → ler resultado, que nenhum teste unitário cobre ponta a ponta.
+2. **Colocá-los no CI**, ou apagá-los. Um teste que ninguém roda não é cobertura: é um arquivo
+   que envelhece afirmando coisas falsas, e foi exatamente o que aconteceu. Rodar exige subir
+   api + banco + web no runner, que o job de integração já faz para outro fim.
+
 ## O rótulo da média no retrato não é o do gráfico (achado na PR-211)
 
 `swing.py` nomeia a média do próprio setup de **`average`** no `series` da entrada

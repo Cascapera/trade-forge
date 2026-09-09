@@ -3,6 +3,16 @@ import { describe, expect, it } from 'vitest'
 import { axesFor } from './axes'
 
 describe('axesFor', () => {
+  it('tells a nullable axis how to ask for the run without the rule', () => {
+    // The value that is not on the parameter's own list and cannot be guessed from it. Without
+    // the sentence, `off` is a word only somebody who read the parser would try.
+    const [htf] = axesFor('structure_choch').filter((axis) => axis.path === 'setup.params.htf')
+    expect(htf?.hint).toMatch(/or off for none/)
+
+    const [side] = axesFor('mme9_breakout').filter((axis) => axis.path === 'setup.params.side')
+    expect(side?.hint).not.toMatch(/off/)
+  })
+
   it('offers the parameters the chosen setup actually has', () => {
     // ⚠️ Asserted against the **DSL's own** parameter names, which is the point of deriving
     // them: this list is generated from the JSON Schema, which is generated from the Pydantic
@@ -104,12 +114,15 @@ describe('axesFor', () => {
     // ⚠️ **This is the bug a reader actually met.** `breakeven_at_r` is `gt=0` in the DSL, and
     // the spec used to fold that into `minimum: 0` — so the hint read "between 0 and 100", the
     // reader typed `0, 1, 2, 3, 4` meaning "no breakeven", and the study came back 422 for
-    // doing exactly what the screen had suggested. Zero is not "off" here; null is.
+    // doing exactly what the screen had suggested. Zero is not "off" here; null is — and since
+    // 2026-09-09 the hint says how to ask for it, which is the other half of that same bug.
     const [breakeven] = axesFor('mme9_breakout').filter(
       (axis) => axis.path === 'setup.params.breakeven_at_r',
     )
 
-    expect(breakeven?.hint).toBe('numbers greater than 0 and at most 100, separated by commas')
+    expect(breakeven?.hint).toBe(
+      'numbers greater than 0 and at most 100, or off for none, separated by commas',
+    )
     expect(breakeven?.hint).not.toMatch(/between 0/)
   })
 

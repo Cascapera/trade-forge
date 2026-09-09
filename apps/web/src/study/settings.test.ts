@@ -2,17 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import { ApiError } from '../api/client'
 
-import {
-  axesOf,
-  combinationCount,
-  emptyStudyForm,
-  parseValues,
-  launchFailure,
-  studyLabel,
-  toStudyRequest,
-  whyNotLaunchable,
-  type StudyForm,
-} from './settings'
+import { OFF, axesOf, combinationCount, emptyStudyForm, launchFailure, parseValues, studyLabel, textOf, toStudyRequest, type StudyForm, whyNotLaunchable } from './settings'
 
 function form(over: Partial<StudyForm> = {}): StudyForm {
   return {
@@ -37,6 +27,29 @@ describe('parseValues', () => {
 
   it('reads flags as flags', () => {
     expect(parseValues('true, false')).toEqual([true, false])
+  })
+
+  it('reads off as the rule switched off, which is a value and not a blank', () => {
+    // ⚠️ The one value on an axis that is not a value: `breakeven_at_r: null` asks what the setup
+    // earns *without* taking winners to breakeven, and `htf: null` asks whether the region above
+    // earns its keep at all. A grid is a cross product, so the only way to ask either is to put
+    // the unfiltered point on the axis beside the filtered ones.
+    expect(parseValues('off, 2, 3')).toEqual([null, 2, 3])
+  })
+
+  it('keeps off apart from the blank a half-typed comma leaves', () => {
+    // Both would be "no value" to a careless reader, and they are opposite: one is a point
+    // somebody asked for, the other is a comma they have not finished typing.
+    expect(parseValues('2, , 3')).toEqual([2, 3])
+    expect(parseValues('2, off, 3')).toEqual([2, null, 3])
+  })
+
+  it('writes a switched-off point back as the word it was read from', () => {
+    // The round trip is what the controls rely on: they hand the line back through `lineOf`,
+    // which is `textOf` per value — and `String(null)` would put the literal "null" on a line
+    // that `parseValues` would then read as a name.
+    expect(textOf(null)).toBe(OFF)
+    expect(parseValues([null, 2].map(textOf).join(', '))).toEqual([null, 2])
   })
 
   it('drops blanks instead of turning a trailing comma into a value', () => {

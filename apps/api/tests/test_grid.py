@@ -12,6 +12,8 @@ from typing import Any
 import pytest
 
 from tradeforge_api.grid import GridError, coordinates, expand, named, read_point, size_of
+from tradeforge_schema import assert_executable
+from tradeforge_schema.models import Strategy
 
 # A setup document, because every strategy in this project's database is one of these. The
 # nesting is what matters: the axes reach two levels down, into a dict shared by every point
@@ -285,3 +287,56 @@ def test_an_axis_the_documents_do_not_have_reads_as_nothing_rather_than_raising(
 
     with pytest.raises(GridError, match=re.escape("nothing at 'setup.params.nothing_reads_this'")):
         expand(document, grid)
+
+
+# --------------------------------------------------------------------------- #
+# An axis that switches a rule off (2026-09-09)                                 #
+# --------------------------------------------------------------------------- #
+
+
+def test_an_axis_may_carry_null_and_the_documents_it_makes_are_runnable() -> None:
+    """⚠️ **The experiment the filters exist to justify, end to end.** "Does the region above earn
+    its keep?" is one grid over `htf` — `off` against `H4` — and a grid is a cross product, so the
+    unfiltered point is a document that carries a broker clock configuring nothing.
+
+    Both halves are checked here because both had to give: `expand` had to copy a `None` through
+    like any other value, and the semantic layer had to stop refusing an offset with no filter
+    above it (`semantic._broker_clock_errors`, relaxed the same day and for this reason). Either
+    one alone leaves the comparison impossible to ask for, and this is the only place both are
+    true at once.
+    """
+    base = {
+        "schema_version": "1.0",
+        "name": "choch",
+        "timeframe": "M15",
+        "setup": {"type": "structure_choch", "params": {"htf": "H4", "htf_offset": 3}},
+        "risk": {"sizing": {"type": "percent_risk", "params": {"percent": 1.0}}},
+    }
+
+    points = expand(base, {"setup.params.htf": [None, "H4"]})
+
+    assert [_params(point.document)["htf"] for point in points] == [None, "H4"]
+    # The clock stays put on both, which is what a cross product does to an axis it is not varying.
+    assert {_params(point.document)["htf_offset"] for point in points} == {3}
+    for point in points:
+        assert_executable(Strategy.model_validate(point.document))
+
+
+def test_a_point_that_switches_a_rule_off_is_named_for_it() -> None:
+    """A study's runs are told apart by name, and `htf=None` has to read as something. Whatever
+    it reads as, two points must not share it — that is the whole job of the name."""
+    base = {
+        "schema_version": "1.0",
+        "name": "choch",
+        "timeframe": "M15",
+        "setup": {"type": "structure_choch", "params": {"htf": "H4", "htf_offset": 3}},
+        "risk": {"sizing": {"type": "percent_risk", "params": {"percent": 1.0}}},
+    }
+
+    names = [named("base", point) for point in expand(base, {"setup.params.htf": [None, "H4"]})]
+
+    assert len(set(names)) == 2
+    # `None` and `'H4'`, spelled the way the label already spells every other value — a string
+    # keeps its quotes there, so the unfiltered point reads as the absence it is rather than as
+    # a timeframe called "None".
+    assert names == ["base [htf=None]", "base [htf='H4']"]

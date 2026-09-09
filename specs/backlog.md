@@ -1966,13 +1966,19 @@ sozinho. O que falta é retorno visual e expressividade da grade, em ordem de va
 2. **No retrato da entrada, a região do H4 é indistinguível da zona base** (`TradeSnapshot.tsx`
    pinta todo retângulo do mesmo azul tracejado e nunca lê `region.label`), e **todas as curvas
    saem na mesma cor**, sem legenda — com o filtro de média longa são duas linhas iguais.
-3. **A grade não sabe pedir "desligado".** `AxisValues` ignora `param.nullable` no ramo de enum e
-   `parseValues` não tem token para nulo, então `htf`, `long_average_period`, `breakeven_at_r` e
-   `max_bos` não podem ter "off" num eixo. O servidor já aceita `null`. É o que destrava o
-   experimento "com filtro × sem filtro" numa corrida só.
-4. **A regra cruzada `htf` ⇄ `htf_offset` não existe no navegador** — o botão fica habilitado e o
+3. ~~A grade não sabe pedir "desligado"~~ — **feito na PR-213.** O token é a palavra `off`, lida e
+   escrita num lugar só (`settings.ts`); enum anulável ganha a caixa, número anulável ganha o
+   botão, e a dica do eixo passa a dizer que a palavra existe. ⚠️ Junto foi preciso **relaxar uma
+   regra semântica que eu mesmo tinha criado na PR-208**: "relógio sem `htf`" era recusado, e uma
+   grade é produto cartesiano — o relógio tem que ficar parado enquanto o filtro varia, então o
+   ponto sem filtro necessariamente carrega um relógio que não configura nada. A recusa na direção
+   perigosa (`htf` sem relógio) continua.
+4. **A regra cruzada `htf` ⇒ `htf_offset` não existe no navegador** — o botão fica habilitado e o
    422 só chega depois de submeter. Idem a exigência de o `htf` ser mais grosso que o `timeframe`:
-   a grade oferece os oito timeframes crus.
+   a grade oferece os oito timeframes crus, e variar `htf` sobre todos eles num documento M15
+   gera pontos que a semântica recusa. ⚠️ Agora que a grade sabe pedir `off`, este é o item que
+   mais dói: o eixo `off, H4, H1` parece razoável e o `H1` derruba o estudo inteiro (nada é
+   escrito se um ponto falhar).
 5. **Oito métricas calculadas e nunca exibidas**: `gross_profit`, `gross_loss`, `long_trades`,
    `short_trades`, `max_drawdown_abs`, `max_dd_duration_days`, `cagr`, `avg_trade_duration`
    (`sortino` só aparece na lista de corridas). Zero trabalho de backend.

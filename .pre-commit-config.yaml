@@ -35,8 +35,14 @@ repos:
   # `RUF100` (the `noqa: BLE001` is unused) on the very lines 0.15 reported `BLE001` on. There was
   # no version of the source that passed both. `.github/dependabot.yml` now watches this file for
   # that reason.
+  #
+  # ⚠️ **Watching it is not the same as keeping it in step, and on 2026-09-09 they had already
+  # drifted**: this pin said 0.16.4 while `uv.lock` said 0.16.5, with no PR open for either. The
+  # two ecosystems are updated independently, so a bump to one lands alone and the gap only shows
+  # when a rule moves between the versions. When you bump one, grep for the other in the same
+  # change.
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.16.4
+    rev: v0.16.6
     hooks:
       - id: ruff-check
         args: [--fix]

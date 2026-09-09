@@ -2014,9 +2014,21 @@ sozinho. O que falta é retorno visual e expressividade da grade, em ordem de va
    `assert_executable` e produz N backtests **idênticos** (portão `None` em todos), ou seja um
    mapa de calor chapado — o modo de falha que `grid.py` classifica como o único totalmente
    silencioso. A guarda retirada na PR-213 barrava isso de lambuja; é a outra metade do preço.
-5. **Oito métricas calculadas e nunca exibidas**: `gross_profit`, `gross_loss`, `long_trades`,
-   `short_trades`, `max_drawdown_abs`, `max_dd_duration_days`, `cagr`, `avg_trade_duration`
-   (`sortino` só aparece na lista de corridas). Zero trabalho de backend.
+5. ~~**Oito métricas calculadas e nunca exibidas**~~ — **resolvido na PR-216.** Nove, na verdade,
+   com o `sortino`, que só aparecia na lista de corridas. Segundo grupo no `MetricCards`, atrás de
+   um título, porque dezessete lajotas numa grade só é uma parede.
+   ⚠️ **Achado ao sondar antes de codar:** o `avg_trade_duration` vem como duração ISO 8601 e o
+   **Pydantic emite ANOS** — 400 dias viram `P1Y35DT2H`. Um parser que lesse só o `D` mostraria
+   `35d 2h`, errado por um fator de onze, sem nada parecer estranho na tela. Medido contra o
+   serializador: um ano ali vale exatamente 365 dias (`P2Y270D` = 1000 dias). Varrido o resto do
+   formato: semanas e meses o Pydantic **nunca** emite (`P14D`, `P30D`, `P31D`), fração só em
+   segundos, e o sinal negativo existe (`-PT1H`) mas é inalcançável numa saída menos uma entrada.
+   ⚠️ O regex **não** trata mês nem semana — `duration('P1M')` devolve travessão. Está certo
+   (falha fechada no que o produtor não emite), e a frase anterior aqui dizia o contrário.
+   ⚠️ **Fica em aberto:** `max_dd_duration_days` vem de `metrics.max_drawdown_duration.days`
+   (`packages/db`, `results.py`), que **trunca** — todo backtest intraday chega como `0`. A tela
+   agora escreve "< 1 d" quando o valor é zero **e** houve drawdown, o que é honesto, mas a
+   perda de resolução é do backend e continua lá.
 6. Menores: a seta do `htf_offset` começa em **-14** (o `startingPoint` cai no `param.min` quando o
    default é nulo) e o exemplo de eixo sugere `0.5, 1, 1.5`, que não são offsets plausíveis.
 

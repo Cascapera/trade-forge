@@ -7,6 +7,7 @@ import { StrategyPicker } from '../components/StrategyPicker'
 import { useSession } from '../store'
 import { TIMEFRAMES } from '../strategy/builder'
 import { axesFor } from '../study/axes'
+import { useGridPreview } from '../study/preview'
 import {
   MAX_POINTS,
   combinationCount,
@@ -53,7 +54,23 @@ export function LaunchStudy(): React.JSX.Element {
   const options = axesFor(chosen?.setup ?? null)
 
 
-  const blocked = strategyId === null ? 'Choose a strategy.' : whyNotLaunchable(form)
+  // ⚠️ Two refusals, from two places, and they answer different questions. `whyNotLaunchable`
+  // knows what this form can decide on its own — a missing market, a repeated value, a product
+  // over the cap. The preview knows what only the DSL's semantics can say, and it is a round
+  // trip away. Neither can be folded into the other without moving a rule to the wrong side.
+  const preview = useGridPreview(strategyId, form)
+  const local = strategyId === null ? 'Choose a strategy.' : whyNotLaunchable(form)
+  const refused = !preview.settled
+    ? null
+    : (preview.gridError ??
+      (preview.refusals.length === 0
+        ? null
+        : `${String(preview.refusals.length)} of these combinations cannot run, so the study will not start.`))
+  // ⚠️ Shown side by side rather than one winning: the local message is about the run — a market,
+  // a period, a product over the cap — and the server's is about the axes, which is what somebody
+  // filling in axes needs to see. Suppressing the second until the first is answered would hide
+  // the axis problem behind an unrelated blank field.
+  const blocked = local ?? refused
   const total = combinationCount(form)
 
   const set = (patch: Partial<StudyForm>) => {
@@ -275,7 +292,23 @@ export function LaunchStudy(): React.JSX.Element {
           </p>
         </div>
 
-        {blocked !== null && total > 0 && <p className="text-sm text-amber-300">{blocked}</p>}
+        {local !== null && total > 0 && <p className="text-sm text-amber-300">{local}</p>}
+        {/* ⚠️ **Every refused point, named.** The server sends all of them because fixing a grid
+            one round trip at a time is exactly what this endpoint exists to prevent — and the
+            label is the one the heatmap and the run log already use, so the reader is not
+            matching two descriptions of the same combination by eye. */}
+        {refused !== null && total > 0 && (
+          <div className="space-y-1">
+            <p className="text-sm text-amber-300">{refused}</p>
+            <ul className="space-y-1 text-xs text-amber-300/80">
+              {preview.refusals.map((refusal) => (
+                <li key={refusal.label}>
+                  <span className="font-medium">{refusal.label}</span> — {refusal.reason}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
         {create.isError && (
           <p className="text-sm text-red-400">{launchFailure(create.error)}</p>
         )}

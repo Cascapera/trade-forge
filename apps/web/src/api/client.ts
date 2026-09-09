@@ -24,12 +24,14 @@ import type {
   LiveSessionDetail,
   LiveSessionsPage,
   OverlaysResponse,
+  PreviewStudyRequest,
   SessionEventsPage,
   Snapshot,
   StrategiesPage,
   StrategyFilters,
   StrategyOut,
   StudyOut,
+  StudyPreview,
   SymbolHistory,
   SymbolSearch,
   TradesPage,
@@ -144,6 +146,11 @@ export const api = {
   getBasket: (id: string): Promise<BasketOut> => request('GET', `/baskets/${id}`),
   createStudy: (payload: CreateStudyRequest): Promise<CreatedStudy> =>
     request('POST', '/studies', payload),
+  // A POST that writes nothing: it asks what the grid would produce. Whether a point can run is
+  // the DSL's semantics, which live in Python once — so the screen asks rather than reimplements,
+  // and its answer cannot drift from the one the launch will give.
+  previewStudy: (payload: PreviewStudyRequest): Promise<StudyPreview> =>
+    request('POST', '/studies/preview', payload),
   getStudy: (id: string): Promise<StudyOut> => request('GET', `/studies/${id}`),
   // Takes a study, not a grid: the comparison a walk-forward exists to support only holds if
   // both halves searched the same parameter space over the same market, and a grid retyped

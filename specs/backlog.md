@@ -1973,12 +1973,25 @@ sozinho. O que falta é retorno visual e expressividade da grade, em ordem de va
    grade é produto cartesiano — o relógio tem que ficar parado enquanto o filtro varia, então o
    ponto sem filtro necessariamente carrega um relógio que não configura nada. A recusa na direção
    perigosa (`htf` sem relógio) continua.
-4. **A regra cruzada `htf` ⇒ `htf_offset` não existe no navegador** — o botão fica habilitado e o
-   422 só chega depois de submeter. Idem a exigência de o `htf` ser mais grosso que o `timeframe`:
-   a grade oferece os oito timeframes crus, e variar `htf` sobre todos eles num documento M15
-   gera pontos que a semântica recusa. ⚠️ Agora que a grade sabe pedir `off`, este é o item que
-   mais dói: o eixo `off, H4, H1` parece razoável e o `H1` derruba o estudo inteiro (nada é
-   escrito se um ponto falhar).
+4. ~~**A regra cruzada `htf` ⇒ `htf_offset` não existe no navegador**~~ — **resolvido na
+   PR-215**, junto com toda a família. ⚠️ **Correção de um fato errado que eu mesmo escrevi
+   aqui:** o exemplo `off, H4, H1` num documento M15 é **legal** — `H1` é mais grosso que M15 e
+   múltiplo inteiro dele. Sondado: num documento M15 a semântica aceita `M30, H1, H4, D1, W1` e
+   recusa `M1, M5, M15`. O eixo que derrubava o estudo é `off, M5, H4`, com um timeframe **mais
+   fino ou igual**, não mais grosso. O defeito era real e o exemplo não era.
+   O conserto foi `POST /studies/preview`: o navegador manda estratégia + grade, o servidor
+   expande, valida cada ponto e devolve **todas** as recusas com o rótulo do ponto. Zero cópia da
+   semântica no TypeScript. ⚠️ Ele **não** reusa o `points_for` (decide, falha fechado no
+   primeiro) — compartilha só o `_prepared`, que é expandir e **nomear**, e essa parte tem que ser
+   idêntica ou o ensaio mente. É um aviso antecipado, **nunca** o portão: o portão continua sendo
+   o `POST /studies`, que revalida tudo e não escreve nada se um ponto falhar.
+   ⚠️ **O que ficou descoberto (achado na conferência da lição da PR-215), para um item futuro:**
+   nada liga a string `'/studies/preview'` do `client.ts` ao decorator do router. Trocar uma das
+   duas deixa os testes verdes e a tela fica muda em produção, indistinguível de "a API caiu". É
+   uma classe **pré-existente** — vale para todos os endpoints —, e o schemathesis não fecha
+   porque sorteia UUID aleatório, bate no 404 e nunca chega no `preview_of`. Menor, junto: o
+   `QueryClient` de produção não desliga `retry`, então um ensaio fora do ar vira 3 tentativas por
+   grade.
    ⚠️ **Duas entradas novas, achadas na conferência da lição da PR-213:**
    (a) ~~o botão `off` é oferecido também em **`htf_offset`**~~ — **resolvido na PR-214.** O
    modelo publica `json_schema_extra={"requiredWith": "htf"}`, o `SchemaParam` carrega a chave e

@@ -16,6 +16,7 @@ vi.mock('../api/client', async () => {
       listInstruments: vi.fn(),
       listStrategies: vi.fn(),
       createStudy: vi.fn(),
+      previewStudy: vi.fn(),
     },
   }
 })
@@ -23,6 +24,7 @@ vi.mock('../api/client', async () => {
 const listInstruments = vi.mocked(api.listInstruments)
 const createStudy = vi.mocked(api.createStudy)
 const listStrategies = vi.mocked(api.listStrategies)
+const previewStudy = vi.mocked(api.previewStudy)
 
 function instrument(symbol: string) {
   return {
@@ -59,6 +61,9 @@ beforeEach(() => {
       },
     ],
   })
+  // Clean by default: the tests that care about the server's verdict say so themselves,
+  // and the rest must not be blocked by a preview they never set up.
+  previewStudy.mockResolvedValue({ points: 2, refusals: [], grid_error: null })
   useSession.setState({ strategyId: 'strategy-1', strategyName: 'MME9' })
 })
 
@@ -427,5 +432,118 @@ describe('LaunchStudy', () => {
     const parameter = screen.getByLabelText('Parameter 1')
     expect(within(parameter).getByRole('option', { name: 'allow_secondary' })).toBeInTheDocument()
     expect(within(parameter).queryByRole('option', { name: 'period' })).not.toBeInTheDocument()
+  })
+  it('names every combination the server refuses, not the first of them', async () => {
+    // ⚠️ **The whole point of the endpoint, seen from the screen.** Whether `htf: M5` can run on
+    // an M15 document is the DSL's semantics, which live in Python — the browser asks rather than
+    // reimplements. And it asks once for all of them: showing the first would make fixing a grid
+    // a sequence of round trips, which is what a person already had with the 422.
+    previewStudy.mockResolvedValue({
+      points: 3,
+      refusals: [
+        { label: "htf='M1'", values: { 'setup.params.htf': 'M1' }, reason: 'must be coarser' },
+        { label: "htf='M5'", values: { 'setup.params.htf': 'M5' }, reason: 'must be coarser' },
+      ],
+      grid_error: null,
+    })
+
+    renderWithProviders(<LaunchStudy />)
+    await screen.findByRole('option', { name: /MME9/ })
+    // ⚠️ The rest of the form is filled in, or the button would be disabled for a missing market
+    // and this test would prove nothing about the preview at all.
+    fireEvent.change(screen.getByLabelText(/Market/), { target: { value: 'AAPL' } })
+    fireEvent.change(screen.getByLabelText(/From/), { target: { value: '2024-01-01' } })
+    fireEvent.change(screen.getByLabelText(/To/), { target: { value: '2024-06-01' } })
+    fireEvent.change(screen.getByLabelText('Parameter 1'), {
+      target: { value: 'setup.params.period' },
+    })
+    setValues(1, '5, 9')
+
+    expect(await screen.findByText(/2 of these combinations cannot run/)).toBeInTheDocument()
+    expect(screen.getByText("htf='M1'")).toBeInTheDocument()
+    expect(screen.getByText("htf='M5'")).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Run the study' })).toBeDisabled()
+  })
+
+  it('says a grid that cannot be applied at all in its own words', async () => {
+    // A different kind of no: there are no points to report on, rather than points that will not
+    // run. Reported by the server in its own field, and it must not be flattened into a count.
+    previewStudy.mockResolvedValue({
+      points: 0,
+      refusals: [],
+      grid_error: "this strategy has nothing at 'setup.params.nonesuch'",
+    })
+
+    renderWithProviders(<LaunchStudy />)
+    await screen.findByRole('option', { name: /MME9/ })
+    // ⚠️ The rest of the form is filled in, or the button would be disabled for a missing market
+    // and this test would prove nothing about the preview at all.
+    fireEvent.change(screen.getByLabelText(/Market/), { target: { value: 'AAPL' } })
+    fireEvent.change(screen.getByLabelText(/From/), { target: { value: '2024-01-01' } })
+    fireEvent.change(screen.getByLabelText(/To/), { target: { value: '2024-06-01' } })
+    fireEvent.change(screen.getByLabelText('Parameter 1'), {
+      target: { value: 'setup.params.period' },
+    })
+    setValues(1, '5, 9')
+
+    expect(await screen.findByText(/nothing at 'setup.params.nonesuch'/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Run the study' })).toBeDisabled()
+  })
+
+  it('stops blocking the moment the axis changes, before the new answer arrives', async () => {
+    // ⚠️ **The stale answer, which is the only thing the debounce makes possible.** For the
+    // 400ms after a keystroke the query is still keyed on the previous grid, so what is on hand
+    // is a real verdict about a grid nobody is looking at any more. Blocking on it means the
+    // reader fixes the axis and the screen goes on refusing what they just corrected.
+    previewStudy.mockResolvedValue({
+      points: 2,
+      refusals: [
+        { label: "htf='M5'", values: { 'setup.params.htf': 'M5' }, reason: 'must be coarser' },
+      ],
+      grid_error: null,
+    })
+
+    renderWithProviders(<LaunchStudy />)
+    await screen.findByRole('option', { name: /MME9/ })
+    fireEvent.change(screen.getByLabelText(/Market/), { target: { value: 'AAPL' } })
+    fireEvent.change(screen.getByLabelText(/From/), { target: { value: '2024-01-01' } })
+    fireEvent.change(screen.getByLabelText(/To/), { target: { value: '2024-06-01' } })
+    fireEvent.change(screen.getByLabelText('Parameter 1'), {
+      target: { value: 'setup.params.period' },
+    })
+    setValues(1, '5, 9')
+
+    const button = await screen.findByRole('button', { name: 'Run the study' })
+    await waitFor(() => {
+      expect(button).toBeDisabled()
+    })
+
+    // The correction. No waiting: the point is what the screen does *before* the next answer.
+    setValues(1, '20')
+
+    expect(button).toBeEnabled()
+    expect(screen.queryByText("htf='M5'")).not.toBeInTheDocument()
+  })
+
+  it('does not block the launch on an answer that has not arrived', async () => {
+    // ⚠️ The preview is an early warning, never the gate — the gate is `POST /studies`, which
+    // validates every point again and writes nothing if one fails. A screen that disabled the
+    // button while waiting would make a slow round trip look like a refusal, and the person
+    // would go looking for a mistake that is not there.
+    previewStudy.mockReturnValue(new Promise(() => undefined))
+
+    renderWithProviders(<LaunchStudy />)
+    await screen.findByRole('option', { name: /MME9/ })
+    fireEvent.change(screen.getByLabelText(/Market/), { target: { value: 'AAPL' } })
+    fireEvent.change(screen.getByLabelText(/From/), { target: { value: '2024-01-01' } })
+    fireEvent.change(screen.getByLabelText(/To/), { target: { value: '2024-06-01' } })
+    fireEvent.change(screen.getByLabelText('Parameter 1'), {
+      target: { value: 'setup.params.period' },
+    })
+    setValues(1, '5, 9')
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Run the study' })).toBeEnabled()
+    })
   })
 })

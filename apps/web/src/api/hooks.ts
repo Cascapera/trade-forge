@@ -39,6 +39,7 @@ import type {
   SymbolHistory,
   SymbolSearch,
   StudyOut,
+  StudyPreview,
   TradesPage,
   WalkForwardOut,
 } from './types'
@@ -404,6 +405,37 @@ export function useTradeSnapshot(backtestId: string | undefined, tradeId: number
         : skipToken,
     // A recorded window never changes: it was frozen with the trade. Nothing to refetch.
     staleTime: Infinity,
+  })
+}
+
+/**
+ * What this grid would produce, asked while it is still being typed.
+ *
+ * ⚠️ **The browser cannot answer this and must not try.** Whether a point can run is the DSL's
+ * semantics — `htf` coarser than the document's own timeframe and a whole number of its bars, a
+ * broker clock required beside a filter — and those live in Python, once. A screen that
+ * reimplemented them in TypeScript would be a second copy of the contract, wrong the day either
+ * changed. So it asks the authority, and the answer cannot drift from the launch's.
+ *
+ * A POST, and still a query: it writes nothing, and the question is asked over and over as the
+ * form changes. The debounce is the caller's, for the reason `useSymbolSearch` gives — keying on
+ * the grid here would re-key on every character anyway.
+ *
+ * `enabled` only once there is a strategy and at least one axis: an empty grid has no preview to
+ * ask for, and the endpoint refuses one.
+ */
+export function useStudyPreview(strategyId: string | null, grid: Record<string, unknown[]>) {
+  const asked = strategyId !== null && Object.keys(grid).length > 0
+  return useQuery<{ grid: Record<string, unknown[]>; preview: StudyPreview }>({
+    queryKey: ['study-preview', strategyId, grid],
+    // ⚠️ **The answer carries the grid it is about**, rather than the caller trusting that
+    // whatever is in `data` belongs to the key it just asked on. That trust holds today only
+    // because this query has no `placeholderData` — and adding some is the obvious improvement
+    // somebody makes to stop the warning flickering, which would silently hand a caller a real
+    // verdict about a grid nobody is looking at. Carried here, that cannot happen quietly.
+    queryFn: asked
+      ? async () => ({ grid, preview: await api.previewStudy({ strategy_id: strategyId, grid }) })
+      : skipToken,
   })
 }
 

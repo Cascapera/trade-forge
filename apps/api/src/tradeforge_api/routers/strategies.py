@@ -63,6 +63,50 @@ def validate_document(document: dict[str, Any]) -> None:
         ) from exc
 
 
+def _field_of(loc: tuple[Any, ...]) -> str:
+    """The field a Pydantic error is about, without the model names on the way to it.
+
+    Falls back to the whole path when the last segment is an index rather than a name — `1` on
+    its own would say nothing, and this is the one case where the path is the information.
+    """
+    field = loc[-1] if loc else None
+    return str(field) if isinstance(field, str) else ".".join(str(part) for part in loc)
+
+
+def refusal_of(document: dict[str, Any]) -> str | None:
+    """Why this document cannot run, or `None` when it can — the *reporting* half of the pair.
+
+    ⚠️ **Deliberately not `validate_document` with the raising taken out.** The two have opposite
+    failure policies and folding them into one helper would force one of them to lie. Launching a
+    study *decides*: the first bad point refuses the whole request and nothing is written, because
+    a study that half-exists answers a question nobody asked. A preview *reports*: it has to walk
+    every point and come back with all of them, or a person fixes one value, asks again, and
+    learns about the next one — which is the round trip the preview exists to remove.
+
+    They also want different bodies. `validate_document` carries Pydantic's structured error list,
+    which is what a strategy screen renders field by field; a preview needs one sentence it can
+    put beside the axis value that caused it.
+    """
+    try:
+        assert_executable(StrategyDSL.model_validate(document))
+    except ValidationError as exc:
+        # `errors()` first, because a bare `str(exc)` on a Pydantic error is several lines of
+        # model paths — unreadable next to a grid value. One clause per failing field, and
+        # **every** failing field: a caller fixing them one per round trip is the thing this
+        # whole endpoint exists to prevent, and stopping at the first here would put that back
+        # one level down.
+        #
+        # ⚠️ Only the last segment of `loc`. The ones before it are the union branch Pydantic
+        # took — `setup.structure_choch.params.stop_buffer` — and `structure_choch` is the name
+        # of an internal model, which means nothing to any client. The web already strips it
+        # (`settings.ts`, `reasonOf`) from the other place these errors surface, so publishing it
+        # here would give one screen two formats for the same failure.
+        return "; ".join(f"{_field_of(error['loc'])}: {error['msg']}" for error in exc.errors())
+    except SemanticValidationError as exc:
+        return str(exc)
+    return None
+
+
 def _persist(session: SessionDep, strategy: Strategy) -> Strategy:
     session.add(strategy)
     try:

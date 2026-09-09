@@ -38,14 +38,17 @@ from tradeforge_api.grid import (
 )
 from tradeforge_api.queue import RUN_BACKTEST
 from tradeforge_api.routers.backtests import list_item
-from tradeforge_api.routers.strategies import validate_document
+from tradeforge_api.routers.strategies import refusal_of, validate_document
 from tradeforge_api.runner import ENGINE_VERSION
 from tradeforge_api.schemas import (
     CreatedStudy,
     CreateStudyRequest,
+    GridRefusal,
+    PreviewStudyRequest,
     StudyAggregate,
     StudyOut,
     StudyPointOut,
+    StudyPreview,
 )
 from tradeforge_collector import step
 from tradeforge_db.models import (
@@ -83,21 +86,34 @@ def points_for(base: Strategy, grid: Mapping[str, Sequence[Any]]) -> list[GridPo
     runs plus an error answers a question nobody asked.
     """
     try:
-        points = expand(base.definition, grid)
+        points = _prepared(base, grid)
     except GridError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
         ) from exc
 
     for point in points:
-        # ⚠️ The name is written **into the document**, not onto the row. `strategies.name` is a
-        # generated column (`definition ->> 'name'`), so the document is the only place a name
-        # can be set — which is the DSL staying the single source of truth all the way into the
-        # database. Done before validating, since the name is a field the DSL checks.
-        point.document["name"] = named(base.name, point)
         # Raises the same 422 the strategy endpoint raises, carrying the same error body — so a
         # client already able to explain why a strategy was rejected can explain this one too.
         validate_document(point.document)
+    return points
+
+
+def _prepared(base: Strategy, grid: Mapping[str, Sequence[Any]]) -> list[GridPoint]:
+    """The grid expanded and every point named — everything that happens before validating.
+
+    ⚠️ **Shared with the preview, and it has to be.** A preview that answered about *nearly* the
+    documents the launch would run is worse than none: it agrees with the right answer and with
+    the wrong one. Naming is part of it and not a flourish — the name is written **into the
+    document**, because `strategies.name` is a generated column (`definition ->> 'name'`) and the
+    document is the only place a name can be set. It is a field the DSL checks, so a point is not
+    the document that will be validated until it has one.
+
+    What is *not* shared is what comes next. See `refusal_of`.
+    """
+    points = expand(base.definition, grid)
+    for point in points:
+        point.document["name"] = named(base.name, point)
     return points
 
 
@@ -170,6 +186,56 @@ def _key(document: dict[str, Any]) -> str:
     accident today and stop working the day one of them makes a round trip through Postgres.
     """
     return json.dumps(document, sort_keys=True, default=str)
+
+
+@router.post("/studies/preview", response_model=StudyPreview, responses={**_NOT_FOUND, **_BAD_BODY})
+def preview_study(request: PreviewStudyRequest, session: SessionDep) -> StudyPreview:
+    """What this grid would produce, without producing any of it.
+
+    ⚠️ **The browser cannot answer this question and must not try.** Whether a point can run is
+    the DSL's semantics — `htf` has to be coarser than the document's own timeframe and a whole
+    number of its bars, a clock is required beside a filter — and those live in Python, once. A
+    screen that reimplemented them in TypeScript would be a second copy of the contract, drifting
+    from the first the day either changed. So the screen asks the authority instead of imitating
+    it, and the answer cannot be wrong for long.
+
+    Nothing is written and nothing is queued. The strategy is read to expand the grid against it,
+    which is why a missing one is a 404 rather than an empty preview.
+
+    ⚠️ **Not `points_for`.** That one decides — first bad point, whole request refused, nothing
+    written — and it is right to. This one reports, so it walks every point and comes back with
+    all of them. The two share `_prepared`, which is the part that has to be identical, and
+    nothing else. See `refusal_of`.
+    """
+    base = session.get(Strategy, request.strategy_id)
+    if base is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="strategy not found")
+    return preview_of(base, request.grid)
+
+
+def preview_of(base: Strategy, grid: Mapping[str, Sequence[Any]]) -> StudyPreview:
+    """The preview itself, with the database left at the door.
+
+    Separated from the route because everything worth being wrong about is here — which points
+    exist, which of them cannot run, and whether that answer matches what a launch would decide.
+    A test driving this through HTTP and a real Postgres would run the same walk behind three
+    layers that can only obscure which one was wrong.
+    """
+    try:
+        points = _prepared(base, grid)
+    except GridError as exc:
+        # Not a 422: the caller asked what this grid would do, and "it cannot be applied to this
+        # strategy at all" is the answer to that question rather than a malformed request.
+        return StudyPreview(points=0, refusals=[], grid_error=str(exc))
+
+    return StudyPreview(
+        points=len(points),
+        refusals=[
+            GridRefusal(label=point.label, values=dict(point.values), reason=reason)
+            for point in points
+            if (reason := refusal_of(point.document)) is not None
+        ],
+    )
 
 
 @router.post(

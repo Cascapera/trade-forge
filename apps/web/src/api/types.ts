@@ -462,6 +462,37 @@ export interface CreateStudyRequest {
   grid: Record<string, unknown[]>
 }
 
+export interface PreviewStudyRequest {
+  strategy_id: string
+  /** The same shape `CreateStudyRequest.grid` takes, so the preview is of the request itself. */
+  grid: Record<string, unknown[]>
+}
+
+/** One point of a grid that cannot run, and why. */
+export interface GridRefusal {
+  /** `htf='M5', stop_buffer=0.2` — the point in the words the rest of the study screen uses. */
+  label: string
+  /** Keyed by full path, so the screen can point at the axis the bad value is on. */
+  values: Record<string, unknown>
+  reason: string
+}
+
+/**
+ * What a grid would produce, asked before anything is produced.
+ *
+ * ⚠️ **`refusals` is every bad point, not the first.** Launching stops at the first, because
+ * nothing may be half-written; a preview that did the same would hand back one problem per round
+ * trip. And a body full of refusals arrives as a 200: the endpoint reports, and reporting that
+ * the news is bad is still a successful answer.
+ */
+export interface StudyPreview {
+  points: number
+  refusals: GridRefusal[]
+  /** Set when the grid cannot be applied to this strategy at all — a path that leads nowhere, an
+   *  empty axis, a product over the cap. A different kind of no: there are no points at all. */
+  grid_error: string | null
+}
+
 export interface CreatedStudy {
   id: string
   points: StudyPoint[]

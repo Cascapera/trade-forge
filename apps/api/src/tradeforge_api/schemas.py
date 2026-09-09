@@ -902,6 +902,58 @@ class StudyPointOut(_Out):
     status: str
 
 
+class PreviewStudyRequest(BaseModel):
+    """Ask what a grid would produce, without producing it.
+
+    Carries the strategy and the grid and nothing else: the question is about **documents**, and
+    a document is the base strategy with values substituted in. The symbol, the dates and the
+    capital belong to the runs, not to the documents, and none of them can make a point legal or
+    illegal.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    strategy_id: uuid.UUID
+    grid: dict[str, list[Any]] = Field(min_length=1)
+    """The same shape `CreateStudyRequest.grid` takes, so a caller previews the request it is
+    about to send rather than a translation of it."""
+
+
+class GridRefusal(_Out):
+    """One point of the grid that cannot run, and why."""
+
+    label: str
+    """`period=9, htf=M5` — the point in the words the rest of the study screen uses."""
+
+    values: dict[str, Any]
+    """Keyed by full path, so a client can point at the axis the bad value is on."""
+
+    reason: str
+    """One sentence, from the same validator `POST /studies` refuses with."""
+
+
+class StudyPreview(_Out):
+    """What a grid would produce: how many points, and every one that could not run.
+
+    ⚠️ **`refusals` is a list because the answer has to be complete.** Launching a study stops at
+    the first bad point — it must, since nothing may be half-written — but a preview that stopped
+    there would hand back one problem at a time, and fixing a grid would become the round trip
+    this endpoint exists to remove.
+
+    A 200 with refusals in it is a *successful answer*, not a failure. The endpoint reports; it
+    does not decide, and reporting that the news is bad is still reporting.
+    """
+
+    points: int
+    """How many combinations the grid expands to, or `0` when `grid_error` says why none do."""
+
+    refusals: list[GridRefusal]
+    grid_error: str | None = None
+    """Set when the grid cannot be applied to this strategy at all — a path that leads nowhere,
+    an empty axis, a product over the cap. A different kind of no from a refused point: there are
+    no points to report on, rather than points that will not run."""
+
+
 class CreatedStudy(_Out):
     """The 202 body: the study exists, and every point of the grid is queued."""
 

@@ -1979,6 +1979,21 @@ sozinho. O que falta é retorno visual e expressividade da grade, em ordem de va
    gera pontos que a semântica recusa. ⚠️ Agora que a grade sabe pedir `off`, este é o item que
    mais dói: o eixo `off, H4, H1` parece razoável e o `H1` derruba o estudo inteiro (nada é
    escrito se um ponto falhar).
+   ⚠️ **Duas entradas novas, achadas na conferência da lição da PR-213:**
+   (a) o botão `off` é oferecido também em **`htf_offset`**, porque ele é derivado de
+   `param.nullable` e o `htf_offset` é anulável — mas essa é justamente a direção que a semântica
+   **continua** recusando. Num documento com `htf: "H4"`, um clique no `off` do eixo `htf_offset`
+   derruba o estudo inteiro com 422. É o mesmo modo de falha que o comentário do `hintFor` já
+   registra ter acontecido com o `breakeven_at_r` ("a tela sugeriu o que a API recusa"), agora com
+   um clique em vez de uma digitação. O `null` do `htf_offset` **nunca** é útil: com `htf` ligado
+   é recusado, e com `htf` desligado o eixo inteiro é inerte (ver (b)). O conserto honesto é o
+   schema publicar que este anulável não é escolhível sozinho — via `json_schema_extra`, ao lado
+   do modelo Pydantic onde a regra mora — e não uma lista à mão em `axes.ts`, que existe
+   exatamente para não ter lista à mão.
+   (b) um eixo sobre `htf_offset` num documento com `htf: null` passa em `expand` +
+   `assert_executable` e produz N backtests **idênticos** (portão `None` em todos), ou seja um
+   mapa de calor chapado — o modo de falha que `grid.py` classifica como o único totalmente
+   silencioso. A guarda retirada na PR-213 barrava isso de lambuja; é a outra metade do preço.
 5. **Oito métricas calculadas e nunca exibidas**: `gross_profit`, `gross_loss`, `long_trades`,
    `short_trades`, `max_drawdown_abs`, `max_dd_duration_days`, `cagr`, `avg_trade_duration`
    (`sortino` só aparece na lista de corridas). Zero trabalho de backend.

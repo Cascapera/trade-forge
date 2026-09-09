@@ -299,11 +299,13 @@ def test_an_axis_may_carry_null_and_the_documents_it_makes_are_runnable() -> Non
     its keep?" is one grid over `htf` — `off` against `H4` — and a grid is a cross product, so the
     unfiltered point is a document that carries a broker clock configuring nothing.
 
-    Both halves are checked here because both had to give: `expand` had to copy a `None` through
-    like any other value, and the semantic layer had to stop refusing an offset with no filter
-    above it (`semantic._broker_clock_errors`, relaxed the same day and for this reason). Either
-    one alone leaves the comparison impossible to ask for, and this is the only place both are
-    true at once.
+    Both halves are checked here, and only one of them had to change. `expand` already copied a
+    `None` through like any other value — not a line of `apps/api/src` moved for this — and that
+    is asserted rather than assumed, because nothing else pinned it. What gave is the semantic
+    layer, which stopped refusing an offset with no filter above it
+    (`semantic._broker_clock_errors`, relaxed the same day and for this reason). Either half
+    alone leaves the comparison impossible to ask for, and this is the only place both are true
+    at once.
     """
     base = {
         "schema_version": "1.0",

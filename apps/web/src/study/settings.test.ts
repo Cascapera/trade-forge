@@ -2,7 +2,19 @@ import { describe, expect, it } from 'vitest'
 
 import { ApiError } from '../api/client'
 
-import { OFF, axesOf, combinationCount, emptyStudyForm, launchFailure, parseValues, studyLabel, textOf, toStudyRequest, type StudyForm, whyNotLaunchable } from './settings'
+import {
+  OFF,
+  axesOf,
+  combinationCount,
+  emptyStudyForm,
+  launchFailure,
+  parseValues,
+  studyLabel,
+  textOf,
+  toStudyRequest,
+  whyNotLaunchable,
+  type StudyForm,
+} from './settings'
 
 function form(over: Partial<StudyForm> = {}): StudyForm {
   return {

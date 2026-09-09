@@ -1,6 +1,7 @@
 import type { StudyOut } from '../api/types'
 import { axisName, fillFor, layoutOf } from '../backtest/study'
 import { percent } from '../format'
+import { OFF } from '../study/settings'
 
 /**
  * A study's grid, drawn as cells coloured by what each combination returned.
@@ -27,6 +28,10 @@ export function StudyHeatmap({ study }: { study: StudyOut }): React.JSX.Element 
   const placed = layout.cells.filter((cell) => cell.row >= 0 && cell.column >= 0)
   const dropped = layout.cells.length - placed.length
 
+  // ⚠️ **One column, unnamed, when the study varies a single parameter** — and it is a phantom,
+  // not a value. Kept apart from `columns` because `null` is now a value an axis can really hold
+  // (`off`, the run without the rule), so the two would otherwise print the same heading.
+  const single = layout.columns === null
   const columns = layout.columns?.values ?? [null]
   const at = (row: number, column: number) =>
     placed.find((cell) => cell.row === row && cell.column === column)
@@ -50,7 +55,7 @@ export function StudyHeatmap({ study }: { study: StudyOut }): React.JSX.Element 
                   scope="col"
                   className="px-2 text-center text-xs font-normal text-slate-400 tabular-nums"
                 >
-                  {label(value)}
+                  {single ? '' : label(value)}
                 </th>
               ))}
             </tr>
@@ -62,7 +67,7 @@ export function StudyHeatmap({ study }: { study: StudyOut }): React.JSX.Element 
                   scope="row"
                   className="px-2 text-right text-xs font-normal text-slate-400 tabular-nums"
                 >
-                  {String(rowValue)}
+                  {label(rowValue)}
                 </th>
                 {columns.map((_, column) => {
                   const cell = at(row, column)
@@ -116,9 +121,14 @@ export function StudyHeatmap({ study }: { study: StudyOut }): React.JSX.Element 
  * Written out rather than `String(value)` because the values come off the wire as `unknown`, and
  * `String` on an object yields `[object Object]` — a heading that says nothing while looking
  * like a heading. Nothing in this API sends one; the axis is captioned honestly if it ever does.
+ *
+ * ⚠️ **`null` is captioned `off`, in the word the axis was written with.** It is a switched-off
+ * rule, and on this chart it is the control every other row is being compared against — the one
+ * heading that must not be blank, and the one `String` would have printed as `null`.
  */
 function label(value: unknown): string {
-  if (value === null || value === undefined) return ''
+  if (value === null) return OFF
+  if (value === undefined) return ''
   if (typeof value === 'object') return JSON.stringify(value)
   // eslint-disable-next-line @typescript-eslint/no-base-to-string -- narrowed to a primitive
   return String(value)

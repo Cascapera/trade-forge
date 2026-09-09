@@ -63,6 +63,10 @@ function hintFor(param: SchemaParam): string {
   // ⚠️ Said out loud, because `off` is the one value on these axes that is not on the parameter's
   // own list and cannot be guessed from it — and it is the point of the axis: the run without the
   // rule, which every other point is being compared against.
+  // ⚠️ Booleans are left out even if one were ever nullable, and it is not tidiness: `AxisValues`
+  // draws a boolean as the two boxes `true` and `false`, with no third one. A hint promising a
+  // word the control beside it cannot produce is the failure this function already has a scar
+  // from — it once said zero was legal on `breakeven_at_r`, and the study came back 422.
   const off = param.kind !== 'boolean' && param.nullable ? `, or ${OFF} for none` : ''
   if (param.kind === 'enum') {
     return `one or more of ${param.options.join(', ')}${off}, separated by commas`

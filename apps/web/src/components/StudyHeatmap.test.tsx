@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest'
 
 import type { BacktestListItem, StudyOut, StudyPoint } from '../api/types'
 import { GAIN, LOSS } from '../backtest/study'
+import { OFF } from '../study/settings'
 import { renderWithProviders } from '../test-utils'
 
 import { StudyHeatmap } from './StudyHeatmap'
@@ -73,6 +74,30 @@ function study(profits: readonly (string | null)[], grid?: Record<string, unknow
       median_return: null,
     },
     runs,
+  }
+}
+
+/** A study over the axes given, one point per combination, every point finished at break-even. */
+function gridStudy(grid: Record<string, unknown[]>): StudyOut {
+  const [rows, columns] = Object.entries(grid)
+  if (rows === undefined) throw new Error('a grid needs an axis')
+  const pairs = (columns?.[1] ?? [undefined]).flatMap((column) =>
+    rows[1].map((row) => ({ row, column })),
+  )
+  const base = study(['0', '0', '0', '0'], grid)
+  return {
+    ...base,
+    points: pairs.map(({ row, column }, at) => ({
+      backtest_id: `g${String(at)}`,
+      strategy_id: `g${String(at)}`,
+      label: `point ${String(at)}`,
+      values:
+        columns === undefined
+          ? { [rows[0]]: row }
+          : { [rows[0]]: row, [columns[0]]: column },
+      status: 'done' as const,
+    })),
+    runs: pairs.map((_, at) => run(`g${String(at)}`, '0')),
   }
 }
 
@@ -151,6 +176,34 @@ describe('StudyHeatmap', () => {
 
     expect(screen.getByText(/no points to draw/)).toBeInTheDocument()
     expect(screen.queryByRole('table')).not.toBeInTheDocument()
+  })
+
+  it('captions a switched-off point with the word its axis was written with', () => {
+    // ⚠️ The control run — the point the rest of the chart exists to be compared against — and
+    // `String(null)` captioned its row `null` while the column header for it came out blank.
+    renderWithProviders(
+      <StudyHeatmap
+        study={gridStudy({
+          'setup.params.htf': [null, 'H4'],
+          'setup.params.breakeven_at_r': [null, 2],
+        })}
+      />,
+    )
+
+    expect(screen.getByRole('rowheader', { name: OFF })).toBeInTheDocument()
+    expect(screen.getByRole('columnheader', { name: OFF })).toBeInTheDocument()
+    expect(screen.queryByText('null')).not.toBeInTheDocument()
+  })
+
+  it('leaves the single column of a one-axis study unnamed, since it is not a value', () => {
+    // ⚠️ A study varying one parameter is drawn as one unnamed column, and that column's value
+    // is `null` for want of anything to put there. Now that `null` is a value an axis can really
+    // hold, captioning the phantom the same way would put a second `off` on the screen naming
+    // nothing.
+    renderWithProviders(<StudyHeatmap study={gridStudy({ 'setup.params.htf': [null, 'H4'] })} />)
+
+    expect(screen.getByRole('rowheader', { name: OFF })).toBeInTheDocument()
+    expect(screen.queryByRole('columnheader', { name: OFF })).not.toBeInTheDocument()
   })
 
   it('says how many points it could not place instead of leaving a hole', () => {

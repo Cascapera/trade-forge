@@ -1,0 +1,18 @@
+{
+  "schema_version": "1.0",
+  "name": "9.1 original — compra na virada da MME9",
+  "description": "A media inclinou para cima: compra no rompimento da maxima da barra que a virou, com stop na minima dela. A ordem nao persegue o preco e so e cancelada quando a media volta a apontar para baixo.",
+  "timeframe": "H1",
+  "setup": {
+    "type": "mme9_turn",
+    "params": {
+      "side": "long",
+      "period": 9,
+      "stop_buffer_ticks": 0,
+      "breakeven_at_r": null
+    }
+  },
+  "risk": {
+    "sizing": { "type": "percent_risk", "params": { "percent": 1 } }
+  }
+}

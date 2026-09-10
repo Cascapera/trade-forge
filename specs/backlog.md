@@ -2116,3 +2116,17 @@ O `apiFailure` agora lê as duas, mas o conserto de raiz é no servidor: ou chav
 normalizar o semântico em `{loc, msg}` — informação que o `SemanticError` **tem** e que o
 `str(exc)` joga fora. A segunda opção também daria à tela o campo pra destacar, que hoje só existe
 no meio da frase.
+
+## O `mme9_breakout` com `period: 1` não arma nunca (achado no PR-231)
+
+`EMA` usa `alpha = 2 / (period + 1)`, então em `period = 1` o alpha é **1** e a média **é** o
+fechamento. O setup dele arma com `close > ema`, que ali nunca é verdade: o documento é válido, o
+backtest roda, e o resultado é zero trade sem uma linha de aviso. O `ponto_continuo` tem a mesma
+forma de problema pelo lado do toque.
+
+O `mme9_turn` (o 9.1 publicado) **não** sofre disso, porque lê a inclinação — está pinado em
+`test_the_two_readings_come_apart_at_a_period_of_one`, que é onde a equivalência entre as duas
+leituras deixa de valer.
+
+Conserto possível: piso de `2` no `period` dos setups de média, no schema. Fora do escopo do
+PR-231 porque muda a gramática de setups que já existem e podem ter documentos salvos.

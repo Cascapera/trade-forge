@@ -246,7 +246,8 @@ export type MaxOpenPositions = number;
 export type Percent = number;
 export type Type10 = "percent_risk";
 export type SchemaVersion = "1.0";
-export type Setup = Mme9BreakoutSetup | PontoContinuoSetup | StructureChochSetup | StructureContinuationSetup;
+export type Setup =
+  Mme9BreakoutSetup | Mme9TurnSetup | PontoContinuoSetup | StructureChochSetup | StructureContinuationSetup;
 export type BreakevenAtR = number | null;
 export type LongAveragePeriod = number | null;
 export type Period3 = number;
@@ -255,25 +256,29 @@ export type StopBufferTicks = number;
 export type VolumeFilter = boolean;
 export type Type11 = "mme9_breakout";
 export type BreakevenAtR1 = number | null;
-export type LongAveragePeriod1 = number | null;
 export type Period4 = number;
 export type StopBufferTicks1 = number;
-export type VolumeFilter1 = boolean;
-export type Type12 = "ponto_continuo";
-export type AllowSecondary = boolean;
+export type Type12 = "mme9_turn";
 export type BreakevenAtR2 = number | null;
+export type LongAveragePeriod1 = number | null;
+export type Period5 = number;
+export type StopBufferTicks2 = number;
+export type VolumeFilter1 = boolean;
+export type Type13 = "ponto_continuo";
+export type AllowSecondary = boolean;
+export type BreakevenAtR3 = number | null;
 export type Timeframe = "M1" | "M5" | "M15" | "M30" | "H1" | "H4" | "D1" | "W1";
 export type HtfOffset = number | null;
 export type StopBuffer = number;
 export type VolumeFilter2 = boolean;
-export type Type13 = "structure_choch";
+export type Type14 = "structure_choch";
 export type AllowSecondary1 = boolean;
-export type BreakevenAtR3 = number | null;
+export type BreakevenAtR4 = number | null;
 export type HtfOffset1 = number | null;
 export type MaxBos = number | null;
 export type StopBuffer1 = number;
 export type VolumeFilter3 = boolean;
-export type Type14 = "structure_continuation";
+export type Type15 = "structure_continuation";
 
 /**
  * A complete, self-contained strategy definition.
@@ -581,9 +586,41 @@ export interface Mme9BreakoutParams {
   stop_buffer_ticks?: StopBufferTicks;
   volume_filter?: VolumeFilter;
 }
+export interface Mme9TurnSetup {
+  params: Mme9TurnParams;
+  type: Type12;
+}
+/**
+ * The published 9.1: enter on the break of the bar whose close bent the MME9.
+ *
+ * ⚠️ **This is not `mme9_breakout`, and the two are both called 9.1.** That one is the author's
+ * own reading — a bar *closes across* the average — and this one is the literature's: the
+ * average's own **slope** changes sign, and where price closed is not part of the question.
+ *
+ * Three rules follow, and each is the opposite of its neighbour's:
+ *
+ * * **The order does not follow price.** It rests at the high of the bar that bent the line (the
+ *   low, for a sell) and stays there while the line keeps pointing that way. `mme9_breakout`
+ *   re-prices to the newest bar of the turn.
+ * * **What cancels it is the line bending back**, not a close on the far side of the average.
+ * * **Arming is a one-bar event**, so a turn that lands while a trade is open is simply lost.
+ *
+ * `breakeven_at_r` defaults to `null` — **off** — because the published setup names an entry and
+ * a protective stop and says nothing about moving it. It is a parameter rather than a constant
+ * so that "what would this earn with his 2x1 on top" stays askable.
+ *
+ * No `entry_point` and no `long_average_period`: the bar patterns and the direction filter are
+ * the author's grafts onto his own setups, and this one is here to say what the book says.
+ */
+export interface Mme9TurnParams {
+  breakeven_at_r?: BreakevenAtR1;
+  period?: Period4;
+  side: SetupSide;
+  stop_buffer_ticks?: StopBufferTicks1;
+}
 export interface PontoContinuoSetup {
   params: PontoContinuoParams;
-  type: Type12;
+  type: Type13;
 }
 /**
  * Two corrections back to the average, then the bar that touches it and closes back.
@@ -617,13 +654,13 @@ export interface PontoContinuoSetup {
  */
 export interface PontoContinuoParams {
   average?: "EMA" | "SMA";
-  breakeven_at_r?: BreakevenAtR1;
+  breakeven_at_r?: BreakevenAtR2;
   entry_point?: "classic" | "martelo" | "martelo_forca" | "gift" | "barra_ignorada";
   gift_stop?: "gift" | "forca";
   long_average_period?: LongAveragePeriod1;
-  period?: Period4;
+  period?: Period5;
   side: SetupSide;
-  stop_buffer_ticks?: StopBufferTicks1;
+  stop_buffer_ticks?: StopBufferTicks2;
   volume_filter?: VolumeFilter1;
 }
 /**
@@ -631,7 +668,7 @@ export interface PontoContinuoParams {
  */
 export interface StructureChochSetup {
   params?: StructureParams;
-  type: Type13;
+  type: Type14;
 }
 /**
  * Shared by every setup that arms a limit order on a zone market structure left behind.
@@ -767,7 +804,7 @@ export interface StructureChochSetup {
  */
 export interface StructureParams {
   allow_secondary?: AllowSecondary;
-  breakeven_at_r?: BreakevenAtR2;
+  breakeven_at_r?: BreakevenAtR3;
   entry_point?:
     "edge" | "midpoint" | "return_pass" | "botinha" | "fffd" | "martelo" | "martelo_forca" | "gift" | "barra_ignorada";
   gift_stop?: "gift" | "forca";
@@ -781,7 +818,7 @@ export interface StructureParams {
  */
 export interface StructureContinuationSetup {
   params?: ContinuationParams;
-  type: Type14;
+  type: Type15;
 }
 /**
  * `max_bos` caps how many breaks after a change of character may still be traded.
@@ -791,7 +828,7 @@ export interface StructureContinuationSetup {
  */
 export interface ContinuationParams {
   allow_secondary?: AllowSecondary1;
-  breakeven_at_r?: BreakevenAtR3;
+  breakeven_at_r?: BreakevenAtR4;
   entry_point?:
     "edge" | "midpoint" | "return_pass" | "botinha" | "fffd" | "martelo" | "martelo_forca" | "gift" | "barra_ignorada";
   gift_stop?: "gift" | "forca";

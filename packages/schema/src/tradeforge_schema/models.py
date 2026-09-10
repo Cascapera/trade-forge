@@ -540,6 +540,40 @@ class Mme9BreakoutSetup(_Node):
     params: Mme9BreakoutParams
 
 
+class Mme9TurnParams(_Node):
+    """The published 9.1: enter on the break of the bar whose close bent the MME9.
+
+    ⚠️ **This is not `mme9_breakout`, and the two are both called 9.1.** That one is the author's
+    own reading — a bar *closes across* the average — and this one is the literature's: the
+    average's own **slope** changes sign, and where price closed is not part of the question.
+
+    Three rules follow, and each is the opposite of its neighbour's:
+
+    * **The order does not follow price.** It rests at the high of the bar that bent the line (the
+      low, for a sell) and stays there while the line keeps pointing that way. `mme9_breakout`
+      re-prices to the newest bar of the turn.
+    * **What cancels it is the line bending back**, not a close on the far side of the average.
+    * **Arming is a one-bar event**, so a turn that lands while a trade is open is simply lost.
+
+    `breakeven_at_r` defaults to `null` — **off** — because the published setup names an entry and
+    a protective stop and says nothing about moving it. It is a parameter rather than a constant
+    so that "what would this earn with his 2x1 on top" stays askable.
+
+    No `entry_point` and no `long_average_period`: the bar patterns and the direction filter are
+    the author's grafts onto his own setups, and this one is here to say what the book says.
+    """
+
+    side: SetupSide
+    period: Annotated[int, Field(ge=1, le=1000)] = 9
+    stop_buffer_ticks: Annotated[int, Field(ge=0, le=10_000)] = 0
+    breakeven_at_r: Annotated[float | None, Field(gt=0, le=100)] = None
+
+
+class Mme9TurnSetup(_Node):
+    type: Literal["mme9_turn"]
+    params: Mme9TurnParams
+
+
 class PontoContinuoParams(_Node):
     """Two corrections back to the average, then the bar that touches it and closes back.
 
@@ -763,7 +797,11 @@ class StructureContinuationSetup(_Node):
 
 
 type Setup = Annotated[
-    Mme9BreakoutSetup | PontoContinuoSetup | StructureChochSetup | StructureContinuationSetup,
+    Mme9BreakoutSetup
+    | Mme9TurnSetup
+    | PontoContinuoSetup
+    | StructureChochSetup
+    | StructureContinuationSetup,
     Field(discriminator="type"),
 ]
 

@@ -16,6 +16,7 @@ describe('the setups the DSL can name', () => {
     // runtime comparison then catches the opposite mistake — a key here that the schema dropped.
     const expected: Record<SetupType, true> = {
       mme9_breakout: true,
+      mme9_turn: true,
       ponto_continuo: true,
       structure_choch: true,
       structure_continuation: true,
@@ -30,7 +31,11 @@ describe('the setups the DSL can name', () => {
 
   it('types SetupType as the literal names, not as string', () => {
     expectTypeOf<SetupType>().toEqualTypeOf<
-      'mme9_breakout' | 'ponto_continuo' | 'structure_choch' | 'structure_continuation'
+      | 'mme9_breakout'
+      | 'mme9_turn'
+      | 'ponto_continuo'
+      | 'structure_choch'
+      | 'structure_continuation'
     >()
   })
 })

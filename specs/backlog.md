@@ -2050,12 +2050,22 @@ procura um botão `save & configure`. Não conferi o resto nem o `screenshot.spe
 executou asserções. O que está podre é o conteúdo dos specs, não a ferramenta. Por isso o bump
 foi mergeado com o e2e vermelho, e isso está dito na PR.
 
-Duas decisões para tomar juntas, e a segunda depende da primeira:
-1. **Consertar os specs** para a UI de hoje — trabalho pequeno, mas eles cobrem o caminho
-   construir → rodar → ler resultado, que nenhum teste unitário cobre ponta a ponta.
-2. **Colocá-los no CI**, ou apagá-los. Um teste que ninguém roda não é cobertura: é um arquivo
-   que envelhece afirmando coisas falsas, e foi exatamente o que aconteceu. Rodar exige subir
-   api + banco + web no runner, que o job de integração já faz para outro fim.
+✅ **RESOLVIDO na PR-224**, decisão dele: consertar **e** colocar no CI. As duas juntas, porque
+consertar sem rodar só recomeça o relógio.
+
+O que o conserto encontrou, além do heading:
+* o fluxo virou **uma** tela (`Run a backtest`), o botão salva e roda junto;
+* o seletor de mercado é combobox sobre `/api/symbols/search`, não select sobre `/instruments`;
+* a tela de resultado busca também `candles` e `overlays`, que nenhum spec mockava;
+* ⚠️ **a fixture do run omitia `candles_seen`/`first_candle`/`last_candle`.** O `coverageNotice`
+  guarda com `=== null`, então campo **ausente** passa pela guarda e estoura no formatador de
+  data — tela branca. Fake que discorda do real ([[fake-que-diverge-do-real]]).
+
+As fixtures viraram um módulo compartilhado (`e2e/fixtures.ts`): eram duas cópias de noventa
+linhas, que é o mecanismo pelo qual os dois apodreceram em separado.
+
+⚠️ **`screenshot.spec.ts` NÃO roda no CI**, de propósito: ele escreve em `docs/assets/`, então
+comitaria uma imagem que ninguém pediu ou falharia com a árvore suja. É ferramenta, rodada à mão.
 
 ## O rótulo da média no retrato não é o do gráfico (achado na PR-211)
 

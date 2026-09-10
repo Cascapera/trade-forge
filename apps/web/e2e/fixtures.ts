@@ -7,6 +7,12 @@
 
 import { expect, type Page, type Route } from '@playwright/test'
 
+// ⚠️ **Run these against the dev server, which is what CI runs them against.** The config's
+// `reuseExistingServer` means a container already listening on 5173 gets used instead — a
+// *built* app, where `/src/**` does not exist and the module graph is bundled. Two failures in
+// this file came from passing locally against that and failing on the runner. `docker compose
+// stop web` before running by hand, or trust CI to be the one that knows.
+
 export const strategy = {
   id: 's1',
   name: 'MA cross',
@@ -171,7 +177,12 @@ export async function mockApi(page: Page): Promise<void> {
   // journey then failed on a later assertion, naming a screen instead of the missing request.
   //
   // Refused loudly rather than answered: a fixture invented here would be a mock nobody chose.
-  await page.route('**/api/**', (route) => {
+  //
+  // ⚠️ Anchored on the origin, not `**/api/**`. That glob also matches `/src/api/client.ts` —
+  // a module the **dev server** serves, which only exists when vite is compiling on demand. The
+  // production build has no such URL, so a net written as a glob passes against a built app and
+  // refuses the app's own source on CI.
+  await page.route(/^https?:\/\/[^/]+\/api\//, (route) => {
     const request = route.request()
     throw new Error(
       `the journey called ${request.method()} ${request.url()}, which no fixture answers — ` +

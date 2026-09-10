@@ -18,6 +18,27 @@ export const strategy = {
 
 // The market picker is a combobox over `/api/symbols/search`, not a select over the catalogue:
 // it searches the broker's terminal by prefix. This is what one row of that answer looks like.
+// ⚠️ Still needed, and the net is what proved it. The market is *picked* through the broker
+// search, but the catalogue is what the run settings read to pre-fill a cost model — so removing
+// this route on the theory that the combobox replaced it left a call that only succeeded on a
+// machine with the backend running.
+export const instruments = [
+  {
+    id: 'i1',
+    symbol: 'EURUSD',
+    name: 'Euro vs US Dollar',
+    asset_class: 'forex',
+    currency_quote: 'USD',
+    currency_base: 'EUR',
+    tick_size: '0.00001',
+    tick_value: '1',
+    contract_size: '100000',
+    digits: 5,
+    // `null`, not zero: nobody measured this one. Zero would claim it is free to trade.
+    default_spread_points: null,
+  },
+]
+
 export const symbolSearch = {
   symbols: [
     {
@@ -138,16 +159,46 @@ export const json = (route: Route, body: unknown, status = 200): Promise<void> =
 
 /** Every call the journey makes, answered from the fixtures above. */
 export async function mockApi(page: Page): Promise<void> {
-  await page.route('**/api/symbols/search**', (route) => json(route, symbolSearch))
+  // ⚠️ **Registered first, and that is not a style choice: playwright matches routes in the
+  // reverse order they were added**, so the last handler registered wins. A net added at the
+  // bottom swallows every call the specific routes below were written to answer — which is
+  // exactly what it did on the first attempt, and the suite then failed naming the search
+  // endpoint it does mock.
+  //
+  // The net exists because this suite passed here and failed on CI. The dev server proxies
+  // `/api` to port 8000, where a developer usually has the real backend running, so an unmocked
+  // call quietly succeeded against live data locally and met a closed port on the runner. The
+  // journey then failed on a later assertion, naming a screen instead of the missing request.
+  //
+  // Refused loudly rather than answered: a fixture invented here would be a mock nobody chose.
+  await page.route('**/api/**', (route) => {
+    const request = route.request()
+    throw new Error(
+      `the journey called ${request.method()} ${request.url()}, which no fixture answers — ` +
+        'add it to mockApi rather than letting it reach a backend that only exists on your machine',
+    )
+  })
+
+  await page.route('**/api/instruments', (route) => json(route, instruments))
+  await page.route(/\/api\/symbols\/search/, (route) => json(route, symbolSearch))
   // A symbol nobody has probed answers 404, which the note beside the field is built to read.
-  await page.route('**/api/symbols/*/history**', (route) => json(route, {}, 404))
-  await page.route('**/api/strategies', (route) => json(route, strategy, 201))
+  await page.route(/\/api\/symbols\/[^/]+\/history/, (route) => json(route, {}, 404))
+  // ⚠️ One path, two questions, and a glob without the query string only ever answered one of
+  // them. `POST` saves the strategy; the builder also `GET`s the same path with a name filter to
+  // find whether this run already has one. Matched by regex so the query comes along, and split
+  // on the method so each answer is the shape its caller expects.
+  await page.route(/\/api\/strategies/, (route) =>
+    route.request().method() === 'POST'
+      ? json(route, strategy, 201)
+      : json(route, { total: 0, limit: 20, offset: 0, items: [] }),
+  )
   await page.route('**/api/backtests', (route) => json(route, { id: 'b1', status: 'queued' }, 202))
   await page.route('**/api/backtests/b1', (route) => json(route, doneRun))
-  await page.route('**/api/backtests/b1/trades**', (route) => json(route, trades))
+  await page.route(/\/api\/backtests\/b1\/trades/, (route) => json(route, trades))
   await page.route('**/api/backtests/b1/equity', (route) => json(route, equity))
   await page.route('**/api/backtests/b1/candles', (route) => json(route, candles))
   await page.route('**/api/backtests/b1/overlays', (route) => json(route, overlays))
+
 }
 
 /**

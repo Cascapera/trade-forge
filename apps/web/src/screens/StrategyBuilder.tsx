@@ -11,6 +11,8 @@ import {
 import { useMemo, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 
+import { ApiError } from '../api/client'
+import { apiFailure } from '../api/failure'
 import { useCreateBacktest, useInstruments, useSaveStrategy, useStrategy } from '../api/hooks'
 import { emptyBacktestForm, toBacktestRequest, whyNotRunnable, type BacktestForm } from '../backtest/settings'
 import { BacktestSettings } from '../components/BacktestSettings'
@@ -57,6 +59,34 @@ import { formOf, type ParseResult } from '../strategy/parse'
 
 /** The headings the picker groups by, in the order they are offered. */
 const GROUPS: readonly StrategyChoice['group'][] = ['Setups', 'Conditions']
+
+/** The status the API answers with when a name and version already exist. */
+const CONFLICT = 409
+
+/**
+ * Why a save was refused, with advice attached only when the status is the one it explains.
+ *
+ * ⚠️ **The advice used to be unconditional.** Every failed save said that a strategy is
+ * immutable for its version and that the name identifies the lineage, which is the explanation of
+ * a 409 — and against a 422 it is wrong twice: nothing about the name is at fault, and the reader
+ * is sent to edit the one field that would change nothing. A 422 already carries the sentence
+ * that says what to fix, and that sentence is the whole answer.
+ *
+ * The 409 itself is now nearly unreachable: `useSaveStrategy` asks `GET /strategies` whether the
+ * name exists and sends a `PUT` when it does, so only two tabs saving one new name at the same
+ * instant still collide. Which is why the advice says to save again rather than to rename — the
+ * second attempt finds the name and versions it.
+ */
+function saveRefusal(error: unknown): string {
+  const because = apiFailure(error, 'no reason was given')
+  if (error instanceof ApiError && error.status === CONFLICT) {
+    return (
+      `${because}. A strategy is immutable for its version, so saving again writes the next ` +
+      'version under this name; a different name starts a lineage of its own.'
+    )
+  }
+  return `${because}.`
+}
 
 const inputClass =
   'rounded border border-slate-700 bg-slate-900 px-2 py-1 text-sm text-slate-100 focus:border-sky-500 focus:outline-none'
@@ -1050,14 +1080,13 @@ export function StrategyBuilder(): React.JSX.Element {
 
       {save.isError && (
         <p className="text-sm text-red-400">
-          The API rejected the strategy: {save.error.message}. A saved strategy is immutable for its
-          version, and the name is what identifies the lineage — pick the strategy again to stamp a
-          fresh name, or edit the name field by hand.
+          The API rejected the strategy — {saveRefusal(save.error)}
         </p>
       )}
       {run.isError && (
         <p className="text-sm text-red-400">
-          The strategy was saved, but the backtest could not be enqueued: {run.error.message}
+          The strategy was saved, but the backtest could not be enqueued —{' '}
+          {`${apiFailure(run.error, 'no reason was given')}.`}
         </p>
       )}
 

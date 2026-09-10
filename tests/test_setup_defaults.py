@@ -47,10 +47,15 @@ from tradeforge_engine.setups import (
     StructureStrategy,
     ZoneEntryPoint,
 )
-from tradeforge_engine.swing import Mme9BreakoutStrategy, PontoContinuoStrategy
+from tradeforge_engine.swing import (
+    Mme9BreakoutStrategy,
+    Mme9TurnStrategy,
+    PontoContinuoStrategy,
+)
 from tradeforge_schema.models import (
     ContinuationParams,
     Mme9BreakoutParams,
+    Mme9TurnParams,
     PontoContinuoParams,
     Setup,
     StructureParams,
@@ -74,6 +79,10 @@ _SETUPS: dict[str, tuple[type[Any], dict[str, Any]]] = {
     "mme9_breakout": (
         Mme9BreakoutParams,
         _owned_by(Mme9BreakoutParams, Mme9BreakoutStrategy),
+    ),
+    "mme9_turn": (
+        Mme9TurnParams,
+        _owned_by(Mme9TurnParams, Mme9TurnStrategy),
     ),
     "ponto_continuo": (
         PontoContinuoParams,
@@ -110,6 +119,15 @@ _PROBES: dict[str, dict[str, tuple[Any, Any]]] = {
         "volume_filter": (True, True),
         # His long-average direction filter (2026-09-09), off by default.
         "long_average_period": (200, 200),
+    },
+    # The published 9.1. Four fields only: no bar patterns, no direction filter.
+    "mme9_turn": {
+        "side": ("short", Side.SHORT),
+        "period": (21, 21),
+        "stop_buffer_ticks": (3, 3),
+        # ⚠️ Probed with a number because the *default* is `None` here, the mirror of every other
+        # setup: on this one it is the switched-on state that has to prove it reaches the class.
+        "breakeven_at_r": (3.3, Decimal("3.3")),
     },
     "ponto_continuo": {
         "side": ("short", Side.SHORT),
@@ -159,6 +177,7 @@ _PROBES: dict[str, dict[str, tuple[Any, Any]]] = {
 # different objects.
 _FACTORY_CLASSES = (
     "Mme9BreakoutStrategy",
+    "Mme9TurnStrategy",
     "PontoContinuoStrategy",
     "StructureStrategy",
     "ChochQualifier",

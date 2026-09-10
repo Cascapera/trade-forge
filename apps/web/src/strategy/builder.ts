@@ -788,6 +788,9 @@ export function rsiOversoldForm(now: Date): StrategyForm {
  */
 export const SETUP_LABELS: Record<SetupType, string> = {
   mme9_breakout: 'MME9 breakout',
+  // Two setups are called 9.1. This one is the published Larry Williams reading — the average's
+  // own slope bends — and `mme9_breakout` is the author's, where a bar closes across the line.
+  mme9_turn: 'MME9 turn (9.1 original)',
   ponto_continuo: 'Ponto Contínuo',
   structure_choch: 'Structure — CHoCH',
   structure_continuation: 'Structure — Continuation',

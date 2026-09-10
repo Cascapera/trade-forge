@@ -7,12 +7,23 @@ the order rests a tick past that bar's edge waiting for price to break through i
 order (ADR-0016), the geometric mirror of the limit — so this is a different machine from the one
 in `setups.py`, and it lives in its own module for exactly that reason.
 
-**Two setups live here and they qualify the bar differently.** For the MME9 breakout the event is a
-bar *closing across* the average. For the Ponto Contínuo it is a bar that *touches* the average and
-closes back on the trend's side, after price has corrected twice — a pullback setup by shape, still
-entered on the breakout of its own high. The shared part is the geometry of the order they leave
-behind, which is `_breakout_entry`, and nothing else: the two hold different state, watch different
-averages, and conduct their trades by different rules.
+**The setups here qualify the bar differently, and that difference is the whole method.** For the
+MME9 breakout the event is a bar *closing across* the average. For the Ponto Contínuo it is a bar
+that *touches* the average and closes back on the trend's side, after price has corrected twice — a
+pullback setup by shape, still entered on the breakout of its own high. For the published 9.1
+(`Mme9TurnStrategy`) it is the average's own **slope** changing sign — which on an exponential
+average turns out to be the same event as his close, so what makes the two different setups is
+what they do *after* arming. The shared part is the geometry of the order they leave behind, which
+is `_breakout_entry`, and nothing else: each holds different state, watches a different event, and
+conducts its trades by its own rules.
+
+⚠️ **Two setups here are both called 9.1 and they are not the same setup.** `Mme9BreakoutStrategy`
+is the author's, dictated; `Mme9TurnStrategy` is the one the Larry Williams literature publishes.
+They arm on different events, they re-price differently, and they are cancelled by different
+things. Keeping both is the point — the pair is comparable, and comparing them is a study.
+
+**The four paragraphs that follow are the author's 9.1 and the Ponto Contínuo.** The published
+9.1 answers three of them differently, and `Mme9TurnStrategy` is where it says so.
 
 **"The average turned" is a closed bar, not a slope.** The author's rule, confirmed: a bar that
 closes *above* the MME9 has turned it up; a bar that closes *below* has turned it down. There is
@@ -742,6 +753,245 @@ class Mme9BreakoutStrategy:
         return _breakout_entry(
             candle, instrument, side=self._side, buffer_ticks=self._stop_buffer_ticks
         )
+
+    def _withdraw(self, armed: _Armed, candle: Candle) -> Signal:
+        return _withdraw(armed, candle, side=self._side, name=self._name)
+
+
+class Mme9TurnStrategy:
+    """9.1 as the literature writes it: the bar that *bent the average* is the trade.
+
+    `Mme9BreakoutStrategy` is the author's own 9.1 and this is the published one, and they are
+    two different machines that happen to share a number. The difference is what "the average
+    turned" means:
+
+    * **His**: a bar **closes across** the MME9. No look at the average's own direction.
+    * **Here**: the MME9's own **slope** changes sign — it was falling and this bar has it rising.
+
+    ⚠️ **On an exponential average those two are the same event, and that is arithmetic, not
+    coincidence.** `ema = prev + a(close - prev)`, so `ema > prev` exactly when `close > prev`,
+    and `close > ema` reduces to `(1-a)(close - prev) > 0`, which is the same inequality again —
+    **as long as `a < 1`**. At `period = 1` the alpha is exactly 1, the average *is* the close,
+    and `close > ema` is never true: his setup can never arm there and this one still does. A
+    degenerate corner the DSL allows (`period >= 1`), pinned rather than forbidden.
+    Held over generated streams by `test_slope_and_close_are_the_same_event_on_an_ema`. On an
+    **arithmetic** average it would not hold: an SMA turns when the bar leaving the window is
+    bigger than the bar entering it, which the newest close alone cannot decide. The literature's
+    MME is exponential, so what separates this setup from his is *not* the arming — it is the
+    three rules below.
+
+    (The identity is exact in real arithmetic. In `Decimal`, `a * (close - prev)` can round to
+    zero when the two are within an ulp of the average, which leaves the line flat under a close
+    that is strictly above it. It changes nothing here — this setup reads the slope and never the
+    close — and it is why the claim above is pinned by a test rather than asserted as algebra.)
+
+    Three consequences follow, and each of them is a rule of its own:
+
+    1. **The reference bar does not move.** The order rests at the high of the bar that bent the
+       line and stays there while the line keeps pointing up (*"espera-se ativação nos candles
+       subsequentes desde que a MME9 continue apontando"*). His setup re-prices to the newest bar
+       every turn — *"vale sempre a última barra"* — and that is exactly what this one must not
+       do, or the two would be the same setup with different arming.
+    2. **The trade is not conducted by the average.** A bar closing back across the MME9 tightens
+       his stop onto that bar; here it does nothing at all — it cancels a *resting* order and
+       leaves an open trade exactly as it was.
+    3. **A turn is a single bar's event, not a state.** His turn is a stretch of bars, which is
+       why he needs "one trade per turn" bookkeeping. Here, arming happens on the bar that bends
+       the line and never again until the line bends back and forward once more, so a spent turn
+       is not a thing this class can have.
+
+    **Flat does not turn and does not cancel: it leaves the direction exactly as it was.** A line
+    that stopped is not a line that turned, and both other readings of a flat bar are wrong in
+    their own direction. Reading it as *"no longer rising"* cancels live orders on the one bar
+    where nothing happened — and, worse, arms a buy on a bar in the middle of a fall. Reading it
+    as *"direction unknown"* forgets the fall, so the real turn that follows has nothing to have
+    turned from and the setup stops appearing after any pause of the average. On a coarse tick
+    size a bar closing exactly on the average is not rare.
+
+    ⚠️ **A turn that lands while a trade is open is lost, deliberately.** One position at a time
+    is the house rule, and this setup's arming is an event: by the time the account is flat the
+    bar that bent the line is history and its high may be far away. Carrying the reference forward
+    would be inventing a rule the literature does not state, so the turn simply passes.
+
+    **Conduction is only what the literature names**, which is the initial stop at the reference
+    bar's low. `breakeven_at_r` is here because his own setups all carry it and a study has to be
+    able to ask the question, but it defaults to `None` — off — because this class exists to say
+    what the published setup does, and the published setup says nothing about moving a stop. The
+    target stays the account's (`take_profit_rr`), as it is for every setup in this engine.
+
+    Also absent, and for the same reason: `entry_point` bar patterns and the long-average filter.
+    Both are the author's, both are grafts onto his own setups, and neither is part of this one.
+    """
+
+    def __init__(
+        self,
+        *,
+        side: Side = Side.LONG,
+        period: int = 9,
+        name: str = "mme9turn",
+        stop_buffer_ticks: int = 0,
+        breakeven_at_r: Decimal | None = None,
+    ) -> None:
+        if period < 1:
+            raise ValueError(f"MME period must be >= 1, got {period}")
+        if stop_buffer_ticks < 0:
+            raise ValueError(f"stop buffer is a magnitude in ticks, got {stop_buffer_ticks}")
+        if breakeven_at_r is not None and breakeven_at_r <= ZERO:
+            raise ValueError(f"breakeven R multiple must be positive, got {breakeven_at_r}")
+
+        self._side = side
+        self._name = name
+        self._period = period
+        self._stop_buffer_ticks = Decimal(stop_buffer_ticks)
+        self._breakeven_at_r = breakeven_at_r
+        self._ema = EMA(period=period, source="close")
+        self._trail_of_the_average = _AverageTrail()
+
+        self._armed: _Armed | None = None
+        self._armed_count = 0
+        # The average's last reading, and the direction it was moving in. `None` for the
+        # direction means "not known yet", which is not the same as flat: the first slope this
+        # class can measure has nothing before it to have turned *from*, so it is recorded and
+        # not traded. The same entry toll the structure series pays on its first bar.
+        self._previous_average: Money | None = None
+        self._rising: bool | None = None
+
+    def overlays(self) -> Mapping[str, Indicator]:
+        """The average this setup is defined by — see `protocols.Charted`."""
+        return {f"EMA {self._period}": self._ema}
+
+    def on_bar(  # noqa: PLR0911 — one flat return per rule, the shape the sibling uses too
+        self, context: Context
+    ) -> tuple[Signal, ...]:
+        candle = context.candle
+        # Every bar feeds the average, open trade or not: the slope is a property of the line,
+        # and a line fed only on the bars that reached the arming branch is a different line.
+        self._ema.update(candle)
+        average = self._ema.value()
+        self._trail_of_the_average.record(candle, average)
+
+        self._observe_fill(context)
+
+        if average is None:
+            return ()
+
+        previous = self._previous_average
+        self._previous_average = average
+        if previous is None:
+            # First reading the average has produced. There is no slope yet, so there is nothing
+            # this bar can be: not a turn, not a cancel.
+            return ()
+
+        was_rising = self._rising
+        # Flat leaves the direction alone — see the class docstring. Only a strict move re-reads
+        # it, which also makes `_rising` a fact about the line rather than about this bar.
+        if average > previous:
+            self._rising = True
+        elif average < previous:
+            self._rising = False
+
+        # The open trade's stop, if the breakeven rule tightened it. Owed on every bar, including
+        # the ones that cancel or arm.
+        conducted = self._conduct(context)
+        signals: list[Signal] = [] if conducted is None else [conducted]
+
+        if self._rising is None:
+            # Every reading so far has been flat, so the line has no direction to be judged by.
+            # Nothing is resting either — arming needs a turn, and there has been none.
+            return tuple(signals)
+
+        favourable = self._rising if self._side is Side.LONG else not self._rising
+        turned = favourable and was_rising is not None and was_rising != self._rising
+
+        if not favourable:
+            # The line bent back: the setup is undone and whatever it left resting goes with it.
+            if self._armed is not None:
+                signals.append(self._withdraw(self._armed, candle))
+                self._armed = None
+            return tuple(signals)
+
+        if not turned or context.position is not None:
+            # The line is still pointing our way but did not bend on this bar, so the order that
+            # is already resting stays exactly where it is — the reference does not follow price.
+            # And nothing arms beside an open trade.
+            return tuple(signals)
+
+        entry = _breakout_entry(
+            candle, context.instrument, side=self._side, buffer_ticks=self._stop_buffer_ticks
+        )
+        if entry is None:
+            # A bar with no range is no reference: the trigger would sit on the stop and the
+            # trade would carry no risk. The turn is spent all the same — this bar was it.
+            return tuple(signals)
+
+        # ⚠️ **Not reachable, and kept for the failure mode rather than for the coverage.**
+        # `turned` requires the previous direction to have been against us, and the bar that made
+        # it so left through the branch above, which withdrew and forgot whatever was resting — so
+        # `_armed` is always `None` here. What it guards is the day a fourth way of arming is
+        # added: without it, a second order would go out under a new name while the first still
+        # rests at the broker, and the setup would hold two triggers believing it held one.
+        if self._armed is not None:
+            signals.append(self._withdraw(self._armed, candle))
+        self._armed_count += 1
+        client_id = f"{self._name}-{candle.time:%Y%m%dT%H%M}-{self._armed_count}"
+        self._armed = _Armed(reference=candle, client_id=client_id)
+        signals.append(
+            Signal(
+                kind=SignalKind.ENTRY,
+                side=self._side,
+                reference_price=candle.close,
+                stop_loss=entry.stop_loss,
+                stop_price=entry.stop_price,
+                reason=f"entry.{self._name}",
+                client_id=client_id,
+                # The average that bent, as a scalar for aggregation and as the curve that shows
+                # the bend. Neither can be derived from the other.
+                context={"average": average},
+                series=self._trail_of_the_average.series(),
+            )
+        )
+        return tuple(signals)
+
+    def _conduct(self, context: Context) -> Signal | None:
+        """The open trade's stop, moved only by the breakeven rule — and only if it is on.
+
+        There is no average rule here. The published setup states an entry and a protective stop
+        and stops talking, so this class stops with it: between the fill and the exit the stop
+        does not move unless `breakeven_at_r` was asked for.
+        """
+        position = context.position
+        if position is None:
+            return None
+
+        breakeven = breakeven_candidate(
+            position=position,
+            side=self._side,
+            candle=context.candle,
+            multiple=self._breakeven_at_r,
+        )
+        if breakeven is None:
+            return None
+        return tighten(
+            position=position,
+            side=self._side,
+            candle=context.candle,
+            candidates=[breakeven],
+            reason=f"trail.{self._name}",
+        )
+
+    def _observe_fill(self, context: Context) -> None:
+        """Notice the armed order becoming a trade, and forget the name.
+
+        Same two signs as the other setups (ADR-0015): a fill on this bar carrying the armed
+        name, or a position for a fill this strategy was never shown. Keeping the name would
+        cancel an order the trade has already consumed.
+        """
+        armed = self._armed
+        if armed is None:
+            return
+        filled = any(fill.order.client_id == armed.client_id for fill in context.fills)
+        if filled or context.position is not None:
+            self._armed = None
 
     def _withdraw(self, armed: _Armed, candle: Candle) -> Signal:
         return _withdraw(armed, candle, side=self._side, name=self._name)

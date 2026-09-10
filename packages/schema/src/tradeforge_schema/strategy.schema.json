@@ -693,6 +693,67 @@
       "title": "Mme9BreakoutSetup",
       "type": "object"
     },
+    "Mme9TurnParams": {
+      "additionalProperties": false,
+      "description": "The published 9.1: enter on the break of the bar whose close bent the MME9.\n\n⚠️ **This is not `mme9_breakout`, and the two are both called 9.1.** That one is the author's\nown reading — a bar *closes across* the average — and this one is the literature's: the\naverage's own **slope** changes sign, and where price closed is not part of the question.\n\nThree rules follow, and each is the opposite of its neighbour's:\n\n* **The order does not follow price.** It rests at the high of the bar that bent the line (the\n  low, for a sell) and stays there while the line keeps pointing that way. `mme9_breakout`\n  re-prices to the newest bar of the turn.\n* **What cancels it is the line bending back**, not a close on the far side of the average.\n* **Arming is a one-bar event**, so a turn that lands while a trade is open is simply lost.\n\n`breakeven_at_r` defaults to `null` — **off** — because the published setup names an entry and\na protective stop and says nothing about moving it. It is a parameter rather than a constant\nso that \"what would this earn with his 2x1 on top\" stays askable.\n\nNo `entry_point` and no `long_average_period`: the bar patterns and the direction filter are\nthe author's grafts onto his own setups, and this one is here to say what the book says.",
+      "properties": {
+        "breakeven_at_r": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "maximum": 100,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Breakeven At R"
+        },
+        "period": {
+          "default": 9,
+          "maximum": 1000,
+          "minimum": 1,
+          "title": "Period",
+          "type": "integer"
+        },
+        "side": {
+          "$ref": "#/$defs/SetupSide"
+        },
+        "stop_buffer_ticks": {
+          "default": 0,
+          "maximum": 10000,
+          "minimum": 0,
+          "title": "Stop Buffer Ticks",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "side"
+      ],
+      "title": "Mme9TurnParams",
+      "type": "object"
+    },
+    "Mme9TurnSetup": {
+      "additionalProperties": false,
+      "properties": {
+        "params": {
+          "$ref": "#/$defs/Mme9TurnParams"
+        },
+        "type": {
+          "const": "mme9_turn",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "params"
+      ],
+      "title": "Mme9TurnSetup",
+      "type": "object"
+    },
     "NotOf": {
       "additionalProperties": false,
       "description": "Logical NOT. Serialised as `not`, which is a Python keyword — hence the alias.",
@@ -1033,6 +1094,7 @@
       "discriminator": {
         "mapping": {
           "mme9_breakout": "#/$defs/Mme9BreakoutSetup",
+          "mme9_turn": "#/$defs/Mme9TurnSetup",
           "ponto_continuo": "#/$defs/PontoContinuoSetup",
           "structure_choch": "#/$defs/StructureChochSetup",
           "structure_continuation": "#/$defs/StructureContinuationSetup"
@@ -1042,6 +1104,9 @@
       "oneOf": [
         {
           "$ref": "#/$defs/Mme9BreakoutSetup"
+        },
+        {
+          "$ref": "#/$defs/Mme9TurnSetup"
         },
         {
           "$ref": "#/$defs/PontoContinuoSetup"

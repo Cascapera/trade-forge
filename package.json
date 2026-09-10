@@ -36,6 +36,14 @@
     "@vitest/coverage-v8": "^5.0.0",
     "vitest": "^5.0.0"
   },
+  "typescriptComment": [
+    "⚠️ TypeScript is held at 6.0.x on purpose, behind the latest. `typescript-eslint` peers on",
+    "`typescript >=4.8.4 <6.1.0` in every version it has shipped so far, and this repo ran 7.0.2",
+    "against it for a while — which npm never complained about, because `npm ci` installs the",
+    "recorded tree without recomputing peers. The lockfile hid an unsupported pair, and the only",
+    "way to find out was to change a range and watch npm refuse to resolve.",
+    "Raise it when typescript-eslint declares support, and bump both in the same change."
+  ],
   "overridesComment": [
     "Transitive pins held ahead of what our direct dependencies ask for. Every key under",
     "`overrides` is read by npm as a package name, so this note lives outside it.",

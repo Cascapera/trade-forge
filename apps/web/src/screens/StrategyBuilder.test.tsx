@@ -1,17 +1,28 @@
 import { fireEvent, screen, within } from '@testing-library/react'
 
+import { ApiError } from '../api/client'
 import { useSession } from '../store'
 import { renderWithProviders } from '../test-utils'
 
-const { save, run, opened } = vi.hoisted(() => ({
+const { save, run, opened, saveState } = vi.hoisted(() => ({
   save: vi.fn(),
   run: vi.fn(),
   // What `/strategies/:id` fetched. `undefined` is the plain builder, opened on nothing.
   opened: { data: undefined as { definition: unknown } | undefined },
+  // How the save mutation is *resting*, which the mocked hook reads on every render. Mutable
+  // because the refusal message is a property of the screen at rest, not of a click: react-query
+  // holds the error and the component renders it, so the test has to be able to say "the last
+  // save failed, with this" before rendering at all.
+  saveState: { isError: false, error: null as Error | null },
 }))
 
 vi.mock('../api/hooks', () => ({
-  useSaveStrategy: () => ({ mutate: save, isPending: false, isError: false, error: null }),
+  useSaveStrategy: () => ({
+    mutate: save,
+    isPending: false,
+    isError: saveState.isError,
+    error: saveState.error,
+  }),
   useCreateBacktest: () => ({ mutate: run, isPending: false, isError: false, error: null }),
   useInstruments: () => ({ data: [{ id: 'i1', symbol: 'AAPL' }] }),
   // The symbol field is a combobox over the broker's catalogue now, so it fetches. Stubbed
@@ -63,6 +74,8 @@ beforeEach(() => {
 
 afterEach(() => {
   opened.data = undefined
+  saveState.isError = false
+  saveState.error = null
   vi.useRealTimers()
   vi.clearAllMocks()
   useSession.getState().clear()
@@ -744,5 +757,41 @@ describe('editing a condition strategy still works', () => {
     fireEvent.change(screen.getByLabelText('name'), { target: { value: '' } })
     expect(screen.getByText(/not valid yet/i)).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /run backtest/i })).toBeDisabled()
+  })
+})
+
+describe('when the API refuses the save', () => {
+  it('shows what the rule said, and does not talk about the name', () => {
+    // ⚠️ The refusal that started this: an `htf` saved without the broker's clock. The screen
+    // showed "API error 422" — the status is all `ApiError.message` holds — followed by advice
+    // about names and immutability, which explains a 409. Against this refusal the advice is
+    // false: the name is the one field that is not the problem.
+    saveState.isError = true
+    saveState.error = new ApiError(422, {
+      message: 'strategy is well-formed but cannot run',
+      errors:
+        "setup.params.htf_offset: a higher timeframe needs the broker's clock: give htf_offset, " +
+        'the hours its server runs ahead of UTC',
+    })
+
+    renderWithProviders(<StrategyBuilder />)
+
+    expect(screen.getByText(/a higher timeframe needs the broker's clock/)).toBeInTheDocument()
+    expect(screen.queryByText(/API error 422/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/immutable/i)).not.toBeInTheDocument()
+  })
+
+  it('keeps the advice about the name for the status that it explains', () => {
+    // A 409 is the collision the advice was written for, and there it is the whole answer: two
+    // versions of one name, and the way out is a different name.
+    saveState.isError = true
+    saveState.error = new ApiError(409, 'a strategy with this name and version already exists')
+
+    renderWithProviders(<StrategyBuilder />)
+
+    expect(
+      screen.getByText(/a strategy with this name and version already exists/),
+    ).toBeInTheDocument()
+    expect(screen.getByText(/immutable/i)).toBeInTheDocument()
   })
 })

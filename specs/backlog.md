@@ -2083,3 +2083,36 @@ nada falhar.
 Conserto é na engine (`_AverageTrail(label=...)` no `swing.py`, para os dois hospedeiros), então
 sai num PR que passa pelo guardian. A fixtura de `TradeSnapshot.test.tsx` usa os rótulos de
 produção de propósito, para que a tela do teste seja a tela de verdade.
+
+## As telas de LEITURA ainda mostram "API error NNN" (achado na PR-230)
+
+A PR-230 consertou os dois pontos de **escrita** do construtor (salvar a estratégia, enfileirar o
+backtest) e pôs a desembalagem em `apps/web/src/api/failure.ts`. Restam três lugares que mostram
+`error.message` cru de uma **consulta**, onde o texto é o status e nada mais:
+
+* `TradesTable.tsx` — "Could not load this entry: ...";
+* `Results.tsx` — o erro do gráfico de candles;
+* `CollectSymbol.tsx:398` — o helper local da tela de coleta.
+
+Não entrou na PR-230 por escopo: são falhas de carregamento em outras telas, e o `detail` de uma
+recusa de leitura tem forma própria (404 com sentença, quase nunca `{message, errors}`). Basta
+trocar por `apiFailure(error, "<a frase da tela>")` — e conferir, tela por tela, se a frase de
+reserva ainda faz sentido.
+
+⚠️ E o `launchFailure` do **basket** (`basket/settings.ts`) continua sendo uma quarta cópia, que
+só lê `detail` quando é string. Isso cobre **todas** as recusas escritas do `POST /baskets` — ele
+não chama `validate_document`, então nunca manda `{message, errors}`. O que escapa é o 422 do
+próprio FastAPI sobre a forma do corpo (`detail` é **lista**) e um 5xx sem corpo nenhum: nos dois
+o leitor recebe a frase da casa e nada do que o servidor disse.
+
+## A API responde 422 com a mesma chave `errors` em dois tipos (achado na PR-230)
+
+`validate_document` (`routers/strategies.py`) manda `errors` como **lista** de falhas do Pydantic
+quando a recusa é de forma, e como **string** quando é de significado (`str(SemanticValidationError)`,
+que é um `"; ".join`). Uma chave, dois tipos, e nada no contrato avisa — foi assim que o navegador
+descartou a razão em silêncio até a PR-230.
+
+O `apiFailure` agora lê as duas, mas o conserto de raiz é no servidor: ou chaves distintas, ou
+normalizar o semântico em `{loc, msg}` — informação que o `SemanticError` **tem** e que o
+`str(exc)` joga fora. A segunda opção também daria à tela o campo pra destacar, que hoje só existe
+no meio da frase.

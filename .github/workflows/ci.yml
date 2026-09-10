@@ -171,6 +171,37 @@ jobs:
       - name: Build
         run: npm run build
 
+      # ⚠️ The e2e suite exists since long before this step, and this is why the step exists.
+      # Nothing ran playwright, so the specs drifted until one waited on a heading that had been
+      # renamed and clicked a button from a flow that had been merged into another — and no
+      # signal anywhere said so. A test nobody runs is not coverage; it is a file that ages while
+      # asserting things that stopped being true.
+      #
+      # Only `happy-path`. `screenshot.spec.ts` writes into `docs/assets/`, so running it here
+      # would either commit a picture nobody asked for or fail on a dirty tree; it is a tool, run
+      # by hand when the results screen changes.
+      #
+      # `--with-deps` because the runner has the browser's system libraries for nothing, and
+      # `chromium` alone because that is the one project the config declares.
+      - name: Install the browser playwright drives
+        run: npx playwright install --with-deps chromium
+        working-directory: apps/web
+
+      # No server to start here: `playwright.config.ts` brings up `npm run dev` itself, and every
+      # API call is fulfilled from a fixture — the journey under test is the UI's wiring, and the
+      # backend has its own end-to-end test in the integration job.
+      - name: 'Playwright (the journey, end to end)'
+        run: npx playwright test happy-path.spec.ts
+        working-directory: apps/web
+
+      - name: Upload the playwright report when the journey fails
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: playwright-report
+          path: apps/web/playwright-report/
+          retention-days: 7
+
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
         with:

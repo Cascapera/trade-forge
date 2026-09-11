@@ -35,6 +35,31 @@ describe('App', () => {
     expect(screen.getByRole('heading', { name: 'Parameter study' })).toBeInTheDocument()
   })
 
+  it('routes to the strategy catalogue', () => {
+    renderWithProviders(<App />, '/catalog')
+
+    expect(screen.getByRole('heading', { name: 'Strategy catalogue' })).toBeInTheDocument()
+  })
+
+  it('groups the sidebar links under headings', () => {
+    renderWithProviders(<App />, '/')
+
+    // The groups are what a column buys over a bar: the reader answers "where do strategies
+    // live?" from the heading, before reading any link. Asserted as headings rather than as
+    // text, because a `div` styled to look like one reads as nothing to a screen reader.
+    expect(screen.getByRole('heading', { name: 'Strategies' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Experiments' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Markets' })).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: 'Catalogue' })).toHaveAttribute('href', '/catalog')
+  })
+
+  it('offers no Recent group until something has been launched', () => {
+    // The group heading, not the links inside it: an empty "Recent" is a promise of history to
+    // a reader who has none, and the heading is what survives when every link is absent.
+    renderWithProviders(<App />, '/')
+    expect(screen.queryByRole('heading', { name: 'Recent' })).not.toBeInTheDocument()
+  })
+
   it('offers no link back to a basket until one has been launched', () => {
     renderWithProviders(<App />, '/')
     expect(screen.queryByRole('link', { name: /markets/ })).not.toBeInTheDocument()

@@ -87,6 +87,7 @@ describe('the strategy picker', () => {
     const picker = screen.getByLabelText('strategy')
     expect(Array.from(picker.querySelectorAll('option')).map((o) => o.textContent)).toEqual([
       'MME9 breakout',
+      'MME9 pullback (9.2 / 9.3)',
       'MME9 turn (9.1 original)',
       'Ponto Contínuo',
       'Structure — CHoCH',

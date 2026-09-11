@@ -49,12 +49,14 @@ from tradeforge_engine.setups import (
 )
 from tradeforge_engine.swing import (
     Mme9BreakoutStrategy,
+    Mme9PullbackStrategy,
     Mme9TurnStrategy,
     PontoContinuoStrategy,
 )
 from tradeforge_schema.models import (
     ContinuationParams,
     Mme9BreakoutParams,
+    Mme9PullbackParams,
     Mme9TurnParams,
     PontoContinuoParams,
     Setup,
@@ -79,6 +81,10 @@ _SETUPS: dict[str, tuple[type[Any], dict[str, Any]]] = {
     "mme9_breakout": (
         Mme9BreakoutParams,
         _owned_by(Mme9BreakoutParams, Mme9BreakoutStrategy),
+    ),
+    "mme9_pullback": (
+        Mme9PullbackParams,
+        _owned_by(Mme9PullbackParams, Mme9PullbackStrategy),
     ),
     "mme9_turn": (
         Mme9TurnParams,
@@ -119,6 +125,16 @@ _PROBES: dict[str, dict[str, tuple[Any, Any]]] = {
         "volume_filter": (True, True),
         # His long-average direction filter (2026-09-09), off by default.
         "long_average_period": (200, 200),
+    },
+    # The published 9.2 and 9.3, which are one type and a count.
+    "mme9_pullback": {
+        "side": ("short", Side.SHORT),
+        # ⚠️ 2 is the 9.3. Probed off the default because the count *is* the difference between
+        # the two setups: routed wrongly, every 9.3 in a study would silently run as a 9.2.
+        "corrections": (2, 2),
+        "period": (21, 21),
+        "stop_buffer_ticks": (3, 3),
+        "breakeven_at_r": (3.3, Decimal("3.3")),
     },
     # The published 9.1. Four fields only: no bar patterns, no direction filter.
     "mme9_turn": {
@@ -177,6 +193,7 @@ _PROBES: dict[str, dict[str, tuple[Any, Any]]] = {
 # different objects.
 _FACTORY_CLASSES = (
     "Mme9BreakoutStrategy",
+    "Mme9PullbackStrategy",
     "Mme9TurnStrategy",
     "PontoContinuoStrategy",
     "StructureStrategy",

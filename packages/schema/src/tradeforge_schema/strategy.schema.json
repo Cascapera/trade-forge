@@ -693,6 +693,74 @@
       "title": "Mme9BreakoutSetup",
       "type": "object"
     },
+    "Mme9PullbackParams": {
+      "additionalProperties": false,
+      "description": "The published 9.2 and 9.3: buy the break of the bar that corrected against the leg's anchor.\n\n**`corrections` is the only thing that separates the two.** One corrective close is 9.2, two\nconsecutive ones are 9.3, and every other rule is identical — so they are one type with a\ncount rather than two, which also makes *\"is the stricter one worth it\"* a single study axis.\nNothing above 2 is offered: the literature names these two and a third would be a setup nobody\npublished.\n\nThe rule, for a buy:\n\n* The MME9 is **rising**, and it bending down undoes everything.\n* The **anchor** is the highest *close* of the leg, and it moves up with every better close.\n  ⚠️ The highest close, not the highest high.\n* A **corrective** close is one strictly below the anchor's close. `corrections` in a row arm.\n* The order rests at the **high of the last corrective bar** and follows the bars after it,\n  which is the opposite of `mme9_turn`, where the reference is frozen.\n* The stop goes under the **low of the whole correction**, not under the trigger bar.\n* A close back **above** the anchor is the leg resuming: new anchor, count to zero, order\n  withdrawn.\n\n`breakeven_at_r` defaults to `null` — off — for the same reason as the other published setups:\nthe source names an entry and a protective stop and nothing about moving one.",
+      "properties": {
+        "breakeven_at_r": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "maximum": 100,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Breakeven At R"
+        },
+        "corrections": {
+          "default": 1,
+          "maximum": 2,
+          "minimum": 1,
+          "title": "Corrections",
+          "type": "integer"
+        },
+        "period": {
+          "default": 9,
+          "maximum": 1000,
+          "minimum": 1,
+          "title": "Period",
+          "type": "integer"
+        },
+        "side": {
+          "$ref": "#/$defs/SetupSide"
+        },
+        "stop_buffer_ticks": {
+          "default": 0,
+          "maximum": 10000,
+          "minimum": 0,
+          "title": "Stop Buffer Ticks",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "side"
+      ],
+      "title": "Mme9PullbackParams",
+      "type": "object"
+    },
+    "Mme9PullbackSetup": {
+      "additionalProperties": false,
+      "properties": {
+        "params": {
+          "$ref": "#/$defs/Mme9PullbackParams"
+        },
+        "type": {
+          "const": "mme9_pullback",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "params"
+      ],
+      "title": "Mme9PullbackSetup",
+      "type": "object"
+    },
     "Mme9TurnParams": {
       "additionalProperties": false,
       "description": "The published 9.1: enter on the break of the bar whose close bent the MME9.\n\n⚠️ **This is not `mme9_breakout`, and the two are both called 9.1.** That one is the author's\nown reading — a bar *closes across* the average — and this one is the literature's: the\naverage's own **slope** changes sign, and where price closed is not part of the question.\n\nThree rules follow, and each is the opposite of its neighbour's:\n\n* **The order does not follow price.** It rests at the high of the bar that bent the line (the\n  low, for a sell) and stays there while the line keeps pointing that way. `mme9_breakout`\n  re-prices to the newest bar of the turn.\n* **What cancels it is the line bending back**, not a close on the far side of the average.\n* **Arming is a one-bar event**, so a turn that lands while a trade is open is simply lost.\n\n`breakeven_at_r` defaults to `null` — **off** — because the published setup names an entry and\na protective stop and says nothing about moving it. It is a parameter rather than a constant\nso that \"what would this earn with his 2x1 on top\" stays askable.\n\nNo `entry_point` and no `long_average_period`: the bar patterns and the direction filter are\nthe author's grafts onto his own setups, and this one is here to say what the book says.",
@@ -1094,6 +1162,7 @@
       "discriminator": {
         "mapping": {
           "mme9_breakout": "#/$defs/Mme9BreakoutSetup",
+          "mme9_pullback": "#/$defs/Mme9PullbackSetup",
           "mme9_turn": "#/$defs/Mme9TurnSetup",
           "ponto_continuo": "#/$defs/PontoContinuoSetup",
           "structure_choch": "#/$defs/StructureChochSetup",
@@ -1104,6 +1173,9 @@
       "oneOf": [
         {
           "$ref": "#/$defs/Mme9BreakoutSetup"
+        },
+        {
+          "$ref": "#/$defs/Mme9PullbackSetup"
         },
         {
           "$ref": "#/$defs/Mme9TurnSetup"

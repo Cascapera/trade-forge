@@ -37,6 +37,7 @@ from tradeforge_engine.setups import (
 )
 from tradeforge_engine.swing import (
     Mme9BreakoutStrategy,
+    Mme9PullbackStrategy,
     Mme9TurnStrategy,
     PontoContinuoStrategy,
 )
@@ -214,6 +215,15 @@ def _mme9_turn(params: Mapping[str, object], _timeframe: dt.timedelta | None) ->
     return Mme9TurnStrategy(**kwargs)
 
 
+def _mme9_pullback(params: Mapping[str, object], _timeframe: dt.timedelta | None) -> Strategy:
+    kwargs: dict[str, Any] = {"side": _side(params)}
+    _int(params, "corrections", kwargs)
+    _int(params, "period", kwargs)
+    _int(params, "stop_buffer_ticks", kwargs)
+    _optional_decimal(params, "breakeven_at_r", kwargs)
+    return Mme9PullbackStrategy(**kwargs)
+
+
 def _ponto_continuo(params: Mapping[str, object], _timeframe: dt.timedelta | None) -> Strategy:
     kwargs: dict[str, Any] = {"side": _side(params)}
     _int(params, "period", kwargs)
@@ -274,6 +284,7 @@ def _structure_continuation(
 
 _BUILDERS = {
     "mme9_breakout": _mme9,
+    "mme9_pullback": _mme9_pullback,
     "mme9_turn": _mme9_turn,
     "ponto_continuo": _ponto_continuo,
     "structure_choch": _structure_choch,

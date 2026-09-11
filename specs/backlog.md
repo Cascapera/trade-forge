@@ -2130,3 +2130,17 @@ leituras deixa de valer.
 
 Conserto possível: piso de `2` no `period` dos setups de média, no schema. Fora do escopo do
 PR-231 porque muda a gramática de setups que já existem e podem ter documentos salvos.
+
+## A barra neutra do 9.2/9.3 não estende a mínima da correção (achado no PR-232)
+
+No `mme9_pullback`, uma barra que fecha **exatamente** no fechamento da âncora não corrige (a regra
+diz *abaixo*) e não avança a perna, então ela não mexe em nada — inclusive não estende a mínima da
+correção, que é de onde sai o stop. Se essa barra imprimir a mínima mais funda do pullback, o stop
+fica **acima** de um preço que o movimento já visitou.
+
+Está pinado em `test_a_close_exactly_on_the_anchor_neither_corrects_nor_advances`, com uma barra
+neutra de propósito mais funda que a correção.
+
+⚠️ **Pergunta para o Guilherme, não bug:** "mínima do movimento de correção" quer dizer as barras
+que **contam** como correção, ou o pullback inteiro no gráfico? A segunda leitura obriga a
+reprecificar a ordem em repouso quando a mínima se estende, o que é uma regra a mais.

@@ -2117,7 +2117,7 @@ normalizar o semântico em `{loc, msg}` — informação que o `SemanticError` *
 `str(exc)` joga fora. A segunda opção também daria à tela o campo pra destacar, que hoje só existe
 no meio da frase.
 
-## O `mme9_breakout` com `period: 1` não arma nunca (achado no PR-231)
+## ✅ RESOLVIDO — o `mme9_breakout` com `period: 1` não armava nunca (achado no PR-231)
 
 `EMA` usa `alpha = 2 / (period + 1)`, então em `period = 1` o alpha é **1** e a média **é** o
 fechamento. O setup dele arma com `close > ema`, que ali nunca é verdade: o documento é válido, o
@@ -2128,19 +2128,66 @@ O `mme9_turn` (o 9.1 publicado) **não** sofre disso, porque lê a inclinação 
 `test_the_two_readings_come_apart_at_a_period_of_one`, que é onde a equivalência entre as duas
 leituras deixa de valer.
 
-Conserto possível: piso de `2` no `period` dos setups de média, no schema. Fora do escopo do
-PR-231 porque muda a gramática de setups que já existem e podem ter documentos salvos.
+**Fechado no PR-234:** ele decidiu piso **3** (não 2) no `period` de todo setup de média, no
+schema. Nenhum documento salvo foi invalidado — conferido nas 267 estratégias do banco. Ver a
+entrada "o piso do período das médias é 3", abaixo.
 
-## A barra neutra do 9.2/9.3 não estende a mínima da correção (achado no PR-232)
+## ✅ RESPONDIDO — a barra neutra do 9.2/9.3 não estende a mínima da correção
 
-No `mme9_pullback`, uma barra que fecha **exatamente** no fechamento da âncora não corrige (a regra
-diz *abaixo*) e não avança a perna, então ela não mexe em nada — inclusive não estende a mínima da
-correção, que é de onde sai o stop. Se essa barra imprimir a mínima mais funda do pullback, o stop
-fica **acima** de um preço que o movimento já visitou.
+Pergunta feita em 10/09/2026: *"mínima do movimento de correção" são as barras que **contam** como
+correção, ou o pullback inteiro no gráfico?*
+
+**Resposta dele: não pertence.** As barras que contam como correção **são** a correção. Uma barra
+que fecha exatamente no fechamento da âncora não corrige, não avança a perna e **não alarga o
+stop** — mesmo que imprima a mínima mais funda do pullback. O stop pode, portanto, ficar acima de
+um preço que o movimento já visitou, e isso é o método, não uma aproximação dele.
 
 Está pinado em `test_a_close_exactly_on_the_anchor_neither_corrects_nor_advances`, com uma barra
 neutra de propósito mais funda que a correção.
 
-⚠️ **Pergunta para o Guilherme, não bug:** "mínima do movimento de correção" quer dizer as barras
-que **contam** como correção, ou o pullback inteiro no gráfico? A segunda leitura obriga a
-reprecificar a ordem em repouso quando a mínima se estende, o que é uma regra a mais.
+## ✅ RESPONDIDO — o piso do período das médias é 3
+
+Pergunta feita em 10/09/2026, saída do canto de `period = 1` do PR-231.
+
+**Resposta dele: mínimo 3.** Aplicado no schema como `AVERAGE_FLOOR`, nos sete lugares onde um
+setup nomeia uma média: o `period` dos quatro `mme9_*` e do `ponto_continuo`, e o
+`long_average_period` dos dois que têm filtro de direção.
+
+É um **estreitamento** de gramática, e por isso foi conferido antes: das **267** estratégias
+salvas, nenhuma usa período abaixo de 3 (só 9, 20 e 200). Nenhum documento existente foi
+invalidado.
+
+⚠️ **As classes da engine continuam aceitando a partir de 1**, de propósito: lá o mecanismo é são,
+e quem publica gramática é o schema. `test_the_two_readings_come_apart_at_a_period_of_one` continua
+existindo por isso — ele prende o comportamento do mecanismo no extremo degenerado.
+
+## O piso de 3 não alcança os indicadores — vale estender? (aberto, do PR-234)
+
+O `AVERAGE_FLOOR` ficou só nos setups. Os nós de indicador (`PeriodSource`, `PeriodParams`: SMA,
+EMA, RSI, ATR, Bollinger) seguem aceitando `period >= 1`, e ali um EMA de 1 é uma série de preços,
+não um setup quebrado — uma condição `close > EMA(1)` é sempre falsa, mas é uma pergunta que o
+usuário pode estar fazendo de propósito.
+
+A assimetria é o tipo de coisa que um leitor futuro lê como bug, então está escrita no docstring do
+`AVERAGE_FLOOR`. Estender ou não é decisão dele; é outra superfície (estratégias de condição, não
+de setup).
+
+## ⚠️ O portão de drift do schema se autocura (achado na conferência do PR-234)
+
+`packages/schema/tests/test_semantic.py` chama `generate.main()`, que **escreve**
+`strategy.schema.json` em disco. Então rodar a suíte do schema **reescreve o artefato como efeito
+colateral**, e o `test_schema_drift` passa a medir um arquivo que a própria suíte acabou de
+consertar.
+
+Consequência medida no PR-234: o artefato ficou na árvore **sem o `ponto_continuo` inteiro** (103
+linhas: os `$defs`, a entrada do `discriminator.mapping` e o `$ref` do `oneOf`), sobra de uma
+regeneração feita durante uma rodada de mutação do guardian — e a suíte do schema passou verde
+`91/91` na minha rodada, porque o `test_semantic` regenerou o arquivo no meio. Quem pegou foi a
+conferência da lição, rodando o drift **isolado**.
+
+Pior: com a ordem aleatória do pytest, a mesma suíte falha numa rodada e passa na seguinte. Ou seja,
+**repetir não confirma nada sobre o artefato** — ver [[repeticao-nao-separa-queda-de-permanencia]].
+
+Conserto possível: `test_semantic` não deveria escrever no arquivo versionado — ou gera num tmp, ou
+compara `render_schema()` em memória. O drift precisa medir o arquivo **como ele está no commit**,
+e hoje ele mede o arquivo como a suíte o deixou.

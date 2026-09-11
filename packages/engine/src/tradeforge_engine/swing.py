@@ -1071,12 +1071,13 @@ class Mme9PullbackStrategy:
     the flat average in `Mme9TurnStrategy`: the reading that would move something is the reading
     that invents an event.
 
-    ⚠️ **And it leaves the correction's low alone as well, which is a simplification.** A bar that
+    ⚠️ **And it leaves the correction's low alone as well — his call, 2026-09-10.** A bar that
     neither corrects nor advances can still print the deepest low of the pullback, and by any
-    chart's reading that low is inside the movement the stop is supposed to clear. Applying the
-    rule literally keeps one sentence instead of two, at the cost of a stop that can sit above a
-    low price already made. Pinned by test and written down in `specs/backlog.md` as a question
-    for the author, because it is his method that decides it.
+    chart's reading that low sits inside the movement the stop is supposed to clear. Asked
+    directly, he answered that it does **not** belong to the correction: the bars that *count* are
+    the correction, and a bar the rule does not count does not widen the stop either. So the stop
+    can sit above a low price already made, and that is the method rather than an approximation
+    of it.
 
     **One trade per correction.** Once the order fills, the setup waits for a new anchor before it
     can arm again, which is what stops a single pullback from being bought on every bar of the move

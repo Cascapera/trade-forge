@@ -233,9 +233,9 @@ def test_a_close_exactly_on_the_anchor_neither_corrects_nor_advances() -> None:
                 *_LEG,
                 ("104", "104.6", "102.0"),
                 # ⚠️ Deeper than bar 4, deliberately: the bar that does nothing does not extend
-                # the correction's low either, so 101.0 never reaches the stop. That is the rule
-                # applied literally, and it is a simplification — the low is inside the pullback
-                # by any chart's reading. Noted in `specs/backlog.md` as a question for the author.
+                # the correction's low either, so 101.0 never reaches the stop. Asked directly
+                # (2026-09-10), the author answered that such a low does **not** belong to the
+                # correction — the bars that count are the correction.
                 ("105", "105.2", "101.0"),
                 ("104.5", "105.1", "103.9"),
             ]

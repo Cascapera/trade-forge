@@ -58,7 +58,7 @@ describe('axesFor', () => {
       (axis) => axis.path === 'setup.params.period',
     )
 
-    expect(period?.hint).toBe('whole numbers at least 1 and at most 1000, separated by commas')
+    expect(period?.hint).toBe('whole numbers at least 3 and at most 1000, separated by commas')
   })
 
   it('lists the choices for a parameter that has them', () => {

@@ -175,7 +175,9 @@ describe('the parameters a form has to treat specially', () => {
   })
 
   it('carries the bounds the schema declares, so the form can refuse out-of-range input', () => {
-    expect(param('mme9_breakout', 'period')).toMatchObject({ min: 1, max: 1000, nullable: false })
+    // ⚠️ The floor is 3, not 1: his call on 2026-09-10, because an exponential average of one
+    // period *is* the close and the setup can never arm on it.
+    expect(param('mme9_breakout', 'period')).toMatchObject({ min: 3, max: 1000, nullable: false })
     expect(param('structure_choch', 'stop_buffer')).toMatchObject({ min: 0, max: 10 })
   })
 })
@@ -283,7 +285,7 @@ describe('exclusive bounds', () => {
     // the assertion above on its own.
     const [period] = setupSpec('mme9_breakout').params.filter((param) => param.name === 'period')
 
-    expect(period).toMatchObject({ kind: 'integer', min: 1 })
+    expect(period).toMatchObject({ kind: 'integer', min: 3 })
     expect(period).not.toHaveProperty('minExclusive')
   })
 })

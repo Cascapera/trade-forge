@@ -635,7 +635,7 @@
           "anyOf": [
             {
               "maximum": 1000,
-              "minimum": 1,
+              "minimum": 3,
               "type": "integer"
             },
             {
@@ -648,7 +648,7 @@
         "period": {
           "default": 9,
           "maximum": 1000,
-          "minimum": 1,
+          "minimum": 3,
           "title": "Period",
           "type": "integer"
         },
@@ -714,7 +714,7 @@
         "period": {
           "default": 9,
           "maximum": 1000,
-          "minimum": 1,
+          "minimum": 3,
           "title": "Period",
           "type": "integer"
         },
@@ -782,7 +782,7 @@
         "period": {
           "default": 9,
           "maximum": 1000,
-          "minimum": 1,
+          "minimum": 3,
           "title": "Period",
           "type": "integer"
         },
@@ -843,7 +843,7 @@
         "period": {
           "default": 9,
           "maximum": 1000,
-          "minimum": 1,
+          "minimum": 3,
           "title": "Period",
           "type": "integer"
         },
@@ -1015,7 +1015,7 @@
           "anyOf": [
             {
               "maximum": 1000,
-              "minimum": 1,
+              "minimum": 3,
               "type": "integer"
             },
             {
@@ -1028,7 +1028,7 @@
         "period": {
           "default": 20,
           "maximum": 1000,
-          "minimum": 1,
+          "minimum": 3,
           "title": "Period",
           "type": "integer"
         },

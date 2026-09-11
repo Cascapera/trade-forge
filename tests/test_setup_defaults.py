@@ -49,6 +49,7 @@ from tradeforge_engine.setups import (
 )
 from tradeforge_engine.swing import (
     Mme9BreakoutStrategy,
+    Mme9FailedTurnStrategy,
     Mme9PullbackStrategy,
     Mme9TurnStrategy,
     PontoContinuoStrategy,
@@ -56,6 +57,7 @@ from tradeforge_engine.swing import (
 from tradeforge_schema.models import (
     ContinuationParams,
     Mme9BreakoutParams,
+    Mme9FailedTurnParams,
     Mme9PullbackParams,
     Mme9TurnParams,
     PontoContinuoParams,
@@ -81,6 +83,10 @@ _SETUPS: dict[str, tuple[type[Any], dict[str, Any]]] = {
     "mme9_breakout": (
         Mme9BreakoutParams,
         _owned_by(Mme9BreakoutParams, Mme9BreakoutStrategy),
+    ),
+    "mme9_failed_turn": (
+        Mme9FailedTurnParams,
+        _owned_by(Mme9FailedTurnParams, Mme9FailedTurnStrategy),
     ),
     "mme9_pullback": (
         Mme9PullbackParams,
@@ -125,6 +131,13 @@ _PROBES: dict[str, dict[str, tuple[Any, Any]]] = {
         "volume_filter": (True, True),
         # His long-average direction filter (2026-09-09), off by default.
         "long_average_period": (200, 200),
+    },
+    # The published 9.4, which has no count: the pattern is always two bars.
+    "mme9_failed_turn": {
+        "side": ("short", Side.SHORT),
+        "period": (21, 21),
+        "stop_buffer_ticks": (3, 3),
+        "breakeven_at_r": (3.3, Decimal("3.3")),
     },
     # The published 9.2 and 9.3, which are one type and a count.
     "mme9_pullback": {
@@ -193,6 +206,7 @@ _PROBES: dict[str, dict[str, tuple[Any, Any]]] = {
 # different objects.
 _FACTORY_CLASSES = (
     "Mme9BreakoutStrategy",
+    "Mme9FailedTurnStrategy",
     "Mme9PullbackStrategy",
     "Mme9TurnStrategy",
     "PontoContinuoStrategy",

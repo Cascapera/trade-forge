@@ -13,11 +13,13 @@ that *touches* the average and closes back on the trend's side, after price has 
 pullback setup by shape, still entered on the breakout of its own high. For the published 9.1
 (`Mme9TurnStrategy`) it is the average's own **slope** changing sign — which on an exponential
 average turns out to be the same event as his close, so what makes the two different setups is
-what they do *after* arming. And for the published 9.2 and 9.3 (`Mme9PullbackStrategy`, one class
-with a count) the event is not about the average at all: it is a bar closing under the **best close
-of the leg**, which the rising average only permits. The shared part is the geometry of the order
-they leave behind, which is `_breakout_entry`, and nothing else: each holds different state,
-watches a different event, and conducts its trades by its own rules.
+what they do *after* arming. For the published 9.2 and 9.3 (`Mme9PullbackStrategy`, one class with
+a count) the event is not about the average at all: it is a bar closing under the **best close of
+the leg**, which the rising average only permits. And for the published 9.4
+(`Mme9FailedTurnStrategy`) it is a **pair** of bars — one that bends the line the wrong way and
+the one right after it that bends it back without taking its low. The shared part is the geometry
+of the order they leave behind, which is `_breakout_entry`, and nothing else: each holds different
+state, watches a different event, and conducts its trades by its own rules.
 
 ⚠️ **Two setups here are both called 9.1 and they are not the same setup.** `Mme9BreakoutStrategy`
 is the author's, dictated; `Mme9TurnStrategy` is the one the Larry Williams literature publishes.
@@ -1301,6 +1303,229 @@ class Mme9PullbackStrategy:
         filled = any(fill.order.client_id == armed.client_id for fill in context.fills)
         if filled or context.position is not None:
             self._spent = True
+            self._armed = None
+
+    def _withdraw(self, armed: _Armed, candle: Candle) -> Signal:
+        return _withdraw(armed, candle, side=self._side, name=self._name)
+
+
+class Mme9FailedTurnStrategy:
+    """9.4: the average dips for exactly one bar and comes straight back, and that is the trade.
+
+    A 9.1 that failed and recovered. The rule, for a buy (the sell mirrors every line):
+
+    1. **The MME9 is pointing up.**
+    2. **One bar turns it down.** Call that the failure bar.
+    3. **The very next bar turns it back up** — *"logo no candle seguinte ela virar novamente para
+       cima"*. Not the bar after that: if the average spends two bars down, this setup is over and
+       what eventually turns the line back up is a 9.1, not a 9.4.
+    4. ⚠️ **And that next bar must not take the failure bar's low** — *"o candle que fez a média
+       virar para baixo não poderá ter a sua mínima violada no candle seguinte, pois se isso
+       ocorrer estaria ativando um Setup 9.1 de VENDA"*. This is not a cancellation that happens
+       later; it is half of the arming, checked on the recovery bar itself.
+    5. **The order rests at the high of the recovery bar** — *"marca-se a máxima deste último
+       candle"* — and it does **not** chase. Same geometry as the published 9.1, and the opposite
+       of the 9.2/9.3, where the literature explicitly moves the trigger forward.
+    6. **The stop clears the low of the correction**, which here is the failure bar's low: rule 4
+       refused the recovery bar if it went under that, so the failure bar is the deeper of the two
+       by construction.
+
+    ⚠️ **The bar that ends a turn is also the bar that may start the next one.** A bar bending the
+    line down withdraws a resting order *and* becomes the new failure bar, because those are the
+    same event seen from two sides. Reading only the first leaves the setup unable to re-arm after
+    the one pattern it is made of.
+
+    **A correction older than the failure bar is not counted.** The pullback may have begun
+    earlier, while the average was still rising, and those bars may have printed lower lows than
+    the failure bar did. They do not reach the stop here: the two bars of the pattern are what the
+    rule names. The same question the 9.2/9.3 leaves open, and it is the author's to settle.
+
+    `breakeven_at_r` defaults to `None`, like the rest of the published family.
+    """
+
+    def __init__(
+        self,
+        *,
+        side: Side = Side.LONG,
+        period: int = 9,
+        name: str = "mme9fail",
+        stop_buffer_ticks: int = 0,
+        breakeven_at_r: Decimal | None = None,
+    ) -> None:
+        if period < 1:
+            raise ValueError(f"MME period must be >= 1, got {period}")
+        if stop_buffer_ticks < 0:
+            raise ValueError(f"stop buffer is a magnitude in ticks, got {stop_buffer_ticks}")
+        if breakeven_at_r is not None and breakeven_at_r <= ZERO:
+            raise ValueError(f"breakeven R multiple must be positive, got {breakeven_at_r}")
+
+        self._side = side
+        self._name = name
+        self._period = period
+        self._stop_buffer_ticks = Decimal(stop_buffer_ticks)
+        self._breakeven_at_r = breakeven_at_r
+        self._ema = EMA(period=period, source="close")
+        self._trail_of_the_average = _AverageTrail()
+        self._slope = _Slope()
+
+        self._armed: _Armed | None = None
+        self._armed_count = 0
+        # The bar that bent the line the wrong way, and what the average read while it did. Set on
+        # that bar and consumed — or dropped — by the very next one: the pattern is two bars, and
+        # a failure bar that survives longer than one bar is not this setup any more.
+        self._failure: Candle | None = None
+        self._dip: Money | None = None
+
+    def overlays(self) -> Mapping[str, Indicator]:
+        """The average this setup is defined by — see `protocols.Charted`."""
+        return {f"EMA {self._period}": self._ema}
+
+    def on_bar(  # noqa: PLR0911 — one flat return per rule, the shape the siblings use too
+        self, context: Context
+    ) -> tuple[Signal, ...]:
+        candle = context.candle
+        self._ema.update(candle)
+        average = self._ema.value()
+        self._trail_of_the_average.record(candle, average)
+
+        self._observe_fill(context)
+
+        if average is None:
+            return ()
+
+        slope = self._slope
+        slope.read(average)
+        if not slope.comparable:
+            return ()
+
+        conducted = self._conduct(context)
+        signals: list[Signal] = [] if conducted is None else [conducted]
+
+        if slope.rising is None:
+            # Nothing but flat readings so far: the line has no direction to fail from.
+            return tuple(signals)
+
+        # Whatever this bar is, it answers the failure bar that was waiting — and it answers it
+        # once. Taken out of the slot here so every path below reads "the bar before this one".
+        failure, dip = self._failure, self._dip
+        self._failure, self._dip = None, None
+
+        favourable = slope.rising if self._side is Side.LONG else not slope.rising
+        if not favourable:
+            # The line bent the wrong way. If that happened on *this* bar it is a failure bar, and
+            # the same event withdraws whatever the previous pattern left resting.
+            if self._armed is not None:
+                signals.append(self._withdraw(self._armed, candle))
+                self._armed = None
+            if slope.turned:
+                self._failure, self._dip = candle, average
+            return tuple(signals)
+
+        if failure is None or not slope.turned:
+            # Pointing our way with nothing to recover from, or still pointing the way it already
+            # was. Either way there is no pattern here.
+            #
+            # ⚠️ The second half is subsumed today and kept for the failure mode: a pending failure
+            # bar means the previous bar pointed the wrong way, so arriving here favourably *is*
+            # a turn. What it guards is the day the failure slot survives longer than one bar —
+            # then a bar that merely continues the trend would complete a pattern it never began.
+            return tuple(signals)
+
+        if self._violates(candle, failure):
+            # Rule 4: the recovery bar took the failure bar's low. The literature is explicit that
+            # what this becomes is the *opposite* setup, so arming here would be trading a reversal
+            # as a continuation.
+            logger.debug("recovery at %s broke the failure bar's low; no 9.4", candle.time)
+            return tuple(signals)
+
+        if context.position is not None:
+            # Nothing arms beside an open trade. The pattern is read anyway — it is two closed
+            # bars, and what the setup knows should not depend on the account.
+            return tuple(signals)
+
+        entry = self._entry_for(candle, failure, context.instrument)
+        if entry is None:
+            return tuple(signals)
+
+        self._armed_count += 1
+        client_id = f"{self._name}-{candle.time:%Y%m%dT%H%M}-{self._armed_count}"
+        self._armed = _Armed(reference=candle, client_id=client_id)
+        signals.append(
+            Signal(
+                kind=SignalKind.ENTRY,
+                side=self._side,
+                reference_price=candle.close,
+                stop_loss=entry.stop_loss,
+                stop_price=entry.stop_price,
+                reason=f"entry.{self._name}",
+                client_id=client_id,
+                # The average now, and the average at the bottom of its dip. The second one is the
+                # whole reason this entry exists and no column downstream would otherwise carry
+                # it: without it the record shows a breakout from an average that only ever rose.
+                context={"average": average, "average_at_failure": dip},
+                series=self._trail_of_the_average.series(),
+            )
+        )
+        return tuple(signals)
+
+    def _violates(self, candle: Candle, failure: Candle) -> bool:
+        """Did the recovery bar take out the failure bar's protective extreme?"""
+        if self._side is Side.LONG:
+            return candle.low < failure.low
+        return candle.high > failure.high
+
+    def _entry_for(
+        self, candle: Candle, failure: Candle, instrument: InstrumentSpec
+    ) -> _Breakout | None:
+        """The recovery bar's break, protected past the failure bar.
+
+        ⚠️ The protective level comes from the **failure** bar, not from this one. `_violates` has
+        already refused a recovery bar that went under it, so the failure bar is the low of the
+        correction — using this bar's low instead would be a tighter stop on every pattern whose
+        recovery bar did not reach as far, which is most of them.
+        """
+        buffer = self._stop_buffer_ticks * instrument.tick_size
+        if self._side is Side.LONG:
+            stop_loss = failure.low - buffer
+            if stop_loss <= ZERO or candle.high <= stop_loss:
+                logger.debug("recovery at %s would carry no risk; nothing", candle.time)
+                return None
+            return _Breakout(stop_price=candle.high, stop_loss=stop_loss)
+        raised = failure.high + buffer
+        if candle.low >= raised:
+            logger.debug("recovery at %s would carry no risk; nothing", candle.time)
+            return None
+        return _Breakout(stop_price=candle.low, stop_loss=raised)
+
+    def _conduct(self, context: Context) -> Signal | None:
+        """The open trade's stop, moved only by the breakeven rule — and only if it is on."""
+        position = context.position
+        if position is None:
+            return None
+
+        breakeven = breakeven_candidate(
+            position=position,
+            side=self._side,
+            candle=context.candle,
+            multiple=self._breakeven_at_r,
+        )
+        if breakeven is None:
+            return None
+        return tighten(
+            position=position,
+            side=self._side,
+            candle=context.candle,
+            candidates=[breakeven],
+            reason=f"trail.{self._name}",
+        )
+
+    def _observe_fill(self, context: Context) -> None:
+        """Notice the armed order becoming a trade, and forget the name."""
+        armed = self._armed
+        if armed is None:
+            return
+        filled = any(fill.order.client_id == armed.client_id for fill in context.fills)
+        if filled or context.position is not None:
             self._armed = None
 
     def _withdraw(self, armed: _Armed, candle: Candle) -> Signal:

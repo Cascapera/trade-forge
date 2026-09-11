@@ -142,14 +142,26 @@ def test_a_backtest_at_the_filters_own_timeframe_is_refused(client: Any) -> None
     assert allowed.status_code == 202, allowed.text
 
 
-def test_a_backtest_at_a_timeframe_the_filter_still_covers_is_accepted(client: Any) -> None:
-    # H1 under an H4 filter: coarser and a whole number of bars, so the filter still filters.
-    # Without this case the guard could refuse every disagreement and look correct.
+def test_a_filtered_backtest_runs_only_on_the_documents_own_timeframe(client: Any) -> None:
+    """⚠️ H1 used to be accepted here, and the rule tightened on 2026-09-11.
+
+    H4 is a whole number of H1 bars, so the DSL is satisfied — but the gate is built with the
+    **document's** bar width and fed the **run's**, and a document finer than the run silences
+    `BarAggregator`'s straddle guard. Measured with a broker clock of 3h30, which `htf_offset`
+    accepts: the honest run raises on a straddling bar and the mismatched one says nothing.
+    """
     filtered = _save(client, _filtered(f"choch {uuid.uuid4()}"))
+
+    refused = client.post(
+        "/backtests",
+        json={"strategy_id": filtered, "symbol": "EURUSD", "timeframe": "H1", **_window()},
+    )
+    assert refused.status_code == 422
+    assert "M15" in refused.text
 
     accepted = client.post(
         "/backtests",
-        json={"strategy_id": filtered, "symbol": "EURUSD", "timeframe": "H1", **_window()},
+        json={"strategy_id": filtered, "symbol": "EURUSD", "timeframe": "M15", **_window()},
     )
     assert accepted.status_code == 202, accepted.text
 

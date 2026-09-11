@@ -50,6 +50,19 @@ class TestTheFilterlessDocumentIsNeverRefused:
     def test_runs_at_any_timeframe(self, run_at: str) -> None:
         assert timeframe_refusal(unfiltered("M15"), run_at) is None
 
+    def test_an_explicit_null_filter_is_a_filter_switched_off(self) -> None:
+        # ⚠️ `"htf": null` written out is not the same shape as the key being absent, and the
+        # DSL treats it as the rule switched off (`setup_factory._optional_timeframe`). A guard
+        # that tested for the key's *presence* rather than its value would refuse every
+        # timeframe for a document that filters by nothing — and the builder writes this shape,
+        # because a form with an "off" option has to send something.
+        document = filtered("M15")
+        document["setup"]["params"]["htf"] = None
+        document["setup"]["params"]["htf_offset"] = None
+
+        for run_at in ("M5", "M15", "H1", "H4", "D1"):
+            assert timeframe_refusal(document, run_at) is None
+
     def test_including_the_one_that_would_be_refused_with_a_filter(self) -> None:
         # H4 against a document saved at M15: refused below when a filter is present, allowed
         # here. Same two timeframes, opposite answers — which is what proves the guard is
@@ -59,13 +72,24 @@ class TestTheFilterlessDocumentIsNeverRefused:
 
 
 class TestTheFilteredDocument:
-    def test_at_its_own_timeframe_it_runs(self) -> None:
-        assert timeframe_refusal(filtered("M15"), "M15") is None
+    @pytest.mark.parametrize("run_at", ["M5", "M30", "H1"])
+    def test_is_refused_anywhere_but_its_own_timeframe(self, run_at: str) -> None:
+        # ⚠️ **These three used to be allowed**, and the rule tightened on 2026-09-11 for a case
+        # the DSL cannot see. H4 is a whole number of each of them, so `assert_executable` is
+        # perfectly happy — but the gate is built with the **document's** bar width and fed the
+        # **run's**, and when the document's is the finer of the two, `BarAggregator`'s straddle
+        # guard compares the wrong width and stops firing.
+        #
+        # Measured with a broker clock of 3h30, which `htf_offset` accepts: document H1 run at
+        # H1 raises on the bar that straddles 00:30, and document M15 run at H1 produces six H4
+        # bars and no complaint at all. The mismatch silences the guard that exists to catch it.
+        reason = timeframe_refusal(filtered("M15"), run_at)
+        assert reason is not None
+        assert "M15" in reason
 
-    @pytest.mark.parametrize("run_at", ["M5", "M15", "M30", "H1"])
-    def test_runs_wherever_the_filter_is_still_coarser(self, run_at: str) -> None:
-        # H4 is a whole number of each of these, so the filter still means something.
-        assert timeframe_refusal(filtered("M15"), run_at) is None
+    def test_runs_at_its_own_timeframe(self) -> None:
+        # The other half of the pair above: the rule is equality, not refusal of everything.
+        assert timeframe_refusal(filtered("M15"), "M15") is None
 
     def test_is_refused_when_the_run_reaches_the_filter(self) -> None:
         # ⚠️ The silent case, and the reason this module exists. The engine raises nothing here:
@@ -91,17 +115,25 @@ class TestTheFilteredDocument:
 
 
 class TestTheDocumentItself:
-    def test_the_question_is_about_the_run_not_about_the_stored_row(self) -> None:
-        # ⚠️ A document stored at H4 under an H4 filter is not runnable as written, and
-        # `assert_executable` would have refused to save it. Run at M15 it is **allowed** — the
-        # substitution makes the filter coarser than the chart, which is the whole rule.
+    def test_a_document_that_was_never_runnable_is_refused_everywhere(self) -> None:
+        # A document stored at H4 under an H4 filter could never have been saved —
+        # `assert_executable` refuses it at the strategy endpoint. Asserted anyway because this
+        # function is reached with whatever the database holds, and a row that predates a rule
+        # has to come out as "cannot run" rather than as an exception nobody catches.
         #
-        # This is the function's contract said out loud: it answers "can this document run at
-        # this timeframe", never "does the stored timeframe look right". A guard that compared
-        # the stored field against the run would answer the opposite on both lines below.
+        # ⚠️ Both lines, and for **different** reasons: at H4 the filter is not coarser than the
+        # chart, which is the DSL's refusal; at M15 the document is legal once substituted and
+        # the equality rule is what catches it. Two rules, one verdict, and a test that asserted
+        # only one of them would go green if the other were deleted.
         document = filtered("H4", htf="H4")
-        assert timeframe_refusal(document, "M15") is None
-        assert timeframe_refusal(document, "H4") is not None
+
+        at_m15 = timeframe_refusal(document, "M15")
+        at_h4 = timeframe_refusal(document, "H4")
+
+        assert at_m15 is not None
+        assert "built from H4 bars" in at_m15
+        assert at_h4 is not None
+        assert "coarser" in at_h4
 
     def test_a_corrupt_document_is_reported_as_a_different_fact(self) -> None:
         # ⚠️ Not dressed up as a timeframe problem. A document that no longer validates is a

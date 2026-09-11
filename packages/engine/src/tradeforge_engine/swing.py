@@ -13,9 +13,11 @@ that *touches* the average and closes back on the trend's side, after price has 
 pullback setup by shape, still entered on the breakout of its own high. For the published 9.1
 (`Mme9TurnStrategy`) it is the average's own **slope** changing sign — which on an exponential
 average turns out to be the same event as his close, so what makes the two different setups is
-what they do *after* arming. The shared part is the geometry of the order they leave behind, which
-is `_breakout_entry`, and nothing else: each holds different state, watches a different event, and
-conducts its trades by its own rules.
+what they do *after* arming. And for the published 9.2 and 9.3 (`Mme9PullbackStrategy`, one class
+with a count) the event is not about the average at all: it is a bar closing under the **best close
+of the leg**, which the rising average only permits. The shared part is the geometry of the order
+they leave behind, which is `_breakout_entry`, and nothing else: each holds different state,
+watches a different event, and conducts its trades by its own rules.
 
 ⚠️ **Two setups here are both called 9.1 and they are not the same setup.** `Mme9BreakoutStrategy`
 is the author's, dictated; `Mme9TurnStrategy` is the one the Larry Williams literature publishes.
@@ -758,6 +760,47 @@ class Mme9BreakoutStrategy:
         return _withdraw(armed, candle, side=self._side, name=self._name)
 
 
+class _Slope:
+    """Which way an average is pointing, and whether this bar is where it changed its mind.
+
+    Every published setup in this module reads the same three lines of arithmetic off the same
+    average, so they live here once — which also keeps the decision that goes with them in one
+    place. **A flat bar preserves the direction**: two equal readings mean the line stopped, not
+    that it turned, and the two other ways to read it are wrong in opposite directions. Calling
+    flat "no longer rising" arms a buy in the middle of a fall; calling it "unknown" forgets the
+    fall, so the real turn that follows has nothing to have turned from.
+
+    `comparable` is false only for the average's very first value, which has nothing behind it —
+    the entry toll of any first-order recurrence.
+    """
+
+    __slots__ = ("_previous", "comparable", "rising", "turned")
+
+    def __init__(self) -> None:
+        self._previous: Money | None = None
+        self.comparable = False
+        self.rising: bool | None = None
+        """`None` until a strict move has been seen: unknown, which is not the same as flat."""
+        self.turned = False
+        """Did *this* bar change the sign? False while the direction is merely being kept."""
+
+    def read(self, average: Money) -> None:
+        """Take this bar's reading of the average."""
+        previous = self._previous
+        self._previous = average
+        self.comparable = previous is not None
+        if previous is None:
+            self.turned = False
+            return
+
+        was = self.rising
+        if average > previous:
+            self.rising = True
+        elif average < previous:
+            self.rising = False
+        self.turned = was is not None and self.rising is not None and was != self.rising
+
+
 class Mme9TurnStrategy:
     """9.1 as the literature writes it: the bar that *bent the average* is the trade.
 
@@ -853,8 +896,7 @@ class Mme9TurnStrategy:
         # direction means "not known yet", which is not the same as flat: the first slope this
         # class can measure has nothing before it to have turned *from*, so it is recorded and
         # not traded. The same entry toll the structure series pays on its first bar.
-        self._previous_average: Money | None = None
-        self._rising: bool | None = None
+        self._slope = _Slope()
 
     def overlays(self) -> Mapping[str, Indicator]:
         """The average this setup is defined by — see `protocols.Charted`."""
@@ -875,33 +917,25 @@ class Mme9TurnStrategy:
         if average is None:
             return ()
 
-        previous = self._previous_average
-        self._previous_average = average
-        if previous is None:
+        slope = self._slope
+        slope.read(average)
+        if not slope.comparable:
             # First reading the average has produced. There is no slope yet, so there is nothing
             # this bar can be: not a turn, not a cancel.
             return ()
-
-        was_rising = self._rising
-        # Flat leaves the direction alone — see the class docstring. Only a strict move re-reads
-        # it, which also makes `_rising` a fact about the line rather than about this bar.
-        if average > previous:
-            self._rising = True
-        elif average < previous:
-            self._rising = False
 
         # The open trade's stop, if the breakeven rule tightened it. Owed on every bar, including
         # the ones that cancel or arm.
         conducted = self._conduct(context)
         signals: list[Signal] = [] if conducted is None else [conducted]
 
-        if self._rising is None:
+        if slope.rising is None:
             # Every reading so far has been flat, so the line has no direction to be judged by.
             # Nothing is resting either — arming needs a turn, and there has been none.
             return tuple(signals)
 
-        favourable = self._rising if self._side is Side.LONG else not self._rising
-        turned = favourable and was_rising is not None and was_rising != self._rising
+        favourable = slope.rising if self._side is Side.LONG else not slope.rising
+        turned = favourable and slope.turned
 
         if not favourable:
             # The line bent back: the setup is undone and whatever it left resting goes with it.
@@ -991,6 +1025,282 @@ class Mme9TurnStrategy:
             return
         filled = any(fill.order.client_id == armed.client_id for fill in context.fills)
         if filled or context.position is not None:
+            self._armed = None
+
+    def _withdraw(self, armed: _Armed, candle: Candle) -> Signal:
+        return _withdraw(armed, candle, side=self._side, name=self._name)
+
+
+class Mme9PullbackStrategy:
+    """9.2 and 9.3: the leg's best close is the anchor, and the correction is bought on its break.
+
+    One machine, one threshold. The literature's 9.2 counts **one** corrective close and its 9.3
+    counts **two consecutive** ones, against the same anchor and with every other rule identical,
+    so `corrections` is what tells them apart rather than a second class. That also makes "does the
+    stricter one earn more" a study axis instead of two backtests a reader has to line up by hand.
+
+    The rule, for a buy (the sell mirrors every line):
+
+    1. **The MME9 is rising.** Everything below happens inside that; the line bending down undoes
+       the setup and withdraws whatever it left resting.
+    2. **The reference candle is the highest close of the leg.** It is not the signal — it is the
+       anchor the correction is measured against, and it moves up with every new best close.
+    3. **A corrective close is one strictly below the reference's close.** `corrections` of them in
+       a row arm the setup: one for 9.2, two for 9.3, and the two need not be falling — the
+       literature asks only that they be under the anchor.
+    4. **The order rests at the high of the last corrective bar and follows the bars after it**
+       (*"podendo ser mudado para as máximas seguintes, desde que a MME9 siga ascendente"*). This
+       is the opposite of the published 9.1, where the reference is frozen, and both are the
+       literature's own words. ⚠️ **It follows upward too.** The sentence is written about a
+       correction that keeps sinking, so a corrective bar with a *higher* high than the last one
+       is a case it does not address; taking the newest bar either way is the reading here, and it
+       is the one that keeps "the trigger is the last corrective bar" a single sentence.
+    5. **The stop goes under the low of the correction as a whole**, not under the trigger bar —
+       *"abaixo da mínima do movimento de correção"*. That low keeps extending while the order
+       chases, so a deeper bar widens the risk of the trade it is still waiting for.
+
+    ⚠️ **A close back above the anchor is the leg resuming, and it resets everything**: new
+    reference, count back to zero, resting order withdrawn. The alternative — keeping the count
+    through a higher close — would let two corrections separated by a fresh leg high count as
+    "consecutive", which is the one word the 9.3 rule is made of.
+
+    **A close exactly on the anchor is neither.** It does not correct (the rule says *below*) and
+    it does not advance the leg, so it leaves the count and the reference alone. Same doctrine as
+    the flat average in `Mme9TurnStrategy`: the reading that would move something is the reading
+    that invents an event.
+
+    ⚠️ **And it leaves the correction's low alone as well, which is a simplification.** A bar that
+    neither corrects nor advances can still print the deepest low of the pullback, and by any
+    chart's reading that low is inside the movement the stop is supposed to clear. Applying the
+    rule literally keeps one sentence instead of two, at the cost of a stop that can sit above a
+    low price already made. Pinned by test and written down in `specs/backlog.md` as a question
+    for the author, because it is his method that decides it.
+
+    **One trade per correction.** Once the order fills, the setup waits for a new anchor before it
+    can arm again, which is what stops a single pullback from being bought on every bar of the move
+    that follows it.
+
+    ⚠️ **The anchor is not the same thing as "the highest high".** A leg whose best *close* came
+    early keeps that close as the anchor even while higher wicks print, and corrective closes are
+    counted against it. That is the literature's wording and it is not an approximation of
+    something else — a version anchored on the high would count corrections that this one does not.
+
+    `breakeven_at_r` defaults to `None`, like the other published setups: the source names an entry
+    and a protective stop and says nothing about moving one.
+    """
+
+    def __init__(  # noqa: PLR0913 — keyword-only; each names one knob of the setup
+        self,
+        *,
+        side: Side = Side.LONG,
+        corrections: int = 1,
+        period: int = 9,
+        name: str = "mme9pull",
+        stop_buffer_ticks: int = 0,
+        breakeven_at_r: Decimal | None = None,
+    ) -> None:
+        if period < 1:
+            raise ValueError(f"MME period must be >= 1, got {period}")
+        if corrections < 1:
+            raise ValueError(f"a correction is at least one closed bar, got {corrections}")
+        if stop_buffer_ticks < 0:
+            raise ValueError(f"stop buffer is a magnitude in ticks, got {stop_buffer_ticks}")
+        if breakeven_at_r is not None and breakeven_at_r <= ZERO:
+            raise ValueError(f"breakeven R multiple must be positive, got {breakeven_at_r}")
+
+        self._side = side
+        self._needed = corrections
+        self._name = name
+        self._period = period
+        self._stop_buffer_ticks = Decimal(stop_buffer_ticks)
+        self._breakeven_at_r = breakeven_at_r
+        self._ema = EMA(period=period, source="close")
+        self._trail_of_the_average = _AverageTrail()
+
+        self._armed: _Armed | None = None
+        self._armed_count = 0
+        self._slope = _Slope()
+        # The best close of the leg, how many bars have closed under it since, and how far they
+        # reached. `_extreme` is directional: the lowest low of the correction for a buy, the
+        # highest high for a sell.
+        self._reference: Candle | None = None
+        self._corrected = 0
+        self._extreme: Money | None = None
+        # A correction gives one trade. Cleared by the next anchor, which is the leg moving on.
+        self._spent = False
+
+    def overlays(self) -> Mapping[str, Indicator]:
+        """The average this setup is defined by — see `protocols.Charted`."""
+        return {f"EMA {self._period}": self._ema}
+
+    def on_bar(  # noqa: PLR0911 — one flat return per rule of the setup
+        self, context: Context
+    ) -> tuple[Signal, ...]:
+        candle = context.candle
+        self._ema.update(candle)
+        average = self._ema.value()
+        self._trail_of_the_average.record(candle, average)
+
+        self._observe_fill(context)
+
+        if average is None:
+            return ()
+
+        slope = self._slope
+        slope.read(average)
+        if not slope.comparable:
+            return ()
+
+        conducted = self._conduct(context)
+        signals: list[Signal] = [] if conducted is None else [conducted]
+
+        if slope.rising is None:
+            # Nothing but flat readings so far: the line has no direction to trade with.
+            return tuple(signals)
+
+        favourable = slope.rising if self._side is Side.LONG else not slope.rising
+        if not favourable:
+            # The line bent against the setup. Everything the leg built goes with it: the anchor
+            # belonged to a trend that is over, and a correction counted against it would be
+            # counted against nothing.
+            if self._armed is not None:
+                signals.append(self._withdraw(self._armed, candle))
+            self._forget()
+            return tuple(signals)
+
+        reference = self._reference
+        if reference is None or self._advances(candle, reference):
+            # A new best close: the leg is going on without us, and anything resting was waiting
+            # for a correction this bar has just ended.
+            if self._armed is not None:
+                signals.append(self._withdraw(self._armed, candle))
+            self._forget()
+            self._reference = candle
+            return tuple(signals)
+
+        if not self._corrects(candle, reference):
+            # A close exactly on the anchor: neither a correction nor a new leg high.
+            return tuple(signals)
+
+        self._corrected += 1
+        self._extreme = self._reach(candle)
+
+        if self._corrected < self._needed or context.position is not None or self._spent:
+            # Not enough bars under the anchor yet — or there is nothing to be done with them,
+            # because a trade is open or this correction has already given its own.
+            return tuple(signals)
+
+        entry = self._entry_for(candle, context.instrument)
+        if entry is None:
+            return tuple(signals)
+
+        if self._armed is not None:
+            # The trigger follows the newest bar of the correction, so what is resting is replaced
+            # rather than left where the previous bar put it.
+            signals.append(self._withdraw(self._armed, candle))
+        self._armed_count += 1
+        client_id = f"{self._name}-{candle.time:%Y%m%dT%H%M}-{self._armed_count}"
+        self._armed = _Armed(reference=candle, client_id=client_id)
+        signals.append(
+            Signal(
+                kind=SignalKind.ENTRY,
+                side=self._side,
+                reference_price=candle.close,
+                stop_loss=entry.stop_loss,
+                stop_price=entry.stop_price,
+                reason=f"entry.{self._name}",
+                client_id=client_id,
+                # The average that allowed this, and the anchor the correction was measured
+                # against. Without the second one a chart of this entry shows a bar bought for no
+                # stated reason, because the anchor is the whole qualification.
+                context={"average": average, "reference_close": reference.close},
+                series=self._trail_of_the_average.series(),
+            )
+        )
+        return tuple(signals)
+
+    def _forget(self) -> None:
+        """Drop the correction and the trade it was owed. The anchor is the caller's business."""
+        self._armed = None
+        self._reference = None
+        self._corrected = 0
+        self._extreme = None
+        self._spent = False
+
+    def _advances(self, candle: Candle, reference: Candle) -> bool:
+        """Does this bar close beyond the anchor — the leg going on rather than correcting?"""
+        if self._side is Side.LONG:
+            return candle.close > reference.close
+        return candle.close < reference.close
+
+    def _corrects(self, candle: Candle, reference: Candle) -> bool:
+        """Does this bar close strictly on the correcting side of the anchor?"""
+        if self._side is Side.LONG:
+            return candle.close < reference.close
+        return candle.close > reference.close
+
+    def _reach(self, candle: Candle) -> Money:
+        """How far the correction has gone, extended by this bar."""
+        if self._side is Side.LONG:
+            return candle.low if self._extreme is None else min(self._extreme, candle.low)
+        return candle.high if self._extreme is None else max(self._extreme, candle.high)
+
+    def _entry_for(self, candle: Candle, instrument: InstrumentSpec) -> _Breakout | None:
+        """The order this corrective bar leaves: its own break, protected past the whole pullback.
+
+        ⚠️ The protective level is the correction's extreme and **not** this bar's, which is what
+        `_breakout_entry` would give. The two coincide whenever the trigger bar is also the deepest
+        one, so a test written on that bar alone cannot tell the difference.
+        """
+        extreme = self._extreme
+        if extreme is None:  # pragma: no cover — the caller sets it on the same bar
+            return None
+
+        buffer = self._stop_buffer_ticks * instrument.tick_size
+        if self._side is Side.LONG:
+            stop_loss = extreme - buffer
+            # The `<= ZERO` has no mirror below on purpose: a sell is protected *above* the
+            # correction, so its level is a positive number plus a magnitude and cannot go under.
+            if stop_loss <= ZERO or candle.high <= stop_loss:
+                logger.debug("correction at %s would carry no risk; nothing", candle.time)
+                return None
+            return _Breakout(stop_price=candle.high, stop_loss=stop_loss)
+        raised = extreme + buffer
+        if candle.low >= raised:
+            logger.debug("correction at %s would carry no risk; nothing", candle.time)
+            return None
+        return _Breakout(stop_price=candle.low, stop_loss=raised)
+
+    def _conduct(self, context: Context) -> Signal | None:
+        """The open trade's stop, moved only by the breakeven rule — and only if it is on."""
+        position = context.position
+        if position is None:
+            return None
+
+        breakeven = breakeven_candidate(
+            position=position,
+            side=self._side,
+            candle=context.candle,
+            multiple=self._breakeven_at_r,
+        )
+        if breakeven is None:
+            return None
+        return tighten(
+            position=position,
+            side=self._side,
+            candle=context.candle,
+            candidates=[breakeven],
+            reason=f"trail.{self._name}",
+        )
+
+    def _observe_fill(self, context: Context) -> None:
+        """Notice the armed order becoming a trade, and spend this correction."""
+        armed = self._armed
+        if armed is None:
+            return
+        filled = any(fill.order.client_id == armed.client_id for fill in context.fills)
+        if filled or context.position is not None:
+            self._spent = True
             self._armed = None
 
     def _withdraw(self, armed: _Armed, candle: Candle) -> Signal:

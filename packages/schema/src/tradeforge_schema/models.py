@@ -574,6 +574,43 @@ class Mme9TurnSetup(_Node):
     params: Mme9TurnParams
 
 
+class Mme9PullbackParams(_Node):
+    """The published 9.2 and 9.3: buy the break of the bar that corrected against the leg's anchor.
+
+    **`corrections` is the only thing that separates the two.** One corrective close is 9.2, two
+    consecutive ones are 9.3, and every other rule is identical — so they are one type with a
+    count rather than two, which also makes *"is the stricter one worth it"* a single study axis.
+    Nothing above 2 is offered: the literature names these two and a third would be a setup nobody
+    published.
+
+    The rule, for a buy:
+
+    * The MME9 is **rising**, and it bending down undoes everything.
+    * The **anchor** is the highest *close* of the leg, and it moves up with every better close.
+      ⚠️ The highest close, not the highest high.
+    * A **corrective** close is one strictly below the anchor's close. `corrections` in a row arm.
+    * The order rests at the **high of the last corrective bar** and follows the bars after it,
+      which is the opposite of `mme9_turn`, where the reference is frozen.
+    * The stop goes under the **low of the whole correction**, not under the trigger bar.
+    * A close back **above** the anchor is the leg resuming: new anchor, count to zero, order
+      withdrawn.
+
+    `breakeven_at_r` defaults to `null` — off — for the same reason as the other published setups:
+    the source names an entry and a protective stop and nothing about moving one.
+    """
+
+    side: SetupSide
+    corrections: Annotated[int, Field(ge=1, le=2)] = 1
+    period: Annotated[int, Field(ge=1, le=1000)] = 9
+    stop_buffer_ticks: Annotated[int, Field(ge=0, le=10_000)] = 0
+    breakeven_at_r: Annotated[float | None, Field(gt=0, le=100)] = None
+
+
+class Mme9PullbackSetup(_Node):
+    type: Literal["mme9_pullback"]
+    params: Mme9PullbackParams
+
+
 class PontoContinuoParams(_Node):
     """Two corrections back to the average, then the bar that touches it and closes back.
 
@@ -798,6 +835,7 @@ class StructureContinuationSetup(_Node):
 
 type Setup = Annotated[
     Mme9BreakoutSetup
+    | Mme9PullbackSetup
     | Mme9TurnSetup
     | PontoContinuoSetup
     | StructureChochSetup

@@ -791,6 +791,8 @@ export const SETUP_LABELS: Record<SetupType, string> = {
   // Two setups are called 9.1. This one is the published Larry Williams reading — the average's
   // own slope bends — and `mme9_breakout` is the author's, where a bar closes across the line.
   mme9_turn: 'MME9 turn (9.1 original)',
+  // One type and a count: `corrections` 1 is the 9.2, 2 is the 9.3.
+  mme9_pullback: 'MME9 pullback (9.2 / 9.3)',
   ponto_continuo: 'Ponto Contínuo',
   structure_choch: 'Structure — CHoCH',
   structure_continuation: 'Structure — Continuation',

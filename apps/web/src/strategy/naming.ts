@@ -21,6 +21,7 @@
 export const RUN_ABBREV: Record<string, string> = {
   mme9_breakout: 'MME9',
   mme9_turn: 'MME9T',
+  mme9_pullback: 'MME9P',
   ponto_continuo: 'PCONT',
   structure_choch: 'SCHOCH',
   structure_continuation: 'SCONT',

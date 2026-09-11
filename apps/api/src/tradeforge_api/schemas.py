@@ -1546,3 +1546,58 @@ def session_fields(row: LiveSession, symbol: str, *, now: dt.datetime) -> dict[s
             ).total_seconds()
         ),
     }
+
+
+class CreateCatalogEntry(BaseModel):
+    """Put a strategy on the shelf, with the sweep it is meant to be asked."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: StorableText = Field(min_length=1, max_length=120)
+    """The label a person writes, and the one the shelf is read by.
+
+    ⚠️ Deliberately **not** the strategy's name. `strategies.name` is a generated column
+    projected out of the document, so it is whatever the builder stamped — this database is full
+    of `MME9-20260910-172055`. Unique in the table, because two entries called `9.1 com filtro`
+    is a catalogue nobody can speak about."""
+
+    description: StorableText | None = Field(default=None, max_length=2000)
+    """Optional. `None` means nobody wrote one, which is not the same as an empty one."""
+
+    strategy_id: uuid.UUID
+    """The exact version, never the lineage — a grid is only meaningful against the document it
+    expands, and every path in it has to exist there."""
+
+    grid: dict[str, list[Any]] = Field(default_factory=dict)
+    """Dotted paths and the values to try at each, in the shape a study takes.
+
+    Empty is the ordinary case and needs no special word for it: `9.1 sem filtro` is one
+    document with nothing to vary, and `{}` says so. What separates a simple entry from a swept
+    one is how many axes it has."""
+
+
+class CatalogEntryOut(BaseModel):
+    """One shelf entry, with enough of its strategy to be chosen without opening it."""
+
+    id: uuid.UUID
+    name: str
+    description: str | None
+    strategy_id: uuid.UUID
+    strategy_name: str
+    """The document's own name — carried beside the label rather than instead of it, because the
+    two are different facts and a reader comparing them is the reader who renamed something."""
+    strategy_version: int
+    setup: str | None
+    """The named setup the document runs, or `None` for one built from indicators. Read from the
+    document, never from either name: a name is typed by a person, a setup is executed."""
+    grid: dict[str, Any]
+    points: int
+    """How many backtests one sweep of this entry would be — the number that decides whether it
+    is a click or an afternoon. Computed from the grid rather than stored, so it cannot disagree
+    with it; `1` for an entry with no axes."""
+    created_at: dt.datetime
+
+
+class CatalogPage(BaseModel):
+    total: int
+    items: list[CatalogEntryOut]

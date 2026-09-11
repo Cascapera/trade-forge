@@ -258,7 +258,7 @@ def list_strategies(  # noqa: PLR0913 — one query parameter per question a pic
                 name=row.name,
                 version=row.version,
                 schema_version=row.schema_version,
-                setup=_setup_of(row.definition),
+                setup=setup_of(row.definition),
                 runs=row.runs,
                 created_at=row.created_at,
             )
@@ -267,7 +267,7 @@ def list_strategies(  # noqa: PLR0913 — one query parameter per question a pic
     )
 
 
-def _setup_of(definition: dict[str, Any]) -> str | None:
+def setup_of(definition: dict[str, Any]) -> str | None:
     """The named setup a document runs, or `None` for one built from indicators and conditions.
 
     Read from the document rather than stored beside it: `setup.type` is the DSL's own field,

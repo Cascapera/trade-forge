@@ -1504,3 +1504,75 @@ class OrderAudit(Base):
         ),
         Index("ix_order_audit_requested_at", "requested_at"),
     )
+
+
+class CatalogEntry(Base):
+    """A shelf label: a strategy, a grid to sweep it over, and a name a person wrote.
+
+    **Why this is not a column on `strategies`.** A strategy document is immutable per version
+    and it is the DSL — the engine reads every field of it. A grid is neither: it is a question
+    *about* a document, the engine never sees it, and putting it inside would mean a
+    `schema_version` bump plus a field nulled on every strategy that is not a catalogue entry.
+    The two also disagree about cardinality: one document can be swept by several grids, and
+    `9.1 across every average` and `9.1 across every stop` are two entries over one strategy.
+
+    ⚠️ **The name here is the person's, and the strategy's is not.** `strategies.name` is a
+    generated column projected out of the document (`definition ->> 'name'`), so it is whatever
+    the builder wrote — this project's own database is full of `MME9-20260910-172055`. A
+    catalogue whose labels were those names would be a catalogue nobody can read, which is the
+    observation that produced this table.
+
+    ⚠️ **It pins a version, never a lineage.** A grid is only meaningful against the document it
+    expands: every path in it has to exist there, which `expand` checks. Following the lineage
+    would let an edit to the strategy leave the entry pointing at a document whose paths have
+    moved — and nothing would say so until a launch refused, long after the edit. Pinning costs
+    a deliberate act to move an entry forward, which is the right cost for the thing the whole
+    shelf is addressed by.
+
+    **An empty grid is a valid entry, and it is the common one.** `9.1 sem filtro` is a single
+    document with nothing to vary; `{}` says exactly that, and it needs no second table and no
+    nullable column to say it. What separates a simple entry from a swept one is how many keys
+    the grid has, which is the same fact a launch reads.
+    """
+
+    __tablename__ = "catalog_entries"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+
+    name: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    """What the shelf calls it. Unique, because two entries with one name is a catalogue that
+    cannot be spoken about — and the failure that produces is a person running the wrong one."""
+
+    description: Mapped[str | None] = mapped_column(Text)
+    """Optional, and it is the one field here a person may reasonably leave empty. NULL means
+    nobody wrote one, which is different from `''` — see the spread column's argument."""
+
+    strategy_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("strategies.id", ondelete="RESTRICT"), nullable=False
+    )
+    """RESTRICT, like every other reference to a strategy here. A catalogue entry is a reason a
+    document must go on existing; deleting it out from under the shelf would leave a label
+    pointing at nothing."""
+
+    grid: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, server_default="{}")
+    """Dotted paths into the document, and the values to try at each — the same shape
+    `studies.grid` holds, because it is the same question asked before it is launched rather
+    than after.
+
+    ⚠️ **Validated against this entry's strategy when it is written**, not when it is run. A grid
+    naming a path the document does not have is not a launch that fails later; it is an entry
+    that was never a coherent thing to save."""
+
+    created_at: Mapped[dt.datetime] = _created_at()
+
+    __table_args__ = (
+        # A grid is an object of axes, never a list or a bare value. Written down here because
+        # JSONB will happily store any of those, and the code that expands one would then meet
+        # its first surprise at launch — in a transaction that is already writing runs.
+        CheckConstraint("jsonb_typeof(grid) = 'object'", name="a_grid_is_an_object_of_axes"),
+        # Newest first is how a shelf is read, and it is the only ordering any caller asks for.
+        # Declared here as well as in the migration because the drift test compares the two and
+        # is right to: an index that exists in one and not the other is a plan that changes
+        # depending on how the database was built.
+        Index("ix_catalog_entries_created_at", "created_at"),
+    )

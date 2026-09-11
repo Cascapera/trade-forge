@@ -35,6 +35,11 @@ TABLES_CHILD_FIRST = (
     # breaks the day the cascade changes — and it breaks as a test leaving rows behind for the
     # next one, which is the hardest kind of failure to attribute.
     "studies",
+    # ⚠️ Before `strategies`, which it points at with a RESTRICT foreign key — so a row
+    # left behind does not merely linger, it makes the next test unable to empty
+    # `strategies` at all. Added with the table; the two lists above it drifted once
+    # before for exactly this reason (`live_sessions`).
+    "catalog_entries",
     "strategies",
     "datasets",
     "instruments",

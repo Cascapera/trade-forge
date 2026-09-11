@@ -9,6 +9,9 @@ import { useEffect, useRef } from 'react'
 
 import { api } from './client'
 import type {
+  CatalogEntry,
+  CatalogPage,
+  CreateCatalogEntry,
   Backtest,
   BacktestFilters,
   BacktestStatus,
@@ -232,6 +235,42 @@ export function useSaveStrategy() {
       return existing === undefined
         ? api.createStrategy(definition)
         : api.updateStrategy(existing.id, definition)
+    },
+  })
+}
+
+/**
+ * The shelf, whole. Not paged: a catalogue is read all at once and a hundred rows is not a
+ * paging problem — one a person has to hunt through page by page is a catalogue that has
+ * stopped being one.
+ */
+export function useCatalog() {
+  return useQuery<CatalogPage>({ queryKey: ['catalog'], queryFn: () => api.listCatalog() })
+}
+
+/**
+ * Put a strategy on the shelf.
+ *
+ * ⚠️ The list is invalidated rather than patched. A catalogue is exactly the kind of thing two
+ * tabs write to, and a locally spliced row is a guess about what the server accepted — which is
+ * wrong the moment the unique name lost a race.
+ */
+export function useCreateCatalogEntry() {
+  const client = useQueryClient()
+  return useMutation<CatalogEntry, Error, CreateCatalogEntry>({
+    mutationFn: (body) => api.createCatalogEntry(body),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: ['catalog'] })
+    },
+  })
+}
+
+export function useDeleteCatalogEntry() {
+  const client = useQueryClient()
+  return useMutation<null, Error, string>({
+    mutationFn: (id) => api.deleteCatalogEntry(id),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: ['catalog'] })
     },
   })
 }

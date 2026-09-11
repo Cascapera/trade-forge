@@ -94,8 +94,23 @@ export function parseValues(raw: string): AxisValue[] {
 
 /** The axes that are complete enough to mean something, keyed by path. */
 export function axesOf(form: StudyForm): Record<string, AxisValue[]> {
+  return gridOf(form.axes)
+}
+
+/**
+ * The same grid, built from the axes alone.
+ *
+ * Separate from `axesOf` because the catalogue saves a sweep without a study around it: there
+ * is no market, no window and no capital to carry, only the axes. `axesOf` delegates rather
+ * than repeating the loop — a second copy would be a second answer to "does a blank line count
+ * as an axis", and the two would disagree on the day one of them was fixed.
+ *
+ * ⚠️ A row with no path, or none with values, is **left out** rather than sent empty. Both are
+ * what a half-typed form looks like, and an empty axis is a grid the server refuses whole.
+ */
+export function gridOf(axes: Axis[]): Record<string, AxisValue[]> {
   const grid: Record<string, AxisValue[]> = {}
-  for (const axis of form.axes) {
+  for (const axis of axes) {
     const path = axis.path.trim()
     const values = parseValues(axis.raw)
     if (path.length > 0 && values.length > 0) grid[path] = values

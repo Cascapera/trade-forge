@@ -693,6 +693,67 @@
       "title": "Mme9BreakoutSetup",
       "type": "object"
     },
+    "Mme9FailedTurnParams": {
+      "additionalProperties": false,
+      "description": "The published 9.4: the average dips for one bar, comes straight back, and that is the trade.\n\nA 9.1 that failed and recovered. For a buy: the MME9 is rising, **one** bar turns it down, and\nthe **very next** bar turns it back up without taking that bar's low. The order rests at the\nhigh of the recovery bar and does **not** chase; the stop clears the failure bar's low, which\nis the deeper of the two because a recovery bar that went under it is refused outright.\n\n⚠️ That refusal is part of the arming, not a later cancellation: the literature says a recovery\nbar breaking the failure bar's low is *\"um Setup 9.1 de VENDA\"*, so arming there would be\ntrading a reversal as a continuation.\n\nTwo bars down and it is not this setup: whatever turns the line back up later is a 9.1.\n\n`breakeven_at_r` defaults to `null` — off — like the rest of the published family.",
+      "properties": {
+        "breakeven_at_r": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "maximum": 100,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Breakeven At R"
+        },
+        "period": {
+          "default": 9,
+          "maximum": 1000,
+          "minimum": 1,
+          "title": "Period",
+          "type": "integer"
+        },
+        "side": {
+          "$ref": "#/$defs/SetupSide"
+        },
+        "stop_buffer_ticks": {
+          "default": 0,
+          "maximum": 10000,
+          "minimum": 0,
+          "title": "Stop Buffer Ticks",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "side"
+      ],
+      "title": "Mme9FailedTurnParams",
+      "type": "object"
+    },
+    "Mme9FailedTurnSetup": {
+      "additionalProperties": false,
+      "properties": {
+        "params": {
+          "$ref": "#/$defs/Mme9FailedTurnParams"
+        },
+        "type": {
+          "const": "mme9_failed_turn",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "params"
+      ],
+      "title": "Mme9FailedTurnSetup",
+      "type": "object"
+    },
     "Mme9PullbackParams": {
       "additionalProperties": false,
       "description": "The published 9.2 and 9.3: buy the break of the bar that corrected against the leg's anchor.\n\n**`corrections` is the only thing that separates the two.** One corrective close is 9.2, two\nconsecutive ones are 9.3, and every other rule is identical — so they are one type with a\ncount rather than two, which also makes *\"is the stricter one worth it\"* a single study axis.\nNothing above 2 is offered: the literature names these two and a third would be a setup nobody\npublished.\n\nThe rule, for a buy:\n\n* The MME9 is **rising**, and it bending down undoes everything.\n* The **anchor** is the highest *close* of the leg, and it moves up with every better close.\n  ⚠️ The highest close, not the highest high.\n* A **corrective** close is one strictly below the anchor's close. `corrections` in a row arm.\n* The order rests at the **high of the last corrective bar** and follows the bars after it,\n  which is the opposite of `mme9_turn`, where the reference is frozen.\n* The stop goes under the **low of the whole correction**, not under the trigger bar.\n* A close back **above** the anchor is the leg resuming: new anchor, count to zero, order\n  withdrawn.\n\n`breakeven_at_r` defaults to `null` — off — for the same reason as the other published setups:\nthe source names an entry and a protective stop and nothing about moving one.",
@@ -1162,6 +1223,7 @@
       "discriminator": {
         "mapping": {
           "mme9_breakout": "#/$defs/Mme9BreakoutSetup",
+          "mme9_failed_turn": "#/$defs/Mme9FailedTurnSetup",
           "mme9_pullback": "#/$defs/Mme9PullbackSetup",
           "mme9_turn": "#/$defs/Mme9TurnSetup",
           "ponto_continuo": "#/$defs/PontoContinuoSetup",
@@ -1173,6 +1235,9 @@
       "oneOf": [
         {
           "$ref": "#/$defs/Mme9BreakoutSetup"
+        },
+        {
+          "$ref": "#/$defs/Mme9FailedTurnSetup"
         },
         {
           "$ref": "#/$defs/Mme9PullbackSetup"

@@ -793,6 +793,7 @@ export const SETUP_LABELS: Record<SetupType, string> = {
   mme9_turn: 'MME9 turn (9.1 original)',
   // One type and a count: `corrections` 1 is the 9.2, 2 is the 9.3.
   mme9_pullback: 'MME9 pullback (9.2 / 9.3)',
+  mme9_failed_turn: 'MME9 failed turn (9.4)',
   ponto_continuo: 'Ponto Contínuo',
   structure_choch: 'Structure — CHoCH',
   structure_continuation: 'Structure — Continuation',

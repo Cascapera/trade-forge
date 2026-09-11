@@ -574,6 +574,34 @@ class Mme9TurnSetup(_Node):
     params: Mme9TurnParams
 
 
+class Mme9FailedTurnParams(_Node):
+    """The published 9.4: the average dips for one bar, comes straight back, and that is the trade.
+
+    A 9.1 that failed and recovered. For a buy: the MME9 is rising, **one** bar turns it down, and
+    the **very next** bar turns it back up without taking that bar's low. The order rests at the
+    high of the recovery bar and does **not** chase; the stop clears the failure bar's low, which
+    is the deeper of the two because a recovery bar that went under it is refused outright.
+
+    ⚠️ That refusal is part of the arming, not a later cancellation: the literature says a recovery
+    bar breaking the failure bar's low is *"um Setup 9.1 de VENDA"*, so arming there would be
+    trading a reversal as a continuation.
+
+    Two bars down and it is not this setup: whatever turns the line back up later is a 9.1.
+
+    `breakeven_at_r` defaults to `null` — off — like the rest of the published family.
+    """
+
+    side: SetupSide
+    period: Annotated[int, Field(ge=1, le=1000)] = 9
+    stop_buffer_ticks: Annotated[int, Field(ge=0, le=10_000)] = 0
+    breakeven_at_r: Annotated[float | None, Field(gt=0, le=100)] = None
+
+
+class Mme9FailedTurnSetup(_Node):
+    type: Literal["mme9_failed_turn"]
+    params: Mme9FailedTurnParams
+
+
 class Mme9PullbackParams(_Node):
     """The published 9.2 and 9.3: buy the break of the bar that corrected against the leg's anchor.
 
@@ -835,6 +863,7 @@ class StructureContinuationSetup(_Node):
 
 type Setup = Annotated[
     Mme9BreakoutSetup
+    | Mme9FailedTurnSetup
     | Mme9PullbackSetup
     | Mme9TurnSetup
     | PontoContinuoSetup

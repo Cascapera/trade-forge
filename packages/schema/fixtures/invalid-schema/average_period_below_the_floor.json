@@ -1,0 +1,21 @@
+{
+  "schema_version": "1.0",
+  "name": "MME de 2 periodos",
+  "description": "Piso de 3 nas medias dos setups, decisao dele em 10/09/2026. Em period=1 a media exponencial E o proprio fechamento e o mme9_breakout nunca arma; em 2 ela ainda e uma media e o setup arma igual ao de 3 (medido). O piso e a regra dele, nao uma consequencia aritmetica de 2.",
+  "timeframe": "H1",
+  "setup": {
+    "type": "mme9_breakout",
+    "params": {
+      "side": "long",
+      "period": 2
+    }
+  },
+  "risk": {
+    "sizing": {
+      "type": "percent_risk",
+      "params": {
+        "percent": 1
+      }
+    }
+  }
+}

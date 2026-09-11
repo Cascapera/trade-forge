@@ -496,6 +496,30 @@ class Exit(_Node):
 # engine class and compares.
 
 
+AVERAGE_FLOOR = 3
+"""The shortest average a setup in this DSL may be built on. His call, 2026-09-10.
+
+⚠️ **A narrowing, and a deliberate one.** The engine classes still accept any period from 1 — the
+mechanism is sound there — so this is the published grammar refusing what the mechanism would
+happily run.
+
+⚠️ **Only `period = 1` is broken by arithmetic**, and the floor is deliberately one above what that
+alone would justify. At 1 the exponential average *is* the close (`alpha = 2/(period+1) = 1`), so
+`mme9_breakout` — whose rule is a bar closing across the average — can never arm, and answers a
+valid document with zero trades and no complaint. **At 2 it arms identically to 3** (measured). So
+3 is his judgement about the shortest average worth trading, not a consequence of the formula, and
+writing it down that way is what stops the next reader from "fixing" it to 1.
+
+The floor does **not** reach the indicator nodes (`PeriodSource`, `PeriodParams`), where an EMA of 1
+is a price series rather than a broken setup. Whether the same argument should apply there is a
+question in `specs/backlog.md`; it is a different surface and it is his to answer.
+
+Nothing saved is invalidated: all 267 strategies in the database use 9, 20 or 200 — and that
+measurement is what lets the narrowing keep `schema_version` at `"1.0"` instead of orphaning every
+one of them. ADR-0028, revisiting ADR-0013.
+"""
+
+
 class Mme9BreakoutParams(_Node):
     """The break of the candle that closed across the MME9 (ADR-0016).
 
@@ -526,13 +550,13 @@ class Mme9BreakoutParams(_Node):
     """
 
     side: SetupSide
-    period: Annotated[int, Field(ge=1, le=1000)] = 9
+    period: Annotated[int, Field(ge=AVERAGE_FLOOR, le=1000)] = 9
     stop_buffer_ticks: Annotated[int, Field(ge=0, le=10_000)] = 0
     breakeven_at_r: Annotated[float | None, Field(gt=0, le=100)] = 2.0
     entry_point: AverageEntryPoint = "classic"
     gift_stop: GiftStop = "gift"
     volume_filter: bool = False
-    long_average_period: Annotated[int | None, Field(ge=1, le=1000)] = None
+    long_average_period: Annotated[int | None, Field(ge=AVERAGE_FLOOR, le=1000)] = None
 
 
 class Mme9BreakoutSetup(_Node):
@@ -564,7 +588,7 @@ class Mme9TurnParams(_Node):
     """
 
     side: SetupSide
-    period: Annotated[int, Field(ge=1, le=1000)] = 9
+    period: Annotated[int, Field(ge=AVERAGE_FLOOR, le=1000)] = 9
     stop_buffer_ticks: Annotated[int, Field(ge=0, le=10_000)] = 0
     breakeven_at_r: Annotated[float | None, Field(gt=0, le=100)] = None
 
@@ -592,7 +616,7 @@ class Mme9FailedTurnParams(_Node):
     """
 
     side: SetupSide
-    period: Annotated[int, Field(ge=1, le=1000)] = 9
+    period: Annotated[int, Field(ge=AVERAGE_FLOOR, le=1000)] = 9
     stop_buffer_ticks: Annotated[int, Field(ge=0, le=10_000)] = 0
     breakeven_at_r: Annotated[float | None, Field(gt=0, le=100)] = None
 
@@ -629,7 +653,7 @@ class Mme9PullbackParams(_Node):
 
     side: SetupSide
     corrections: Annotated[int, Field(ge=1, le=2)] = 1
-    period: Annotated[int, Field(ge=1, le=1000)] = 9
+    period: Annotated[int, Field(ge=AVERAGE_FLOOR, le=1000)] = 9
     stop_buffer_ticks: Annotated[int, Field(ge=0, le=10_000)] = 0
     breakeven_at_r: Annotated[float | None, Field(gt=0, le=100)] = None
 
@@ -671,14 +695,14 @@ class PontoContinuoParams(_Node):
     """
 
     side: SetupSide
-    period: Annotated[int, Field(ge=1, le=1000)] = 20
+    period: Annotated[int, Field(ge=AVERAGE_FLOOR, le=1000)] = 20
     average: AverageKind = "EMA"
     stop_buffer_ticks: Annotated[int, Field(ge=0, le=10_000)] = 0
     breakeven_at_r: Annotated[float | None, Field(gt=0, le=100)] = 2.0
     entry_point: AverageEntryPoint = "classic"
     gift_stop: GiftStop = "gift"
     volume_filter: bool = False
-    long_average_period: Annotated[int | None, Field(ge=1, le=1000)] = None
+    long_average_period: Annotated[int | None, Field(ge=AVERAGE_FLOOR, le=1000)] = None
 
 
 class PontoContinuoSetup(_Node):

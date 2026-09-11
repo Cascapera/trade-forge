@@ -386,9 +386,12 @@ def test_the_two_readings_come_apart_at_a_period_of_one() -> None:
 
     `alpha = 2 / (period + 1)`, so at `period = 1` the alpha is 1 and the average is the close
     itself. `close > ema` is then never true, which leaves the author's setup unable to arm at
-    all, while this one — reading the slope — arms on the close that rises after a fall. Pinned
-    rather than forbidden: the schema allows `period >= 1`, and a corner that silently means
-    something different is worth an address.
+    all, while this one — reading the slope — arms on the close that rises after a fall.
+
+    ⚠️ **The DSL no longer allows it.** His answer to this finding was a floor of **3** on every
+    setup average (`AVERAGE_FLOOR`), so no document can ask for it. The class still can, because
+    the engine is the mechanism and the schema is the grammar — and this test is what keeps the
+    mechanism's behaviour at the degenerate end a known quantity rather than a surprise.
     """
     candles = _candles(["100", "99", "98", "105", "106"])
 

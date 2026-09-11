@@ -365,7 +365,7 @@ describe('LaunchStudy', () => {
     // The sentence comes from the schema's own minimum and maximum, so it tightens on its own
     // the day a bound does.
     expect(
-      screen.getByText('whole numbers at least 1 and at most 1000, separated by commas'),
+      screen.getByText('whole numbers at least 3 and at most 1000, separated by commas'),
     ).toBeInTheDocument()
   })
 

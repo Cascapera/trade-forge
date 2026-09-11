@@ -60,8 +60,8 @@ describe('stepped', () => {
   it('stops at an inclusive bound instead of one step past it', () => {
     const period = param('mme9_breakout', 'period')
 
-    expect(stepped(period, 1, -1)).toBe(null)
-    expect(stepped(period, 2, -1)).toBe(1)
+    expect(stepped(period, 3, -1)).toBe(null)
+    expect(stepped(period, 4, -1)).toBe(3)
     expect(stepped(period, 1000, 1)).toBe(null)
     expect(stepped(period, 999, 1)).toBe(1000)
   })
@@ -69,7 +69,7 @@ describe('stepped', () => {
 
 describe('startingPoint', () => {
   it('opens on the value the parameter author chose, not on the floor of its range', () => {
-    // `period` runs from 1 to 1000. Starting an empty field at 1 opens every search at the least
+    // `period` runs from 3 to 1000. Starting an empty field at 3 opens every search at the least
     // interesting end of the range; the default is the value somebody decided was right.
     expect(startingPoint(param('mme9_breakout', 'period'))).toBe(9)
     expect(startingPoint(param('ponto_continuo', 'period'))).toBe(20)

@@ -33,6 +33,10 @@ SCHEMA_ERRORS = {
     # the same `extra="forbid"` that catches a typo, doing the other half of its job: a field
     # the engine could not honour is a request the document believes was granted.
     "atr_with_a_price_source.json": "source",
+    # The floor on a setup's average (his call, 2026-09-10). A narrowing, and worth a fixture of
+    # its own because the engine would run a period of 2 quite happily — measured: it arms
+    # identically to 3. What refuses it is the published grammar, not arithmetic.
+    "average_period_below_the_floor.json": "greater than or equal to 3",
 }
 
 SEMANTIC_ERRORS = {

@@ -1,79 +1,75 @@
-import type { StrategyListItem } from '../api/types'
-import { filterCatalogue, setupsIn } from './catalogue'
+import { filterCatalogue, gridSummary, type Searchable } from './catalogue'
 
-function row(partial: Partial<StrategyListItem> & { name: string }): StrategyListItem {
-  return {
-    id: partial.name,
-    version: 1,
-    schema_version: '1.0.0',
-    setup: null,
-    runs: 0,
-    created_at: '2026-09-01T00:00:00Z',
-    ...partial,
-  }
+function row(name: string, setup: string | null = null): Searchable {
+  return { id: name, name, setup }
 }
 
-// ⚠️ The names here deliberately do **not** contain their own setup. A fixture called
-// `MME9 turn` running `mme9_turn` agrees with every wrong implementation in this file: matching
-// the name only, matching the setup only, and matching either would all pass it.
-const SHELF: StrategyListItem[] = [
-  row({ name: 'Structure — CHoCH 56454', setup: 'mme9_breakout' }),
-  row({ name: '9.1 sem filtro', setup: 'mme9_turn' }),
-  row({ name: '9.1 com filtro', setup: 'mme9_turn' }),
-  row({ name: 'Ponto Contínuo', setup: 'continuous_point' }),
-  row({ name: 'Hand-built document', setup: null }),
+// ⚠️ The names here deliberately do **not** contain their own setup. A fixture called `MME9 turn`
+// running `mme9_turn` agrees with every wrong implementation: matching the name only, matching
+// the setup only, and matching either would all pass it.
+const SHELF: Searchable[] = [
+  row('Structure — CHoCH 56454', 'mme9_breakout'),
+  row('9.1 sem filtro', 'mme9_turn'),
+  row('9.1 com filtro', 'mme9_turn'),
+  row('Ponto Contínuo', 'continuous_point'),
+  row('Hand-built document'),
 ]
-
-describe('setupsIn', () => {
-  it('lists each setup once, sorted', () => {
-    expect(setupsIn(SHELF)).toEqual(['continuous_point', 'mme9_breakout', 'mme9_turn'])
-  })
-
-  it('leaves out the document with no named setup', () => {
-    // Not the same assertion as the one above dressed differently: an implementation that
-    // pushed `null` through would produce a list with a hole in it, and the length is what
-    // catches that regardless of where sorting puts it.
-    expect(setupsIn(SHELF)).toHaveLength(3)
-    expect(setupsIn([row({ name: 'only a DSL doc' })])).toEqual([])
-  })
-})
 
 describe('filterCatalogue', () => {
   it('returns everything when nothing is asked', () => {
-    expect(filterCatalogue(SHELF, '', '')).toHaveLength(5)
+    expect(filterCatalogue(SHELF, '')).toHaveLength(5)
+    expect(filterCatalogue(SHELF, '   ')).toHaveLength(5)
   })
 
   it('matches a name no setup contains', () => {
-    const found = filterCatalogue(SHELF, 'sem filtro', '')
-    expect(found.map((item) => item.name)).toEqual(['9.1 sem filtro'])
+    expect(filterCatalogue(SHELF, 'sem filtro').map((item) => item.name)).toEqual([
+      '9.1 sem filtro',
+    ])
   })
 
   it('matches a setup no name contains', () => {
-    // `mme9_breakout` appears in no name on this shelf, so a filter that only ever read the name
-    // returns nothing here. That is the mutant this case exists to kill.
-    const found = filterCatalogue(SHELF, 'mme9_breakout', '')
-    expect(found.map((item) => item.name)).toEqual(['Structure — CHoCH 56454'])
+    // `mme9_breakout` appears in no name on this shelf, so an implementation that only ever
+    // read the name returns nothing here. That is the mutant this case exists to kill.
+    expect(filterCatalogue(SHELF, 'mme9_breakout').map((item) => item.name)).toEqual([
+      'Structure — CHoCH 56454',
+    ])
   })
 
   it('ignores case and surrounding space', () => {
-    expect(filterCatalogue(SHELF, '  MME9_TURN ', '')).toHaveLength(2)
+    expect(filterCatalogue(SHELF, '  MME9_TURN ')).toHaveLength(2)
   })
 
-  it('narrows by setup alone', () => {
-    const found = filterCatalogue(SHELF, '', 'mme9_turn')
-    expect(found.map((item) => item.name)).toEqual(['9.1 sem filtro', '9.1 com filtro'])
+  it('leaves out a row with no setup without throwing on it', () => {
+    // The row whose setup is `null` has to survive being *asked about* — an optional chain that
+    // was a bare property read would throw here rather than simply not matching.
+    expect(filterCatalogue(SHELF, 'mme9')).toHaveLength(3)
+    expect(filterCatalogue(SHELF, 'Hand-built').map((item) => item.name)).toEqual([
+      'Hand-built document',
+    ])
+  })
+})
+
+describe('gridSummary', () => {
+  it('says a sweep in one line, by the last segment of each path', () => {
+    // ⚠️ `setup.params.` is on every path, so a caption repeating it is a column of identical
+    // prefixes. The full path is still what travels to the server.
+    const summary = gridSummary({
+      'setup.params.period': [5, 9, 21],
+      'setup.params.stop_buffer': [0.1, 0.2],
+    })
+
+    expect(summary).toBe('period=5, 9, 21 · stop_buffer=0.1, 0.2')
   })
 
-  it('requires both when both are given', () => {
-    // `9.1` matches two rows and `continuous_point` matches a third, and none of them is the
-    // same row — so an implementation that ORed the two filters returns three here instead of
-    // none. An AND that happened to be an OR is invisible on any fixture where the two agree.
-    expect(filterCatalogue(SHELF, '9.1', 'continuous_point')).toEqual([])
-    expect(filterCatalogue(SHELF, 'com filtro', 'mme9_turn')).toHaveLength(1)
+  it('keeps a path that has no dot in it', () => {
+    // `timeframe` is a top-level field of the document, and it is the axis a sweep across
+    // several charts will need. Dropping the segment logic on it must not produce an empty name.
+    expect(gridSummary({ timeframe: ['M15', 'H1'] })).toBe('timeframe=M15, H1')
   })
 
-  it('leaves the document with no setup out of a setup filter without throwing', () => {
-    const found = filterCatalogue(SHELF, 'document', 'mme9_turn')
-    expect(found).toEqual([])
+  it('is empty for a grid with no axes', () => {
+    // The screen reads this as "there is nothing to say here" rather than printing a bare
+    // separator, so an entry with no sweep shows no caption at all.
+    expect(gridSummary({})).toBe('')
   })
 })

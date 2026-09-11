@@ -7,10 +7,13 @@ import type {
   BacktestFilters,
   BacktestsPage,
   BasketOut,
+  CatalogEntry,
+  CatalogPage,
   CandlesResponse,
   Collection,
   CreateBacktestRequest,
   CreateBasketRequest,
+  CreateCatalogEntry,
   CreateCollection,
   CreateStudyRequest,
   CreateWalkForwardRequest,
@@ -110,6 +113,15 @@ export const api = {
   listCollections: (): Promise<Collection[]> => request('GET', '/collections'),
   listBacktests: (filters: BacktestFilters = {}): Promise<BacktestsPage> =>
     request('GET', `/backtests${query({ ...filters })}`),
+  // The shelf. Separate from `/strategies` because that endpoint answers "what documents exist",
+  // which is a different question from "what is worth running" — and its names are generated
+  // from the documents, so they are not labels anybody chose.
+  listCatalog: (): Promise<CatalogPage> => request('GET', '/catalog'),
+  createCatalogEntry: (body: CreateCatalogEntry): Promise<CatalogEntry> =>
+    request('POST', '/catalog', body),
+  // 204, so nothing comes back. The caller refetches the list rather than patching it in place:
+  // a shelf two tabs can write to is a shelf whose local copy is a guess.
+  deleteCatalogEntry: (id: string): Promise<null> => request('DELETE', `/catalog/${id}`),
   createStrategy: (definition: unknown): Promise<StrategyOut> =>
     request('POST', '/strategies', definition),
   getStrategy: (id: string): Promise<StrategyOut> => request('GET', `/strategies/${id}`),

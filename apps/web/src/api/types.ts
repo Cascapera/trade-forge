@@ -909,3 +909,43 @@ export type SessionFrame =
   | { type: 'fill'; client_id: string; at: string; symbol: string; price: string; volume: string; spread: string }
   | { type: 'refusal'; client_id: string; at: string; reason: string; by_venue: boolean; retcode: number | null }
   | { type: 'error'; detail: string }
+
+/**
+ * One shelf entry: a strategy, a label a person wrote, and the sweep it is meant to be asked.
+ *
+ * ⚠️ `name` and `strategy_name` are different facts and both are carried. The strategy's is a
+ * generated column projected out of its document, so it is whatever the builder stamped — this
+ * database is full of `MME9-20260910-172055`. A screen showing only one of them is showing
+ * either a label nobody can trace or an identifier nobody can read.
+ */
+export interface CatalogEntry {
+  id: string
+  name: string
+  description: string | null
+  strategy_id: string
+  strategy_name: string
+  strategy_version: number
+  /** The named setup the document runs, or `null` for one built from indicators. Read from the
+   *  document, never from either name. */
+  setup: string | null
+  /** Dotted paths and the values to try at each — the shape a study's grid takes. */
+  grid: Record<string, unknown[]>
+  /** How many backtests one sweep would be. `1` for an entry with no axes: the empty product,
+   *  not zero, because an entry with nothing to vary is still one run. */
+  points: number
+  created_at: string
+}
+
+export interface CatalogPage {
+  total: number
+  items: CatalogEntry[]
+}
+
+export interface CreateCatalogEntry {
+  name: string
+  /** Omitted rather than sent empty when nobody wrote one: `null` and `''` are different facts
+   *  and the column keeps them apart. */
+  description?: string
+  strategy_id: string
+  grid: Record<string, unknown[]>
+}

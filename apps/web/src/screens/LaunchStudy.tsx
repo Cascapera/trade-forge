@@ -2,11 +2,10 @@ import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 
 import { useCreateStudy, useInstruments, useStrategies } from '../api/hooks'
-import { AxisValues } from '../components/AxisValues'
+import { GridEditor } from '../components/GridEditor'
 import { StrategyPicker } from '../components/StrategyPicker'
 import { useSession } from '../store'
 import { TIMEFRAMES } from '../strategy/builder'
-import { axesFor } from '../study/axes'
 import { useGridPreview } from '../study/preview'
 import {
   MAX_POINTS,
@@ -51,8 +50,6 @@ export function LaunchStudy(): React.JSX.Element {
   // this shares the picker's single request rather than making a second one.
   const strategies = useStrategies({ limit: 200 })
   const chosen = strategies.data?.items.find((item) => item.id === strategyId)
-  const options = axesFor(chosen?.setup ?? null)
-
 
   // ⚠️ Two refusals, from two places, and they answer different questions. `whyNotLaunchable`
   // knows what this form can decide on its own — a missing market, a repeated value, a product
@@ -75,12 +72,6 @@ export function LaunchStudy(): React.JSX.Element {
 
   const set = (patch: Partial<StudyForm>) => {
     setForm((current) => ({ ...current, ...patch }))
-  }
-  const setAxis = (at: number, patch: Partial<StudyForm['axes'][number]>) => {
-    setForm((current) => ({
-      ...current,
-      axes: current.axes.map((axis, index) => (index === at ? { ...axis, ...patch } : axis)),
-    }))
   }
 
   return (
@@ -206,74 +197,16 @@ export function LaunchStudy(): React.JSX.Element {
           </label>
         </div>
 
-        <fieldset className="space-y-2 rounded border border-slate-800 p-4">
-          <legend className="px-1 text-sm text-slate-300">Parameters to vary</legend>
-          {form.axes.map((axis, at) => {
-            const chosen = options.find((option) => option.path === axis.path)
-            return (
-              <div key={at} className="space-y-1">
-                <div className="flex flex-wrap items-center gap-2">
-                  {/* A dropdown rather than a text field, and the options are **derived**: they
-                      come from the JSON Schema the DSL generates, so a parameter added in
-                      Python appears here with nothing changed. A typed path is still accepted
-                      for a DSL strategy, whose axes this list cannot describe. */}
-                  {options.length > 0 ? (
-                    <select
-                      className={`${inputClass} min-w-64 flex-1`}
-                      aria-label={`Parameter ${String(at + 1)}`}
-                      value={axis.path}
-                      onChange={(event) => {
-                        setAxis(at, { path: event.target.value, raw: '' })
-                      }}
-                    >
-                      <option value="">Choose a parameter…</option>
-                      {options.map((option) => (
-                        <option key={option.path} value={option.path}>
-                          {option.label}
-                        </option>
-                      ))}
-                    </select>
-                  ) : (
-                    <input
-                      className={`${inputClass} min-w-64 flex-1`}
-                      placeholder="setup.params.period"
-                      aria-label={`Parameter ${String(at + 1)} path`}
-                      value={axis.path}
-                      onChange={(event) => {
-                        setAxis(at, { path: event.target.value })
-                      }}
-                    />
-                  )}
-                  {/* The control the parameter deserves — checkboxes for a set of names, arrows
-                      for a number with bounds — chosen from what the JSON Schema says it is. The
-                      values still travel as the same comma-separated line underneath. */}
-                  <AxisValues
-                    option={chosen}
-                    raw={axis.raw}
-                    label={`Parameter ${String(at + 1)} values`}
-                    onChange={(raw) => {
-                      setAxis(at, { raw })
-                    }}
-                  />
-                </div>
-                {/* The format *and* what is legal, both read from the parameter's own schema —
-                    so the sentence tightens on its own the day a bound does. */}
-                {chosen !== undefined && (
-                  <p className="text-xs text-slate-500">{chosen.hint}</p>
-                )}
-              </div>
-            )
-          })}
-          <button
-            type="button"
-            className="text-xs text-sky-400 hover:text-sky-300"
-            onClick={() => {
-              set({ axes: [...form.axes, { path: '', raw: '' }] })
-            }}
-          >
-            Add a parameter
-          </button>
-        </fieldset>
+        {/* The same editor the catalogue uses. Extracted when the second caller appeared —
+            seventy lines of controls copied is a second place to decide what a parameter may
+            be, and the copy stops matching the day one of them learns a new control. */}
+        <GridEditor
+          setup={chosen?.setup ?? null}
+          axes={form.axes}
+          onChange={(axes) => {
+            set({ axes })
+          }}
+        />
 
         <div className="flex flex-wrap items-center gap-4">
           <button

@@ -94,7 +94,8 @@ class TestTheLabelIsTheEntrysOwn:
         first = a_strategy(client)
         second = a_strategy(client)
 
-        assert client.post("/catalog", json={"name": name, "strategy_id": first}).status_code == 201
+        first_entry = client.post("/catalog", json={"name": name, "strategy_id": first})
+        assert first_entry.status_code == 201
         clash = client.post("/catalog", json={"name": name, "strategy_id": second})
 
         # A catalogue with two entries of one name is a catalogue nobody can speak about, and
@@ -189,12 +190,10 @@ class TestReadingAndRemoving:
     def test_the_shelf_reads_newest_first(self, client: Any) -> None:
         names = [f"entry {i} {uuid.uuid4()}" for i in range(3)]
         for name in names:
-            assert (
-                client.post(
-                    "/catalog", json={"name": name, "strategy_id": a_strategy(client)}
-                ).status_code
-                == 201
+            created = client.post(
+                "/catalog", json={"name": name, "strategy_id": a_strategy(client)}
             )
+            assert created.status_code == 201
 
         listed = client.get("/catalog").json()
 
@@ -202,16 +201,26 @@ class TestReadingAndRemoving:
         assert [item["name"] for item in listed["items"]] == list(reversed(names))
 
     def test_an_unknown_entry_is_a_404_rather_than_an_empty_one(self, client: Any) -> None:
-        assert client.get(f"/catalog/{uuid.uuid4()}").status_code == 404
-        assert client.delete(f"/catalog/{uuid.uuid4()}").status_code == 404
+        # ⚠️ The requests are made *before* the asserts, never inside them. `python -O` strips
+        # an assert whole, so a request made in one is a request that does not happen — and a
+        # test whose only action lives in its assertion becomes a test that checks nothing
+        # while still passing. CodeQL names this `py/side-effect-in-assert`; it caught two of
+        # these here, and the rest of the file is written the same way for the same reason.
+        read = client.get(f"/catalog/{uuid.uuid4()}")
+        removed = client.delete(f"/catalog/{uuid.uuid4()}")
+
+        assert read.status_code == 404
+        assert removed.status_code == 404
 
     def test_an_unknown_strategy_is_a_404_and_writes_nothing(self, client: Any) -> None:
         refused = client.post(
             "/catalog", json={"name": f"orphan {uuid.uuid4()}", "strategy_id": str(uuid.uuid4())}
         )
 
+        listed = client.get("/catalog").json()
+
         assert refused.status_code == 404
-        assert client.get("/catalog").json()["total"] == 0
+        assert listed["total"] == 0
 
     def test_removing_an_entry_leaves_its_strategy_alone(self, client: Any) -> None:
         strategy = a_strategy(client)
@@ -219,13 +228,16 @@ class TestReadingAndRemoving:
             "/catalog", json={"name": f"gone {uuid.uuid4()}", "strategy_id": strategy}
         ).json()["id"]
 
-        assert client.delete(f"/catalog/{entry}").status_code == 204
+        removed = client.delete(f"/catalog/{entry}")
+        gone = client.get(f"/catalog/{entry}")
+        document = client.get(f"/strategies/{strategy}")
 
-        assert client.get(f"/catalog/{entry}").status_code == 404
+        assert removed.status_code == 204
+        assert gone.status_code == 404
         # ⚠️ The document survives. A run answers "what did I execute?" by pointing at an
         # immutable document, so deleting one would make a finished result unexplainable —
         # what the entry owned was the label and the grid, never the strategy.
-        assert client.get(f"/strategies/{strategy}").status_code == 200
+        assert document.status_code == 200
 
     def test_a_labelled_strategy_cannot_be_deleted_out_from_under_the_shelf(
         self, session: Session, client: Any

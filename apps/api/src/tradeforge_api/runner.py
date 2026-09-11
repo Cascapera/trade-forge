@@ -116,24 +116,31 @@ def timeframe_refusal(definition: Mapping[str, Any], timeframe: str) -> str | No
     filterless strategy on another timeframe is exactly as safe as it has always been, and this
     function says nothing about it.
 
-    ⚠️ **With a filter, the three outcomes are not equally loud** (measured 2026-09-11 against
-    the shipped `setup_structure_choch_htf` fixture, an H4 filter and a broker clock of 3h):
+    ⚠️ **Under a filter the two timeframes must be the same**, and that is stricter than the
+    first version of this function, which only substituted and asked the DSL. Measured
+    2026-09-11 against the shipped `setup_structure_choch_htf` fixture with an H4 filter:
 
-    | document | run | what happens |
-    |---|---|---|
-    | M15 | H1 | identical H4 bars — benign |
-    | H1 | M15 | `EngineError` naming the boundary — loud, and fine |
-    | M15 | H4 | 6 bars in, 5 "H4" out: **the filter becomes a one-bar-lagged copy of the
-      chart**, with no error anywhere |
+    | document | run | broker clock | what the engine does |
+    |---|---|---|---|
+    | M15 | H4 | 3h | 6 bars in, 5 "H4" out: the filter is a one-bar-lagged copy of the chart |
+    | H1 | M15 | 3h | `EngineError` naming the boundary — loud |
+    | M15 | H1 | 3h | identical H4 bars — benign *here* |
+    | H1 | H1 | **3h30** | `EngineError`: the bar straddles the 00:30 boundary — correct |
+    | M15 | H1 | **3h30** | **6 H4 bars and no complaint at all** |
 
-    The third is why this exists. A report that says it filtered by the higher timeframe, and did
-    not, is worse than one that refused.
+    The last pair is why equality, and not merely "the substituted document is legal". The gate
+    is built with the **document's** bar width and the run feeds it the **run's**; when the
+    document's is the finer of the two, `BarAggregator`'s straddle guard compares the wrong
+    width and stops firing. The honest run raises and the mismatched one does not — the guard
+    that exists to catch misalignment is silenced by the misalignment. Half-hour broker clocks
+    are not hypothetical: `htf_offset` accepts them, and the ADR says so in as many words.
 
-    **The rule is not restated here.** It is the DSL's own — a filter has to be coarser than the
-    chart and a whole number of its bars, and it needs the broker's clock beside it — so this
-    substitutes the run's timeframe into the document and asks `assert_executable`, the same
-    authority that answered when the strategy was saved. A second copy of the comparison would
-    be a second thing to keep in step with `semantic.py`.
+    **Neither rule is restated here.** The semantic one is the DSL's own — a filter has to be
+    coarser than the chart and a whole number of its bars, with the broker's clock beside it —
+    so this substitutes the run's timeframe into the document and asks `assert_executable`, the
+    authority that answered when the strategy was saved. The equality is this function's, and it
+    is about the *wiring* rather than the grammar: no DSL rule can see two timeframes at once,
+    because a document only ever declares one.
 
     The caller is expected to have accepted `timeframe` already (`step()` refuses a name the DSL
     does not define). A stored document that no longer validates is reported as the different
@@ -146,7 +153,38 @@ def timeframe_refusal(definition: Mapping[str, Any], timeframe: str) -> str | No
         return f"the stored document no longer validates ({fields})"
     except SemanticValidationError as exc:
         return str(exc)
+
+    # ⚠️ **After the DSL, not instead of it.** A run at or above the filter's own timeframe is
+    # refused above with `semantic.py`'s own sentence, which is the better message for the case
+    # it covers. What is left is the pair the grammar cannot see, because a document declares
+    # one timeframe and the comparison needs two.
+    declared = definition.get("timeframe")
+    if _filters_by_a_higher_timeframe(definition) and declared != timeframe:
+        return (
+            f"setup.params.htf: this strategy's higher-timeframe filter is built from {declared} "
+            f"bars, so it has to run on {declared}; running it on {timeframe} feeds the filter a "
+            f"bar width it was not built for"
+        )
     return None
+
+
+def _filters_by_a_higher_timeframe(definition: Mapping[str, Any]) -> bool:
+    """Does this document's setup declare an `htf`?
+
+    Read from the document rather than from the compiled strategy, because this is asked before
+    anything is compiled — and read as *declared*, so an explicit `null` is the filter switched
+    off, exactly as `setup_factory._optional_timeframe` treats it.
+
+    A document built from indicators and conditions has no setup and no filter; it is the case
+    the whole equality rule must not touch, because its timeframe reaches nothing.
+    """
+    setup = definition.get("setup")
+    if not isinstance(setup, Mapping):
+        return False
+    params = setup.get("params")
+    if not isinstance(params, Mapping):
+        return False
+    return params.get("htf") is not None
 
 
 def _candles_to_run(

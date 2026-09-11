@@ -2191,3 +2191,22 @@ Pior: com a ordem aleatória do pytest, a mesma suíte falha numa rodada e passa
 Conserto possível: `test_semantic` não deveria escrever no arquivo versionado — ou gera num tmp, ou
 compara `render_schema()` em memória. O drift precisa medir o arquivo **como ele está no commit**,
 e hoje ele mede o arquivo como a suíte o deixou.
+
+- [origem: PR-235] **Buraco de fim de mês no M15 do GBPUSD** — medido em 11/09/2026 ao comparar o
+  H4 montado com o H4 do venue. Dias de virada de mês trazem **13** barras de M15 onde um dia
+  útil normal traz **96** (2025-04-30, 2025-12-31, 2026-04-30; controle em 2025-04-16 e
+  2026-04-15 traz 96). Efeito: 16 barras de H4 do venue sem contrapartida montada e 6 com OHLC
+  diferente — **todas** em fronteira de mês. EURUSD e XAUUSD, coletados de forma contígua, batem
+  100%. Não é bug de agregação: é coleta. Adiado porque o conserto é re-coletar as janelas de
+  borda, e nenhum backtest atual usa GBPUSD. ⚠️ Enquanto não for feito, todo resultado de GBPUSD
+  com filtro de time frame superior tem 0,2% das barras de H4 erradas e 0,7% ausentes.
+
+- [origem: PR-236] **O documento de um ponto de estudo grava um time frame que ele não rodou** —
+  `points_for` valida cada ponto com o time frame do estudo substituído, mas **não** escreve a
+  substituição: o documento persistido continua dizendo o que a estratégia base dizia. Isso é
+  proposital hoje, porque `strategies_for` deduplica por documento e um time frame dentro dele
+  faria a mesma grade em dois time frames colidir em `(name, version)` — o mesmo mecanismo que
+  faz seis folds de walk-forward escreverem cinquenta estratégias em vez de trezentas. O efeito é
+  de procedência, não de execução: o run carrega o time frame certo e é ele que a engine usa.
+  Consertar junto com a varredura de vários time frames, que vai precisar de um ponto por time
+  frame de qualquer jeito — provavelmente pondo o time frame no **nome** do ponto.

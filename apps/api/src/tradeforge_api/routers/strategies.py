@@ -20,6 +20,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
 from tradeforge_api.deps import SessionDep
+from tradeforge_api.runner import timeframe_refusal
 from tradeforge_api.schemas import (
     StorableText,
     StrategiesPage,
@@ -61,6 +62,31 @@ def validate_document(document: dict[str, Any]) -> None:
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail={"message": "strategy is well-formed but cannot run", "errors": str(exc)},
         ) from exc
+
+
+def assert_runnable_at(document: dict[str, Any], timeframe: str) -> None:
+    """422 unless this document can run at *this* timeframe — the *deciding* half.
+
+    ⚠️ **A launch settles two timeframes and they are not the same field.** The document carries
+    one, the request carries another, and the engine reads each by a different road: the loop
+    steps at the request's, while a setup builds its higher-timeframe bars out of the document's.
+    They agreed by habit until a screen let somebody pick, and a disagreement under an `htf`
+    filter is a backtest whose filter quietly stops filtering — see `runner.timeframe_refusal`
+    for the three measured outcomes.
+
+    Refused here rather than in the worker on purpose. A study expands into a hundred runs, and
+    a hundred rows reaching `failed` one by one is the same news delivered a hundred times, an
+    hour late, with nothing left to fix it on.
+
+    ⚠️ The body is `{message, errors}` with `errors` a **string** — the shape a semantic refusal
+    already takes, so the screens that learned to read it in PR-230 need no second format.
+    """
+    reason = timeframe_refusal(document, timeframe)
+    if reason is not None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={"message": f"strategy cannot run at {timeframe}", "errors": reason},
+        )
 
 
 def _field_of(loc: tuple[Any, ...]) -> str:

@@ -847,3 +847,117 @@ def test_an_order_the_venue_refused_at_the_hand_over_is_told_to_the_strategy(
         f"{refused[0]}, which the venue refused, so it never offered the region again"
     )
     assert demand[1] != demand[0], "it re-armed under the name the venue already refused"
+
+
+def filtered_strategy() -> dict[str, object]:
+    """The same entry under his H4 filter, saved at M15 — the shipped fixture's shape.
+
+    ⚠️ Run at H4 the filter is no longer coarser than the chart, and **nothing raises**: the
+    setup assembles one "H4" bar per H4 bar, a bar late, so the session trades a filter that is
+    a lagged copy of its own chart. In a backtest that is a report to throw away; here it is
+    orders on an account.
+    """
+    return {
+        "schema_version": "1.0",
+        "name": "CHoCH under H4",
+        "timeframe": "M15",
+        "setup": {"type": "structure_choch", "params": {"htf": "H4", "htf_offset": 3}},
+        "risk": {"sizing": {"type": "percent_risk", "params": {"percent": 1.0}}},
+    }
+
+
+def test_a_session_at_the_filters_own_timeframe_refuses_before_the_warm_up(
+    session: Session,
+    session_factory: Callable[[], Session],
+    rows: tuple[Strategy, Instrument],
+    parquet_root: Path,
+) -> None:
+    """A plan whose timeframe swallows the document's filter never starts.
+
+    ⚠️ **Refused before the warm-up**, which the counted source proves — the same doctrine as
+    the promotion gate and the venue check above it. Warming reads tens of thousands of bars,
+    and spending that to say something knowable at the first line is the mistake this file keeps
+    testing for.
+    """
+    _, instrument = rows
+    filtered = Strategy(definition=filtered_strategy(), version=1)
+    session.add(filtered)
+    session.commit()
+    paper_evidence(session, filtered, instrument, days=5)
+
+    history, live_bars, cut = split()
+    source = CountingSource(history, live_bars)
+    plan = SessionPlan(
+        strategy_id=filtered.id,
+        instrument_id=instrument.id,
+        timeframe="H4",
+        initial_capital=Decimal("10000"),
+        cost_model={"type": "none"},
+    )
+
+    with pytest.raises(Exception, match=r"(?i)htf"):
+        run_session(
+            factory=factory_of(session_factory),
+            source=source,
+            plan=plan,
+            parquet_root=parquet_root,
+            stopping=lambda: False,
+            venue=None,
+            now=lambda: cut,
+        )
+
+    assert source.reads == 0, "the warm-up ran before the refusal"
+
+    # ⚠️ **No row of its own.** `paper_evidence` wrote five, and a refusal that opened a session
+    # before failing would leave a sixth. Asserting merely that *some* row exists would pass on
+    # the evidence alone and prove nothing about the refusal — which is what the first draft of
+    # this line did.
+    session.expire_all()
+    rows_after = session.scalars(
+        select(LiveSession).where(LiveSession.strategy_id == filtered.id)
+    ).all()
+    assert len(rows_after) == 5
+
+
+def test_a_session_at_a_timeframe_the_filter_still_covers_is_not_refused(
+    session: Session,
+    session_factory: Callable[[], Session],
+    rows: tuple[Strategy, Instrument],
+    parquet_root: Path,
+) -> None:
+    """⚠️ The half a "refuse any disagreement" guard would get wrong.
+
+    The same document, planned at H1: the H4 filter is still coarser and still a whole number of
+    bars, so the session is allowed to start. Without this case the guard above could be
+    refusing every timeframe that is not the document's, and every session of a filtered
+    strategy anywhere but M15 would stop working.
+    """
+    _, instrument = rows
+    filtered = Strategy(definition=filtered_strategy(), version=1)
+    session.add(filtered)
+    session.commit()
+    paper_evidence(session, filtered, instrument, days=5)
+
+    history, live_bars, cut = split()
+    source = CountingSource(history, live_bars)
+    plan = SessionPlan(
+        strategy_id=filtered.id,
+        instrument_id=instrument.id,
+        timeframe="H1",
+        initial_capital=Decimal("10000"),
+        cost_model={"type": "none"},
+    )
+
+    run_session(
+        factory=factory_of(session_factory),
+        source=source,
+        plan=plan,
+        parquet_root=parquet_root,
+        stopping=lambda: False,
+        venue=None,
+        now=lambda: cut,
+    )
+
+    # It got past the guard and read its bars — which is the whole assertion. What the session
+    # then *did* is `test_session_integration.py`'s subject, not this one's.
+    assert source.reads > 0

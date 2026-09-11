@@ -64,6 +64,7 @@ from tradeforge_api.runner import (
     instrument_spec,
     risk_percent,
     take_profit_rr,
+    timeframe_refusal,
 )
 from tradeforge_collector import read_candles, step
 from tradeforge_db.live_sessions import finish_session, open_session, reconcile_stale
@@ -211,6 +212,19 @@ def run_session(  # noqa: PLR0913 — keyword-only; each names one seam of a ses
         spec = instrument_spec(instrument)
         symbol = instrument.symbol
         definition = dict(strategy.definition)
+
+    # ⚠️ **Asked here for the same reason the promotion gate above is: it is knowable now.** A
+    # document carries its own `timeframe` and this plan carries another, and a setup builds its
+    # higher-timeframe bars out of the document's while the loop steps at the plan's. Under an
+    # `htf` filter a disagreement can leave the filter silently copying the chart
+    # (`runner.timeframe_refusal`) — and a live session is the one place where that is not a
+    # report to throw away but orders on an account.
+    #
+    # Before the warm-up, which reads months of candles: discovering it afterwards would spend
+    # minutes to say something that was true at the first line of this function.
+    refusal = timeframe_refusal(definition, plan.timeframe)
+    if refusal is not None:
+        raise EngineError(f"refusing to start a session at {plan.timeframe}: {refusal}")
 
     timeframe = step(plan.timeframe)
     candles = splice(

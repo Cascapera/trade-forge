@@ -67,7 +67,9 @@ _NOT_FOUND: _Responses = {status.HTTP_404_NOT_FOUND: {"description": "not found"
 _BAD_BODY: _Responses = {status.HTTP_400_BAD_REQUEST: {"description": "malformed request body"}}
 
 
-def points_for(base: Strategy, grid: Mapping[str, Sequence[Any]]) -> list[GridPoint]:
+def points_for(
+    base: Strategy, grid: Mapping[str, Sequence[Any]], timeframe: str
+) -> list[GridPoint]:
     """Expand the grid, or refuse — and validate every document before any of them is written.
 
     Public because `/walkforwards` runs the same grid over each of its folds, and it has to
@@ -95,7 +97,17 @@ def points_for(base: Strategy, grid: Mapping[str, Sequence[Any]]) -> list[GridPo
     for point in points:
         # Raises the same 422 the strategy endpoint raises, carrying the same error body — so a
         # client already able to explain why a strategy was rejected can explain this one too.
-        validate_document(point.document)
+        #
+        # ⚠️ **Validated at the timeframe the study will actually run**, which is not the one the
+        # document carries. The two are different fields and the engine reads each by a different
+        # road (`runner.timeframe_refusal`); a point whose `htf` filter is legal on the saved
+        # document can be a filter that quietly stops filtering at the study's timeframe.
+        #
+        # Substituted for the check only — **not** written into the point. The stored document is
+        # what `strategies_for` deduplicates on, and a timeframe in it would make the same grid
+        # at two timeframes collide on `(name, version)`. That the point then records a timeframe
+        # it did not run at is a separate, older problem; it is in the backlog.
+        validate_document({**point.document, "timeframe": timeframe})
     return points
 
 
@@ -210,10 +222,10 @@ def preview_study(request: PreviewStudyRequest, session: SessionDep) -> StudyPre
     base = session.get(Strategy, request.strategy_id)
     if base is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="strategy not found")
-    return preview_of(base, request.grid)
+    return preview_of(base, request.grid, request.timeframe)
 
 
-def preview_of(base: Strategy, grid: Mapping[str, Sequence[Any]]) -> StudyPreview:
+def preview_of(base: Strategy, grid: Mapping[str, Sequence[Any]], timeframe: str) -> StudyPreview:
     """The preview itself, with the database left at the door.
 
     Separated from the route because everything worth being wrong about is here — which points
@@ -233,7 +245,10 @@ def preview_of(base: Strategy, grid: Mapping[str, Sequence[Any]]) -> StudyPrevie
         refusals=[
             GridRefusal(label=point.label, values=dict(point.values), reason=reason)
             for point in points
-            if (reason := refusal_of(point.document)) is not None
+            # At the study's timeframe, exactly as `points_for` decides — a preview that
+            # answered about the document's own would disagree with the launch on precisely
+            # the points a person most needs warning about.
+            if (reason := refusal_of({**point.document, "timeframe": timeframe})) is not None
         ],
     )
 
@@ -278,7 +293,7 @@ async def create_study(
             detail=f"unknown symbol: {request.symbol}",
         )
 
-    points = points_for(base, request.grid)
+    points = points_for(base, request.grid, request.timeframe)
 
     study = Study(
         strategy_id=base.id,

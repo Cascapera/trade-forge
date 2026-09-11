@@ -424,17 +424,27 @@ export function useTradeSnapshot(backtestId: string | undefined, tradeId: number
  * `enabled` only once there is a strategy and at least one axis: an empty grid has no preview to
  * ask for, and the endpoint refuses one.
  */
-export function useStudyPreview(strategyId: string | null, grid: Record<string, unknown[]>) {
+export function useStudyPreview(
+  strategyId: string | null,
+  grid: Record<string, unknown[]>,
+  timeframe: string,
+) {
   const asked = strategyId !== null && Object.keys(grid).length > 0
   return useQuery<{ grid: Record<string, unknown[]>; preview: StudyPreview }>({
-    queryKey: ['study-preview', strategyId, grid],
+    // ⚠️ The timeframe is in the key, not only in the body. Leaving it out would serve the
+    // verdict for M15 after the reader switched the form to H4 — a cached answer about a study
+    // nobody is proposing, which is the same failure the grid is keyed for.
+    queryKey: ['study-preview', strategyId, grid, timeframe],
     // ⚠️ **The answer carries the grid it is about**, rather than the caller trusting that
     // whatever is in `data` belongs to the key it just asked on. That trust holds today only
     // because this query has no `placeholderData` — and adding some is the obvious improvement
     // somebody makes to stop the warning flickering, which would silently hand a caller a real
     // verdict about a grid nobody is looking at. Carried here, that cannot happen quietly.
     queryFn: asked
-      ? async () => ({ grid, preview: await api.previewStudy({ strategy_id: strategyId, grid }) })
+      ? async () => ({
+          grid,
+          preview: await api.previewStudy({ strategy_id: strategyId, grid, timeframe }),
+        })
       : skipToken,
   })
 }

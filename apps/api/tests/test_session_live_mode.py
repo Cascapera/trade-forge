@@ -850,7 +850,7 @@ def test_an_order_the_venue_refused_at_the_hand_over_is_told_to_the_strategy(
 
 
 def filtered_strategy() -> dict[str, object]:
-    """The same entry under his H4 filter, saved at M15 — the shipped fixture's shape.
+    """The same entry under his H4 filter, saved at H1 — the width this file's market replays.
 
     ⚠️ Run at H4 the filter is no longer coarser than the chart, and **nothing raises**: the
     setup assembles one "H4" bar per H4 bar, a bar late, so the session trades a filter that is

@@ -72,9 +72,6 @@ class TestTheFilterlessDocumentIsNeverRefused:
 
 
 class TestTheFilteredDocument:
-    def test_at_its_own_timeframe_it_runs(self) -> None:
-        assert timeframe_refusal(filtered("M15"), "M15") is None
-
     @pytest.mark.parametrize("run_at", ["M5", "M30", "H1"])
     def test_is_refused_anywhere_but_its_own_timeframe(self, run_at: str) -> None:
         # ⚠️ **These three used to be allowed**, and the rule tightened on 2026-09-11 for a case

@@ -39,6 +39,11 @@ EXPECTED_TABLES = {
     # into it: that one says what exists, this one says what was asked for and how it went.
     "collections",
     "strategies",
+    # The shelf: a label a person wrote, and the sweep saved beside the strategy. Beside
+    # `strategies` rather than columns on it, because the name here is written by a person
+    # while `strategies.name` is generated out of the document, and one document can be
+    # swept by several grids.
+    "catalog_entries",
     "baskets",
     "studies",
     "walk_forwards",

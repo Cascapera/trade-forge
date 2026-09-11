@@ -30,6 +30,11 @@ TABLES_CHILD_FIRST = (
     "backtest_metrics",
     "backtests",
     "baskets",
+    # ⚠️ Before `strategies`, which it points at with a RESTRICT foreign key — so a row
+    # left behind does not merely linger, it makes the next test unable to empty
+    # `strategies` at all. Added with the table; the two lists above it drifted once
+    # before for exactly this reason (`live_sessions`).
+    "catalog_entries",
     "strategies",
     "datasets",
     "instruments",

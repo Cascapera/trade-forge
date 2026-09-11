@@ -26,6 +26,7 @@ from tradeforge_api.queue import JobQueue, redis_settings
 from tradeforge_api.routers import (
     backtests,
     baskets,
+    catalog,
     collections,
     executor,
     instruments,
@@ -116,6 +117,7 @@ def create_app(
     app.include_router(symbols.router)
     app.include_router(collections.router)
     app.include_router(strategies.router)
+    app.include_router(catalog.router)
     app.include_router(backtests.router)
     app.include_router(executor.router)
     app.include_router(live_sessions.router)

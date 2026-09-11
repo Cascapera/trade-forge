@@ -466,6 +466,16 @@ export interface PreviewStudyRequest {
   strategy_id: string
   /** The same shape `CreateStudyRequest.grid` takes, so the preview is of the request itself. */
   grid: Record<string, unknown[]>
+  /**
+   * The timeframe the study would run at — and **not** just another property of the run.
+   *
+   * ⚠️ A document carries its own `timeframe`, and a setup builds its higher-timeframe bars out
+   * of that one while the engine's loop steps at the run's. So a point whose `htf` filter is
+   * legal on the saved document can be a filter that quietly stops filtering at the study's
+   * timeframe. Required, because a preview that skipped the check when this was absent would
+   * agree with the launch everywhere except where it matters.
+   */
+  timeframe: string
 }
 
 /** One point of a grid that cannot run, and why. */

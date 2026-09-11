@@ -19,6 +19,7 @@ from sqlalchemy.orm import selectinload
 from tradeforge_api.config import Settings
 from tradeforge_api.deps import QueueDep, SessionDep, SettingsDep
 from tradeforge_api.queue import RUN_BACKTEST
+from tradeforge_api.routers.strategies import assert_runnable_at
 from tradeforge_api.runner import ENGINE_VERSION, instrument_spec
 from tradeforge_api.schemas import (
     BacktestListItem,
@@ -225,6 +226,11 @@ async def create_backtest(
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
         ) from exc
+
+    # After `step`, which is what makes the name safe to substitute, and before anything is
+    # written: a run whose timeframe disagrees with its document's under a higher-timeframe
+    # filter is a filter that quietly stops filtering.
+    assert_runnable_at(strategy.definition, request.timeframe)
 
     if request.date_to < request.date_from:
         raise HTTPException(

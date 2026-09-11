@@ -152,7 +152,10 @@ async def create_walk_forward(
         )
 
     grid: dict[str, list[Any]] = dict(study.grid)
-    points = points_for(base, grid)
+    # The study's timeframe, because a walk-forward re-runs *that* study's points — and the
+    # study already refused any point its timeframe cannot run. Passing anything else here would
+    # let the two halves of the comparison search different spaces.
+    points = points_for(base, grid, study.timeframe)
     folds = _folds_for(settings, study, instrument.symbol, request)
 
     # ⚠️ The multiplication is the whole point of checking here rather than trusting the two

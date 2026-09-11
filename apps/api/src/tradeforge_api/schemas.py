@@ -905,16 +905,24 @@ class StudyPointOut(_Out):
 class PreviewStudyRequest(BaseModel):
     """Ask what a grid would produce, without producing it.
 
-    Carries the strategy and the grid and nothing else: the question is about **documents**, and
-    a document is the base strategy with values substituted in. The symbol, the dates and the
-    capital belong to the runs, not to the documents, and none of them can make a point legal or
-    illegal.
+    The question is about **documents** — the base strategy with values substituted in — so the
+    symbol, the dates and the capital are absent: they belong to the runs and none of them can
+    make a point legal or illegal.
+
+    ⚠️ **The timeframe is the exception, and it is why this field exists.** It looks like another
+    property of the run and it is not: a document carries its own `timeframe`, and a setup builds
+    its higher-timeframe bars out of that one while the loop steps at the run's. A point whose
+    `htf` filter is legal on the saved document can be a filter that quietly stops filtering at
+    the study's timeframe (`runner.timeframe_refusal`). Required rather than optional, because a
+    preview that skipped the check when the field was absent would be a preview that agrees with
+    the launch *except* on the points a person most needs warning about.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     strategy_id: uuid.UUID
     grid: dict[str, list[Any]] = Field(min_length=1)
+    timeframe: Timeframe
     """The same shape `CreateStudyRequest.grid` takes, so a caller previews the request it is
     about to send rather than a translation of it."""
 

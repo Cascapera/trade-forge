@@ -20,6 +20,8 @@ from collections.abc import Mapping, Sequence
 from decimal import Decimal
 from typing import Any, NamedTuple
 
+from pydantic import ValidationError
+
 from tradeforge_collector import step
 from tradeforge_db.models import Instrument
 from tradeforge_engine import (
@@ -38,6 +40,8 @@ from tradeforge_engine import (
 from tradeforge_engine import BacktestMetrics as EngineMetrics
 from tradeforge_engine import __version__ as ENGINE_VERSION  # noqa: N812 — public constant
 from tradeforge_engine.protocols import CostModel
+from tradeforge_schema import SemanticValidationError, assert_executable
+from tradeforge_schema import Strategy as StrategyDSL
 
 
 def _decimal(value: object) -> Decimal:
@@ -94,6 +98,55 @@ def risk_percent(definition: Mapping[str, Any]) -> Decimal:
     if percent is None:
         raise ValueError("strategy declares no percent_risk sizing; positions cannot be sized")
     return _decimal(percent)
+
+
+def timeframe_refusal(definition: Mapping[str, Any], timeframe: str) -> str | None:
+    """Why this document cannot run at *this* timeframe, or `None` when it can.
+
+    ⚠️ **A document carries a `timeframe` and a run carries another, and nothing compared them.**
+    They are not the same field and they reach the engine by different roads: `execute_backtest`
+    below steps the loop at the **run's**, while `compile_strategy` reads the **document's** and
+    hands it to the setup, which builds its higher-timeframe bars out of it
+    (`setup_factory._structure_kwargs`). Every other caller of that road ignores it.
+
+    **The disagreement only matters when the document carries an `htf`**, and that is measured
+    rather than assumed: the base timeframe is passed to a setup only under
+    `if kwargs.get("htf") is not None`, and `CompiledStrategy.timeframe` — the road the
+    indicator-and-condition documents take — is assigned once and read nowhere. So re-running a
+    filterless strategy on another timeframe is exactly as safe as it has always been, and this
+    function says nothing about it.
+
+    ⚠️ **With a filter, the three outcomes are not equally loud** (measured 2026-09-11 against
+    the shipped `setup_structure_choch_htf` fixture, an H4 filter and a broker clock of 3h):
+
+    | document | run | what happens |
+    |---|---|---|
+    | M15 | H1 | identical H4 bars — benign |
+    | H1 | M15 | `EngineError` naming the boundary — loud, and fine |
+    | M15 | H4 | 6 bars in, 5 "H4" out: **the filter becomes a one-bar-lagged copy of the
+      chart**, with no error anywhere |
+
+    The third is why this exists. A report that says it filtered by the higher timeframe, and did
+    not, is worse than one that refused.
+
+    **The rule is not restated here.** It is the DSL's own — a filter has to be coarser than the
+    chart and a whole number of its bars, and it needs the broker's clock beside it — so this
+    substitutes the run's timeframe into the document and asks `assert_executable`, the same
+    authority that answered when the strategy was saved. A second copy of the comparison would
+    be a second thing to keep in step with `semantic.py`.
+
+    The caller is expected to have accepted `timeframe` already (`step()` refuses a name the DSL
+    does not define). A stored document that no longer validates is reported as the different
+    fact it is, rather than dressed up as a timeframe problem.
+    """
+    try:
+        assert_executable(StrategyDSL.model_validate({**definition, "timeframe": timeframe}))
+    except ValidationError as exc:
+        fields = ", ".join(str(error["loc"][-1]) for error in exc.errors())
+        return f"the stored document no longer validates ({fields})"
+    except SemanticValidationError as exc:
+        return str(exc)
+    return None
 
 
 def _candles_to_run(
@@ -201,4 +254,5 @@ __all__ = [
     "instrument_spec",
     "risk_percent",
     "take_profit_rr",
+    "timeframe_refusal",
 ]

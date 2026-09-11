@@ -42,7 +42,7 @@ def _base(document: dict[str, Any] | None = None) -> Strategy:
 
 
 def test_a_grid_whose_every_point_runs_reports_no_refusals() -> None:
-    preview = preview_of(_base(), {"setup.params.htf": [None, "H4", "D1"]})
+    preview = preview_of(_base(), {"setup.params.htf": [None, "H4", "D1"]}, "M15")
 
     assert preview.points == 3
     assert preview.refusals == []
@@ -57,7 +57,7 @@ def test_every_refusal_comes_back_at_once_rather_than_the_first() -> None:
 
     `M1`, `M5` and `M15` are all finer than or equal to the document's own M15.
     """
-    preview = preview_of(_base(), {"setup.params.htf": ["M1", "M5", "M15", "H4"]})
+    preview = preview_of(_base(), {"setup.params.htf": ["M1", "M5", "M15", "H4"]}, "M15")
 
     assert preview.points == 4
     assert [refusal.values["setup.params.htf"] for refusal in preview.refusals] == [
@@ -71,7 +71,9 @@ def test_every_refusal_comes_back_at_once_rather_than_the_first() -> None:
 def test_a_refusal_names_the_point_in_the_words_the_rest_of_the_screen_uses() -> None:
     """The label is what the heatmap and the run log call this point. A preview that invented its
     own phrasing would make the reader match two descriptions of the same combination by eye."""
-    preview = preview_of(_base(), {"setup.params.htf": ["M5"], "setup.params.stop_buffer": [0.2]})
+    preview = preview_of(
+        _base(), {"setup.params.htf": ["M5"], "setup.params.stop_buffer": [0.2]}, "M15"
+    )
 
     (refusal,) = preview.refusals
     # A string keeps its quotes here, the way `label_for` writes every other point in the study.
@@ -97,7 +99,7 @@ def test_a_grid_that_cannot_be_applied_is_an_answer_rather_than_an_error(
     Reported separately from `refusals` because it is a different kind of no: there are no points
     to report on, rather than points that will not run.
     """
-    preview = preview_of(_base(), grid)
+    preview = preview_of(_base(), grid, "M15")
 
     assert preview.points == 0
     assert preview.refusals == []
@@ -116,14 +118,14 @@ def test_the_preview_refuses_exactly_what_a_launch_refuses() -> None:
     clean = {"setup.params.htf": [None, "H4"]}
     dirty = {"setup.params.htf": ["M5", "H4"]}
 
-    assert preview_of(_base(), clean).refusals == []
-    assert len(points_for(_base(), clean)) == 2
+    assert preview_of(_base(), clean, "M15").refusals == []
+    assert len(points_for(_base(), clean, "M15")) == 2
 
     assert [
-        refusal.values["setup.params.htf"] for refusal in preview_of(_base(), dirty).refusals
+        refusal.values["setup.params.htf"] for refusal in preview_of(_base(), dirty, "M15").refusals
     ] == ["M5"]
     with pytest.raises(HTTPException) as refused:
-        points_for(_base(), dirty)
+        points_for(_base(), dirty, "M15")
     assert refused.value.status_code == 422
 
 
@@ -141,7 +143,7 @@ def test_the_preview_asks_about_the_named_documents_a_launch_would_write() -> No
     long_name = "c" * 110
     base = _base({**_FILTERED, "name": long_name})
 
-    preview = preview_of(base, {"setup.params.htf": ["H4", "D1"]})
+    preview = preview_of(base, {"setup.params.htf": ["H4", "D1"]}, "M15")
 
     assert preview.points == 2
     assert [refusal.label for refusal in preview.refusals] == ["htf='H4'", "htf='D1'"]
@@ -173,7 +175,7 @@ def test_a_point_wrong_in_two_places_says_both() -> None:
         }
     )
 
-    (refusal,) = preview_of(base, {"setup.params.breakeven_at_r": [-1]}).refusals
+    (refusal,) = preview_of(base, {"setup.params.breakeven_at_r": [-1]}, "M15").refusals
 
     assert refusal.reason == (
         "stop_buffer: Input should be greater than or equal to 0; "
@@ -204,7 +206,7 @@ def test_a_refusal_names_the_field_without_the_model_it_lives_in() -> None:
         }
     )
 
-    (refusal,) = preview_of(base, {"setup.params.breakeven_at_r": [2.0]}).refusals
+    (refusal,) = preview_of(base, {"setup.params.breakeven_at_r": [2.0]}, "M15").refusals
 
     assert refusal.reason.startswith("stop_buffer: ")
     assert "structure_choch" not in refusal.reason
@@ -216,8 +218,68 @@ def test_a_refusal_reads_as_one_sentence_rather_than_a_model_dump() -> None:
     and the wrong one for a caption on a grid."""
     long_name = "c" * 110
     (refusal,) = preview_of(
-        _base({**_FILTERED, "name": long_name}), {"setup.params.htf": ["H4"]}
+        _base({**_FILTERED, "name": long_name}), {"setup.params.htf": ["H4"]}, "M15"
     ).refusals
 
     assert "\n" not in refusal.reason
     assert refusal.reason.startswith("name: ")
+
+
+class TestTheStudysTimeframeDecidesToo:
+    """⚠️ The axis that is not in the grid.
+
+    `_FILTERED` is saved at M15 under an H4 filter, which is legal. Launch the same grid at H4
+    and the filter stops being coarser than the chart — and the engine says nothing: it assembles
+    one "H4" bar per H4 bar, a bar late, so the run reports a filtered strategy that filtered
+    nothing. See `runner.timeframe_refusal` for the measurement.
+    """
+
+    def test_a_grid_that_runs_at_m15_can_be_refused_whole_at_h4(self) -> None:
+        grid = {"setup.params.stop_buffer": [0.1, 0.2]}
+
+        assert preview_of(_base(), grid, "M15").refusals == []
+        refused = preview_of(_base(), grid, "H4").refusals
+
+        # Every point, because the timeframe is not on an axis: it is the same wrongness
+        # repeated, and reporting one of two would suggest the other is fine.
+        assert len(refused) == 2
+        assert all("htf" in refusal.reason for refusal in refused)
+
+    def test_the_launch_agrees_with_the_preview(self) -> None:
+        # The property this whole module exists for, now across the new argument. A preview that
+        # said yes where the launch says no is worse than no preview: it is a promise.
+        grid = {"setup.params.stop_buffer": [0.1, 0.2]}
+
+        assert len(points_for(_base(), grid, "M15")) == 2
+        with pytest.raises(HTTPException) as refused:
+            points_for(_base(), grid, "H4")
+        assert refused.value.status_code == 422
+
+    def test_a_filterless_document_runs_at_every_timeframe(self) -> None:
+        # ⚠️ The half a "refuse any disagreement" guard would break. Without `htf` the document's
+        # timeframe reaches no setup at all, so a grid over a filterless strategy is as legal at
+        # H4 as at M15 — and studies over these are most of what this endpoint serves.
+        plain = dict(_FILTERED)
+        plain["setup"] = {"type": "structure_choch", "params": {"stop_buffer": 0.1}}
+        grid = {"setup.params.stop_buffer": [0.1, 0.2]}
+
+        for timeframe in ("M5", "M15", "H1", "H4", "D1"):
+            assert preview_of(_base(plain), grid, timeframe).refusals == []
+
+    def test_the_axis_and_the_timeframe_are_judged_together(self) -> None:
+        # An axis over `htf` that is half legal at M15 becomes wholly illegal at H4: `H4` is no
+        # longer coarser than the chart and `M30` never was. A check that looked at one or the
+        # other would get this pair wrong in opposite directions.
+        grid = {"setup.params.htf": ["M30", "H4"]}
+
+        at_m15 = {
+            refusal.values["setup.params.htf"]
+            for refusal in preview_of(_base(), grid, "M15").refusals
+        }
+        at_h4 = {
+            refusal.values["setup.params.htf"]
+            for refusal in preview_of(_base(), grid, "H4").refusals
+        }
+
+        assert at_m15 == set()
+        assert at_h4 == {"M30", "H4"}

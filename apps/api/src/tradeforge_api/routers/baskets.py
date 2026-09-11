@@ -22,6 +22,7 @@ from sqlalchemy.orm import selectinload
 from tradeforge_api.deps import QueueDep, SessionDep
 from tradeforge_api.queue import RUN_BACKTEST
 from tradeforge_api.routers.backtests import list_item
+from tradeforge_api.routers.strategies import assert_runnable_at
 from tradeforge_api.runner import ENGINE_VERSION
 from tradeforge_api.schemas import (
     BasketAggregate,
@@ -92,6 +93,10 @@ async def create_basket(
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
         ) from exc
+
+    # One timeframe across every market in the basket, so one question settles all of them —
+    # and it is settled before anything is written, like the unknown symbols below.
+    assert_runnable_at(strategy.definition, request.timeframe)
 
     if request.date_to < request.date_from:
         raise HTTPException(

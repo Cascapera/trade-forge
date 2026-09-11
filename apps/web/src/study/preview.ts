@@ -65,7 +65,14 @@ export function useGridPreview(strategyId: string | null, form: StudyForm): Grid
 
   // The debounced grid, parsed back — so the query is keyed on exactly what was asked rather
   // than on a string that would make the key a different shape from every other query's.
-  const preview = useStudyPreview(strategyId, JSON.parse(asked) as Record<string, unknown[]>)
+  // ⚠️ The form's timeframe, undebounced, and that is deliberate: it changes by a click on a
+  // select rather than by typing, so there is no half-finished value to wait out — and a stale
+  // verdict about the timeframe the reader just left is exactly what this screen must not show.
+  const preview = useStudyPreview(
+    strategyId,
+    JSON.parse(asked) as Record<string, unknown[]>,
+    form.timeframe,
+  )
 
   // ⚠️ **Which grid the answer on hand is about**, read off the answer rather than assumed from
   // the key. The debounce opens the gap this closes: for 400ms after a keystroke the query is

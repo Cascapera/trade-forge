@@ -1003,8 +1003,9 @@ export interface SweepPreview {
    *  request over them. A number that quietly excluded them would describe a sweep nobody can
    *  start. */
   uncovered: UncoveredMarket[]
-  /** Set when the sweep cannot be launched at all — an unknown entry, a product over the cap,
-   *  nothing runnable. A different kind of no: there is nothing to run. */
+  /** Set when the sweep cannot be launched at all — a product over the cap, nothing runnable,
+   *  or a coverage gap. ⚠️ On a coverage gap it is filled **beside** `uncovered`, never instead
+   *  of it. An unknown entry never lands here: the endpoint answers that with a 404. */
   error: string | null
 }
 

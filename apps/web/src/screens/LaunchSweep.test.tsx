@@ -1,7 +1,7 @@
 import { fireEvent, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { api } from '../api/client'
+import { ApiError, api } from '../api/client'
 import type { CatalogEntry, SweepPreview } from '../api/types'
 import { renderWithProviders } from '../test-utils'
 
@@ -57,6 +57,8 @@ function entry(id: string, name: string, points: number): CatalogEntry {
   }
 }
 
+const COVERAGE_ERROR = '2 of these markets have no candles in this window; move the window or collect them first'
+
 function preview(patch: Partial<SweepPreview> = {}): SweepPreview {
   return { runs: 2, documents: 2, entries: [], uncovered: [], error: null, ...patch }
 }
@@ -111,10 +113,14 @@ describe('the count on screen', () => {
     // leaving no way to tell "nothing to run" from "I could not count".
     const { client } = renderWithProviders(<LaunchSweep />)
 
-    fireEvent.click(await screen.findByLabelText(/nine one plain/i))
-    fireEvent.click(await screen.findByLabelText(/^EURUSD,/))
-    fireEvent.click(screen.getByLabelText('M15'))
+    // ⚠️ The **whole** form, window included, and the button seen live before the entry goes.
+    // An earlier draft left the dates blank, so the disabled button below was `Choose a period.`
+    // talking — the assertion passed with the uncountable-sweep refusal deleted.
+    await fillIn()
     expect(await screen.findByText('1 backtest.')).toBeInTheDocument()
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /run the sweep/i })).toBeEnabled()
+    })
 
     // ⚠️ The shelf loses the entry from underneath the tick — and it has to be an actual
     // **refetch**, not merely a re-pointed mock. Re-pointing alone changes nothing on a mounted
@@ -137,6 +143,10 @@ describe('the three refusals stay apart', () => {
     // ⚠️ The coverage gap is the only one of the three whose fix is outside this screen, and the
     // two shapes of it are said differently: never collected is a backfill, collected for other
     // years is a window to move.
+    //
+    // ⚠️ The server's real shape: on a coverage gap `error` is filled **beside** `uncovered`
+    // (`routers/sweeps.py`). A fixture with `error: null` here was a shape the server never
+    // sends, and under it the guard that stops the same no being printed twice was invisible.
     previewSweep.mockResolvedValue(
       preview({
         runs: 0,
@@ -144,6 +154,7 @@ describe('the three refusals stay apart', () => {
           { symbol: 'GBPUSD', timeframe: 'M15', covers: null },
           { symbol: 'EURUSD', timeframe: 'M15', covers: '2020-01-01 to 2021-01-01' },
         ],
+        error: COVERAGE_ERROR,
       }),
     )
     renderWithProviders(<LaunchSweep />)
@@ -153,6 +164,55 @@ describe('the three refusals stay apart', () => {
     expect(screen.getByText(/collected 2020-01-01 to 2021-01-01/i)).toBeInTheDocument()
     // Not described as a combination that cannot run: nothing about the entries is wrong.
     expect(screen.queryByText(/cannot run and will be left out/i)).not.toBeInTheDocument()
+    // And said once, as the list — not a second time as the server's sentence under it.
+    expect(screen.queryByText(COVERAGE_ERROR)).not.toBeInTheDocument()
+  })
+
+  it('refuses a sweep with nothing runnable, in the server’s words', async () => {
+    // The third no, with no list beside it: every combination was refused, or the product is over
+    // the cap after the refusals were subtracted. Only the server knows the net count, so only
+    // its sentence can say this — and the button must follow it.
+    previewSweep.mockResolvedValue(
+      preview({ runs: 0, error: 'no combination in this sweep can run' }),
+    )
+    renderWithProviders(<LaunchSweep />)
+    await fillIn()
+
+    expect(await screen.findByText('no combination in this sweep can run')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /run the sweep/i })).toBeDisabled()
+  })
+
+  it('says the form’s own refusal once, not again in the server’s wording', async () => {
+    // 3001 points x 1 market x 1 chart is one over the cap. The form refuses it before any answer
+    // lands, and the server — asked anyway — refuses it too, in other words. One no, one sentence.
+    listCatalog.mockResolvedValue({ total: 1, items: [entry('a', 'nine one plain', 3001)] })
+    //
+    // ⚠️ The answer carries a refusal so the test can **see it land**. Waiting only for the call
+    // to be made asserted the silence before the reply had rendered, and passed with the guard
+    // deleted — a machine that had not yet had the chance to speak.
+    previewSweep.mockResolvedValue(
+      preview({
+        runs: 3001,
+        entries: [
+          {
+            entry_id: 'a',
+            name: 'nine one plain',
+            points: 3001,
+            refusals: [{ label: 'M15 · period=5', values: {}, reason: 'nope' }],
+          },
+        ],
+        error: 'this sweep expands to 3001 backtests, over the 3000 one sweep will run',
+      }),
+    )
+    renderWithProviders(<LaunchSweep />)
+    await fillIn()
+
+    expect(
+      await screen.findByText('That is 3001 backtests, over the 3000 one sweep will run.'),
+    ).toBeInTheDocument()
+    await screen.findByText(/will be left out/i)
+    expect(screen.queryByText(/this sweep expands to/)).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /run the sweep/i })).toBeDisabled()
   })
 
   it('names the entry beside each refused combination', async () => {
@@ -207,6 +267,11 @@ describe('the three refusals stay apart', () => {
   it('blocks the launch when a market has no candles at all', async () => {
     // The other side of the pair above: this one the server refuses whole, so the screen must
     // not offer a button that is going to 422.
+    //
+    // ⚠️ `error: null` beside a non-empty `uncovered` is **deliberately** a shape today's server
+    // never sends. The screen blocks on the list itself, not only on the sentence, so a server
+    // that stopped filling `error` on a coverage gap would still fail closed — this is the one
+    // test that can see that guard, and it can only see it through the impossible shape.
     previewSweep.mockResolvedValue(
       preview({ runs: 0, uncovered: [{ symbol: 'EURUSD', timeframe: 'M15', covers: null }] }),
     )
@@ -217,6 +282,63 @@ describe('the three refusals stay apart', () => {
     await waitFor(() => {
       expect(screen.getByRole('button', { name: /run the sweep/i })).toBeDisabled()
     })
+  })
+})
+
+describe('the answer on hand', () => {
+  it('drops a verdict the moment the form stops asking it', async () => {
+    // ⚠️ **The gap the debounce opens.** For 400ms after an edit the query is still keyed on the
+    // previous question, so what is in hand is a true verdict about a sweep nobody is proposing.
+    // Asserted **synchronously** after the edit, on purpose: once the debounce fires the key
+    // moves and the data goes undefined on its own, so a `waitFor` here would pass with the
+    // `asked` comparison deleted — it would wait out the very window this test is about.
+    previewSweep.mockResolvedValueOnce(
+      preview({
+        runs: 0,
+        uncovered: [{ symbol: 'EURUSD', timeframe: 'M15', covers: null }],
+        error: COVERAGE_ERROR,
+      }),
+    )
+    previewSweep.mockReturnValue(new Promise<SweepPreview>(() => undefined))
+    renderWithProviders(<LaunchSweep />)
+    await fillIn()
+    expect(await screen.findByText(/never collected/i)).toBeInTheDocument()
+
+    // The reader fixes the window — the gap was about the old one.
+    fireEvent.change(screen.getByLabelText('From'), { target: { value: '2025-02-01' } })
+
+    expect(screen.queryByText(/never collected/i)).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /run the sweep/i })).toBeEnabled()
+  })
+
+  it('says the check failed rather than showing an all-clear', async () => {
+    // ⚠️ A failed request used to fall through to the empty answer, which is exactly what "this
+    // sweep is fine" looks like. The reason is the server's own, via `apiFailure` — here the
+    // 422 a request with more than fifty entries gets, a limit this form does not apply.
+    previewSweep.mockRejectedValue(new ApiError(422, 'entry_ids: at most 50 items'))
+    renderWithProviders(<LaunchSweep />)
+    await fillIn()
+
+    expect(await screen.findByText(/entry_ids: at most 50 items/)).toBeInTheDocument()
+    expect(screen.getByText(/still be checked when you press it/i)).toBeInTheDocument()
+    // Not a gate: the launch is checked again by the server.
+    expect(screen.getByRole('button', { name: /run the sweep/i })).toBeEnabled()
+  })
+
+  it('drops a failure the moment the form stops asking it', async () => {
+    // The failure's own copy of the stale-verdict rule. A failed request carries no `asked` to
+    // compare, so it is matched against the question the query is keyed on — and asserted
+    // synchronously for the same reason as above: after the debounce the old error goes away
+    // by itself, and waiting would pass with the comparison deleted.
+    previewSweep.mockRejectedValueOnce(new ApiError(422, 'entry_ids: at most 50 items'))
+    previewSweep.mockReturnValue(new Promise<SweepPreview>(() => undefined))
+    renderWithProviders(<LaunchSweep />)
+    await fillIn()
+    expect(await screen.findByText(/entry_ids: at most 50 items/)).toBeInTheDocument()
+
+    fireEvent.change(screen.getByLabelText('From'), { target: { value: '2025-02-01' } })
+
+    expect(screen.queryByText(/entry_ids: at most 50 items/)).not.toBeInTheDocument()
   })
 })
 

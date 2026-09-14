@@ -2263,3 +2263,11 @@ e hoje ele mede o arquivo como a suíte o deixou.
 
   Quando for feito: é migração, não bump. A prova são os 825 testes web **e** os e2e, que desde a
   `#229` rodam no CI — e ver [[e2e-local-passa-contra-outro-app]] antes de confiar num verde local.
+
+- [origem: PR-248] **O ensaio do estudo tem os dois furos que a #248 fechou no da varredura.**
+  (1) `useStudyRehearsal`/`useStudyPreview` não olham `isError`: um `POST /studies/preview` que
+  falha cai na resposta vazia, que é a cara de "tudo certo" — sem aviso, sem "Checking…", botão
+  vivo. (2) `useStudyPreview` carrega só a `grid` na resposta, mas a chave também tem `strategyId`
+  e `timeframe`; hoje não fura porque não há `placeholderData`, e com ele ligado trocar o time
+  frame passaria na comparação. A varredura carrega o request inteiro e mostra a falha à parte,
+  sem bloquear — o formato a copiar está em `apps/web/src/sweep/preview.ts`.

@@ -296,8 +296,21 @@ export function LaunchSweep(): React.JSX.Element {
           </div>
         )}
 
-        {serverError !== null && uncovered.length === 0 && (
+        {/* ⚠️ Printed only when neither of the others already said it. The server fills `error`
+            beside `uncovered` on a coverage gap, and repeats the cap the form already refused —
+            so without both guards one no reaches the reader twice, in two different wordings. */}
+        {serverError !== null && uncovered.length === 0 && local === null && (
           <p className="text-sm text-amber-300">{serverError}</p>
+        )}
+
+        {/* ⚠️ **A failed check is not a passed one.** Without this line a preview that errored
+            fell through to the empty answer — no warning, no "Checking…", a live button — which
+            is exactly what "nothing wrong with this sweep" looks like. It does not block: the
+            launch is checked again by the server, and a flaky preview must not hold that hostage. */}
+        {rehearsal.failure !== null && (
+          <p className="text-sm text-amber-300">
+            {rehearsal.failure} The launch will still be checked when you press it.
+          </p>
         )}
 
         {create.isError && <p className="text-sm text-red-400">{launchFailure(create.error)}</p>}

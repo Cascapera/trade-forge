@@ -8,6 +8,7 @@
 
 import { useEffect, useState } from 'react'
 
+import { apiFailure } from '../api/failure'
 import { useSweepPreview } from '../api/hooks'
 import type { GridRefusal, SweepEntryPreview, UncoveredMarket } from '../api/types'
 
@@ -34,8 +35,22 @@ export interface SweepRehearsal {
   /** (symbol, timeframe) pairs with no candles in this window. ⚠️ Not a refusal to fix by
    *  editing: the fix is a backfill, or a different window. */
   uncovered: UncoveredMarket[]
-  /** Set when the sweep cannot be launched at all — over the cap, or nothing runnable. */
+  /**
+   * Set when the sweep cannot be launched at all — over the cap, nothing runnable, or a market
+   * with no candles. ⚠️ The server fills it on a coverage gap **too**, beside `uncovered`, which
+   * is why the screen only prints it when `uncovered` is empty: otherwise the same no is said
+   * twice, once as a list and once as a sentence. An unknown entry is not here — that is a 404.
+   */
   error: string | null
+  /**
+   * Why the question itself could not be answered — the request failed — or null.
+   *
+   * ⚠️ **Not the same as a preview that found nothing wrong.** A failed request used to fall
+   * through to the empty answer, and the empty answer is what "all clear" looks like: no warning,
+   * no "Checking…", a live button. Reported apart from `error` because it says nothing about the
+   * sweep — only that this early warning is missing. The launch is still checked by the server.
+   */
+  failure: string | null
   /**
    * Whether the answer on hand is about the sweep currently on screen.
    *
@@ -48,7 +63,7 @@ export interface SweepRehearsal {
   asking: boolean
 }
 
-const NOTHING: Omit<SweepRehearsal, 'settled' | 'asking'> = {
+const NOTHING: Omit<SweepRehearsal, 'settled' | 'asking' | 'failure'> = {
   runs: 0,
   entries: [],
   refusals: [],
@@ -92,7 +107,14 @@ export function useSweepRehearsal(form: SweepForm): SweepRehearsal {
   const preview = query.data?.preview
 
   if (preview === undefined) {
-    return { ...NOTHING, settled: wanted === null, asking: query.isFetching }
+    // ⚠️ A failure belongs to the question the query is keyed on, which is `asked`, not
+    // `current`: during the debounce after an edit it is about a sweep nobody is proposing any
+    // more, and it is dropped for the same reason a stale verdict is.
+    const failure =
+      query.isError && asked === current
+        ? apiFailure(query.error, 'Could not check this sweep with the server.')
+        : null
+    return { ...NOTHING, settled: wanted === null, asking: query.isFetching, failure }
   }
 
   return {
@@ -106,6 +128,7 @@ export function useSweepRehearsal(form: SweepForm): SweepRehearsal {
     ),
     uncovered: preview.uncovered,
     error: preview.error,
+    failure: null,
     settled,
     asking: query.isFetching,
   }

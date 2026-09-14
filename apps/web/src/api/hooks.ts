@@ -509,9 +509,10 @@ export function useCreateStudy() {
  *
  * ⚠️ **The answer carries the question it is about.** Read off `asked`, never assumed from the
  * key: the caller debounces, so for as long as the debounce lasts what is in hand is a *true*
- * verdict about a sweep nobody is proposing any more. The study's copy of this notes that its
- * own correctness leans on there being no `placeholderData`; carrying the question removes the
- * dependency on that absence rather than restating it.
+ * verdict about a sweep nobody is proposing any more. It carries the **whole** request, where the
+ * study's copy carries only the grid while its key also holds the strategy and the timeframe —
+ * so with `placeholderData` switched on, a study whose timeframe changed would still pass its
+ * comparison. Carrying everything the key holds leaves no field for that to slip through.
  */
 export function useSweepPreview(request: PreviewSweepRequest | null) {
   return useQuery<{ asked: PreviewSweepRequest; preview: SweepPreview }>({

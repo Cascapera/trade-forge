@@ -810,6 +810,16 @@ class Backtest(Base):
     )
     study: Mapped[Study | None] = relationship(back_populates="backtests")
 
+    # The third, and the one that can sit beside either of the others. A sweep is a basket and a
+    # study at once — several catalogue entries, over several timeframes, over several markets —
+    # so a run it produced is genuinely a member of all of those questions. Independent columns
+    # rather than one `group_id` with a kind, because a run belonging to a sweep *and* nothing
+    # else is the common case and a discriminator would make every reader ask which kind first.
+    sweep_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("sweeps.id", ondelete="SET NULL"), index=True
+    )
+    sweep: Mapped[Sweep | None] = relationship(back_populates="backtests")
+
     timeframe: Mapped[str] = mapped_column(TIMEFRAME, nullable=False)
 
     date_from: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -1575,4 +1585,86 @@ class CatalogEntry(Base):
         # is right to: an index that exists in one and not the other is a plan that changes
         # depending on how the database was built.
         Index("ix_catalog_entries_created_at", "created_at"),
+    )
+
+
+class Sweep(Base):
+    """Several catalogue entries, over several timeframes, over several markets — at once.
+
+    **The product a study and a basket each refuse to take.** A study varies the parameters and
+    holds the market still; a basket varies the market and holds the parameters still. Both exist
+    because one number from one run cannot tell a method apart from a lucky corner, and each
+    attacks that from one direction. A sweep takes both directions at once and adds a third, the
+    timeframe — which is what "run every variation I care about" actually means.
+
+    ⚠️ **What this table makes easy is also the mistake it makes easy, and more so than a study
+    does.** A grid of fifty points searched over five markets and three timeframes is seven
+    hundred and fifty measurements, and the best of them is the best of *seven hundred and fifty
+    draws*. Re-running that winner returns the identical number — the engine is deterministic by
+    invariant, measured on this project's own data as three identical runs trade for trade — so
+    a second look at the same window is not a second opinion. The only honest follow-up is data
+    the winner was **not chosen on**: a walk-forward, another market, a reserved window.
+
+    ⚠️ **The timeframe is written into each point's document, not only onto its run.** Since
+    PR-238 a document and its run must agree under a higher-timeframe filter, because the filter
+    is built from the document's own bar width; a sweep that varied only the run's would produce
+    exactly the disagreement that rule exists to refuse. It also makes the documents distinct per
+    timeframe, which is what lets `strategies_for` keep deduplicating them.
+
+    No `instrument_id`, unlike `Study`: the markets are the sweep's own axis and live in
+    `symbols`. No `cost_model` column either, for the reason `Basket` and `Study` give — the
+    concrete model lands on each run, which is what keeps every point independently reproducible.
+    """
+
+    __tablename__ = "sweeps"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+
+    entry_ids: Mapped[list[Any]] = mapped_column(JSONB, nullable=False)
+    """Which catalogue entries were swept, in the order they were asked for.
+
+    ⚠️ **Ids in a document rather than a join table, and it is a deliberate trade.** A join table
+    would let the database refuse a sweep naming an entry that no longer exists — and that is
+    precisely the wrong answer here: an entry is a *label*, removable by design, and a finished
+    sweep must go on being readable after somebody tidies the shelf. What the runs point at is
+    the strategy document, which is immutable and cannot be deleted out from under them."""
+
+    symbols: Mapped[list[Any]] = mapped_column(JSONB, nullable=False)
+    """The markets, by symbol. Text rather than instrument ids, for the same reason: the sweep
+    records the question that was asked, and the runs record what it resolved to."""
+
+    timeframes: Mapped[list[Any]] = mapped_column(JSONB, nullable=False)
+    """The charts. One is the ordinary case and is not a special case — a list of one."""
+
+    points: Mapped[list[Any]] = mapped_column(JSONB, nullable=False, server_default="[]")
+    """Where each written document sits on the axes: `strategy_id`, `entry_id`, `label`, `values`.
+
+    ⚠️ **Stored, because the alternative is parsing a caption.** A point's document is written
+    under `{entry name} [{label}]` — that name is what a run log row shows, and it is the reason
+    the points are separate lineages at all. Recovering the *coordinates* from it would mean
+    splitting text on brackets and separators, which works until an entry is named so that
+    another's name is a prefix of it, or until a value contains a separator. Both are things a
+    person will do.
+
+    A JSONB list rather than a table, on the same terms as `entry_ids` above: the runs point at
+    immutable documents, and this column records the question, not a set of live references."""
+
+    date_from: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    date_to: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    initial_capital: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+
+    created_at: Mapped[dt.datetime] = _created_at()
+
+    backtests: Mapped[list[Backtest]] = relationship(back_populates="sweep", passive_deletes="all")
+
+    __table_args__ = (
+        # Each axis is a JSON array, never an object or a bare value. The same argument the
+        # catalogue's grid CHECK makes: JSONB stores any of those happily, and the expansion
+        # would meet its first surprise inside the transaction that is already writing runs.
+        CheckConstraint("jsonb_typeof(entry_ids) = 'array'", name="entries_are_a_list"),
+        CheckConstraint("jsonb_typeof(symbols) = 'array'", name="symbols_are_a_list"),
+        CheckConstraint("jsonb_typeof(timeframes) = 'array'", name="timeframes_are_a_list"),
+        CheckConstraint("jsonb_typeof(points) = 'array'", name="points_are_a_list"),
+        CheckConstraint("date_to > date_from", name="a_window_runs_forwards"),
+        Index("ix_sweeps_created_at", "created_at"),
     )

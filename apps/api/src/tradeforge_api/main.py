@@ -33,6 +33,7 @@ from tradeforge_api.routers import (
     live_sessions,
     strategies,
     studies,
+    sweeps,
     symbols,
     walkforwards,
 )
@@ -123,6 +124,7 @@ def create_app(
     app.include_router(live_sessions.router)
     app.include_router(baskets.router)
     app.include_router(studies.router)
+    app.include_router(sweeps.router)
     app.include_router(walkforwards.router)
     app.include_router(ws.router)
 

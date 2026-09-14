@@ -46,6 +46,10 @@ EXPECTED_TABLES = {
     "catalog_entries",
     "baskets",
     "studies",
+    # Several entries, over several timeframes, over several markets — the product a
+    # study and a basket each refuse to take. Beside them rather than folded into either,
+    # because a run can belong to a sweep and to nothing else.
+    "sweeps",
     "walk_forwards",
     "walk_forward_folds",
     "backtests",

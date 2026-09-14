@@ -30,6 +30,12 @@ TABLES_CHILD_FIRST = (
     "backtest_metrics",
     "backtests",
     "baskets",
+    # The third grouping, beside `baskets` and `studies`, and here for the reason they are:
+    # after `backtests`, which points at it. A sweep row left behind is not inert — it is a
+    # parent the next test's runs could attach to. ⚠️ Unlike `catalog_entries` below it, this
+    # table holds **no** foreign key to `strategies`: the strategy ids in `points` are text
+    # inside JSONB, which is the trade `rev_0018` makes so a finished sweep stays readable.
+    "sweeps",
     # ⚠️ Before `strategies`, which it points at with a RESTRICT foreign key — so a row
     # left behind does not merely linger, it makes the next test unable to empty
     # `strategies` at all. Added with the table; the two lists above it drifted once

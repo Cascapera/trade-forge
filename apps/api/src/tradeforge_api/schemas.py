@@ -1601,3 +1601,135 @@ class CatalogEntryOut(BaseModel):
 class CatalogPage(BaseModel):
     total: int
     items: list[CatalogEntryOut]
+
+
+class CreateSweep(BaseModel):
+    """Run several catalogue entries, over several charts, over several markets."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    entry_ids: list[uuid.UUID] = Field(min_length=1, max_length=50)
+    """Which entries to sweep. One is the ordinary case and is not a special case."""
+
+    symbols: list[Symbol] = Field(min_length=1, max_length=_MAX_SYMBOLS)
+    """The markets. Unlike a basket, one market is legal here: a sweep of one entry over one
+    market across three timeframes is a coherent question, and it is a study's shape plus a
+    chart axis."""
+
+    timeframes: list[Timeframe] = Field(min_length=1, max_length=8)
+    """The charts. ⚠️ Each becomes a **document** of its own, not merely a run parameter — since
+    PR-238 a document and its run must agree under a higher-timeframe filter."""
+
+    date_from: dt.datetime
+    date_to: dt.datetime
+    initial_capital: Decimal = Field(gt=0)
+    cost_model: dict[str, Any]
+
+
+class PreviewSweepRequest(BaseModel):
+    """Ask what a sweep would enqueue, before any of it is enqueued.
+
+    ⚠️ **The window is here, and the first draft left it out.** That draft's comment said the
+    dates "only decide how long each run reads for" — and the first real sweep launched against
+    this project's own data proved it false: nine of twelve runs failed because the symbol had no
+    candles in the window at all, each at the cost of a worker discovering what the `datasets`
+    index already knew. Coverage is per (symbol, timeframe), so the window decides whether a run
+    can happen at all, not merely how much it reads.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    entry_ids: list[uuid.UUID] = Field(min_length=1, max_length=50)
+    symbols: list[Symbol] = Field(min_length=1, max_length=_MAX_SYMBOLS)
+    timeframes: list[Timeframe] = Field(min_length=1, max_length=8)
+    date_from: dt.datetime
+    date_to: dt.datetime
+
+
+class SweepEntryPreview(BaseModel):
+    """What one entry contributes, and why some of it may not run."""
+
+    entry_id: uuid.UUID
+    name: str
+    points: int
+    """Its grid's own size — before the timeframes and the markets multiply it."""
+    refusals: list[GridRefusal]
+    """Combinations this entry cannot run, each with the reason in the DSL's own words.
+
+    ⚠️ Reported per entry rather than pooled, because a sweep holds several and `htf must be
+    coarser than H4` says nothing about which shelf label caused it."""
+
+
+class UncoveredMarket(BaseModel):
+    """One (symbol, timeframe) with no candles inside the requested window."""
+
+    symbol: str
+    timeframe: str
+    covers: str | None
+    """What the dataset does hold, as `2025-01-01 to 2026-07-31` — or `None` when nothing of
+    this pair has ever been collected. ⚠️ The two are different failures with different fixes:
+    one is a window to move, the other is a backfill to run."""
+
+
+class SweepPreview(BaseModel):
+    """What a sweep would produce, asked before anything is produced.
+
+    ⚠️ `runs` counts what would actually be **enqueued** — refused combinations are already
+    subtracted. A number that included them would be a promise the launch does not keep.
+    """
+
+    runs: int
+    documents: int
+    """Strategy documents the sweep would write: entries x timeframes x points, before markets."""
+    entries: list[SweepEntryPreview]
+    uncovered: list[UncoveredMarket]
+    """Markets and charts with no data in this window — refused by the launch, not dropped.
+
+    ⚠️ Reported rather than subtracted from `runs`, because the launch refuses the whole request
+    over them. A number that quietly excluded them would describe a sweep nobody can start."""
+    error: str | None = None
+    """Set when the sweep cannot be launched at all — an unknown entry, a grid that leads
+    nowhere, a product over the cap. A different kind of no: there is nothing to run."""
+
+
+class SweepRunOut(BaseModel):
+    """One run of a sweep: where it sits on the axes, wrapped around the run itself.
+
+    ⚠️ **The run is carried whole rather than flattened.** `BacktestListItem` is what the run log
+    already renders — symbol, window, costs, status, metrics — and copying those fields up here
+    would be a second description of a run that drifts from the first. What a sweep adds is the
+    *coordinates*, which nothing else knows.
+    """
+
+    entry_id: uuid.UUID
+    entry_name: str
+    """The label from the shelf, which is what makes a sweep readable. It is **not** the
+    strategy's name: that one is inside `run` and is generated from the document."""
+
+    label: str
+    """`M15 · period=9` — a caption. ⚠️ Place a heatmap cell from `values`, never by splitting
+    this: splitting a caption works until a value contains a separator."""
+
+    values: dict[str, Any]
+    """The coordinates, keyed by the grid's own dotted paths plus `timeframe`."""
+
+    run: BacktestListItem
+
+
+class SweepOut(BaseModel):
+    """A sweep read back: the question that was asked, and every run it became."""
+
+    id: uuid.UUID
+    entry_ids: list[uuid.UUID]
+    symbols: list[str]
+    timeframes: list[str]
+    date_from: dt.datetime
+    date_to: dt.datetime
+    initial_capital: Decimal
+    created_at: dt.datetime
+    runs: list[SweepRunOut]
+
+
+class CreatedSweep(BaseModel):
+    id: uuid.UUID
+    runs: int

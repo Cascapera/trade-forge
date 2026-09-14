@@ -2210,3 +2210,37 @@ e hoje ele mede o arquivo como a suíte o deixou.
   de procedência, não de execução: o run carrega o time frame certo e é ele que a engine usa.
   Consertar junto com a varredura de vários time frames, que vai precisar de um ponto por time
   frame de qualquer jeito — provavelmente pondo o time frame no **nome** do ponto.
+
+- [origem: PR-240] **Todo fake de fila do repo engole `**options`, e `_job_id` é a idempotência
+  inteira.** O `Protocol` `JobQueue` documenta `**options` com um ⚠️ dizendo que `_job_id` "é o que
+  importa aqui", porque um id derivado da linha torna o enfileiramento **idempotente** — um request
+  que morre no meio de N jobs se recupera reenviando. Mas os nove fakes `_CapturingQueue` /
+  `_FakeQueue` dos testes guardam só `(function, args)`. Medido: apagar `_job_id=` do router de
+  `/sweeps` deixava a suíte inteira verde. Consertado **só no `/sweeps`** (o fake guarda as opções
+  e o teste compara os ids com os run ids); `/studies`, `/baskets`, `/walkforwards`,
+  `/collections`, `/candles`, `/symbols` e `/flow` continuam com a afirmação inobservável. O
+  conserto é um fake compartilhado em `conftest.py` — nove cópias é o que produziu nove buracos
+  iguais. Ver [[fake-que-diverge-do-real]].
+
+- [origem: PR-240] **`date_to precedes date_from` está escrito quatro vezes.** `backtests.py:235`,
+  `baskets.py:101`, `studies.py:284` e agora `sweeps.py` (duas vezes, preview e launch, mas essas
+  duas já saem da mesma função). ⚠️ **E as cópias já divergem**: as três primeiras usam `<`, que
+  aceita janela de duração zero; a do sweep usa `<=`, porque o CHECK `date_to > date_from` de
+  `rev_0018` recusa a igualdade e um `<` ali viraria 500 em vez de 422. Ou seja, não é cópia
+  literal — é uma regra que muda com a tabela, e é por isso que ninguém fundiu ainda. Antes de
+  fatorar, decidir se as outras três tabelas também recusam janela de duração zero; se sim, o
+  helper é um só, se não, são dois e o comentário tem que dizer qual é qual. Ver
+  [[nivel-escrito-tres-vezes]].
+
+- [origem: PR-240] ~~**`sweep_size` é código morto em produção.**~~ ✅ **RESOLVIDO no próprio PR:
+  apagada**, com o teste do teto reancorado nas constantes e perguntando ao `size_refusal` (a função
+  que os dois endpoints chamam). Mantido aqui só pelo raciocínio, que vale para a próxima vez.
+  Era função pura em
+  `apps/api/src/tradeforge_api/sweep.py`, com quatro testes — inclusive o que pegou o teto errado
+  de 2 000 recusando a forma exata para a qual a feature existe (3 entradas x 50 pontos x 3 time
+  frames x 5 mercados = 2 250). Nenhum caminho do router a chama: o router tem o número **exato**
+  na mão (`len(documents) * len(symbols)`), e um previsor é sempre pior que a verdade. O risco não
+  é a função errar, é o `TestTheSize` parecer que guarda o teto enquanto o caminho guardado é
+  outro — e a soma-vs-produto que ela ensinava já estava provada num lugar melhor, no teste de
+  integração com fixture assimétrica (3 e 1 pontos), onde multiplicar as entradas daria 18 em vez
+  de 24. Ver [[teste-que-parece-cobrir-e-nao-separa]].

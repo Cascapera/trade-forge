@@ -2244,3 +2244,22 @@ e hoje ele mede o arquivo como a suíte o deixou.
   outro — e a soma-vs-produto que ela ensinava já estava provada num lugar melhor, no teste de
   integração com fixture assimétrica (3 e 1 pontos), onde multiplicar as entradas daria 18 em vez
   de 24. Ver [[teste-que-parece-cobrir-e-nao-separa]].
+
+- [origem: PR-247] **React 18 → 19, a fazer como UM PR deliberado.** O Dependabot propôs em
+  14/09/2026 e as duas PRs foram fechadas: `#241` (react-dom + @types/react-dom) e `#242` (react +
+  @types/react), ambas para `^19.3.0`. ⚠️ **Nenhuma das duas era mergeável sozinha**: o `react-dom`
+  faz peer **exato** no `react`, então a `#241` sozinha instala react-dom@19 contra react@18 e a
+  `#242` faz o inverso — e as duas reescrevem as mesmas entradas do lock, então a segunda
+  conflitaria com a primeira.
+
+  O repo já encontrou este upgrade uma vez: o comentário no topo do `.github/dependabot.yml`
+  registra que a `#33` chegou como *"bump the js-prod group with 3 updates"* carregando React
+  18 → 19 e reprovou os 25 testes web num element-symbol mismatch. A correção de então — major sai
+  do grupo e vem como PR individual — **funcionou**. O que ela não previu é que `react` e
+  `react-dom` são um **par**: separá-los troca "um major escondido num grupo" por "um major
+  partido em dois pedaços, cada um quebrado sozinho". Se valer a pena ensinar isso ao dependabot,
+  o mecanismo é um grupo só para esse par, com `update-types: [major]` — ao contrário dos grupos
+  de cima, aqui agrupar é o que **revela** o major em vez de escondê-lo.
+
+  Quando for feito: é migração, não bump. A prova são os 825 testes web **e** os e2e, que desde a
+  `#229` rodam no CI — e ver [[e2e-local-passa-contra-outro-app]] antes de confiar num verde local.

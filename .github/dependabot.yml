@@ -69,3 +69,20 @@ updates:
       js-prod:
         dependency-type: production
         update-types: [minor, patch]
+    ignore:
+      # TypeScript majors are held until the linter says it supports them.
+      #
+      # #228 pinned TypeScript back to 6.0.3 because `typescript-eslint` declares
+      # `peerDependencies.typescript: >=4.8.4 <6.1.0` and the repo was running 7.0.2 —
+      # outside the range, with `npm ci` not recalculating peers, so the lock hid it and
+      # nothing ever went red. That pin held the version but not the proposal: #243 arrived
+      # a week later offering 7.0.2 again, and would have arrived every week after.
+      #
+      # ⚠️ **The trigger for lifting this is `typescript-eslint` widening that peer, not a
+      # newer TypeScript.** Check with:
+      #   npm view typescript-eslint peerDependencies.typescript
+      # When the range admits 7, delete this block and take the major deliberately — a
+      # TypeScript major is migration work, which is the same reason majors are kept out of
+      # the groups above.
+      - dependency-name: typescript
+        update-types: [version-update:semver-major]

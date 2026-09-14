@@ -301,7 +301,11 @@ class TestReadingItBack:
         entry = an_entry(client, name=f"doomed {uuid.uuid4()}")
         launched = client.post("/sweeps", json=a_sweep_body([entry], ["EURUSD"], ["M15"]))
 
-        assert client.delete(f"/catalog/{entry}").status_code == 204
+        # ⚠️ The removal is its own statement, not an expression inside the `assert`. Under
+        # `python -O` asserts are stripped — the entry would never be deleted and this would go
+        # on passing as a test of something else entirely.
+        removed = client.delete(f"/catalog/{entry}")
+        assert removed.status_code == 204
 
         read = client.get(f"/sweeps/{launched.json()['id']}")
         assert read.status_code == 200

@@ -197,16 +197,26 @@ def list_strategies(  # noqa: PLR0913 — one query parameter per question a pic
     ⚠️ **A grid's own points are left out by default, and without that this list is unusable.**
     A study writes one strategy per combination (`MME9 [period=5, rr=2]`), so a single
     hundred-point search would bury forty-five authored strategies under a hundred generated
-    ones. Which those are is **derived, never flagged**: a point is a strategy whose runs belong
+    ones. A **sweep** writes one per combination per timeframe, for every entry it was given,
+    which is the same failure an order of magnitude larger.
+
+    Which those are is **derived, never flagged**: a point is a strategy whose runs belong
     to a study, and the study already records that. A boolean column would be a second place for
     the same truth, and on the day the two disagreed it is the column that would be believed.
 
     `include_generated` exists because the exclusion is a default, not a judgement — a reader
     who wants to open the exact document a grid ran has to be able to find it.
     """
+    # ⚠️ **A sweep generates points too, and far more of them.** A study writes one strategy per
+    # grid combination; a sweep writes one per combination *per timeframe*, for every entry it
+    # was given. Left out of this condition, one sweep would bury the authored strategies under
+    # its own points — the exact failure `study_id` was added here to prevent, at a larger scale.
+    # Derived from the runs, never flagged on the row: a boolean column would be a second place
+    # for the same truth, and on the day the two disagreed it is the column that would be
+    # believed.
     generated = (
         select(Backtest.strategy_id)
-        .where(Backtest.study_id.is_not(None))
+        .where(Backtest.study_id.is_not(None) | Backtest.sweep_id.is_not(None))
         .distinct()
         .scalar_subquery()
     )

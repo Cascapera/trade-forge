@@ -41,6 +41,15 @@ describe('App', () => {
     expect(screen.getByRole('heading', { name: 'Strategy catalogue' })).toBeInTheDocument()
   })
 
+  it('routes to the sweep launcher', () => {
+    // ⚠️ Pinned because the catch-all makes a broken route **silent**: `<Route path="*">`
+    // redirects an unknown path to `/`, so renaming this one would land the reader on the
+    // builder with the sidebar link still lit, and nothing would fail.
+    renderWithProviders(<App />, '/sweep')
+
+    expect(screen.getByRole('heading', { name: 'Sweep' })).toBeInTheDocument()
+  })
+
   it('groups the sidebar links under headings', () => {
     renderWithProviders(<App />, '/')
 

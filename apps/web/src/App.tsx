@@ -6,6 +6,7 @@ import { LaunchBacktest } from './screens/LaunchBacktest'
 import { LaunchBasket } from './screens/LaunchBasket'
 import { Results } from './screens/Results'
 import { LaunchStudy } from './screens/LaunchStudy'
+import { LaunchSweep } from './screens/LaunchSweep'
 import { LiveSessions } from './screens/LiveSessions'
 import { RunLog } from './screens/RunLog'
 import { StrategyBuilder } from './screens/StrategyBuilder'
@@ -85,6 +86,9 @@ export function App(): React.JSX.Element {
             <NavLink to="/study" className={navClass}>
               Study
             </NavLink>
+            <NavLink to="/sweep" className={navClass}>
+              Sweep
+            </NavLink>
             <NavLink to="/runs" className={navClass}>
               Run log
             </NavLink>
@@ -138,6 +142,7 @@ export function App(): React.JSX.Element {
             <Route path="/baskets/:id" element={<BasketResult />} />
             <Route path="/study" element={<LaunchStudy />} />
             <Route path="/studies/:id" element={<StudyResult />} />
+            <Route path="/sweep" element={<LaunchSweep />} />
             <Route path="/walkforwards/:id" element={<WalkForwardResult />} />
             <Route path="/collect" element={<CollectSymbol />} />
             <Route path="/runs" element={<RunLog />} />

@@ -23,10 +23,12 @@ import type {
   CreateBasketRequest,
   CreateCollection,
   CreateStudyRequest,
+  CreateSweepRequest,
   CreateWalkForwardRequest,
   CreatedBacktest,
   CreatedBasket,
   CreatedStudy,
+  CreatedSweep,
   CreatedWalkForward,
   EquityPoint,
   Instrument,
@@ -43,6 +45,8 @@ import type {
   SymbolSearch,
   StudyOut,
   StudyPreview,
+  PreviewSweepRequest,
+  SweepPreview,
   TradesPage,
   WalkForwardOut,
 } from './types'
@@ -491,6 +495,37 @@ export function useStudyPreview(
 export function useCreateStudy() {
   return useMutation<CreatedStudy, Error, CreateStudyRequest>({
     mutationFn: (payload) => api.createStudy(payload),
+  })
+}
+
+/**
+ * What this sweep would enqueue, asked while the form is still being filled in.
+ *
+ * The study's preview one axis up, and for the same reason: whether a combination can run is the
+ * DSL's semantics, and those live in Python once. What is new here is that the answer carries
+ * **three** independent noes — a combination the DSL refuses, a (symbol, timeframe) with no
+ * candles in the window, and a product over the cap — and only the first is about the strategy.
+ * A screen that pooled them would send somebody to edit a grid when the fix is a backfill.
+ *
+ * ⚠️ **The answer carries the question it is about.** Read off `asked`, never assumed from the
+ * key: the caller debounces, so for as long as the debounce lasts what is in hand is a *true*
+ * verdict about a sweep nobody is proposing any more. The study's copy of this notes that its
+ * own correctness leans on there being no `placeholderData`; carrying the question removes the
+ * dependency on that absence rather than restating it.
+ */
+export function useSweepPreview(request: PreviewSweepRequest | null) {
+  return useQuery<{ asked: PreviewSweepRequest; preview: SweepPreview }>({
+    queryKey: ['sweep-preview', request],
+    queryFn:
+      request !== null
+        ? async () => ({ asked: request, preview: await api.previewSweep(request) })
+        : skipToken,
+  })
+}
+
+export function useCreateSweep() {
+  return useMutation<CreatedSweep, Error, CreateSweepRequest>({
+    mutationFn: (payload) => api.createSweep(payload),
   })
 }
 

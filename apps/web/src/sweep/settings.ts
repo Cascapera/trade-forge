@@ -7,7 +7,7 @@
 //
 // ⚠️ **Nothing here decides whether a combination is legal.** That is the DSL's semantics, and
 // they live in Python once (`/sweeps/preview`). This file knows only what the form can see: an
-// empty field, a window that runs backwards, a product over the cap.
+// empty field, a window that runs backwards, an entry that has left the shelf.
 
 import type { CatalogEntry, CreateSweepRequest, PreviewSweepRequest } from '../api/types'
 import { apiFailure } from '../api/failure'
@@ -35,12 +35,11 @@ export const emptySweepForm: SweepForm = {
 }
 
 /**
- * The server's own cap, repeated here so the form can refuse before the request is sent.
+ * The server's cap, repeated here **only to be printed** beside the warning about searching.
  *
- * ⚠️ **A repeated constant is a drift risk, and it is taken deliberately — the same trade
- * `MAX_POINTS` makes.** The alternative is a round trip to learn that a product a person can see
- * on screen is too large, which teaches them nothing they could not have been told while typing.
- * The server refuses again regardless, and its refusal is the one that counts.
+ * ⚠️ Not a check. The server caps the runs that will actually be enqueued, after the DSL's
+ * refusals are subtracted, and the form can only count before them — so a form that refused on
+ * this would refuse sweeps the server starts. The preview's `error` says when a sweep is over.
  */
 export const MAX_SWEEP_RUNS = 3000
 
@@ -94,14 +93,15 @@ export function whyNotLaunchable(form: SweepForm, entries: readonly CatalogEntry
   if (form.dateTo <= form.dateFrom) return 'The end of the period must be after its start.'
   if (Number(form.initialCapital) <= 0) return 'Initial capital must be positive.'
 
-  const total = runCount(form, entries)
-  // ⚠️ Refused rather than waved through. A sweep whose size cannot be counted is one whose cap
-  // cannot be checked, and letting it launch on the grounds that no number exceeded the cap is
-  // treating an unanswered question as a passing answer.
-  if (total === null) return 'An entry you chose is no longer on the shelf.'
-  if (total > MAX_SWEEP_RUNS) {
-    return `That is ${String(total)} backtests, over the ${String(MAX_SWEEP_RUNS)} one sweep will run.`
-  }
+  // ⚠️ Refused rather than waved through: the entry is gone from the shelf, so the launch would
+  // come back as a 404 after the click. Said here, where the reader can see which tick to undo.
+  //
+  // ⚠️ **The cap is not checked here, and an earlier draft did.** It capped this count, which is
+  // gross — every combination, including the ones the DSL refuses — while the server caps the
+  // net count, what would actually be enqueued. 3100 combinations with 200 refused is 2900 runs:
+  // the server starts that sweep and the old form refused it. Only the preview knows the net
+  // number, and its sentence already blocks the button.
+  if (runCount(form, entries) === null) return 'An entry you chose is no longer on the shelf.'
   return null
 }
 

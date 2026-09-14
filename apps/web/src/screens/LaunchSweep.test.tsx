@@ -133,7 +133,7 @@ describe('the count on screen', () => {
       expect(screen.getByRole('status')).toHaveTextContent(/no longer on the shelf/i)
     })
     expect(screen.queryByText('0 backtests.')).not.toBeInTheDocument()
-    // And the launch is refused, not waved through on the grounds that no number exceeded the cap.
+    // And the launch is refused here, rather than sent off to come back as a 404.
     expect(screen.getByRole('button', { name: /run the sweep/i })).toBeDisabled()
   })
 })
@@ -182,17 +182,15 @@ describe('the three refusals stay apart', () => {
     expect(screen.getByRole('button', { name: /run the sweep/i })).toBeDisabled()
   })
 
-  it('says the form’s own refusal once, not again in the server’s wording', async () => {
-    // 3001 points x 1 market x 1 chart is one over the cap. The form refuses it before any answer
-    // lands, and the server — asked anyway — refuses it too, in other words. One no, one sentence.
+  it('does not refuse on a count the server does not use', async () => {
+    // ⚠️ **The cap is on what will run, and only the server knows that number.** 3001 points over
+    // one market and one chart, one of them refused by the DSL, is 3000 runs — exactly the cap,
+    // and the server accepts it. A form that capped its own gross count would refuse a sweep the
+    // server starts; this is the shape where the two counts disagree.
     listCatalog.mockResolvedValue({ total: 1, items: [entry('a', 'nine one plain', 3001)] })
-    //
-    // ⚠️ The answer carries a refusal so the test can **see it land**. Waiting only for the call
-    // to be made asserted the silence before the reply had rendered, and passed with the guard
-    // deleted — a machine that had not yet had the chance to speak.
     previewSweep.mockResolvedValue(
       preview({
-        runs: 3001,
+        runs: 3000,
         entries: [
           {
             entry_id: 'a',
@@ -201,17 +199,38 @@ describe('the three refusals stay apart', () => {
             refusals: [{ label: 'M15 · period=5', values: {}, reason: 'nope' }],
           },
         ],
+      }),
+    )
+    renderWithProviders(<LaunchSweep />)
+    await fillIn()
+
+    // Seen landing before the silence is asserted: waiting only for the call asserts the silence
+    // of a machine that has not yet had the chance to speak.
+    await screen.findByText(/will be left out/i)
+    expect(screen.queryByText(/over the 3000/)).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /run the sweep/i })).toBeEnabled()
+  })
+
+  it('refuses a sweep over the cap in the server’s words', async () => {
+    previewSweep.mockResolvedValue(
+      preview({
+        runs: 3001,
         error: 'this sweep expands to 3001 backtests, over the 3000 one sweep will run',
       }),
     )
     renderWithProviders(<LaunchSweep />)
     await fillIn()
 
-    expect(
-      await screen.findByText('That is 3001 backtests, over the 3000 one sweep will run.'),
-    ).toBeInTheDocument()
-    await screen.findByText(/will be left out/i)
-    expect(screen.queryByText(/this sweep expands to/)).not.toBeInTheDocument()
+    expect(await screen.findByText(/this sweep expands to 3001 backtests/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /run the sweep/i })).toBeDisabled()
+  })
+
+  it('says the form’s own refusal beside the button', async () => {
+    renderWithProviders(<LaunchSweep />)
+    await fillIn()
+    fireEvent.change(screen.getByLabelText('Initial capital'), { target: { value: '0' } })
+
+    expect(await screen.findByText('Initial capital must be positive.')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /run the sweep/i })).toBeDisabled()
   })
 

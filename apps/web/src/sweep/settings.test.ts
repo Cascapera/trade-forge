@@ -105,31 +105,22 @@ describe('whyNotLaunchable', () => {
     expect(whyNotLaunchable(inverted, entries)).toMatch(/after its start/)
   })
 
-  it('refuses a product over the cap and says its own size', () => {
-    // 2 points x 4 charts x 400 markets = 3200, over the 3000 cap. The number is in the message
-    // because "too big" without it sends a reader back to count their own form.
+  it('leaves the cap to the server, which counts only what will run', () => {
+    // ⚠️ 2 points x 4 charts x 400 markets = 3200 **before** the DSL's refusals, and the cap is on
+    // what is left after them — a number only `/sweeps/preview` has. An earlier draft capped this
+    // gross count and refused sweeps the server would have started. Over the cap is now the
+    // server's sentence, which the screen prints and which blocks its button.
     const markets = Array.from({ length: 400 }, (_, i) => `SYM${String(i)}`)
     const form = aForm({ symbols: markets, timeframes: ['M15', 'H1', 'H4', 'D1'] })
 
-    const refusal = whyNotLaunchable(form, entries)
-
-    expect(refusal).toMatch(/3200/)
-    expect(refusal).toMatch(new RegExp(String(MAX_SWEEP_RUNS)))
-  })
-
-  it('admits a sweep exactly at the cap', () => {
-    // ⚠️ The other side of the edge. Without it, this test file passes for a cap applied with
-    // `>=`, which would refuse the largest sweep the message says is allowed.
-    const markets = Array.from({ length: 1500 }, (_, i) => `SYM${String(i)}`)
-    const form = aForm({ symbols: markets, timeframes: ['M15'] })
-
-    expect(runCount(form, entries)).toBe(MAX_SWEEP_RUNS)
+    expect(runCount(form, entries)).toBeGreaterThan(MAX_SWEEP_RUNS)
     expect(whyNotLaunchable(form, entries)).toBeNull()
   })
 
   it('refuses rather than waves through a sweep it cannot count', () => {
-    // An uncountable sweep is one whose cap was never checked. Treating "no number exceeded the
-    // cap" as "the cap was satisfied" is exactly the unanswered-question-as-answer defect.
+    // An entry gone from the shelf is a launch the server answers with a 404 after the click.
+    // Treating "no number came back" as "nothing is wrong" is the unanswered-question-as-answer
+    // defect.
     const form = aForm({ entryIds: ['a', 'gone'] })
 
     expect(whyNotLaunchable(form, entries)).toMatch(/no longer on the shelf/)

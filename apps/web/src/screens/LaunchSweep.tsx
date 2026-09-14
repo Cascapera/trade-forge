@@ -49,7 +49,9 @@ export function LaunchSweep(): React.JSX.Element {
   const local = whyNotLaunchable(form, entries)
 
   // ⚠️ **Three refusals, kept apart, because they have three different fixes.** The local one is
-  // about this form — a blank field, a product over the cap — and the screen can decide it alone.
+  // about this form — a blank field, an entry that left the shelf — and the screen can decide it
+  // alone. ⚠️ Not the cap: that is on the runs left after the DSL's refusals, a number only the
+  // server has, so it arrives as the server's `error`.
   // The DSL's is about a combination and is fixed by editing the entry's grid. The coverage gap
   // is about *data*, and nothing on this form will make it go away: the fix is a backfill or a
   // different window. Pooling them into one "cannot run" would send somebody to edit a grid when
@@ -241,7 +243,7 @@ export function LaunchSweep(): React.JSX.Element {
           {/* ⚠️ **A count it could not make is said in words, never as `0`.** `runCount` returns
               null when a ticked entry has left the shelf, and printing that as zero would claim
               a measurement — the reader could not tell "nothing to run" from "I could not
-              count", and the cap would have been checked against a number nobody computed. */}
+              count". */}
           <p className="text-sm text-slate-300" role="status">
             {total === null
               ? 'One of the entries you chose is no longer on the shelf.'
@@ -296,10 +298,10 @@ export function LaunchSweep(): React.JSX.Element {
           </div>
         )}
 
-        {/* ⚠️ Printed only when neither of the others already said it. The server fills `error`
-            beside `uncovered` on a coverage gap, and repeats the cap the form already refused —
-            so without both guards one no reaches the reader twice, in two different wordings. */}
-        {serverError !== null && uncovered.length === 0 && local === null && (
+        {/* ⚠️ Printed only when the list above has not already said it. The server fills `error`
+            beside `uncovered` on a coverage gap, so without this guard one no reaches the reader
+            twice — once as the list of markets, once as a sentence under it. */}
+        {serverError !== null && uncovered.length === 0 && (
           <p className="text-sm text-amber-300">{serverError}</p>
         )}
 

@@ -949,3 +949,77 @@ export interface CreateCatalogEntry {
   strategy_id: string
   grid: Record<string, unknown[]>
 }
+
+/**
+ * Ask what a sweep would enqueue, before any of it is enqueued.
+ *
+ * ⚠️ **The window is part of the question, not a detail of the runs.** Coverage is per
+ * (symbol, timeframe): a pair with no candles inside these dates cannot run at all, which is a
+ * different fact from how much history each run would read. The first real sweep lost nine runs
+ * of twelve to exactly that, each at the cost of a worker discovering what the index knew.
+ */
+export interface PreviewSweepRequest {
+  entry_ids: string[]
+  symbols: string[]
+  timeframes: string[]
+  date_from: string
+  date_to: string
+}
+
+/** What one shelf entry contributes to a sweep, and why some of it may not run. */
+export interface SweepEntryPreview {
+  entry_id: string
+  name: string
+  /** Its grid's own size — before the timeframes and the markets multiply it. */
+  points: number
+  /** ⚠️ Per entry rather than pooled: a sweep holds several, and `htf must be coarser than H4`
+   *  says nothing about which shelf label caused it. */
+  refusals: GridRefusal[]
+}
+
+/**
+ * One (symbol, timeframe) with no candles inside the requested window.
+ *
+ * ⚠️ **A third kind of no, and it must not be shown as the other two.** A DSL refusal is a
+ * combination to fix and a cap is a sweep to shrink; this one is data that was never collected,
+ * or collected for other years. The fix is a backfill or a different window — nothing in the
+ * form will make it go away.
+ */
+export interface UncoveredMarket {
+  symbol: string
+  timeframe: string
+  /** What the dataset does hold, as `2025-01-01 to 2026-07-31` — or `null` when nothing of this
+   *  pair has ever been collected. ⚠️ The two are different failures with different fixes. */
+  covers: string | null
+}
+
+export interface SweepPreview {
+  /** What would actually be **enqueued** — refusals already subtracted. */
+  runs: number
+  /** Strategy documents the sweep would write: entries x timeframes x points, before markets. */
+  documents: number
+  entries: SweepEntryPreview[]
+  /** ⚠️ Reported rather than subtracted from `runs`, because the launch refuses the whole
+   *  request over them. A number that quietly excluded them would describe a sweep nobody can
+   *  start. */
+  uncovered: UncoveredMarket[]
+  /** Set when the sweep cannot be launched at all — a product over the cap, nothing runnable,
+   *  or a coverage gap. ⚠️ On a coverage gap it is filled **beside** `uncovered`, never instead
+   *  of it. An unknown entry never lands here: the endpoint answers that with a 404. */
+  error: string | null
+}
+
+export interface CreateSweepRequest {
+  entry_ids: string[]
+  symbols: string[]
+  timeframes: string[]
+  date_from: string
+  date_to: string
+  initial_capital: string
+  cost_model: Record<string, unknown>
+}
+
+export interface CreatedSweep {
+  id: string
+  runs: number
+}

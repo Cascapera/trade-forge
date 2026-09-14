@@ -16,10 +16,12 @@ import type {
   CreateCatalogEntry,
   CreateCollection,
   CreateStudyRequest,
+  CreateSweepRequest,
   CreateWalkForwardRequest,
   CreatedBacktest,
   CreatedBasket,
   CreatedStudy,
+  CreatedSweep,
   CreatedWalkForward,
   EquityPoint,
   KillSwitch,
@@ -28,6 +30,7 @@ import type {
   LiveSessionsPage,
   OverlaysResponse,
   PreviewStudyRequest,
+  PreviewSweepRequest,
   SessionEventsPage,
   Snapshot,
   StrategiesPage,
@@ -35,6 +38,7 @@ import type {
   StrategyOut,
   StudyOut,
   StudyPreview,
+  SweepPreview,
   SymbolHistory,
   SymbolSearch,
   TradesPage,
@@ -164,6 +168,14 @@ export const api = {
   previewStudy: (payload: PreviewStudyRequest): Promise<StudyPreview> =>
     request('POST', '/studies/preview', payload),
   getStudy: (id: string): Promise<StudyOut> => request('GET', `/studies/${id}`),
+  createSweep: (payload: CreateSweepRequest): Promise<CreatedSweep> =>
+    request('POST', '/sweeps', payload),
+  // The same doctrine as `previewStudy`, one axis up: a POST that writes nothing, asked while
+  // the form is still being filled in. ⚠️ It answers three different noes — a combination the
+  // DSL refuses, a market with no candles in the window, and a product over the cap — and the
+  // screen has to keep them apart, because the fixes are to edit, to collect, and to shrink.
+  previewSweep: (payload: PreviewSweepRequest): Promise<SweepPreview> =>
+    request('POST', '/sweeps/preview', payload),
   // Takes a study, not a grid: the comparison a walk-forward exists to support only holds if
   // both halves searched the same parameter space over the same market, and a grid retyped
   // here could differ by one value while still looking like the same experiment.

@@ -5,7 +5,10 @@ import { MemoryRouter } from 'react-router-dom'
 
 // Render a component inside the providers it expects — a fresh React Query client (retries off,
 // so a mocked rejection surfaces at once) and a memory router at the given path.
-export function renderWithProviders(ui: ReactElement, route = '/'): RenderResult {
+export function renderWithProviders(
+  ui: ReactElement,
+  route = '/',
+): RenderResult & { client: QueryClient } {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   })
@@ -22,6 +25,12 @@ export function renderWithProviders(ui: ReactElement, route = '/'): RenderResult
   // same component in the same position, so `initialEntries` is not re-applied.
   return {
     ...result,
+    // ⚠️ **Handed back so a test can make the server's answer change under a mounted screen.**
+    // Re-pointing a mocked client method does nothing on its own — React Query will not ask
+    // again just because the fixture moved — so a test written that way measures a machine that
+    // was never given the chance to speak. Invalidating through this client is what actually
+    // reproduces "somebody removed that row in another tab".
+    client,
     rerender: (next: ReactNode) => {
       result.rerender(wrap(next))
     },

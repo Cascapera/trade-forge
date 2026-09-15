@@ -73,7 +73,7 @@ export function App(): React.JSX.Element {
               New backtest
             </NavLink>
             <NavLink to="/launch" className={navClass}>
-              Re-run saved
+              Run saved
             </NavLink>
           </Group>
           {/* One strategy over several markets — whether it travels, which no single run can

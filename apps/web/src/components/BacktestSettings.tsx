@@ -9,9 +9,10 @@ const inputClass =
 /**
  * Where and when to run, shared by the builder and the standalone launch screen.
  *
- * The timeframe is not here: it belongs to the strategy document, and whoever owns that renders it.
- * `children` is the slot right after the instrument, so a screen that has no strategy in hand — the
- * launch route, which knows only an id — can put its own timeframe field where it reads naturally.
+ * The timeframe is not a field here: it belongs to the strategy document, and both callers read
+ * it from there. ⚠️ There used to be a `children` slot for the launch route to put its own
+ * timeframe field in, back when that screen held only an id — it now reads the document too, and
+ * a slot nobody fills is an invitation to ask for the chart a second time.
  */
 export function BacktestSettings(props: {
   form: BacktestForm
@@ -25,9 +26,8 @@ export function BacktestSettings(props: {
    * answer, and a note that guessed one would report a span for a series nobody is running.
    */
   timeframe?: string
-  children?: React.ReactNode
 }): React.JSX.Element {
-  const { form, instruments, onChange, timeframe, children } = props
+  const { form, instruments, onChange, timeframe } = props
   const patch = (update: Partial<BacktestForm>): void => {
     onChange({ ...form, ...update })
   }
@@ -49,7 +49,6 @@ export function BacktestSettings(props: {
           onChange(withInstrumentCosts({ ...form, symbol }, next))
         }}
       />
-      {children}
       <label className="flex flex-col gap-1 text-sm">
         Initial capital
         <input

@@ -1,6 +1,8 @@
-// UI state that outlives a single screen: which strategy the user just built and saved, so the
-// launch screen knows what to run. Server state (the strategy row itself, backtests, results)
-// lives in React Query, not here — this holds only the thin thread of the current session.
+// UI state that outlives a single screen: which strategy this person last saved or picked, so the
+// launch, study and basket screens open with it preselected — a default, not the only thing they
+// can run, since each of them picks from the server's list. Server state (the strategy row
+// itself, backtests, results) lives in React Query, not here — this holds only the thin thread of
+// the current session.
 
 import { create } from 'zustand'
 

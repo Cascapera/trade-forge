@@ -2291,3 +2291,14 @@ e hoje ele mede o arquivo como a suíte o deixou.
   `GET /sweeps` (lista), e o run log não carrega `sweep_id` — fechou a aba, o endereço
   `/sweeps/{id}` só volta pelo histórico do navegador. O estudo e a cesta têm o mesmo buraco?
   Conferir antes de decidir se é uma lista por tipo ou uma coluna no run log.
+- [origem: PR-252] **O dataset é de UMA varredura; o ML vai querer várias.** `GET /sweeps/{id}/dataset.csv`
+  e o dicionário são por varredura, porque as colunas `param:` são as da varredura. Juntar varreduras
+  exige decidir a união das colunas e, principalmente, **separar janelas**: é juntando varreduras de
+  períodos diferentes que aparece dado fora da amostra. Fazer depois que houver duas varreduras reais.
+- [origem: PR-252] **Parâmetro não varrido sai vazio no dataset, e o valor real existe.** Uma entrada que
+  não varre `setup.params.period` rodou com o `period` do próprio documento; o CSV deixa a célula
+  vazia (honesto: ninguém escolheu), mas o ML perde um valor conhecido. Opção: coluna preenchida a
+  partir do documento, marcada como "fixo, não varrido". Decidir com o Guilherme.
+- [origem: PR-252] **Características de mercado da janela** (volatilidade, tendência, spread médio)
+  ficaram fora do dataset. São o que permitiria ao ML dizer "este setup funciona em mercado assim";
+  hoje a linha só diz em qual ativo e período. É um cálculo novo sobre as velas, não um export.

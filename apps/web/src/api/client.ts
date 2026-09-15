@@ -215,6 +215,17 @@ export const api = {
 }
 
 /**
+ * The address of a path under the REST API's prefix, for the browser to open itself — a file to
+ * download or a document to read in a new tab, rather than a response for `request` to parse.
+ *
+ * Prefixed from `BASE_URL` for the reason `socketUrl` gives: a link hard-coded to `/api` points at
+ * the wrong host the moment the API is served from anywhere else.
+ */
+export function apiUrl(path: string): string {
+  return `${BASE_URL}${path}`
+}
+
+/**
  * The `ws://` (or `wss://`) address of a path served under the same prefix as the REST API.
  *
  * ⚠️ Derived rather than configured, and derived from `BASE_URL` rather than from the page. The

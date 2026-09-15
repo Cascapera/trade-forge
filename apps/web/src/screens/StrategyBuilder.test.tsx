@@ -4,16 +4,20 @@ import { ApiError } from '../api/client'
 import { useSession } from '../store'
 import { renderWithProviders } from '../test-utils'
 
-const { save, run, opened, saveState } = vi.hoisted(() => ({
+const { save, opened, saveState } = vi.hoisted(() => ({
   save: vi.fn(),
-  run: vi.fn(),
   // What `/strategies/:id` fetched. `undefined` is the plain builder, opened on nothing.
   opened: { data: undefined as { definition: unknown } | undefined },
   // How the save mutation is *resting*, which the mocked hook reads on every render. Mutable
   // because the refusal message is a property of the screen at rest, not of a click: react-query
   // holds the error and the component renders it, so the test has to be able to say "the last
   // save failed, with this" before rendering at all.
-  saveState: { isError: false, error: null as Error | null },
+  saveState: {
+    isError: false,
+    error: null as Error | null,
+    isSuccess: false,
+    data: null as { id: string; name: string; version: number } | null,
+  },
 }))
 
 vi.mock('../api/hooks', () => ({
@@ -22,33 +26,23 @@ vi.mock('../api/hooks', () => ({
     isPending: false,
     isError: saveState.isError,
     error: saveState.error,
+    isSuccess: saveState.isSuccess,
+    data: saveState.data,
   }),
-  useCreateBacktest: () => ({ mutate: run, isPending: false, isError: false, error: null }),
-  useInstruments: () => ({ data: [{ id: 'i1', symbol: 'AAPL' }] }),
-  // The symbol field is a combobox over the broker's catalogue now, so it fetches. Stubbed
-  // with an empty snapshot: these tests type a ticker rather than picking from the list, which
-  // is the path that matters to them, and a real query here would be a network call in jsdom.
-  useSymbolSearch: () => ({ data: { symbols: [], snapshot: null } }),
-  useSyncSymbols: () => ({ mutate: () => undefined, isPending: false }),
-  // The symbol field now also asks how much history the pair has. Stubbed as "never probed",
-  // which is the state these tests are in and the one that renders the least.
-  useSymbolHistory: () => ({ data: undefined, error: null }),
-  useProbeSymbol: () => ({ mutate: () => undefined, isPending: false, isSuccess: false }),
   // The builder asks for a saved strategy whenever the route carries an id.
   useStrategy: () => opened,
 }))
 
 import { StrategyBuilder } from './StrategyBuilder'
 
-/** Fill in what only a person can decide, so the run is otherwise ready. */
+/** Fill in what only a person can decide, so the save is otherwise ready. */
 function answerTheOpenQuestions(side = 'long'): void {
   const sideField = screen.queryByLabelText('setup side')
   if (sideField !== null) fireEvent.change(sideField, { target: { value: side } })
-  fireEvent.change(screen.getByLabelText('Symbol'), { target: { value: 'AAPL' } })
 }
 
-/** Both calls succeed: the strategy is saved, then the backtest is enqueued. */
-function succeed(strategyId = 's1', backtestId = 'b1'): void {
+/** The save succeeds, and hands back the strategy it wrote. */
+function succeed(strategyId = 's1'): void {
   save.mockImplementation(
     (
       payload: { definition: { name: string } },
@@ -57,9 +51,6 @@ function succeed(strategyId = 's1', backtestId = 'b1'): void {
       options.onSuccess({ id: strategyId, name: payload.definition.name })
     },
   )
-  run.mockImplementation((_payload: unknown, options: { onSuccess: (b: { id: string }) => void }) => {
-    options.onSuccess({ id: backtestId })
-  })
 }
 
 // The screen reads the wall clock to stamp a run's name, so the clock is pinned. Built from local
@@ -76,6 +67,8 @@ afterEach(() => {
   opened.data = undefined
   saveState.isError = false
   saveState.error = null
+  saveState.isSuccess = false
+  saveState.data = null
   vi.useRealTimers()
   vi.clearAllMocks()
   useSession.getState().clear()
@@ -219,10 +212,10 @@ describe('the strategy picker', () => {
   })
 })
 
-describe('running the backtest', () => {
-  it('will not start until the questions only a person can answer are answered', () => {
+describe('saving the strategy', () => {
+  it('will not save until the question only a person can answer is answered', () => {
     renderWithProviders(<StrategyBuilder />)
-    const button = screen.getByRole('button', { name: /run backtest/i })
+    const button = screen.getByRole('button', { name: /save strategy/i })
 
     // `side` has no schema default on purpose: the engine classes fall back to long, and a
     // pre-selected field would turn a forgotten choice into a long-only run read as the result.
@@ -230,67 +223,56 @@ describe('running the backtest', () => {
     expect(button).toBeDisabled()
 
     fireEvent.change(screen.getByLabelText('setup side'), { target: { value: 'short' } })
-    expect(button).toBeDisabled()
-    expect(screen.getByText(/choose an instrument/i)).toBeInTheDocument()
-
-    fireEvent.change(screen.getByLabelText('Symbol'), { target: { value: 'AAPL' } })
     expect(button).toBeEnabled()
   })
 
-  it('says why it cannot start when the window is backwards', () => {
-    renderWithProviders(<StrategyBuilder />)
-    answerTheOpenQuestions()
-    fireEvent.change(screen.getByLabelText('from'), { target: { value: '2024-12-31' } })
-    fireEvent.change(screen.getByLabelText('to'), { target: { value: '2024-01-01' } })
-
-    expect(screen.getByText(/window ends before it starts/i)).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /run backtest/i })).toBeDisabled()
-  })
-
-  it('saves the strategy, enqueues the backtest and goes to the results', () => {
-    succeed('s1', 'b1')
+  it('saves the document, and asks nothing about where to run it', () => {
+    succeed('s1')
     renderWithProviders(<StrategyBuilder />)
     fireEvent.change(screen.getByLabelText('strategy'), { target: { value: 'ponto_continuo' } })
     answerTheOpenQuestions()
-    fireEvent.click(screen.getByRole('button', { name: /run backtest/i }))
+    fireEvent.click(screen.getByRole('button', { name: /save strategy/i }))
 
     expect(save).toHaveBeenCalledTimes(1)
     // ⚠️ The document, and only the document. Whether this is a new lineage or the next version
-    // of one is no longer the screen's call — it used to be decided from the id *this tab* had
-    // created, which is exactly why saving a name from another tab was a 409. `useSaveStrategy`
-    // asks the server now, and its own test pins that.
+    // of one is not the screen's call — `useSaveStrategy` asks the server, and its own test pins
+    // that.
     expect(save.mock.calls[0]?.[0]).toMatchObject({
       definition: { setup: { type: 'ponto_continuo', params: { side: 'long', period: 20 } } },
     })
-
-    expect(run).toHaveBeenCalledTimes(1)
-    expect(run.mock.calls[0]?.[0]).toMatchObject({
-      strategy_id: 's1',
-      symbol: 'AAPL',
-      // The strategy's own timeframe, not a second one the screen asked for separately.
-      timeframe: 'H1',
-      date_from: '2024-01-01T00:00:00Z',
-      date_to: '2024-12-31T00:00:00Z',
-      initial_capital: '10000',
-      cost_model: { type: 'none' },
-    })
+    // ⚠️ No market, window or cost on this screen any more: running is New backtest's job, and a
+    // field left here would be a second place to ask for a run nothing on this screen starts.
+    expect(screen.queryByLabelText('Symbol')).not.toBeInTheDocument()
+    // Remembered, so New backtest opens with it preselected.
     expect(useSession.getState().strategyId).toBe('s1')
   })
 
-  it('saves the next version when the same name is run again', () => {
+  it('says it was saved, that it is not on the shelf, and where to run it', () => {
+    saveState.isSuccess = true
+    saveState.data = { id: 's1', name: 'MME9 rompimento', version: 2 }
+    renderWithProviders(<StrategyBuilder />)
+
+    const said = screen.getByText(/not on the shelf until you add it/).closest('p')
+    expect(said).toHaveTextContent('Saved MME9 rompimento v2.')
+    // ⚠️ Both halves of what saving did not do. A reader from the old builder expects a run, and
+    // one who knows the shelf expects an entry — the sentence answers the second, the link the first.
+    expect(within(said as HTMLElement).getByRole('link', { name: /run it in new backtest/i })).toHaveAttribute(
+      'href',
+      '/',
+    )
+  })
+
+  it('saves the next version when the same name is saved again', () => {
     // `POST` always writes version 1 and (name, version) is unique, so iterating on a parameter can
-    // only work as a new version of the same lineage. Without this, nudging the period and running
-    // again would be a 409 every time.
-    succeed('s1', 'b1')
+    // only work as a new version of the same lineage.
+    succeed('s1')
     renderWithProviders(<StrategyBuilder />)
     answerTheOpenQuestions()
-    fireEvent.click(screen.getByRole('button', { name: /run backtest/i }))
+    fireEvent.click(screen.getByRole('button', { name: /save strategy/i }))
 
     fireEvent.change(screen.getByLabelText('setup period'), { target: { value: '21' } })
-    fireEvent.click(screen.getByRole('button', { name: /run backtest/i }))
+    fireEvent.click(screen.getByRole('button', { name: /save strategy/i }))
 
-    // The edited document reaches the save both times; which of them becomes a new version is
-    // `useSaveStrategy`'s decision, taken against the database rather than against this tab.
     expect(save).toHaveBeenCalledTimes(2)
     expect(save.mock.calls[1]?.[0]).toMatchObject({
       definition: { setup: { params: { period: 21 } } },
@@ -298,44 +280,29 @@ describe('running the backtest', () => {
   })
 
   it('starts a fresh lineage when the name changes', () => {
-    succeed('s1', 'b1')
+    succeed('s1')
     renderWithProviders(<StrategyBuilder />)
     answerTheOpenQuestions()
-    fireEvent.click(screen.getByRole('button', { name: /run backtest/i }))
+    fireEvent.click(screen.getByRole('button', { name: /save strategy/i }))
 
     fireEvent.change(screen.getByLabelText('name'), { target: { value: 'MME9 wider stop' } })
-    fireEvent.click(screen.getByRole('button', { name: /run backtest/i }))
+    fireEvent.click(screen.getByRole('button', { name: /save strategy/i }))
 
-    // The new name reaches the save; that a new name starts a new lineage is now a fact the
-    // server settles, not one the screen assumes.
     expect(save.mock.calls[1]?.[0]).toMatchObject({
       definition: { name: 'MME9 wider stop' },
     })
   })
 
-  it('carries the spread through when costs are switched on', () => {
-    succeed()
-    renderWithProviders(<StrategyBuilder />)
-    answerTheOpenQuestions()
-    fireEvent.change(screen.getByLabelText('cost model'), { target: { value: 'spread' } })
-    fireEvent.change(screen.getByLabelText('spread points'), { target: { value: '25' } })
-    fireEvent.click(screen.getByRole('button', { name: /run backtest/i }))
-
-    expect(run.mock.calls[0]?.[0]).toMatchObject({
-      cost_model: { type: 'spread', spread_points: 25 },
-    })
-  })
-
-  it('does not enqueue a backtest when the strategy could not be saved', () => {
+  it('remembers nothing when the strategy could not be saved', () => {
     save.mockImplementation(() => {
       /* the mutation fails, so onSuccess never runs */
     })
     renderWithProviders(<StrategyBuilder />)
     answerTheOpenQuestions()
-    fireEvent.click(screen.getByRole('button', { name: /run backtest/i }))
+    fireEvent.click(screen.getByRole('button', { name: /save strategy/i }))
 
     expect(save).toHaveBeenCalledTimes(1)
-    expect(run).not.toHaveBeenCalled()
+    expect(useSession.getState().strategyId).toBeNull()
   })
 })
 
@@ -354,7 +321,7 @@ describe('building a nested rule on the screen', () => {
 
     succeed()
     answerTheOpenQuestions()
-    fireEvent.click(screen.getByRole('button', { name: /run backtest/i }))
+    fireEvent.click(screen.getByRole('button', { name: /save strategy/i }))
 
     expect(save.mock.calls[0]?.[0]).toMatchObject({
       definition: {
@@ -380,7 +347,7 @@ describe('building a nested rule on the screen', () => {
 
     succeed()
     answerTheOpenQuestions()
-    fireEvent.click(screen.getByRole('button', { name: /run backtest/i }))
+    fireEvent.click(screen.getByRole('button', { name: /save strategy/i }))
     expect(save.mock.calls[0]?.[0]).toMatchObject({
       definition: {
         entry: {
@@ -393,7 +360,7 @@ describe('building a nested rule on the screen', () => {
     // different accessible name from `not` on purpose: the two are different states, and a
     // toggle that kept one name would leave the reader guessing which way it goes.
     fireEvent.click(screen.getByLabelText('Long un-not 0'))
-    fireEvent.click(screen.getByRole('button', { name: /run backtest/i }))
+    fireEvent.click(screen.getByRole('button', { name: /save strategy/i }))
     expect(save.mock.calls[1]?.[0]).toMatchObject({
       definition: {
         entry: { long: { op: 'crosses_above', left: { ref: 'fast' }, right: { ref: 'slow' } } },
@@ -473,7 +440,7 @@ describe('opening a strategy that was already saved', () => {
 
     succeed()
     answerTheOpenQuestions()
-    fireEvent.click(screen.getByRole('button', { name: /run backtest/i }))
+    fireEvent.click(screen.getByRole('button', { name: /save strategy/i }))
 
     expect(save.mock.calls[0]?.[0]).toEqual({ definition: saved })
   })
@@ -565,7 +532,7 @@ describe('editing a condition strategy still works', () => {
 
     succeed()
     answerTheOpenQuestions()
-    fireEvent.click(screen.getByRole('button', { name: /run backtest/i }))
+    fireEvent.click(screen.getByRole('button', { name: /save strategy/i }))
 
     expect(save.mock.calls[0]?.[0]).toMatchObject({
       definition: {
@@ -585,7 +552,7 @@ describe('editing a condition strategy still works', () => {
 
     succeed()
     answerTheOpenQuestions()
-    fireEvent.click(screen.getByRole('button', { name: /run backtest/i }))
+    fireEvent.click(screen.getByRole('button', { name: /save strategy/i }))
 
     const definition = (save.mock.calls[0]?.[0] as { definition: { entry: { long: object } } })
       .definition
@@ -640,7 +607,7 @@ describe('editing a condition strategy still works', () => {
 
     succeed()
     answerTheOpenQuestions()
-    fireEvent.click(screen.getByRole('button', { name: /run backtest/i }))
+    fireEvent.click(screen.getByRole('button', { name: /save strategy/i }))
 
     const definition = (
       save.mock.calls[0]?.[0] as { definition: { indicators: { params: object }[] } }
@@ -702,7 +669,7 @@ describe('editing a condition strategy still works', () => {
 
     succeed()
     answerTheOpenQuestions()
-    fireEvent.click(screen.getByRole('button', { name: /run backtest/i }))
+    fireEvent.click(screen.getByRole('button', { name: /save strategy/i }))
 
     expect(save.mock.calls[0]?.[0]).toMatchObject({
       definition: {
@@ -731,7 +698,7 @@ describe('editing a condition strategy still works', () => {
 
     succeed()
     answerTheOpenQuestions()
-    fireEvent.click(screen.getByRole('button', { name: /run backtest/i }))
+    fireEvent.click(screen.getByRole('button', { name: /save strategy/i }))
 
     expect(save.mock.calls[0]?.[0]).toMatchObject({
       definition: { entry: { long: { left: { ref: 'candle[-3].high' } } } },
@@ -759,7 +726,7 @@ describe('editing a condition strategy still works', () => {
     fireEvent.change(screen.getByLabelText('strategy'), { target: { value: 'ma_cross' } })
     fireEvent.change(screen.getByLabelText('name'), { target: { value: '' } })
     expect(screen.getByText(/not valid yet/i)).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /run backtest/i })).toBeDisabled()
+    expect(screen.getByRole('button', { name: /save strategy/i })).toBeDisabled()
   })
 })
 

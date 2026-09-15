@@ -124,10 +124,11 @@ uv run arq tradeforge_api.worker.WorkerSettings                       # the back
 npm run dev -w @tradeforge/web                                        # the UI at :5173
 ```
 
-**4. Open [http://localhost:5173](http://localhost:5173).** The builder opens on a ready-made
-MA-cross template — click **Save & configure backtest**, pick `EURUSD` and your dates, and
-**Run backtest**. The results screen above is what you get: metrics, the equity curve and every
-trade. (Prefer the terminal? The same flow is three `curl`s — `POST /strategies`,
+**4. Open [http://localhost:5173](http://localhost:5173).** Building and running are two screens:
+in **Catalogue**, **New strategy** opens the builder on a ready-made template — answer its side
+and **Save strategy** (saving does not put it on the shelf; **Add to the catalogue** does). Then
+**Run it in New backtest**, pick `EURUSD` and your dates, and **Run backtest**. The results screen
+above is what you get: metrics, the equity curve and every trade. (Prefer the terminal? The same flow is three `curl`s — `POST /strategies`,
 `POST /backtests`, then poll `GET /backtests/{id}`.)
 
 ### Running the tests

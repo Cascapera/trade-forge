@@ -199,7 +199,7 @@ export function Results(): React.JSX.Element {
         </>
       )}
 
-      <Link to="/launch" className="text-sm text-sky-400 hover:text-sky-300">
+      <Link to="/" className="text-sm text-sky-400 hover:text-sky-300">
         Run another backtest
       </Link>
     </div>

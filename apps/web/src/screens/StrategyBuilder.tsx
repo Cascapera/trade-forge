@@ -9,13 +9,11 @@ import {
   type SetupType,
 } from '@tradeforge/schema'
 import { useMemo, useState } from 'react'
-import { useNavigate, useParams } from 'react-router-dom'
+import { Link, useParams } from 'react-router-dom'
 
 import { ApiError } from '../api/client'
 import { apiFailure } from '../api/failure'
-import { useCreateBacktest, useInstruments, useSaveStrategy, useStrategy } from '../api/hooks'
-import { emptyBacktestForm, toBacktestRequest, whyNotRunnable, type BacktestForm } from '../backtest/settings'
-import { BacktestSettings } from '../components/BacktestSettings'
+import { useSaveStrategy, useStrategy } from '../api/hooks'
 import { NumberStepper } from '../components/NumberStepper'
 import { useSession } from '../store'
 import {
@@ -710,17 +708,13 @@ function SetupFields(props: {
 export function StrategyBuilder(): React.JSX.Element {
   const [choiceId, setChoiceId] = useState(STRATEGY_CHOICES[0]?.id ?? '')
   // The clock enters here and nowhere deeper. Every form factory takes the instant as an argument,
-  // so the name a run is saved under is decided at the moment the strategy is *picked* — see
+  // so the name a strategy is saved under is decided at the moment it is *picked* — see
   // `runName` for why that timing is what keeps versioning working.
   const [form, setForm] = useState<StrategyForm>(() => strategyChoice(choiceId).form(new Date()))
-  const [backtest, setBacktest] = useState<BacktestForm>(emptyBacktestForm)
   const { id: openedId } = useParams<{ id: string }>()
   const opened = useStrategy(openedId)
-  const navigate = useNavigate()
   const session = useSession()
-  const instruments = useInstruments()
   const save = useSaveStrategy()
-  const run = useCreateBacktest()
 
   /**
    * A saved strategy, read back into the form — or the reasons it cannot be shown.
@@ -764,17 +758,23 @@ export function StrategyBuilder(): React.JSX.Element {
   const refs = useMemo(() => refCatalogue(form.indicators), [form.indicators])
   const document = useMemo(() => buildStrategy(form), [form])
   const validation = useMemo(() => validateStrategy(document), [document])
-  const blocked = whyNotRunnable(backtest, instruments.data)
 
   const patch = (update: Partial<StrategyForm>): void => {
     setForm({ ...form, ...update })
   }
 
   /**
-   * Save, then enqueue, then go and watch it.
+   * Save the document — and nothing else.
+   *
+   * ⚠️ **No run, and no shelf.** This builder lives in the catalogue now and only saves: running
+   * a saved strategy is New backtest's job, and putting it on the shelf is "Add to the
+   * catalogue". Saving used to enqueue a backtest in the same click, which made every draft a
+   * run in the log; and it does not add a catalogue entry, because a strategy built and then
+   * disliked should be able to stay off the shelf. The session remembers it, so New backtest
+   * opens with it preselected.
    *
    * The save is a `PUT` whenever this name has been saved before, because the API writes version
-   * 1 on every `POST` and (name, version) is unique — so re-running after nudging a parameter is
+   * 1 on every `POST` and (name, version) is unique — so saving again after nudging a parameter is
    * a *new version* of the same strategy, which is what the lineage in the database was built
    * for. Under a new name it is a `POST` and a new lineage.
    *
@@ -784,17 +784,12 @@ export function StrategyBuilder(): React.JSX.Element {
    * `POST` onto a name that already had a version 1. The lookup lives in `useSaveStrategy`, so
    * every caller of it gets the same answer.
    */
-  const launch = (): void => {
+  const saveIt = (): void => {
     save.mutate(
       { definition: document },
       {
         onSuccess: (strategy) => {
           session.setStrategy(strategy.id, strategy.name)
-          run.mutate(toBacktestRequest(backtest, strategy.id, form.timeframe), {
-            onSuccess: (created) => {
-              void navigate(`/results/${created.id}`)
-            },
-          })
         },
       },
     )
@@ -802,7 +797,7 @@ export function StrategyBuilder(): React.JSX.Element {
 
   return (
     <div className="space-y-6">
-      <h2 className="text-xl font-semibold">Run a backtest</h2>
+      <h3 className="text-lg font-semibold">Build a strategy</h3>
 
       {/* ⚠️ Said out loud, and the form below is left as it was. The tempting alternative is to
           show the parts that could be read and let the reader carry on — which hands them a form
@@ -1048,18 +1043,6 @@ export function StrategyBuilder(): React.JSX.Element {
         )}
       </section>
 
-      <section className={sectionClass}>
-        <h3 className="mb-3 font-medium">Where and when</h3>
-        {/* The timeframe belongs to the strategy document, so the builder reads it from the
-            form it is editing rather than asking for it a second time. */}
-        <BacktestSettings
-          form={backtest}
-          instruments={instruments.data}
-          onChange={setBacktest}
-          timeframe={form.timeframe}
-        />
-      </section>
-
       {!validation.valid && (
         <section className="rounded-lg border border-amber-800 bg-amber-950/40 p-4 text-sm">
           <p className="mb-2 font-medium text-amber-300">This strategy is not valid yet:</p>
@@ -1073,30 +1056,33 @@ export function StrategyBuilder(): React.JSX.Element {
         </section>
       )}
 
-      {validation.valid && blocked !== null && (
-        // Why the button is disabled, rather than leaving the user to guess which field is at fault.
-        <p className="text-sm text-amber-300">Before running: {blocked}.</p>
-      )}
-
       {save.isError && (
         <p className="text-sm text-red-400">
           The API rejected the strategy — {saveRefusal(save.error)}
         </p>
       )}
-      {run.isError && (
-        <p className="text-sm text-red-400">
-          The strategy was saved, but the backtest could not be enqueued —{' '}
-          {`${apiFailure(run.error, 'no reason was given')}.`}
+      {/* ⚠️ Says what saving did **not** do, in the same breath as what it did. A reader coming
+          from the old one-click builder expects a run to have started, and one who knows the
+          shelf expects the strategy to be on it — neither is true. The run is one link away; the
+          shelf is "Add to the catalogue", further down this same screen. */}
+      {save.isSuccess && (
+        <p className="text-sm text-emerald-300" role="status">
+          Saved <span className="font-medium">{save.data.name}</span> v{save.data.version}. It is
+          not on the shelf until you add it.{' '}
+          <Link to="/" className="underline hover:text-emerald-200">
+            Run it in New backtest
+          </Link>
+          .
         </p>
       )}
 
       <button
         type="button"
-        disabled={!validation.valid || blocked !== null || save.isPending || run.isPending}
-        onClick={launch}
+        disabled={!validation.valid || save.isPending}
+        onClick={saveIt}
         className="rounded bg-sky-600 px-4 py-2 font-medium text-white enabled:hover:bg-sky-500 disabled:opacity-40"
       >
-        {save.isPending || run.isPending ? 'Starting…' : 'Run backtest'}
+        {save.isPending ? 'Saving…' : 'Save strategy'}
       </button>
     </div>
   )

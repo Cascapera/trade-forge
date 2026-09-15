@@ -9,7 +9,6 @@ import { LaunchStudy } from './screens/LaunchStudy'
 import { LaunchSweep } from './screens/LaunchSweep'
 import { LiveSessions } from './screens/LiveSessions'
 import { RunLog } from './screens/RunLog'
-import { StrategyBuilder } from './screens/StrategyBuilder'
 import { StrategyCatalog } from './screens/StrategyCatalog'
 import { StudyResult } from './screens/StudyResult'
 import { WalkForwardResult } from './screens/WalkForwardResult'
@@ -63,17 +62,14 @@ export function App(): React.JSX.Element {
       <aside className="w-56 shrink-0 border-r border-slate-800 px-2 pb-8">
         <h1 className="px-3 py-4 text-lg font-bold tracking-tight">TradeForge</h1>
         <nav className="flex flex-col">
-          {/* The shelf, and the two ways onto it: build something new, or re-run what is already
-              saved over a different instrument or window — which costs no new version. */}
+          {/* Two places, one job each: the catalogue is where a strategy is built and saved — and,
+              as a separate step, put on the shelf — and a new backtest runs one already saved. */}
           <Group title="Strategies">
             <NavLink to="/catalog" className={navClass}>
               Catalogue
             </NavLink>
             <NavLink to="/" end className={navClass}>
               New backtest
-            </NavLink>
-            <NavLink to="/launch" className={navClass}>
-              Run saved
             </NavLink>
           </Group>
           {/* One strategy over several markets — whether it travels, which no single run can
@@ -132,12 +128,12 @@ export function App(): React.JSX.Element {
       <main className="min-w-0 flex-1 px-8 py-8">
         <div className="mx-auto max-w-5xl">
           <Routes>
-            <Route path="/" element={<StrategyBuilder />} />
-            {/* The same screen, opened on a saved strategy. One component rather than a viewer and
-                an editor, because a builder that cannot show what it produced is how the two drift. */}
-            <Route path="/strategies/:id" element={<StrategyBuilder />} />
+            <Route path="/" element={<LaunchBacktest />} />
+            {/* A saved strategy opens where strategies are built: the catalogue, with the builder
+                already open on it. One builder rather than a viewer and an editor, because a
+                builder that cannot show what it produced is how the two drift. */}
+            <Route path="/strategies/:id" element={<StrategyCatalog />} />
             <Route path="/catalog" element={<StrategyCatalog />} />
-            <Route path="/launch" element={<LaunchBacktest />} />
             <Route path="/basket" element={<LaunchBasket />} />
             <Route path="/baskets/:id" element={<BasketResult />} />
             <Route path="/study" element={<LaunchStudy />} />

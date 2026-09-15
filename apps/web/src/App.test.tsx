@@ -9,15 +9,33 @@ afterEach(() => {
 })
 
 describe('App', () => {
-  it('renders the builder at the root', () => {
+  it('runs a saved strategy at the root', () => {
     renderWithProviders(<App />, '/')
     expect(screen.getByRole('heading', { name: 'TradeForge' })).toBeInTheDocument()
-    expect(screen.getByRole('heading', { name: 'Run a backtest' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'New backtest' })).toBeInTheDocument()
+    // ⚠️ Building is not here any more — it moved to the catalogue.
+    expect(screen.queryByRole('heading', { name: 'Build a strategy' })).not.toBeInTheDocument()
   })
 
-  it('redirects an unknown route to the builder', () => {
+  it('redirects an unknown route to New backtest', () => {
     renderWithProviders(<App />, '/nowhere')
-    expect(screen.getByRole('heading', { name: 'Run a backtest' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'New backtest' })).toBeInTheDocument()
+  })
+
+  it('sends the launch screen’s old address on to where it lives now', () => {
+    // No route of its own: the catch-all already lands `/launch` on `/`, which is now exactly
+    // where that screen is — a dedicated redirect would be a guard nothing could tell apart.
+    renderWithProviders(<App />, '/launch')
+    expect(screen.getByRole('heading', { name: 'New backtest' })).toBeInTheDocument()
+    expect(screen.queryByRole('link', { name: /run saved/i })).not.toBeInTheDocument()
+  })
+
+  it('opens a saved strategy in the catalogue, with the builder open on it', () => {
+    // ⚠️ Pinned for the same reason as the sweep's route: the catch-all makes a broken route
+    // silent, and a row's strategy link landing on New backtest would fail nothing else.
+    renderWithProviders(<App />, '/strategies/s1')
+    expect(screen.getByRole('heading', { name: 'Strategy catalogue' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Build a strategy' })).toBeInTheDocument()
   })
 
   it('routes to the basket launcher', () => {
@@ -43,8 +61,8 @@ describe('App', () => {
 
   it('routes to the sweep launcher', () => {
     // ⚠️ Pinned because the catch-all makes a broken route **silent**: `<Route path="*">`
-    // redirects an unknown path to `/`, so renaming this one would land the reader on the
-    // builder — with "New backtest" lit instead of "Sweep" — and nothing would fail.
+    // redirects an unknown path to `/`, so renaming this one would land the reader on New
+    // backtest — with that link lit instead of "Sweep" — and nothing would fail.
     renderWithProviders(<App />, '/sweep')
 
     expect(screen.getByRole('heading', { name: 'Sweep' })).toBeInTheDocument()

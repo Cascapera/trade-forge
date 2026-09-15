@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { Link } from 'react-router-dom'
+import { useNavigate } from 'react-router-dom'
 
 import { useCatalog, useCreateSweep, useInstruments } from '../api/hooks'
 import type { CatalogEntry } from '../api/types'
@@ -40,6 +40,7 @@ export function LaunchSweep(): React.JSX.Element {
   const catalog = useCatalog()
   const instruments = useInstruments()
   const create = useCreateSweep()
+  const navigate = useNavigate()
 
   const [form, setForm] = useState<SweepForm>(emptySweepForm)
   const entries: CatalogEntry[] = catalog.data?.items ?? []
@@ -86,12 +87,15 @@ export function LaunchSweep(): React.JSX.Element {
         onSubmit={(event) => {
           event.preventDefault()
           if (blocked !== null) return
-          // ⚠️ **It does not navigate to `/sweeps/{id}`, because that screen does not exist yet.**
-          // React Router's catch-all redirects an unknown path to `/`, so routing there would
-          // have landed a person on the builder with no word about the two hundred backtests
-          // they just started — a launch that looks exactly like a click that did nothing.
-          // Reports here instead, and points at the run log, which does show them.
-          create.mutate(toSweepRequest(form))
+          // Straight to the sweep, where its runs land section by section as the worker drains
+          // them — the same move a study makes. Until `/sweeps/:id` existed this reported here
+          // and pointed at the run log, because the router's catch-all would have turned the
+          // navigation into a silent trip to `/`.
+          create.mutate(toSweepRequest(form), {
+            onSuccess: (created) => {
+              void navigate(`/sweeps/${created.id}`)
+            },
+          })
         }}
       >
         <fieldset className="space-y-2">
@@ -316,16 +320,6 @@ export function LaunchSweep(): React.JSX.Element {
         )}
 
         {create.isError && <p className="text-sm text-red-400">{launchFailure(create.error)}</p>}
-        {create.isSuccess && (
-          <p className="text-sm text-emerald-300" role="status">
-            Launched {String(create.data.runs)} backtest{create.data.runs === 1 ? '' : 's'}. They
-            are queued —{' '}
-            <Link to="/runs" className="underline hover:text-emerald-200">
-              watch them in the run log
-            </Link>
-            .
-          </p>
-        )}
       </form>
 
       {/* ⚠️ **The warning that belongs beside this screen and nowhere else.** A study searches one

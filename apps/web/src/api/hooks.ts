@@ -46,6 +46,7 @@ import type {
   StudyOut,
   StudyPreview,
   PreviewSweepRequest,
+  SweepOut,
   SweepPreview,
   TradesPage,
   WalkForwardOut,
@@ -538,6 +539,32 @@ export function useSweepPreview(request: PreviewSweepRequest | null) {
 export function useCreateSweep() {
   return useMutation<CreatedSweep, Error, CreateSweepRequest>({
     mutationFn: (payload) => api.createSweep(payload),
+  })
+}
+
+/**
+ * Whether every run of a sweep has landed — the moment its poll can stop.
+ *
+ * Its own function rather than the study's, for the reason `isStudySettled` gives: the bodies are
+ * different shapes, and one function over a union is a seam where a field added to one of them
+ * silently applies to the other. Here the status sits one level down, inside `run`.
+ */
+export function isSweepSettled(sweep: SweepOut | undefined): boolean {
+  return sweep?.runs.every((row) => isTerminal(row.run.status)) ?? false
+}
+
+/**
+ * One sweep, polled until every run has landed.
+ *
+ * ⚠️ **At the study's cadence, not a basket's, and the sweep is where that matters most.** A sweep
+ * is up to thousands of runs drained by one worker pool, and every response carries all of them —
+ * asking every second would add requests to the very queue being waited on.
+ */
+export function useSweep(id: string | undefined) {
+  return useQuery<SweepOut>({
+    queryKey: ['sweep', id],
+    queryFn: id === undefined ? skipToken : () => api.getSweep(id),
+    refetchInterval: (query) => (isSweepSettled(query.state.data) ? false : STUDY_POLL_MS),
   })
 }
 

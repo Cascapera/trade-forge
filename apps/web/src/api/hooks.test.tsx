@@ -18,10 +18,11 @@ vi.mock('./client', () => ({
   },
 }))
 
-import type { BasketOut } from './types'
+import type { BasketOut, SweepOut } from './types'
 import { api } from './client'
 import {
   isSettled,
+  isSweepSettled,
   isTerminal,
   useBasket,
   useCreateBasket,
@@ -84,6 +85,23 @@ describe('isSettled', () => {
     // The API refuses fewer than two symbols so this cannot be created, but `every` is true of an
     // empty list — reading that as unsettled would be a query polling a shape that cannot happen.
     expect(isSettled(basket())).toBe(true)
+  })
+})
+
+describe('isSweepSettled', () => {
+  function sweep(...statuses: string[]): SweepOut {
+    return { runs: statuses.map((status) => ({ run: { status } })) } as SweepOut
+  }
+
+  it('waits for the last run, reading the status inside each one', () => {
+    // ⚠️ One level down from a basket's: a sweep row wraps the run. Read off the row itself the
+    // status is always undefined, which is never terminal — a poll that never stops, in silence.
+    expect(isSweepSettled(sweep('done', 'queued'))).toBe(false)
+    expect(isSweepSettled(sweep('done', 'failed'))).toBe(true)
+  })
+
+  it('keeps polling while the sweep has not arrived at all', () => {
+    expect(isSweepSettled(undefined)).toBe(false)
   })
 })
 

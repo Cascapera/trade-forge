@@ -26,6 +26,7 @@ from pydantic import (
     ConfigDict,
     Field,
     PlainSerializer,
+    ValidationInfo,
     computed_field,
     field_validator,
     model_validator,
@@ -1625,6 +1626,28 @@ class CreateSweep(BaseModel):
     initial_capital: Decimal = Field(gt=0)
     cost_model: dict[str, Any]
 
+    @field_validator("entry_ids", "symbols", "timeframes")
+    @classmethod
+    def _distinct(cls, values: list[Any], info: ValidationInfo) -> list[Any]:
+        return _distinct_axis(values, info)
+
+
+def _distinct_axis(values: list[Any], info: ValidationInfo) -> list[Any]:
+    """Refuse a sweep axis that names the same value twice.
+
+    ⚠️ **Each of the three breaks something different, and none of them loudly enough.** A
+    repeated symbol enqueues every run twice. A repeated timeframe writes two identical documents
+    that collide on `(name, version)` inside the launch. A repeated entry does the first on a
+    shelf whose strategies already exist, and the second on one whose do not — and on a read, it
+    heads two sections with the same summary of twice the runs. Rejected rather than
+    de-duplicated, for the basket's reason: a caller whose own list disagrees with the sweep it
+    got learns nothing from being quietly corrected.
+    """
+    duplicated = sorted({str(one) for one in values if values.count(one) > 1})
+    if duplicated:
+        raise ValueError(f"{info.field_name} must be distinct; repeated: {', '.join(duplicated)}")
+    return values
+
 
 class PreviewSweepRequest(BaseModel):
     """Ask what a sweep would enqueue, before any of it is enqueued.
@@ -1644,6 +1667,13 @@ class PreviewSweepRequest(BaseModel):
     timeframes: list[Timeframe] = Field(min_length=1, max_length=8)
     date_from: dt.datetime
     date_to: dt.datetime
+
+    @field_validator("entry_ids", "symbols", "timeframes")
+    @classmethod
+    def _distinct(cls, values: list[Any], info: ValidationInfo) -> list[Any]:
+        # The launch's rule, from the same function: a preview that accepted a repeat would
+        # promise twice the runs the launch then refuses to create.
+        return _distinct_axis(values, info)
 
 
 class SweepEntryPreview(BaseModel):
@@ -1716,6 +1746,31 @@ class SweepRunOut(BaseModel):
     run: BacktestListItem
 
 
+class SweepEntryOut(BaseModel):
+    """One shelf entry's share of a sweep, summarised **on its own**.
+
+    ⚠️ **Per entry, never pooled, and that is the decision this schema exists to hold.** Entries
+    are alternatives — `9.1 sem filtro` beside `choch com filtro H4` — so the median of both
+    together is the median of two methods, which describes neither. It is the same refusal a
+    basket makes about summing curves: a number with the shape of an answer to a question
+    nobody asked.
+
+    The summary is the study's, computed by the study's function, so a sweep entry and a study
+    say "median" in the same words and by the same rule. A "point" here is one run: a grid point
+    on one chart over one market.
+    """
+
+    entry_id: uuid.UUID
+    entry_name: str | None
+    """Null when the entry has since been removed from the shelf. Not the name of one of its
+    generated strategies: those carry one point's label, and a section headed by it would read
+    as that point's result."""
+
+    aggregate: StudyAggregate
+    """`best_label` and `worst_label` lead with the symbol (`EURUSD · M15 · period=9`), because
+    the point label alone repeats once per market and would name several runs at once."""
+
+
 class SweepOut(BaseModel):
     """A sweep read back: the question that was asked, and every run it became."""
 
@@ -1727,6 +1782,10 @@ class SweepOut(BaseModel):
     date_to: dt.datetime
     initial_capital: Decimal
     created_at: dt.datetime
+    entries: list[SweepEntryOut]
+    """In the order the request listed the entries — which, from the launch screen, is the order
+    they were **ticked**, not the order the shelf shows them in."""
+
     runs: list[SweepRunOut]
 
 

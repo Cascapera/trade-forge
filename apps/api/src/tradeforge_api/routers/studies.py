@@ -386,7 +386,7 @@ async def create_study(
     )
 
 
-def _aggregate(runs: list[tuple[Backtest, str]], initial_capital: Decimal) -> StudyAggregate:
+def aggregate_points(runs: list[tuple[Backtest, str]], initial_capital: Decimal) -> StudyAggregate:
     """Dispersion across the finished points. Never the maximum alone — see `StudyAggregate`.
 
     A run counts as finished only when it has metrics. `status == done` is not enough on its
@@ -496,8 +496,8 @@ def get_study(study_id: uuid.UUID, session: SessionDep) -> StudyOut:
         # while `points[].label` serves `period=20` leaves a client unable to match the best
         # point to any point. It is the same defect `label_for` was extracted to close, reopened
         # one call site over, and neither suite saw it: the unit tests pass the label *into*
-        # `_aggregate`, so they prove the function rather than its caller.
-        aggregate=_aggregate(
+        # `aggregate_points`, so they prove the function rather than its caller.
+        aggregate=aggregate_points(
             [(run, label_for(values)) for run, _, values in placed], study.initial_capital
         ),
         points=[

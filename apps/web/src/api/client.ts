@@ -38,6 +38,7 @@ import type {
   StrategyOut,
   StudyOut,
   StudyPreview,
+  SweepOut,
   SweepPreview,
   SymbolHistory,
   SymbolSearch,
@@ -170,6 +171,7 @@ export const api = {
   getStudy: (id: string): Promise<StudyOut> => request('GET', `/studies/${id}`),
   createSweep: (payload: CreateSweepRequest): Promise<CreatedSweep> =>
     request('POST', '/sweeps', payload),
+  getSweep: (id: string): Promise<SweepOut> => request('GET', `/sweeps/${id}`),
   // The same doctrine as `previewStudy`, one axis up: a POST that writes nothing, asked while
   // the form is still being filled in. ⚠️ It answers three different noes — a combination the
   // DSL refuses, a market with no candles in the window, and a product over the cap — and the

@@ -1,4 +1,5 @@
 import { fireEvent, screen, within } from '@testing-library/react'
+import { Route, Routes } from 'react-router-dom'
 
 import { ApiError } from '../api/client'
 import type { CatalogEntry, CatalogPage } from '../api/types'
@@ -22,6 +23,17 @@ const { create, remove, state } = vi.hoisted(() => {
 })
 
 vi.mock('../api/hooks', () => ({
+  // The builder lives at the top of this screen now. Resting and never opened on a document:
+  // these tests are about where it is and when it shows, and its own file tests what it does.
+  useSaveStrategy: () => ({
+    mutate: vi.fn(),
+    isPending: false,
+    isError: false,
+    error: null,
+    isSuccess: false,
+    data: undefined,
+  }),
+  useStrategy: () => ({ data: undefined }),
   useCatalog: () => ({ data: state.data, isPending: state.isPending, isError: state.isError }),
   useCreateCatalogEntry: () => ({
     mutate: create,
@@ -325,5 +337,62 @@ describe('removing an entry', () => {
 
     expect(remove).not.toHaveBeenCalled()
     expect(screen.getAllByRole('button', { name: 'Remove' })).toHaveLength(3)
+  })
+})
+
+describe('building a strategy at the top', () => {
+  /** Both addresses this screen answers, so a close can leave one for the other. */
+  function atRoutes(route: string): void {
+    renderWithProviders(
+      <Routes>
+        <Route path="/catalog" element={<StrategyCatalog />} />
+        <Route path="/strategies/:id" element={<StrategyCatalog />} />
+      </Routes>,
+      route,
+    )
+  }
+
+  it('keeps the builder closed until asked for, and closes it again', () => {
+    // ⚠️ Closed by default: the builder is the tallest form in the app, and open it would push
+    // the shelf — what this screen is for — below the fold.
+    state.data = { total: 0, items: [] }
+    atRoutes('/catalog')
+    expect(screen.queryByRole('heading', { name: 'Build a strategy' })).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'New strategy' }))
+    expect(screen.getByRole('heading', { name: 'Build a strategy' })).toBeInTheDocument()
+    // And it says, beside the button, that saving is not shelving.
+    expect(screen.getByText(/reaches the shelf only when you add it/i)).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Close the builder' }))
+    expect(screen.queryByRole('heading', { name: 'Build a strategy' })).not.toBeInTheDocument()
+  })
+
+  it('opens when a row’s strategy link is followed from the list', () => {
+    // ⚠️ **The case the derived `open` exists for, and mounting straight on `/strategies/s1`
+    // cannot see it.** `/catalog` and `/strategies/:id` render this component in the same place,
+    // so React keeps it mounted across the click — a flag initialised from the id once would
+    // already hold `false` from `/catalog` and stay closed. A test that mounts on the address
+    // passes against exactly that flag.
+    state.data = page(SHELF)
+    atRoutes('/catalog')
+    expect(screen.queryByRole('heading', { name: 'Build a strategy' })).not.toBeInTheDocument()
+
+    const [link] = screen.getAllByRole('link', { name: 'MME9-20260910-172055' })
+    fireEvent.click(link!)
+
+    expect(screen.getByRole('heading', { name: 'Build a strategy' })).toBeInTheDocument()
+  })
+
+  it('opens on a strategy a row links to, and closing leaves that address', () => {
+    // ⚠️ Opened by the address, not by the button. Closing has to leave the address: `open` is
+    // derived from it on every render, so without the navigation the builder never closes at all.
+    state.data = { total: 0, items: [] }
+    atRoutes('/strategies/s1')
+    expect(screen.getByRole('heading', { name: 'Build a strategy' })).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Close the builder' }))
+    expect(screen.queryByRole('heading', { name: 'Build a strategy' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'New strategy' })).toBeInTheDocument()
   })
 })

@@ -18,7 +18,20 @@ export const strategy = {
   name: 'MA cross',
   version: 1,
   schema_version: '1.0',
-  definition: {},
+  // ⚠️ The chart is the one field New backtest reads off the document, and it refuses to run a
+  // strategy whose document it cannot read one from.
+  definition: { timeframe: 'H1' },
+  created_at: '2024-01-01T00:00:00Z',
+}
+
+/** The same strategy as one row of `GET /strategies`, which is what New backtest's picker lists. */
+export const strategyRow = {
+  id: 's1',
+  name: 'MA cross',
+  version: 1,
+  schema_version: '1.0',
+  setup: null,
+  runs: 0,
   created_at: '2024-01-01T00:00:00Z',
 }
 
@@ -194,15 +207,22 @@ export async function mockApi(page: Page): Promise<void> {
   await page.route(/\/api\/symbols\/search/, (route) => json(route, symbolSearch))
   // A symbol nobody has probed answers 404, which the note beside the field is built to read.
   await page.route(/\/api\/symbols\/[^/]+\/history/, (route) => json(route, {}, 404))
-  // ⚠️ One path, two questions, and a glob without the query string only ever answered one of
-  // them. `POST` saves the strategy; the builder also `GET`s the same path with a name filter to
-  // find whether this run already has one. Matched by regex so the query comes along, and split
-  // on the method so each answer is the shape its caller expects.
-  await page.route(/\/api\/strategies/, (route) =>
-    route.request().method() === 'POST'
-      ? json(route, strategy, 201)
-      : json(route, { total: 0, limit: 20, offset: 0, items: [] }),
-  )
+  // ⚠️ One path, four questions, and a glob without the query string only ever answered one of
+  // them. `POST` saves the strategy; the builder first `GET`s the list with a `name` filter to
+  // find whether the name already has a lineage (it must not, or the save becomes a `PUT`); New
+  // backtest's picker `GET`s the list without one and must find the strategy just saved; and it
+  // then `GET`s the document itself for the chart. Matched by regex so the query comes along.
+  await page.route(/\/api\/strategies/, (route) => {
+    const request = route.request()
+    if (request.method() === 'POST') return json(route, strategy, 201)
+    const url = new URL(request.url())
+    if (url.pathname.endsWith('/strategies/s1')) return json(route, strategy)
+    return url.searchParams.has('name')
+      ? json(route, { total: 0, limit: 20, offset: 0, items: [] })
+      : json(route, { total: 1, limit: 200, offset: 0, items: [strategyRow] })
+  })
+  // The catalogue is where the journey starts now; an empty shelf is all it needs to read.
+  await page.route('**/api/catalog', (route) => json(route, { total: 0, items: [] }))
   await page.route('**/api/backtests', (route) => json(route, { id: 'b1', status: 'queued' }, 202))
   await page.route('**/api/backtests/b1', (route) => json(route, doneRun))
   await page.route(/\/api\/backtests\/b1\/trades/, (route) => json(route, trades))
@@ -215,25 +235,36 @@ export async function mockApi(page: Page): Promise<void> {
 /**
  * From an empty builder to the results screen, the way a person gets there.
  *
- * ⚠️ One screen, not two. Building the strategy and configuring the run were separate pages once
- * — these specs still clicked a `save & configure` button between them — and are now the same
- * form, whose single button saves and starts the run together.
+ * ⚠️ **Two screens again, for a different reason than before.** Building and running were once
+ * separate pages joined by a `save & configure` button, then one form whose button saved and ran
+ * together (PR-249 and before). Since PR-250 building lives in the catalogue and only saves, and
+ * New backtest runs a strategy that is already saved — so the journey crosses between them.
  */
 export async function runToResults(page: Page): Promise<void> {
-  await page.goto('/')
-  await expect(page.getByRole('heading', { name: 'Run a backtest' })).toBeVisible()
+  await page.goto('/catalog')
+  await page.getByRole('button', { name: 'New strategy' }).click()
+  await expect(page.getByRole('heading', { name: 'Build a strategy' })).toBeVisible()
 
   // ⚠️ `side` has no schema default on purpose — a pre-selected one turns a forgotten choice into
   // a long-only run read as the setup's result — so the button stays disabled until it is
   // answered. Asserting that first is what makes the click below mean anything.
-  const run = page.getByRole('button', { name: /run backtest/i })
-  await expect(run).toBeDisabled()
+  const save = page.getByRole('button', { name: /save strategy/i })
+  await expect(save).toBeDisabled()
   await page.getByLabel('setup side').selectOption('long')
+  await expect(save).toBeEnabled()
+  await save.click()
+
+  // Saved, not run and not shelved — and the way on is the link the builder offers.
+  await page.getByRole('link', { name: /run it in new backtest/i }).click()
+  await expect(page.getByRole('heading', { name: 'New backtest' })).toBeVisible()
+  // Preselected from the save, and its chart read off the document.
+  await expect(page.getByText('as the strategy was written')).toBeVisible()
 
   // The market comes from the broker search, typed and picked the way a person does it.
   await page.getByLabel('Symbol').fill('EUR')
   await page.getByRole('option', { name: /EURUSD/ }).click()
 
+  const run = page.getByRole('button', { name: /run backtest/i })
   await expect(run).toBeEnabled()
   await run.click()
   await expect(page.getByRole('heading', { name: 'Backtest results' })).toBeVisible()

@@ -368,6 +368,28 @@ describe('useSaveStrategy', () => {
     expect(api.createStrategy).not.toHaveBeenCalled()
   })
 
+  it('refreshes the strategy lists once the save lands', async () => {
+    // ⚠️ The builder only saves now, from the catalogue, and the next thing the reader does is go
+    // looking for what they saved — in "Add to the catalogue" or in New backtest. A picker that
+    // was already mounted would otherwise go on offering the list from before the save.
+    vi.mocked(api.listStrategies).mockResolvedValue(page([]))
+    vi.mocked(api.createStrategy).mockResolvedValue({ id: 'new' } as never)
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const invalidate = vi.spyOn(client, 'invalidateQueries')
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    )
+
+    const { result } = renderHook(() => useSaveStrategy(), { wrapper })
+    act(() => {
+      result.current.mutate({ definition: document })
+    })
+
+    await waitFor(() => {
+      expect(invalidate).toHaveBeenCalledWith({ queryKey: ['strategies'] })
+    })
+  })
+
   it('asks about generated names too, because hidden is not free', async () => {
     // A grid's points are left out of the picker, but their names are taken in the database
     // just as hard. A lookup that inherited the picker's default would report a name as free

@@ -81,9 +81,9 @@ export function LaunchBacktest(): React.JSX.Element {
   return (
     <div className="space-y-6">
       <header className="space-y-1">
-        <h2 className="text-xl font-semibold">Run a saved strategy</h2>
+        <h2 className="text-xl font-semibold">New backtest</h2>
         <p className="text-sm text-slate-400">
-          Pick a strategy you have saved, then the market and the window to run it over.
+          Pick a strategy saved in the catalogue, then the market and the window to run it over.
         </p>
       </header>
 

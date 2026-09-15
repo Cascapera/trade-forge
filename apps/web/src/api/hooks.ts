@@ -229,7 +229,18 @@ export function useStrategies(filters: StrategyFilters = {}) {
  * for exactly the names a study had generated.
  */
 export function useSaveStrategy() {
+  const client = useQueryClient()
   return useMutation<StrategyOut, Error, { definition: Strategy }>({
+    // ⚠️ **The lists are invalidated, because saving no longer happens beside a run.** The builder
+    // used to save and launch in one click, and nothing read the strategy list in between. It now
+    // lives in the catalogue and only saves, and the strategy just saved is exactly what the
+    // reader goes looking for next. ⚠️ The one picker that needs this is "Add to the catalogue",
+    // which can be open on the same screen while the builder saves: mounted before the save, it
+    // would go on offering the list from before it. New backtest's picker mounts after the
+    // navigation and refetches on mount anyway (`useStrategies` sets no `staleTime`).
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: ['strategies'] })
+    },
     mutationFn: async ({ definition }) => {
       const taken = await api.listStrategies({
         name: definition.name,

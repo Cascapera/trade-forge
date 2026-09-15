@@ -43,7 +43,8 @@ class TestTheFilterlessDocumentIsNeverRefused:
 
     Without `htf`, `setup_factory` does not pass the document's timeframe to the setup at all,
     and `CompiledStrategy.timeframe` is written once and read nowhere. So these runs are exactly
-    as safe as they have always been, and refusing them would break `Re-run saved`.
+    as safe as they have always been, and refusing them would break Basket and Study, which
+    still ask for a timeframe of their own rather than reading the document's.
     """
 
     @pytest.mark.parametrize("run_at", ["M5", "M15", "M30", "H1", "H4", "D1"])

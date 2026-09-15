@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react'
-import { Link } from 'react-router-dom'
+import { Link, useNavigate, useParams } from 'react-router-dom'
 
 import { apiFailure } from '../api/failure'
 import { useCatalog, useCreateCatalogEntry, useDeleteCatalogEntry } from '../api/hooks'
@@ -9,6 +9,8 @@ import { StrategyPicker } from '../components/StrategyPicker'
 import { count } from '../format'
 import { filterCatalogue, gridSummary } from '../strategy/catalogue'
 import { gridOf, type Axis } from '../study/settings'
+
+import { StrategyBuilder } from './StrategyBuilder'
 
 const inputClass =
   'rounded border border-slate-700 bg-slate-900 px-2 py-1.5 text-sm text-slate-100 focus:border-sky-500 focus:outline-none'
@@ -35,6 +37,14 @@ function day(iso: string): string {
 export function StrategyCatalog(): React.JSX.Element {
   const [text, setText] = useState('')
   const [adding, setAdding] = useState(false)
+  const [building, setBuilding] = useState(false)
+  const navigate = useNavigate()
+  // ⚠️ **Open is derived from the address as well as from the button, never copied from it once.**
+  // `/catalog` and `/strategies/:id` render this same component in the same place, so React keeps
+  // its state across a click from one to the other — a flag initialised from the id would stay
+  // closed when a row's strategy link is followed from the list, which is the main way here.
+  const { id: openedId } = useParams<{ id: string }>()
+  const open = building || openedId !== undefined
 
   const catalog = useCatalog()
   const items = useMemo(() => catalog.data?.items ?? [], [catalog.data])
@@ -54,6 +64,32 @@ export function StrategyCatalog(): React.JSX.Element {
           be asked. An entry with nothing to vary is a single backtest.
         </p>
       </header>
+
+      {/* ⚠️ **Closed until asked for.** The builder is the tallest form in the app, and open by
+          default it would push the shelf — what this screen is for — below the fold. */}
+      <section className="flex flex-col gap-3">
+        <div className="flex flex-wrap items-center gap-3">
+          <button
+            type="button"
+            onClick={() => {
+              setBuilding(!open)
+              // Opened by the address, it can only be closed by leaving the address.
+              if (openedId !== undefined) void navigate('/catalog')
+            }}
+            className="rounded border border-slate-700 px-3 py-1.5 text-sm text-slate-200 hover:border-slate-500"
+          >
+            {open ? 'Close the builder' : 'New strategy'}
+          </button>
+          <p className="text-xs text-slate-500">
+            Saving keeps the strategy; it reaches the shelf only when you add it below.
+          </p>
+        </div>
+        {open && (
+          <div className="rounded-lg border border-slate-800 p-4">
+            <StrategyBuilder />
+          </div>
+        )}
+      </section>
 
       <div className="flex flex-wrap items-end gap-3">
         <label className="flex flex-col gap-1 text-xs text-slate-400">

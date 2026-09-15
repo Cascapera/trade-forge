@@ -6,8 +6,8 @@ from none of them leaves that file green and the hole open.
 
 ⚠️ Each endpoint is asserted with the filtered strategy **and** the filterless one, at the same
 timeframe. Without the second half these tests pass on a router that refuses every timeframe
-disagreement — which would break `Re-run saved` for every strategy that has no higher-timeframe
-filter, and that is most of them.
+disagreement — which would break Basket and Study, which still ask for a timeframe of their own,
+for every strategy that has no higher-timeframe filter, and that is most of them.
 
 Run locally with:  docker compose up -d  &&  uv run pytest -m integration
 """

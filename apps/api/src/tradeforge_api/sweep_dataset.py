@@ -1,10 +1,11 @@
 """A sweep as a dataset: one row per run, and a dictionary that says what every column is.
 
 Two readers, and they fail in different ways. A model fed this file needs a table with nothing
-ambiguous in it — one row per run, an empty cell never standing in for zero, numbers exactly as
-stored. An AI reading it needs to know what each column *is*: which values were chosen, which
-were measured, and which must never be treated as a knob. Without that it optimises a result as
-if it were a parameter, and reads an in-sample number as a forecast.
+ambiguous in it — one row per run, an empty cell never standing in for zero, stored numbers with
+the digits they were stored with and derived ratios computed in `Decimal`, never in float. An AI
+reading it needs to know what each column *is*: which values were chosen, which were measured,
+and which must never be treated as a knob. Without that it optimises a result as if it were a
+parameter, and reads an in-sample number as a forecast.
 
 ⚠️ **The file and its dictionary come from one list, `columns_for`.** A dictionary written by hand
 beside the file describes yesterday's file the first time a column is added. Generated from the
@@ -32,7 +33,8 @@ from tradeforge_db.models import Backtest
 Role = Literal["identity", "choice", "condition", "outcome"]
 """What a column is *for*, which is what a reader most needs and cannot infer from a name.
 
-* `identity` — which row this is. For grouping and reproducing, never a feature.
+* `identity` — which row this is: for grouping, splitting and reproducing. Not a feature, except
+  `entry_id`, which may stand in for "which method" as a categorical one.
 * `choice` — what was decided before the run: the market, the chart, the grid's values.
 * `condition` — under what the run was measured: the window, the capital, the costs.
 * `outcome` — what the run produced. The thing to explain, never an input to explain it with.
@@ -60,12 +62,12 @@ CAVEATS: tuple[str, ...] = (
     "best row is the best of this many draws, not a forecast; evidence needs a window that no row "
     "was chosen on.",
     "Entries are alternative methods. Do not pool their rows into one average: compare within an "
-    "entry, or treat entry_id as a feature.",
+    "entry, or treat entry_id as a categorical feature.",
     "Rows of one entry share everything but a parameter value, a chart or a market. Split training "
     "and test data by entry_id or by window, never by row, or the model is graded on near-copies "
     "of what it trained on.",
     "Read every other outcome through total_trades: over a handful of trades any ratio is a draw.",
-    "An empty cell means not yet measured, undefined or not applicable — never zero. In a param: "
+    "An empty cell means not measured, undefined or not applicable — never zero. In a param: "
     "column, empty means the entry does not sweep that path, and `null` means it swept the path "
     "and chose null (the setting off).",
     "A run that failed keeps its row, with its status and error. Dropping it would describe a "
@@ -75,13 +77,15 @@ CAVEATS: tuple[str, ...] = (
 OMITTED: tuple[tuple[str, str], ...] = (
     (
         "max_dd_duration_days",
-        "Stored in whole days, so every intraday drawdown reads 0 — which would say the drawdown "
-        "never lasted. Left out until it is stored at a finer grain.",
+        "Truncated to whole days: a drawdown shorter than 24 hours reads 0, and one of 3 days and "
+        "23 hours reads 3. On intraday charts most drawdowns read 0, which would say they never "
+        "lasted. Left out until it is stored at a finer grain.",
     ),
     (
         "cagr",
-        "Annualises the window. Over a window of weeks that is an extrapolation of a few trades "
-        "to a year, not a measurement.",
+        "The engine computes it only over an equity curve spanning at least a year and leaves it "
+        "empty otherwise, so on most sweeps it would be an empty column. `return` over the "
+        "stated window is the measurement.",
     ),
     (
         "net_profit, gross_profit, gross_loss, max_drawdown_abs, expectancy",
@@ -92,8 +96,8 @@ OMITTED: tuple[tuple[str, str], ...] = (
     ),
     (
         "equity_curve, trades",
-        "Too large for a row. Read per run from /backtests/{run_id}/equity and "
-        "/backtests/{run_id}/trades.",
+        "Too large for a row. Read per run from the API: GET /backtests/{run_id}/equity (once the "
+        "run is done) and GET /backtests/{run_id}/trades (paginated).",
     ),
 )
 
@@ -164,7 +168,7 @@ def _average_duration(row: DatasetRun) -> object:
     return metrics.avg_trade_duration // dt.timedelta(seconds=1)
 
 
-_UNFINISHED = "Empty until the run finishes."
+_DONE_ONLY = "Empty unless the run is done."
 
 _BEFORE_PARAMS: tuple[Column, ...] = (
     Column(
@@ -178,7 +182,7 @@ _BEFORE_PARAMS: tuple[Column, ...] = (
         "run_id",
         "identity",
         "id",
-        "The backtest run; its page is /results/{run_id}.",
+        "The backtest run; its page in the web app is /results/{run_id}.",
         lambda r: r.run.id,
     ),
     Column(
@@ -213,7 +217,8 @@ _BEFORE_PARAMS: tuple[Column, ...] = (
         "engine_version",
         "identity",
         "text",
-        "The engine that produced the outcomes. Rows from different engines are not like for like.",
+        "The engine version stamped on the run when it was launched. Rows stamped with different "
+        "versions are not like for like.",
         lambda r: r.run.engine_version,
     ),
     Column(
@@ -273,29 +278,31 @@ _AFTER_PARAMS: tuple[Column, ...] = (
         "candles_seen",
         "condition",
         "count",
-        "Candles the run actually read — fewer than the window holds when data is missing. "
-        f"{_UNFINISHED}",
+        "Candles the run actually read. Weekends and holidays keep it below the calendar; below "
+        "another run on the same market and chart means missing data. "
+        f"{_DONE_ONLY}",
         lambda r: r.run.candles_seen,
     ),
     Column(
         "first_candle",
         "condition",
         "ISO 8601, UTC",
-        f"The first candle read. {_UNFINISHED}",
+        f"The first candle read. {_DONE_ONLY}",
         lambda r: r.run.first_candle,
     ),
     Column(
         "last_candle",
         "condition",
         "ISO 8601, UTC",
-        f"The last candle read. {_UNFINISHED}",
+        f"The last candle read. {_DONE_ONLY}",
         lambda r: r.run.last_candle,
     ),
     Column(
         "status",
         "outcome",
         "queued | running | done | failed",
-        "Where the run is. Only `done` rows carry the outcomes below.",
+        "Where the run is. Only `done` rows carry the measured outcomes; `failed` rows carry "
+        "`error` instead.",
         lambda r: r.run.status,
     ),
     Column(
@@ -309,43 +316,42 @@ _AFTER_PARAMS: tuple[Column, ...] = (
         "return",
         "outcome",
         "fraction of initial_capital",
-        "Net profit over the starting capital; 0.025 is 2.5%. The comparable result. "
-        f"{_UNFINISHED}",
+        f"Net profit over the starting capital; 0.025 is 2.5%. The comparable result. {_DONE_ONLY}",
         _return,
     ),
     Column(
         "total_trades",
         "outcome",
         "count",
-        f"Closed trades. Read every other outcome through this one. {_UNFINISHED}",
+        f"Closed trades. Read every other outcome through this one. {_DONE_ONLY}",
         _metric("total_trades"),
     ),
     Column(
         "long_trades",
         "outcome",
         "count",
-        f"Closed long trades. {_UNFINISHED}",
+        f"Closed long trades. {_DONE_ONLY}",
         _metric("long_trades"),
     ),
     Column(
         "short_trades",
         "outcome",
         "count",
-        f"Closed short trades. {_UNFINISHED}",
+        f"Closed short trades. {_DONE_ONLY}",
         _metric("short_trades"),
     ),
     Column(
         "win_rate",
         "outcome",
         "fraction of total_trades",
-        f"Trades that closed in profit. {_UNFINISHED} Empty too when the run closed no trade.",
+        f"Trades that closed in profit. {_DONE_ONLY} Empty too when the run closed no trade.",
         _win_rate,
     ),
     Column(
         "payoff",
         "outcome",
         "ratio",
-        f"Average winning trade over average losing trade. {_UNFINISHED} Empty too unless the "
+        f"Average winning trade over average losing trade. {_DONE_ONLY} Empty too unless the "
         "run has at least one winning and one losing trade.",
         _metric("payoff"),
     ),
@@ -353,7 +359,7 @@ _AFTER_PARAMS: tuple[Column, ...] = (
         "profit_factor",
         "outcome",
         "ratio",
-        f"Gross profit over gross loss. {_UNFINISHED} Empty too when no trade lost; 0 when trades "
+        f"Gross profit over gross loss. {_DONE_ONLY} Empty too when no trade lost; 0 when trades "
         "lost and none won.",
         _metric("profit_factor"),
     ),
@@ -361,7 +367,7 @@ _AFTER_PARAMS: tuple[Column, ...] = (
         "expectancy_per_trade",
         "outcome",
         "fraction of initial_capital per trade",
-        f"Average result of one trade over the starting capital. {_UNFINISHED} Empty too when "
+        f"Average result of one trade over the starting capital. {_DONE_ONLY} Empty too when "
         "the run closed no trade.",
         _expectancy_per_trade,
     ),
@@ -369,7 +375,7 @@ _AFTER_PARAMS: tuple[Column, ...] = (
         "max_drawdown_pct",
         "outcome",
         "fraction of peak equity",
-        f"The deepest fall from a running peak, relative to that peak. {_UNFINISHED}",
+        f"The deepest fall from a running peak, relative to that peak. {_DONE_ONLY}",
         _metric("max_drawdown_pct"),
     ),
     Column(
@@ -378,7 +384,7 @@ _AFTER_PARAMS: tuple[Column, ...] = (
         "ratio of per-trade returns, not annualised",
         "Mean per-trade return (net P&L over initial_capital) over its sample standard deviation. "
         "Not annualised: do not read it against annual benchmarks. "
-        f"{_UNFINISHED} Empty too with fewer than two trades, or when every trade returned the "
+        f"{_DONE_ONLY} Empty too with fewer than two trades, or when every trade returned the "
         "same.",
         _metric("sharpe"),
     ),
@@ -388,14 +394,14 @@ _AFTER_PARAMS: tuple[Column, ...] = (
         "ratio of per-trade returns, not annualised",
         "Mean per-trade return over the downside deviation (squared losing returns, summed and "
         "divided by n-1 over all trades). Not annualised. "
-        f"{_UNFINISHED} Empty too with fewer than two trades, or when no trade lost.",
+        f"{_DONE_ONLY} Empty too with fewer than two trades, or when no trade lost.",
         _metric("sortino"),
     ),
     Column(
         "avg_trade_duration_seconds",
         "outcome",
         "seconds",
-        f"How long a trade stayed open, on average. {_UNFINISHED} Empty too when the run closed "
+        f"How long a trade stayed open, on average. {_DONE_ONLY} Empty too when the run closed "
         "no trade.",
         _average_duration,
     ),
@@ -438,10 +444,11 @@ def columns_for(runs: Sequence[DatasetRun]) -> list[Column]:
 def cell(value: object) -> str:
     """One value as the exact text a reader should parse.
 
-    ⚠️ `None` is the only thing that becomes an empty cell. `bool` is checked before anything
-    numeric because it *is* an `int` in Python, and `True` would otherwise print as `True`. A
-    `Decimal` is written in fixed notation: `str` would turn a stored zero into `0E-8`, which
-    parses but puts two spellings of one kind of number in one column.
+    ⚠️ `None` is the only thing that becomes an empty cell. `bool` is checked first because
+    `str(True)` is `True` and this file writes `true`. A timestamp is converted to UTC, so the
+    dictionary's unit holds whatever timezone the database session happened to use. A `Decimal` is
+    written in fixed notation: `str` would turn a stored zero into `0E-8`, which parses but puts
+    two spellings of one kind of number in one column.
     """
     if value is None:
         return ""
@@ -450,7 +457,7 @@ def cell(value: object) -> str:
     if isinstance(value, Enum):
         return str(value.value)
     if isinstance(value, dt.datetime):
-        return value.isoformat()
+        return (value.astimezone(dt.UTC) if value.tzinfo is not None else value).isoformat()
     if isinstance(value, (dict, list)):
         return json.dumps(value, sort_keys=True, separators=(",", ":"))
     return format(value, "f") if isinstance(value, Decimal) else str(value)

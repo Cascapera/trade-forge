@@ -16,6 +16,13 @@ vi.mock('../api/hooks', () => ({
   useEquityCurves: vi.fn(),
 }))
 
+// ⚠️ A prefix the real client never produces. With the real module a test run spells `/api` both
+// ways, so a link hard-coded to `/api/sweeps/…` and one built by `apiUrl` would be indistinguishable
+// here — and the hard-coded one points at the wrong host the day the API moves.
+vi.mock('../api/client', () => ({
+  apiUrl: (path: string) => `https://api.test${path}`,
+}))
+
 // The chart draws to a canvas jsdom lacks. Stubbed to report what it was *asked* to draw, which
 // is what this screen decides — its own test covers the drawing.
 vi.mock('../components/ComparisonChart', () => ({

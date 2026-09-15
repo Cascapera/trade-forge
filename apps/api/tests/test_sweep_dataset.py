@@ -79,6 +79,22 @@ def a_run(  # noqa: PLR0913 — keyword-only; one knob per fact a row is read fr
     )
 
 
+def an_idle_run() -> DatasetRun:
+    """A finished run that closed no trade, carrying the metrics the engine writes for one.
+
+    ⚠️ Not `a_run(total_trades=0)` alone: that keeps the expectancy and duration of a run with
+    trades, and a guard against their being null would then go untested — the null a real idle
+    run carries is exactly what those guards stand between and a `TypeError`.
+    """
+    row = a_run(net_profit="0", total_trades=0, win_rate="0E-8")
+    metrics = row.run.metrics
+    assert metrics is not None
+    metrics.profit_factor = None
+    metrics.expectancy = None
+    metrics.avg_trade_duration = None
+    return row
+
+
 def table(runs: Sequence[DatasetRun]) -> list[dict[str, str]]:
     return list(csv.DictReader(io.StringIO(to_csv(runs))))
 
@@ -110,7 +126,7 @@ class TestTheDictionary:
         assert "not annualised" in units["sortino"]
 
     def test_the_drawdown_duration_is_left_out_and_the_dictionary_says_why(self) -> None:
-        # ⚠️ Stored in whole days, every intraday drawdown reads 0. In a dataset that zero is a
+        # ⚠️ Truncated to whole days, an intraday drawdown reads 0. In a dataset that zero is a
         # claim — "it never lasted" — and a model would learn from it.
         names = header([a_run()])
 
@@ -197,15 +213,22 @@ class TestTheOutcomes:
         assert row["payoff"] == ""
         assert row["short_trades"] == "0"
 
-    def test_a_run_that_closed_no_trade_has_no_win_rate(self) -> None:
-        # ⚠️ The engine stores 0 here, because the column cannot be null. Exported as 0 it reads
-        # as a measured 0% — the one zero in this file that is not a measurement.
-        (idle,) = table([a_run(total_trades=0, win_rate="0E-8")])
-        (busy,) = table([a_run(total_trades=12, win_rate="0E-8")])
+    def test_a_run_that_closed_no_trade_has_no_rates_and_still_writes_its_row(self) -> None:
+        # ⚠️ The engine stores win_rate 0 — the column cannot be null — and leaves expectancy and
+        # duration null. The first would read as a measured 0%; the other two, unguarded, would
+        # raise and take the whole sweep's download down with one idle run.
+        (idle,) = table([an_idle_run()])
 
         assert idle["total_trades"] == "0"
         assert idle["win_rate"] == ""
-        # Twelve trades and no winner is a real 0%, and it stays one.
+        assert idle["expectancy_per_trade"] == ""
+        assert idle["avg_trade_duration_seconds"] == ""
+        assert Decimal(idle["return"]) == 0
+
+    def test_trades_that_all_lost_are_a_real_zero_win_rate(self) -> None:
+        # The other side of the guard above: twelve trades and no winner is a measurement.
+        (busy,) = table([a_run(total_trades=12, win_rate="0E-8")])
+
         assert busy["win_rate"] == "0.00000000"
 
     def test_a_failed_run_keeps_its_row_and_says_why(self) -> None:
@@ -235,6 +258,16 @@ class TestTheCells:
         (row,) = table([a_run(entry_name=name)])
 
         assert row["entry_name"] == name
+
+    def test_a_timestamp_is_written_in_utc_whatever_zone_it_arrived_in(self) -> None:
+        # ⚠️ The dictionary's unit says UTC. What a timestamp arrives in follows the database
+        # session's timezone, which nothing in this project sets — so the file converts rather
+        # than trusting that the server happens to run in UTC.
+        three_hours_behind = dt.timezone(dt.timedelta(hours=-3))
+
+        written = cell(dt.datetime(2024, 1, 1, 0, 0, tzinfo=three_hours_behind))
+
+        assert written == "2024-01-01T03:00:00+00:00"
 
     def test_values_are_written_as_the_exact_text_a_reader_should_parse(self) -> None:
         assert cell(Decimal("0.10000000")) == "0.10000000"

@@ -506,10 +506,15 @@ def _read_sweep(
 
 
 def _dataset_runs(session: SessionDep, sweep_id: uuid.UUID) -> list[DatasetRun]:
-    """The sweep's runs as dataset rows, in the order the screen lists them.
+    """The sweep's runs as dataset rows, in the order `_read_sweep` reads them.
+
+    That is launch time — which ties across a whole sweep, written in one transaction — then
+    strategy name (`{entry} [{label}]`), then symbol. Not the screen's order, which groups the runs
+    by entry as the request listed them.
 
     `entry_name` is null for an entry removed from the shelf — not the generated strategy's name
-    the screen falls back to, which carries one point's label and would name the entry after it.
+    that `SweepRunOut.entry_name` falls back to, which carries one point's label and would name
+    the entry after that point.
     """
     sweep, entries, coordinates, rows = _read_sweep(session, sweep_id)
     out: list[DatasetRun] = []

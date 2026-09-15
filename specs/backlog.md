@@ -2271,3 +2271,10 @@ e hoje ele mede o arquivo como a suíte o deixou.
   e `timeframe`; hoje não fura porque não há `placeholderData`, e com ele ligado trocar o time
   frame passaria na comparação. A varredura carrega o request inteiro e mostra a falha à parte,
   sem bloquear — o formato a copiar está em `apps/web/src/sweep/preview.ts`.
+
+- [origem: PR-249] **Basket e Study ainda perguntam o time frame de uma estratégia salva, com default
+  H1.** A #249 tirou esse campo do `/launch`, que agora lê o `timeframe` do documento: um H4 rodado
+  em H1 é aceito pelo servidor sem filtro HTF e deixa de ser a estratégia montada. `LaunchBasket.tsx`
+  e `study/settings.ts` continuam com o seletor. Decidir com o Guilherme se lá ele também vira
+  leitura do documento — o Sweep só varia gráfico de entradas da **prateleira**, então Basket/Study
+  são hoje o único caminho de mudar o gráfico de uma estratégia salva fora dela.

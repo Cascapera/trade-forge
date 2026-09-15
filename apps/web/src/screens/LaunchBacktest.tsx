@@ -1,7 +1,8 @@
 import { useState } from 'react'
-import { Link, useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router-dom'
 
-import { useCreateBacktest, useInstruments } from '../api/hooks'
+import { apiFailure } from '../api/failure'
+import { useCreateBacktest, useInstruments, useStrategy } from '../api/hooks'
 import {
   emptyBacktestForm,
   toBacktestRequest,
@@ -9,45 +10,67 @@ import {
   type BacktestForm,
 } from '../backtest/settings'
 import { BacktestSettings } from '../components/BacktestSettings'
+import { StrategyPicker } from '../components/StrategyPicker'
 import { useSession } from '../store'
-import { TIMEFRAMES } from '../strategy/builder'
-
-const inputClass =
-  'rounded border border-slate-700 bg-slate-900 px-2 py-1 text-sm text-slate-100 focus:border-sky-500 focus:outline-none'
 
 /**
- * Re-run a strategy already saved this session, over a different instrument or window.
+ * The chart a saved document was written for, or null when it does not say.
  *
- * The builder saves and runs in one go; this exists for the second run, which needs no new version
- * of the strategy — the document has not changed, only where it is pointed. That is also why the
- * timeframe is asked for here: this screen holds an id, not a document, so it cannot read the one
- * the strategy was written for.
+ * ⚠️ **Read off the document, never asked for again.** This screen used to offer its own
+ * timeframe field, defaulting to H1, because it held an id and not a document. That let a
+ * strategy written for H4 be run on H1 — accepted by the server unless a higher-timeframe filter
+ * is involved, and no longer the strategy that was built. Running one saved strategy over a
+ * market is what this screen is for. ⚠️ Varying the chart is the sweep's job **only for entries
+ * on the shelf**; a saved strategy kept off it can still be pointed at another chart through
+ * `/basket` and `/study`, whose own timeframe fields default to H1 (in `specs/backlog.md`).
+ */
+function documentTimeframe(definition: Record<string, unknown> | undefined): string | null {
+  const timeframe = definition?.timeframe
+  return typeof timeframe === 'string' ? timeframe : null
+}
+
+/**
+ * Run a saved strategy over one market and one window.
+ *
+ * ⚠️ **Chosen from what the server holds, not from what this tab remembers.** It used to open
+ * only on the strategy saved in the current browser session and told everybody else to build
+ * something first — after a reload that meant every saved strategy was unreachable from here.
+ * The session still preselects the last one saved, which is the second run this screen began as.
  */
 export function LaunchBacktest(): React.JSX.Element {
   const strategyId = useSession((state) => state.strategyId)
-  const strategyName = useSession((state) => state.strategyName)
+  const setStrategy = useSession((state) => state.setStrategy)
   const instruments = useInstruments()
+  const opened = useStrategy(strategyId ?? undefined)
   const create = useCreateBacktest()
   const navigate = useNavigate()
 
   const [form, setForm] = useState<BacktestForm>(emptyBacktestForm)
-  const [timeframe, setTimeframe] = useState('H1')
 
-  if (strategyId === null) {
-    return (
-      <p className="text-sm text-slate-300">
-        Build and run a strategy first.{' '}
-        <Link to="/" className="text-sky-400 hover:text-sky-300">
-          Go to the builder
-        </Link>
-        .
-      </p>
-    )
-  }
+  const timeframe = documentTimeframe(opened.data?.definition)
 
-  const blocked = whyNotRunnable(form, instruments.data)
+  // ⚠️ The strategy is asked about **before** the form, and each unanswered state is said as
+  // itself. A document still loading and a document that failed to load both leave `timeframe`
+  // null — different facts, and pooling them would call a slow network a broken document.
+  //
+  // A document naming no chart is **not reachable**: the schema makes `timeframe` a required
+  // literal. The branch stays anyway, because of how its absence would fail — `launch` returns
+  // on a null chart, so without a reason here the button would be live and the click would do
+  // nothing, silently. The empty-string guard went for the opposite reason: it failed loudly.
+  const noStrategy =
+    strategyId === null
+      ? 'choose a strategy'
+      : opened.isError
+        ? 'the strategy could not be read'
+        : opened.data === undefined
+          ? 'reading the strategy'
+          : timeframe === null
+            ? 'the strategy does not say which chart it was written for'
+            : null
+  const blocked = noStrategy ?? whyNotRunnable(form, instruments.data)
 
   const launch = (): void => {
+    if (strategyId === null || timeframe === null) return
     create.mutate(toBacktestRequest(form, strategyId, timeframe), {
       onSuccess: (created) => {
         void navigate(`/results/${created.id}`)
@@ -57,41 +80,43 @@ export function LaunchBacktest(): React.JSX.Element {
 
   return (
     <div className="space-y-6">
-      <h2 className="text-xl font-semibold">
-        Backtest <span className="text-sky-400">{strategyName}</span>
-      </h2>
+      <header className="space-y-1">
+        <h2 className="text-xl font-semibold">Run a saved strategy</h2>
+        <p className="text-sm text-slate-400">
+          Pick a strategy you have saved, then the market and the window to run it over.
+        </p>
+      </header>
 
-      <div className="rounded-lg border border-slate-800 bg-slate-900/40 p-4">
+      <div className="space-y-4 rounded-lg border border-slate-800 bg-slate-900/40 p-4">
+        <div className="flex flex-wrap items-end gap-4">
+          <StrategyPicker
+            value={strategyId ?? ''}
+            onChange={(picked) => {
+              setStrategy(picked.id, picked.name)
+            }}
+          />
+          {timeframe !== null && (
+            <p className="pb-1 text-sm text-slate-300">
+              Chart <span className="font-mono text-sky-400">{timeframe}</span>{' '}
+              <span className="text-slate-500">— as the strategy was written</span>
+            </p>
+          )}
+        </div>
+
         <BacktestSettings
           form={form}
           instruments={instruments.data}
           onChange={setForm}
-          timeframe={timeframe}
-        >
-          <label className="flex flex-col gap-1 text-sm">
-            Timeframe
-            <select
-              aria-label="timeframe"
-              className={inputClass}
-              value={timeframe}
-              onChange={(event) => {
-                setTimeframe(event.target.value)
-              }}
-            >
-              {TIMEFRAMES.map((tf) => (
-                <option key={tf} value={tf}>
-                  {tf}
-                </option>
-              ))}
-            </select>
-          </label>
-        </BacktestSettings>
+          {...(timeframe === null ? {} : { timeframe })}
+        />
       </div>
 
       {blocked !== null && <p className="text-sm text-amber-300">Before running: {blocked}.</p>}
 
       {create.isError && (
-        <p className="text-sm text-red-400">Could not enqueue the backtest. Check the fields.</p>
+        <p className="text-sm text-red-400">
+          {apiFailure(create.error, 'Could not enqueue the backtest. Check the fields.')}
+        </p>
       )}
 
       <button

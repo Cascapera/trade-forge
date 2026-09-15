@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react'
 import { useParams } from 'react-router-dom'
 
+import { apiUrl } from '../api/client'
 import { useEquityCurves, useSweep } from '../api/hooks'
 import {
   EMPTY_SEATS,
@@ -77,6 +78,28 @@ export function SweepResult(): React.JSX.Element {
         <p className="text-sm text-slate-400">
           {data.symbols.join(', ')} · {data.timeframes.join(', ')} · {day(data.date_from)} →{' '}
           {day(data.date_to)} · {money(data.initial_capital)} per run
+        </p>
+        {/* ⚠️ The file and its legend, always together. A dataset handed over without the
+            dictionary is the half an AI misreads — it cannot tell a parameter from a result, or
+            an in-sample return from a forecast, by the column's name. Opened by the browser
+            itself: a download and a document, not a response for React Query to hold. */}
+        <p className="mt-2 text-sm">
+          <a
+            href={apiUrl(`/sweeps/${data.id}/dataset.csv`)}
+            download
+            className="text-sky-400 underline hover:text-sky-300"
+          >
+            Download the dataset (CSV)
+          </a>
+          <span className="text-slate-500"> · </span>
+          <a
+            href={apiUrl(`/sweeps/${data.id}/dataset/dictionary`)}
+            target="_blank"
+            rel="noreferrer"
+            className="text-sky-400 underline hover:text-sky-300"
+          >
+            What each column means
+          </a>
         </p>
       </div>
 

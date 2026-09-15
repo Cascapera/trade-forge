@@ -22,7 +22,7 @@ import datetime as dt
 import uuid
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Response, status
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
@@ -37,6 +37,9 @@ from tradeforge_api.runner import ENGINE_VERSION
 from tradeforge_api.schemas import (
     CreatedSweep,
     CreateSweep,
+    DatasetColumnOut,
+    DatasetDictionaryOut,
+    DatasetOmissionOut,
     GridRefusal,
     PreviewSweepRequest,
     SweepEntryOut,
@@ -53,6 +56,7 @@ from tradeforge_api.sweep import (
     points_in,
     size_refusal,
 )
+from tradeforge_api.sweep_dataset import CAVEATS, OMITTED, ROW, DatasetRun, columns_for, to_csv
 from tradeforge_db.models import (
     Backtest,
     BacktestMetrics,
@@ -402,34 +406,7 @@ def get_sweep(sweep_id: uuid.UUID, session: SessionDep) -> SweepOut:
     entry's name is a prefix of another's or a value contains the separator. The first draft of
     this endpoint did exactly that; the column exists because of it.
     """
-    sweep = session.get(Sweep, sweep_id)
-    if sweep is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="sweep not found")
-
-    entries = {
-        str(entry.id): entry
-        for entry in session.scalars(
-            select(CatalogEntry).where(CatalogEntry.id.in_([uuid.UUID(x) for x in sweep.entry_ids]))
-        )
-    }
-    # Keyed by the strategy each point produced, which is the join the runs already carry.
-    coordinates = {str(point["strategy_id"]): point for point in sweep.points}
-
-    rows = session.execute(
-        select(Backtest, Strategy, Instrument)
-        .join(Strategy, Strategy.id == Backtest.strategy_id)
-        .join(Instrument, Instrument.id == Backtest.instrument_id)
-        .where(Backtest.sweep_id == sweep.id)
-        .order_by(Backtest.created_at, Strategy.name, Instrument.symbol)
-        # ⚠️ **The curve is deferred, and on this endpoint that is not an optimisation.** The
-        # screen polls it every few seconds while the runs land, and each response carries every
-        # run: loaded lazily, row by row, with the curve (the largest measured is 856 kB), one
-        # poll of a two-thousand-run sweep would read the whole history of every finished run
-        # to serve fields that never reach the response. The study's read defers it too, as a
-        # column no field of its response reaches; here the poll is what turns that into a bill.
-        # Held by `test_reading_a_sweep_costs_the_same_however_many_runs_it_holds`.
-        .options(selectinload(Backtest.metrics).defer(BacktestMetrics.equity_curve))
-    ).all()
+    sweep, entries, coordinates, rows = _read_sweep(session, sweep_id)
 
     out: list[SweepRunOut] = []
     scored: dict[str, list[tuple[Backtest, str]]] = {one: [] for one in sweep.entry_ids}
@@ -476,4 +453,139 @@ def get_sweep(sweep_id: uuid.UUID, session: SessionDep) -> SweepOut:
         created_at=sweep.created_at,
         entries=summaries,
         runs=out,
+    )
+
+
+_SweepRows = list[tuple[Backtest, Strategy, Instrument]]
+
+
+def _read_sweep(
+    session: SessionDep, sweep_id: uuid.UUID
+) -> tuple[Sweep, dict[str, CatalogEntry], dict[str, dict[str, Any]], _SweepRows]:
+    """A sweep, its surviving shelf entries, its coordinates by strategy, and every run joined.
+
+    ⚠️ **One read for every view of a sweep**, the screen's and the dataset's. The query below
+    carries the guard that keeps a poll from dragging every equity curve out of Postgres, and a
+    second query written for the export would be a second place for that defect to come back.
+    """
+    sweep = session.get(Sweep, sweep_id)
+    if sweep is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="sweep not found")
+
+    entries = {
+        str(entry.id): entry
+        for entry in session.scalars(
+            select(CatalogEntry).where(CatalogEntry.id.in_([uuid.UUID(x) for x in sweep.entry_ids]))
+        )
+    }
+    # Keyed by the strategy each point produced, which is the join the runs already carry.
+    coordinates = {str(point["strategy_id"]): point for point in sweep.points}
+
+    rows = session.execute(
+        select(Backtest, Strategy, Instrument)
+        .join(Strategy, Strategy.id == Backtest.strategy_id)
+        .join(Instrument, Instrument.id == Backtest.instrument_id)
+        .where(Backtest.sweep_id == sweep.id)
+        .order_by(Backtest.created_at, Strategy.name, Instrument.symbol)
+        # ⚠️ **The curve is deferred, and on this endpoint that is not an optimisation.** The
+        # screen polls it every few seconds while the runs land, and each response carries every
+        # run: loaded lazily, row by row, with the curve (the largest measured is 856 kB), one
+        # poll of a two-thousand-run sweep would read the whole history of every finished run
+        # to serve fields that never reach the response. The study's read defers it too, as a
+        # column no field of its response reaches; here the poll is what turns that into a bill.
+        # Held by `test_reading_a_sweep_costs_the_same_however_many_runs_it_holds`.
+        .options(selectinload(Backtest.metrics).defer(BacktestMetrics.equity_curve))
+    ).all()
+
+    return (
+        sweep,
+        entries,
+        coordinates,
+        [(run, strategy, instrument) for run, strategy, instrument in rows],
+    )
+
+
+def _dataset_runs(session: SessionDep, sweep_id: uuid.UUID) -> list[DatasetRun]:
+    """The sweep's runs as dataset rows, in the order `_read_sweep` reads them.
+
+    That is launch time — which ties across a whole sweep, written in one transaction — then
+    strategy name (`{entry} [{label}]`), then symbol. Not the screen's order, which groups the runs
+    by entry as the request listed them.
+
+    `entry_name` is null for an entry removed from the shelf — not the generated strategy's name
+    that `SweepRunOut.entry_name` falls back to, which carries one point's label and would name
+    the entry after that point.
+    """
+    sweep, entries, coordinates, rows = _read_sweep(session, sweep_id)
+    out: list[DatasetRun] = []
+    for run, strategy, instrument in rows:
+        point = coordinates.get(str(run.strategy_id), {})
+        entry_id = str(point.get("entry_id", ""))
+        shelved = entries.get(entry_id)
+        out.append(
+            DatasetRun(
+                sweep_id=str(sweep.id),
+                run=run,
+                entry_id=entry_id,
+                entry_name=None if shelved is None else shelved.name,
+                strategy_version=strategy.version,
+                symbol=instrument.symbol,
+                asset_class=str(instrument.asset_class),
+                values=dict(point.get("values", {})),
+            )
+        )
+    return out
+
+
+@router.get(
+    "/sweeps/{sweep_id}/dataset.csv",
+    response_class=Response,
+    responses={
+        **_NOT_FOUND,
+        status.HTTP_200_OK: {
+            "content": {"text/csv": {}},
+            "description": "One row per run. `/sweeps/{sweep_id}/dataset/dictionary` says what "
+            "every column is.",
+        },
+    },
+)
+def get_sweep_dataset(sweep_id: uuid.UUID, session: SessionDep) -> Response:
+    """The sweep as a table for a model: one row per run, every column described by the dictionary.
+
+    ⚠️ **Runs that have not finished, and runs that failed, keep their rows.** A download taken
+    while the sweep is still draining is a true picture of that moment, and a failed run is part
+    of the space that was searched — a file that dropped either would describe a sweep nobody ran.
+    """
+    return Response(
+        content=to_csv(_dataset_runs(session, sweep_id)),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="sweep-{sweep_id}.csv"'},
+    )
+
+
+@router.get(
+    "/sweeps/{sweep_id}/dataset/dictionary",
+    response_model=DatasetDictionaryOut,
+    responses=_NOT_FOUND,
+)
+def get_sweep_dataset_dictionary(sweep_id: uuid.UUID, session: SessionDep) -> DatasetDictionaryOut:
+    """What every column of this sweep's dataset is, what was left out, and what to beware of.
+
+    Read from the same rows as the file, because the grid columns are the sweep's own: asking a
+    sweep with no `period` axis for its dictionary must not describe a `param:…period` column.
+    """
+    runs = _dataset_runs(session, sweep_id)
+    return DatasetDictionaryOut(
+        row=ROW,
+        caveats=list(CAVEATS),
+        columns=[
+            DatasetColumnOut(
+                name=column.name,
+                role=column.role,
+                unit=column.unit,
+                description=column.description,
+            )
+            for column in columns_for(runs)
+        ],
+        omitted=[DatasetOmissionOut(name=name, reason=reason) for name, reason in OMITTED],
     )

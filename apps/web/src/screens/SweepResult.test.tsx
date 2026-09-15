@@ -1,5 +1,6 @@
 import { fireEvent, screen, within } from '@testing-library/react'
 
+import { apiUrl } from '../api/client'
 import type {
   BacktestListItem,
   Metrics,
@@ -13,6 +14,13 @@ import { renderWithProviders } from '../test-utils'
 vi.mock('../api/hooks', () => ({
   useSweep: vi.fn(),
   useEquityCurves: vi.fn(),
+}))
+
+// ⚠️ A prefix the real client never produces. With the real module a test run spells `/api` both
+// ways, so a link hard-coded to `/api/sweeps/…` and one built by `apiUrl` would be indistinguishable
+// here — and the hard-coded one points at the wrong host the day the API moves.
+vi.mock('../api/client', () => ({
+  apiUrl: (path: string) => `https://api.test${path}`,
 }))
 
 // The chart draws to a canvas jsdom lacks. Stubbed to report what it was *asked* to draw, which
@@ -190,6 +198,23 @@ describe('SweepResult', () => {
     expect(
       screen.getByText('EURUSD, GBPUSD · M15, H1 · 2024-01-01 → 2024-02-01 · 10,000.00 per run'),
     ).toBeInTheDocument()
+  })
+
+  it('offers the dataset beside the dictionary that says what its columns are', () => {
+    // Both, and as links the browser opens itself: the file for a model, the legend for whoever —
+    // or whatever — reads it. A dataset offered without its dictionary is the half an AI misreads.
+    showing(sweep())
+
+    renderWithProviders(<SweepResult />)
+
+    expect(screen.getByRole('link', { name: /download the dataset/i })).toHaveAttribute(
+      'href',
+      apiUrl('/sweeps/sweep-1/dataset.csv'),
+    )
+    expect(screen.getByRole('link', { name: /what each column means/i })).toHaveAttribute(
+      'href',
+      apiUrl('/sweeps/sweep-1/dataset/dictionary'),
+    )
   })
 
   it('summarises each entry on its own, in the order the entries were asked for', () => {

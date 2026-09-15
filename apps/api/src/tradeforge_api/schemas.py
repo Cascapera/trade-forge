@@ -32,6 +32,7 @@ from pydantic import (
     model_validator,
 )
 
+from tradeforge_api.sweep_dataset import Role
 from tradeforge_api.walkforward import MAX_FOLDS, MIN_FOLDS
 from tradeforge_collector.classify import asset_class_from_path
 from tradeforge_db.live_sessions import is_stale, silence
@@ -1787,6 +1788,42 @@ class SweepOut(BaseModel):
     they were **ticked**, not the order the shelf shows them in."""
 
     runs: list[SweepRunOut]
+
+
+class DatasetColumnOut(BaseModel):
+    """One column of a sweep's dataset, as the file names it."""
+
+    name: str
+    role: Role
+    """`identity`, `choice`, `condition` or `outcome` — which is what separates a knob from a
+    result, and the one thing a reader cannot infer from a column's name."""
+
+    unit: str
+    description: str
+
+
+class DatasetOmissionOut(BaseModel):
+    """A fact the dataset leaves out on purpose, and why.
+
+    Listed so that its absence is not read as an oversight — and not fetched from elsewhere by a
+    reader who assumed it was forgotten."""
+
+    name: str
+    reason: str
+
+
+class DatasetDictionaryOut(BaseModel):
+    """What every column of `/sweeps/{id}/dataset.csv` is, served beside the file.
+
+    ⚠️ Generated from the list that writes the file's header (`sweep_dataset.columns_for`), and
+    per sweep, because the grid columns are: a dictionary shared by every sweep would describe
+    columns this file does not have.
+    """
+
+    row: str
+    caveats: list[str]
+    columns: list[DatasetColumnOut]
+    omitted: list[DatasetOmissionOut]
 
 
 class CreatedSweep(BaseModel):

@@ -16,7 +16,9 @@ at — and `POSTGRES_DB` defaults to `tradeforge`, the real one. Running this fi
 the override once emptied this project's own backtests.
 """
 
+import csv
 import datetime as dt
+import io
 import uuid
 from collections.abc import Callable
 from decimal import Decimal
@@ -445,6 +447,45 @@ class TestReadingItBack:
             f"a two-run sweep took {two_runs} queries and a three-run sweep took {three_runs}: "
             f"the per-row query is back, and with it the curve nobody reads"
         )
+
+    def test_the_dataset_is_one_row_per_run_and_its_dictionary_names_every_column(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        # The file and its legend over HTTP. `test_sweep_dataset.py` proves the rows on objects;
+        # what only exists here is the join — the coordinates written at launch reaching the
+        # grid columns, and the dictionary served for exactly the columns this file has.
+        entry = an_entry(client, name=f"data {uuid.uuid4()}", grid={"setup.params.period": [5, 9]})
+        launched = client.post("/sweeps", json=a_sweep_body([entry], ["EURUSD", "GBPUSD"], ["M15"]))
+        assert launched.status_code == 202, launched.text
+        address = f"/sweeps/{launched.json()['id']}"
+        first = client.get(address).json()["runs"][0]
+        finish(session_factory, first["run"]["id"], 250)
+
+        served = client.get(f"{address}/dataset.csv")
+        dictionary = client.get(f"{address}/dataset/dictionary")
+
+        assert served.status_code == 200, served.text
+        assert served.headers["content-type"].startswith("text/csv")
+        assert "attachment" in served.headers["content-disposition"]
+        rows = list(csv.DictReader(io.StringIO(served.text)))
+        assert len(rows) == 4
+        assert dictionary.status_code == 200, dictionary.text
+        assert [column["name"] for column in dictionary.json()["columns"]] == list(rows[0])
+        assert sorted(row["param:setup.params.period"] for row in rows) == ["5", "5", "9", "9"]
+        (done,) = [row for row in rows if row["status"] == "done"]
+        assert done["run_id"] == first["run"]["id"]
+        assert Decimal(done["return"]) == Decimal("0.025")
+        # The three still queued keep their rows, with nothing where a result would be.
+        assert {row["return"] for row in rows if row["status"] != "done"} == {""}
+
+    def test_the_dataset_of_an_unknown_sweep_is_a_404(self, client: Any) -> None:
+        missing = uuid.uuid4()
+
+        served = client.get(f"/sweeps/{missing}/dataset.csv")
+        dictionary = client.get(f"/sweeps/{missing}/dataset/dictionary")
+
+        assert served.status_code == 404
+        assert dictionary.status_code == 404
 
 
 class TestWhatItRefuses:

@@ -1,4 +1,5 @@
 import { fireEvent, screen, waitFor } from '@testing-library/react'
+import { Route, Routes, useParams } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { ApiError, api } from '../api/client'
@@ -361,9 +362,20 @@ describe('the answer on hand', () => {
   })
 })
 
+/** Stands in for the sweep's screen, and says which sweep it was sent to. */
+function SweepLanded(): React.JSX.Element {
+  const { id } = useParams<{ id: string }>()
+  return <p>sweep screen for {id}</p>
+}
+
 describe('launching', () => {
-  it('sends the axes it was given and reports what was queued', async () => {
-    renderWithProviders(<LaunchSweep />)
+  it('sends the axes it was given and opens the sweep it created', async () => {
+    renderWithProviders(
+      <Routes>
+        <Route path="/" element={<LaunchSweep />} />
+        <Route path="/sweeps/:id" element={<SweepLanded />} />
+      </Routes>,
+    )
     await fillIn()
     await waitFor(() => {
       expect(screen.getByRole('button', { name: /run the sweep/i })).toBeEnabled()
@@ -383,10 +395,9 @@ describe('launching', () => {
         }),
       )
     })
-    // ⚠️ It reports rather than navigating. `/sweeps/{id}` does not exist yet, and the router's
-    // catch-all would have sent the reader to the builder with no word about what they started.
-    expect(await screen.findByText(/Launched 2 backtests/i)).toBeInTheDocument()
-    expect(screen.getByRole('link', { name: /run log/i })).toHaveAttribute('href', '/runs')
+    // The id the server handed back reaches the address. Asserted as text rather than as "some
+    // sweep screen rendered", which a navigation carrying the wrong field would also satisfy.
+    expect(await screen.findByText('sweep screen for sweep-1')).toBeInTheDocument()
   })
 
   it('does not ask the server about a sweep with no window yet', async () => {

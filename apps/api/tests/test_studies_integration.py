@@ -378,7 +378,7 @@ def test_the_summary_names_its_best_point_the_way_the_points_are_named(
     strategy's* name — `MME9 for the grid [period=20, …]` against `period=20, …` — they never
     match, and a screen highlighting the best point highlights nothing.
 
-    Neither existing suite could see it. The unit tests hand `_aggregate` a label and assert
+    Neither existing suite could see it. The unit tests hand `aggregate_points` a label and assert
     what comes back, which proves the function and says nothing about its caller; the test
     above compares the creation body with the read body and never looks at the summary. This
     one closes the loop by asserting the summary against the points in the **same** response.

@@ -25,19 +25,21 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import selectinload
 
 from tradeforge_api.deps import QueueDep, SessionDep
 from tradeforge_api.grid import GridPoint
 from tradeforge_api.queue import RUN_BACKTEST
 from tradeforge_api.routers.backtests import list_item
 from tradeforge_api.routers.strategies import refusal_of
-from tradeforge_api.routers.studies import strategies_for
+from tradeforge_api.routers.studies import aggregate_points, strategies_for
 from tradeforge_api.runner import ENGINE_VERSION
 from tradeforge_api.schemas import (
     CreatedSweep,
     CreateSweep,
     GridRefusal,
     PreviewSweepRequest,
+    SweepEntryOut,
     SweepEntryPreview,
     SweepOut,
     SweepPreview,
@@ -53,6 +55,7 @@ from tradeforge_api.sweep import (
 )
 from tradeforge_db.models import (
     Backtest,
+    BacktestMetrics,
     BacktestStatus,
     CatalogEntry,
     Dataset,
@@ -418,13 +421,23 @@ def get_sweep(sweep_id: uuid.UUID, session: SessionDep) -> SweepOut:
         .join(Instrument, Instrument.id == Backtest.instrument_id)
         .where(Backtest.sweep_id == sweep.id)
         .order_by(Backtest.created_at, Strategy.name, Instrument.symbol)
+        # ⚠️ **The curve is deferred, and on this endpoint that is not an optimisation.** The
+        # screen polls it every few seconds while the runs land, and each response carries every
+        # run: loaded lazily, row by row, with the curve (the largest measured is 856 kB), one
+        # poll of a two-thousand-run sweep would read the whole history of every finished run
+        # to serve fields that never reach the response. The study's read defers it too, as a
+        # column no field of its response reaches; here the poll is what turns that into a bill.
+        # Held by `test_reading_a_sweep_costs_the_same_however_many_runs_it_holds`.
+        .options(selectinload(Backtest.metrics).defer(BacktestMetrics.equity_curve))
     ).all()
 
     out: list[SweepRunOut] = []
+    scored: dict[str, list[tuple[Backtest, str]]] = {one: [] for one in sweep.entry_ids}
     for run, strategy, instrument in rows:
         point = coordinates.get(str(run.strategy_id), {})
         entry_id = str(point.get("entry_id", ""))
         entry = entries.get(entry_id)
+        label = str(point.get("label", ""))
         out.append(
             SweepRunOut(
                 entry_id=uuid.UUID(entry_id) if entry_id else uuid.UUID(int=0),
@@ -432,11 +445,25 @@ def get_sweep(sweep_id: uuid.UUID, session: SessionDep) -> SweepOut:
                 # it is not. Removing an entry is allowed by design and must not blank a finished
                 # sweep — what it costs is the label, never the measurement.
                 entry_name=entry.name if entry is not None else strategy.name,
-                label=str(point.get("label", "")),
+                label=label,
                 values=dict(point.get("values", {})),
                 run=list_item(run, instrument.symbol, strategy.name, strategy.version),
             )
         )
+        if entry_id in scored:
+            # The symbol leads because the point label repeats once per market: `M15 · period=9`
+            # over three symbols is three runs, and a best that named only the point would name
+            # all three of them.
+            scored[entry_id].append((run, f"{instrument.symbol} · {label}"))
+
+    summaries = [
+        SweepEntryOut(
+            entry_id=uuid.UUID(entry_id),
+            entry_name=shelved.name if (shelved := entries.get(entry_id)) is not None else None,
+            aggregate=aggregate_points(scored[entry_id], sweep.initial_capital),
+        )
+        for entry_id in sweep.entry_ids
+    ]
 
     return SweepOut(
         id=sweep.id,
@@ -447,5 +474,6 @@ def get_sweep(sweep_id: uuid.UUID, session: SessionDep) -> SweepOut:
         date_to=sweep.date_to,
         initial_capital=sweep.initial_capital,
         created_at=sweep.created_at,
+        entries=summaries,
         runs=out,
     )

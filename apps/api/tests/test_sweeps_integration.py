@@ -25,12 +25,12 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import select
+from sqlalchemy import Engine, event, select
 from sqlalchemy.orm import Session
 
 from tradeforge_api.config import Settings
 from tradeforge_api.main import create_app
-from tradeforge_db.models import Dataset, Instrument
+from tradeforge_db.models import Backtest, BacktestMetrics, BacktestStatus, Dataset, Instrument
 from tradeforge_engine.domain import AssetClass
 
 pytestmark = pytest.mark.integration
@@ -161,6 +161,40 @@ def an_entry(
     entry = client.post("/catalog", json=body)
     assert entry.status_code == 201, entry.text
     return str(entry.json()["id"])
+
+
+def finish(session_factory: Callable[[], Session], run_id: str, net: int) -> None:
+    """Mark a queued run done with a hand-written result.
+
+    The runs are only queued in this suite — what is under test is how a sweep is read back,
+    and waiting for real backtests would test the worker instead. The row still has to be one
+    the engine could produce: the table enforces `net = gross_profit + gross_loss`.
+    """
+    session = session_factory()
+    try:
+        run = session.get(Backtest, uuid.UUID(run_id))
+        assert run is not None
+        run.status = BacktestStatus.DONE
+        profit = Decimal(net)
+        session.add(
+            BacktestMetrics(
+                backtest_id=run.id,
+                net_profit=profit,
+                gross_profit=max(profit, Decimal(0)),
+                gross_loss=min(profit, Decimal(0)),
+                total_trades=0,
+                long_trades=0,
+                short_trades=0,
+                win_rate=Decimal(0),
+                max_drawdown_abs=Decimal(0),
+                max_drawdown_pct=Decimal(0),
+                max_dd_duration_days=0,
+                equity_curve=[],
+            )
+        )
+        session.commit()
+    finally:
+        session.close()
 
 
 def a_sweep_body(entries: list[str], symbols: list[str], timeframes: list[str]) -> dict[str, Any]:
@@ -310,6 +344,107 @@ class TestReadingItBack:
         read = client.get(f"/sweeps/{launched.json()['id']}")
         assert read.status_code == 200
         assert len(read.json()["runs"]) == 1
+        # The section keeps its summary and loses only its heading. Null rather than a generated
+        # strategy's name, which carries one point's label and would head the section as if the
+        # whole entry were that point.
+        (summary,) = read.json()["entries"]
+        assert summary["entry_name"] is None
+        assert summary["aggregate"]["points_total"] == 1
+
+    def test_each_entry_is_summarised_on_its_own_in_the_order_it_was_asked(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        # ⚠️ **Pooled, these six runs have a median of 1.5%; per entry they have 2.5% and -2%.**
+        # Entries are alternatives, so the pooled figure is the median of two methods and
+        # describes neither — which is why `points_total` (4 and 2, never 6) is asserted too.
+        # zeta's 1 000 is there so its mean (4%) is not its median: without it the two coincide
+        # and a mean would pass as well.
+        #
+        # The asked order is set against the two orders an implementation could plausibly fall
+        # into instead. The runs come back ordered by strategy name — the query orders by
+        # `created_at` first, but the whole sweep is one transaction and `now()` is its start,
+        # so that column ties — and `entries` built by walking the rows would list `alpha`
+        # first; `alpha` is also created first, so ordering by the shelf's `created_at` would
+        # too. Only the request says `zeta` leads.
+        tag = str(uuid.uuid4())[:8]
+        plain = an_entry(client, name=f"alpha {tag}")
+        swept = an_entry(client, name=f"zeta {tag}", grid={"setup.params.period": [5, 9]})
+        launched = client.post(
+            "/sweeps", json=a_sweep_body([swept, plain], ["EURUSD", "GBPUSD"], ["M15"])
+        )
+        assert launched.status_code == 202, launched.text
+        address = f"/sweeps/{launched.json()['id']}"
+
+        profits = {swept: iter([100, 200, 300, 1000]), plain: iter([-100, -300])}
+        net_of: dict[str, int] = {}
+        for row in client.get(address).json()["runs"]:
+            net = next(profits[row["entry_id"]])
+            net_of[row["run"]["id"]] = net
+            finish(session_factory, row["run"]["id"], net)
+
+        read = client.get(address).json()
+
+        assert [one["entry_id"] for one in read["entries"]] == [swept, plain]
+        by_entry = {one["entry_id"]: one["aggregate"] for one in read["entries"]}
+        assert [by_entry[swept]["points_total"], by_entry[plain]["points_total"]] == [4, 2]
+        assert Decimal(by_entry[swept]["median_return"]) == Decimal("0.025")
+        assert Decimal(by_entry[plain]["median_return"]) == Decimal("-0.02")
+        # ⚠️ The best is named so a reader can find it: the point label alone (`M15 · period=9`)
+        # is two runs here, one per market, and only the symbol tells them apart.
+        best = max(
+            (row for row in read["runs"] if row["entry_id"] == swept),
+            key=lambda row: net_of[row["run"]["id"]],
+        )
+        assert by_entry[swept]["best_label"] == f"{best['run']['symbol']} · {best['label']}"
+
+    def test_reading_a_sweep_costs_the_same_however_many_runs_it_holds(
+        self,
+        client: Any,
+        session_factory: Callable[[], Session],
+        migrated_engine: Engine,
+    ) -> None:
+        """The N+1 guard of a read that a screen polls, stated as a property, not a number.
+
+        `Backtest.metrics` lazy-loads by default and `list_item` touches it, so without the
+        `selectinload` every run costs one more query — and each drags that run's equity curve
+        out of Postgres to build a row that does not contain it. The body stays correct and only
+        the clock moves, which is what makes the regression invisible; the sweep screen then
+        pays it again every few seconds. The basket's read has the same guard.
+
+        The runs are finished first, so the metrics exist and the lazy path would have rows to
+        drag. Two sweeps of two and three runs are compared with each other, and nothing is
+        claimed about the absolute count, which would encode today's implementation.
+        """
+        entry = an_entry(client, name=f"counted {uuid.uuid4()}")
+        sweep_ids: list[str] = []
+        for symbols in (["EURUSD", "GBPUSD"], list(SYMBOLS)):
+            launched = client.post("/sweeps", json=a_sweep_body([entry], symbols, ["M15"]))
+            assert launched.status_code == 202, launched.text
+            sweep_ids.append(launched.json()["id"])
+        for sweep_id in sweep_ids:
+            for row in client.get(f"/sweeps/{sweep_id}").json()["runs"]:
+                finish(session_factory, row["run"]["id"], 100)
+
+        counted: list[int] = []
+
+        def count(*_args: object, **_kwargs: object) -> None:
+            counted[-1] += 1
+
+        event.listen(migrated_engine, "before_cursor_execute", count)
+        try:
+            for sweep_id in sweep_ids:
+                counted.append(0)
+                read = client.get(f"/sweeps/{sweep_id}")
+                assert read.status_code == 200
+        finally:
+            event.remove(migrated_engine, "before_cursor_execute", count)
+
+        two_runs, three_runs = counted
+        assert two_runs > 0, "the listener saw nothing, so this proves nothing"
+        assert two_runs == three_runs, (
+            f"a two-run sweep took {two_runs} queries and a three-run sweep took {three_runs}: "
+            f"the per-row query is back, and with it the curve nobody reads"
+        )
 
 
 class TestWhatItRefuses:

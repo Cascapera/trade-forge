@@ -2278,3 +2278,16 @@ e hoje ele mede o arquivo como a suíte o deixou.
   e `study/settings.ts` continuam com o seletor. Decidir com o Guilherme se lá ele também vira
   leitura do documento — o Sweep só varia gráfico de entradas da **prateleira**, então Basket/Study
   são hoje o único caminho de mudar o gráfico de uma estratégia salva fora dela.
+
+- [origem: PR-251] **A docstring de `aggregate_points` (ex-`_aggregate`, `routers/studies.py`) afirma
+  uma corrida que o worker não tem.** Diz que "um run é marcado `done` um instante antes de a linha
+  de métricas ser escrita", e usa isso para justificar contar só runs **com** métricas. Medido no
+  `worker.py`: `session.add(metrics_row)` e `backtest.status = DONE` vão no **mesmo** `commit`. A
+  guarda `metrics is not None` continua certa (um `done` sem métricas seria linha feita à mão ou
+  migração), mas o motivo escrito é falso, e quem lê para de procurar. Corrigir a frase; a tela da
+  varredura e a do estudo decidem o fim do polling pelo **status** e dependem desse commit único.
+  Ver [[docstring-e-afirmacao-testavel]].
+- [origem: PR-251] **Uma varredura só é alcançável na hora em que é lançada.** Não existe
+  `GET /sweeps` (lista), e o run log não carrega `sweep_id` — fechou a aba, o endereço
+  `/sweeps/{id}` só volta pelo histórico do navegador. O estudo e a cesta têm o mesmo buraco?
+  Conferir antes de decidir se é uma lista por tipo ou uma coluna no run log.

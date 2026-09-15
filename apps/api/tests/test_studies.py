@@ -1,6 +1,6 @@
 """The dispersion arithmetic of a study, with no database in sight.
 
-`_aggregate` is the only place in this feature that computes rather than plumbs, so it is
+`aggregate_points` is the only place in this feature that computes rather than plumbs, so it is
 tested directly on in-memory rows. Driving it through HTTP and a real Postgres would run the
 same arithmetic behind three layers that can only obscure which one was wrong.
 
@@ -11,7 +11,7 @@ to be the maximum.
 
 from decimal import Decimal
 
-from tradeforge_api.routers.studies import _aggregate
+from tradeforge_api.routers.studies import aggregate_points
 from tradeforge_db.models import Backtest, BacktestMetrics, BacktestStatus
 
 CAPITAL = Decimal("10000")
@@ -37,7 +37,7 @@ def test_a_grid_that_has_not_started_reports_undefined_rather_than_zero() -> Non
         _point("period=9", None, BacktestStatus.QUEUED),
     ]
 
-    aggregate = _aggregate(points, CAPITAL)
+    aggregate = aggregate_points(points, CAPITAL)
 
     assert aggregate.points_total == 2
     assert aggregate.points_finished == 0
@@ -56,7 +56,7 @@ def test_a_run_marked_done_before_its_metrics_exist_is_not_counted_as_finished()
     """
     points = [_point("period=5", None, BacktestStatus.DONE), _point("period=9", "500")]
 
-    aggregate = _aggregate(points, CAPITAL)
+    aggregate = aggregate_points(points, CAPITAL)
 
     assert aggregate.points_total == 2
     assert aggregate.points_finished == 1
@@ -83,7 +83,7 @@ def test_the_headline_is_the_median_not_the_best_corner() -> None:
         )
     ]
 
-    aggregate = _aggregate(points, CAPITAL)
+    aggregate = aggregate_points(points, CAPITAL)
 
     assert aggregate.median_return == Decimal("0.01")
     assert aggregate.best_return == Decimal("0.8")
@@ -104,7 +104,7 @@ def test_an_even_count_averages_the_two_middle_points() -> None:
         _point("d", "4600"),
     ]
 
-    aggregate = _aggregate(points, CAPITAL)
+    aggregate = aggregate_points(points, CAPITAL)
 
     assert aggregate.median_return == Decimal("0.035")
     assert aggregate.points_finished == 4
@@ -125,7 +125,7 @@ def test_how_much_of_the_searched_space_works_is_reported_beside_the_best() -> N
         _point("e", "900"),
     ]
 
-    aggregate = _aggregate(points, CAPITAL)
+    aggregate = aggregate_points(points, CAPITAL)
 
     assert aggregate.points_profitable == 2
     assert aggregate.points_finished == 5
@@ -136,7 +136,7 @@ def test_the_extremes_are_named_so_the_corner_can_be_found_and_looked_at() -> No
     reader's next move is to open that run, and they need to know which one it is."""
     points = [_point("period=5", "-2500"), _point("period=9", "100"), _point("period=20", "3000")]
 
-    aggregate = _aggregate(points, CAPITAL)
+    aggregate = aggregate_points(points, CAPITAL)
 
     assert (aggregate.worst_label, aggregate.worst_return) == ("period=5", Decimal("-0.25"))
     assert (aggregate.best_label, aggregate.best_return) == ("period=20", Decimal("0.3"))
@@ -154,7 +154,7 @@ def test_a_failed_point_is_counted_without_being_scored() -> None:
         _point("period=9", "-500"),
     ]
 
-    aggregate = _aggregate(points, CAPITAL)
+    aggregate = aggregate_points(points, CAPITAL)
 
     assert aggregate.points_total == 3
     assert aggregate.points_finished == 2

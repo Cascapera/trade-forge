@@ -1023,3 +1023,43 @@ export interface CreatedSweep {
   id: string
   runs: number
 }
+
+/** One run of a sweep: where it sits on the axes, wrapped around the run-log row itself. */
+export interface SweepRunOut {
+  entry_id: string
+  /** The shelf label, or the generated strategy's name once the entry has been removed. */
+  entry_name: string
+  /** `M15 · period=9` — a caption. ⚠️ Place anything by `values`, never by splitting this. */
+  label: string
+  /** The coordinates, keyed by the grid's dotted paths plus `timeframe`. */
+  values: Record<string, unknown>
+  run: BacktestListItem
+}
+
+/**
+ * One shelf entry's share of a sweep, summarised on its own.
+ *
+ * ⚠️ **Per entry, never pooled.** Entries are alternatives, so a median across two of them is the
+ * median of two methods and describes neither. A "point" in `aggregate` is one run.
+ */
+export interface SweepEntryOut {
+  entry_id: string
+  /** Null once the entry has been removed from the shelf — the summary survives, the name does not. */
+  entry_name: string | null
+  /** `best_label`/`worst_label` lead with the symbol: `EURUSD · M15 · period=9`. */
+  aggregate: StudyAggregate
+}
+
+export interface SweepOut {
+  id: string
+  entry_ids: string[]
+  symbols: string[]
+  timeframes: string[]
+  date_from: string
+  date_to: string
+  initial_capital: string
+  created_at: string
+  /** In the order the entries were asked for. */
+  entries: SweepEntryOut[]
+  runs: SweepRunOut[]
+}

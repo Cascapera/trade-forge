@@ -20,12 +20,12 @@ never searched, and it would look exactly like a map of one it did.
 
 import datetime as dt
 import uuid
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import APIRouter, HTTPException, Response, status
-from sqlalchemy import select
+from fastapi import APIRouter, HTTPException, Query, Response, status
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import defer, selectinload
 
 from tradeforge_api.deps import QueueDep, SessionDep
 from tradeforge_api.grid import GridPoint
@@ -44,9 +44,13 @@ from tradeforge_api.schemas import (
     PreviewSweepRequest,
     SweepEntryOut,
     SweepEntryPreview,
+    SweepListEntry,
+    SweepListItem,
     SweepOut,
     SweepPreview,
+    SweepRunCounts,
     SweepRunOut,
+    SweepsPage,
     UncoveredMarket,
 )
 from tradeforge_api.sweep import (
@@ -73,6 +77,10 @@ router = APIRouter(tags=["sweeps"])
 _Responses = dict[int | str, dict[str, Any]]
 _NOT_FOUND: _Responses = {status.HTTP_404_NOT_FOUND: {"description": "not found"}}
 _BAD_BODY: _Responses = {status.HTTP_400_BAD_REQUEST: {"description": "malformed request body"}}
+
+# The type's own limit, as the other paged routers bound it: every value it admits is valid SQL
+# that returns an empty page, so nothing legitimate is refused.
+_MAX_OFFSET = 9_223_372_036_854_775_807  # 2**63 - 1, Postgres bigint
 
 
 def _entries(session: SessionDep, ids: list[uuid.UUID]) -> list[tuple[CatalogEntry, Strategy]]:
@@ -394,6 +402,81 @@ async def create_sweep(request: CreateSweep, session: SessionDep, queue: QueueDe
         await queue.enqueue_job(RUN_BACKTEST, str(run.id), _job_id=str(run.id))
 
     return CreatedSweep(id=sweep.id, runs=len(runs))
+
+
+@router.get("/sweeps", response_model=SweepsPage)
+def list_sweeps(
+    session: SessionDep,
+    *,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0, le=_MAX_OFFSET)] = 0,
+) -> SweepsPage:
+    """Every sweep, newest first: what it asked, and how many of its runs have landed.
+
+    ⚠️ **This is the only way back to a sweep once its tab is closed.** The run log hides the runs
+    a grid generated, and `/sweeps/{id}` needs an id nobody wrote down — before this list, the
+    sweeps of three evenings were reachable only through the browser's history.
+
+    ⚠️ **The same queries for a page of one sweep as for a page of many**: the total, the sweeps,
+    one grouped count
+    of their runs, and the shelf names of their entries. Reading each sweep back in full would
+    work, and would ship every run of every sweep on the page to say "480 of 500 done". `points`
+    is deferred for the same reason: it is one element per grid point, and no field of this
+    response reaches it. Held by `test_listing_sweeps_costs_the_same_however_many_there_are`.
+    """
+    total = session.scalar(select(func.count()).select_from(Sweep)) or 0
+    sweeps = session.scalars(
+        select(Sweep)
+        .options(defer(Sweep.points))
+        # `created_at` is the launch transaction's start, so it only ties between sweeps launched
+        # in the same instant; the id breaks that tie so a page boundary cannot move between reads.
+        .order_by(Sweep.created_at.desc(), Sweep.id)
+        .limit(limit)
+        .offset(offset)
+    ).all()
+
+    counts: dict[uuid.UUID, dict[BacktestStatus, int]] = {
+        sweep.id: dict.fromkeys(BacktestStatus, 0) for sweep in sweeps
+    }
+    for sweep_id, run_status, how_many in session.execute(
+        select(Backtest.sweep_id, Backtest.status, func.count())
+        .where(Backtest.sweep_id.in_(list(counts)))
+        .group_by(Backtest.sweep_id, Backtest.status)
+    ).all():
+        counts[sweep_id][run_status] = how_many
+
+    asked = {uuid.UUID(one) for sweep in sweeps for one in sweep.entry_ids}
+    names = {
+        entry.id: entry.name
+        for entry in session.scalars(select(CatalogEntry).where(CatalogEntry.id.in_(asked)))
+    }
+
+    items: list[SweepListItem] = []
+    for sweep in sweeps:
+        tally = counts[sweep.id]
+        items.append(
+            SweepListItem(
+                id=sweep.id,
+                created_at=sweep.created_at,
+                entries=[
+                    SweepListEntry(entry_id=one, name=names.get(one))
+                    for one in (uuid.UUID(raw) for raw in sweep.entry_ids)
+                ],
+                symbols=list(sweep.symbols),
+                timeframes=list(sweep.timeframes),
+                date_from=sweep.date_from,
+                date_to=sweep.date_to,
+                runs=SweepRunCounts(
+                    total=sum(tally.values()),
+                    done=tally[BacktestStatus.DONE],
+                    running=tally[BacktestStatus.RUNNING],
+                    queued=tally[BacktestStatus.QUEUED],
+                    failed=tally[BacktestStatus.FAILED],
+                ),
+            )
+        )
+
+    return SweepsPage(total=total, limit=limit, offset=offset, items=items)
 
 
 @router.get("/sweeps/{sweep_id}", response_model=SweepOut, responses=_NOT_FOUND)

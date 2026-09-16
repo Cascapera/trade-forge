@@ -22,6 +22,7 @@ import io
 import uuid
 from collections.abc import Callable
 from decimal import Decimal
+from itertools import permutations
 from pathlib import Path
 from typing import Any
 
@@ -32,7 +33,14 @@ from sqlalchemy.orm import Session
 
 from tradeforge_api.config import Settings
 from tradeforge_api.main import create_app
-from tradeforge_db.models import Backtest, BacktestMetrics, BacktestStatus, Dataset, Instrument
+from tradeforge_db.models import (
+    Backtest,
+    BacktestMetrics,
+    BacktestStatus,
+    Dataset,
+    Instrument,
+    Sweep,
+)
 from tradeforge_engine.domain import AssetClass
 
 pytestmark = pytest.mark.integration
@@ -754,3 +762,193 @@ class TestTheDataHasToBeThere:
         assert uncovered["covers"] is not None
         # And the launch agrees, which is the whole point of a preview.
         assert client.post("/sweeps", json=body).status_code == 422
+
+
+def launch(client: Any, entries: list[str], symbols: list[str]) -> str:
+    launched = client.post("/sweeps", json=a_sweep_body(entries, symbols, ["M15"]))
+    assert launched.status_code == 202, launched.text
+    return str(launched.json()["id"])
+
+
+def run_ids(client: Any, sweep_id: str) -> list[str]:
+    return [row["run"]["id"] for row in client.get(f"/sweeps/{sweep_id}").json()["runs"]]
+
+
+def move(session_factory: Callable[[], Session], run_id: str, to: BacktestStatus) -> None:
+    """Put a queued run in flight, or fail it — the two statuses `finish` does not reach."""
+    session = session_factory()
+    try:
+        run = session.get(Backtest, uuid.UUID(run_id))
+        assert run is not None
+        run.status = to
+        run.started_at = START
+        if to is BacktestStatus.FAILED:
+            run.error = "the worker lost its database"  # the table refuses a silent failure
+        session.commit()
+    finally:
+        session.close()
+
+
+def launched_at(session_factory: Callable[[], Session], moments: dict[str, dt.datetime]) -> None:
+    session = session_factory()
+    try:
+        for sweep_id, moment in moments.items():
+            sweep = session.get(Sweep, uuid.UUID(sweep_id))
+            assert sweep is not None
+            sweep.created_at = moment
+        session.commit()
+    finally:
+        session.close()
+
+
+class TestTheHistory:
+    def test_an_empty_history_is_an_empty_page(self, client: Any) -> None:
+        listed = client.get("/sweeps")
+
+        assert listed.status_code == 200
+        assert listed.json() == {"total": 0, "limit": 50, "offset": 0, "items": []}
+
+    def test_a_line_says_what_was_asked_and_how_far_it_got(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        # ⚠️ **Four statuses, four different counts** (3 done, 2 running, 1 failed, 0 queued), so
+        # a count read from the wrong status — or a total taken from one status alone — cannot
+        # land on the right number by coincidence. The first draft had three of them at 1, and
+        # swapping `done` with `failed` passed it. The second sweep stays all queued, so a count
+        # that ignored the sweep id would move it too.
+        tag = str(uuid.uuid4())[:8]
+        plain = an_entry(client, name=f"alpha {tag}")
+        doomed = an_entry(client, name=f"zeta {tag}")
+        busy = launch(client, [doomed, plain], list(SYMBOLS))
+        idle = launch(client, [plain], ["EURUSD", "GBPUSD"])
+
+        runs = run_ids(client, busy)
+        assert len(runs) == 6
+        for run_id in runs[:3]:
+            finish(session_factory, run_id, 100)
+        for run_id in runs[3:5]:
+            move(session_factory, run_id, BacktestStatus.RUNNING)
+        move(session_factory, runs[5], BacktestStatus.FAILED)
+        # Removing an entry costs the line its name and nothing else, as on the sweep's page.
+        # Its own statement, not inside the `assert`: `python -O` strips asserts.
+        removed = client.delete(f"/catalog/{doomed}")
+        assert removed.status_code == 204
+
+        items = {item["id"]: item for item in client.get("/sweeps").json()["items"]}
+
+        line = items[busy]
+        assert line["runs"] == {"total": 6, "done": 3, "running": 2, "queued": 0, "failed": 1}
+        # In the order they were asked for, which is neither alphabetical nor the shelf's order.
+        assert line["entries"] == [
+            {"entry_id": doomed, "name": None},
+            {"entry_id": plain, "name": f"alpha {tag}"},
+        ]
+        assert line["symbols"] == list(SYMBOLS)
+        assert line["timeframes"] == ["M15"]
+        assert dt.datetime.fromisoformat(line["date_from"]) == START
+        assert dt.datetime.fromisoformat(line["date_to"]) == START + 100 * HOUR
+        assert items[idle]["runs"] == {
+            "total": 2,
+            "done": 0,
+            "running": 0,
+            "queued": 2,
+            "failed": 0,
+        }
+
+    def test_the_newest_sweep_comes_first_and_pages_go_back_in_time(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        # ⚠️ **The launch order is chosen after the ids are known**, so that it differs from the
+        # four orders a wrong query could fall into: insertion order, its reverse, and the ids
+        # either way round. With three random ids any one of those matches a fixed expectation
+        # one time in six, and a test that passes a broken query by luck proves nothing.
+        entry = an_entry(client, name=f"paged {uuid.uuid4()}")
+        inserted = [launch(client, [entry], ["EURUSD"]) for _ in range(3)]
+        wrong = {
+            tuple(inserted),
+            tuple(reversed(inserted)),
+            tuple(sorted(inserted, key=uuid.UUID)),
+            tuple(sorted(inserted, key=uuid.UUID, reverse=True)),
+        }
+        newest_first = next(order for order in permutations(inserted) if order not in wrong)
+        launched_at(
+            session_factory,
+            {one: START - dt.timedelta(days=i) for i, one in enumerate(newest_first)},
+        )
+
+        whole = client.get("/sweeps").json()
+        head = client.get("/sweeps", params={"limit": 2}).json()
+        tail = client.get("/sweeps", params={"limit": 2, "offset": 2}).json()
+
+        assert [item["id"] for item in whole["items"]] == list(newest_first)
+        assert [item["id"] for item in head["items"]] == list(newest_first[:2])
+        assert [item["id"] for item in tail["items"]] == list(newest_first[2:])
+        # The total is the history's, not the page's — it is what sizes the pager.
+        assert (head["total"], head["limit"], tail["offset"]) == (3, 2, 2)
+
+    def test_sweeps_launched_in_the_same_instant_keep_one_order_across_pages(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        # A tie in `created_at` is broken by the id, ascending — without it Postgres may return
+        # the two in either order on each read, and a page boundary between them would show one
+        # sweep twice and the other never.
+        entry = an_entry(client, name=f"tied {uuid.uuid4()}")
+        tied = [launch(client, [entry], ["EURUSD"]) for _ in range(2)]
+        launched_at(session_factory, dict.fromkeys(tied, START))
+
+        pages = [
+            client.get("/sweeps", params={"limit": 1, "offset": offset}).json()["items"]
+            for offset in (0, 1)
+        ]
+
+        assert [item["id"] for page in pages for item in page] == sorted(tied, key=uuid.UUID)
+
+    @pytest.mark.parametrize("params", [{"limit": 0}, {"limit": 201}, {"offset": -1}])
+    def test_a_page_outside_the_bounds_is_refused(
+        self, client: Any, params: dict[str, int]
+    ) -> None:
+        assert client.get("/sweeps", params=params).status_code == 422
+
+    def test_listing_sweeps_costs_the_same_however_many_there_are(
+        self, client: Any, migrated_engine: Engine
+    ) -> None:
+        """One sweep and three are listed in the same number of queries, and none reads `points`.
+
+        The count holds the shape of the read: a per-sweep query — for its runs, its entries, or
+        a lazy load of `points` — makes three sweeps cost more than one. The statement text holds
+        what the count cannot see: an undeferred `points` rides along in a query that already
+        runs, at no extra count, and it is one element per grid point of every sweep on the page.
+        """
+        entry = an_entry(
+            client, name=f"counted {uuid.uuid4()}", grid={"setup.params.period": [5, 9]}
+        )
+        launch(client, [entry], ["EURUSD"])
+
+        counted: list[int] = []
+        statements: list[str] = []
+
+        def count(_conn: object, _cursor: object, statement: str, *_rest: object) -> None:
+            counted[-1] += 1
+            statements.append(statement)
+
+        def listed() -> int:
+            counted.append(0)
+            event.listen(migrated_engine, "before_cursor_execute", count)
+            try:
+                read = client.get("/sweeps")
+            finally:
+                event.remove(migrated_engine, "before_cursor_execute", count)
+            assert read.status_code == 200
+            return len(read.json()["items"])
+
+        assert listed() == 1
+        launch(client, [entry], ["GBPUSD"])
+        launch(client, [entry], ["USDJPY"])
+        assert listed() == 3
+
+        one, three = counted
+        assert one > 0, "the listener saw nothing, so this proves nothing"
+        assert one == three, f"one sweep took {one} queries and three took {three}"
+        reading_sweeps = [text for text in statements if "FROM sweeps" in text]
+        assert reading_sweeps, "no statement read the sweeps table, so the check below is vacuous"
+        assert not any("sweeps.points" in text for text in reading_sweeps)

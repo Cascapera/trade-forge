@@ -17,7 +17,8 @@ from typing import Any
 
 import pytest
 
-from tradeforge_api.schemas import SnapshotOut, TradeOut, ZoneOut
+from tradeforge_api.schemas import SnapshotOut, SweepRunCounts, TradeOut, ZoneOut
+from tradeforge_db.models import BacktestStatus
 
 START = dt.datetime(2024, 1, 1, tzinfo=dt.UTC)
 HOUR = dt.timedelta(hours=1)
@@ -184,3 +185,11 @@ def test_a_region_recorded_before_the_filter_existed_reads_as_the_run_s_own() ->
     payload = _a_zone()
     assert "label" not in payload
     assert ZoneOut.model_validate(payload).label == "zone"
+
+
+def test_a_sweeps_counts_name_every_status_a_run_can_have() -> None:
+    """`total` sums every status; the fields name four. A fifth status would be counted in the
+    total and shown nowhere — "6 runs, 5 accounted for" — so adding one has to fail here first."""
+    fields = set(SweepRunCounts.model_fields) - {"total"}
+
+    assert fields == {str(status) for status in BacktestStatus}

@@ -1790,6 +1790,57 @@ class SweepOut(BaseModel):
     runs: list[SweepRunOut]
 
 
+class SweepRunCounts(BaseModel):
+    """How many of a sweep's runs sit in each status: `done + running + queued + failed == total`.
+
+    One field per `BacktestStatus`, held by `test_a_sweeps_counts_name_every_status_a_run_can_have`.
+    """
+
+    total: int
+    done: int
+    running: int
+    queued: int
+    failed: int
+
+
+class SweepListEntry(BaseModel):
+    """One entry a listed sweep ran, named the way the shelf names it today."""
+
+    entry_id: uuid.UUID
+    name: str | None
+    """Null when the entry has since been removed from the shelf — an entry is a removable label,
+    and a finished sweep must stay readable without it (see `Sweep.entry_ids`)."""
+
+
+class SweepListItem(BaseModel):
+    """One sweep as a line of history: enough to recognise it, and how far along it is.
+
+    ⚠️ **No runs and no summaries, and that is what makes the list affordable.** Reading a sweep
+    in full is every one of its runs, joined and serialised; a line that only needs "480 of 500
+    done" is one grouped count. The full read is one click away, at `/sweeps/{id}`.
+    """
+
+    id: uuid.UUID
+    created_at: dt.datetime
+    entries: list[SweepListEntry]
+    """In the order the request listed them, as on the sweep's own page."""
+
+    symbols: list[str]
+    timeframes: list[str]
+    date_from: dt.datetime
+    date_to: dt.datetime
+    runs: SweepRunCounts
+
+
+class SweepsPage(BaseModel):
+    """A page of sweeps, newest first. `total` lets a client size the pager."""
+
+    total: int
+    limit: int
+    offset: int
+    items: list[SweepListItem]
+
+
 class DatasetColumnOut(BaseModel):
     """One column of a sweep's dataset, as the file names it."""
 

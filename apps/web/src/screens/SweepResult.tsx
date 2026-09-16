@@ -14,6 +14,7 @@ import { ComparisonChart } from '../components/ComparisonChart'
 import { RunTable } from '../components/RunTable'
 import { StudyDispersion } from '../components/StudyDispersion'
 import { money } from '../format'
+import { settled, summarise, tally } from '../sweep/progress'
 
 /** The calendar day of an ISO instant — the granularity a window is read at. */
 function day(iso: string): string {
@@ -62,11 +63,7 @@ export function SweepResult(): React.JSX.Element {
   }
 
   const data = sweep.data
-  const pending = data.entries.reduce(
-    (sum, { aggregate }) =>
-      sum + aggregate.points_total - aggregate.points_finished - aggregate.points_failed,
-    0,
-  )
+  const counts = tally(data.runs)
 
   return (
     <div className="space-y-6">
@@ -103,13 +100,22 @@ export function SweepResult(): React.JSX.Element {
         </p>
       </div>
 
-      {/* The poll is visible rather than silent: sections of dashes without a word about why
-          read as a sweep that produced nothing. */}
-      {pending > 0 && (
-        <p role="status" className="text-sm text-sky-300">
-          {pending} of {backtests(data.runs.length)} still running — this updates on its own.
-        </p>
-      )}
+      {/* ⚠️ **Always on screen, and that is the whole point.** The line this replaced appeared
+          only while runs were outstanding, so a sweep that had finished and one that had never
+          started both rendered as nothing at all — and a sweep holding a run that will never
+          execute (a worker that lost its database connection leaves one `queued` for ever) looked
+          exactly like a sweep that was done. Now it says `9 of 10 done · 1 queued` and keeps
+          saying it.
+
+          A live region only while something is in flight: a settled sweep has nothing left to
+          announce, and a `role="status"` that never changes is noise for a screen reader. */}
+      <p
+        role={settled(counts) ? undefined : 'status'}
+        className={`text-sm ${settled(counts) ? 'text-slate-400' : 'text-sky-300'}`}
+      >
+        {summarise(counts)}
+        {settled(counts) ? '' : ' — this updates on its own.'}
+      </p>
 
       <section className="space-y-2">
         <h3 className="font-medium">Equity of the runs you pick, as percent of starting capital</h3>

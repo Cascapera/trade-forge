@@ -952,3 +952,212 @@ class TestTheHistory:
         reading_sweeps = [text for text in statements if "FROM sweeps" in text]
         assert reading_sweeps, "no statement read the sweeps table, so the check below is vacuous"
         assert not any("sweeps.points" in text for text in reading_sweeps)
+
+
+class TestTheDashboard:
+    def test_the_route_is_not_read_as_a_sweep_id_and_starts_empty(self, client: Any) -> None:
+        # Declared after `/sweeps/{sweep_id}`, "dashboard" would be a malformed UUID and a 422.
+        read = client.get("/sweeps/dashboard")
+
+        assert read.status_code == 200, read.text
+        body = read.json()
+        assert body["totals"]["sweeps"] == 0
+        assert body["totals"]["runs"]["total"] == 0
+        assert body["overall"]["median_return"] is None
+        assert body["by_entry"] == []
+        assert body["sweeps"] == []
+
+    def test_the_window_is_half_open_on_the_launch_instant(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        entry = an_entry(client, name=f"windowed {uuid.uuid4()}")
+        first, second, third = (launch(client, [entry], ["EURUSD"]) for _ in range(3))
+        launched_at(
+            session_factory,
+            {first: START, second: START + HOUR, third: START + 2 * HOUR},
+        )
+
+        def listed(**window: dt.datetime) -> list[str]:
+            params = {name: moment.isoformat() for name, moment in window.items()}
+            read = client.get("/sweeps/dashboard", params=params)
+            assert read.status_code == 200, read.text
+            return [one["id"] for one in read.json()["sweeps"]]
+
+        # The first instant is in, the last is out — so two adjacent windows share nothing.
+        assert listed(launched_from=START + HOUR, launched_to=START + 2 * HOUR) == [second]
+        assert listed(launched_from=START + HOUR) == [second, third]
+        assert listed(launched_to=START + HOUR) == [first]
+        # Oldest first, the order a timeline is read in.
+        assert listed() == [first, second, third]
+        # The same instant written in another zone is the same instant.
+        brasilia = dt.timezone(dt.timedelta(hours=-3))
+        assert listed(launched_from=(START + HOUR).astimezone(brasilia)) == [second, third]
+
+    @pytest.mark.parametrize(
+        "params",
+        [
+            {"launched_from": "2026-09-15T00:00:00"},
+            {"launched_to": "2026-09-15"},
+            {"launched_from": "2026-09-16T00:00:00Z", "launched_to": "2026-09-15T00:00:00Z"},
+            {"launched_from": "2026-09-16T00:00:00Z", "launched_to": "2026-09-16T00:00:00Z"},
+        ],
+    )
+    def test_a_window_without_a_zone_or_running_backwards_is_refused(
+        self, client: Any, params: dict[str, str]
+    ) -> None:
+        # A bare date is "the 15th" in nobody's clock; an empty window is a typo, not a question.
+        assert client.get("/sweeps/dashboard", params=params).status_code == 422
+
+    def test_runs_are_summarised_by_the_entry_that_launched_them(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        # zeta: 2 points x 2 markets = 4 runs, nets 100, 200, 300, -100 → returns 0.01, 0.02,
+        #       0.03, -0.01 → median 0.015, 3 winners.
+        # alpha: 1 point x 2 markets, nets -100, -300 → median -0.02; then removed from the shelf.
+        # A second sweep of zeta alone reuses its documents: its runs must still count as zeta's.
+        tag = str(uuid.uuid4())[:8]
+        plain = an_entry(client, name=f"alpha {tag}")
+        swept = an_entry(client, name=f"zeta {tag}", grid={"setup.params.period": [5, 9]})
+        both = launch(client, [swept, plain], ["EURUSD", "GBPUSD"])
+        again = launch(client, [swept], ["USDJPY"])
+
+        profits = {swept: iter([100, 200, 300, -100]), plain: iter([-100, -300])}
+        for row in client.get(f"/sweeps/{both}").json()["runs"]:
+            finish(session_factory, row["run"]["id"], next(profits[row["entry_id"]]))
+        removed = client.delete(f"/catalog/{plain}")
+        assert removed.status_code == 204
+
+        body = client.get("/sweeps/dashboard").json()
+
+        entries = {one["key"]: one for one in body["by_entry"]}
+        assert set(entries) == {swept, plain}
+        # 4 finished runs of the first sweep plus 2 queued of the second, all zeta's.
+        assert (entries[swept]["runs"], entries[swept]["finished"]) == (6, 4)
+        assert entries[swept]["winners"] == 3
+        assert Decimal(entries[swept]["median_return"]) == Decimal("0.015")
+        assert entries[plain]["label"] is None
+        assert Decimal(entries[plain]["median_return"]) == Decimal("-0.02")
+        # Ranked by the median: zeta above alpha.
+        assert [one["key"] for one in body["by_entry"]] == [swept, plain]
+
+        assert body["totals"]["sweeps"] == 2
+        assert body["totals"]["entries"] == 2
+        assert body["totals"]["symbols"] == ["EURUSD", "GBPUSD", "USDJPY"]
+        assert body["totals"]["runs"]["total"] == 8
+        # USDJPY is a market the first sweep never ran, so nothing here is a copy.
+        assert body["totals"]["measurements"] == 8
+        assert body["overall"]["finished"] == 6
+        assert (body["overall"]["winners"], body["overall"]["losers"]) == (3, 3)
+        timeline = {one["id"]: one for one in body["sweeps"]}
+        assert timeline[both]["entry_names"] == [f"zeta {tag}", None]
+        assert (timeline[again]["runs"], timeline[again]["median_return"]) == (2, None)
+
+    def test_a_measurement_repeated_by_another_sweep_counts_once(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        # First sweep, EURUSD + GBPUSD x period 5, 9: nets E5=100, E9=300, G5=-100, G9=-300.
+        # Second sweep, EURUSD again, same window and capital: copies, finishing as the engine
+        # would — identically. Counted once, the median of (1%, 3%, -1%, -3%) is 0; counted
+        # twice, (1, 1, 3, 3, -1, -3) has median 1% and four winners instead of two.
+        # Two more sweeps look like copies and are not: a different capital, a different window.
+        entry = an_entry(
+            client, name=f"repeated {uuid.uuid4()}", grid={"setup.params.period": [5, 9]}
+        )
+        first = launch(client, [entry], ["EURUSD", "GBPUSD"])
+        again = launch(client, [entry], ["EURUSD"])
+        richer = client.post(
+            "/sweeps",
+            json={**a_sweep_body([entry], ["EURUSD"], ["M15"]), "initial_capital": "20000"},
+        )
+        longer = client.post(
+            "/sweeps",
+            json={
+                **a_sweep_body([entry], ["EURUSD"], ["M15"]),
+                "date_to": (START + 200 * HOUR).isoformat(),
+            },
+        )
+        assert (richer.status_code, longer.status_code) == (202, 202)
+
+        nets = {("EURUSD", 5): 100, ("EURUSD", 9): 300, ("GBPUSD", 5): -100, ("GBPUSD", 9): -300}
+        for sweep_id in (first, again):
+            for row in client.get(f"/sweeps/{sweep_id}").json()["runs"]:
+                point = (row["run"]["symbol"], row["values"]["setup.params.period"])
+                finish(session_factory, row["run"]["id"], nets[point])
+
+        body = client.get("/sweeps/dashboard").json()
+
+        assert body["totals"]["runs"]["total"] == 10
+        assert body["totals"]["measurements"] == 8
+        overall = body["overall"]
+        assert (overall["finished"], overall["winners"], overall["losers"]) == (4, 2, 2)
+        assert Decimal(overall["median_return"]) == 0
+        symbols = {one["key"]: one for one in body["by_symbol"]}
+        # EURUSD: 2 finished measurements + 4 unfinished (2 richer, 2 longer) = 6, not 8.
+        assert (symbols["EURUSD"]["runs"], symbols["EURUSD"]["finished"]) == (6, 2)
+        # `finish` records no trades: four measurements that never traded, not six.
+        assert body["totals"]["runs_without_trades"] == 4
+        # The timeline is per sweep and keeps every run it launched.
+        timeline = {one["id"]: one for one in body["sweeps"]}
+        assert (timeline[again]["runs"], timeline[again]["finished"]) == (2, 2)
+        assert Decimal(timeline[again]["median_return"]) == Decimal("0.02")
+
+    def test_the_dashboard_reads_no_equity_curve(
+        self, client: Any, session_factory: Callable[[], Session], migrated_engine: Engine
+    ) -> None:
+        # Deferred, and a query count cannot see it: the column would ride along in the metrics
+        # query that already runs. So the statement text is what is asserted.
+        entry = an_entry(client, name=f"curveless {uuid.uuid4()}")
+        sweep_id = launch(client, [entry], ["EURUSD"])
+        for row in client.get(f"/sweeps/{sweep_id}").json()["runs"]:
+            finish(session_factory, row["run"]["id"], 100)
+
+        statements: list[str] = []
+
+        def record(_conn: object, _cursor: object, statement: str, *_rest: object) -> None:
+            statements.append(statement)
+
+        event.listen(migrated_engine, "before_cursor_execute", record)
+        try:
+            read = client.get("/sweeps/dashboard")
+        finally:
+            event.remove(migrated_engine, "before_cursor_execute", record)
+
+        assert read.status_code == 200
+        metrics = [text for text in statements if "FROM backtest_metrics" in text]
+        assert metrics, "no statement read the metrics, so the check below is vacuous"
+        assert not any("equity_curve" in text for text in metrics)
+
+    def test_the_dashboard_costs_the_same_however_many_sweeps_it_reads(
+        self, client: Any, migrated_engine: Engine
+    ) -> None:
+        """A read per sweep would make three sweeps cost more than one.
+
+        ⚠️ Holds below 500 runs: `selectinload` splits its `IN` into batches of 500, so the metrics
+        read grows by one query per 500 runs. That growth is bounded and not what this guards.
+        """
+        entry = an_entry(client, name=f"counted {uuid.uuid4()}")
+        launch(client, [entry], ["EURUSD"])
+
+        counted: list[int] = []
+
+        def count(*_args: object) -> None:
+            counted[-1] += 1
+
+        def read() -> int:
+            counted.append(0)
+            event.listen(migrated_engine, "before_cursor_execute", count)
+            try:
+                body = client.get("/sweeps/dashboard")
+            finally:
+                event.remove(migrated_engine, "before_cursor_execute", count)
+            assert body.status_code == 200
+            return int(body.json()["totals"]["sweeps"])
+
+        assert read() == 1
+        launch(client, [entry], ["GBPUSD"])
+        launch(client, [entry], ["USDJPY"])
+        assert read() == 3
+
+        one, three = counted
+        assert one > 0, "the listener saw nothing, so this proves nothing"
+        assert one == three, f"one sweep took {one} queries and three took {three}"

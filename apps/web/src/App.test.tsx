@@ -86,6 +86,19 @@ describe('App', () => {
     expect(screen.getByRole('link', { name: 'Sweep history' })).not.toHaveAttribute('aria-current')
   })
 
+  it('routes to the sweep dashboard rather than reading it as a sweep id', () => {
+    renderWithProviders(<App />, '/sweeps/dashboard')
+
+    expect(screen.getByRole('heading', { name: 'Sweep dashboard' })).toBeInTheDocument()
+    expect(screen.queryByText('Loading the sweep…')).not.toBeInTheDocument()
+    expect(screen.getByRole('link', { name: 'Sweep dashboard' })).toHaveAttribute(
+      'aria-current',
+      'page',
+    )
+    // The history's link is `end`, so it does not light up over a path beneath it.
+    expect(screen.getByRole('link', { name: 'Sweep history' })).not.toHaveAttribute('aria-current')
+  })
+
   it('groups the sidebar links under headings', () => {
     renderWithProviders(<App />, '/')
 

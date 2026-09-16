@@ -11,6 +11,7 @@ import { LiveSessions } from './screens/LiveSessions'
 import { RunLog } from './screens/RunLog'
 import { StrategyCatalog } from './screens/StrategyCatalog'
 import { StudyResult } from './screens/StudyResult'
+import { SweepDashboard } from './screens/SweepDashboard'
 import { SweepHistory } from './screens/SweepHistory'
 import { SweepResult } from './screens/SweepResult'
 import { WalkForwardResult } from './screens/WalkForwardResult'
@@ -91,6 +92,9 @@ export function App(): React.JSX.Element {
             <NavLink to="/sweeps" end className={navClass}>
               Sweep history
             </NavLink>
+            <NavLink to="/sweeps/dashboard" className={navClass}>
+              Sweep dashboard
+            </NavLink>
             <NavLink to="/runs" className={navClass}>
               Run log
             </NavLink>
@@ -146,6 +150,8 @@ export function App(): React.JSX.Element {
             <Route path="/studies/:id" element={<StudyResult />} />
             <Route path="/sweep" element={<LaunchSweep />} />
             <Route path="/sweeps" element={<SweepHistory />} />
+            {/* A static segment outranks `:id` in React Router, so this is never read as a sweep. */}
+            <Route path="/sweeps/dashboard" element={<SweepDashboard />} />
             <Route path="/sweeps/:id" element={<SweepResult />} />
             <Route path="/walkforwards/:id" element={<WalkForwardResult />} />
             <Route path="/collect" element={<CollectSymbol />} />

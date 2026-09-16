@@ -404,3 +404,70 @@ def test_a_source_that_cannot_be_watched_is_refused_with_a_sentence(
 
     assert cli.main(["live", "EURUSD", "M5", "--once"]) == 1
     assert "cannot be watched live" in capsys.readouterr().err
+
+
+class TestTheAgentCommand:
+    def test_it_serves_the_agent_with_the_grace_it_was_given(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from tradeforge_collector import agent, supervisor  # noqa: PLC0415
+
+        seen: dict[str, object] = {}
+
+        async def fake_serve(settings: object, **kwargs: object) -> int:
+            seen["settings"] = settings
+            seen.update(kwargs)
+            return 0
+
+        monkeypatch.setattr(supervisor, "serve", fake_serve)
+
+        assert cli.main(["agent", "--grace", "3"]) == 0
+        assert seen["settings"] is agent.WorkerSettings
+        assert seen["redis_settings"] is agent.WorkerSettings.redis_settings
+        assert seen["grace"] == 3.0
+
+    def test_the_default_grace_is_the_supervisors(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from tradeforge_collector import supervisor  # noqa: PLC0415
+
+        seen: dict[str, object] = {}
+
+        async def fake_serve(_settings: object, **kwargs: object) -> int:
+            seen.update(kwargs)
+            return 0
+
+        monkeypatch.setattr(supervisor, "serve", fake_serve)
+
+        cli.main(["agent"])
+
+        assert seen["grace"] == supervisor.DEFAULT_GRACE == 15.0
+
+    def test_a_missing_stack_reaches_the_shell_as_status_2(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from tradeforge_collector import supervisor  # noqa: PLC0415
+
+        async def no_redis(_settings: object, **_kwargs: object) -> int:
+            return supervisor.EXIT_NO_REDIS
+
+        monkeypatch.setattr(supervisor, "serve", no_redis)
+
+        assert cli.main(["agent"]) == 2
+
+    def test_ctrl_c_is_a_clean_stop(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # A second Ctrl-C while the agent is still stopping reaches the command as an interrupt.
+        # (A first one is handled inside `serve`, which returns 0 — `test_supervisor` covers it.)
+        from tradeforge_collector import supervisor  # noqa: PLC0415
+
+        async def interrupted(_settings: object, **_kwargs: object) -> int:
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(supervisor, "serve", interrupted)
+
+        # Caught here, or an escaping interrupt would abort the whole pytest session rather than
+        # fail this test by name.
+        try:
+            code = cli.main(["agent"])
+        except KeyboardInterrupt:
+            pytest.fail("Ctrl-C escaped the agent command")
+
+        assert code == 0

@@ -26,7 +26,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from tradeforge_api.grid import GridError, GridPoint, expand, size_of
+from tradeforge_api.grid import GridError, GridPoint, expand, fit_name, size_of
 
 SECONDS_PER_BACKTEST = 0.23
 """What a backtest costs, measured rather than guessed.
@@ -117,13 +117,18 @@ def documents_for(
             # and (name, version) is unique — the second one would collide rather than insert.
             document = {**point.document, "timeframe": timeframe}
             label = timeframe if point.label == "" else f"{timeframe} · {point.label}"
-            document["name"] = f"{entry_name} [{label}]"
+            values = {"timeframe": timeframe, **point.values}
+            # ⚠️ `fit_name`, not an f-string: a grid with five axes writes a label longer than the
+            # DSL allows a name to be, and every point of it was refused for that — 120 documents,
+            # zero runs. The full label is kept on the point either way, which is what the sweep's
+            # screen and its dataset read.
+            document["name"] = fit_name(entry_name, label, values)
             out.append(
                 SweepDocument(
                     entry_id=entry_id,
                     timeframe=timeframe,
                     label=label,
-                    values={"timeframe": timeframe, **point.values},
+                    values=values,
                     document=document,
                 )
             )

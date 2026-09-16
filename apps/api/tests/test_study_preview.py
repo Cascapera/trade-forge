@@ -17,6 +17,7 @@ from fastapi import HTTPException
 
 from tradeforge_api.routers.studies import points_for, preview_of
 from tradeforge_db.models import Strategy
+from tradeforge_schema import NAME_MAX_LENGTH
 
 # ⚠️ M15, and the number matters. `htf` must be coarser than the document's own timeframe, so on
 # this base `M30` and up are legal and `M15` and below are not — which makes an axis over the raw
@@ -136,18 +137,36 @@ def test_the_preview_asks_about_the_named_documents_a_launch_would_write() -> No
     asking about a document one field short of the one that gets written, which is the class of
     divergence that agrees with the right answer and the wrong one alike.
 
-    Made observable by a base name near the DSL's 120-character ceiling: the suffix each point
-    carries is what pushes it over. Drop the naming from `_prepared` and this grid comes back
-    clean — which is also the bug a person would otherwise meet as a 422 after clicking launch.
+    ⚠️ **This used to be observable through length, and no longer is.** A base name near the
+    DSL's 120-character ceiling made every point overflow, so dropping the naming made the grid
+    come back clean. `fit_name` closed that — a generated name is trimmed to fit — so naming can
+    no longer turn a valid point invalid, and the property has to be seen directly: the prepared
+    points carry the name, and it is the name the launch will store.
     """
     long_name = "c" * 110
     base = _base({**_FILTERED, "name": long_name})
 
     preview = preview_of(base, {"setup.params.htf": ["H4", "D1"]}, "M15")
+    points = points_for(base, {"setup.params.htf": ["H4", "D1"]}, "M15")
 
+    # The overflow is gone: a long base name no longer refuses every point of its own grid.
     assert preview.points == 2
-    assert [refusal.label for refusal in preview.refusals] == ["htf='H4'", "htf='D1'"]
-    assert all("at most 120 characters" in refusal.reason for refusal in preview.refusals)
+    assert preview.refusals == []
+    # And every prepared document carries a name — written before validation, since `_prepared`
+    # is what the launch and the preview both call. Spelled out rather than compared against
+    # `named(...)`, which would only be this function rebuilding its own output.
+    names = [str(point.document["name"]) for point in points]
+    assert [point.label for point in points] == ["htf='H4'", "htf='D1'"]
+    # ⚠️ At this length the base name itself is trimmed — 110 characters leave no room for the
+    # label and the digest — so the name is neither the base nor `{base} [{label}]`. What has to
+    # be true is that the document was named at all, that it fits, and that the two points did
+    # not end up sharing a name.
+    assert all(name != long_name for name in names)
+    assert all(name.startswith("c" * 100) for name in names)
+    assert all(name.endswith("]") for name in names)
+    assert all(len(name) <= NAME_MAX_LENGTH for name in names)
+    # Distinct, which at this length only the digest can make them.
+    assert len(set(names)) == 2
 
 
 def test_a_point_wrong_in_two_places_says_both() -> None:
@@ -215,14 +234,35 @@ def test_a_refusal_names_the_field_without_the_model_it_lives_in() -> None:
 def test_a_refusal_reads_as_one_sentence_rather_than_a_model_dump() -> None:
     """The reason sits beside an axis value on screen. Pydantic's own `str(exc)` is several lines
     of model paths and input values, which is the right body for a strategy form field by field
-    and the wrong one for a caption on a grid."""
-    long_name = "c" * 110
-    (refusal,) = preview_of(
-        _base({**_FILTERED, "name": long_name}), {"setup.params.htf": ["H4"]}, "M15"
-    ).refusals
+    and the wrong one for a caption on a grid.
+
+    ⚠️ The vehicle used to be a name over the DSL's length limit; `fit_name` made that refusal
+    unreachable, so this rides on a bad `stop_buffer` instead. What is under test is the *shape*
+    of the sentence, and any refusal shows it.
+    """
+    base = _base(
+        {
+            **_FILTERED,
+            "setup": {
+                "type": "structure_choch",
+                "params": {
+                    "htf": None,
+                    "htf_offset": None,
+                    "stop_buffer": -5,
+                    "breakeven_at_r": 2.0,
+                },
+            },
+        }
+    )
+
+    (refusal,) = preview_of(base, {"setup.params.breakeven_at_r": [2.0]}, "M15").refusals
 
     assert "\n" not in refusal.reason
-    assert refusal.reason.startswith("name: ")
+    assert refusal.reason.startswith("stop_buffer: ")
+    # Pydantic's own rendering opens with a count and closes with a documentation link; neither
+    # belongs in a caption beside a grid value.
+    assert "validation error" not in refusal.reason
+    assert "further information" not in refusal.reason
 
 
 class TestTheStudysTimeframeDecidesToo:

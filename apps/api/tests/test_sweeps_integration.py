@@ -488,6 +488,50 @@ class TestReadingItBack:
         assert dictionary.status_code == 404
 
 
+class TestTheGeneratedName:
+    def test_a_grid_whose_label_outgrows_the_name_still_runs(self, client: Any) -> None:
+        """⚠️ **This is the sweep that produced nothing.**
+
+        A real five-axis entry called `PC DE COMPRA CLASSICO` expanded to 120 documents, and all
+        120 were refused: `name: String should have at most 120 characters`. The strategy was
+        fine; the caption the sweep writes into `name` was nine characters too long. The entry
+        contributed zero runs to a sweep that looked like it had launched.
+
+        Three axes and a long entry name reproduce it here — the label's length is what matters,
+        not which parameters it holds.
+        """
+        long_name = f"PC DE COMPRA CLASSICO {uuid.uuid4()} {uuid.uuid4()}"
+        entry = an_entry(
+            client,
+            name=long_name,
+            grid={
+                "setup.params.period": [5, 9, 21],
+                "setup.params.breakeven_at_r": [None, 2.0],
+                "setup.params.side": ["long", "short"],
+            },
+        )
+        body = a_sweep_body([entry], ["EURUSD"], ["M15"])
+
+        preview = client.post(
+            "/sweeps/preview",
+            json={
+                k: body[k] for k in ("entry_ids", "symbols", "timeframes", "date_from", "date_to")
+            },
+        ).json()
+        launched = client.post("/sweeps", json=body)
+
+        assert preview["entries"][0]["refusals"] == []
+        assert preview["runs"] == 12
+        assert launched.status_code == 202, launched.text
+        read = client.get(f"/sweeps/{launched.json()['id']}").json()
+        names = {row["run"]["strategy_name"] for row in read["runs"]}
+        # Twelve distinct names, every one inside the limit: the trim fits, and the digest keeps
+        # points whose visible part is identical from colliding on `(name, version)`.
+        assert len(names) == 12
+        assert max(len(name) for name in names) <= 120
+        assert any("…" in name for name in names), "nothing was trimmed, so this proves nothing"
+
+
 class TestWhatItRefuses:
     def test_a_backwards_window_is_a_typo_in_both_endpoints(self, client: Any) -> None:
         # ⚠️ **The preview and the launch have to give one verdict.** The launch always

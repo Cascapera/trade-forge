@@ -11,7 +11,13 @@ distinction matters:
 """
 
 from tradeforge_schema.generate import SCHEMA_PATH, build_schema, render_schema
-from tradeforge_schema.models import SCHEMA_VERSION, Condition, Indicator, Strategy
+from tradeforge_schema.models import (
+    NAME_MAX_LENGTH,
+    SCHEMA_VERSION,
+    Condition,
+    Indicator,
+    Strategy,
+)
 from tradeforge_schema.semantic import (
     SemanticError,
     SemanticValidationError,
@@ -20,6 +26,7 @@ from tradeforge_schema.semantic import (
 )
 
 __all__ = [
+    "NAME_MAX_LENGTH",
     "SCHEMA_PATH",
     "SCHEMA_VERSION",
     "Condition",

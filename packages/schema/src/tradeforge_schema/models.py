@@ -519,6 +519,17 @@ measurement is what lets the narrowing keep `schema_version` at `"1.0"` instead 
 one of them. ADR-0028, revisiting ADR-0013.
 """
 
+NAME_MAX_LENGTH = 120
+"""How long a document's `name` may be.
+
+Exported because a **generated** name has to fit it and the generator lives a layer up: a study
+and a sweep both write `{base} [{label}]`, and the label grows with the number of axes. Measured
+on this project's own shelf — a five-axis entry expanded to 120 documents whose generated names
+all ran past this limit, and every one was refused for the length of a caption, with a message
+about strings that says nothing about the strategy. (That the entry had 120 points and the limit
+is 120 characters is a coincidence.) `grid.fit_name` is what keeps that from happening, and it is
+what asks this."""
+
 
 class Mme9BreakoutParams(_Node):
     """The break of the candle that closed across the MME9 (ADR-0016).
@@ -944,7 +955,7 @@ class Strategy(_Node):
     # Pinned, not free-form: a saved strategy is immutable for its version, and the
     # engine must be able to refuse a document it was not built to interpret.
     schema_version: Literal["1.0"]
-    name: Annotated[str, Field(min_length=1, max_length=120)]
+    name: Annotated[str, Field(min_length=1, max_length=NAME_MAX_LENGTH)]
     description: str = ""
     timeframe: Timeframe
     indicators: Annotated[list[Indicator], Field(max_length=20)] = Field(default_factory=list)

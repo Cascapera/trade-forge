@@ -29,11 +29,13 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from tradeforge_api.config import Settings
 from tradeforge_api.main import create_app
 from tradeforge_api.queue import RUN_WALK_FORWARD
+from tradeforge_api.runner import execute_backtest
 from tradeforge_api.worker import process_walk_forward
 from tradeforge_collector import write_candles
 from tradeforge_db.models import (
@@ -519,6 +521,92 @@ def test_an_experiment_that_died_halfway_resumes_instead_of_failing_again(
         assert walk_forward.error is None
         # And no fold was scored twice: the ones already holding a test run are skipped whole.
         assert session.scalar(select(func.count()).select_from(Backtest)) == before
+    finally:
+        session.close()
+
+
+def test_a_run_the_fold_cannot_reach_the_database_for_is_failed_not_left_running(
+    prepared: Callable[[], Any],
+    session_factory: Callable[[], Session],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The walk-forward runs its folds inline and nobody retries those runs one by one.
+
+    An unreachable database in the middle of a training run is therefore recorded on that run,
+    as it was before the backtest job learned to retry. Handed upwards instead, it would fail
+    the experiment and leave the run `running` for ever — the kind of row PR-258 exists to stop.
+    """
+    with TestClient(prepared()) as client:
+        _, created = _launch(client)
+
+    def lost(**_kwargs: object) -> object:
+        raise OperationalError("COMMIT", {}, Exception("server closed the connection"))
+
+    with monkeypatch.context() as patched:
+        patched.setattr("tradeforge_api.worker.execute_backtest", lost)
+        _drive(session_factory, tmp_path, created["id"])
+
+    session = session_factory()
+    try:
+        # The launched study's own runs stay queued — nothing here runs them. Every run the
+        # walk-forward touched must have an ending.
+        touched = list(
+            session.scalars(select(Backtest).where(Backtest.status != BacktestStatus.QUEUED))
+        )
+        assert touched, "the walk-forward ran nothing, so this proves nothing"
+        assert {run.status for run in touched} == {BacktestStatus.FAILED}
+        assert all("server closed the connection" in (run.error or "") for run in touched)
+    finally:
+        session.close()
+
+
+def test_the_out_of_sample_run_that_cannot_reach_the_database_is_failed_not_left_running(
+    prepared: Callable[[], Any],
+    session_factory: Callable[[], Session],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same rule for the run that scores a fold's choice, which is created inside the fold.
+
+    Two grid points, so the third engine call is fold 0's out-of-sample run: training passes,
+    a point is chosen, and only the run that tests it loses the database.
+    """
+    real = execute_backtest
+    calls: list[int] = []
+
+    def third_call_lost(**kwargs: Any) -> Any:
+        calls.append(1)
+        if len(calls) == 3:
+            raise OperationalError("COMMIT", {}, Exception("server closed the connection"))
+        return real(**kwargs)
+
+    with TestClient(prepared()) as client:
+        _, created = _launch(client)
+
+    with monkeypatch.context() as patched:
+        patched.setattr("tradeforge_api.worker.execute_backtest", third_call_lost)
+        _drive(session_factory, tmp_path, created["id"])
+
+    session = session_factory()
+    try:
+        walk_forward = session.get(WalkForward, uuid.UUID(created["id"]))
+        assert walk_forward is not None
+        first_fold = walk_forward.fold_rows[0]
+        assert first_fold.test_backtest_id is not None, (
+            "fold 0 has no linked test run: nothing was chosen, or its test run raised out of the "
+            f"fold and failed the experiment ({walk_forward.error})"
+        )
+        tested = session.get(Backtest, first_fold.test_backtest_id)
+        assert tested is not None
+        assert tested.status is BacktestStatus.FAILED
+        assert "server closed the connection" in (tested.error or "")
+        running = session.scalar(
+            select(func.count())
+            .select_from(Backtest)
+            .where(Backtest.status == BacktestStatus.RUNNING)
+        )
+        assert running == 0
     finally:
         session.close()
 

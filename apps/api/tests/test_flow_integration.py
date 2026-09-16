@@ -18,14 +18,15 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import Engine, event
+from sqlalchemy import Engine, event, func, select
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from tradeforge_api.config import Settings
 from tradeforge_api.main import create_app
 from tradeforge_api.worker import process_backtest
 from tradeforge_collector import write_candles
-from tradeforge_db.models import Instrument
+from tradeforge_db.models import BacktestMetrics, Instrument
 from tradeforge_engine.domain import AssetClass, Candle
 from tradeforge_engine.testing import bar
 
@@ -442,3 +443,210 @@ def test_a_timeframe_with_no_collected_candles_fails_instead_of_finishing_empty(
         # Nothing was read, so nothing is claimed. Null is the honest answer, not zero.
         assert finished["candles_seen"] is None
         assert finished["first_candle"] is None
+
+
+def _launch(client: TestClient) -> str:
+    strategy_id = client.post("/strategies", json=_strategy()).json()["id"]
+    enqueued = client.post(
+        "/backtests",
+        json={
+            "strategy_id": strategy_id,
+            "symbol": "EURUSD",
+            "timeframe": "H1",
+            "date_from": START.isoformat(),
+            "date_to": (START + 100 * HOUR).isoformat(),
+            "initial_capital": "10000",
+            "cost_model": {"type": "none"},
+        },
+    )
+    assert enqueued.status_code == 202, enqueued.text
+    return str(enqueued.json()["id"])
+
+
+def _work(session_factory: Callable[[], Session], parquet_root: Path, backtest_id: str) -> None:
+    session = session_factory()
+    try:
+        asyncio.run(
+            process_backtest(
+                session=session,
+                redis=_RecordingRedis(),  # type: ignore[arg-type]
+                parquet_root=parquet_root,
+                backtest_id=uuid.UUID(backtest_id),
+            )
+        )
+    finally:
+        session.close()
+
+
+def _app(session_factory: Callable[[], Session], settings: Settings, tmp_path: Path) -> TestClient:
+    seeding = session_factory()
+    _seed_instrument(seeding)
+    seeding.close()
+    write_candles(tmp_path, "EURUSD", "H1", _candles())
+    return TestClient(
+        create_app(
+            settings=settings.model_copy(update={"parquet_root": tmp_path}),
+            session_factory=session_factory,
+            arq_pool=_CapturingQueue(),
+        )
+    )
+
+
+def test_a_database_lost_mid_run_is_not_recorded_as_the_runs_failure_and_a_retry_finishes_it(
+    session_factory: Callable[[], Session],
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The connection drops after the run is marked running; the retry picks it up from there.
+
+    Before the fix, the broad `except` would record the driver's error as the run's result — a
+    backtest reported as failed for a reason that says nothing about the strategy.
+    """
+    with _app(session_factory, settings, tmp_path) as client:
+        backtest_id = _launch(client)
+
+        def lost(**_kwargs: object) -> object:
+            raise OperationalError("COMMIT", {}, Exception("server closed the connection"))
+
+        with monkeypatch.context() as patched:
+            patched.setattr("tradeforge_api.worker.execute_backtest", lost)
+            with pytest.raises(OperationalError):
+                _work(session_factory, tmp_path, backtest_id)
+
+        interrupted = client.get(f"/backtests/{backtest_id}").json()
+        assert interrupted["status"] == "running"
+        assert interrupted["error"] is None
+
+        _work(session_factory, tmp_path, backtest_id)
+
+        finished = client.get(f"/backtests/{backtest_id}").json()
+        assert finished["status"] == "done"
+        assert finished["error"] is None
+        assert finished["metrics"] is not None
+
+
+def test_an_error_the_database_answered_is_recorded_on_the_first_try(
+    session_factory: Callable[[], Session],
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancelled query is an answer, not an absence: the run fails now, with that reason."""
+
+    class _CancelledError(Exception):
+        sqlstate = "57014"
+
+    with _app(session_factory, settings, tmp_path) as client:
+        backtest_id = _launch(client)
+
+        def cancelled(**_kwargs: object) -> object:
+            raise OperationalError(
+                "SELECT", {}, _CancelledError("canceling statement due to timeout")
+            )
+
+        with monkeypatch.context() as patched:
+            patched.setattr("tradeforge_api.worker.execute_backtest", cancelled)
+            _work(session_factory, tmp_path, backtest_id)
+
+        failed = client.get(f"/backtests/{backtest_id}").json()
+        assert failed["status"] == "failed"
+        assert "canceling statement due to timeout" in failed["error"]
+
+
+def test_a_walk_forward_fold_records_an_unreachable_database_on_the_run(
+    session_factory: Callable[[], Session],
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The inline caller cannot retry, so the run is failed rather than left `running`."""
+    with _app(session_factory, settings, tmp_path) as client:
+        backtest_id = _launch(client)
+
+        def lost(**_kwargs: object) -> object:
+            raise OperationalError("COMMIT", {}, Exception("server closed the connection"))
+
+        with monkeypatch.context() as patched:
+            patched.setattr("tradeforge_api.worker.execute_backtest", lost)
+            session = session_factory()
+            try:
+                asyncio.run(
+                    process_backtest(
+                        session=session,
+                        redis=_RecordingRedis(),  # type: ignore[arg-type]
+                        parquet_root=tmp_path,
+                        backtest_id=uuid.UUID(backtest_id),
+                        retry_unreachable=False,
+                    )
+                )
+            finally:
+                session.close()
+
+        failed = client.get(f"/backtests/{backtest_id}").json()
+        assert failed["status"] == "failed"
+        assert "server closed the connection" in failed["error"]
+
+
+def test_a_retry_of_a_failed_run_keeps_the_reason_it_failed(
+    session_factory: Callable[[], Session],
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The failure was recorded but its commit's answer was lost; the retry must not restart it.
+
+    Restarting would stamp a start after the recorded finish, and the CHECK refusing that would
+    write its own message over the real reason.
+    """
+    with _app(session_factory, settings, tmp_path) as client:
+        backtest_id = _launch(client)
+
+        def broken(**_kwargs: object) -> object:
+            raise ValueError("the strategy is wrong")
+
+        with monkeypatch.context() as patched:
+            patched.setattr("tradeforge_api.worker.execute_backtest", broken)
+            _work(session_factory, tmp_path, backtest_id)
+        first = client.get(f"/backtests/{backtest_id}").json()
+        assert first["status"] == "failed"
+
+        _work(session_factory, tmp_path, backtest_id)
+
+        again = client.get(f"/backtests/{backtest_id}").json()
+        assert again["status"] == "failed"
+        assert again["error"] == "the strategy is wrong"
+        assert again["finished_at"] == first["finished_at"]
+
+
+def test_a_retry_of_a_finished_run_leaves_its_result_alone(
+    session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+) -> None:
+    """A commit whose answer was lost with the connection is retried; the run had already landed.
+
+    Running it again would write a second metrics row against the same key, and the collision
+    would be recorded as the failure of a run that had succeeded.
+    """
+    with _app(session_factory, settings, tmp_path) as client:
+        backtest_id = _launch(client)
+        _work(session_factory, tmp_path, backtest_id)
+        first = client.get(f"/backtests/{backtest_id}").json()
+        assert first["status"] == "done"
+
+        _work(session_factory, tmp_path, backtest_id)
+
+        again = client.get(f"/backtests/{backtest_id}").json()
+        assert again["status"] == "done"
+        assert again["error"] is None
+        assert again["finished_at"] == first["finished_at"]
+        assert again["metrics"] == first["metrics"]
+        reading = session_factory()
+        try:
+            rows = reading.scalar(
+                select(func.count())
+                .select_from(BacktestMetrics)
+                .where(BacktestMetrics.backtest_id == uuid.UUID(backtest_id))
+            )
+        finally:
+            reading.close()
+        assert rows == 1

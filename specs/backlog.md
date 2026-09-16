@@ -2348,3 +2348,14 @@ e hoje ele mede o arquivo como a suíte o deixou.
 - [origem: PR-256] **O painel mistura retornos de janelas de tamanhos diferentes na mesma mediana.**
   Uma entrada varrida em 2024 (1 ano) e em 2020–2026 (6 anos) põe as duas medidas no mesmo ranking.
   A tela avisa. Conserto possível: anualizar, ou agrupar também por janela.
+- [origem: PR-258] **O walk-forward ainda não sobrevive ao banco fora do ar.** A PR-258 devolve à fila
+  (`Retry` do arq) só os backtests. Os runs que o walk-forward executa inline continuam como antes:
+  banco inalcançável vira falha **do run** (`retry_unreachable=False`), e o experimento segue com um
+  buraco no ranking. Aqui não há espera: se o banco também recusar essa gravação, o run fica
+  `running` (o commit que o marcou já entrou) e ninguém volta para ele.
+  Repetir não resolve sozinho: `_process_fold` só grava `test_backtest_id` **depois** de rodar o
+  run de teste, então uma repetição no meio cria um **segundo** run fora da amostra para o mesmo
+  fold. Conserto: vincular o run de teste logo depois de criá-lo (a FK e o CHECK já permitem, porque
+  `chosen_strategy_id` está gravado) e, na repetição, rodar o vinculado se ele não estiver `done`.
+- [origem: PR-258] **Os runs que já estão presos continuam presos.** O conserto evita casos novos.
+  O `77842306` (15/09) segue `queued`, e o contador X/Y mostra isso (decisão dele: sem reconciliador).

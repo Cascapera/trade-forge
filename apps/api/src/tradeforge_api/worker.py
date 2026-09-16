@@ -9,10 +9,20 @@ The lifecycle is a state machine written into the `backtests` row: `queued → r
 progress channel, so a WebSocket subscriber sees the same story the database tells. A failure
 is *recorded*, not re-raised — a wrong strategy is a result to report (`GET /backtests/{id}`),
 not a job for arq to retry forever.
+
+⚠️ **Except when the database cannot be reached at all.** A run that cannot reach Postgres has
+not failed; nothing about it was measured. Before this rule, a worker that picked a job while
+Postgres was still starting raised out of `session.get`, arq — which does not retry an ordinary
+exception — dropped the job, and the row stayed `queued` for ever with nothing to say why
+(measured on 15/09, run `77842306`). Now an unreachable database hands the job back to arq with a
+growing delay, and only the last try records the run as failed. Every other database error — a
+cancelled query, a full disk, a deadlock — is a result, recorded on the first try, provided the
+database takes that write. Nothing here can record anything in a database that refuses it.
 """
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import json
 import uuid
@@ -21,8 +31,10 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from arq.worker import Retry, func
 from redis.asyncio import Redis
 from sqlalchemy import select
+from sqlalchemy.exc import DBAPIError, OperationalError
 from sqlalchemy.orm import Session
 
 from tradeforge_api.config import RedisConfig, Settings
@@ -55,21 +67,60 @@ async def _announce(redis: Redis, backtest_id: uuid.UUID, payload: dict[str, Any
     await redis.publish(progress_channel(backtest_id), json.dumps(payload))
 
 
+# SQLSTATEs that mean "the server is not there to answer": connection exceptions (class 08), and
+# the server shutting down, crashing or still starting (57P01, 57P02, 57P03). 57014, a cancelled
+# query, shares class 57 and is deliberately not here — the server answered it.
+_UNREACHABLE_STATES = frozenset({"57P01", "57P02", "57P03"})
+
+
+def database_unreachable(exc: BaseException) -> bool:
+    """Whether `exc` says the database could not be reached, as opposed to what it answered.
+
+    ⚠️ psycopg files a cancelled query, a full disk and a deadlock under `OperationalError` too.
+    Retrying those would re-run the whole backtest eight times to reach the same answer, so the
+    class alone is not the test: the SQLSTATE is. An `OperationalError` with no SQLSTATE comes
+    from the connect step — a refused connection, or a server that answered `57P03` at connect
+    time, which psycopg reports without the code (the 15/09 case) — and counts as unreachable.
+    """
+    if not isinstance(exc, DBAPIError):
+        return False
+    if exc.connection_invalidated:
+        return True
+    sqlstate: str | None = getattr(exc.orig, "sqlstate", None)
+    if sqlstate is None:
+        return isinstance(exc, OperationalError)
+    return sqlstate.startswith("08") or sqlstate in _UNREACHABLE_STATES
+
+
 async def process_backtest(
     *,
     session: Session,
     redis: Redis,
     parquet_root: Path,
     backtest_id: uuid.UUID,
+    retry_unreachable: bool = True,
 ) -> None:
     """Run one backtest end to end, driving its row through the status state machine.
 
     Split from the arq entry point so it can be exercised inline in a test — pass a real
     session and Redis, and this is the whole worker without a running arq process.
+
+    `retry_unreachable=False` is for a caller that cannot retry — the walk-forward runs its folds
+    inline — and records an unreachable database as the run's failure, as before, rather than
+    leaving the run `running` with nobody coming back for it.
     """
+    # ⚠️ Outside the `try`, on purpose: a database that cannot answer this is not a failed run,
+    # and the error must reach the caller — `run_backtest`, which retries or records it.
     backtest = session.get(Backtest, backtest_id)
     if backtest is None:
         return  # the row was deleted between enqueue and pickup; nothing to run
+    if backtest.status in (BacktestStatus.DONE, BacktestStatus.FAILED):
+        # A retry after a commit whose outcome was lost with the connection: the run already has
+        # its result. Running a `done` one again would write a second metrics row against the same
+        # key; restarting a `failed` one would stamp a start after its recorded finish, and the
+        # CHECK that refuses that would replace the real reason with its own. Nothing enqueues a
+        # finished run on purpose — every launch writes a new row.
+        return
 
     try:
         backtest.status = BacktestStatus.RUNNING
@@ -113,6 +164,14 @@ async def process_backtest(
         session.commit()
         await _announce(redis, backtest_id, {"status": "done", "progress": 1.0})
 
+    except DBAPIError as exc:
+        if retry_unreachable and database_unreachable(exc):
+            # The database, not the run: nothing was measured, so nothing is recorded. The caller
+            # hands the job back to arq.
+            raise
+        session.rollback()
+        _record_failure(session, backtest_id, exc)
+        await _announce(redis, backtest_id, {"status": "failed", "error": _reason(exc)})
     except Exception as exc:  # noqa: BLE001 — a failed run is a recorded result, not a crash
         session.rollback()
         _record_failure(session, backtest_id, exc)
@@ -225,7 +284,11 @@ async def _process_fold(
         if run.status is BacktestStatus.DONE:
             continue
         await process_backtest(
-            session=session, redis=redis, parquet_root=parquet_root, backtest_id=run.id
+            session=session,
+            redis=redis,
+            parquet_root=parquet_root,
+            backtest_id=run.id,
+            retry_unreachable=False,
         )
 
     ranked = _candidates(session, fold, training, walk_forward.metric)
@@ -257,7 +320,11 @@ async def _process_fold(
     session.commit()
 
     await process_backtest(
-        session=session, redis=redis, parquet_root=parquet_root, backtest_id=test.id
+        session=session,
+        redis=redis,
+        parquet_root=parquet_root,
+        backtest_id=test.id,
+        retry_unreachable=False,
     )
 
     # Linked after the run exists, never before: `test_backtest_id` is a foreign key, and the
@@ -327,6 +394,10 @@ def _record_failure(session: Session, backtest_id: uuid.UUID, exc: Exception) ->
     backtest = session.get(Backtest, backtest_id)
     if backtest is None:
         return
+    if backtest.status is BacktestStatus.DONE:
+        # A result already landed — a commit whose answer was lost, or an error raised after it
+        # (the progress publish). What failed afterwards is not the run, and must not erase it.
+        return
     backtest.status = BacktestStatus.FAILED
     backtest.error = _reason(exc)
     # `finished_at` may only be set once the run has started (a DB CHECK). If we failed before
@@ -347,9 +418,35 @@ def _reason(exc: Exception) -> str:
 # --------------------------------------------------------------------------- #
 
 
+MAX_TRIES = 8
+"""How many times a backtest job runs before a database that will not answer is its result.
+
+With `retry_delay`, the seven waits add up to 140 seconds — room for a database that is starting.
+That is the waiting alone: each try also spends however long its own connect takes, and no
+connect timeout is set. A database that comes back within the budget gets the run recorded,
+done or failed; one that never does leaves the row as it was, with the error in arq's result."""
+
+
+def retry_delay(job_try: int) -> int:
+    """Seconds to wait before try `job_try + 1`: 5, 10, 15 … — room for a database to start."""
+    return 5 * job_try
+
+
 async def run_backtest(ctx: dict[str, Any], backtest_id: str) -> None:
     """The registered job. arq passes the run's id as a string; everything else is read from
-    the database inside `process_backtest`."""
+    the database inside `process_backtest`.
+
+    ⚠️ **The last try is ours, not arq's.** Past `max_tries` arq refuses the job without calling
+    this function, so a retry budget spent by arq would leave the row exactly where the bug left
+    it. On the last try the unreachable database is recorded as the run's failure — if the
+    database answers that write. If it does not, that write's error goes to arq's own result (the
+    original rides along as its context), and the row stays as it was: nothing here can write to
+    a database that is not there.
+
+    A database error that is **not** unreachability — a cancelled query on the first read — is
+    recorded the same way, on the first try: it is an answer, and retrying would get it again.
+    """
+    run_id = uuid.UUID(backtest_id)
     session: Session = ctx["session_factory"]()
     settings: Settings = ctx["settings"]
     try:
@@ -357,10 +454,34 @@ async def run_backtest(ctx: dict[str, Any], backtest_id: str) -> None:
             session=session,
             redis=ctx["redis"],
             parquet_root=settings.parquet_root,
-            backtest_id=uuid.UUID(backtest_id),
+            backtest_id=run_id,
         )
+    except DBAPIError as exc:
+        job_try: int = ctx.get("job_try", 1)
+        if database_unreachable(exc) and job_try < MAX_TRIES:
+            raise Retry(defer=retry_delay(job_try)) from exc
+        # ⚠️ **The old session is let go before the new one is opened.** If its connection were
+        # still alive inside an aborted transaction, it would hold this row's lock until ROLLBACK,
+        # and the new session's UPDATE would wait on it — synchronously, stalling the worker's
+        # whole event loop. Not reproduced against a real server; the order costs nothing.
+        _discard(session)
+        last = ctx["session_factory"]()
+        try:
+            _record_failure(last, run_id, exc)
+        finally:
+            last.close()
+        await _announce(ctx["redis"], run_id, {"status": "failed", "error": _reason(exc)})
     finally:
         session.close()
+
+
+def _discard(session: Session) -> None:
+    """Roll back and close, tolerating a connection that is already gone."""
+    # Nothing to roll back on a dead connection; closing hands it back, and the pool discards an
+    # invalidated one rather than reusing it.
+    with contextlib.suppress(DBAPIError):
+        session.rollback()
+    session.close()
 
 
 async def run_walk_forward(ctx: dict[str, Any], walk_forward_id: str) -> None:
@@ -400,7 +521,9 @@ async def shutdown(ctx: dict[str, Any]) -> None:
 class WorkerSettings:
     """`arq tradeforge_api.worker.WorkerSettings` starts the worker from this."""
 
-    functions = (run_backtest, run_walk_forward)
+    # `run_backtest` spends the last try itself, so arq must be told the same number — stated on
+    # that function alone. The walk-forward keeps arq's default: it does not raise `Retry`.
+    functions = (func(run_backtest, max_tries=MAX_TRIES), run_walk_forward)
     # Built from RedisConfig, not Settings: this line runs at import, and importing the worker
     # must not require the Postgres password. The DB config is read later, in `startup`.
     redis_settings = redis_settings(RedisConfig())
@@ -409,9 +532,12 @@ class WorkerSettings:
 
 
 __all__ = [
+    "MAX_TRIES",
     "WorkerSettings",
+    "database_unreachable",
     "process_backtest",
     "process_walk_forward",
+    "retry_delay",
     "run_backtest",
     "run_walk_forward",
 ]

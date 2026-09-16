@@ -15,10 +15,14 @@ one row. An override column would make "what did this run actually execute" a qu
 answers, joined by merge logic that could drift, and nothing would raise when it did.
 """
 
+import hashlib
+import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from itertools import product
 from typing import Any
+
+from tradeforge_schema import NAME_MAX_LENGTH
 
 type Json = str | int | float | bool | list["Json"] | dict[str, "Json"] | None
 """What a strategy document is made of, spelled out.
@@ -304,4 +308,54 @@ def named(base_name: str, point: GridPoint) -> str:
     separate rows either way, and a run log row reading `MME9 breakout v37` cannot be read at
     all — the run log is exactly where a study's result gets read.
     """
-    return f"{base_name} [{point.label}]"
+    return fit_name(base_name, point.label, point.values)
+
+
+def _digest(values: Mapping[str, Any]) -> str:
+    """Six hex characters that stand for this point's coordinates.
+
+    ⚠️ **sha256, not `hash()`.** The built-in is salted per process, so a name built today and the
+    same name rebuilt tomorrow would differ — and a stored strategy would be written twice instead
+    of being found and reused.
+    """
+    canonical = json.dumps(dict(sorted(values.items())), sort_keys=True, default=str)
+    return hashlib.sha256(canonical.encode()).hexdigest()[:6]
+
+
+def fit_name(base_name: str, label: str, values: Mapping[str, Any]) -> str:
+    """`{base} [{label}]`, kept inside the DSL's own limit on a document's name.
+
+    ⚠️ **Why this exists, measured on a real sweep.** A five-axis entry on this project's own
+    shelf expanded to 120 documents and every one was refused, for `name: String should have at
+    most 120 characters` — the length of a caption, which says nothing about the strategy behind
+    it. That entry contributed zero runs to a sweep that looked like it had launched. (The two
+    120s are a coincidence: one is the number of points, the other the limit.)
+
+    Trimmed rather than the limit raised: the limit is the DSL's contract, and a 300-character
+    name is one nobody reads — the run log prints it in full, beside the version and the dates.
+
+    ⚠️ **The suffix is what makes trimming safe.** Neighbouring points of a grid differ only in
+    the axis that varies fastest, so a trim can leave them sharing every visible character;
+    without the digest the second one would collide on the unique `(name, version)` and come back
+    as an integrity error from the database — trading a refusal anyone can read for one nobody
+    can.
+    """
+    full = f"{base_name} [{label}]"
+    if len(full) <= NAME_MAX_LENGTH:
+        return full
+
+    tail = f"… #{_digest(values)}]"
+    room = NAME_MAX_LENGTH - len(base_name) - len(" [") - len(tail)
+    if room < 0:
+        # The base name alone does not leave room for the digest. Trim it too: the digest is what
+        # keeps two points apart, so it is the part that must survive.
+        #
+        # ⚠️ A mutant swapping `< 0` for `< 1` survives the suite, and it is **under-specified**
+        # rather than equivalent: at exactly zero room the two differ by one character — `< 1`
+        # trims the base by one so a single character of label survives, `< 0` keeps the base and
+        # shows none. Both land on the limit and both carry the digest, so nothing a caller
+        # depends on changes; pinning it would take a golden on a 108-character base name, and
+        # that golden would be a test of caption cosmetics.
+        base_name = base_name[: max(1, NAME_MAX_LENGTH - len(" [") - len(tail) - 1)]
+        room = NAME_MAX_LENGTH - len(base_name) - len(" [") - len(tail)
+    return f"{base_name} [{label[: max(0, room)].rstrip(', ')}{tail}"

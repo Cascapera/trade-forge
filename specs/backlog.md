@@ -2299,6 +2299,33 @@ e hoje ele mede o arquivo como a suíte o deixou.
   não varre `setup.params.period` rodou com o `period` do próprio documento; o CSV deixa a célula
   vazia (honesto: ninguém escolheu), mas o ML perde um valor conhecido. Opção: coluna preenchida a
   partir do documento, marcada como "fixo, não varrido". Decidir com o Guilherme.
+- [origem: PR-253, MEDIDO em 15/09] **Um run pode ficar `queued` para sempre, sem erro, se o worker
+  o pegar antes de o Postgres aceitar conexão.** Caso real: o backtest
+  `77842306-1810-47fc-b0af-c1174a2513bf` (varredura `29e00cfa`, 15/09 01:27) está `queued` até hoje,
+  com `started_at`, `finished_at` e `error` NULOS e sem métricas. O resultado guardado no Redis
+  (`arq:result:<id>`) é um `sqlalchemy.exc.OperationalError`: *"connection to server at 172.21.0.6,
+  port 5432 failed: FATAL: the database system is starting up"*. O `arq:job:<id>` não existe mais e
+  `arq:queue` está vazia — ninguém vai reprocessá-lo.
+  **Mecanismo:** `process_backtest` só consegue gravar `FAILED` através de `_record_failure(session,
+  ...)`, que precisa de uma sessão; se a falha é *na própria conexão*, não há como registrar nada, e
+  a linha fica no status inicial. O `depends_on: postgres healthy` do compose ordena a **primeira**
+  subida, não os reinícios (`restart: unless-stopped`), então basta o Postgres reiniciar junto com a
+  máquina para a corrida acontecer.
+  **Efeito:** a tela e o contador dizem "na fila" para um run que nunca vai rodar — status que mente,
+  do tipo que [[sinal-de-vida-na-escala-errada]] descreve. Isso também é o que o contador X/Y pedido
+  por ele em 15/09 tornaria visível.
+  **Candidatos de conserto (decidir):** (a) no worker, tratar falha de conexão como retentativa do
+  arq (`Retry`) em vez de consumir o job; (b) um reconciliador que marca `queued` órfão como
+  `failed` dizendo o motivo; (c) healthcheck/espera do worker antes de consumir a fila. Enquanto não
+  houver conserto, o sintoma é reconhecível: `queued` antigo com `arq:result` presente e `arq:job`
+  ausente.
+- [origem: PR-253] **A tela da varredura mostra a frase crua do Pydantic quando um ponto é
+  recusado.** O `refusal_of` devolve `campo: mensagem` (`name: String should have at most 120
+  characters`), e a tela imprime isso ao lado do rótulo do ponto. Para quem está montando uma
+  estratégia, a frase fala de um campo que ele não escreveu. Depois da #253 essa recusa específica
+  não acontece mais, mas as outras continuam chegando assim — por exemplo `htf must be coarser
+  than the chart`, que é boa, ao lado de mensagens de tipo que não são. Decidir se a API traduz ou
+  se a tela agrupa por campo. Ver [[uma-chave-dois-tipos]].
 - [origem: PR-252] **Características de mercado da janela** (volatilidade, tendência, spread médio)
   ficaram fora do dataset. São o que permitiria ao ML dizer "este setup funciona em mercado assim";
   hoje a linha só diz em qual ativo e período. É um cálculo novo sobre as velas, não um export.

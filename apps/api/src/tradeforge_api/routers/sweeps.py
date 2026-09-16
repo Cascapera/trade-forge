@@ -19,14 +19,17 @@ never searched, and it would look exactly like a map of one it did.
 """
 
 import datetime as dt
+import json
 import uuid
 from typing import Annotated, Any
 
 from fastapi import APIRouter, HTTPException, Query, Response, status
+from pydantic import AwareDatetime
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import defer, selectinload
 
+from tradeforge_api import sweep_dashboard as dashboard
 from tradeforge_api.deps import QueueDep, SessionDep
 from tradeforge_api.grid import GridPoint
 from tradeforge_api.queue import RUN_BACKTEST
@@ -42,6 +45,7 @@ from tradeforge_api.schemas import (
     DatasetOmissionOut,
     GridRefusal,
     PreviewSweepRequest,
+    SweepDashboardOut,
     SweepEntryOut,
     SweepEntryPreview,
     SweepListEntry,
@@ -477,6 +481,138 @@ def list_sweeps(
         )
 
     return SweepsPage(total=total, limit=limit, offset=offset, items=items)
+
+
+@router.get("/sweeps/dashboard", response_model=SweepDashboardOut)
+def get_sweep_dashboard(
+    session: SessionDep,
+    *,
+    launched_from: Annotated[
+        AwareDatetime | None, Query(description="first launch instant included")
+    ] = None,
+    launched_to: Annotated[
+        AwareDatetime | None, Query(description="first launch instant excluded")
+    ] = None,
+) -> SweepDashboardOut:
+    """Every sweep launched in `[launched_from, launched_to)`, summarised at once.
+
+    ⚠️ **Declared before `/sweeps/{sweep_id}`, and the order is the route.** FastAPI tries paths
+    in declaration order, and `dashboard` would otherwise be read as a malformed sweep id — a 422
+    for a page that exists.
+
+    ⚠️ **Instants with an offset, never bare dates.** "Launched on the 15th" depends on whose
+    clock: a sweep launched at 22:00 in São Paulo is the 16th in UTC. The screen turns the days a
+    person picked into instants in their own zone, and this endpoint only compares; a date
+    without an offset is refused rather than guessed at.
+
+    Half-open, so two adjacent windows never count the same sweep twice. Either end may be
+    left out.
+
+    ⚠️ **`points` is read here, unlike the history list.** It is the only record of which entry a
+    run belongs to — the strategy's name is a caption, and recovering the entry from it breaks
+    the day one entry's name is a prefix of another's. The equity curve stays deferred.
+    """
+    if launched_from is not None and launched_to is not None and launched_to <= launched_from:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="launched_to must come after launched_from",
+        )
+
+    window = []
+    if launched_from is not None:
+        window.append(Sweep.created_at >= launched_from)
+    if launched_to is not None:
+        window.append(Sweep.created_at < launched_to)
+    sweeps = session.scalars(
+        select(Sweep).where(*window).order_by(Sweep.created_at, Sweep.id)
+    ).all()
+
+    asked = {uuid.UUID(one) for sweep in sweeps for one in sweep.entry_ids}
+    names = {
+        str(entry.id): entry.name
+        for entry in session.scalars(select(CatalogEntry).where(CatalogEntry.id.in_(asked)))
+    }
+    # Per sweep: each run is looked up in the points of the sweep that launched it. A document
+    # is reused by every later sweep of the same entry, so the sweep is the only key that says,
+    # without a second lookup, which record wrote this run's coordinates.
+    entry_of = {
+        sweep.id: {str(point["strategy_id"]): str(point["entry_id"]) for point in sweep.points}
+        for sweep in sweeps
+    }
+
+    rows = session.execute(
+        select(Backtest, Instrument.symbol)
+        .join(Instrument, Instrument.id == Backtest.instrument_id)
+        .where(Backtest.sweep_id.in_(list(entry_of)))
+        # Launch order, so which copy of a repeated measurement is kept does not change between
+        # two reads of the same data.
+        .order_by(Backtest.created_at, Backtest.id)
+        .options(selectinload(Backtest.metrics).defer(BacktestMetrics.equity_curve))
+    ).all()
+
+    runs: list[dashboard.DashboardRun] = []
+    for run, symbol in rows:
+        if run.sweep_id is None:  # pragma: no cover — the filter above selects by sweep
+            continue
+        entry_id = entry_of[run.sweep_id].get(str(run.strategy_id), "")
+        metrics = run.metrics
+        runs.append(
+            dashboard.DashboardRun(
+                sweep_id=str(run.sweep_id),
+                entry_id=entry_id,
+                entry_name=names.get(entry_id),
+                symbol=symbol,
+                timeframe=run.timeframe,
+                status=run.status,
+                initial_capital=run.initial_capital,
+                measurement=(
+                    run.strategy_id,
+                    run.instrument_id,
+                    run.timeframe,
+                    run.date_from,
+                    run.date_to,
+                    run.initial_capital,
+                    json.dumps(run.cost_model, sort_keys=True),
+                    run.engine_version,
+                ),
+                result=None
+                if metrics is None
+                else dashboard.RunResult(
+                    net_profit=metrics.net_profit,
+                    total_trades=metrics.total_trades,
+                    win_rate=metrics.win_rate,
+                    profit_factor=metrics.profit_factor,
+                    expectancy=metrics.expectancy,
+                    max_drawdown_pct=metrics.max_drawdown_pct,
+                ),
+            )
+        )
+
+    listed = [
+        dashboard.DashboardSweepRow(
+            sweep_id=str(sweep.id),
+            created_at=sweep.created_at,
+            entry_names=[names.get(one) for one in sweep.entry_ids],
+        )
+        for sweep in sweeps
+    ]
+    # Each measurement once for everything that summarises results; every run for what counts
+    # launches. See the module's note on why a copy must not vote twice.
+    measured = dashboard.distinct(runs)
+    win_rate, profit_factor, expectancy = dashboard.ratios(measured)
+    return SweepDashboardOut(
+        launched_from=launched_from,
+        launched_to=launched_to,
+        totals=dashboard.totals(listed, runs),
+        overall=dashboard.summarise("all", "All sweeps", measured),
+        win_rate=win_rate,
+        profit_factor=profit_factor,
+        expectancy=expectancy,
+        by_entry=dashboard.by_entry(measured),
+        by_symbol=dashboard.by_symbol(measured),
+        by_timeframe=dashboard.by_timeframe(measured),
+        sweeps=dashboard.per_sweep(listed, runs),
+    )
 
 
 @router.get("/sweeps/{sweep_id}", response_model=SweepOut, responses=_NOT_FOUND)

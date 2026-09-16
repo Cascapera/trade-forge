@@ -1086,6 +1086,78 @@ export interface SweepListItem {
   runs: SweepRunCounts
 }
 
+/** One group of a dashboard's runs. `winners + losers + flat == finished`. Returns are fractions. */
+export interface DashboardSlice {
+  key: string
+  /** Null only for an entry since removed from the shelf. */
+  label: string | null
+  runs: number
+  finished: number
+  failed: number
+  winners: number
+  losers: number
+  flat: number
+  median_return: string | null
+  mean_return: string | null
+  best_return: string | null
+  worst_return: string | null
+  median_drawdown: string | null
+  worst_drawdown: string | null
+}
+
+/** A per-run ratio's median, and over how many runs it exists at all. */
+export interface DashboardRatio {
+  median: string | null
+  runs: number
+}
+
+export interface DashboardTotals {
+  sweeps: number
+  entries: number
+  symbols: string[]
+  timeframes: string[]
+  /** Every run launched, copies included. */
+  runs: SweepRunCounts
+  /** Distinct measurements among those runs; every result figure counts each one once. */
+  measurements: number
+  trades: number
+  runs_without_trades: number
+}
+
+/** One sweep on the timeline. Its median pools the sweep's entries. */
+export interface DashboardSweep {
+  id: string
+  created_at: string
+  entry_names: (string | null)[]
+  runs: number
+  finished: number
+  winners: number
+  median_return: string | null
+}
+
+export interface SweepDashboard {
+  launched_from: string | null
+  launched_to: string | null
+  totals: DashboardTotals
+  overall: DashboardSlice
+  win_rate: DashboardRatio
+  profit_factor: DashboardRatio
+  /** Per trade, as a fraction of the run's starting capital. */
+  expectancy: DashboardRatio
+  /** Best median first. */
+  by_entry: DashboardSlice[]
+  by_symbol: DashboardSlice[]
+  by_timeframe: DashboardSlice[]
+  /** Oldest first. */
+  sweeps: DashboardSweep[]
+}
+
+/** Instants with an offset, half-open: `[launched_from, launched_to)`. Either may be absent. */
+export interface LaunchWindow {
+  launched_from?: string
+  launched_to?: string
+}
+
 export interface SweepsPage {
   total: number
   limit: number

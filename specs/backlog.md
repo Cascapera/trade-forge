@@ -2339,3 +2339,12 @@ e hoje ele mede o arquivo como a suíte o deixou.
 - [origem: PR-252] **Características de mercado da janela** (volatilidade, tendência, spread médio)
   ficaram fora do dataset. São o que permitiria ao ML dizer "este setup funciona em mercado assim";
   hoje a linha só diz em qual ativo e período. É um cálculo novo sobre as velas, não um export.
+- [origem: PR-256] **O painel das varreduras lê tudo, sem teto.** Sem datas, `GET /sweeps/dashboard`
+  carrega todo run de toda varredura como objeto ORM. Medido em 16/09: 794 runs em 0,12 s. Mas
+  `MAX_SWEEP_RUNS` é 3000 por varredura e não há limite de varreduras: 20 cheias seriam cerca de 60
+  mil objetos (uns 9 s por extrapolação). Candidatos: agregar em SQL (`percentile_cont`), ou recusar
+  acima de N runs pedindo um período. Cuidado: agregar em SQL cria uma segunda definição de mediana
+  e de vencedor, além da do estudo.
+- [origem: PR-256] **O painel mistura retornos de janelas de tamanhos diferentes na mesma mediana.**
+  Uma entrada varrida em 2024 (1 ano) e em 2020–2026 (6 anos) põe as duas medidas no mesmo ranking.
+  A tela avisa. Conserto possível: anualizar, ou agrupar também por janela.

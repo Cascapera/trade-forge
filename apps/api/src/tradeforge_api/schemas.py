@@ -1841,6 +1841,110 @@ class SweepsPage(BaseModel):
     items: list[SweepListItem]
 
 
+class DashboardSlice(BaseModel):
+    """One group of a dashboard's runs — an entry, a market, a chart, or all of them.
+
+    `winners + losers + flat == finished`, split by the sign of the net profit. A run with no
+    metrics yet is in `runs` and in none of those: it has not won or lost anything.
+    """
+
+    key: str
+    """The entry's id, the symbol, or the timeframe; `all` for the whole dashboard."""
+
+    label: str | None
+    """What a person reads. Null only for an entry since removed from the shelf."""
+
+    runs: int
+    finished: int
+    failed: int
+    winners: int
+    losers: int
+    flat: int
+    median_return: Money | None
+    mean_return: Money | None
+    best_return: Money | None
+    worst_return: Money | None
+    """Returns are fractions of each run's own starting capital. All null until a run finishes."""
+
+    median_drawdown: Money | None
+    worst_drawdown: Money | None
+    """The largest fall from a peak measured as a fraction of that peak — not necessarily the
+    deepest fall in money, which the engine tracks separately."""
+
+
+class DashboardRatio(BaseModel):
+    """A per-run ratio's median, and over how many runs it exists at all."""
+
+    median: Money | None
+    runs: int
+    """A win rate needs a trade and a profit factor needs a loss, so each ratio is defined over
+    its own subset. A median over five runs is a smaller claim than one over five hundred."""
+
+
+class DashboardTotals(BaseModel):
+    sweeps: int
+    entries: int
+    symbols: list[str]
+    timeframes: list[str]
+    runs: SweepRunCounts
+    """Every run launched, copies included."""
+
+    measurements: int
+    """Distinct measurements among those runs. Every other figure of the dashboard, except the
+    per-sweep timeline, counts each measurement once."""
+
+    trades: int
+    """Closed trades, summed over finished measurements."""
+
+    runs_without_trades: int
+    """Finished measurements that never traded — flat by construction, not evidence of anything."""
+
+
+class DashboardSweep(BaseModel):
+    """One sweep on the dashboard's timeline.
+
+    ⚠️ Its median pools the sweep's entries. It says how that search went, not whether a method
+    works — that is `SweepDashboardOut.by_entry`.
+    """
+
+    id: uuid.UUID
+    created_at: dt.datetime
+    entry_names: list[str | None]
+    runs: int
+    finished: int
+    winners: int
+    median_return: Money | None
+
+
+class SweepDashboardOut(BaseModel):
+    """Every sweep launched in a window, summarised at once.
+
+    ⚠️ **Every figure is in-sample**, and the best of them is the best of the widest search this
+    project runs. Read the medians and the share of winners first.
+    """
+
+    launched_from: dt.datetime | None
+    launched_to: dt.datetime | None
+    totals: DashboardTotals
+    overall: DashboardSlice
+    win_rate: DashboardRatio
+    profit_factor: DashboardRatio
+    expectancy: DashboardRatio
+    """Per trade, as a fraction of the run's starting capital, as in the dataset."""
+
+    by_entry: list[DashboardSlice]
+    """Best median first. Never pooled across entries: each is its own method.
+
+    ⚠️ Returns are over each run's whole window, and one entry's sweeps may have used windows of
+    different lengths — a six-year return and a one-year return sit in the same median."""
+
+    by_symbol: list[DashboardSlice]
+    by_timeframe: list[DashboardSlice]
+    sweeps: list[DashboardSweep]
+    """Oldest first, which is the order a timeline is read in. Each counts all its own runs,
+    copies of another sweep's included."""
+
+
 class DatasetColumnOut(BaseModel):
     """One column of a sweep's dataset, as the file names it."""
 

@@ -16,6 +16,7 @@ vi.mock('./client', () => ({
     listStrategies: vi.fn(),
     updateStrategy: vi.fn(),
     listSweeps: vi.fn(),
+    getSweepDashboard: vi.fn(),
   },
 }))
 
@@ -37,6 +38,7 @@ import {
   useEquity,
   useEquityCurves,
   useInstruments,
+  useSweepDashboard,
   useSweeps,
   useTrades,
 } from './hooks'
@@ -169,6 +171,46 @@ describe('useSweeps keeps the page up while the next one loads', () => {
     })
     expect(result.current.data?.offset).toBe(0)
     expect(result.current.isPlaceholderData).toBe(true)
+  })
+})
+
+describe('useSweepDashboard', () => {
+  it('asks for the window it was given', async () => {
+    mockedApi.getSweepDashboard.mockResolvedValue({ launched_from: null } as never)
+    const window = { launched_from: '2026-09-15T03:00:00.000Z' }
+
+    const { result } = renderHook(() => useSweepDashboard(window), { wrapper: makeWrapper() })
+
+    await waitFor(() => {
+      expect(result.current.isSuccess).toBe(true)
+    })
+    expect(mockedApi.getSweepDashboard).toHaveBeenCalledWith(window)
+  })
+
+  it('asks nothing for a window that runs backwards', () => {
+    renderHook(() => useSweepDashboard(null), { wrapper: makeWrapper() })
+
+    expect(mockedApi.getSweepDashboard).not.toHaveBeenCalled()
+  })
+
+  it('does not poll, even with a run that will never leave the queue', async () => {
+    // A stuck `queued` run is real on this project; a poll waiting for it would never stop.
+    mockedApi.getSweepDashboard.mockResolvedValue({
+      totals: { runs: { total: 1, done: 0, running: 0, queued: 1, failed: 0 } },
+    } as never)
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    )
+
+    const { result } = renderHook(() => useSweepDashboard({}), { wrapper })
+    await waitFor(() => {
+      expect(result.current.isSuccess).toBe(true)
+    })
+
+    const query = client.getQueryCache().find({ queryKey: ['sweep-dashboard', {}] })
+    const interval = (query?.options as { refetchInterval?: unknown } | undefined)?.refetchInterval
+    expect(interval).toBeUndefined()
   })
 })
 

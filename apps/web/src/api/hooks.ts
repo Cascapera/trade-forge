@@ -50,6 +50,8 @@ import type {
   PreviewSweepRequest,
   SweepOut,
   SweepPreview,
+  LaunchWindow,
+  SweepDashboard,
   SweepsPage,
   TradesPage,
   WalkForwardOut,
@@ -582,6 +584,21 @@ export const SWEEPS_PER_PAGE = 10
  */
 export function isHistorySettled(page: SweepsPage | undefined): boolean {
   return page?.items.every((item) => settled(item.runs)) ?? false
+}
+
+/**
+ * Every sweep launched in a window, summarised — read once, refreshed by hand.
+ *
+ * ⚠️ **Not polled, unlike the history.** A run left `queued` by a worker that never picked it up
+ * stays queued for ever, and a poll that waited for everything to settle would re-read every run
+ * of every sweep every few seconds, indefinitely. The screen offers a refresh instead.
+ */
+export function useSweepDashboard(launched: LaunchWindow | null) {
+  return useQuery<SweepDashboard>({
+    queryKey: ['sweep-dashboard', launched],
+    queryFn: launched === null ? skipToken : () => api.getSweepDashboard(launched),
+    placeholderData: (previous) => previous,
+  })
 }
 
 /**

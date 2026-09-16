@@ -40,6 +40,7 @@ import type {
   StudyPreview,
   SweepOut,
   SweepPreview,
+  SweepsPage,
   SymbolHistory,
   SymbolSearch,
   TradesPage,
@@ -172,6 +173,8 @@ export const api = {
   createSweep: (payload: CreateSweepRequest): Promise<CreatedSweep> =>
     request('POST', '/sweeps', payload),
   getSweep: (id: string): Promise<SweepOut> => request('GET', `/sweeps/${id}`),
+  listSweeps: (page: { limit: number; offset: number }): Promise<SweepsPage> =>
+    request('GET', `/sweeps${query(page)}`),
   // The same doctrine as `previewStudy`, one axis up: a POST that writes nothing, asked while
   // the form is still being filled in. ⚠️ It answers three different noes — a combination the
   // DSL refuses, a market with no candles in the window, and a product over the cap — and the

@@ -7,6 +7,8 @@ import { skipToken, useMutation, useQueries, useQuery, useQueryClient } from '@t
 import type { Strategy } from '@tradeforge/schema'
 import { useEffect, useRef } from 'react'
 
+import { settled } from '../sweep/progress'
+
 import { api } from './client'
 import type {
   CatalogEntry,
@@ -48,6 +50,7 @@ import type {
   PreviewSweepRequest,
   SweepOut,
   SweepPreview,
+  SweepsPage,
   TradesPage,
   WalkForwardOut,
 } from './types'
@@ -565,6 +568,36 @@ export function useSweep(id: string | undefined) {
     queryKey: ['sweep', id],
     queryFn: id === undefined ? skipToken : () => api.getSweep(id),
     refetchInterval: (query) => (isSweepSettled(query.state.data) ? false : STUDY_POLL_MS),
+  })
+}
+
+/** How many sweeps the history shows at once. */
+export const SWEEPS_PER_PAGE = 10
+
+/**
+ * Whether every sweep on a history page has stopped moving — the moment its poll can stop.
+ *
+ * Read off the server's counts, not off runs: a history line carries none. Not yet arrived is
+ * not settled, as for a single sweep.
+ */
+export function isHistorySettled(page: SweepsPage | undefined): boolean {
+  return page?.items.every((item) => settled(item.runs)) ?? false
+}
+
+/**
+ * One page of the sweep history, newest first, polled while any sweep on it is still draining.
+ *
+ * The page keeps showing while the next one loads (`placeholderData`), so paging does not blank
+ * the screen between clicks. ⚠️ The data can then be a different page from the one asked for:
+ * a screen must number the page from `data.offset`, never from the offset it requested. The poll reads counts, not runs — the server sums them — so
+ * it stays cheap however large the sweeps on the page are.
+ */
+export function useSweeps(offset: number) {
+  return useQuery<SweepsPage>({
+    queryKey: ['sweeps', offset],
+    queryFn: () => api.listSweeps({ limit: SWEEPS_PER_PAGE, offset }),
+    placeholderData: (previous) => previous,
+    refetchInterval: (query) => (isHistorySettled(query.state.data) ? false : STUDY_POLL_MS),
   })
 }
 

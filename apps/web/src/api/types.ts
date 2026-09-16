@@ -1063,3 +1063,32 @@ export interface SweepOut {
   entries: SweepEntryOut[]
   runs: SweepRunOut[]
 }
+
+/** How many of a sweep's runs sit in each status. The four always add up to `total`. */
+export interface SweepRunCounts {
+  total: number
+  done: number
+  running: number
+  queued: number
+  failed: number
+}
+
+/** One sweep as a line of history — no runs, no summaries; those are a click away. */
+export interface SweepListItem {
+  id: string
+  created_at: string
+  /** In the order they were asked for. `name` is null for an entry since removed from the shelf. */
+  entries: { entry_id: string; name: string | null }[]
+  symbols: string[]
+  timeframes: string[]
+  date_from: string
+  date_to: string
+  runs: SweepRunCounts
+}
+
+export interface SweepsPage {
+  total: number
+  limit: number
+  offset: number
+  items: SweepListItem[]
+}

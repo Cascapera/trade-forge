@@ -15,12 +15,15 @@ vi.mock('./client', () => ({
     getBasket: vi.fn(),
     listStrategies: vi.fn(),
     updateStrategy: vi.fn(),
+    listSweeps: vi.fn(),
   },
 }))
 
-import type { BasketOut, SweepOut } from './types'
+import type { BasketOut, SweepOut, SweepsPage } from './types'
 import { api } from './client'
 import {
+  SWEEPS_PER_PAGE,
+  isHistorySettled,
   isSettled,
   isSweepSettled,
   isTerminal,
@@ -34,6 +37,7 @@ import {
   useEquity,
   useEquityCurves,
   useInstruments,
+  useSweeps,
   useTrades,
 } from './hooks'
 
@@ -102,6 +106,69 @@ describe('isSweepSettled', () => {
 
   it('keeps polling while the sweep has not arrived at all', () => {
     expect(isSweepSettled(undefined)).toBe(false)
+  })
+})
+
+describe('isHistorySettled', () => {
+  function page(...lines: { running: number; queued: number }[]): SweepsPage {
+    return {
+      total: lines.length,
+      limit: SWEEPS_PER_PAGE,
+      offset: 0,
+      items: lines.map((runs) => ({ runs: { total: 5, done: 0, failed: 0, ...runs } })),
+    } as SweepsPage
+  }
+
+  it('keeps polling while any sweep on the page has a run queued or running', () => {
+    // One line in flight among settled ones is enough — and each of the two statuses on its own,
+    // so a check that looked at only one of them would fail here.
+    expect(isHistorySettled(page({ running: 0, queued: 0 }, { running: 0, queued: 1 }))).toBe(false)
+    expect(isHistorySettled(page({ running: 1, queued: 0 }, { running: 0, queued: 0 }))).toBe(false)
+  })
+
+  it('stops once every line has settled, and an empty history has nothing to wait for', () => {
+    expect(isHistorySettled(page({ running: 0, queued: 0 }, { running: 0, queued: 0 }))).toBe(true)
+    expect(isHistorySettled(page())).toBe(true)
+  })
+
+  it('keeps polling while the page has not arrived at all', () => {
+    expect(isHistorySettled(undefined)).toBe(false)
+  })
+})
+
+describe('useSweeps', () => {
+  it('asks for one page of ten at the offset it was given', async () => {
+    mockedApi.listSweeps.mockResolvedValue({ total: 23, limit: 10, offset: 20, items: [] })
+
+    const { result } = renderHook(() => useSweeps(20), { wrapper: makeWrapper() })
+
+    await waitFor(() => {
+      expect(result.current.data?.total).toBe(23)
+    })
+    expect(SWEEPS_PER_PAGE).toBe(10)
+    expect(mockedApi.listSweeps).toHaveBeenCalledWith({ limit: 10, offset: 20 })
+  })
+})
+
+describe('useSweeps keeps the page up while the next one loads', () => {
+  it('serves the previous page, marked as a placeholder, until the new one arrives', async () => {
+    mockedApi.listSweeps.mockResolvedValueOnce({ total: 23, limit: 10, offset: 0, items: [] })
+    mockedApi.listSweeps.mockReturnValueOnce(new Promise(() => undefined))
+
+    const { result, rerender } = renderHook(({ offset }) => useSweeps(offset), {
+      wrapper: makeWrapper(),
+      initialProps: { offset: 0 },
+    })
+    await waitFor(() => {
+      expect(result.current.data?.offset).toBe(0)
+    })
+    rerender({ offset: 10 })
+
+    await waitFor(() => {
+      expect(mockedApi.listSweeps).toHaveBeenLastCalledWith({ limit: 10, offset: 10 })
+    })
+    expect(result.current.data?.offset).toBe(0)
+    expect(result.current.isPlaceholderData).toBe(true)
   })
 })
 

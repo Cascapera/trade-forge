@@ -68,6 +68,24 @@ describe('App', () => {
     expect(screen.getByRole('heading', { name: 'Sweep' })).toBeInTheDocument()
   })
 
+  it('routes to the sweep history, and lights its link only there', () => {
+    // Pinned for the launcher's reason: under the catch-all a renamed route fails silently. The
+    // screen's loading line is enough to name it, asserted before the request settles.
+    const { unmount } = renderWithProviders(<App />, '/sweeps')
+
+    expect(screen.getByText('Loading the sweep history…')).toBeInTheDocument()
+    const history = screen.getByRole('link', { name: 'Sweep history' })
+    expect(history).toHaveAttribute('href', '/sweeps')
+    expect(history).toHaveAttribute('aria-current', 'page')
+    unmount()
+
+    // ⚠️ One sweep being read is not the history: without `end` the link would stay lit on
+    // every `/sweeps/:id`, and the reader could not tell which of the two screens they are on.
+    renderWithProviders(<App />, '/sweeps/abc')
+    expect(screen.getByText('Loading the sweep…')).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: 'Sweep history' })).not.toHaveAttribute('aria-current')
+  })
+
   it('groups the sidebar links under headings', () => {
     renderWithProviders(<App />, '/')
 

@@ -247,8 +247,8 @@ describe('SweepResult', () => {
   })
 
   it('counts the runs as X of Y while they are still landing', () => {
-    // ⚠️ Read off the runs' own statuses, not the entries' aggregates: an aggregate calls a point
-    // finished once it has metrics, so a run marked done an instant earlier would be in no column.
+    // ⚠️ Read off the runs' own statuses, not the entries' aggregates: this fixture's aggregates
+    // still say every point finished, so a count taken from them would read 3 of 3.
     const busy = sweep()
     busy.runs[0]!.run.status = 'queued'
     busy.runs[1]!.run.status = 'running'
@@ -256,12 +256,14 @@ describe('SweepResult', () => {
 
     renderWithProviders(<SweepResult />)
 
-    expect(screen.getByRole('status')).toHaveTextContent('1 of 3 done · 1 running · 1 queued')
+    // Exact, suffix included: `toHaveTextContent` with a string matches any substring.
+    expect(screen.getByRole('status')).toHaveTextContent(
+      /^1 of 3 done · 1 running · 1 queued — this updates on its own\.$/,
+    )
   })
 
   it('keeps the count on screen after everything has landed', () => {
-    // ⚠️ The defect this replaced: the old line appeared only while runs were outstanding, so a
-    // sweep that had finished and one that had never started both showed nothing at all.
+    // The old line vanished once nothing was outstanding, so a finished sweep said nothing at all.
     showing(sweep())
 
     renderWithProviders(<SweepResult />)
@@ -283,9 +285,10 @@ describe('SweepResult', () => {
     expect(screen.getByText('2 of 3 done · 1 failed')).toBeInTheDocument()
   })
 
-  it('shows a run that will never execute rather than letting it vanish', () => {
-    // ⚠️ Measured on this project: a worker that lost its database connection left a run `queued`
-    // with no job behind it and no error on the row. With no counter, that sweep looked finished.
+  it('names a run that will never execute as queued, not running', () => {
+    // ⚠️ Measured on this project: a worker that took its job before Postgres accepted
+    // connections left a run `queued` with no error on the row. The old line called it "still
+    // running"; the counter names it queued.
     const stuck = sweep()
     stuck.runs[0]!.run.status = 'queued'
     showing(stuck)

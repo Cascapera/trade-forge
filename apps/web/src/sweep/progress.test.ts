@@ -19,23 +19,21 @@ function rows(...statuses: BacktestStatus[]): SweepRunOut[] {
 
 describe('tally', () => {
   it('puts every run in exactly one column', () => {
-    // ⚠️ The property an X of Y counter lives on: the columns add up to the total. A tally read
-    // off the entries' aggregates does not — those count a point finished once it has metrics.
+    // ⚠️ The property an X of Y counter lives on: the columns add up to the total.
     const counts = tally(rows('done', 'done', 'running', 'queued', 'failed'))
 
     expect(counts).toEqual({ total: 5, done: 2, running: 1, queued: 1, failed: 1 })
     expect(counts.done + counts.running + counts.queued + counts.failed).toBe(counts.total)
   })
 
-  it('counts an empty sweep as nothing rather than as finished', () => {
+  it('counts no runs as zero in every column', () => {
     expect(tally([])).toEqual({ total: 0, done: 0, running: 0, queued: 0, failed: 0 })
   })
 })
 
 describe('summarise', () => {
   it('says how many are done even when every one of them is', () => {
-    // ⚠️ The reason this exists. The old line showed only while runs were outstanding, so a
-    // finished sweep and one that never started both rendered as no line at all.
+    // The old line disappeared once nothing was outstanding, and never said how many had finished.
     expect(summarise(tally(rows('done', 'done', 'done')))).toBe('3 of 3 done')
   })
 
@@ -58,8 +56,8 @@ describe('summarise', () => {
   })
 
   it('shows a run that will never execute rather than hiding it', () => {
-    // A worker that lost its database connection leaves a run `queued` with no job behind it.
-    // The counter is where that becomes visible: 9 of 10, one queued, for ever.
+    // A worker that took its job before Postgres accepted connections left a run `queued` with no
+    // job behind it. The old line called it "still running"; the counter says queued, for ever.
     expect(summarise(tally(rows(...Array<BacktestStatus>(9).fill('done'), 'queued')))).toBe(
       '9 of 10 done · 1 queued',
     )

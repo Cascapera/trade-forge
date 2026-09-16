@@ -100,12 +100,14 @@ export function SweepResult(): React.JSX.Element {
         </p>
       </div>
 
-      {/* ⚠️ **Always on screen, and that is the whole point.** The line this replaced appeared
-          only while runs were outstanding, so a sweep that had finished and one that had never
-          started both rendered as nothing at all — and a sweep holding a run that will never
-          execute (a worker that lost its database connection leaves one `queued` for ever) looked
-          exactly like a sweep that was done. Now it says `9 of 10 done · 1 queued` and keeps
-          saying it.
+      {/* ⚠️ **Always on screen, and waiting kept apart from executing.** The line this replaced
+          read `1 of 10 backtests still running`, vanished once nothing was outstanding, and
+          counted a queued run as running — so a run a worker will never pick up (one took its job
+          before Postgres accepted connections) was "still running" for ever. Now it says
+          `9 of 10 done · 1 queued` and keeps saying it.
+
+          ⚠️ Not solved here: a stuck run still reads as queued, and the suffix below still says
+          this updates on its own. Telling stuck from waiting needs the worker fix, not the screen.
 
           A live region only while something is in flight: a settled sweep has nothing left to
           announce, and a `role="status"` that never changes is noise for a screen reader. */}

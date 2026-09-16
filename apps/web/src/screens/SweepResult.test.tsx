@@ -246,49 +246,56 @@ describe('SweepResult', () => {
     expect(within(alpha!).queryByText(/zeta \[/)).not.toBeInTheDocument()
   })
 
-  it('says how many backtests are still running rather than showing dashes in silence', () => {
-    showing(
-      sweep({}, [
-        {
-          entry_id: ZETA.id,
-          entry_name: ZETA.name,
-          aggregate: aggregate({ points_total: 2, points_finished: 1 }),
-        },
-        {
-          entry_id: ALPHA.id,
-          entry_name: ALPHA.name,
-          aggregate: aggregate({ points_total: 1 }),
-        },
-      ]),
-    )
+  it('counts the runs as X of Y while they are still landing', () => {
+    // ⚠️ Read off the runs' own statuses, not the entries' aggregates: this fixture's aggregates
+    // still say every point finished, so a count taken from them would read 3 of 3.
+    const busy = sweep()
+    busy.runs[0]!.run.status = 'queued'
+    busy.runs[1]!.run.status = 'running'
+    showing(busy)
 
     renderWithProviders(<SweepResult />)
 
-    // Summed across the sections: one in zeta and one in alpha.
-    expect(screen.getByRole('status')).toHaveTextContent('2 of 3 backtests still running')
+    // Exact, suffix included: `toHaveTextContent` with a string matches any substring.
+    expect(screen.getByRole('status')).toHaveTextContent(
+      /^1 of 3 done · 1 running · 1 queued — this updates on its own\.$/,
+    )
   })
 
-  it('counts a failed run as landed, not as still running', () => {
-    // A failed run is not coming back. Counted as pending, the screen would promise an update
-    // that never arrives — and it would say so for as long as the tab stays open.
-    showing(
-      sweep({}, [
-        {
-          entry_id: ZETA.id,
-          entry_name: ZETA.name,
-          aggregate: aggregate({ points_total: 2, points_finished: 1, points_failed: 1 }),
-        },
-        {
-          entry_id: ALPHA.id,
-          entry_name: ALPHA.name,
-          aggregate: aggregate({ points_total: 1, points_finished: 1 }),
-        },
-      ]),
-    )
+  it('keeps the count on screen after everything has landed', () => {
+    // The old line vanished once nothing was outstanding, so a finished sweep said nothing at all.
+    showing(sweep())
 
     renderWithProviders(<SweepResult />)
 
+    expect(screen.getByText('3 of 3 done')).toBeInTheDocument()
+    // Nothing is in flight, so there is no live region to announce — the line is plain text.
     expect(screen.queryByRole('status')).not.toBeInTheDocument()
+  })
+
+  it('counts a failed run as landed and keeps it in view', () => {
+    // A failed run is not coming back, so it is not "still running" — but hiding it would make a
+    // sweep that half worked read like one that worked.
+    const withFailure = sweep()
+    withFailure.runs[0]!.run.status = 'failed'
+    showing(withFailure)
+
+    renderWithProviders(<SweepResult />)
+
+    expect(screen.getByText('2 of 3 done · 1 failed')).toBeInTheDocument()
+  })
+
+  it('names a run that will never execute as queued, not running', () => {
+    // ⚠️ Measured on this project: a worker that took its job before Postgres accepted
+    // connections left a run `queued` with no error on the row. The old line called it "still
+    // running"; the counter names it queued.
+    const stuck = sweep()
+    stuck.runs[0]!.run.status = 'queued'
+    showing(stuck)
+
+    renderWithProviders(<SweepResult />)
+
+    expect(screen.getByRole('status')).toHaveTextContent('2 of 3 done · 1 queued')
   })
 
   it('heads a removed entry as removed rather than borrowing one of its runs for a name', () => {

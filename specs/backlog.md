@@ -2287,10 +2287,20 @@ e hoje ele mede o arquivo como a suíte o deixou.
   migração), mas o motivo escrito é falso, e quem lê para de procurar. Corrigir a frase; a tela da
   varredura e a do estudo decidem o fim do polling pelo **status** e dependem desse commit único.
   Ver [[docstring-e-afirmacao-testavel]].
-- [origem: PR-251] **Uma varredura só é alcançável na hora em que é lançada.** Não existe
-  `GET /sweeps` (lista), e o run log não carrega `sweep_id` — fechou a aba, o endereço
-  `/sweeps/{id}` só volta pelo histórico do navegador. O estudo e a cesta têm o mesmo buraco?
-  Conferir antes de decidir se é uma lista por tipo ou uma coluna no run log.
+- [origem: varredura real de 15/09] **A mediana por entrada mistura gráficos e mercados.** Medido na
+  varredura `eef98f56`: 480 runs de uma entrada, espalhados por EURUSD/AUDUSD **e** H4/M15, caem numa
+  única mediana (−1,0%). Separar entradas foi o acerto da #251, mas dentro de uma entrada a mediana
+  soma duas perguntas diferentes: "o método funciona neste gráfico?" e "funciona neste mercado?".
+  Um H4 lucrativo e um M15 destrutivo se cancelam e o resultado lido é "quase zero". Candidato:
+  agregado por (entrada × time frame) e por (entrada × ativo), ou um seletor na tela. Confirmar com
+  ele o que ele quer comparar antes de escolher a forma.
+- ⭐ [origem: PR-251, **PRIORIDADE pedida por ele em 15/09**] **Uma varredura só é alcançável na hora
+  em que é lançada — precisamos consultar o histórico.** Palavras dele: *"precisamos poder consultar
+  o histórico do sweep, isso é importante"*. Não existe `GET /sweeps` (lista), e o run log não
+  carrega `sweep_id` — fechou a aba, o endereço `/sweeps/{id}` só volta pelo histórico do navegador.
+  Já há varreduras de 11/09, 15/09 e 16/09 inalcançáveis pela interface. O estudo e a cesta têm o
+  mesmo buraco? Conferir antes de decidir se é uma aba própria (`/sweeps`) ou uma coluna/filtro no
+  run log — e perguntar a ele o que cada linha precisa mostrar para ele reconhecer a varredura.
 - [origem: PR-252] **O dataset é de UMA varredura; o ML vai querer várias.** `GET /sweeps/{id}/dataset.csv`
   e o dicionário são por varredura, porque as colunas `param:` são as da varredura. Juntar varreduras
   exige decidir a união das colunas e, principalmente, **separar janelas**: é juntando varreduras de

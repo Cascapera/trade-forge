@@ -15,6 +15,7 @@ import { RunTable } from '../components/RunTable'
 import { StudyDispersion } from '../components/StudyDispersion'
 import { money } from '../format'
 import { settled, summarise, tally } from '../sweep/progress'
+import { RANKINGS, type RankKey, pageOf, rank, rankingOf } from '../sweep/ranking'
 
 /** The calendar day of an ISO instant — the granularity a window is read at. */
 function day(iso: string): string {
@@ -25,6 +26,43 @@ function backtests(count: number): string {
   return `${String(count)} backtest${count === 1 ? '' : 's'}`
 }
 
+function Pager(props: {
+  label: string
+  index: number
+  pages: number
+  onPage: (index: number) => void
+}): React.JSX.Element | null {
+  if (props.pages <= 1) return null
+  const button = 'rounded border border-slate-700 px-3 py-1 disabled:opacity-40'
+  return (
+    <nav aria-label={props.label} className="flex items-center gap-3 text-sm">
+      <button
+        type="button"
+        disabled={props.index === 0}
+        onClick={() => {
+          props.onPage(props.index - 1)
+        }}
+        className={button}
+      >
+        ← Better
+      </button>
+      <span className="text-slate-400">
+        Page {String(props.index + 1)} of {String(props.pages)}
+      </span>
+      <button
+        type="button"
+        disabled={props.index >= props.pages - 1}
+        onClick={() => {
+          props.onPage(props.index + 1)
+        }}
+        className={button}
+      >
+        Worse →
+      </button>
+    </nav>
+  )
+}
+
 /**
  * One sweep read back: every entry it ran, each summarised on its own.
  *
@@ -33,10 +71,10 @@ function backtests(count: number): string {
  * median of two methods and describes neither. The server summarises each entry separately for
  * that reason, and this screen keeps the separation visible instead of adding the sections up.
  *
- * Inside a section the reading order is the study's, for the study's reason: the dispersion comes
- * first, led by the median, and the best run is one row in a table like every other. A sweep
- * searches more than a study does, so its best is the best of more draws, and leading with it
- * would present the luckiest corner of a larger search as the result.
+ * Inside a section the dispersion comes first, led by the median, and only then the runs, ranked
+ * best first by the measure the reader picks, ten at a time. A sweep searches more than a study
+ * does, so its best is the best of more draws: the list starts from it because that is what the
+ * reader asked to browse, and the median above is what keeps it from reading as the result.
  *
  * ⚠️ **One chart for the whole screen, above the sections, rather than one per entry.** The
  * comparison worth making often crosses entries — the median run of one method against the
@@ -47,6 +85,9 @@ export function SweepResult(): React.JSX.Element {
   const { id } = useParams<{ id: string }>()
   const sweep = useSweep(id)
   const [seats, setSeats] = useState(EMPTY_SEATS)
+  const [rankBy, setRankBy] = useState<RankKey>('return')
+  // One page per entry, by entry id. Changing the measure starts every entry from its best again.
+  const [pageOfEntry, setPageOfEntry] = useState<Record<string, number>>({})
 
   const runs = useMemo(() => (sweep.data?.runs ?? []).map((row) => row.run), [sweep.data])
   const picked = useMemo(() => selectedIds(seats), [seats])
@@ -119,6 +160,27 @@ export function SweepResult(): React.JSX.Element {
         {settled(counts) ? '' : ' — this updates on its own.'}
       </p>
 
+      {/* ⚠️ The median sits above every ranked list, in each entry's summary: the best of a
+          sweep is the best of its whole search, and a list that starts from it reads as a result
+          unless the typical run is on screen first. */}
+      <label className="flex w-fit flex-col gap-1 text-xs text-slate-400">
+        Rank each entry's runs by
+        <select
+          value={rankBy}
+          onChange={(event) => {
+            setRankBy(event.target.value as RankKey)
+            setPageOfEntry({})
+          }}
+          className="rounded border border-slate-700 bg-slate-900 px-2 py-1.5 text-sm text-slate-100"
+        >
+          {RANKINGS.map((one) => (
+            <option key={one.key} value={one.key}>
+              {one.label}
+            </option>
+          ))}
+        </select>
+      </label>
+
       <section className="space-y-2">
         <h3 className="font-medium">Equity of the runs you pick, as percent of starting capital</h3>
         <ComparisonChart series={series} />
@@ -134,6 +196,8 @@ export function SweepResult(): React.JSX.Element {
         // name against a strategy name, which breaks the day one entry's name prefixes another's.
         const mine = data.runs.filter((row) => row.entry_id === entry.entry_id).map((row) => row.run)
         const heading = `sweep-entry-${entry.entry_id}`
+        const name = entry.entry_name ?? 'An entry since removed from the shelf'
+        const page = pageOf(rank(mine, rankBy), pageOfEntry[entry.entry_id] ?? 0)
         return (
           <section
             key={entry.entry_id}
@@ -142,12 +206,25 @@ export function SweepResult(): React.JSX.Element {
           >
             <div>
               <h3 id={heading} className="text-lg font-medium text-sky-400">
-                {entry.entry_name ?? 'An entry since removed from the shelf'}
+                {name}
               </h3>
               <p className="text-sm text-slate-400">{backtests(mine.length)}</p>
             </div>
             <StudyDispersion aggregate={entry.aggregate} />
-            <RunTable runs={mine} seats={seats} onToggle={toggle} />
+            <p className="text-xs text-slate-500">
+              {page.first === 0
+                ? 'No runs yet.'
+                : `Runs ${String(page.first)}–${String(page.last)} of ${String(mine.length)}, best ${rankingOf(rankBy).label.toLowerCase()} first. Runs with nothing to rank by — unfinished, failed, or without this measure — come last.`}
+            </p>
+            <RunTable runs={page.items} seats={seats} onToggle={toggle} />
+            <Pager
+              label={`${name} pages`}
+              index={page.index}
+              pages={page.pages}
+              onPage={(index) => {
+                setPageOfEntry((current) => ({ ...current, [entry.entry_id]: index }))
+              }}
+            />
           </section>
         )
       })}

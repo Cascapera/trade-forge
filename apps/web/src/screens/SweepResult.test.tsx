@@ -312,6 +312,143 @@ describe('SweepResult', () => {
     expect(medianIn(removed!)).toHaveTextContent('2.5%')
   })
 
+  /**
+   * Twenty-three zeta runs whose return and drawdown rank in opposite orders: `z<n>` returns n
+   * and falls n %, so the best return (z23) has the deepest drawdown. One more zeta run has not
+   * finished. Alpha has twelve runs, so it has a second page of its own.
+   */
+  function long(): SweepOut {
+    const zetas = Array.from({ length: 23 }, (_, i) => {
+      const n = i + 1
+      const one = row(`z${String(n)}`, ZETA, `M15 · period=${String(n)}`, String(n))
+      one.run.metrics!.max_drawdown_pct = String(n / 100)
+      return one
+    })
+    const alphas = Array.from({ length: 12 }, (_, i) =>
+      row(`a${String(i + 1)}`, ALPHA, `M15 · period=${String(i + 1)}`, String(-i)),
+    )
+    return sweep({
+      runs: [...alphas, row('zq', ZETA, 'M15 · period=99', null), ...zetas],
+    })
+  }
+
+  function shownIn(section: HTMLElement): string[] {
+    return within(section)
+      .getAllByRole('link')
+      .map((link) => link.getAttribute('href')?.replace('/results/z', '') ?? '?')
+  }
+
+  it('lists each entry best return first, ten at a time, with unfinished runs last', () => {
+    showing(long())
+    renderWithProviders(<SweepResult />)
+    const [zeta] = sections()
+
+    expect(shownIn(zeta!)).toEqual(['23', '22', '21', '20', '19', '18', '17', '16', '15', '14'])
+    expect(
+      within(zeta!).getByText(
+        'Runs 1–10 of 24, best return first. Runs with nothing to rank by — unfinished, failed, or without this measure — come last.',
+      ),
+    ).toBeInTheDocument()
+
+    const pager = within(zeta!).getByRole('navigation', { name: 'zeta pages' })
+    fireEvent.click(within(pager).getByRole('button', { name: 'Worse →' }))
+    fireEvent.click(within(pager).getByRole('button', { name: 'Worse →' }))
+
+    expect(within(pager).getByText('Page 3 of 3')).toBeInTheDocument()
+    expect(shownIn(zeta!)).toEqual(['3', '2', '1', 'q'])
+    expect(within(pager).getByRole('button', { name: 'Worse →' })).toBeDisabled()
+    fireEvent.click(within(pager).getByRole('button', { name: '← Better' }))
+    expect(within(pager).getByText('Page 2 of 3')).toBeInTheDocument()
+  })
+
+  it('pages each entry on its own', () => {
+    showing(long())
+    renderWithProviders(<SweepResult />)
+    const [zeta, alpha] = sections()
+
+    fireEvent.click(within(zeta!).getByRole('button', { name: 'Worse →' }))
+
+    expect(within(zeta!).getByText(/^Runs 11–20 of 24,/)).toBeInTheDocument()
+    expect(within(alpha!).getByText(/^Runs 1–10 of 12,/)).toBeInTheDocument()
+  })
+
+  it('gives a list that fits one page no pager', () => {
+    showing(sweep())
+    renderWithProviders(<SweepResult />)
+    const [, alpha] = sections()
+
+    expect(within(alpha!).queryByRole('navigation')).not.toBeInTheDocument()
+    expect(within(alpha!).getByText(/^Runs 1–1 of 1,/)).toBeInTheDocument()
+  })
+
+  it('reranks by the measure picked, and starts every entry from its best again', () => {
+    showing(long())
+    renderWithProviders(<SweepResult />)
+    const [zeta, alpha] = sections()
+    fireEvent.click(within(zeta!).getByRole('button', { name: 'Worse →' }))
+    fireEvent.click(within(alpha!).getByRole('button', { name: 'Worse →' }))
+
+    fireEvent.change(screen.getByLabelText("Rank each entry's runs by"), {
+      target: { value: 'drawdown' },
+    })
+
+    // Shallowest first: the opposite of the return order.
+    expect(shownIn(zeta!)).toEqual(['1', '2', '3', '4', '5', '6', '7', '8', '9', '10'])
+    expect(
+      within(zeta!).getByText(/^Runs 1–10 of 24, best smallest drawdown first\./),
+    ).toBeInTheDocument()
+    expect(within(alpha!).getByText(/^Runs 1–10 of 12,/)).toBeInTheDocument()
+  })
+
+  it('puts the median above the ranked list, so the best run is never read first', () => {
+    showing(long())
+    renderWithProviders(<SweepResult />)
+    const [zeta] = sections()
+
+    const median = medianIn(zeta!)
+    const table = within(zeta!).getByRole('table')
+    // DOCUMENT_POSITION_FOLLOWING: the table comes after the median tile.
+    expect(median.compareDocumentPosition(table) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+  })
+
+  it('says an entry whose every point was refused has no runs', () => {
+    // Reachable: a launch drops the combinations the DSL refuses, and an entry can lose all of them.
+    showing(sweep({ runs: [row('a1', ALPHA, 'M15', '-200')] }))
+    renderWithProviders(<SweepResult />)
+    const [zeta] = sections()
+
+    expect(within(zeta!).getByText('No runs yet.')).toBeInTheDocument()
+    expect(within(zeta!).queryByRole('navigation')).not.toBeInTheDocument()
+  })
+
+  it('offers every measure to rank by', () => {
+    showing(sweep())
+    renderWithProviders(<SweepResult />)
+
+    const options = within(screen.getByLabelText("Rank each entry's runs by")).getAllByRole(
+      'option',
+    )
+    expect(options.map((one) => one.textContent)).toEqual([
+      'Return',
+      'Profit factor',
+      'Win rate',
+      'Expectancy',
+      'Smallest drawdown',
+    ])
+  })
+
+  it('keeps a run seated on the chart after its page is left', () => {
+    // Seats are by run id over every run, not over the page on screen.
+    showing(long())
+    renderWithProviders(<SweepResult />)
+    const [zeta] = sections()
+    fireEvent.click(within(zeta!).getAllByRole('checkbox')[0]!)
+
+    fireEvent.click(within(zeta!).getByRole('button', { name: 'Worse →' }))
+
+    expect(screen.getByTestId('chart')).toHaveTextContent('z23')
+  })
+
   it('compares runs from different entries on the one chart', () => {
     // ⚠️ The reason there is one chart and not one per section: the comparison worth making often
     // crosses methods, and seats kept per section could never hold both ends of it.
@@ -322,8 +459,9 @@ describe('SweepResult', () => {
     fireEvent.click(within(zeta!).getAllByRole('checkbox')[0]!)
     fireEvent.click(within(alpha!).getAllByRole('checkbox')[0]!)
 
+    // The first row of each section is its best run by return, not the first to arrive.
     const chart = screen.getByTestId('chart')
-    expect(chart).toHaveTextContent('z5')
+    expect(chart).toHaveTextContent('z9')
     expect(chart).toHaveTextContent('a1')
   })
 

@@ -106,10 +106,20 @@ def _window() -> dict[str, Any]:
 
 
 @pytest.fixture
-def client(session_factory: Callable[[], Session], settings: Settings, tmp_path: Path) -> Any:
+def client(
+    session_factory: Callable[[], Session],
+    settings: Settings,
+    tmp_path: Path,
+    indexed: Callable[..., None],
+) -> Any:
     seeding = session_factory()
     _seed(seeding)
     seeding.close()
+    # Covered at every chart these tests launch on, so a refusal here is the filter's, not the
+    # index's (PR-262 made the launch ask it).
+    for symbol in ("EURUSD", "GBPUSD"):
+        for timeframe in ("M15", "H1", "H4"):
+            indexed(symbol, timeframe)
     with TestClient(_app(settings, session_factory, tmp_path, _CapturingQueue())) as opened:
         yield opened
 

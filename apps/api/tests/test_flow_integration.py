@@ -25,7 +25,6 @@ from sqlalchemy.orm import Session
 from tradeforge_api.config import Settings
 from tradeforge_api.main import create_app
 from tradeforge_api.worker import process_backtest
-from tradeforge_collector import write_candles
 from tradeforge_db.models import BacktestMetrics, Instrument
 from tradeforge_engine.domain import AssetClass, Candle
 from tradeforge_engine.testing import bar
@@ -273,12 +272,13 @@ def test_create_enqueue_run_and_read(
     session_factory: Callable[[], Session],
     settings: Settings,
     tmp_path: Path,
+    collected: Callable[..., None],
     migrated_engine: Engine,
 ) -> None:
     seeding = session_factory()
     _seed_instrument(seeding)
     seeding.close()
-    write_candles(tmp_path, "EURUSD", "H1", _candles())
+    collected(tmp_path, "EURUSD", "H1", _candles())
 
     queue = _CapturingQueue()
     app = create_app(
@@ -387,19 +387,194 @@ def test_a_backtest_for_an_unknown_symbol_is_rejected(
         assert "NOPE" in response.json()["detail"]
 
 
+def test_a_timeframe_the_index_has_never_seen_is_refused_at_launch(
+    session_factory: Callable[[], Session],
+    settings: Settings,
+    tmp_path: Path,
+    collected: Callable[..., None],
+) -> None:
+    """H1 is collected, M15 never was: the launch says so instead of queueing a run to fail."""
+    seeding = session_factory()
+    _seed_instrument(seeding)
+    seeding.close()
+    collected(tmp_path, "EURUSD", "H1", _candles())
+    queue = _CapturingQueue()
+    app = create_app(
+        settings=settings.model_copy(update={"parquet_root": tmp_path}),
+        session_factory=session_factory,
+        arq_pool=queue,
+    )
+
+    with TestClient(app) as client:
+        strategy_id = client.post("/strategies", json=_strategy()).json()["id"]
+        body = {
+            "strategy_id": strategy_id,
+            "symbol": "EURUSD",
+            "timeframe": "M15",
+            "date_from": START.isoformat(),
+            "date_to": (START + 100 * HOUR).isoformat(),
+            "initial_capital": "10000",
+            "cost_model": {"type": "none"},
+        }
+        refused = client.post("/backtests", json=body)
+        listed = client.get("/backtests").json()
+
+    assert refused.status_code == 422
+    assert refused.json()["detail"] == "no candles in this window for EURUSD M15 (never collected)"
+    assert queue.jobs == []
+    assert listed["total"] == 0
+
+
+def test_a_window_the_data_does_not_reach_is_refused_at_launch(
+    session_factory: Callable[[], Session],
+    settings: Settings,
+    tmp_path: Path,
+    collected: Callable[..., None],
+) -> None:
+    """Collected, but for other dates: the refusal names what the disk does hold."""
+    seeding = session_factory()
+    _seed_instrument(seeding)
+    seeding.close()
+    collected(tmp_path, "EURUSD", "H1", _candles())
+    with TestClient(
+        create_app(
+            settings=settings.model_copy(update={"parquet_root": tmp_path}),
+            session_factory=session_factory,
+            arq_pool=_CapturingQueue(),
+        )
+    ) as client:
+        strategy_id = client.post("/strategies", json=_strategy()).json()["id"]
+        refused = client.post(
+            "/backtests",
+            json={
+                "strategy_id": strategy_id,
+                "symbol": "EURUSD",
+                "timeframe": "H1",
+                "date_from": (START + 1000 * HOUR).isoformat(),
+                "date_to": (START + 1100 * HOUR).isoformat(),
+                "initial_capital": "10000",
+                "cost_model": {"type": "none"},
+            },
+        )
+
+    assert refused.status_code == 422
+    day = START.date().isoformat()
+    assert refused.json()["detail"] == (
+        f"no candles in this window for EURUSD H1 (on disk: {day} to "
+        f"{(START + HOUR * (len(_candles()) - 1)).date().isoformat()})"
+    )
+
+
+def _launch_over(
+    session_factory: Callable[[], Session],
+    settings: Settings,
+    tmp_path: Path,
+    collected: Callable[..., None],
+    **window: str,
+) -> Any:
+    """EURUSD H1 collected from `START`, then one launch over `window`."""
+    seeding = session_factory()
+    _seed_instrument(seeding)
+    seeding.close()
+    collected(tmp_path, "EURUSD", "H1", _candles())
+    with TestClient(
+        create_app(
+            settings=settings.model_copy(update={"parquet_root": tmp_path}),
+            session_factory=session_factory,
+            arq_pool=_CapturingQueue(),
+        )
+    ) as client:
+        strategy_id = client.post("/strategies", json=_strategy()).json()["id"]
+        return client.post(
+            "/backtests",
+            json={
+                "strategy_id": strategy_id,
+                "symbol": "EURUSD",
+                "timeframe": "H1",
+                "initial_capital": "10000",
+                "cost_model": {"type": "none"},
+                **window,
+            },
+        )
+
+
+def test_a_window_that_starts_on_the_last_bar_is_accepted(
+    session_factory: Callable[[], Session],
+    settings: Settings,
+    tmp_path: Path,
+    collected: Callable[..., None],
+) -> None:
+    """⚠️ The worker reads `date_from <= time <= date_to`, both ends closed, so a window opening
+    exactly on the last bar reads that bar. A launch that compared with `<=` refused it — a D1
+    run from the day of the last daily bar, which is what the screen sends at midnight."""
+    last = _candles()[-1].time
+    response = _launch_over(
+        session_factory,
+        settings,
+        tmp_path,
+        collected,
+        date_from=last.isoformat(),
+        date_to=(last + 5 * HOUR).isoformat(),
+    )
+    assert response.status_code == 202, response.text
+
+
+def test_a_window_that_ends_on_the_first_bar_is_accepted(
+    session_factory: Callable[[], Session],
+    settings: Settings,
+    tmp_path: Path,
+    collected: Callable[..., None],
+) -> None:
+    response = _launch_over(
+        session_factory,
+        settings,
+        tmp_path,
+        collected,
+        date_from=(START - 5 * HOUR).isoformat(),
+        date_to=START.isoformat(),
+    )
+    assert response.status_code == 202, response.text
+
+
+@pytest.mark.parametrize("field", ["date_from", "date_to"])
+def test_an_instant_without_a_timezone_is_refused_not_a_500(
+    session_factory: Callable[[], Session],
+    settings: Settings,
+    tmp_path: Path,
+    collected: Callable[..., None],
+    field: str,
+) -> None:
+    """A naive instant cannot be compared with the index's `timestamptz`; before the launch
+    asked the index it was silently accepted, and after, it was a 500."""
+    window = {"date_from": START.isoformat(), "date_to": (START + 5 * HOUR).isoformat()}
+    window[field] = "2024-01-01T02:00:00"
+    response = _launch_over(session_factory, settings, tmp_path, collected, **window)
+    assert response.status_code == 422, response.text
+    assert "timezone" in response.text
+
+
 def test_a_timeframe_with_no_collected_candles_fails_instead_of_finishing_empty(
-    session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+    session_factory: Callable[[], Session],
+    settings: Settings,
+    tmp_path: Path,
+    collected: Callable[..., None],
+    indexed: Callable[..., None],
 ) -> None:
     """The bug this PR exists for, end to end.
 
-    The symbol is catalogued and the strategy is valid — only the *timeframe* has never been
-    collected. This used to finish `done` with every metric at zero, which is indistinguishable
-    on screen from a strategy that found no setups.
+    The symbol is catalogued and the strategy is valid — only the *timeframe* has no bars. This
+    used to finish `done` with every metric at zero, which is indistinguishable on screen from a
+    strategy that found no setups.
+
+    ⚠️ Since PR-262 the launch refuses a timeframe the index has never seen (the test below), so
+    this one reaches the worker the only way left: an index that claims M15 while the disk holds
+    none. The worker's refusal is the guard for exactly that disagreement.
     """
     seeding = session_factory()
     _seed_instrument(seeding)
     seeding.close()
-    write_candles(tmp_path, "EURUSD", "H1", _candles())  # H1 exists; the run will ask for M15
+    collected(tmp_path, "EURUSD", "H1", _candles())  # H1 exists; the run will ask for M15
+    indexed("EURUSD", "M15")  # ...and the index wrongly says M15 does too
 
     app = create_app(
         settings=settings.model_copy(update={"parquet_root": tmp_path}),
@@ -478,11 +653,16 @@ def _work(session_factory: Callable[[], Session], parquet_root: Path, backtest_i
         session.close()
 
 
-def _app(session_factory: Callable[[], Session], settings: Settings, tmp_path: Path) -> TestClient:
+def _app(
+    session_factory: Callable[[], Session],
+    settings: Settings,
+    tmp_path: Path,
+    collected: Callable[..., None],
+) -> TestClient:
     seeding = session_factory()
     _seed_instrument(seeding)
     seeding.close()
-    write_candles(tmp_path, "EURUSD", "H1", _candles())
+    collected(tmp_path, "EURUSD", "H1", _candles())
     return TestClient(
         create_app(
             settings=settings.model_copy(update={"parquet_root": tmp_path}),
@@ -496,6 +676,7 @@ def test_a_database_lost_mid_run_is_not_recorded_as_the_runs_failure_and_a_retry
     session_factory: Callable[[], Session],
     settings: Settings,
     tmp_path: Path,
+    collected: Callable[..., None],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The connection drops after the run is marked running; the retry picks it up from there.
@@ -503,7 +684,7 @@ def test_a_database_lost_mid_run_is_not_recorded_as_the_runs_failure_and_a_retry
     Before the fix, the broad `except` would record the driver's error as the run's result — a
     backtest reported as failed for a reason that says nothing about the strategy.
     """
-    with _app(session_factory, settings, tmp_path) as client:
+    with _app(session_factory, settings, tmp_path, collected) as client:
         backtest_id = _launch(client)
 
         def lost(**_kwargs: object) -> object:
@@ -530,6 +711,7 @@ def test_an_error_the_database_answered_is_recorded_on_the_first_try(
     session_factory: Callable[[], Session],
     settings: Settings,
     tmp_path: Path,
+    collected: Callable[..., None],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A cancelled query is an answer, not an absence: the run fails now, with that reason."""
@@ -537,7 +719,7 @@ def test_an_error_the_database_answered_is_recorded_on_the_first_try(
     class _CancelledError(Exception):
         sqlstate = "57014"
 
-    with _app(session_factory, settings, tmp_path) as client:
+    with _app(session_factory, settings, tmp_path, collected) as client:
         backtest_id = _launch(client)
 
         def cancelled(**_kwargs: object) -> object:
@@ -558,10 +740,11 @@ def test_a_walk_forward_fold_records_an_unreachable_database_on_the_run(
     session_factory: Callable[[], Session],
     settings: Settings,
     tmp_path: Path,
+    collected: Callable[..., None],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The inline caller cannot retry, so the run is failed rather than left `running`."""
-    with _app(session_factory, settings, tmp_path) as client:
+    with _app(session_factory, settings, tmp_path, collected) as client:
         backtest_id = _launch(client)
 
         def lost(**_kwargs: object) -> object:
@@ -592,6 +775,7 @@ def test_a_retry_of_a_failed_run_keeps_the_reason_it_failed(
     session_factory: Callable[[], Session],
     settings: Settings,
     tmp_path: Path,
+    collected: Callable[..., None],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The failure was recorded but its commit's answer was lost; the retry must not restart it.
@@ -599,7 +783,7 @@ def test_a_retry_of_a_failed_run_keeps_the_reason_it_failed(
     Restarting would stamp a start after the recorded finish, and the CHECK refusing that would
     write its own message over the real reason.
     """
-    with _app(session_factory, settings, tmp_path) as client:
+    with _app(session_factory, settings, tmp_path, collected) as client:
         backtest_id = _launch(client)
 
         def broken(**_kwargs: object) -> object:
@@ -620,14 +804,17 @@ def test_a_retry_of_a_failed_run_keeps_the_reason_it_failed(
 
 
 def test_a_retry_of_a_finished_run_leaves_its_result_alone(
-    session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+    session_factory: Callable[[], Session],
+    settings: Settings,
+    tmp_path: Path,
+    collected: Callable[..., None],
 ) -> None:
     """A commit whose answer was lost with the connection is retried; the run had already landed.
 
     Running it again would write a second metrics row against the same key, and the collision
     would be recorded as the failure of a run that had succeeded.
     """
-    with _app(session_factory, settings, tmp_path) as client:
+    with _app(session_factory, settings, tmp_path, collected) as client:
         backtest_id = _launch(client)
         _work(session_factory, tmp_path, backtest_id)
         first = client.get(f"/backtests/{backtest_id}").json()

@@ -18,7 +18,6 @@ what the preview promised. A sweep that silently dropped points would draw a map
 never searched, and it would look exactly like a map of one it did.
 """
 
-import datetime as dt
 import json
 import uuid
 from typing import Annotated, Any
@@ -30,6 +29,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import defer, selectinload
 
 from tradeforge_api import sweep_dashboard as dashboard
+from tradeforge_api.coverage import describe, uncovered_markets
 from tradeforge_api.deps import QueueDep, SessionDep
 from tradeforge_api.grid import GridPoint
 from tradeforge_api.queue import RUN_BACKTEST
@@ -55,7 +55,6 @@ from tradeforge_api.schemas import (
     SweepRunCounts,
     SweepRunOut,
     SweepsPage,
-    UncoveredMarket,
 )
 from tradeforge_api.sweep import (
     SweepDocument,
@@ -70,7 +69,6 @@ from tradeforge_db.models import (
     BacktestMetrics,
     BacktestStatus,
     CatalogEntry,
-    Dataset,
     Instrument,
     Strategy,
     Sweep,
@@ -132,65 +130,6 @@ def _expand(
     return out
 
 
-def _uncovered(
-    session: SessionDep,
-    symbols: list[str],
-    timeframes: list[str],
-    date_from: dt.datetime,
-    date_to: dt.datetime,
-) -> list[UncoveredMarket]:
-    """Which (symbol, timeframe) pairs hold no candles inside this window.
-
-    ⚠️ **Asked of the index, not of the files.** `datasets` exists to answer "do I have EURUSD H1
-    for 2021?" with a lookup rather than by opening Parquet (ADR-05), and that is the whole
-    reason this check is cheap enough to run before a launch.
-
-    ⚠️ **This exists because the first real sweep lost nine runs of twelve to it.** Each failure
-    was honest — the worker said exactly which window the data covers — but it arrived after
-    twelve jobs had been enqueued, which is the round trip a preview exists to remove. A pair
-    that has never been collected and a pair collected for other years are reported apart: one
-    is a backfill to run, the other is a window to move.
-    """
-    instruments = {
-        instrument.symbol: instrument
-        for instrument in session.scalars(select(Instrument).where(Instrument.symbol.in_(symbols)))
-    }
-    coverage = {
-        (row.instrument_id, row.timeframe): row
-        for row in session.scalars(
-            select(Dataset).where(
-                Dataset.instrument_id.in_([one.id for one in instruments.values()]),
-                Dataset.timeframe.in_(timeframes),
-            )
-        )
-    }
-
-    out: list[UncoveredMarket] = []
-    for symbol in symbols:
-        instrument = instruments.get(symbol)
-        if instrument is None:
-            continue  # an unknown symbol is a different refusal, and the caller makes it first
-        for timeframe in timeframes:
-            dataset = coverage.get((instrument.id, timeframe))
-            if dataset is None:
-                out.append(UncoveredMarket(symbol=symbol, timeframe=timeframe, covers=None))
-            elif dataset.date_from >= date_to or dataset.date_to <= date_from:
-                # No overlap at all. A *partial* overlap is deliberately allowed: a run over the
-                # half of the window that exists is a real measurement, and refusing it would
-                # make every sweep wait for the least-collected symbol on the list.
-                out.append(
-                    UncoveredMarket(
-                        symbol=symbol,
-                        timeframe=timeframe,
-                        covers=(
-                            f"{dataset.date_from.date().isoformat()} to "
-                            f"{dataset.date_to.date().isoformat()}"
-                        ),
-                    )
-                )
-    return out
-
-
 @router.post("/sweeps/preview", response_model=SweepPreview, responses={**_NOT_FOUND, **_BAD_BODY})
 def preview_sweep(request: PreviewSweepRequest, session: SessionDep) -> SweepPreview:
     """What this sweep would enqueue, without enqueuing any of it.
@@ -207,9 +146,10 @@ def preview_sweep(request: PreviewSweepRequest, session: SessionDep) -> SweepPre
     pairs = _entries(session, request.entry_ids)
 
     # ⚠️ **The same guard the launch has, and the preview needs it more.** Without it a
-    # backwards window overlaps no dataset at all, so `_uncovered` reports every market and the
-    # screen reads "no candles in this window; move the window or collect them first" — blaming
-    # the data for a typo, and sending a person to run a backfill they do not need. Refused the
+    # backwards window is not a window any dataset can overlap, so `uncovered_markets` can name
+    # a market that is collected and the screen reads "no candles in this window; move the
+    # window or collect them first" — blaming the data for a typo, and sending a person to run
+    # a backfill they do not need. Refused the
     # same way and in the same words the launch refuses it, so one request cannot get two
     # verdicts from the two endpoints.
     if request.date_to <= request.date_from:
@@ -239,7 +179,7 @@ def preview_sweep(request: PreviewSweepRequest, session: SessionDep) -> SweepPre
             )
         )
 
-    uncovered = _uncovered(
+    uncovered = uncovered_markets(
         session, list(request.symbols), timeframes, request.date_from, request.date_to
     )
 
@@ -311,14 +251,13 @@ async def create_sweep(request: CreateSweep, session: SessionDep, queue: QueueDe
     # ⚠️ Refused, not dropped, and named one by one. Enqueuing a run that cannot read a single
     # candle spends a worker to re-learn what the `datasets` index already knows — which is what
     # the first real sweep did, nine times out of twelve.
-    uncovered = _uncovered(
+    uncovered = uncovered_markets(
         session, list(request.symbols), timeframes, request.date_from, request.date_to
     )
     if uncovered:
-        named = ", ".join(f"{one.symbol} {one.timeframe}" for one in uncovered)
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail=f"no candles in this window for: {named}",
+            detail="no candles in this window for: " + ", ".join(map(describe, uncovered)),
         )
 
     documents = [

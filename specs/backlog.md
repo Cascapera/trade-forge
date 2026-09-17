@@ -2381,3 +2381,18 @@ entregou antes (M1 com teto de `maxbars`, por exemplo), o `delete_matching` troc
 uma versão menor. O corte pela sondagem (`symbol_history.oldest`) evita isso quando o par foi
 sondado. Sem sondagem, o risco existe. A próxima peça (enfileirar a partir do plano) deve sondar
 antes, ou recusar reescrever uma partição com menos barras do que ela tinha.
+
+## O que a fatia "roda com o que tem" (PR-262) deixou de fora
+
+* **A cesta não guarda quem foi pulado.** O `skipped` só vem na resposta do `POST /baskets`.
+  Aberta depois, a tela da cesta mostra os runs que existem e não sabe dizer quais mercados
+  ficaram de fora. Guardar exige uma coluna nova (migration).
+* **O estudo (`POST /studies`) ainda enfileira sem perguntar ao índice.** A regra dele (17/09)
+  vale para o estudo também; ficou para uma fatia própria.
+* **As telas ainda não avisam nem perguntam.** O servidor já pula e recusa. O aviso "faltam X,
+  coletar?" com os dois botões é a fatia seguinte.
+* **A CLI `backfill` cataloga a extensão do download, não a do disco** (`backfill.py:_catalogue`).
+  Coletar 2015 depois de 2020 por ela faz o índice dizer "só 2015". Desde a PR-262 isso é
+  alcançável: o backtest e a cesta recusam ou pulam barras que existem, e a frase "on disk"
+  mostra números errados. O coletor da tela (`collect.py`) já cataloga a partir do disco
+  (`storage.coverage`). Conserto: o `backfill` usar o mesmo `coverage`.

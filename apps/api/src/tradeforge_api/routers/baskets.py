@@ -19,6 +19,7 @@ from fastapi import APIRouter, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
+from tradeforge_api.coverage import describe, uncovered_markets
 from tradeforge_api.deps import QueueDep, SessionDep
 from tradeforge_api.queue import RUN_BACKTEST
 from tradeforge_api.routers.backtests import list_item
@@ -116,6 +117,18 @@ async def create_basket(
             detail=f"unknown symbols: {', '.join(unknown)}",
         )
 
+    skipped = uncovered_markets(
+        session, list(request.symbols), [request.timeframe], request.date_from, request.date_to
+    )
+    empty = {market.symbol for market in skipped}
+    symbols = [symbol for symbol in request.symbols if symbol not in empty]
+    if not symbols:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="no market has candles in this window: "
+            + ", ".join(describe(market) for market in skipped),
+        )
+
     basket = Basket(
         strategy_id=strategy.id,
         timeframe=request.timeframe,
@@ -141,7 +154,7 @@ async def create_basket(
             status=BacktestStatus.QUEUED,
             engine_version=ENGINE_VERSION,
         )
-        for symbol in request.symbols
+        for symbol in symbols
     ]
     session.add_all(runs)
     session.commit()
@@ -164,8 +177,9 @@ async def create_basket(
                 cost_model=run.cost_model,
                 default_spread_points=found[symbol].default_spread_points,
             )
-            for symbol, run in zip(request.symbols, runs, strict=True)
+            for symbol, run in zip(symbols, runs, strict=True)
         ],
+        skipped=skipped,
     )
 
 

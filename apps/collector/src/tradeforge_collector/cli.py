@@ -2,6 +2,7 @@
 
     tradeforge-collector backfill EURUSD H1 2024-01-01 2024-12-31
     tradeforge-collector backfill EURUSD H1 2024-01-01 2024-12-31 --source mt5
+    tradeforge-collector agent
 
 `--source mock` is the default, and that is a deliberate choice: the command a new
 contributor runs first must work on their machine, on Linux, with no broker account.
@@ -20,9 +21,11 @@ import os
 import sys
 from collections.abc import Sequence
 from pathlib import Path
+from typing import TYPE_CHECKING, cast
 
 from tradeforge_collector.backfill import backfill
 from tradeforge_collector.gaps import format_report
+from tradeforge_collector.lifetime import DEFAULT_GRACE
 from tradeforge_collector.live import (
     DEFAULT_MAX_BACKFILL,
     LiveSource,
@@ -35,6 +38,9 @@ from tradeforge_collector.timeframes import TIMEFRAME_STEP
 from tradeforge_db.instruments import CatalogueEntry, upsert_instruments
 from tradeforge_db.session import create_db_engine, create_session_factory, session_scope
 from tradeforge_engine.domain import AssetClass
+
+if TYPE_CHECKING:
+    from arq.typing import WorkerSettingsType
 
 DEFAULT_DATA_DIR = Path("data/ohlcv")
 
@@ -192,7 +198,48 @@ def _parser() -> argparse.ArgumentParser:
     live.add_argument("--redis-host", default=os.environ.get("REDIS_HOST", "localhost"))
     live.add_argument("--redis-port", type=int, default=int(os.environ.get("REDIS_PORT", "6379")))
 
+    # The host agent (ADR-0021), run under a loop that stops it when the stack's Redis goes.
+    # Redis comes from REDIS_HOST/REDIS_PORT, like every other setting of this process.
+    agent = commands.add_parser(
+        "agent",
+        help="serve the API's collection jobs until the Docker stack goes away",
+        description=(
+            "Runs the host agent that answers the API's MetaTrader jobs. It exits by itself, "
+            "with status 0, once Redis has not answered for --grace seconds — the stack was "
+            "stopped — and carries on if Redis comes back sooner. If Redis does not answer at "
+            "start, it exits at once with status 2: start the stack first."
+        ),
+    )
+    agent.add_argument(
+        "--grace",
+        type=float,
+        default=DEFAULT_GRACE,
+        metavar="SECONDS",
+        help=f"how long a lost Redis may take to come back (default: {DEFAULT_GRACE:g})",
+    )
+
     return parser
+
+
+def _agent(args: argparse.Namespace) -> int:
+    """Serve the collection queue until stopped or until the stack's Redis is gone."""
+    # Deferred like `_live`'s imports: `--help` and the other subcommands need neither arq nor
+    # the agent's database wiring.
+    import asyncio  # noqa: PLC0415
+
+    from tradeforge_collector.agent import WorkerSettings  # noqa: PLC0415
+    from tradeforge_collector.supervisor import serve  # noqa: PLC0415
+
+    try:
+        # arq's settings type is structural; the agent's class matches it without naming it.
+        settings: WorkerSettingsType = cast("WorkerSettingsType", WorkerSettings)
+        return asyncio.run(
+            serve(settings, redis_settings=WorkerSettings.redis_settings, grace=args.grace)
+        )
+    except KeyboardInterrupt:
+        # A first Ctrl-C is caught inside `serve`, which stops the worker and returns 0. This is
+        # the second one, pressed while it is still stopping — the answer is the same.
+        return 0
 
 
 def _catalogue_command(args: argparse.Namespace) -> int:
@@ -369,6 +416,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "catalogue": _catalogue_command,
             "live": _live,
             "backfill": _backfill,
+            "agent": _agent,
         }
         return commands[args.command](args)
     except (LookupError, ValueError, ConnectionError) as error:

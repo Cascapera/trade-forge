@@ -465,9 +465,10 @@ class TestTheAgentCommand:
 
         # Caught here, or an escaping interrupt would abort the whole pytest session rather than
         # fail this test by name.
+        code: int | None = None
         try:
             code = cli.main(["agent"])
         except KeyboardInterrupt:
-            pytest.fail("Ctrl-C escaped the agent command")
+            code = None
 
-        assert code == 0
+        assert code == 0, "Ctrl-C escaped the agent command"

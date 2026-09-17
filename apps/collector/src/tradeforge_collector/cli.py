@@ -231,12 +231,10 @@ def _agent(args: argparse.Namespace) -> int:
     from tradeforge_collector.supervisor import serve  # noqa: PLC0415
 
     try:
+        # arq's settings type is structural; the agent's class matches it without naming it.
+        settings: WorkerSettingsType = cast("WorkerSettingsType", WorkerSettings)
         return asyncio.run(
-            serve(
-                cast("WorkerSettingsType", WorkerSettings),
-                redis_settings=WorkerSettings.redis_settings,
-                grace=args.grace,
-            )
+            serve(settings, redis_settings=WorkerSettings.redis_settings, grace=args.grace)
         )
     except KeyboardInterrupt:
         # A first Ctrl-C is caught inside `serve`, which stops the worker and returns 0. This is

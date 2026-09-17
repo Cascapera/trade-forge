@@ -169,7 +169,7 @@ def test_the_agent_takes_work_again_when_redis_comes_back_inside_the_grace() -> 
         finally:
             agent.cancel()
             with contextlib.suppress(asyncio.CancelledError):
-                await agent
+                await asyncio.wait_for(agent, timeout=10)
             await proxy.cut()
             await queue.delete(before, after, settings.queue_name)
             await queue.aclose()

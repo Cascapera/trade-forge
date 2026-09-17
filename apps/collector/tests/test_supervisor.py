@@ -392,7 +392,7 @@ class TestAStopIsNeverLost:
             outer = asyncio.ensure_future(supervisor._stop(inner))
             await asyncio.sleep(0.01)
             outer.cancel()
-            await outer
+            await asyncio.wait_for(outer, timeout=5)
 
         with pytest.raises(asyncio.CancelledError):
             asyncio.run(scenario())

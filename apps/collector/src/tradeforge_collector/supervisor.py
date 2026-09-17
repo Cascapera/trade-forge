@@ -70,9 +70,11 @@ against a silent server that second part would otherwise wait for ever."""
 class _Worker(Protocol):
     main_task: asyncio.Task[None] | None
 
-    async def main(self) -> None: ...
+    async def main(self) -> None:
+        """Poll the queue and run jobs until cancelled or until Redis fails."""
 
-    async def close(self) -> None: ...
+    async def close(self) -> None:
+        """Wait for running jobs, then let go of Redis."""
 
 
 Ask = Callable[[], Awaitable[bool]]
@@ -170,7 +172,8 @@ async def _stop(task: asyncio.Future[Any]) -> None:
         if current is not None and current.cancelling():
             raise
     except REDIS_GONE:
-        pass
+        # A task that ended on a lost Redis has nothing more to report: that is why it is stopped.
+        return
 
 
 async def _end(worker: _Worker, *tasks: asyncio.Future[Any]) -> None:

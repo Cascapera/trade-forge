@@ -3,7 +3,7 @@ import { fireEvent, screen } from '@testing-library/react'
 import { useSession } from '../store'
 import { renderWithProviders } from '../test-utils'
 
-const { mutate, history, documents } = vi.hoisted(() => {
+const { mutate, history, documents, gate } = vi.hoisted(() => {
   interface Read {
     data: { definition: Record<string, unknown> } | undefined
     isError: boolean
@@ -17,7 +17,18 @@ const { mutate, history, documents } = vi.hoisted(() => {
     loading: { data: undefined, isError: false },
     broken: { data: undefined, isError: true },
   }
-  return { mutate: vi.fn(), history: vi.fn(), documents: reads }
+  const plan = {
+    answer: [] as unknown[],
+    hold: false,
+    pending: null as null | (() => void),
+    asked: vi.fn(),
+  }
+  return {
+    mutate: vi.fn(),
+    history: vi.fn(),
+    documents: reads,
+    gate: { plan, collect: vi.fn(), collectMode: 'take' },
+  }
 })
 
 function listed(id: string, name: string) {
@@ -40,6 +51,42 @@ vi.mock('../api/hooks', () => ({
   },
   useProbeSymbol: () => ({ mutate: () => undefined, isPending: false, isSuccess: false }),
   useCreateBacktest: () => ({ mutate, isPending: false, isError: false }),
+  usePlanCollections: () => ({
+    mutate: (request: unknown, options: { onSuccess: (items: unknown[]) => void }) => {
+      gate.plan.asked(request)
+      // A fresh array per answer, as a real response is.
+      const answer = [...gate.plan.answer]
+      const respond = (): void => {
+        options.onSuccess(answer)
+      }
+      if (gate.plan.hold) gate.plan.pending = respond
+      else respond()
+    },
+    // Like React Query: a reset mutation never calls the `onSuccess` it was given.
+    reset: () => {
+      gate.plan.pending = null
+    },
+    isPending: false,
+    isError: false,
+  }),
+  useCollectMissing: () => ({
+    // `take`: each request is reported as taken and the sending ends, as the real hook does.
+    // `hold`: still sending. `refuse`: the sending ends with nothing taken.
+    mutate: (
+      variables: { bodies: unknown[]; onQueued: (body: unknown) => void },
+      options?: { onSettled?: () => void },
+    ) => {
+      gate.collect(variables.bodies)
+      if (gate.collectMode === 'hold') return
+      if (gate.collectMode === 'take') for (const body of variables.bodies) variables.onQueued(body)
+      options?.onSettled?.()
+    },
+    reset: () => undefined,
+    isPending: false,
+    isSuccess: false,
+    isError: false,
+    data: undefined,
+  }),
   // The server's list, which is what the picker offers — not this tab's memory.
   useStrategies: () => ({
     data: {
@@ -62,6 +109,10 @@ import { LaunchBacktest } from './LaunchBacktest'
 afterEach(() => {
   vi.clearAllMocks()
   useSession.getState().clear()
+  gate.plan.answer = []
+  gate.plan.hold = false
+  gate.plan.pending = null
+  gate.collectMode = 'take'
 })
 
 function fillIn(): void {
@@ -145,5 +196,143 @@ describe('LaunchBacktest', () => {
     const payload = mutate.mock.calls[0]?.[0] as { symbol: string; cost_model: unknown }
     expect(payload.symbol).toBe('EURUSD')
     expect(payload.cost_model).toEqual({ type: 'spread', spread_points: 15 })
+  })
+})
+
+describe('LaunchBacktest when data is missing', () => {
+  const MISSING = [
+    {
+      symbol: 'EURUSD',
+      timeframe: 'H4',
+      covers: '2023-03-01 to 2026-09-10',
+      windows: [{ date_from: '2023-01-01T00:00:00Z', date_to: '2023-12-31T23:59:59.999999Z' }],
+    },
+  ]
+
+  function ready(): void {
+    useSession.getState().setStrategy('s1', 'MME9 breakout')
+    renderWithProviders(<LaunchBacktest />)
+    fillIn()
+  }
+
+  it("asks the plan about the market, the document's chart and the window before launching", () => {
+    ready()
+    fireEvent.click(runButton())
+
+    expect(gate.plan.asked).toHaveBeenCalledWith({
+      symbols: ['EURUSD'],
+      timeframes: ['H4'],
+      date_from: '2023-01-01T00:00:00Z',
+      date_to: '2023-06-01T00:00:00Z',
+    })
+    // Nothing missing: straight through, as before.
+    expect(mutate).toHaveBeenCalledTimes(1)
+  })
+
+  it('says what is missing and waits instead of launching', () => {
+    gate.plan.answer = MISSING
+    ready()
+    fireEvent.click(runButton())
+
+    const prompt = screen.getByRole('region', { name: 'missing data' })
+    expect(prompt).toHaveTextContent(
+      'EURUSD H4 — on disk 2023-03-01 to 2026-09-10; would fetch 2023',
+    )
+    expect(mutate).not.toHaveBeenCalled()
+  })
+
+  it('runs with what there is when told to', () => {
+    gate.plan.answer = MISSING
+    ready()
+    fireEvent.click(runButton())
+    fireEvent.click(screen.getByRole('button', { name: 'Run with what there is' }))
+
+    expect(mutate).toHaveBeenCalledTimes(1)
+    expect((mutate.mock.calls[0]?.[0] as { symbol: string }).symbol).toBe('EURUSD')
+  })
+
+  it('queues the collection when told to, and does not launch', () => {
+    gate.plan.answer = MISSING
+    ready()
+    fireEvent.click(runButton())
+    fireEvent.click(screen.getByRole('button', { name: 'Collect what is missing' }))
+
+    expect(gate.collect).toHaveBeenCalledWith([
+      {
+        items: [{ symbol: 'EURUSD' }],
+        rows: [{ timeframe: 'H4', ...MISSING[0]!.windows[0]! }],
+      },
+    ])
+    expect(mutate).not.toHaveBeenCalled()
+  })
+
+  it('never queues the same window twice, however often it is pressed', () => {
+    // ⚠️ The server does not merge identical requests: a second press would download the same
+    // year again. Pressed twice before the screen re-renders, and once more after a new Run.
+    gate.plan.answer = MISSING
+    ready()
+    fireEvent.click(runButton())
+    const collect = screen.getByRole('button', { name: 'Collect what is missing' })
+    fireEvent.click(collect)
+    fireEvent.click(collect)
+    fireEvent.click(runButton())
+
+    expect(gate.collect).toHaveBeenCalledTimes(1)
+    expect(screen.getByRole('button', { name: 'Already queued' })).toBeDisabled()
+  })
+
+  it('closes the prompt when the form changes, since it answered the old form', () => {
+    gate.plan.answer = MISSING
+    ready()
+    fireEvent.click(runButton())
+    fireEvent.change(screen.getByLabelText('to'), { target: { value: '2023-09-01' } })
+
+    expect(screen.queryByRole('region', { name: 'missing data' })).not.toBeInTheDocument()
+  })
+
+  it('drops an answer that arrives after the form changed', () => {
+    // ⚠️ Nothing missing, so this answer would launch — with the dates as they were when the
+    // question was asked, not as they are on screen now.
+    gate.plan.hold = true
+    ready()
+    fireEvent.click(runButton())
+    fireEvent.change(screen.getByLabelText('to'), { target: { value: '2023-09-01' } })
+    gate.plan.pending?.()
+
+    expect(mutate).not.toHaveBeenCalled()
+  })
+
+  it('launches on an answer that arrives with the form unchanged', () => {
+    // The pair of the test above: the same late answer, no edit in between.
+    gate.plan.hold = true
+    ready()
+    fireEvent.click(runButton())
+    gate.plan.pending?.()
+
+    expect(mutate).toHaveBeenCalledTimes(1)
+  })
+
+  it('sends nothing on a second press while the first is still sending', () => {
+    gate.plan.answer = MISSING
+    gate.collectMode = 'hold'
+    ready()
+    fireEvent.click(runButton())
+    fireEvent.click(screen.getByRole('button', { name: 'Collect what is missing' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Collect what is missing' }))
+
+    expect(gate.collect).toHaveBeenCalledTimes(1)
+  })
+
+  it('offers a refused window again', () => {
+    // Nothing was taken, so nothing would be downloaded twice — and the person may have fixed
+    // what the server refused.
+    gate.plan.answer = MISSING
+    gate.collectMode = 'refuse'
+    ready()
+    fireEvent.click(runButton())
+    fireEvent.click(screen.getByRole('button', { name: 'Collect what is missing' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Collect what is missing' }))
+
+    expect(gate.collect).toHaveBeenCalledTimes(2)
   })
 })

@@ -17,6 +17,8 @@ vi.mock('./client', () => ({
     updateStrategy: vi.fn(),
     listSweeps: vi.fn(),
     getSweepDashboard: vi.fn(),
+    createCollection: vi.fn(),
+    planCollections: vi.fn(),
   },
 }))
 
@@ -29,6 +31,7 @@ import {
   isSweepSettled,
   isTerminal,
   useBasket,
+  useCollectMissing,
   useCreateBasket,
   useBacktest,
   useBacktests,
@@ -535,5 +538,58 @@ describe('useSaveStrategy', () => {
         include_generated: true,
       })
     })
+  })
+})
+
+describe('useCollectMissing', () => {
+  const row = (year: string) => ({
+    timeframe: 'H1',
+    date_from: `${year}-01-01T00:00:00Z`,
+    date_to: `${year}-12-31T23:59:59.999999Z`,
+  })
+  const bodies = [
+    { items: [{ symbol: 'EURUSD' }], rows: [row('2019')] },
+    { items: [{ symbol: 'EURUSD' }], rows: [row('2026')] },
+  ]
+
+  it('sends each request in turn, reports each one taken, and resolves with every row', async () => {
+    mockedApi.createCollection
+      .mockResolvedValueOnce([{ id: 'c1' }] as never)
+      .mockResolvedValueOnce([{ id: 'c2' }] as never)
+    const onQueued = vi.fn()
+    const { result } = renderHook(() => useCollectMissing(), { wrapper: makeWrapper() })
+
+    act(() => {
+      result.current.mutate({ bodies, onQueued })
+    })
+    await waitFor(() => {
+      expect(result.current.isSuccess).toBe(true)
+    })
+
+    expect(mockedApi.createCollection).toHaveBeenCalledTimes(2)
+    expect(onQueued.mock.calls).toEqual([[bodies[0]], [bodies[1]]])
+    expect(result.current.data).toEqual([{ id: 'c1' }, { id: 'c2' }])
+  })
+
+  it('stops at the first refusal and keeps what was queued before it', async () => {
+    const refusal = new Error('409')
+    mockedApi.createCollection
+      .mockResolvedValueOnce([{ id: 'c1' }] as never)
+      .mockRejectedValueOnce(refusal)
+    const onQueued = vi.fn()
+    const { result } = renderHook(() => useCollectMissing(), { wrapper: makeWrapper() })
+
+    act(() => {
+      result.current.mutate({ bodies: [...bodies, bodies[0]!], onQueued })
+    })
+    await waitFor(() => {
+      expect(result.current.isError).toBe(true)
+    })
+
+    // The third request is never sent, and the refused one is not reported as taken.
+    expect(mockedApi.createCollection).toHaveBeenCalledTimes(2)
+    expect(onQueued.mock.calls).toEqual([[bodies[0]]])
+    expect(result.current.error?.queued).toEqual([{ id: 'c1' }])
+    expect(result.current.error?.refusal).toBe(refusal)
   })
 })

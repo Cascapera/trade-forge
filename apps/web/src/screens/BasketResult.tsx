@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { useParams } from 'react-router-dom'
+import { useLocation, useParams } from 'react-router-dom'
 
 import { useBasket, useEquityCurves } from '../api/hooks'
+import type { UncoveredMarket } from '../api/types'
 import {
   EMPTY_SEATS,
   MAX_COMPARED,
@@ -16,6 +17,19 @@ import { BasketDispersion } from '../components/BasketDispersion'
 import { ComparisonChart } from '../components/ComparisonChart'
 import { RunTable } from '../components/RunTable'
 import { money } from '../format'
+
+/**
+ * The markets the launch left out, if this page was opened straight from it.
+ *
+ * ⚠️ Read from the navigation, not from the server: only the launch's response knows them. A
+ * reload or a link opened later shows the basket without this line, which says nothing false —
+ * only less.
+ */
+function skippedFrom(state: unknown): UncoveredMarket[] {
+  if (state === null || typeof state !== 'object' || !('skipped' in state)) return []
+  const { skipped } = state
+  return Array.isArray(skipped) ? (skipped as UncoveredMarket[]) : []
+}
 
 /** The calendar day of an ISO instant — the granularity a window is read at. */
 function day(iso: string): string {
@@ -36,6 +50,7 @@ function day(iso: string): string {
 export function BasketResult(): React.JSX.Element {
   const { id } = useParams<{ id: string }>()
   const basket = useBasket(id)
+  const skipped = skippedFrom(useLocation().state)
   const [seats, setSeats] = useState(EMPTY_SEATS)
 
   // Every run this screen has already put on the chart once. A ref, not state: changing it must
@@ -82,6 +97,23 @@ export function BasketResult(): React.JSX.Element {
           per market
         </p>
       </div>
+
+      {skipped.length > 0 && (
+        <p
+          role="status"
+          className="rounded border border-amber-800 bg-amber-950/40 p-4 text-sm text-amber-200"
+        >
+          Left out — no candles in this window:{' '}
+          {skipped
+            .map((market) =>
+              market.covers === null
+                ? `${market.symbol} (never collected)`
+                : `${market.symbol} (on disk ${market.covers})`,
+            )
+            .join(', ')}
+          .
+        </p>
+      )}
 
       {/* The poll is visible rather than silent: a screen that showed dashes without saying why
           reads as a basket that produced nothing. */}

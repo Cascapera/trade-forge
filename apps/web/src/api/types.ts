@@ -359,6 +359,12 @@ export interface BasketRunOut {
 export interface CreatedBasket {
   id: string
   runs: BasketRunOut[]
+  /**
+   * Markets left out because the index holds no candle of theirs in the window — his rule: told
+   * not to collect, the basket runs on what exists and names the rest. ⚠️ Only in this response;
+   * the basket read back later does not know them.
+   */
+  skipped: UncoveredMarket[]
 }
 
 /**
@@ -788,6 +794,30 @@ export interface CreateCollection {
    * would be wrong for all but one of them.
    */
   rows: CollectionRow[]
+}
+
+/** Which markets still need collecting before a run over this window (`POST /collections/plan`). */
+export interface PlanCollectionRequest {
+  symbols: string[]
+  timeframes: string[]
+  date_from: string
+  date_to: string
+}
+
+/** One span to collect, inclusive: whole UTC years, the current one stopping at the plan's now. */
+export interface PlannedWindow {
+  date_from: string
+  date_to: string
+}
+
+/** One (symbol, timeframe) not fully on disk. Covered pairs are left out of the answer. */
+export interface PlannedCollection {
+  symbol: string
+  timeframe: string
+  /** What the index holds, as `2020-01-02 to 2026-09-10`, or `null` when never collected. */
+  covers: string | null
+  /** ⚠️ Possibly wider than asked: a window always reaches the data already on disk. */
+  windows: PlannedWindow[]
 }
 
 export interface Collection {

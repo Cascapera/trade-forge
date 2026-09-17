@@ -5,12 +5,23 @@ import type { CreateBasketRequest } from '../api/types'
 import { useSession } from '../store'
 import { renderWithProviders } from '../test-utils'
 
-const { mutate, state } = vi.hoisted(() => {
+const { mutate, state, gate, navigate } = vi.hoisted(() => {
   // Annotated rather than asserted: the mutation's error is whatever the client threw, and the
   // test needs to put an `ApiError` in here later.
   const state: { isError: boolean; error: unknown } = { isError: false, error: null }
-  return { mutate: vi.fn(), state }
+  const plan = {
+    answer: [] as unknown[],
+    hold: false,
+    pending: null as null | (() => void),
+    asked: vi.fn(),
+  }
+  return { mutate: vi.fn(), state, gate: { plan, collect: vi.fn() }, navigate: vi.fn() }
 })
+
+vi.mock('react-router-dom', async (original) => ({
+  ...(await original<typeof import('react-router-dom')>()),
+  useNavigate: () => navigate,
+}))
 
 vi.mock('../api/hooks', () => ({
   useInstruments: () => ({
@@ -18,10 +29,44 @@ vi.mock('../api/hooks', () => ({
       { id: 'i1', symbol: 'EURUSD', default_spread_points: '8.0000000000' },
       { id: 'i2', symbol: 'GBPUSD', default_spread_points: '9.0000000000' },
       { id: 'i3', symbol: 'US500', default_spread_points: null },
-      { id: 'i4', symbol: 'XAUUSD', default_spread_points: null },
+      { id: 'i4', symbol: 'XAUUSD', default_spread_points: null, asset_class: 'future' },
     ],
   }),
   useCreateBasket: () => ({ mutate, isPending: false, ...state }),
+  usePlanCollections: () => ({
+    mutate: (request: unknown, options: { onSuccess: (items: unknown[]) => void }) => {
+      gate.plan.asked(request)
+      // A fresh array per answer, as a real response is.
+      const answer = [...gate.plan.answer]
+      const respond = (): void => {
+        options.onSuccess(answer)
+      }
+      if (gate.plan.hold) gate.plan.pending = respond
+      else respond()
+    },
+    // Like React Query: a reset mutation never calls the `onSuccess` it was given.
+    reset: () => {
+      gate.plan.pending = null
+    },
+    isPending: false,
+    isError: false,
+  }),
+  useCollectMissing: () => ({
+    // The server takes every request; each one is reported as taken, as the real hook does.
+    mutate: (
+      variables: { bodies: unknown[]; onQueued: (body: unknown) => void },
+      options?: { onSettled?: () => void },
+    ) => {
+      gate.collect(variables.bodies)
+      for (const body of variables.bodies) variables.onQueued(body)
+      options?.onSettled?.()
+    },
+    reset: () => undefined,
+    isPending: false,
+    isSuccess: false,
+    isError: false,
+    data: undefined,
+  }),
   // The strategy picker asks the server what exists. Empty here: these tests are about the
   // basket's own rules, and the picker has its own test.
   useStrategies: () => ({ data: { total: 0, limit: 200, offset: 0, items: [] }, isPending: false }),
@@ -36,6 +81,9 @@ function pick(name: string): void {
 beforeEach(() => {
   state.isError = false
   state.error = null
+  gate.plan.answer = []
+  gate.plan.hold = false
+  gate.plan.pending = null
 })
 
 afterEach(() => {
@@ -156,5 +204,85 @@ describe('LaunchBasket', () => {
     renderWithProviders(<LaunchBasket />)
 
     expect(screen.getByText('unknown symbols: NOPE, ALSONOPE')).toBeInTheDocument()
+  })
+})
+
+describe('LaunchBasket when data is missing', () => {
+  function chosen(): void {
+    useSession.getState().setStrategy('s1', 'MA cross')
+    renderWithProviders(<LaunchBasket />)
+    pick('EURUSD, 8 ticks')
+    pick('GBPUSD, 9 ticks')
+    fireEvent.change(screen.getByLabelText('timeframe'), { target: { value: 'H4' } })
+  }
+
+  it('asks the plan about every chosen market at the chosen chart', () => {
+    chosen()
+    fireEvent.click(screen.getByRole('button', { name: /run 2 markets/i }))
+
+    expect(gate.plan.asked).toHaveBeenCalledWith(
+      expect.objectContaining({ symbols: ['EURUSD', 'GBPUSD'], timeframes: ['H4'] }),
+    )
+  })
+
+  it('waits for an answer when something is missing, and runs with what there is on request', () => {
+    gate.plan.answer = [
+      {
+        symbol: 'GBPUSD',
+        timeframe: 'H4',
+        covers: null,
+        windows: [{ date_from: '2024-01-01T00:00:00Z', date_to: '2024-12-31T23:59:59.999999Z' }],
+      },
+    ]
+    chosen()
+    fireEvent.click(screen.getByRole('button', { name: /run 2 markets/i }))
+
+    expect(screen.getByRole('region', { name: 'missing data' })).toHaveTextContent(
+      'GBPUSD H4 — never collected; would fetch 2024',
+    )
+    expect(mutate).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Run with what there is' }))
+    expect(mutate).toHaveBeenCalledTimes(1)
+  })
+
+  it('carries the markets the server left out to the result page', () => {
+    // ⚠️ Only the launch's response knows them; the basket read back later does not.
+    const skipped = [{ symbol: 'GBPUSD', timeframe: 'H4', covers: null }]
+    mutate.mockImplementation(
+      (
+        _payload: unknown,
+        options: { onSuccess: (b: { id: string; runs: unknown[]; skipped: unknown[] }) => void },
+      ) => {
+        options.onSuccess({ id: 'k9', runs: [{}], skipped })
+      },
+    )
+    chosen()
+    fireEvent.click(screen.getByRole('button', { name: /run 2 markets/i }))
+
+    expect(navigate).toHaveBeenCalledWith('/baskets/k9', { state: { skipped } })
+  })
+
+  it('queues a market the broker files outside the five classes with the class the catalogue holds', () => {
+    // XAUUSD sits under Metals on this broker, a path the collection endpoint cannot classify —
+    // without the catalogue's answer the whole request would be refused with a 409.
+    gate.plan.answer = [
+      {
+        symbol: 'XAUUSD',
+        timeframe: 'H1',
+        covers: null,
+        windows: [{ date_from: '2024-01-01T00:00:00Z', date_to: '2024-12-31T23:59:59.999999Z' }],
+      },
+    ]
+    useSession.getState().setStrategy('s1', 'MA cross')
+    renderWithProviders(<LaunchBasket />)
+    pick('EURUSD, 8 ticks')
+    pick('XAUUSD, no spread measured')
+    fireEvent.click(screen.getByRole('button', { name: /run 2 markets/i }))
+    fireEvent.click(screen.getByRole('button', { name: 'Collect what is missing' }))
+
+    expect(gate.collect).toHaveBeenCalledWith([
+      expect.objectContaining({ items: [{ symbol: 'XAUUSD', asset_class: 'future' }] }),
+    ])
   })
 })

@@ -198,3 +198,35 @@ describe('BasketResult', () => {
     expect(screen.getByText(/loading the basket/i)).toBeInTheDocument()
   })
 })
+
+describe('BasketResult, opened straight from a launch that left markets out', () => {
+  beforeEach(() => {
+    stub([])
+  })
+
+  it('names each market left out and what the disk holds of it', () => {
+    renderWithProviders(<BasketResult />, {
+      pathname: '/baskets/k1',
+      state: {
+        skipped: [
+          { symbol: 'GBPUSD', timeframe: 'H1', covers: null },
+          { symbol: 'AUDUSD', timeframe: 'H1', covers: '2019-01-02 to 2019-12-30' },
+        ],
+      },
+    })
+
+    expect(
+      screen.getByText(/Left out — no candles in this window: GBPUSD \(never collected\), AUDUSD \(on disk 2019-01-02 to 2019-12-30\)/),
+    ).toBeInTheDocument()
+  })
+
+  it('says nothing about left-out markets when opened any other way', () => {
+    renderWithProviders(<BasketResult />, '/baskets/k1')
+    expect(screen.queryByText(/Left out/)).not.toBeInTheDocument()
+  })
+
+  it('ignores navigation state that is not a list', () => {
+    renderWithProviders(<BasketResult />, { pathname: '/baskets/k1', state: { skipped: 'x' } })
+    expect(screen.queryByText(/Left out/)).not.toBeInTheDocument()
+  })
+})

@@ -760,8 +760,17 @@ class TestTheDataHasToBeThere:
         assert uncovered["symbol"] == "GBPUSD"
         # The range it *does* hold, so the reader can move the window rather than guess at it.
         assert uncovered["covers"] is not None
-        # And the launch agrees, which is the whole point of a preview.
-        assert client.post("/sweeps", json=body).status_code == 422
+        # And the launch agrees, which is the whole point of a preview — in the words the
+        # basket and the single backtest use too (`coverage.describe`).
+        refused = client.post("/sweeps", json=body)
+        assert refused.status_code == 422
+        held = (
+            f"{(START + dt.timedelta(days=3650)).date().isoformat()} to "
+            f"{(START + dt.timedelta(days=4015)).date().isoformat()}"
+        )
+        assert refused.json()["detail"] == (
+            f"no candles in this window for: GBPUSD M15 (on disk: {held})"
+        )
 
 
 def launch(client: Any, entries: list[str], symbols: list[str]) -> str:

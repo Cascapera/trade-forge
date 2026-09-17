@@ -25,7 +25,6 @@ from sqlalchemy.orm import Session
 from tradeforge_api.config import Settings
 from tradeforge_api.main import create_app
 from tradeforge_api.worker import process_backtest
-from tradeforge_collector import write_candles
 from tradeforge_db.models import Backtest, Basket, Instrument
 from tradeforge_engine.domain import AssetClass, Candle
 from tradeforge_engine.testing import bar
@@ -180,7 +179,10 @@ def _run_worker(session_factory: Callable[[], Session], tmp_path: Path, backtest
 
 
 def test_each_market_in_a_basket_is_charged_its_own_measured_spread(
-    session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+    session_factory: Callable[[], Session],
+    settings: Settings,
+    tmp_path: Path,
+    indexed: Callable[..., None],
 ) -> None:
     """The reason a basket takes no `cost_model`: there is no single cost across markets.
 
@@ -197,6 +199,8 @@ def test_each_market_in_a_basket_is_charged_its_own_measured_spread(
     seeding = session_factory()
     _seed_instruments(seeding)
     seeding.close()
+    for symbol in SPREADS:
+        indexed(symbol)
 
     queue = _CapturingQueue()
     with TestClient(_app(settings, session_factory, tmp_path, queue)) as client:
@@ -252,7 +256,10 @@ def test_each_market_in_a_basket_is_charged_its_own_measured_spread(
 
 
 def test_a_basket_reads_back_as_the_spread_of_outcomes_across_its_markets(
-    session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+    session_factory: Callable[[], Session],
+    settings: Settings,
+    tmp_path: Path,
+    collected: Callable[..., None],
 ) -> None:
     """Two markets, both finished, and the aggregate agreeing with the rows it summarises.
 
@@ -264,8 +271,8 @@ def test_a_basket_reads_back_as_the_spread_of_outcomes_across_its_markets(
     seeding = session_factory()
     _seed_instruments(seeding)
     seeding.close()
-    write_candles(tmp_path, "EURUSD", "H1", _rising())
-    write_candles(tmp_path, "GBPUSD", "H1", _falling())
+    collected(tmp_path, "EURUSD", "H1", _rising())
+    collected(tmp_path, "GBPUSD", "H1", _falling())
 
     with TestClient(_app(settings, session_factory, tmp_path, _CapturingQueue())) as client:
         strategy_id = client.post("/strategies", json=_strategy()).json()["id"]
@@ -320,6 +327,7 @@ def test_reading_a_basket_costs_the_same_however_many_runs_it_holds(
     session_factory: Callable[[], Session],
     settings: Settings,
     tmp_path: Path,
+    indexed: Callable[..., None],
     migrated_engine: Engine,
 ) -> None:
     """The N+1 guard, stated as the property it is rather than as a magic number.
@@ -336,6 +344,8 @@ def test_reading_a_basket_costs_the_same_however_many_runs_it_holds(
     seeding = session_factory()
     _seed_instruments(seeding)
     seeding.close()
+    for symbol in SPREADS:
+        indexed(symbol)
 
     with TestClient(_app(settings, session_factory, tmp_path, _CapturingQueue())) as client:
         strategy_id = client.post("/strategies", json=_strategy()).json()["id"]
@@ -464,7 +474,10 @@ def test_a_basket_is_refused_when_the_launch_itself_makes_no_sense(
 
 
 def test_deleting_a_basket_leaves_the_runs_it_grouped_standing(
-    session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+    session_factory: Callable[[], Session],
+    settings: Settings,
+    tmp_path: Path,
+    indexed: Callable[..., None],
 ) -> None:
     """`ON DELETE SET NULL`, which is the difference between forgetting and destroying.
 
@@ -476,6 +489,8 @@ def test_deleting_a_basket_leaves_the_runs_it_grouped_standing(
     seeding = session_factory()
     _seed_instruments(seeding)
     seeding.close()
+    for symbol in SPREADS:
+        indexed(symbol)
 
     with TestClient(_app(settings, session_factory, tmp_path, _CapturingQueue())) as client:
         strategy_id = client.post("/strategies", json=_strategy()).json()["id"]
@@ -514,3 +529,106 @@ def test_an_unknown_basket_is_a_404_rather_than_an_empty_one(
     """An empty aggregate would read as "this comparison ran and found nothing"."""
     with TestClient(_app(settings, session_factory, tmp_path, _CapturingQueue())) as client:
         assert client.get(f"/baskets/{uuid.uuid4()}").status_code == 404
+
+
+class TestAMarketWithNoCandlesInTheWindow:
+    """His rule (17/09): told not to collect, a basket runs on the markets that have data and
+    names the ones that do not. Only a basket where no market has any candle is refused."""
+
+    @pytest.fixture
+    def client(
+        self, session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+    ) -> Any:
+        seeding = session_factory()
+        _seed_instruments(seeding)
+        seeding.close()
+        self.queue = _CapturingQueue()
+        with TestClient(_app(settings, session_factory, tmp_path, self.queue)) as opened:
+            yield opened
+
+    def _launch(self, client: Any, symbols: list[str]) -> Any:
+        strategy_id = client.post("/strategies", json=_strategy()).json()["id"]
+        self.queue.jobs.clear()
+        return client.post("/baskets", json=_basket_body(strategy_id, symbols))
+
+    def test_it_is_skipped_and_named_while_the_others_run(
+        self, client: Any, indexed: Callable[..., None]
+    ) -> None:
+        # EURUSD and US500 are covered; GBPUSD, in the middle, was never collected.
+        indexed("EURUSD")
+        indexed("US500")
+        response = self._launch(client, ["EURUSD", "GBPUSD", "US500"])
+
+        assert response.status_code == 202, response.text
+        body = response.json()
+        # The request's order, with the gap closed — not the database's order.
+        assert [run["symbol"] for run in body["runs"]] == ["EURUSD", "US500"]
+        assert body["skipped"] == [{"symbol": "GBPUSD", "timeframe": "H1", "covers": None}]
+        assert [str(args[0]) for _, args in self.queue.jobs] == [
+            run["backtest_id"] for run in body["runs"]
+        ]
+
+    def test_data_for_other_dates_is_named_with_what_it_holds(
+        self, client: Any, indexed: Callable[..., None], session_factory: Callable[[], Session]
+    ) -> None:
+        indexed("EURUSD")
+        indexed("GBPUSD")
+        with session_factory() as session:
+            gbp = session.scalars(select(Instrument).where(Instrument.symbol == "GBPUSD")).one()
+            (dataset,) = gbp.datasets
+            dataset.date_from = dt.datetime(2019, 1, 2, tzinfo=dt.UTC)
+            dataset.date_to = dt.datetime(2019, 12, 30, tzinfo=dt.UTC)
+            session.commit()
+
+        body = self._launch(client, ["EURUSD", "GBPUSD"]).json()
+
+        assert [run["symbol"] for run in body["runs"]] == ["EURUSD"]
+        assert body["skipped"] == [
+            {"symbol": "GBPUSD", "timeframe": "H1", "covers": "2019-01-02 to 2019-12-30"}
+        ]
+
+    def test_data_at_another_timeframe_does_not_count(
+        self, client: Any, indexed: Callable[..., None]
+    ) -> None:
+        # GBPUSD is collected — at H4. The basket runs at H1.
+        indexed("EURUSD")
+        indexed("GBPUSD", "H4")
+        body = self._launch(client, ["EURUSD", "GBPUSD"]).json()
+
+        assert [run["symbol"] for run in body["runs"]] == ["EURUSD"]
+        assert [market["symbol"] for market in body["skipped"]] == ["GBPUSD"]
+
+    def test_a_fully_covered_basket_skips_nothing(
+        self, client: Any, indexed: Callable[..., None]
+    ) -> None:
+        indexed("EURUSD")
+        indexed("GBPUSD")
+        body = self._launch(client, ["EURUSD", "GBPUSD"]).json()
+
+        assert [run["symbol"] for run in body["runs"]] == ["EURUSD", "GBPUSD"]
+        assert body["skipped"] == []
+
+    def test_a_basket_where_no_market_has_data_is_refused_and_nothing_is_written(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        response = self._launch(client, ["EURUSD", "GBPUSD"])
+
+        assert response.status_code == 422
+        assert response.json()["detail"] == (
+            "no market has candles in this window: "
+            "EURUSD H1 (never collected), GBPUSD H1 (never collected)"
+        )
+        assert self.queue.jobs == []
+        with session_factory() as verifying:
+            assert verifying.scalars(select(Basket)).all() == []
+            assert verifying.scalars(select(Backtest)).all() == []
+
+    def test_an_unknown_symbol_is_still_refused_before_coverage_is_asked(
+        self, client: Any, indexed: Callable[..., None]
+    ) -> None:
+        # A typo is not "no data": skipping it would hide the mistake behind a plausible reason.
+        indexed("EURUSD")
+        response = self._launch(client, ["EURUSD", "EURUSDX"])
+
+        assert response.status_code == 422
+        assert response.json()["detail"] == "unknown symbols: EURUSDX"

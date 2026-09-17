@@ -170,7 +170,10 @@ def test_a_grids_own_points_are_left_out_of_the_picker(
 
 
 def test_the_run_count_says_which_strategy_has_been_worked_on(
-    session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+    session_factory: Callable[[], Session],
+    settings: Settings,
+    tmp_path: Path,
+    indexed: Callable[..., None],
 ) -> None:
     """What distinguishes a strategy from something typed once and abandoned.
 
@@ -181,6 +184,7 @@ def test_the_run_count_says_which_strategy_has_been_worked_on(
     seeding = session_factory()
     _seed_instrument(seeding)
     seeding.close()
+    indexed("EURUSD", "H1")
 
     with TestClient(_app(settings, session_factory, tmp_path)) as client:
         busy = _create(client, "Run twice")

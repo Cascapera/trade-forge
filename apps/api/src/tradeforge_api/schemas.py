@@ -22,6 +22,7 @@ from typing import Annotated, Any
 from pydantic import (
     AfterValidator,
     AliasChoices,
+    AwareDatetime,
     BaseModel,
     ConfigDict,
     Field,
@@ -87,6 +88,14 @@ Timeframe = Annotated[str, AfterValidator(_known_timeframe)]
 
 Symbol = Annotated[str, AfterValidator(_storable)]
 """An instrument symbol as it arrives from a client, refused only where the database would."""
+
+AwareInstant = AwareDatetime
+"""A launch window's edge, refused with a 422 unless it carries a timezone.
+
+⚠️ **Required since the launches ask the `datasets` index** (PR-262). A naive instant cannot be
+compared with that index's `timestamptz`, so the check raised and the API answered 500 where,
+before the check existed, the same body got a 202. `CollectionRow` refuses the same thing.
+"""
 
 StorableText = Annotated[str, AfterValidator(_storable)]
 """Any free text from a client that reaches a query against a text column.
@@ -365,8 +374,8 @@ class CreateBacktestRequest(BaseModel):
     strategy_id: uuid.UUID
     symbol: Symbol
     timeframe: str
-    date_from: dt.datetime
-    date_to: dt.datetime
+    date_from: AwareInstant
+    date_to: AwareInstant
     initial_capital: Decimal = Field(gt=0)
     cost_model: dict[str, Any] = Field(default_factory=lambda: {"type": "none"})
 
@@ -760,8 +769,8 @@ class CreateBasketRequest(BaseModel):
     strategy_id: uuid.UUID
     symbols: list[Symbol] = Field(min_length=_MIN_SYMBOLS, max_length=_MAX_SYMBOLS)
     timeframe: str
-    date_from: dt.datetime
-    date_to: dt.datetime
+    date_from: AwareInstant
+    date_to: AwareInstant
     initial_capital: Decimal = Field(gt=0)
 
     @field_validator("symbols")
@@ -793,10 +802,20 @@ class BasketRunOut(_Out):
 
 
 class CreatedBasket(_Out):
-    """The 202 body: the basket exists and its runs are queued, one per symbol."""
+    """The 202 body: the basket exists and its runs are queued, one per symbol that has data."""
 
     id: uuid.UUID
     runs: list[BasketRunOut]
+    skipped: list[UncoveredMarket] = Field(default_factory=list)
+    """Symbols left out because the index holds no candle of theirs inside the window.
+
+    ⚠️ **Skipped, not refused — his rule (17/09).** Asked whether to collect first and told no,
+    the basket runs on the markets that have data and names the ones that do not. Refusing the
+    whole basket for one empty market would make the answer "no" useless.
+
+    ⚠️ **Only in this response.** The basket row does not record them, so the result page, read
+    later, lists the runs that exist and cannot say which markets were left out.
+    """
 
 
 class BasketAggregate(BaseModel):
@@ -1680,8 +1699,8 @@ class CreateSweep(BaseModel):
     """The charts. ⚠️ Each becomes a **document** of its own, not merely a run parameter — since
     PR-238 a document and its run must agree under a higher-timeframe filter."""
 
-    date_from: dt.datetime
-    date_to: dt.datetime
+    date_from: AwareInstant
+    date_to: AwareInstant
     initial_capital: Decimal = Field(gt=0)
     cost_model: dict[str, Any]
 
@@ -1724,8 +1743,8 @@ class PreviewSweepRequest(BaseModel):
     entry_ids: list[uuid.UUID] = Field(min_length=1, max_length=50)
     symbols: list[Symbol] = Field(min_length=1, max_length=_MAX_SYMBOLS)
     timeframes: list[Timeframe] = Field(min_length=1, max_length=8)
-    date_from: dt.datetime
-    date_to: dt.datetime
+    date_from: AwareInstant
+    date_to: AwareInstant
 
     @field_validator("entry_ids", "symbols", "timeframes")
     @classmethod

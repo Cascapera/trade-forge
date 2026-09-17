@@ -17,6 +17,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
 
 from tradeforge_api.config import Settings
+from tradeforge_api.coverage import describe, uncovered_markets
 from tradeforge_api.deps import QueueDep, SessionDep, SettingsDep
 from tradeforge_api.queue import RUN_BACKTEST
 from tradeforge_api.routers.strategies import assert_runnable_at
@@ -235,6 +236,17 @@ async def create_backtest(
     if request.date_to < request.date_from:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="date_to precedes date_from"
+        )
+
+    # ⚠️ Refused here rather than failed in the worker: the index already knows, and a run that
+    # cannot read one candle would spend a worker to learn it. A window covered in part runs.
+    missing = uncovered_markets(
+        session, [instrument.symbol], [request.timeframe], request.date_from, request.date_to
+    )
+    if missing:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=f"no candles in this window for {describe(missing[0])}",
         )
 
     backtest = Backtest(

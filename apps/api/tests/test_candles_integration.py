@@ -23,7 +23,6 @@ from sqlalchemy.orm import Session
 from tradeforge_api.config import Settings
 from tradeforge_api.main import create_app
 from tradeforge_api.worker import process_backtest
-from tradeforge_collector import write_candles
 from tradeforge_db.models import Backtest, BacktestStatus, Instrument
 from tradeforge_engine.domain import AssetClass, Candle
 from tradeforge_engine.indicators import EMA
@@ -165,7 +164,10 @@ def _launch(client: TestClient, hours: int = 100) -> str:
 
 
 def test_the_chart_shows_what_the_run_read_even_after_the_dataset_grows(
-    session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+    session_factory: Callable[[], Session],
+    settings: Settings,
+    tmp_path: Path,
+    collected: Callable[..., None],
 ) -> None:
     """The test the whole endpoint exists for.
 
@@ -187,7 +189,7 @@ def test_the_chart_shows_what_the_run_read_even_after_the_dataset_grows(
     _seed_instrument(seeding)
     seeding.close()
     original = _candles()
-    write_candles(tmp_path, "EURUSD", "H1", original)
+    collected(tmp_path, "EURUSD", "H1", original)
 
     with TestClient(_app(settings, session_factory, tmp_path)) as client:
         backtest_id = _launch(client)
@@ -196,7 +198,7 @@ def test_the_chart_shows_what_the_run_read_even_after_the_dataset_grows(
         later = [
             bar(len(original) + i, open_="1.14000", close="1.14100") for i in range(len(original))
         ]
-        write_candles(tmp_path, "EURUSD", "H1", original + later)
+        collected(tmp_path, "EURUSD", "H1", original + later)
 
         response = client.get(f"/backtests/{backtest_id}/candles")
 
@@ -217,7 +219,10 @@ def test_the_chart_shows_what_the_run_read_even_after_the_dataset_grows(
 
 
 def test_the_bars_carry_the_prices_the_dataset_stored_exactly(
-    session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+    session_factory: Callable[[], Session],
+    settings: Settings,
+    tmp_path: Path,
+    collected: Callable[..., None],
 ) -> None:
     """Prices cross the wire as strings, and the first bar is the one written.
 
@@ -227,7 +232,7 @@ def test_the_bars_carry_the_prices_the_dataset_stored_exactly(
     seeding = session_factory()
     _seed_instrument(seeding)
     seeding.close()
-    write_candles(tmp_path, "EURUSD", "H1", _candles())
+    collected(tmp_path, "EURUSD", "H1", _candles())
 
     with TestClient(_app(settings, session_factory, tmp_path)) as client:
         backtest_id = _launch(client)
@@ -246,7 +251,10 @@ def test_the_bars_carry_the_prices_the_dataset_stored_exactly(
 
 
 def test_a_run_that_recorded_no_candles_is_refused_not_approximated(
-    session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+    session_factory: Callable[[], Session],
+    settings: Settings,
+    tmp_path: Path,
+    collected: Callable[..., None],
 ) -> None:
     """A failed run never reached a candle, so it has no window — and neither has any row
     written before `rev_0002`.
@@ -258,7 +266,7 @@ def test_a_run_that_recorded_no_candles_is_refused_not_approximated(
     seeding = session_factory()
     _seed_instrument(seeding)
     seeding.close()
-    write_candles(tmp_path, "EURUSD", "H1", _candles())
+    collected(tmp_path, "EURUSD", "H1", _candles())
 
     with TestClient(_app(settings, session_factory, tmp_path)) as client:
         backtest_id = _launch(client)
@@ -280,7 +288,10 @@ def test_a_run_that_recorded_no_candles_is_refused_not_approximated(
 
 
 def test_a_run_too_long_to_draw_says_so_instead_of_truncating(
-    session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+    session_factory: Callable[[], Session],
+    settings: Settings,
+    tmp_path: Path,
+    collected: Callable[..., None],
 ) -> None:
     """Over the cap the endpoint refuses, and the refusal names both numbers.
 
@@ -291,7 +302,7 @@ def test_a_run_too_long_to_draw_says_so_instead_of_truncating(
     seeding = session_factory()
     _seed_instrument(seeding)
     seeding.close()
-    write_candles(tmp_path, "EURUSD", "H1", _candles())
+    collected(tmp_path, "EURUSD", "H1", _candles())
 
     with TestClient(_app(settings, session_factory, tmp_path)) as client:
         backtest_id = _launch(client)
@@ -373,7 +384,10 @@ def _launch_with(
 
 
 def test_a_setup_reports_the_average_it_trades_even_with_no_indicators_block(
-    session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+    session_factory: Callable[[], Session],
+    settings: Settings,
+    tmp_path: Path,
+    collected: Callable[..., None],
 ) -> None:
     """⚠️ The test that would have caught the obvious wrong implementation.
 
@@ -385,7 +399,7 @@ def test_a_setup_reports_the_average_it_trades_even_with_no_indicators_block(
     seeding = session_factory()
     _seed_instrument(seeding)
     seeding.close()
-    write_candles(tmp_path, "EURUSD", "H1", _candles())
+    collected(tmp_path, "EURUSD", "H1", _candles())
 
     with TestClient(_app(settings, session_factory, tmp_path)) as client:
         backtest_id = _launch_with(client, _setup_strategy())
@@ -397,7 +411,10 @@ def test_a_setup_reports_the_average_it_trades_even_with_no_indicators_block(
 
 
 def test_the_curve_starts_where_the_indicator_did_not_where_the_bars_do(
-    session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+    session_factory: Callable[[], Session],
+    settings: Settings,
+    tmp_path: Path,
+    collected: Callable[..., None],
 ) -> None:
     """Warm-up bars are absent rather than null, so the series is shorter than the candles.
 
@@ -409,7 +426,7 @@ def test_the_curve_starts_where_the_indicator_did_not_where_the_bars_do(
     _seed_instrument(seeding)
     seeding.close()
     bars = _candles()
-    write_candles(tmp_path, "EURUSD", "H1", bars)
+    collected(tmp_path, "EURUSD", "H1", bars)
 
     with TestClient(_app(settings, session_factory, tmp_path)) as client:
         backtest_id = _launch_with(client, _setup_strategy())
@@ -427,14 +444,17 @@ def test_the_curve_starts_where_the_indicator_did_not_where_the_bars_do(
 
 
 def test_a_dsl_strategy_is_charted_under_the_ids_its_own_rules_refer_to(
-    session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+    session_factory: Callable[[], Session],
+    settings: Settings,
+    tmp_path: Path,
+    collected: Callable[..., None],
 ) -> None:
     """The other path. Labels are the document's ids (`fast`, `slow`), not prettified names —
     those ids are what the conditions say, so the curve can be read against the rule."""
     seeding = session_factory()
     _seed_instrument(seeding)
     seeding.close()
-    write_candles(tmp_path, "EURUSD", "H1", _candles())
+    collected(tmp_path, "EURUSD", "H1", _candles())
 
     with TestClient(_app(settings, session_factory, tmp_path)) as client:
         backtest_id = _launch(client)
@@ -468,7 +488,10 @@ def _bands_strategy() -> dict[str, Any]:
 
 
 def test_one_multi_output_indicator_is_charted_as_one_curve_per_component(
-    session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+    session_factory: Callable[[], Session],
+    settings: Settings,
+    tmp_path: Path,
+    collected: Callable[..., None],
 ) -> None:
     """⚠️ The whole reason this endpoint needed nothing changed for multi-output indicators.
 
@@ -486,7 +509,7 @@ def test_one_multi_output_indicator_is_charted_as_one_curve_per_component(
     _seed_instrument(seeding)
     seeding.close()
     bars = _candles()
-    write_candles(tmp_path, "EURUSD", "H1", bars)
+    collected(tmp_path, "EURUSD", "H1", bars)
 
     with TestClient(_app(settings, session_factory, tmp_path)) as client:
         backtest_id = _launch_with(client, _bands_strategy())
@@ -529,12 +552,15 @@ def test_one_multi_output_indicator_is_charted_as_one_curve_per_component(
 
 
 def test_prices_on_the_curve_are_strings_like_every_other_price(
-    session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+    session_factory: Callable[[], Session],
+    settings: Settings,
+    tmp_path: Path,
+    collected: Callable[..., None],
 ) -> None:
     seeding = session_factory()
     _seed_instrument(seeding)
     seeding.close()
-    write_candles(tmp_path, "EURUSD", "H1", _candles())
+    collected(tmp_path, "EURUSD", "H1", _candles())
 
     with TestClient(_app(settings, session_factory, tmp_path)) as client:
         backtest_id = _launch_with(client, _setup_strategy())
@@ -547,14 +573,17 @@ def test_prices_on_the_curve_are_strings_like_every_other_price(
 
 
 def test_a_run_with_no_provenance_has_no_curves_either(
-    session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+    session_factory: Callable[[], Session],
+    settings: Settings,
+    tmp_path: Path,
+    collected: Callable[..., None],
 ) -> None:
     """The same guard as `/candles`, and it has to be the same guard: a curve served for a window
     the candles endpoint refuses would be drawn against bars nothing agreed on."""
     seeding = session_factory()
     _seed_instrument(seeding)
     seeding.close()
-    write_candles(tmp_path, "EURUSD", "H1", _candles())
+    collected(tmp_path, "EURUSD", "H1", _candles())
 
     with TestClient(_app(settings, session_factory, tmp_path)) as client:
         backtest_id = _launch_with(client, _setup_strategy())
@@ -575,7 +604,10 @@ def test_a_run_with_no_provenance_has_no_curves_either(
 
 
 def test_every_value_on_the_curve_is_the_average_over_the_window_the_run_read(
-    session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+    session_factory: Callable[[], Session],
+    settings: Settings,
+    tmp_path: Path,
+    collected: Callable[..., None],
 ) -> None:
     """⚠️ The only test here that looks at the *numbers*.
 
@@ -600,7 +632,7 @@ def test_every_value_on_the_curve_is_the_average_over_the_window_the_run_read(
     _seed_instrument(seeding)
     seeding.close()
     bars = _candles()
-    write_candles(tmp_path, "EURUSD", "H1", bars)
+    collected(tmp_path, "EURUSD", "H1", bars)
 
     with TestClient(_app(settings, session_factory, tmp_path)) as client:
         backtest_id = _launch_with(client, _setup_strategy())
@@ -628,7 +660,10 @@ def test_every_value_on_the_curve_is_the_average_over_the_window_the_run_read(
 
 
 def test_the_two_provenance_numbers_are_reported_when_they_disagree(
-    session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+    session_factory: Callable[[], Session],
+    settings: Settings,
+    tmp_path: Path,
+    collected: Callable[..., None],
 ) -> None:
     """A bar appearing *inside* the window after the run, which is the case the pair exists for.
 
@@ -651,14 +686,14 @@ def test_the_two_provenance_numbers_are_reported_when_they_disagree(
     complete = [bar(i, open_=_LEVELS[i], close=_LEVELS[i + 1]) for i in range(len(_LEVELS) - 1)]
     # The same series with its sixth hour missing — the shape a gap in collection leaves behind.
     with_a_hole = [candle for index, candle in enumerate(complete) if index != 5]
-    write_candles(tmp_path, "EURUSD", "H1", with_a_hole)
+    collected(tmp_path, "EURUSD", "H1", with_a_hole)
 
     with TestClient(_app(settings, session_factory, tmp_path)) as client:
         backtest_id = _launch_with(client, _setup_strategy())
         _run(session_factory, tmp_path, backtest_id)
 
         # The gap is filled in afterwards, the way a re-collection would fill it.
-        write_candles(tmp_path, "EURUSD", "H1", complete)
+        collected(tmp_path, "EURUSD", "H1", complete)
 
         candles = client.get(f"/backtests/{backtest_id}/candles").json()
         overlays = client.get(f"/backtests/{backtest_id}/overlays").json()
@@ -741,7 +776,10 @@ def _launch_over_the_structure(
 
 
 def test_a_structure_setup_is_drawn_as_regions_and_a_swing_setup_as_curves(
-    session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+    session_factory: Callable[[], Session],
+    settings: Settings,
+    tmp_path: Path,
+    collected: Callable[..., None],
 ) -> None:
     """The two halves of the overlay are independent, and each setup fills exactly one of them.
 
@@ -753,7 +791,7 @@ def test_a_structure_setup_is_drawn_as_regions_and_a_swing_setup_as_curves(
     seeding = session_factory()
     _seed_instrument(seeding)
     seeding.close()
-    write_candles(tmp_path, "EURUSD", "H1", _structured_candles())
+    collected(tmp_path, "EURUSD", "H1", _structured_candles())
 
     with TestClient(_app(settings, session_factory, tmp_path)) as client:
         structure_id = _launch_over_the_structure(client)
@@ -771,7 +809,10 @@ def test_a_structure_setup_is_drawn_as_regions_and_a_swing_setup_as_curves(
 
 
 def test_the_regions_served_are_the_ones_the_author_s_example_marks(
-    session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+    session_factory: Callable[[], Session],
+    settings: Settings,
+    tmp_path: Path,
+    collected: Callable[..., None],
 ) -> None:
     """Two demand regions, primary and secondary, at the levels the engine's golden pins.
 
@@ -783,7 +824,7 @@ def test_the_regions_served_are_the_ones_the_author_s_example_marks(
     seeding = session_factory()
     _seed_instrument(seeding)
     seeding.close()
-    write_candles(tmp_path, "EURUSD", "H1", _structured_candles())
+    collected(tmp_path, "EURUSD", "H1", _structured_candles())
 
     with TestClient(_app(settings, session_factory, tmp_path)) as client:
         backtest_id = _launch_over_the_structure(client)
@@ -811,7 +852,10 @@ def test_the_regions_served_are_the_ones_the_author_s_example_marks(
 
 
 def test_the_three_instants_of_a_region_do_not_collapse_into_one(
-    session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+    session_factory: Callable[[], Session],
+    settings: Settings,
+    tmp_path: Path,
+    collected: Callable[..., None],
 ) -> None:
     """Marked, confirmed and taken are three different bars, and the chart reads all three.
 
@@ -824,7 +868,7 @@ def test_the_three_instants_of_a_region_do_not_collapse_into_one(
     seeding = session_factory()
     _seed_instrument(seeding)
     seeding.close()
-    write_candles(tmp_path, "EURUSD", "H1", _structured_candles())
+    collected(tmp_path, "EURUSD", "H1", _structured_candles())
 
     with TestClient(_app(settings, session_factory, tmp_path)) as client:
         backtest_id = _launch_over_the_structure(client)
@@ -844,7 +888,10 @@ def test_the_three_instants_of_a_region_do_not_collapse_into_one(
 
 
 def test_a_region_still_standing_is_served_as_null_not_as_the_last_bar(
-    session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+    session_factory: Callable[[], Session],
+    settings: Settings,
+    tmp_path: Path,
+    collected: Callable[..., None],
 ) -> None:
     """`null` is "price never came back", and the chart draws it to its own right edge.
 
@@ -860,7 +907,7 @@ def test_a_region_still_standing_is_served_as_null_not_as_the_last_bar(
     _seed_instrument(seeding)
     seeding.close()
     bars = _structured_candles()
-    write_candles(tmp_path, "EURUSD", "H1", bars)
+    collected(tmp_path, "EURUSD", "H1", bars)
 
     with TestClient(_app(settings, session_factory, tmp_path)) as client:
         backtest_id = _launch_over_the_structure(client)
@@ -876,7 +923,10 @@ def test_a_region_still_standing_is_served_as_null_not_as_the_last_bar(
 
 
 def test_the_last_bar_of_the_window_is_replayed_like_every_other(
-    session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+    session_factory: Callable[[], Session],
+    settings: Settings,
+    tmp_path: Path,
+    collected: Callable[..., None],
 ) -> None:
     """⚠️ The test that separates a full replay from one that stops a bar short.
 
@@ -897,7 +947,7 @@ def test_the_last_bar_of_the_window_is_replayed_like_every_other(
     seeding = session_factory()
     _seed_instrument(seeding)
     seeding.close()
-    write_candles(tmp_path, "EURUSD", "H1", _structured_candles())
+    collected(tmp_path, "EURUSD", "H1", _structured_candles())
 
     with TestClient(_app(settings, session_factory, tmp_path)) as client:
         backtest_id = _launch_over_the_structure(client, date_to=START + 12 * HOUR)

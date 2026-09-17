@@ -17,9 +17,9 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
 
 from tradeforge_api.config import Settings
-from tradeforge_api.coverage import describe, uncovered_markets
+from tradeforge_api.coverage import describe, plan_for, uncovered_markets
 from tradeforge_api.deps import QueueDep, SessionDep, SettingsDep
-from tradeforge_api.queue import RUN_BACKTEST
+from tradeforge_api.queue import COLLECT_QUEUE, COLLECT_RANGE, RUN_BACKTEST
 from tradeforge_api.routers.strategies import assert_runnable_at
 from tradeforge_api.runner import ENGINE_VERSION, instrument_spec
 from tradeforge_api.schemas import (
@@ -42,8 +42,11 @@ from tradeforge_api.schemas import (
     ZoneOut,
 )
 from tradeforge_collector import read_candles, step
+from tradeforge_collector.collect import year_slices
+from tradeforge_db.collections import create_collection
 from tradeforge_db.models import (
     Backtest,
+    BacktestCollection,
     BacktestMetrics,
     BacktestStatus,
     Instrument,
@@ -240,14 +243,32 @@ async def create_backtest(
 
     # ⚠️ Refused here rather than failed in the worker: the index already knows, and a run that
     # cannot read one candle would spend a worker to learn it. A window covered in part runs.
-    missing = uncovered_markets(
-        session, [instrument.symbol], [request.timeframe], request.date_from, request.date_to
-    )
-    if missing:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail=f"no candles in this window for {describe(missing[0])}",
+    # Unless the caller answered "collect it first", in which case the gap is work to queue.
+    planned = (
+        plan_for(
+            session,
+            symbols=[instrument.symbol],
+            timeframes=[request.timeframe],
+            date_from=request.date_from,
+            date_to=request.date_to,
         )
+        if request.collect_missing
+        else []
+    )
+
+    # ⚠️ Asked **even when collecting was allowed**, and only skipped once there is something to
+    # collect. An empty plan does not mean "covered": a window wholly in the future, or older
+    # than the broker's oldest bar, has nothing worth downloading and no candle either, and
+    # queueing that run would spend a worker to re-learn what the index already knows.
+    if not planned:
+        missing = uncovered_markets(
+            session, [instrument.symbol], [request.timeframe], request.date_from, request.date_to
+        )
+        if missing:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=f"no candles in this window for {describe(missing[0])}",
+            )
 
     backtest = Backtest(
         strategy_id=strategy.id,
@@ -261,9 +282,36 @@ async def create_backtest(
         engine_version=ENGINE_VERSION,
     )
     session.add(backtest)
+
+    # ⚠️ Written in the same transaction as the run, and before either job is queued. A
+    # collection committed without its link is a download nothing is waiting for; a run
+    # committed without its links starts on a window still being downloaded.
+    collections = [
+        create_collection(
+            session,
+            symbol=instrument.symbol,
+            timeframe=request.timeframe,
+            date_from=window.date_from,
+            date_to=window.date_to,
+            # The class the catalogue already decided, so the broker's tree path — which cannot
+            # classify 24 of this broker's 84 symbols — never refuses a collection the launch
+            # itself asked for.
+            asset_class=instrument.asset_class,
+            years_total=len(year_slices(window.date_from, window.date_to)),
+        )
+        for market in planned
+        for window in market.windows
+    ]
+    session.flush()
+    session.add_all(
+        BacktestCollection(backtest_id=backtest.id, collection_id=collection.id)
+        for collection in collections
+    )
     session.commit()
     session.refresh(backtest)
 
+    for collection in collections:
+        await queue.enqueue_job(COLLECT_RANGE, str(collection.id), _queue_name=COLLECT_QUEUE)
     await queue.enqueue_job(RUN_BACKTEST, str(backtest.id))
     return backtest
 

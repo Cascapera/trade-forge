@@ -18,6 +18,8 @@ from tradeforge_db.testing import truncate
 # Children first: TRUNCATE ... CASCADE would do this for us, but naming the order
 # makes the dependency between the tables visible where someone will read it.
 TABLES_CHILD_FIRST = (
+    # ⚠️ First of all: it points at `backtests` and at `collections`, and both are emptied below.
+    "backtest_collections",
     # ⚠️ Append-only, and the only table here whose trigger has to be lifted to empty it
     # at all — see `tradeforge_db.testing.truncate`. Listed because a row left behind is
     # a parent the next test could attach to, exactly like `live_sessions`.

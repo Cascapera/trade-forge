@@ -12,6 +12,8 @@ import {
   whyNotLaunchable,
   type BasketForm,
 } from '../basket/settings'
+import { useMissingDataGate } from '../collect/gate'
+import { MissingDataPrompt } from '../components/MissingDataPrompt'
 import { StrategyPicker } from '../components/StrategyPicker'
 import { SymbolPicker } from '../components/SymbolPicker'
 import { useSession } from '../store'
@@ -56,9 +58,30 @@ export function LaunchBasket(): React.JSX.Element {
     create.mutate(toBasketRequest(form, strategyId, timeframe), {
       onSuccess: (created) => {
         setBasket(created.id, basketLabel(strategyName, created.runs.length))
-        void navigate(`/baskets/${created.id}`)
+        // ⚠️ Carried to the result page, because only this response knows them: the basket
+        // read back from the server lists its runs and nothing about the markets left out.
+        void navigate(`/baskets/${created.id}`, { state: { skipped: created.skipped } })
       },
     })
+  }
+  const gate = useMissingDataGate(launch, instruments.data)
+
+  // Asked first, launched only if nothing is missing — otherwise the prompt below decides.
+  const run = (): void => {
+    if (strategyId === null) return
+    const request = toBasketRequest(form, strategyId, timeframe)
+    gate.check({
+      symbols: request.symbols,
+      timeframes: [timeframe],
+      date_from: request.date_from,
+      date_to: request.date_to,
+    })
+  }
+
+  // A prompt answers the form it was asked about; any edit closes it.
+  const edit = (next: BasketForm): void => {
+    gate.dismiss()
+    setForm(next)
   }
 
   return (
@@ -75,6 +98,7 @@ export function LaunchBasket(): React.JSX.Element {
       <StrategyPicker
         value={strategyId ?? ''}
         onChange={(chosen) => {
+          gate.dismiss()
           setStrategy(chosen.id, chosen.name)
         }}
       />
@@ -84,7 +108,7 @@ export function LaunchBasket(): React.JSX.Element {
           instruments={instruments.data}
           chosen={form.symbols}
           onToggle={(symbol) => {
-            setForm(toggleSymbol(form, symbol))
+            edit(toggleSymbol(form, symbol))
           }}
         />
 
@@ -96,6 +120,7 @@ export function LaunchBasket(): React.JSX.Element {
               className={inputClass}
               value={timeframe}
               onChange={(event) => {
+                gate.dismiss()
                 setTimeframe(event.target.value)
               }}
             >
@@ -114,7 +139,7 @@ export function LaunchBasket(): React.JSX.Element {
               className={inputClass}
               value={form.capital}
               onChange={(event) => {
-                setForm({ ...form, capital: event.target.value })
+                edit({ ...form, capital: event.target.value })
               }}
             />
           </label>
@@ -126,7 +151,7 @@ export function LaunchBasket(): React.JSX.Element {
               className={inputClass}
               value={form.dateFrom}
               onChange={(event) => {
-                setForm({ ...form, dateFrom: event.target.value })
+                edit({ ...form, dateFrom: event.target.value })
               }}
             />
           </label>
@@ -138,7 +163,7 @@ export function LaunchBasket(): React.JSX.Element {
               className={inputClass}
               value={form.dateTo}
               onChange={(event) => {
-                setForm({ ...form, dateTo: event.target.value })
+                edit({ ...form, dateTo: event.target.value })
               }}
             />
           </label>
@@ -169,17 +194,21 @@ export function LaunchBasket(): React.JSX.Element {
 
       {blocked !== null && <p className="text-sm text-amber-300">Before running: {blocked}.</p>}
 
+      <MissingDataPrompt gate={gate} onRunAnyway={launch} launching={create.isPending} />
+
       {create.isError && <p className="text-sm text-red-400">{launchFailure(create.error)}</p>}
 
       <button
         type="button"
-        disabled={blocked !== null || create.isPending}
-        onClick={launch}
+        disabled={blocked !== null || create.isPending || gate.plan.isPending}
+        onClick={run}
         className="rounded bg-sky-600 px-4 py-2 font-medium text-white enabled:hover:bg-sky-500 disabled:opacity-40"
       >
         {create.isPending
           ? 'Enqueuing…'
-          : `Run ${String(form.symbols.length)} market${form.symbols.length === 1 ? '' : 's'}`}
+          : gate.plan.isPending
+            ? 'Checking the data…'
+            : `Run ${String(form.symbols.length)} market${form.symbols.length === 1 ? '' : 's'}`}
       </button>
     </div>
   )

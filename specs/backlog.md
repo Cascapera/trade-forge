@@ -2396,3 +2396,15 @@ antes, ou recusar reescrever uma partição com menos barras do que ela tinha.
   alcançável: o backtest e a cesta recusam ou pulam barras que existem, e a frase "on disk"
   mostra números errados. O coletor da tela (`collect.py`) já cataloga a partir do disco
   (`storage.coverage`). Conserto: o `backfill` usar o mesmo `coverage`.
+
+## O que a tela "avisa o que falta" (PR-263) deixou de fora
+
+* **"Run with what there is" aparece mesmo quando não há nada para rodar.** Num backtest simples
+  de um par nunca coletado, o clique recebe o 422 com a frase certa, mas o botão não deveria
+  estar lá. O plano não diz se a janela se sobrepõe ao disco, e a tela não tenta adivinhar.
+* **Ativo fora de `instruments`** (fatia 265): o plano o trata como "nunca coletado", mas o
+  lançamento recusa com "unknown symbol(s)", e na cesta isso derruba o pedido inteiro. Hoje é
+  inalcançável, porque os seletores só oferecem ativos do catálogo.
+* **"Já enfileirado" vive enquanto a tela está aberta.** Recarregada a página, um segundo
+  "Collect" manda de novo uma janela que ainda está na fila. Resolver de verdade é o servidor
+  recusar uma coleta idêntica à que está `queued`/`running`.

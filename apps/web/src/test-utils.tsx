@@ -4,10 +4,11 @@ import type { ReactElement, ReactNode } from 'react'
 import { MemoryRouter } from 'react-router-dom'
 
 // Render a component inside the providers it expects — a fresh React Query client (retries off,
-// so a mocked rejection surfaces at once) and a memory router at the given path.
+// so a mocked rejection surfaces at once) and a memory router at the given path. A route given as
+// an object also carries navigation `state`, the way `navigate(to, { state })` would.
 export function renderWithProviders(
   ui: ReactElement,
-  route = '/',
+  route: string | { pathname: string; state: unknown } = '/',
 ): RenderResult & { client: QueryClient } {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },

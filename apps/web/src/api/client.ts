@@ -29,6 +29,8 @@ import type {
   LiveSessionDetail,
   LiveSessionsPage,
   OverlaysResponse,
+  PlanCollectionRequest,
+  PlannedCollection,
   PreviewStudyRequest,
   PreviewSweepRequest,
   SessionEventsPage,
@@ -117,6 +119,9 @@ export const api = {
   // One row per symbol asked for, in the order they were asked for.
   createCollection: (body: CreateCollection): Promise<Collection[]> =>
     request('POST', '/collections', body),
+  // A POST that writes nothing: which of these markets a run over this window would find short.
+  planCollections: (body: PlanCollectionRequest): Promise<PlannedCollection[]> =>
+    request('POST', '/collections/plan', body),
   getCollection: (id: string): Promise<Collection> => request('GET', `/collections/${id}`),
   listCollections: (): Promise<Collection[]> => request('GET', '/collections'),
   listBacktests: (filters: BacktestFilters = {}): Promise<BacktestsPage> =>

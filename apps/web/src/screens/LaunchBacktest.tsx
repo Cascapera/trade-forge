@@ -9,7 +9,9 @@ import {
   whyNotRunnable,
   type BacktestForm,
 } from '../backtest/settings'
+import { useMissingDataGate } from '../collect/gate'
 import { BacktestSettings } from '../components/BacktestSettings'
+import { MissingDataPrompt } from '../components/MissingDataPrompt'
 import { StrategyPicker } from '../components/StrategyPicker'
 import { useSession } from '../store'
 
@@ -77,6 +79,25 @@ export function LaunchBacktest(): React.JSX.Element {
       },
     })
   }
+  const gate = useMissingDataGate(launch, instruments.data)
+
+  // Asked first, launched only if nothing is missing — otherwise the prompt below decides.
+  const run = (): void => {
+    if (strategyId === null || timeframe === null) return
+    const request = toBacktestRequest(form, strategyId, timeframe)
+    gate.check({
+      symbols: [request.symbol],
+      timeframes: [timeframe],
+      date_from: request.date_from,
+      date_to: request.date_to,
+    })
+  }
+
+  // A prompt answers the form it was asked about; any edit closes it.
+  const edit = (next: BacktestForm): void => {
+    gate.dismiss()
+    setForm(next)
+  }
 
   return (
     <div className="space-y-6">
@@ -92,6 +113,7 @@ export function LaunchBacktest(): React.JSX.Element {
           <StrategyPicker
             value={strategyId ?? ''}
             onChange={(picked) => {
+              gate.dismiss()
               setStrategy(picked.id, picked.name)
             }}
           />
@@ -106,12 +128,14 @@ export function LaunchBacktest(): React.JSX.Element {
         <BacktestSettings
           form={form}
           instruments={instruments.data}
-          onChange={setForm}
+          onChange={edit}
           {...(timeframe === null ? {} : { timeframe })}
         />
       </div>
 
       {blocked !== null && <p className="text-sm text-amber-300">Before running: {blocked}.</p>}
+
+      <MissingDataPrompt gate={gate} onRunAnyway={launch} launching={create.isPending} />
 
       {create.isError && (
         <p className="text-sm text-red-400">
@@ -121,11 +145,15 @@ export function LaunchBacktest(): React.JSX.Element {
 
       <button
         type="button"
-        disabled={blocked !== null || create.isPending}
-        onClick={launch}
+        disabled={blocked !== null || create.isPending || gate.plan.isPending}
+        onClick={run}
         className="rounded bg-sky-600 px-4 py-2 font-medium text-white enabled:hover:bg-sky-500 disabled:opacity-40"
       >
-        {create.isPending ? 'Enqueuing…' : 'Run backtest'}
+        {create.isPending
+          ? 'Enqueuing…'
+          : gate.plan.isPending
+            ? 'Checking the data…'
+            : 'Run backtest'}
       </button>
     </div>
   )

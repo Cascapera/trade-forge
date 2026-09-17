@@ -223,6 +223,8 @@ export async function mockApi(page: Page): Promise<void> {
   })
   // The catalogue is where the journey starts now; an empty shelf is all it needs to read.
   await page.route('**/api/catalog', (route) => json(route, { total: 0, items: [] }))
+  // Asked before the launch: nothing missing, so the journey runs straight through as it did.
+  await page.route('**/api/collections/plan', (route) => json(route, []))
   await page.route('**/api/backtests', (route) => json(route, { id: 'b1', status: 'queued' }, 202))
   await page.route('**/api/backtests/b1', (route) => json(route, doneRun))
   await page.route(/\/api\/backtests\/b1\/trades/, (route) => json(route, trades))

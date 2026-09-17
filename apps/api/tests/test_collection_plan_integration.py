@@ -136,6 +136,7 @@ def test_a_symbol_never_collected_is_planned_whole(client: TestClient) -> None:
             "symbol": "EURUSD",
             "timeframe": "H1",
             "covers": None,
+            "in_window": False,
             "windows": [{"date_from": year_start(2019), "date_to": year_end(2021)}],
         }
     ]
@@ -196,6 +197,7 @@ def test_the_probe_is_read_per_timeframe(
             "symbol": "BTCUSD",
             "timeframe": "H4",
             "covers": "2020-05-10 to 2022-12-30",
+            "in_window": True,
             "windows": [{"date_from": year_start(2019), "date_to": year_end(2020)}],
         }
     ]
@@ -265,3 +267,28 @@ def test_a_malformed_request_is_refused(
     response = a_plan(client, **fields)
     assert response.status_code == 422
     assert complaint in response.text
+
+
+class TestWhetherAnythingCanRunNow:
+    """⚠️ `covers` cannot answer this, and the screen must not guess from it: a pair collected
+    for 2019 under a window in 2024 has a `covers` string and not one candle to run over."""
+
+    def test_a_pair_with_candles_inside_the_window_can_run(
+        self, client: TestClient, session_factory: Callable[[], Session]
+    ) -> None:
+        # Asked 2019-06 .. 2021-06; on disk 2021-03 .. 2021-09 — the window's tail is covered.
+        on_disk(session_factory, "EURUSD", "H1", at(2021, 3), at(2021, 9, 30))
+        (planned,) = a_plan(client).json()
+        assert planned["in_window"] is True
+
+    def test_a_pair_collected_for_other_dates_cannot(
+        self, client: TestClient, session_factory: Callable[[], Session]
+    ) -> None:
+        on_disk(session_factory, "EURUSD", "H1", at(2015, 1, 5), at(2016, 12, 30))
+        (planned,) = a_plan(client).json()
+        assert planned["covers"] == "2015-01-05 to 2016-12-30"
+        assert planned["in_window"] is False
+
+    def test_a_pair_never_collected_cannot(self, client: TestClient) -> None:
+        (planned,) = a_plan(client).json()
+        assert (planned["covers"], planned["in_window"]) == (None, False)

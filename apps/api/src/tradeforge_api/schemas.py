@@ -1450,6 +1450,14 @@ class PlannedCollection(BaseModel):
     covers: str | None
     """What the index holds today, as `2020-01-02 to 2026-09-10`, or `None` when nothing has
     ever been collected — the reason each window is there, in the words `UncoveredMarket` uses."""
+    in_window: bool
+    """Whether the index holds any candle **inside the window asked about** — that is, whether a
+    run over it would read anything at all.
+
+    ⚠️ **Not derivable from `covers`, and a screen that tried would be wrong the useful half of
+    the time.** A pair collected for 2019 under a window in 2024 has a `covers` string and not one
+    candle to run: the launch refuses it (`coverage.uncovered_markets`, the same question asked
+    here), and offering "run with what there is" for it offers nothing."""
     windows: list[PlannedWindow]
     """⚠️ Possibly wider than the request: a window always reaches the data already on disk,
     so the index never has to describe a hole it cannot represent (`collection_plan`)."""

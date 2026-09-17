@@ -28,6 +28,23 @@ export function missingLine(market: PlannedCollection): string {
 }
 
 /**
+ * Would anything run right now, if the person declined to collect?
+ *
+ * True when at least one of the markets being launched has a candle inside the window. ⚠️ The
+ * markets missing from `plan` are the fully covered ones, which run — so a symbol nobody planned
+ * for is a symbol that can run.
+ */
+export function anythingToRun(
+  symbols: readonly string[],
+  plan: readonly PlannedCollection[],
+): boolean {
+  const empty = new Set(
+    plan.filter((market) => !market.in_window).map((market) => market.symbol),
+  )
+  return symbols.some((symbol) => !empty.has(symbol))
+}
+
+/**
  * The class the catalogue already holds for each symbol.
  *
  * ⚠️ **Sent with every collection this prompt queues.** The collection endpoint decides a class

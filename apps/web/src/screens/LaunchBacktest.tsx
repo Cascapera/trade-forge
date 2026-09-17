@@ -10,6 +10,7 @@ import {
   type BacktestForm,
 } from '../backtest/settings'
 import { useMissingDataGate } from '../collect/gate'
+import { anythingToRun } from '../collect/missing'
 import { BacktestSettings } from '../components/BacktestSettings'
 import { MissingDataPrompt } from '../components/MissingDataPrompt'
 import { StrategyPicker } from '../components/StrategyPicker'
@@ -135,7 +136,12 @@ export function LaunchBacktest(): React.JSX.Element {
 
       {blocked !== null && <p className="text-sm text-amber-300">Before running: {blocked}.</p>}
 
-      <MissingDataPrompt gate={gate} onRunAnyway={launch} launching={create.isPending} />
+      <MissingDataPrompt
+        gate={gate}
+        onRunAnyway={launch}
+        launching={create.isPending}
+        canRun={gate.missing === null || anythingToRun([form.symbol], gate.missing)}
+      />
 
       {create.isError && (
         <p className="text-sm text-red-400">

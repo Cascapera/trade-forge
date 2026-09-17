@@ -12,6 +12,7 @@ const MISSING: PlannedCollection[] = [
     symbol: 'GBPUSD',
     timeframe: 'H1',
     covers: null,
+    in_window: false,
     windows: [{ date_from: '2024-01-01T00:00:00Z', date_to: '2024-12-31T23:59:59.999999Z' }],
   },
 ]
@@ -40,8 +41,10 @@ function gate(over: {
   } as unknown as MissingDataGate
 }
 
-function show(g: MissingDataGate, { launching = false, run = vi.fn() } = {}) {
-  return renderWithProviders(<MissingDataPrompt gate={g} onRunAnyway={run} launching={launching} />)
+function show(g: MissingDataGate, { launching = false, run = vi.fn(), canRun = true } = {}) {
+  return renderWithProviders(
+    <MissingDataPrompt gate={g} onRunAnyway={run} launching={launching} canRun={canRun} />,
+  )
 }
 
 describe('MissingDataPrompt', () => {
@@ -123,5 +126,22 @@ describe('MissingDataPrompt', () => {
     )
     fireEvent.click(screen.getByRole('button', { name: 'Run anyway' }))
     expect(run).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not offer a run that would read nothing', () => {
+    // The launch would answer 422; the only thing left to do here is collect.
+    show(gate({}), { canRun: false })
+
+    expect(screen.queryByRole('button', { name: 'Run with what there is' })).not.toBeInTheDocument()
+    expect(screen.getByText('Nothing would run until this is collected.')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Collect what is missing' })).toBeEnabled()
+  })
+
+  it('offers the run when the plan could not be asked, whatever canRun says', () => {
+    // Nothing was learned about the data, so nothing justifies hiding it.
+    show(gate({ missing: null, plan: { isError: true, error: new ApiError(404, 'Not Found') } }), {
+      canRun: false,
+    })
+    expect(screen.getByRole('button', { name: 'Run anyway' })).toBeInTheDocument()
   })
 })

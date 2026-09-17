@@ -2399,9 +2399,11 @@ antes, ou recusar reescrever uma partição com menos barras do que ela tinha.
 
 ## O que a tela "avisa o que falta" (PR-263) deixou de fora
 
-* **"Run with what there is" aparece mesmo quando não há nada para rodar.** Num backtest simples
-  de um par nunca coletado, o clique recebe o 422 com a frase certa, mas o botão não deveria
-  estar lá. O plano não diz se a janela se sobrepõe ao disco, e a tela não tenta adivinhar.
+* ✅ **RESOLVIDO na PR-264** — "Run with what there is" aparecia mesmo sem nada para rodar. Ele
+  apareceu para o Guilherme em 17/09 (estratégia H1 sobre um par coletado só em M15/H4) e o
+  clique trouxe "no candles in this window for EURUSD H1 (never collected)". O plano passou a
+  responder `in_window`, e a tela esconde o botão quando nenhum mercado do lançamento leria
+  candle.
 * **Ativo fora de `instruments`** (fatia 265): o plano o trata como "nunca coletado", mas o
   lançamento recusa com "unknown symbol(s)", e na cesta isso derruba o pedido inteiro. Hoje é
   inalcançável, porque os seletores só oferecem ativos do catálogo.

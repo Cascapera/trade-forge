@@ -30,9 +30,17 @@ export function missingLine(market: PlannedCollection): string {
 /**
  * Would anything run right now, if the person declined to collect?
  *
- * True when at least one of the markets being launched has a candle inside the window. ⚠️ The
- * markets missing from `plan` are the fully covered ones, which run — so a symbol nobody planned
- * for is a symbol that can run.
+ * True when at least one of the markets being launched has a candle inside the window. A symbol
+ * the plan does not mention needs no collection, and is taken to run.
+ *
+ * ⚠️ **Keyed by symbol alone**, because both launch screens ask the plan about one chart. A plan
+ * covering several timeframes would need the pair, and `PlanCollectionRequest.timeframes` is a
+ * list, so a third caller must not reuse this as it stands.
+ *
+ * ⚠️ **"Needs no collection" is not quite "has candles".** A window entirely before the broker's
+ * oldest bar, or entirely in the future, is planned as nothing to fetch and still holds no
+ * candle. The launch answers that one: the basket leaves the market out and names it, the single
+ * backtest is refused.
  */
 export function anythingToRun(
   symbols: readonly string[],

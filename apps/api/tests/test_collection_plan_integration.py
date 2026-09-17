@@ -292,3 +292,17 @@ class TestWhetherAnythingCanRunNow:
     def test_a_pair_never_collected_cannot(self, client: TestClient) -> None:
         (planned,) = a_plan(client).json()
         assert (planned["covers"], planned["in_window"]) == (None, False)
+
+    def test_a_symbol_collected_at_another_chart_cannot(
+        self, client: TestClient, session_factory: Callable[[], Session]
+    ) -> None:
+        """⚠️ The shape that reached him on 17/09: EURUSD collected at M15 over the very window
+        asked about, and an H1 strategy. The instrument exists, the data exists, and the pair
+        asked about holds nothing — which is why this is asked per (symbol, timeframe)."""
+        on_disk(session_factory, "EURUSD", "M15", at(2018, 1, 2), at(2022, 12, 30))
+        (planned,) = a_plan(client).json()
+        assert (planned["timeframe"], planned["covers"], planned["in_window"]) == (
+            "H1",
+            None,
+            False,
+        )

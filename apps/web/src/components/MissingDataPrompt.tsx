@@ -105,7 +105,9 @@ export function MissingDataPrompt({
         {canRun ? (
           runButton('Run with what there is')
         ) : (
-          <p className="self-center text-amber-300">
+          // Announced, not merely drawn: this replaces a button, and a reader who cannot see
+          // the panel would otherwise find the run gone with nothing said.
+          <p role="status" className="self-center text-amber-300">
             Nothing would run until this is collected.
           </p>
         )}

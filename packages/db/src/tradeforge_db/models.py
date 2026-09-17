@@ -579,6 +579,28 @@ class Collection(Base):
     )
 
 
+class BacktestCollection(Base):
+    """One run waiting for one collection (`rev_0019`).
+
+    ⚠️ **The wait is a row, and it stays.** A run told to collect first is enqueued like any
+    other; the worker asks this table what it is waiting for, defers itself while any of them is
+    still downloading, and **fails the run outright if one of them failed** — half a window is
+    not a shorter measurement, it is a different one. Removing the row on completion would make
+    that question depend on rows disappearing under it, and would erase why a run started ten
+    minutes after it was created.
+    """
+
+    __tablename__ = "backtest_collections"
+
+    backtest_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("backtests.id", ondelete="CASCADE"), primary_key=True
+    )
+    collection_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("collections.id", ondelete="CASCADE"), primary_key=True
+    )
+    created_at: Mapped[dt.datetime] = _created_at()
+
+
 # --------------------------------------------------------------------------- #
 # Strategies — append-only                                                      #
 # --------------------------------------------------------------------------- #

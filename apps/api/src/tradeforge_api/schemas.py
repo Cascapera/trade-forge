@@ -378,6 +378,17 @@ class CreateBacktestRequest(BaseModel):
     date_to: AwareInstant
     initial_capital: Decimal = Field(gt=0)
     cost_model: dict[str, Any] = Field(default_factory=lambda: {"type": "none"})
+    collect_missing: bool = False
+    """Collect what this window is missing, and run once it has landed.
+
+    ⚠️ **False is the answer "no", not a default nobody chose.** Left false, a window the index
+    holds no candle of is refused at once (PR-262). Set true, the same window is planned
+    (`coverage.plan_for`), the collections are queued, and the run waits for them — which is his
+    rule of 17/09: say what is missing and ask, then do what the answer says.
+
+    ⚠️ The windows are the **server's** plan, not the caller's: a client that sent its own could
+    queue a partial year, and a partial year erases the rest of that year's partition.
+    """
 
 
 class MetricsOut(_Out):

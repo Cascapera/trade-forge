@@ -39,14 +39,16 @@ from sqlalchemy.orm import Session
 
 from tradeforge_api.config import RedisConfig, Settings
 from tradeforge_api.grid import coordinates, label_for, read_point
-from tradeforge_api.queue import progress_channel, redis_settings
+from tradeforge_api.queue import RUN_BACKTEST, progress_channel, redis_settings
 from tradeforge_api.runner import ENGINE_VERSION, execute_backtest
 from tradeforge_api.walkforward import Candidate, choose
 from tradeforge_collector import read_candles
 from tradeforge_db.models import (
     Backtest,
+    BacktestCollection,
     BacktestMetrics,
     BacktestStatus,
+    Collection,
     Instrument,
     SelectionMetric,
     Strategy,
@@ -418,6 +420,21 @@ def _reason(exc: Exception) -> str:
 # --------------------------------------------------------------------------- #
 
 
+WAIT_POLL_SECONDS = 30
+"""How long a run waiting for its collection sleeps before asking again.
+
+A collection advances one calendar year at a time and a cold year takes minutes on this broker,
+so asking every second would be hundreds of questions about a row that changes five times."""
+
+WAIT_LIMIT = dt.timedelta(hours=2)
+"""How long a run may wait for its data before it is failed instead.
+
+⚠️ **A ceiling on the wait, not an estimate of it.** Measured on this broker, a year of H1 takes
+about three minutes and a year of M1 rather more; two hours covers a large backfill with room to
+spare. Without it a collection that never finishes — an agent that stopped, a terminal nobody
+logged in — leaves a run queued for ever, which is the failure `arq`'s own retries exist to
+avoid and the one this project has already paid for once (the run stuck `queued` on 15/09)."""
+
 MAX_TRIES = 8
 """How many times a backtest job runs before a database that will not answer is its result.
 
@@ -430,6 +447,78 @@ done or failed; one that never does leaves the row as it was, with the error in 
 def retry_delay(job_try: int) -> int:
     """Seconds to wait before try `job_try + 1`: 5, 10, 15 … — room for a database to start."""
     return 5 * job_try
+
+
+async def _still_collecting(ctx: dict[str, Any], session: Session, run_id: uuid.UUID) -> bool:
+    """Is this run waiting for data, and has the waiting been dealt with?
+
+    True means the caller must stop: the run was either deferred (the download is still going) or
+    failed (the download failed, or the wait outlived `WAIT_LIMIT`). False means there is nothing
+    to wait for — no collection was ever linked, or every one of them has finished.
+
+    ⚠️ **Deferred by enqueuing a new job, never by `Retry`.** `run_backtest`'s retry budget exists
+    for a database that is not answering, and it is eight tries; a wait of two hours is two
+    hundred and forty. Spending one budget on the other would make an unreachable database look
+    like a slow download, and would run out long before the data landed.
+
+    ⚠️ **On the run's own session, inside the caller's `try`.** A database that stops answering
+    while this question is being asked is the caller's case, not a new one, and answering it here
+    would be a second error policy for the same failure.
+    """
+    run = session.get(Backtest, run_id)
+    if run is None:
+        return False
+    waits = list(
+        session.scalars(
+            select(Collection)
+            .join(BacktestCollection, BacktestCollection.collection_id == Collection.id)
+            .where(BacktestCollection.backtest_id == run_id)
+        )
+    )
+    if not waits:
+        return False
+
+    failed = [one for one in waits if one.status is BacktestStatus.FAILED]
+    if failed:
+        first = failed[0]
+        _fail(
+            session,
+            run,
+            f"the collection of {first.symbol} {first.timeframe} failed: "
+            f"{first.error or 'no reason recorded'}",
+        )
+        await _announce(ctx["redis"], run_id, {"status": "failed", "error": run.error})
+        return True
+
+    unfinished = [one for one in waits if one.status is not BacktestStatus.DONE]
+    if not unfinished:
+        return False
+
+    waited = _now() - run.created_at
+    if waited > WAIT_LIMIT:
+        names = ", ".join(f"{one.symbol} {one.timeframe}" for one in unfinished)
+        _fail(session, run, f"waited {WAIT_LIMIT} for the collection of {names} and gave up")
+        await _announce(ctx["redis"], run_id, {"status": "failed", "error": run.error})
+        return True
+
+    await ctx["redis"].enqueue_job(
+        RUN_BACKTEST, str(run_id), _defer_by=dt.timedelta(seconds=WAIT_POLL_SECONDS)
+    )
+    return True
+
+
+def _fail(session: Session, run: Backtest, reason: str) -> None:
+    """Record a run that ends before it ever reads a candle.
+
+    ⚠️ `started_at` is stamped too, for `_record_failure`'s reason: the database refuses a row
+    that finished without starting, and a run failed while waiting has genuinely never run.
+    """
+    run.status = BacktestStatus.FAILED
+    run.error = reason
+    if run.started_at is None:
+        run.started_at = _now()
+    run.finished_at = _now()
+    session.commit()
 
 
 async def run_backtest(ctx: dict[str, Any], backtest_id: str) -> None:
@@ -450,6 +539,10 @@ async def run_backtest(ctx: dict[str, Any], backtest_id: str) -> None:
     session: Session = ctx["session_factory"]()
     settings: Settings = ctx["settings"]
     try:
+        # ⚠️ Before anything is read for the run: a run told to collect first has no candles yet,
+        # and starting it would record "no candles in this window" for data on its way.
+        if await _still_collecting(ctx, session, run_id):
+            return
         await process_backtest(
             session=session,
             redis=ctx["redis"],

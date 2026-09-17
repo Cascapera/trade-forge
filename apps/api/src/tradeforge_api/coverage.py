@@ -15,8 +15,10 @@ import datetime as dt
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from tradeforge_api.schemas import UncoveredMarket
-from tradeforge_db.models import Dataset, Instrument
+from tradeforge_api.collection_plan import Window, missing_windows
+from tradeforge_api.schemas import PlannedCollection, PlannedWindow, UncoveredMarket
+from tradeforge_collector import step
+from tradeforge_db.models import Dataset, Instrument, SymbolHistory
 
 
 def uncovered_markets(
@@ -84,3 +86,95 @@ def describe(market: UncoveredMarket) -> str:
     """`EURUSD M15 (never collected)` or `EURUSD M15 (on disk: 2020-01-02 to 2026-09-10)`."""
     held = "never collected" if market.covers is None else f"on disk: {market.covers}"
     return f"{market.symbol} {market.timeframe} ({held})"
+
+
+def plan_for(
+    session: Session,
+    *,
+    symbols: list[str],
+    timeframes: list[str],
+    date_from: dt.datetime,
+    date_to: dt.datetime,
+) -> list[PlannedCollection]:
+    """Which (symbol, timeframe) pairs still need collecting for a run over this window.
+
+    ⚠️ **One function, because the plan a person is shown and the plan a launch acts on must be
+    the same one.** `POST /collections/plan` answers with it; a launch told to collect first
+    queues exactly these windows. Two implementations would differ the first time either changed,
+    and the difference would read as the screen lying about what it was about to download.
+
+    Nothing is written here. The rules — whole years, windows that reach the data on disk, slack
+    at the edges, nothing before the broker's oldest bar — are `collection_plan`'s.
+    """
+    now = dt.datetime.now(tz=dt.UTC)
+    extents = {
+        (symbol, timeframe): Window(date_from, date_to)
+        for symbol, timeframe, date_from, date_to in session.execute(
+            select(Instrument.symbol, Dataset.timeframe, Dataset.date_from, Dataset.date_to)
+            .join(Instrument, Instrument.id == Dataset.instrument_id)
+            .where(
+                Instrument.symbol.in_(symbols),
+                Dataset.timeframe.in_(timeframes),
+            )
+        )
+    }
+    # ⚠️ A probe that found no bars at all stores NULL, and reads back here exactly like a pair
+    # never probed: both plan the whole window. For the first, the collection then fails with a
+    # sentence on the screen rather than being planned away in silence — but asked again, the
+    # plan asks again. Whatever queues from this plan must stop on a collection that already
+    # came back empty, or it loops.
+    oldest = {
+        (symbol, timeframe): first
+        for symbol, timeframe, first in session.execute(
+            select(SymbolHistory.symbol, SymbolHistory.timeframe, SymbolHistory.oldest).where(
+                SymbolHistory.symbol.in_(symbols),
+                SymbolHistory.timeframe.in_(timeframes),
+            )
+        )
+    }
+
+    # The launch's own question, asked here so the screen never has to guess it from `covers`.
+    empty = {
+        (market.symbol, market.timeframe)
+        for market in uncovered_markets(
+            session,
+            list(symbols),
+            list(timeframes),
+            date_from,
+            date_to,
+        )
+    }
+
+    out: list[PlannedCollection] = []
+    for symbol in symbols:
+        for timeframe in timeframes:
+            on_disk = extents.get((symbol, timeframe))
+            windows = missing_windows(
+                date_from=date_from,
+                date_to=date_to,
+                on_disk=on_disk,
+                oldest=oldest.get((symbol, timeframe)),
+                now=now,
+                bar=step(timeframe),
+            )
+            if not windows:
+                continue
+            out.append(
+                PlannedCollection(
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    # An instrument the table does not know is not in `empty` — it was never
+                    # asked about — and holds no candle either.
+                    in_window=on_disk is not None and (symbol, timeframe) not in empty,
+                    covers=(
+                        None
+                        if on_disk is None
+                        else f"{on_disk.date_from.date().isoformat()} to "
+                        f"{on_disk.date_to.date().isoformat()}"
+                    ),
+                    windows=[
+                        PlannedWindow(date_from=w.date_from, date_to=w.date_to) for w in windows
+                    ],
+                )
+            )
+    return out

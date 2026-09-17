@@ -816,6 +816,15 @@ export interface PlannedCollection {
   timeframe: string
   /** What the index holds, as `2020-01-02 to 2026-09-10`, or `null` when never collected. */
   covers: string | null
+  /**
+   * Whether the index holds a candle **inside the window asked about** — whether a run over it
+   * would read anything at all.
+   *
+   * ⚠️ Not derivable from `covers`: a pair collected for 2019 under a window in 2024 has a
+   * `covers` string and nothing to run. The launch refuses exactly this, so the screen asks the
+   * server rather than guessing.
+   */
+  in_window: boolean
   /** ⚠️ Possibly wider than asked: a window always reaches the data already on disk. */
   windows: PlannedWindow[]
 }

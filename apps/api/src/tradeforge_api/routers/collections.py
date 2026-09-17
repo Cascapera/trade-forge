@@ -24,6 +24,7 @@ from fastapi import APIRouter, HTTPException, status
 from sqlalchemy import select
 
 from tradeforge_api.collection_plan import Window, missing_windows
+from tradeforge_api.coverage import uncovered_markets
 from tradeforge_api.deps import QueueDep, SessionDep
 from tradeforge_api.queue import COLLECT_QUEUE, COLLECT_RANGE
 from tradeforge_api.schemas import (
@@ -172,6 +173,18 @@ def plan(session: SessionDep, request: PlanCollectionRequest) -> list[PlannedCol
         )
     }
 
+    # The launch's own question, asked here so the screen never has to guess it from `covers`.
+    empty = {
+        (market.symbol, market.timeframe)
+        for market in uncovered_markets(
+            session,
+            list(request.symbols),
+            list(request.timeframes),
+            request.date_from,
+            request.date_to,
+        )
+    }
+
     out: list[PlannedCollection] = []
     for symbol in request.symbols:
         for timeframe in request.timeframes:
@@ -190,6 +203,9 @@ def plan(session: SessionDep, request: PlanCollectionRequest) -> list[PlannedCol
                 PlannedCollection(
                     symbol=symbol,
                     timeframe=timeframe,
+                    # An instrument the table does not know is not in `empty` — it was never
+                    # asked about — and holds no candle either.
+                    in_window=on_disk is not None and (symbol, timeframe) not in empty,
                     covers=(
                         None
                         if on_disk is None

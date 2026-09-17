@@ -27,10 +27,15 @@ export function MissingDataPrompt({
   gate,
   onRunAnyway,
   launching,
+  canRun,
 }: {
   gate: MissingDataGate
   onRunAnyway: () => void
   launching: boolean
+  /** Whether any market being launched would read a candle. ⚠️ False hides the run: the launch
+   *  would be refused, and offering it offers nothing. A plan that could not be asked cannot
+   *  answer this, so the run is offered there regardless. */
+  canRun: boolean
 }): React.JSX.Element | null {
   const { missing, plan, collection, outstanding } = gate
 
@@ -97,7 +102,15 @@ export function MissingDataPrompt({
               ? 'Already queued'
               : 'Collect what is missing'}
         </button>
-        {runButton('Run with what there is')}
+        {canRun ? (
+          runButton('Run with what there is')
+        ) : (
+          // Announced, not merely drawn: this replaces a button, and a reader who cannot see
+          // the panel would otherwise find the run gone with nothing said.
+          <p role="status" className="self-center text-amber-300">
+            Nothing would run until this is collected.
+          </p>
+        )}
       </div>
     </section>
   )

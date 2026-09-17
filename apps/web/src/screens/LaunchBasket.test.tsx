@@ -231,6 +231,7 @@ describe('LaunchBasket when data is missing', () => {
         symbol: 'GBPUSD',
         timeframe: 'H4',
         covers: null,
+        in_window: false,
         windows: [{ date_from: '2024-01-01T00:00:00Z', date_to: '2024-12-31T23:59:59.999999Z' }],
       },
     ]
@@ -271,6 +272,7 @@ describe('LaunchBasket when data is missing', () => {
         symbol: 'XAUUSD',
         timeframe: 'H1',
         covers: null,
+        in_window: false,
         windows: [{ date_from: '2024-01-01T00:00:00Z', date_to: '2024-12-31T23:59:59.999999Z' }],
       },
     ]
@@ -284,5 +286,22 @@ describe('LaunchBasket when data is missing', () => {
     expect(gate.collect).toHaveBeenCalledWith([
       expect.objectContaining({ items: [{ symbol: 'XAUUSD', asset_class: 'future' }] }),
     ])
+  })
+
+  it('still offers the run when only one market of the basket is empty', () => {
+    // ⚠️ The basket's rule: the markets with data run, and the server names the one left out.
+    gate.plan.answer = [
+      {
+        symbol: 'GBPUSD',
+        timeframe: 'H4',
+        covers: null,
+        in_window: false,
+        windows: [{ date_from: '2024-01-01T00:00:00Z', date_to: '2024-12-31T23:59:59.999999Z' }],
+      },
+    ]
+    chosen()
+    fireEvent.click(screen.getByRole('button', { name: /run 2 markets/i }))
+
+    expect(screen.getByRole('button', { name: 'Run with what there is' })).toBeInTheDocument()
   })
 })

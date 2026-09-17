@@ -200,11 +200,13 @@ describe('LaunchBacktest', () => {
 })
 
 describe('LaunchBacktest when data is missing', () => {
+  // Collected, and the window's tail is on disk: part of this run would read candles.
   const MISSING = [
     {
       symbol: 'EURUSD',
       timeframe: 'H4',
       covers: '2023-03-01 to 2026-09-10',
+      in_window: true,
       windows: [{ date_from: '2023-01-01T00:00:00Z', date_to: '2023-12-31T23:59:59.999999Z' }],
     },
   ]
@@ -334,5 +336,26 @@ describe('LaunchBacktest when data is missing', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Collect what is missing' }))
 
     expect(gate.collect).toHaveBeenCalledTimes(2)
+  })
+
+  it('does not offer to run a market that was never collected', () => {
+    // ⚠️ His case on 17/09: an H1 strategy over a pair collected only at M15 and H4. The launch
+    // answered "no candles in this window for EURUSD H1 (never collected)" — a refusal the screen
+    // already knew about and should not have invited.
+    gate.plan.answer = [
+      {
+        symbol: 'EURUSD',
+        timeframe: 'H4',
+        covers: null,
+        in_window: false,
+        windows: [{ date_from: '2024-01-01T00:00:00Z', date_to: '2024-12-31T23:59:59.999999Z' }],
+      },
+    ]
+    ready()
+    fireEvent.click(runButton())
+
+    expect(screen.queryByRole('button', { name: 'Run with what there is' })).not.toBeInTheDocument()
+    expect(screen.getByText('Nothing would run until this is collected.')).toBeInTheDocument()
+    expect(mutate).not.toHaveBeenCalled()
   })
 })

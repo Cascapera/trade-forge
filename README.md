@@ -131,6 +131,20 @@ and **Save strategy** (saving does not put it on the shelf; **Add to the catalog
 above is what you get: metrics, the equity curve and every trade. (Prefer the terminal? The same flow is three `curl`s — `POST /strategies`,
 `POST /backtests`, then poll `GET /backtests/{id}`.)
 
+### On Windows, with a MetaTrader 5 terminal
+
+The whole containerised stack plus the MT5 collector agent (which cannot run in Docker, ADR-0021)
+come up and go down together:
+
+```powershell
+.\tradeforge.ps1 up        # Docker Desktop if needed, the stack, then the agent in the background
+.\tradeforge.ps1 status    # containers, the agent, the collection queue, the agent's last log lines
+.\tradeforge.ps1 down      # the stack; the agent stops by itself once Redis is gone
+```
+
+Run it from a terminal: a program that captures its output through a pipe waits for the agent
+(see the script's `.NOTES`).
+
 ### Running the tests
 
 ```bash

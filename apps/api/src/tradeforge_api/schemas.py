@@ -1378,6 +1378,64 @@ class CollectionOut(_Out):
     finished_at: dt.datetime | None = None
 
 
+class PlanCollectionRequest(BaseModel):
+    """Which of these markets still need collecting before a run over this window.
+
+    ⚠️ **One window for every timeframe, unlike `CreateCollectionRequest`.** That request sizes
+    a download, and a year of M1 is not seventeen years of H1. This one describes a run someone
+    is about to launch, and a run reads the same dates whatever chart it is on — the plan is what
+    turns that into per-timeframe work.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    symbols: list[Symbol] = Field(min_length=1, max_length=_MAX_SYMBOLS)
+    timeframes: list[Timeframe] = Field(min_length=1, max_length=8)
+    date_from: dt.datetime
+    date_to: dt.datetime
+
+    @field_validator("symbols", "timeframes")
+    @classmethod
+    def _distinct(cls, values: list[Any], info: ValidationInfo) -> list[Any]:
+        return _distinct_axis(values, info)
+
+    @field_validator("date_from", "date_to")
+    @classmethod
+    def _must_be_aware(cls, value: dt.datetime) -> dt.datetime:
+        """⚠️ Refused rather than assumed UTC, for `CollectionRow`'s reason: the windows this
+        answers with are meant to be sent to `POST /collections` as they are."""
+        if value.tzinfo is None:
+            raise ValueError("an instant must carry a timezone; send UTC as ...Z")
+        return value
+
+    @model_validator(mode="after")
+    def _window_must_run_forwards(self) -> PlanCollectionRequest:
+        if self.date_to < self.date_from:
+            raise ValueError("date_to is before date_from")
+        return self
+
+
+class PlannedWindow(BaseModel):
+    """One span to collect, inclusive at both ends: whole calendar years in UTC, except that the
+    current year stops at the moment the plan was made."""
+
+    date_from: dt.datetime
+    date_to: dt.datetime
+
+
+class PlannedCollection(BaseModel):
+    """One (symbol, timeframe) that is not fully on disk, and what to fetch for it."""
+
+    symbol: str
+    timeframe: str
+    covers: str | None
+    """What the index holds today, as `2020-01-02 to 2026-09-10`, or `None` when nothing has
+    ever been collected — the reason each window is there, in the words `UncoveredMarket` uses."""
+    windows: list[PlannedWindow]
+    """⚠️ Possibly wider than the request: a window always reaches the data already on disk,
+    so the index never has to describe a hole it cannot represent (`collection_plan`)."""
+
+
 class KillSwitchOut(BaseModel):
     """The state of the **one** kill-switch layer this API can see and write.
 

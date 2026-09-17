@@ -2359,3 +2359,25 @@ e hoje ele mede o arquivo como a suíte o deixou.
   `chosen_strategy_id` está gravado) e, na repetição, rodar o vinculado se ele não estiver `done`.
 - [origem: PR-258] **Os runs que já estão presos continuam presos.** O conserto evita casos novos.
   O `77842306` (15/09) segue `queued`, e o contador X/Y mostra isso (decisão dele: sem reconciliador).
+
+## ⚠️ Coletar parte de um ano apaga o resto daquele ano (achado na PR-261)
+
+`write_candles` particiona por ano e grava com `existing_data_behavior="delete_matching"`.
+Medido em 17/09/2026: um ano com 12 barras, depois uma gravação de uma barra de 2024-12-20, e
+sobrou **uma** barra. A tela de coleta (`POST /collections`) aceita qualquer janela, então pedir
+"2026-06 a 2026-09" sobre um par que já tem 2020-2026 apaga janeiro a maio de 2026. O pior é que
+o índice (`datasets`) continua dizendo 2020-2026, porque ele só guarda o primeiro e o último
+candle, e o buraco fica invisível para o plano de coleta e para a checagem da varredura.
+O plano da PR-261 já contorna isso: pede sempre anos inteiros. A tela de coleta ainda não.
+Conserto provável: a coleta arredonda a janela para anos inteiros (ou o coletor mescla com o que
+está na partição antes de gravar). Adiado: fora do escopo da PR-261, e decidir qual das duas
+opções usar muda o contrato do coletor.
+
+## A lacuna inferior regrava o primeiro ano que já está no disco (risco não medido, PR-261)
+
+O plano de coleta sempre inclui o primeiro ano do disco na janela inferior, porque ele não sabe
+se aquela partição está completa. Se a corretora hoje entrega **menos** daquele ano do que
+entregou antes (M1 com teto de `maxbars`, por exemplo), o `delete_matching` troca a partição por
+uma versão menor. O corte pela sondagem (`symbol_history.oldest`) evita isso quando o par foi
+sondado. Sem sondagem, o risco existe. A próxima peça (enfileirar a partir do plano) deve sondar
+antes, ou recusar reescrever uma partição com menos barras do que ela tinha.

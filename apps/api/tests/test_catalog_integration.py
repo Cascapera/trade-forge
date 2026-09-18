@@ -150,8 +150,11 @@ class TestTheGridIsSavedAndChecked:
         assert refused.status_code == 422
         assert "htf" in refused.text
 
-    def test_a_grid_over_the_cap_is_refused_with_its_own_size(self, client: Any) -> None:
-        refused = client.post(
+    def test_a_grid_past_the_old_cap_is_saved_whole(self, client: Any) -> None:
+        # ⚠️ His decision (18/09), met on this very screen: a grid of 2034 combinations was refused
+        # by the old cap of 500. No cap since — every combination is kept, and the entry says how
+        # many it holds.
+        saved = client.post(
             "/catalog",
             json={
                 "name": f"huge {uuid.uuid4()}",
@@ -163,10 +166,8 @@ class TestTheGridIsSavedAndChecked:
             },
         )
 
-        assert refused.status_code == 422
-        # 900, said out loud rather than quietly trimmed: half a grid drawn as a heatmap is a
-        # picture of a space that was never searched, and it looks exactly like one that was.
-        assert "900" in refused.text
+        assert saved.status_code == 201, saved.text
+        assert saved.json()["points"] == 900
 
     def test_the_database_refuses_a_grid_that_is_not_an_object(
         self, session: Session, client: Any

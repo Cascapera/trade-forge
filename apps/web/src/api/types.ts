@@ -531,7 +531,7 @@ export interface StudyPreview {
   points: number
   refusals: GridRefusal[]
   /** Set when the grid cannot be applied to this strategy at all — a path that leads nowhere, an
-   *  empty axis, a product over the cap. A different kind of no: there are no points at all. */
+   *  empty axis, a repeated value. A different kind of no: there are no points at all. */
   grid_error: string | null
 }
 
@@ -1074,7 +1074,7 @@ export interface SweepPreview {
   /** Pairs with no candles in this window, on a chart where some point can run. The launch skips
    *  and names them (PR-269), unless it is told to collect them. */
   uncovered: UncoveredMarket[]
-  /** Set when the sweep cannot be launched at all — a product over the cap, nothing runnable, or
+  /** Set when the sweep cannot be launched at all — never for its size (no cap), but nothing runnable, or
    *  **every** pair without data. ⚠️ That last one is filled **beside** `uncovered` with `runs`
    *  at zero, and collecting is its fix; with `runs` above zero the error is never about data.
    *  An unknown entry never lands here: the endpoint answers that with a 404. */

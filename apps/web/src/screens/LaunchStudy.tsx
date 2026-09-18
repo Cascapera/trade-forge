@@ -11,7 +11,6 @@ import { useSession } from '../store'
 import { TIMEFRAMES } from '../strategy/builder'
 import { useGridPreview } from '../study/preview'
 import {
-  MAX_POINTS,
   combinationCount,
   emptyStudyForm,
   launchFailure,
@@ -55,8 +54,8 @@ export function LaunchStudy(): React.JSX.Element {
   const chosen = strategies.data?.items.find((item) => item.id === strategyId)
 
   // ⚠️ Two refusals, from two places, and they answer different questions. `whyNotLaunchable`
-  // knows what this form can decide on its own — a missing market, a repeated value, a product
-  // over the cap. The preview knows what only the DSL's semantics can say, and it is a round
+  // knows what this form can decide on its own — a missing market, a repeated value. Never the
+  // size of the grid: there is no cap (18/09). The preview knows what only the DSL's semantics can say, and it is a round
   // trip away. Neither can be folded into the other without moving a rule to the wrong side.
   const preview = useGridPreview(strategyId, form)
   const local = strategyId === null ? 'Choose a strategy.' : whyNotLaunchable(form)
@@ -67,7 +66,7 @@ export function LaunchStudy(): React.JSX.Element {
         ? null
         : `${String(preview.refusals.length)} of these combinations cannot run, so the study will not start.`))
   // ⚠️ Shown side by side rather than one winning: the local message is about the run — a market,
-  // a period, a product over the cap — and the server's is about the axes, which is what somebody
+  // a period — and the server's is about the axes, which is what somebody
   // filling in axes needs to see. Suppressing the second until the first is answered would hide
   // the axis problem behind an unrelated blank field.
   const blocked = local ?? refused
@@ -295,8 +294,7 @@ export function LaunchStudy(): React.JSX.Element {
         A grid always has a best point — a grid of pure noise has a best point. What a study can
         tell you is whether the good results form a broad region or a single lucky cell, and how
         much of the space works at all. It cannot tell you the winning parameters will work next
-        month: every figure it produces is measured on the same data it searched. Up to{' '}
-        {String(MAX_POINTS)} combinations.
+        month: every figure it produces is measured on the same data it searched.
       </p>
     </section>
   )

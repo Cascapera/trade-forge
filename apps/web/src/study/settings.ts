@@ -61,9 +61,6 @@ export const emptyStudyForm: StudyForm = {
   axes: [{ path: '', raw: '' }],
 }
 
-/** The server's own cap, repeated here so the form can refuse before the request is sent. */
-export const MAX_POINTS = 500
-
 /**
  * One axis's values, out of a comma-separated line.
  *
@@ -155,10 +152,8 @@ export function whyNotLaunchable(form: StudyForm): string | null {
     }
   }
 
-  const total = combinationCount(form)
-  if (total > MAX_POINTS) {
-    return `That is ${String(total)} combinations, over the ${String(MAX_POINTS)} a study will run.`
-  }
+  // ⚠️ No cap on the number of combinations (his decision, 18/09): a grid of any size runs, and
+  // the count on screen is how its size is said — not a refusal.
   return null
 }
 

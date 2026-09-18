@@ -175,35 +175,23 @@ def test_a_grid_with_no_axes_is_refused() -> None:
         expand(_BASE, {})
 
 
-def test_a_grid_over_the_limit_is_refused_with_its_own_size() -> None:
-    """Refused whole, never trimmed — and the message carries the count.
+def test_a_grid_is_expanded_whole_however_large() -> None:
+    """⚠️ His decision (18/09): no cap on a grid. 2034 combinations is the shape that met the old
+    cap of 500 on his catalogue entry; every one is expanded, none trimmed, none refused.
 
-    Half a grid drawn as a heatmap is a picture of a space that was never searched, and it looks
-    exactly like a picture of one that was. The size is in the message because the product grows
-    multiplicatively: the caller who typed a fourth axis did not add five points, they multiplied
-    by five, and the number is the only thing that says so.
+    Asserted on the count and on both ends of the product, so a quietly truncating expansion
+    (the first 500, say) fails here rather than drawing half a heatmap as if it were whole.
     """
-    with pytest.raises(GridError, match="expands to 27 combinations, over the 8"):
-        expand(
-            _BASE,
-            {
-                "setup.params.period": [5, 9, 20],
-                "setup.params.take_profit_rr": [2, 3, 4],
-                "setup.params.side": ["long", "short", "both"],
-            },
-            limit=8,
-        )
+    grid: dict[str, Sequence[Any]] = {
+        "setup.params.period": list(range(2, 36)),  # 34 values
+        "setup.params.take_profit_rr": [round(0.5 + 0.1 * step, 1) for step in range(60)],
+    }
 
+    points = expand(_BASE, grid)
 
-def test_a_grid_exactly_at_the_limit_is_accepted() -> None:
-    """The boundary belongs to the accepted side: a limit of N means N points may run.
-
-    Its own test because `>` and `>=` are indistinguishable everywhere else — every other
-    scenario here sits well clear of the cap.
-    """
-    points = expand(_BASE, {"setup.params.period": [5, 9, 20]}, limit=3)
-
-    assert len(points) == 3
+    assert len(points) == 34 * 60 == 2040
+    assert points[0].values == {"setup.params.period": 2, "setup.params.take_profit_rr": 0.5}
+    assert points[-1].values == {"setup.params.period": 35, "setup.params.take_profit_rr": 6.4}
 
 
 def test_the_size_is_the_product_of_the_axes_not_their_total() -> None:

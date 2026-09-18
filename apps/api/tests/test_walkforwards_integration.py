@@ -291,6 +291,27 @@ def test_a_walk_forward_writes_one_study_per_fold_and_shares_their_strategies(
         session.close()
 
 
+def test_a_walk_forward_past_the_old_cap_is_accepted(prepared: Callable[[], Any]) -> None:
+    """⚠️ His decision (18/09): no cap on points x folds. 501 points over two folds is 1002 runs —
+    refused by the old cap of 1 000, which meant a study of his full grid could never be walked
+    forward at all. Accepted now, and the count is reported rather than held against it."""
+    app = prepared()
+    with TestClient(app) as client:
+        strategy_id = client.post("/strategies", json=_strategy()).json()["id"]
+        body = _study_body(strategy_id)
+        body["grid"] = {"indicators.1.params.period": list(range(5, 506))}
+        study = client.post("/studies", json=body)
+        assert study.status_code == 202, study.text
+
+        response = client.post(
+            "/walkforwards",
+            json={"study_id": study.json()["id"], "folds": FOLDS, "train_multiple": TRAIN_MULTIPLE},
+        )
+
+    assert response.status_code == 202, response.text
+    assert response.json()["runs_queued"] == 501 * FOLDS == 1002
+
+
 def test_only_one_job_is_queued_for_the_whole_experiment(prepared: Callable[[], Any]) -> None:
     """⚠️ The training runs are written `queued` and deliberately never enqueued.
 

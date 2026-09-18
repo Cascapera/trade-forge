@@ -1018,7 +1018,7 @@ class StudyPreview(_Out):
     refusals: list[GridRefusal]
     grid_error: str | None = None
     """Set when the grid cannot be applied to this strategy at all — a path that leads nowhere,
-    an empty axis, a product over the cap. A different kind of no from a refused point: there are
+    an empty axis, a repeated value. A different kind of no from a refused point: there are
     no points to report on, rather than points that will not run."""
 
 
@@ -1865,8 +1865,9 @@ class SweepPreview(BaseModel):
     """Markets and charts with no data in this window — skipped by the launch and named, unless
     it is told to collect them (his rule, 18/09). Kept on the sweep as `SweepOut.skipped`."""
     error: str | None = None
-    """Set when the sweep cannot be launched at all — an unknown entry, a grid that leads
-    nowhere, a product over the cap, every pair without data. A different kind of no: there is
+    """Set when the sweep cannot be launched at all — a grid that leads nowhere, nothing
+    runnable, every pair without data. Never for its size (no cap since 18/09). A different kind
+    of no: there is
     nothing to run."""
 
 

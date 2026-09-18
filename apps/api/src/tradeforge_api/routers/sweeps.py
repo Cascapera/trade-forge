@@ -197,8 +197,8 @@ def preview_sweep(request: PreviewSweepRequest, session: SessionDep) -> SweepPre
 
     Reports rather than decides, like the study's preview and for the same reason: a person
     fixing one axis per round trip is the round trip this endpoint exists to remove. What would
-    make the launch refuse — nothing runnable, every pair without data, a product over the cap —
-    is reported as an `error` instead, in the launch's own words.
+    make the launch refuse — nothing runnable, every pair without data — is reported as an
+    `error` instead, in the launch's own words. Never its size: there is no cap (18/09).
     """
     pairs = _entries(session, request.entry_ids)
 
@@ -244,7 +244,7 @@ def preview_sweep(request: PreviewSweepRequest, session: SessionDep) -> SweepPre
 
     # ⚠️ Counted as the launch counts them when told not to collect: the pairs with no candles
     # are skipped, not refused (his rule, 18/09), so they subtract rather than block.
-    # ⚠️ The empty sweep and the cap are asked of the same functions the launch below asks, so
+    # ⚠️ The empty sweep and the all-skipped one are asked of the same functions the launch asks, so
     # the two endpoints cannot answer this in different words. Reported as an `error` rather than
     # raised, which is the one thing that *is* different: a preview that raised would have
     # nothing to preview.
@@ -280,7 +280,8 @@ async def create_sweep(request: CreateSweep, session: SessionDep, queue: QueueDe
     `assert_executable` knew — and the preview names it. A pair with no candles in the window is
     part of the space and has nothing to read (his answer "do not collect", 18/09): it is left out
     and written on the sweep as `skipped`. What must never happen is a point that *could* have
-    run disappearing without a name, which is why the cap refuses the whole request instead.
+    run disappearing without a name — and since 18/09 no point is left out for the size of the
+    sweep either: there is no cap.
     """
     pairs = _entries(session, request.entry_ids)
     timeframes = list(request.timeframes)

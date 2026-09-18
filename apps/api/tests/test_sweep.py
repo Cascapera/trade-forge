@@ -11,8 +11,6 @@ from typing import Any
 import pytest
 
 from tradeforge_api.sweep import (
-    MAX_SWEEP_RUNS,
-    SECONDS_PER_BACKTEST,
     SweepDocument,
     SweepError,
     documents_for,
@@ -174,57 +172,25 @@ class TestTheSize:
 
         assert produced == promised == 6
 
-    def test_the_cap_admits_the_sweep_this_feature_was_asked_for(self) -> None:
-        # ⚠️ This caught a real one. Three catalogue entries of fifty points each, over five
-        # markets and three timeframes, is 2 250 runs — and the first cap was 2 000, so it
-        # refused the exact shape the feature exists for. A cap that refuses the feature is not
-        # a cap.
-        #
-        # Written as the shape rather than as `2250`, so a reader sees which axis is which:
-        # the three entries **add**, the charts and the markets multiply.
-        asked_for = (50 + 50 + 50) * 3 * 5
-
-        assert asked_for == 2250
-        assert size_refusal(asked_for) is None
-
-    def test_the_cap_is_a_time_budget_a_person_can_sit_through(self) -> None:
-        # The other side, and the reason the cap is not simply enormous. Asserted against the
-        # measured cost rather than against the number itself, so raising one without the other
-        # fails here — which is what makes this a budget rather than a preference.
-        minutes = MAX_SWEEP_RUNS * SECONDS_PER_BACKTEST / 60
-
-        assert minutes < 12
-        # Even if every run were the slowest ever measured on this project (2.17 s).
-        assert MAX_SWEEP_RUNS * 2.17 / 60 < 120
+    def test_the_sweep_he_was_refused_is_admitted(self) -> None:
+        # ⚠️ The real one, 18/09: "this sweep expands to 3168 backtests, over the 3000". No cap
+        # since (his decision) — hours of queue are his to spend. Written as a size far past the
+        # old cap too, so a cap reintroduced at any plausible number fails here.
+        assert size_refusal(3168) is None
+        assert size_refusal(1_000_000) is None
 
 
 class TestWhatTheSizeRefuses:
-    """`size_refusal` is the one sentence both endpoints say, so it is tested once here."""
+    """`size_refusal` is the one sentence both endpoints say, so it is tested once here — and
+    since 18/09 the only size it refuses is none at all."""
 
-    def test_a_sweep_inside_the_budget_is_not_refused(self) -> None:
+    def test_any_sweep_with_something_to_run_is_not_refused(self) -> None:
         assert size_refusal(1) is None
-        assert size_refusal(MAX_SWEEP_RUNS) is None
-
-    def test_the_cap_is_exclusive_at_the_edge(self) -> None:
-        # ⚠️ The boundary in both directions, in one test. `>` and `>=` are one character
-        # apart and a test at only one side of the edge does not separate them — it would pass
-        # for a cap that silently refuses the largest sweep a person was told they could run.
-        assert size_refusal(MAX_SWEEP_RUNS) is None
-        assert size_refusal(MAX_SWEEP_RUNS + 1) is not None
-
-    def test_the_refusal_says_the_sweep_own_size_and_the_cap(self) -> None:
-        # Both numbers, because "too big" without either is a message that sends a person back
-        # to count their own grid.
-        message = size_refusal(3600)
-
-        assert message is not None
-        assert "3600" in message
-        assert str(MAX_SWEEP_RUNS) in message
+        assert size_refusal(3001) is None
 
     def test_zero_is_a_refusal_and_not_a_small_sweep(self) -> None:
-        # ⚠️ Separated from the cap on purpose: both return a string, and a helper that
-        # answered "nothing runs" with the cap's sentence would read as plausible and be absurd.
+        # The one refusal left: nothing to run is a question that cannot be asked, and `0 runs`
+        # beside a live button invites pressing it.
         message = size_refusal(0)
 
-        assert message is not None
-        assert str(MAX_SWEEP_RUNS) not in message
+        assert message == "no combination in this sweep can run"

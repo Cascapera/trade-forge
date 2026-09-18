@@ -186,7 +186,7 @@ export const api = {
     request('GET', `/sweeps/dashboard${query({ ...launched })}`),
   // The same doctrine as `previewStudy`, one axis up: a POST that writes nothing, asked while
   // the form is still being filled in. ⚠️ It answers three different noes — a combination the
-  // DSL refuses, a market with no candles in the window, and a product over the cap — and the
+  // DSL refuses, a market with no candles in the window, and a sweep with nothing to run — and the
   // screen has to keep them apart, because the fixes are to edit, to collect, and to shrink.
   previewSweep: (payload: PreviewSweepRequest): Promise<SweepPreview> =>
     request('POST', '/sweeps/preview', payload),

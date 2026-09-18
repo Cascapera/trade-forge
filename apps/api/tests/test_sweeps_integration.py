@@ -591,45 +591,37 @@ class TestWhatItRefuses:
         assert "ALSONOPE" in refused.text
         assert queue.jobs == []
 
-    def test_a_sweep_over_the_cap_is_refused_with_its_own_size(
+    def test_a_sweep_past_the_old_cap_is_launched_whole(
         self, client: Any, queue: _CapturingQueue
     ) -> None:
-        # ⚠️ Refused whole, never trimmed. Half a sweep is a picture of a space that was never
-        # searched, and it looks exactly like a picture of one that was.
+        # ⚠️ His decision (18/09): no cap. 300 points over three markets and four charts is 3600
+        # runs — refused by the old cap of 3000, and now written and queued, every one of them.
+        # The preview agrees: no `error`, and the same count.
         entry = an_entry(
             client,
             name=f"huge {uuid.uuid4()}",
-            # 300 points, which is inside `MAX_POINTS` for the entry itself — the sweep is over
-            # the cap only once the markets and the charts multiply it. That is the shape worth
-            # testing: each axis looks reasonable and the product does not.
             grid={"setup.params.period": list(range(3, 303))},
         )
+        timeframes = ["M15", "H1", "H4", "D1"]
+        queue.jobs.clear()
 
-        refused = client.post(
-            "/sweeps", json=a_sweep_body([entry], list(SYMBOLS), ["M15", "H1", "H4", "D1"])
-        )
-
-        assert refused.status_code == 422
-        # 300 x 3 markets x 4 charts, said out loud in the message.
-        assert "3600" in refused.text
-        assert queue.jobs == []
-
-        # ⚠️ **And the screen says the same thing the button does.** The sentence used to be
-        # written out in both endpoints; a rewording of either would have left a person reading
-        # one verdict in the preview and getting another from the launch, with nothing failing.
         previewed = client.post(
             "/sweeps/preview",
             json={
                 "entry_ids": [entry],
                 "symbols": list(SYMBOLS),
-                "timeframes": ["M15", "H1", "H4", "D1"],
+                "timeframes": timeframes,
                 "date_from": START.isoformat(),
                 "date_to": (START + 100 * HOUR).isoformat(),
             },
-        )
+        ).json()
+        launched = client.post("/sweeps", json=a_sweep_body([entry], list(SYMBOLS), timeframes))
 
-        assert previewed.status_code == 200
-        assert previewed.json()["error"] == refused.json()["detail"]
+        assert previewed["error"] is None
+        assert previewed["runs"] == 3600
+        assert launched.status_code == 202, launched.text
+        assert launched.json()["runs"] == 3600
+        assert len(queue.jobs) == 3600
 
     def test_a_sweep_with_nothing_runnable_is_an_error_not_a_zero(self, client: Any) -> None:
         # An H4 filter swept only at H4: no combination can run. Reported as an error rather

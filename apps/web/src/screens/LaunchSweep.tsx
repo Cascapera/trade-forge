@@ -10,7 +10,6 @@ import { SymbolPicker } from '../components/SymbolPicker'
 import { TIMEFRAMES } from '../strategy/builder'
 import { useSweepRehearsal } from '../sweep/preview'
 import {
-  MAX_SWEEP_RUNS,
   emptySweepForm,
   launchFailure,
   runCount,
@@ -57,8 +56,7 @@ export function LaunchSweep(): React.JSX.Element {
 
   // ⚠️ **Three refusals, kept apart, because they have three different fixes.** The local one is
   // about this form — a blank field, an entry that left the shelf — and the screen can decide it
-  // alone. ⚠️ Not the cap: that is on the runs left after the DSL's refusals, a number only the
-  // server has, so it arrives as the server's `error`.
+  // alone. Never the size of the sweep: there is no cap (18/09).
   // The DSL's is about a combination and is fixed by editing the entry's grid. The coverage gap
   // is about *data*, and nothing on this form will make it go away: the fix is a backfill or a
   // different window. Pooling them into one "cannot run" would send somebody to edit a grid when
@@ -74,8 +72,9 @@ export function LaunchSweep(): React.JSX.Element {
   // ⚠️ **The one server error that must not block: every pair without data.** Collecting is its
   // fix, and a disabled button would keep the reader from the prompt that offers it. It is told
   // apart by shape, not by wording: `uncovered` names only pairs on a chart that can run, so a
-  // non-empty list with nothing left to run *is* "all skipped". With runs above zero the error is
-  // the cap — and collecting only adds runs, so that one blocks.
+  // non-empty list with nothing left to run *is* "all skipped". With runs above zero the server
+  // sends no error at all since the cap went (18/09): a sweep with something to run is never refused
+  // for its size.
   //
   // ⚠️ **Until the plan says there is nothing to fetch.** A window wholly in the future, or older
   // than the broker's first bar, is "all skipped" too, and no download can mend it: the plan
@@ -373,9 +372,9 @@ export function LaunchSweep(): React.JSX.Element {
         )}
 
         {/* ⚠️ Printed unless it is the all-skipped sentence, which the list above already says.
-            Keyed on `dataGap`, not on the list being empty: a partial gap beside a sweep over
-            the cap carries the cap's sentence, and hiding it would leave a disabled button with
-            no reason given. */}
+            Keyed on `dataGap` rather than on the list being empty, so any other refusal the
+            server sends beside a partial gap still reaches the reader instead of leaving a
+            disabled button with no reason given. */}
         {serverError !== null && !dataGap && (
           <p className="text-sm text-amber-300">{serverError}</p>
         )}
@@ -411,8 +410,7 @@ export function LaunchSweep(): React.JSX.Element {
         and the best of them is the best of seven hundred and fifty draws. Re-running the winner
         over the same window returns the identical number — the engine is deterministic, so that
         is not a second opinion. The only honest follow-up is data the winner was not chosen on: a
-        walk-forward, another market, a window you held back. Up to {String(MAX_SWEEP_RUNS)}{' '}
-        backtests per sweep.
+        walk-forward, another market, a window you held back.
       </p>
     </section>
   )

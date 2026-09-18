@@ -174,12 +174,14 @@ describe('the strategy picker', () => {
     expect(screen.getByLabelText('Stop at candle extreme')).toBeInTheDocument()
   })
 
-  it('drops side when the structure family is chosen, since it is not directional', () => {
+  it('offers the structure family a side that starts at both', () => {
+    // His request (18/09): long only, short only or both on every setup. `both` is what the
+    // structure family always did, so the form starts there rather than asking.
     renderWithProviders(<StrategyBuilder />)
     fireEvent.change(screen.getByLabelText('strategy'), {
       target: { value: 'structure_continuation' },
     })
-    expect(screen.queryByLabelText('setup side')).not.toBeInTheDocument()
+    expect(screen.getByLabelText('setup side')).toHaveValue('both')
     expect(screen.getByLabelText('setup stop_buffer')).toHaveValue('0.1')
     // `max_bos` defaults to null, which is uncapped — an empty box, not a zero.
     expect(screen.getByLabelText('setup max_bos')).toHaveValue('')

@@ -270,6 +270,12 @@ def _structure_kwargs(
     _optional_hours(params, "htf_offset", kwargs)
     if kwargs.get("htf") is not None:
         kwargs["timeframe"] = timeframe
+    # ⚠️ `both` is the class's own default (`None`), so it is passed only when narrowed — the same
+    # rule as the timeframe above: a keyword the document never asked for is a place a default
+    # could hide. Anything but the three names is refused, never read as both.
+    traded = params.get("side", "both")
+    if traded != "both":
+        kwargs["side"] = _side(params)
     return kwargs
 
 

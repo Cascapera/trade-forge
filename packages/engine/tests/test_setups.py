@@ -5465,3 +5465,78 @@ def test_the_follow_activation_refuses_a_dial_that_would_not_be_a_setup(
 ) -> None:
     with pytest.raises(EngineError, match=message):
         ForceFollowActivation(trigger=GiftTrigger(), **kwargs)  # type: ignore[arg-type]
+
+
+class TestTheSideFilter:
+    """His request (18/09): every setup offers long only, short only, or both.
+
+    The structure family trades whichever way the zone it reads points — demand is a long, supply
+    a short — and `side` only narrows that. Each test drives a scenario that *does* arm with no
+    filter, so a filter that silenced everything would fail the control rather than pass.
+    """
+
+    def test_the_default_trades_both_as_it_always_did(self) -> None:
+        # The controls: the impulse on an uptrend arms a long on bar 9, its mirror a short.
+        # ⚠️ `_drive_from_bullish` for the long, never `_drive`: from a fresh machine the impulse
+        # confirms nothing, and a "never arms" beside it would pass for any filter at all.
+        [bought] = _drive_from_bullish(
+            StructureStrategy(qualifier=_Marked(), name="test"), _IMPULSE
+        )[9]
+        [sold] = _drive(StructureStrategy(qualifier=_Marked(), name="test"), _mirror(_IMPULSE))[9]
+
+        assert (bought.side, sold.side) == (Side.LONG, Side.SHORT)
+
+    def test_long_only_never_arms_a_supply_zone_and_still_arms_demand(self) -> None:
+        only_long = StructureStrategy(qualifier=_Marked(), name="test", side=Side.LONG)
+        signals = _drive(only_long, _mirror(_IMPULSE))
+
+        assert all(bar == [] for bar in signals)
+        [bought] = _drive_from_bullish(
+            StructureStrategy(qualifier=_Marked(), name="test", side=Side.LONG), _IMPULSE
+        )[9]
+        assert bought.side is Side.LONG
+
+    def test_short_only_never_arms_a_demand_zone_and_still_arms_supply(self) -> None:
+        only_short = StructureStrategy(qualifier=_Marked(), name="test", side=Side.SHORT)
+        signals = _drive_from_bullish(only_short, _IMPULSE)
+
+        assert all(bar == [] for bar in signals)
+        [sold] = _drive(
+            StructureStrategy(qualifier=_Marked(), name="test", side=Side.SHORT),
+            _mirror(_IMPULSE),
+        )[9]
+        assert sold.side is Side.SHORT
+
+
+@pytest.mark.parametrize("kind", ["structure_choch", "structure_continuation"])
+@pytest.mark.parametrize(
+    ("side", "arms_demand", "arms_supply"),
+    [("long", True, False), ("short", False, True), ("both", True, True)],
+)
+def test_a_documents_side_reaches_the_engine_as_the_side_it_names(
+    kind: str, side: str, arms_demand: bool, arms_supply: bool
+) -> None:
+    """⚠️ The engine-guardian's blocker on PR-275: the *document* to engine path, both mirrors.
+
+    `TestTheSideFilter` drives the constructor; this drives `build_setup`, which is what a saved
+    strategy reaches. A factory that always passed SHORT, or dropped `long` and ran both, left every
+    other test green — the only probe of the path was on the short side. Judged by behaviour, not
+    by a private attribute: demand armed on the uptrend's impulse, supply on its mirror.
+    """
+
+    def built() -> StructureStrategy:
+        setup = build_setup({"type": kind, "params": {"side": side}})
+        assert isinstance(setup, StructureStrategy)
+        # The qualifier under test is the path, not a setup's own taste in zones: `_Marked`
+        # names every zone the detector marks, so the side is the only filter left. ⚠️ Asserted
+        # first: were the attribute renamed, assigning would create a new one silently, and this
+        # test would go on passing while testing a real qualifier instead of the side.
+        assert hasattr(setup, "_qualifier")
+        setup._qualifier = _Marked()
+        return setup
+
+    demand = _drive_from_bullish(built(), _IMPULSE)
+    supply = _drive(built(), _mirror(_IMPULSE))
+
+    assert any(bar != [] for bar in demand) is arms_demand
+    assert any(bar != [] for bar in supply) is arms_supply

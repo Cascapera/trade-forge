@@ -74,22 +74,29 @@ _BAD_BODY: _Responses = {status.HTTP_400_BAD_REQUEST: {"description": "malformed
 def points_for(
     base: Strategy, grid: Mapping[str, Sequence[Any]], timeframe: str
 ) -> list[GridPoint]:
-    """Expand the grid, or refuse — and validate every document before any of them is written.
+    """Expand the grid, drop the points that cannot run at this timeframe, or refuse.
 
     Public because `/walkforwards` runs the same grid over each of its folds, and it has to
     produce *identical* documents to the ones the study ran: the whole comparison is between a
     heatmap and a blind choice over the same parameter space. A second expansion written next
     door would be the same code until the day one of them was fixed.
 
-    Two refusals, and the order matters. `expand` rejects a grid that cannot be applied to
-    *this* document (an unreachable path, an empty axis, a repeated value). Then each
-    resulting document is put through the same validator `POST /strategies` uses, because a
-    substituted value can be individually legal and still produce a strategy that cannot run —
-    a period of zero, a risk-reward of minus one.
+    `expand` rejects a grid that cannot be applied to *this* document at all (an unreachable
+    path, an empty axis, a repeated value) — that refuses the request. Then each resulting
+    document is asked, at the study's timeframe, whether it can run, because a substituted value
+    can be individually legal and still produce a strategy that cannot: a higher timeframe no
+    coarser than the chart, a period of zero.
 
-    **Nothing is written until both have passed for every point.** A study that half-exists is
-    worse than one that was refused: the caller asked one question about a space, and sixty
-    runs plus an error answers a question nobody asked.
+    ⚠️ **A point that cannot run is dropped, not a reason to refuse the grid** (his request,
+    18/09). Sweeping the higher timeframe from M5 to W1 over an M30 chart makes M5 and M15
+    impossible by the DSL's own rule, and refusing the whole study for them made the axis
+    unusable — while the sweep, over the very same rule, already left such points out. The
+    preview names every one of them (`preview_of`), so none disappears without a word; and a
+    point that *could* run is never dropped. Only when nothing is left is the request refused,
+    with the first point's reason in the validator's own body.
+
+    Dropped here, once, for the walk-forward too: it runs the same points the study ran, and a
+    second rule next door would be the same code until one of them was fixed.
     """
     try:
         points = _prepared(base, grid)
@@ -98,21 +105,22 @@ def points_for(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
         ) from exc
 
-    for point in points:
+    # ⚠️ **Asked at the timeframe the study will actually run**, which is not the one the
+    # document carries. The two are different fields and the engine reads each by a different
+    # road (`runner.timeframe_refusal`); a point whose `htf` filter is legal on the saved document
+    # can be a filter that quietly stops filtering at the study's timeframe.
+    #
+    # Substituted for the check only — **not** written into the point. The stored document is
+    # what `strategies_for` deduplicates on, and a timeframe in it would make the same grid at two
+    # timeframes collide on `(name, version)`.
+    runnable = [
+        point for point in points if refusal_of({**point.document, "timeframe": timeframe}) is None
+    ]
+    if not runnable:
         # Raises the same 422 the strategy endpoint raises, carrying the same error body — so a
         # client already able to explain why a strategy was rejected can explain this one too.
-        #
-        # ⚠️ **Validated at the timeframe the study will actually run**, which is not the one the
-        # document carries. The two are different fields and the engine reads each by a different
-        # road (`runner.timeframe_refusal`); a point whose `htf` filter is legal on the saved
-        # document can be a filter that quietly stops filtering at the study's timeframe.
-        #
-        # Substituted for the check only — **not** written into the point. The stored document is
-        # what `strategies_for` deduplicates on, and a timeframe in it would make the same grid
-        # at two timeframes collide on `(name, version)`. That the point then records a timeframe
-        # it did not run at is a separate, older problem; it is in the backlog.
-        validate_document({**point.document, "timeframe": timeframe})
-    return points
+        validate_document({**points[0].document, "timeframe": timeframe})
+    return runnable
 
 
 def _prepared(base: Strategy, grid: Mapping[str, Sequence[Any]]) -> list[GridPoint]:
@@ -218,10 +226,10 @@ def preview_study(request: PreviewStudyRequest, session: SessionDep) -> StudyPre
     Nothing is written and nothing is queued. The strategy is read to expand the grid against it,
     which is why a missing one is a 404 rather than an empty preview.
 
-    ⚠️ **Not `points_for`.** That one decides — first bad point, whole request refused, nothing
-    written — and it is right to. This one reports, so it walks every point and comes back with
-    all of them. The two share `_prepared`, which is the part that has to be identical, and
-    nothing else. See `refusal_of`.
+    ⚠️ **Not `points_for`.** That one decides — it drops what cannot run and refuses only when
+    nothing is left. This one reports, so it walks every point and names each one the launch will
+    drop, with the reason. Both ask `refusal_of` at the study's timeframe, over the same
+    `_prepared` points, so the list a person reads is the list the launch leaves out.
     """
     base = session.get(Strategy, request.strategy_id)
     if base is None:

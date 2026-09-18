@@ -103,11 +103,12 @@ def refusal_of(document: dict[str, Any]) -> str | None:
     """Why this document cannot run, or `None` when it can — the *reporting* half of the pair.
 
     ⚠️ **Deliberately not `validate_document` with the raising taken out.** The two have opposite
-    failure policies and folding them into one helper would force one of them to lie. Launching a
-    study *decides*: the first bad point refuses the whole request and nothing is written, because
-    a study that half-exists answers a question nobody asked. A preview *reports*: it has to walk
-    every point and come back with all of them, or a person fixes one value, asks again, and
-    learns about the next one — which is the round trip the preview exists to remove.
+    failure policies and folding them into one helper would force one of them to lie. Launching
+    *decides*: a point that cannot run is dropped (since 18/09, for the study as for the sweep), and
+    a grid where none can is refused with `validate_document`'s structured body, nothing written.
+    A preview *reports*: it has to walk every point and come back with all of them, or a person
+    fixes one value, asks again, and learns about the next one — which is the round trip the
+    preview exists to remove.
 
     They also want different bodies. `validate_document` carries Pydantic's structured error list,
     which is what a strategy screen renders field by field; a preview needs one sentence it can

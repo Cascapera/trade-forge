@@ -122,11 +122,20 @@ def test_the_preview_refuses_exactly_what_a_launch_refuses() -> None:
     assert preview_of(_base(), clean, "M15").refusals == []
     assert len(points_for(_base(), clean, "M15")) == 2
 
-    assert [
+    # ⚠️ Since the study drops what cannot run (18/09), "refuses exactly what a launch refuses"
+    # reads as: the points the preview names are exactly the ones the launch leaves out.
+    named = [
         refusal.values["setup.params.htf"] for refusal in preview_of(_base(), dirty, "M15").refusals
-    ] == ["M5"]
+    ]
+    ran = [point.values["setup.params.htf"] for point in points_for(_base(), dirty, "M15")]
+    assert named == ["M5"]
+    assert ran == ["H4"]
+
+    # And with nothing left, the launch refuses — the one refusal the preview reports as a list.
+    only_dirty = {"setup.params.htf": ["M5", "M15"]}
+    assert len(preview_of(_base(), only_dirty, "M15").refusals) == 2
     with pytest.raises(HTTPException) as refused:
-        points_for(_base(), dirty, "M15")
+        points_for(_base(), only_dirty, "M15")
     assert refused.value.status_code == 422
 
 

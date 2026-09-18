@@ -41,8 +41,8 @@ export interface GridPreview {
 /**
  * The server's verdict on the grid this form describes.
  *
- * ⚠️ **An early warning, never the gate.** The gate is `POST /studies`, which validates every
- * point again and writes nothing if one fails — and it has to be, because a person can click
+ * ⚠️ **An early warning, never the gate.** The gate is `POST /studies`, which asks every point
+ * again, drops the ones that cannot run and writes nothing if none can — and it has to be, because a person can click
  * launch before this answer lands, and because a preview is a different request that could be
  * answered by a different deploy. This exists so the refusal arrives while the axis that caused
  * it is still on screen, instead of as a 422 after a click.

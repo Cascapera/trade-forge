@@ -43,6 +43,7 @@ from tradeforge_db.models import (
     Dataset,
     Instrument,
     Sweep,
+    SymbolHistory,
 )
 from tradeforge_engine.domain import AssetClass
 
@@ -681,9 +682,12 @@ class TestTheDataHasToBeThere:
     The `datasets` index knew before any of them started; it was simply not asked.
     """
 
-    def test_a_market_with_no_candles_in_the_window_refuses_the_whole_sweep(
+    def test_a_market_with_no_candles_in_the_window_is_skipped_and_named(
         self, client: Any, session: Session, queue: _CapturingQueue
     ) -> None:
+        """His rule (18/09): the pair with nothing to read is left out, the rest runs, and the
+        sweep says which. It used to refuse the whole launch; a map with a hole is allowed now,
+        a map whose hole is not written down is still not."""
         entry = an_entry(client, name=f"real {uuid.uuid4()}")
         # Move USDJPY's coverage entirely outside the window the body asks for.
         for dataset in session.scalars(
@@ -692,14 +696,127 @@ class TestTheDataHasToBeThere:
             dataset.date_from = START + dt.timedelta(days=3650)
             dataset.date_to = START + dt.timedelta(days=4015)
         session.commit()
+        queue.jobs.clear()
 
-        refused = client.post("/sweeps", json=a_sweep_body([entry], list(SYMBOLS), ["M15"]))
+        launched = client.post("/sweeps", json=a_sweep_body([entry], list(SYMBOLS), ["M15"]))
+
+        assert launched.status_code == 202, launched.text
+        body = launched.json()
+        assert body["runs"] == 2
+        assert [(one["symbol"], one["timeframe"]) for one in body["skipped"]] == [("USDJPY", "M15")]
+        # The range it does hold, so a later reader can tell "move the window" from "backfill".
+        assert body["skipped"][0]["covers"] is not None
+        assert len(queue.jobs) == 2
+        # ⚠️ **Kept on the sweep, not only said once.** Read back, the header still lists the
+        # three markets asked; this is what tells the reader one of them was never measured.
+        read = client.get(f"/sweeps/{body['id']}").json()
+        assert read["symbols"] == list(SYMBOLS)
+        assert read["skipped"] == body["skipped"]
+        assert {row["run"]["symbol"] for row in read["runs"]} == {"EURUSD", "GBPUSD"}
+
+    def test_a_market_is_skipped_by_chart_not_as_a_whole(
+        self, client: Any, session: Session
+    ) -> None:
+        """GBPUSD holds M15 and not H4. Dropping the market would lose three runs that read every
+        bar; only the pair with nothing to read is left out."""
+        entry = an_entry(client, name=f"real {uuid.uuid4()}")
+        for dataset in session.scalars(
+            select(Dataset)
+            .join(Instrument)
+            .where(Instrument.symbol == "GBPUSD", Dataset.timeframe == "H4")
+        ):
+            session.delete(dataset)
+        session.commit()
+
+        launched = client.post(
+            "/sweeps", json=a_sweep_body([entry], ["EURUSD", "GBPUSD"], ["M15", "H4"])
+        )
+
+        assert launched.status_code == 202, launched.text
+        body = launched.json()
+        assert [(one["symbol"], one["timeframe"], one["covers"]) for one in body["skipped"]] == [
+            ("GBPUSD", "H4", None)
+        ]
+        read = client.get(f"/sweeps/{body['id']}").json()
+        ran = sorted((row["run"]["symbol"], row["run"]["timeframe"]) for row in read["runs"])
+        assert ran == [("EURUSD", "H4"), ("EURUSD", "M15"), ("GBPUSD", "M15")]
+
+    def test_a_chart_skipped_on_every_market_writes_no_points(
+        self, client: Any, session: Session
+    ) -> None:
+        """H4 is missing everywhere: its documents would have no run under them, and writing them
+        would put coordinates on the map that nothing measured."""
+        entry = an_entry(client, name=f"real {uuid.uuid4()}")
+        for dataset in session.scalars(select(Dataset).where(Dataset.timeframe == "H4")):
+            session.delete(dataset)
+        session.commit()
+
+        launched = client.post(
+            "/sweeps", json=a_sweep_body([entry], ["EURUSD", "GBPUSD"], ["M15", "H4"])
+        )
+
+        assert launched.status_code == 202, launched.text
+        session.expire_all()
+        sweep = session.get(Sweep, uuid.UUID(launched.json()["id"]))
+        assert sweep is not None
+        assert {point["values"]["timeframe"] for point in sweep.points} == {"M15"}
+        assert {(one["symbol"], one["timeframe"]) for one in sweep.skipped} == {
+            ("EURUSD", "H4"),
+            ("GBPUSD", "H4"),
+        }
+
+    def test_a_chart_the_dsl_refuses_is_not_named_as_missing_data(
+        self, client: Any, session: Session
+    ) -> None:
+        """⚠️ The two absences `Sweep.skipped` exists to keep apart, meeting on one pair. This entry
+        filters by H4, so H4 is refused by the DSL; EURUSD H4 also has no candles. Named as
+        skipped, it would offer a download that could never produce a run."""
+        entry = an_entry(
+            client,
+            name=f"filtered {uuid.uuid4()}",
+            document=a_filtered_document(f"choch {uuid.uuid4()}"),
+        )
+        for dataset in session.scalars(select(Dataset).where(Dataset.timeframe == "H4")):
+            session.delete(dataset)
+        session.commit()
+        body = a_sweep_body([entry], ["EURUSD"], ["M15", "H4"])
+
+        preview = client.post(
+            "/sweeps/preview",
+            json={
+                k: body[k] for k in ("entry_ids", "symbols", "timeframes", "date_from", "date_to")
+            },
+        ).json()
+        launched = client.post("/sweeps", json=body)
+
+        assert preview["uncovered"] == []
+        # Where it belongs instead: a refusal, in the DSL's words.
+        (refusal,) = preview["entries"][0]["refusals"]
+        assert refusal["values"]["timeframe"] == "H4"
+        assert launched.status_code == 202, launched.text
+        assert launched.json()["skipped"] == []
+
+    def test_every_pair_skipped_is_refused_as_missing_data_not_as_an_empty_grid(
+        self, client: Any, session: Session, queue: _CapturingQueue
+    ) -> None:
+        """⚠️ With nothing left, the size rule would say "no combination in this sweep can run" —
+        true, and blaming the grid for what is missing data."""
+        entry = an_entry(client, name=f"real {uuid.uuid4()}")
+        for dataset in session.scalars(select(Dataset).where(Dataset.timeframe == "M15")):
+            session.delete(dataset)
+        session.commit()
+        queue.jobs.clear()
+
+        refused = client.post("/sweeps", json=a_sweep_body([entry], ["EURUSD", "GBPUSD"], ["M15"]))
 
         assert refused.status_code == 422
-        assert "USDJPY M15" in refused.text
-        # ⚠️ Refused whole, and nothing enqueued. The other two markets do have data — running
-        # them and silently dropping the third would draw a map of a space it never searched.
+        assert refused.json()["detail"] == (
+            "no candles in this window for: "
+            "EURUSD M15 (never collected), GBPUSD M15 (never collected)"
+        )
         assert queue.jobs == []
+        session.expire_all()
+        assert session.scalars(select(Sweep)).all() == []
 
     def test_a_chart_that_was_never_collected_is_named_too(
         self, client: Any, session: Session
@@ -758,15 +875,43 @@ class TestTheDataHasToBeThere:
             },
         ).json()
 
-        assert preview["error"] is not None
+        # ⚠️ Not an error any more: the launch skips the pair rather than refusing (18/09), and a
+        # preview that still blocked would hold the button hostage to a no the server never says.
+        assert preview["error"] is None
         (uncovered,) = preview["uncovered"]
         assert uncovered["symbol"] == "GBPUSD"
         # The range it *does* hold, so the reader can move the window rather than guess at it.
         assert uncovered["covers"] is not None
-        # And the launch agrees, which is the whole point of a preview — in the words the
-        # basket and the single backtest use too (`coverage.describe`).
+        # And the launch agrees, which is the whole point of a preview: the same count, and the
+        # same pair named.
+        assert preview["runs"] == 1
+        launched = client.post("/sweeps", json=body).json()
+        assert launched["runs"] == preview["runs"]
+        assert launched["skipped"] == preview["uncovered"]
+
+    def test_the_preview_and_the_launch_refuse_an_all_skipped_sweep_in_one_sentence(
+        self, client: Any, session: Session
+    ) -> None:
+        entry = an_entry(client, name=f"real {uuid.uuid4()}")
+        for dataset in session.scalars(
+            select(Dataset).join(Instrument).where(Instrument.symbol == "GBPUSD")
+        ):
+            dataset.date_from = START + dt.timedelta(days=3650)
+            dataset.date_to = START + dt.timedelta(days=4015)
+        session.commit()
+
+        body = a_sweep_body([entry], ["GBPUSD"], ["M15"])
+        preview = client.post(
+            "/sweeps/preview",
+            json={
+                k: body[k] for k in ("entry_ids", "symbols", "timeframes", "date_from", "date_to")
+            },
+        ).json()
         refused = client.post("/sweeps", json=body)
+
+        assert preview["runs"] == 0
         assert refused.status_code == 422
+        # In the words the basket and the single backtest use too (`coverage.describe`).
         held = (
             f"{(START + dt.timedelta(days=3650)).date().isoformat()} to "
             f"{(START + dt.timedelta(days=4015)).date().isoformat()}"
@@ -774,6 +919,7 @@ class TestTheDataHasToBeThere:
         assert refused.json()["detail"] == (
             f"no candles in this window for: GBPUSD M15 (on disk: {held})"
         )
+        assert preview["error"] == refused.json()["detail"]
 
 
 class TestCollectingWhatASweepIsMissing:
@@ -954,7 +1100,8 @@ class TestCollectingWhatASweepIsMissing:
         self, client: Any, session: Session, queue: _CapturingQueue
     ) -> None:
         """⚠️ An empty plan is not "covered". A window wholly in the future has nothing to fetch
-        and no candle either; the sweep is refused whole, and nothing is written."""
+        and no candle either, so the pair is skipped even when told to collect — and being the
+        only pair here, nothing is left, the sweep is refused and nothing is written."""
         entry = an_entry(client, name=f"real {uuid.uuid4()}")
         ahead = dt.datetime.now(tz=dt.UTC) + dt.timedelta(days=30)
         queue.jobs.clear()
@@ -975,6 +1122,38 @@ class TestCollectingWhatASweepIsMissing:
         session.expire_all()
         assert session.scalars(select(Sweep)).all() == []
         assert session.scalars(select(Collection)).all() == []
+
+    def test_told_to_collect_a_pair_with_nothing_to_fetch_is_skipped_beside_one_that_waits(
+        self, client: Any, session: Session
+    ) -> None:
+        """The mixed case: GBPUSD M15 was never collected and can be; EURUSD M15 was never
+        collected and the broker's history starts after the window, so there is nothing to
+        fetch. One waits for its download, the other is left out and named."""
+        self.never_collected(session, "GBPUSD", "M15")
+        self.never_collected(session, "EURUSD", "M15")
+        session.add(
+            SymbolHistory(
+                symbol="EURUSD",
+                timeframe="M15",
+                oldest=START + dt.timedelta(days=1000),
+                bar_count=1000,
+                terminal_maxbars=100_000,
+                probed_at=START,
+            )
+        )
+        session.commit()
+
+        created = self.launch(client, ["EURUSD", "GBPUSD"], ["M15"], collect_missing=True)
+
+        assert created["runs"] == 3
+        assert [(one["symbol"], one["timeframe"]) for one in created["skipped"]] == [
+            ("EURUSD", "M15")
+        ]
+        session.expire_all()
+        (collection,) = session.scalars(select(Collection)).all()
+        assert collection.symbol == "GBPUSD"
+        waits = self.waits(session, created["id"])
+        assert waits == {("GBPUSD", "M15"): {collection.id}}
 
     def test_without_the_flag_nothing_is_collected(self, client: Any, session: Session) -> None:
         self.never_collected(session, "GBPUSD", "M15")

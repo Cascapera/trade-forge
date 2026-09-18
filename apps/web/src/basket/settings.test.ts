@@ -175,7 +175,11 @@ describe('toBasketRequest', () => {
       date_from: '2024-01-01T00:00:00Z',
       date_to: '2024-12-31T00:00:00Z',
       initial_capital: '10000',
+      // Asked for explicitly: "no" is an answer the person gave, and the launch reads it either
+      // way rather than inferring it from an absent key.
+      collect_missing: false,
     })
+    expect(toBasketRequest(form, 's1', 'H4', true).collect_missing).toBe(true)
     // ⚠️ Asserted as an absence, not merely omitted from the expectation above: the server
     // charges each market its own measured spread, and a `cost_model` sent from here would be a
     // single figure applied across instruments whose tick sizes differ by a thousandfold.

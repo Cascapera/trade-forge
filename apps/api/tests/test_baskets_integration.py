@@ -24,8 +24,16 @@ from sqlalchemy.orm import Session
 
 from tradeforge_api.config import Settings
 from tradeforge_api.main import create_app
+from tradeforge_api.queue import COLLECT_QUEUE, COLLECT_RANGE, RUN_BACKTEST
 from tradeforge_api.worker import process_backtest
-from tradeforge_db.models import Backtest, Basket, Instrument
+from tradeforge_db.models import (
+    Backtest,
+    BacktestCollection,
+    Basket,
+    Collection,
+    Dataset,
+    Instrument,
+)
 from tradeforge_engine.domain import AssetClass, Candle
 from tradeforge_engine.testing import bar
 
@@ -45,9 +53,14 @@ class _CapturingQueue:
 
     def __init__(self) -> None:
         self.jobs: list[tuple[str, tuple[Any, ...]]] = []
+        # ⚠️ The queue a job went on, recorded beside it: the downloads a basket asks for belong
+        # on the host's queue and its runs on the worker's, and a fake that dropped the option
+        # would agree with a launch that sent every job to the same place.
+        self.queued_on: list[tuple[str, str | None]] = []
 
     async def enqueue_job(self, function: str, *args: Any, **options: Any) -> None:
         self.jobs.append((function, args))
+        self.queued_on.append((function, options.get("_queue_name")))
 
 
 class _SilentRedis:
@@ -632,3 +645,143 @@ class TestAMarketWithNoCandlesInTheWindow:
 
         assert response.status_code == 422
         assert response.json()["detail"] == "unknown symbols: EURUSDX"
+
+
+class TestCollectingWhatABasketIsMissing:
+    """His rule, now for the basket: answered "collect", every market runs — each waiting for its
+    own downloads — instead of the empty ones being left out."""
+
+    @pytest.fixture
+    def client(
+        self, session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+    ) -> Any:
+        seeding = session_factory()
+        _seed_instruments(seeding)
+        seeding.close()
+        self.queue = _CapturingQueue()
+        with TestClient(_app(settings, session_factory, tmp_path, self.queue)) as opened:
+            yield opened
+
+    def _launch(self, client: Any, symbols: list[str], **over: Any) -> Any:
+        strategy_id = client.post("/strategies", json=_strategy()).json()["id"]
+        self.queue.jobs.clear()
+        return client.post("/baskets", json=_basket_body(strategy_id, symbols, **over))
+
+    def waits(self, session_factory: Callable[[], Session], run_id: str) -> list[Collection]:
+        with session_factory() as session:
+            return list(
+                session.scalars(
+                    select(Collection)
+                    .join(BacktestCollection, BacktestCollection.collection_id == Collection.id)
+                    .where(BacktestCollection.backtest_id == uuid.UUID(run_id))
+                )
+            )
+
+    def test_every_market_runs_and_each_waits_for_its_own_download(
+        self, client: Any, session_factory: Callable[[], Session], indexed: Callable[..., None]
+    ) -> None:
+        # EURUSD is collected; GBPUSD never was. Told to collect, both run.
+        indexed("EURUSD")
+        body = self._launch(client, ["EURUSD", "GBPUSD"], collect_missing=True).json()
+
+        assert [run["symbol"] for run in body["runs"]] == ["EURUSD", "GBPUSD"]
+        assert body["skipped"] == []
+        by_symbol = {run["symbol"]: run["backtest_id"] for run in body["runs"]}
+        # ⚠️ The link is per run, not per basket: the covered market must not wait for its
+        # neighbour's download.
+        assert self.waits(session_factory, by_symbol["EURUSD"]) == []
+        (waiting,) = self.waits(session_factory, by_symbol["GBPUSD"])
+        assert (waiting.symbol, waiting.timeframe) == ("GBPUSD", "H1")
+
+    def test_a_market_covered_in_part_waits_for_its_gap(
+        self, client: Any, session_factory: Callable[[], Session], indexed: Callable[..., None]
+    ) -> None:
+        """⚠️ The case the other tests cannot separate: EURUSD **can** run — it has candles inside
+        the window — and it still waits, because running now would measure half the window under a
+        heading that says all of it. GBPUSD beside it is covered whole and starts at once, so the
+        two branches are told apart in one launch."""
+        indexed("GBPUSD")
+        with session_factory() as session:
+            instrument = session.scalars(
+                select(Instrument).where(Instrument.symbol == "EURUSD")
+            ).one()
+            session.add(
+                Dataset(
+                    instrument_id=instrument.id,
+                    timeframe="H1",
+                    # The window opens at START; this begins a year later and runs past its end.
+                    date_from=START + dt.timedelta(days=365),
+                    date_to=START + dt.timedelta(days=800),
+                    candle_count=1000,
+                    parquet_path="EURUSD/H1",
+                )
+            )
+            session.commit()
+
+        body = self._launch(
+            client,
+            ["EURUSD", "GBPUSD"],
+            collect_missing=True,
+            date_from=START.isoformat(),
+            date_to=(START + dt.timedelta(days=700)).isoformat(),
+        ).json()
+
+        assert body["skipped"] == []
+        by_symbol = {run["symbol"]: run["backtest_id"] for run in body["runs"]}
+        (waiting,) = self.waits(session_factory, by_symbol["EURUSD"])
+        assert waiting.date_from.year == START.year
+        assert self.waits(session_factory, by_symbol["GBPUSD"]) == []
+
+    def test_the_downloads_go_on_the_hosts_queue_and_the_runs_on_the_workers(
+        self, client: Any, indexed: Callable[..., None]
+    ) -> None:
+        indexed("EURUSD")
+        self._launch(client, ["EURUSD", "GBPUSD"], collect_missing=True)
+
+        assert self.queue.queued_on.count((COLLECT_RANGE, COLLECT_QUEUE)) == 1
+        assert self.queue.queued_on.count((RUN_BACKTEST, None)) == 2
+
+    def test_without_the_flag_the_empty_market_is_still_left_out(
+        self, client: Any, indexed: Callable[..., None]
+    ) -> None:
+        indexed("EURUSD")
+        body = self._launch(client, ["EURUSD", "GBPUSD"]).json()
+
+        assert [run["symbol"] for run in body["runs"]] == ["EURUSD"]
+        assert [market["symbol"] for market in body["skipped"]] == ["GBPUSD"]
+
+    def test_a_market_with_nothing_to_collect_and_nothing_to_read_is_still_left_out(
+        self, client: Any, indexed: Callable[..., None]
+    ) -> None:
+        """⚠️ An empty plan is not "covered": a window wholly in the future has nothing to fetch
+        and no candle either, and a run over it would spend a worker to learn that."""
+        indexed("EURUSD")
+        ahead = dt.datetime.now(tz=dt.UTC) + dt.timedelta(days=30)
+        body = self._launch(
+            client,
+            ["EURUSD", "GBPUSD"],
+            collect_missing=True,
+            date_from=ahead.isoformat(),
+            date_to=(ahead + dt.timedelta(days=10)).isoformat(),
+        ).json()
+
+        assert [run["symbol"] for run in body["runs"]] == ["EURUSD"]
+        assert [market["symbol"] for market in body["skipped"]] == ["GBPUSD"]
+
+    def test_a_basket_where_nothing_can_run_or_be_collected_is_refused(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        ahead = dt.datetime.now(tz=dt.UTC) + dt.timedelta(days=30)
+        response = self._launch(
+            client,
+            ["EURUSD", "GBPUSD"],
+            collect_missing=True,
+            date_from=ahead.isoformat(),
+            date_to=(ahead + dt.timedelta(days=10)).isoformat(),
+        )
+
+        assert response.status_code == 422
+        assert "no market has candles in this window" in response.json()["detail"]
+        with session_factory() as verifying:
+            assert verifying.scalars(select(Basket)).all() == []
+            assert verifying.scalars(select(Collection)).all() == []

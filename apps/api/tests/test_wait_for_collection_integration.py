@@ -457,9 +457,68 @@ class TestTheWait:
             is BacktestStatus.DONE
         )
 
+    def test_a_queue_that_is_still_delivering_keeps_the_wait_alive(
+        self, waiting: str, session_factory: Callable[[], Session], queue: _Queue, tmp_path: Any
+    ) -> None:
+        """⚠️ The case a basket makes ordinary: the host agent downloads one collection at a
+        time, so the tenth market's download has not started three hours in — and the run was
+        created when the basket was launched. Giving up on it would fail a healthy system."""
+        old = dt.datetime.now(tz=dt.UTC) - dt.timedelta(hours=3)
+        with session_factory() as session:
+            run = session.get(Backtest, uuid.UUID(waiting))
+            assert run is not None
+            run.created_at = old
+            # Somebody else's download landed a minute ago: the queue is moving.
+            session.add(
+                Collection(
+                    symbol="GBPUSD",
+                    timeframe="H1",
+                    date_from=old,
+                    date_to=old,
+                    status=BacktestStatus.DONE,
+                    years_total=1,
+                    years_done=1,
+                    finished_at=dt.datetime.now(tz=dt.UTC) - dt.timedelta(minutes=1),
+                )
+            )
+            session.commit()
+        queue.jobs.clear()
+        work(session_factory, queue, waiting, tmp_path)
+
+        assert queue.of(RUN_BACKTEST) == [{"_defer_by": dt.timedelta(seconds=30)}]
+        assert self.run_status(session_factory, waiting).status is BacktestStatus.QUEUED
+
+    def test_a_fresh_run_waits_even_when_the_last_delivery_is_old(
+        self, waiting: str, session_factory: Callable[[], Session], queue: _Queue, tmp_path: Any
+    ) -> None:
+        """⚠️ The clock is the later of the two: this run was created a minute ago, and the last
+        thing the queue delivered landed three hours ago — probably because nobody asked for
+        anything in between. Timing the delivery alone would fail a run that has barely waited."""
+        with session_factory() as session:
+            session.add(
+                Collection(
+                    symbol="GBPUSD",
+                    timeframe="H1",
+                    date_from=START,
+                    date_to=START,
+                    status=BacktestStatus.DONE,
+                    years_total=1,
+                    years_done=1,
+                    finished_at=dt.datetime.now(tz=dt.UTC) - dt.timedelta(hours=3),
+                )
+            )
+            session.commit()
+        queue.jobs.clear()
+        work(session_factory, queue, waiting, tmp_path)
+
+        assert queue.of(RUN_BACKTEST) == [{"_defer_by": dt.timedelta(seconds=30)}]
+        assert self.run_status(session_factory, waiting).status is BacktestStatus.QUEUED
+
     def test_a_wait_that_outlives_the_limit_fails_rather_than_waiting_for_ever(
         self, waiting: str, session_factory: Callable[[], Session], queue: _Queue, tmp_path: Any
     ) -> None:
+        # ⚠️ Nothing has landed anywhere since: the queue itself is dead, which is the case
+        # this limit exists for — an agent that stopped, a terminal nobody logged in to.
         with session_factory() as session:
             run = session.get(Backtest, uuid.UUID(waiting))
             assert run is not None
@@ -471,5 +530,5 @@ class TestTheWait:
         run_row = self.run_status(session_factory, waiting)
         assert run_row.status is BacktestStatus.FAILED
         assert run_row.error is not None
-        assert "waited" in run_row.error
+        assert "nothing has been collected" in run_row.error
         assert queue.of(RUN_BACKTEST) == []

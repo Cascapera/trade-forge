@@ -108,6 +108,7 @@ export function toBasketRequest(
   form: BasketForm,
   strategyId: string,
   timeframe: string,
+  collectMissing = false,
 ): CreateBasketRequest {
   return {
     strategy_id: strategyId,
@@ -116,6 +117,7 @@ export function toBasketRequest(
     date_from: toIso(form.dateFrom),
     date_to: toIso(form.dateTo),
     initial_capital: form.capital,
+    collect_missing: collectMissing,
   }
 }
 

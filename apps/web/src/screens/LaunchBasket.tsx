@@ -54,9 +54,9 @@ export function LaunchBasket(): React.JSX.Element {
   const blocked = strategyId === null ? 'choose a strategy' : whyNotLaunchable(form)
   const uncosted = uncostedAmong(form.symbols, instruments.data)
 
-  const launch = (): void => {
+  const launch = (collectMissing = false): void => {
     if (strategyId === null || strategyName === null) return
-    create.mutate(toBasketRequest(form, strategyId, timeframe), {
+    create.mutate(toBasketRequest(form, strategyId, timeframe, collectMissing), {
       onSuccess: (created) => {
         setBasket(created.id, basketLabel(strategyName, created.runs.length))
         // ⚠️ Carried to the result page, because only this response knows them: the basket
@@ -65,7 +65,10 @@ export function LaunchBasket(): React.JSX.Element {
       },
     })
   }
-  const gate = useMissingDataGate(launch, instruments.data)
+  // ⚠️ The plan is asked with the flag off: nothing missing means an ordinary launch.
+  const gate = useMissingDataGate(() => {
+    launch()
+  })
 
   // Asked first, launched only if nothing is missing — otherwise the prompt below decides.
   const run = (): void => {
@@ -197,7 +200,13 @@ export function LaunchBasket(): React.JSX.Element {
 
       <MissingDataPrompt
         gate={gate}
-        onRunAnyway={launch}
+        onRunAnyway={() => {
+          launch()
+        }}
+        // Each market waits for its own downloads, and the covered ones start at once.
+        onCollectAndRun={() => {
+          launch(true)
+        }}
         launching={create.isPending}
         canRun={gate.missing === null || anythingToRun(form.symbols, gate.missing)}
       />

@@ -794,6 +794,15 @@ class CreateBasketRequest(BaseModel):
     date_from: AwareInstant
     date_to: AwareInstant
     initial_capital: Decimal = Field(gt=0)
+    collect_missing: bool = False
+    """Collect what each market is missing, and run it once its own downloads have landed.
+
+    ⚠️ **Per market, not per basket.** A basket mixes markets that are covered with markets
+    that are not; a **fully** covered market starts at once and every other one waits for its own
+    windows — including a market covered in part, which waits for the gap rather than running
+    over a window it could only half read. Left false, a market with no candles in the window
+    is skipped and named (`CreatedBasket.skipped`), which is his rule for the answer "no".
+    """
 
     @field_validator("symbols")
     @classmethod

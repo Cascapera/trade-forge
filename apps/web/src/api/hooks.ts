@@ -192,54 +192,6 @@ export function usePlanCollections() {
   })
 }
 
-/**
- * A queue that stopped part-way: what was queued before the refusal, and the refusal itself.
- *
- * ⚠️ Kept rather than dropped, because the collections before it **are** on the queue. A screen
- * that showed only the error would leave the person to press again and queue those twice — the
- * server does not merge identical requests.
- */
-export class CollectionStopped extends Error {
-  constructor(
-    readonly queued: Collection[],
-    readonly refusal: unknown,
-  ) {
-    super('the collection stopped part-way')
-    this.name = 'CollectionStopped'
-  }
-}
-
-/**
- * Queue these collection requests, one after another, stopping at the first refusal.
- *
- * `onQueued` hears about each request the server accepted, as it is accepted — which is how the
- * caller keeps track of what not to send again, even when a later one fails.
- */
-export function useCollectMissing() {
-  const client = useQueryClient()
-  return useMutation<
-    Collection[],
-    CollectionStopped,
-    { bodies: readonly CreateCollection[]; onQueued: (body: CreateCollection) => void }
-  >({
-    mutationFn: async ({ bodies, onQueued }) => {
-      const created: Collection[] = []
-      for (const body of bodies) {
-        try {
-          created.push(...(await api.createCollection(body)))
-        } catch (refusal) {
-          throw new CollectionStopped(created, refusal)
-        }
-        onQueued(body)
-      }
-      return created
-    },
-    onSettled: () => {
-      void client.invalidateQueries({ queryKey: ['collections'] })
-    },
-  })
-}
-
 export function useSyncSymbols() {
   const client = useQueryClient()
   return useMutation<{ job: string }>({

@@ -1,21 +1,13 @@
-import { Link } from 'react-router-dom'
-
 import { apiFailure } from '../api/failure'
 import type { MissingDataGate } from '../collect/gate'
 import { missingLine } from '../collect/missing'
 
-function plural(count: number, one: string, many: string): string {
-  return count === 1 ? one : many
-}
-
 /**
  * The prompt: what is missing, and the answers.
  *
- * - **Collect and run** (`onCollectAndRun`, where the launch takes `collect_missing`) hands the
- *   whole thing to the server: it plans the windows, queues the downloads, and the run starts by
- *   itself when they land.
- * - **Collect what is missing** is the older answer, still the basket's: the downloads are queued
- *   from here, and the person runs again once they have finished.
+ * - **Collect and run** hands the whole thing to the server (`collect_missing`): it plans the
+ *   windows, queues the downloads, links them to the runs, and each run starts by itself once its
+ *   own downloads have landed.
  * - **Run with what there is** launches now. The server runs the part of the window that exists;
  *   a single backtest with nothing in the window is refused, and a basket leaves such a market out
  *   and names it.
@@ -35,21 +27,25 @@ export function MissingDataPrompt({
 }: {
   gate: MissingDataGate
   onRunAnyway: () => void
-  /** Launch now and let the server collect first, where it can (`collect_missing`). ⚠️ Absent on
-   *  a screen whose launch does not take that flag — the basket, until its own slice — and there
-   *  the prompt queues the downloads by itself and the person runs again. */
-  onCollectAndRun?: () => void
+  /** Launch now and let the server collect first (`collect_missing`), then run by itself. */
+  onCollectAndRun: () => void
   launching: boolean
   /** Whether any market being launched would read a candle. ⚠️ False hides the run: the launch
    *  would be refused, and offering it offers nothing. A plan that could not be asked cannot
    *  answer this, so the run is offered there regardless. */
   canRun: boolean
 }): React.JSX.Element | null {
-  const { missing, plan, collection, outstanding } = gate
+  const { missing, plan } = gate
 
   const runButton = (label: string): React.JSX.Element => (
     <button type="button" disabled={launching} onClick={onRunAnyway} className={secondary}>
       {launching ? 'Enqueuing…' : label}
+    </button>
+  )
+
+  const collectButton = (): React.JSX.Element => (
+    <button type="button" disabled={launching} onClick={onCollectAndRun} className={primary}>
+      {launching ? 'Enqueuing…' : 'Collect and run'}
     </button>
   )
 
@@ -63,16 +59,7 @@ export function MissingDataPrompt({
         <div className="flex flex-wrap gap-3">
           {/* ⚠️ Offered here too, and it is the better answer: this button needs no plan — the
               server makes its own and collects whatever the window is missing. */}
-          {onCollectAndRun !== undefined && (
-            <button
-              type="button"
-              disabled={launching}
-              onClick={onCollectAndRun}
-              className={primary}
-            >
-              {launching ? 'Enqueuing…' : 'Collect and run'}
-            </button>
-          )}
+          {collectButton()}
           {runButton('Run anyway')}
         </div>
       </section>
@@ -80,11 +67,6 @@ export function MissingDataPrompt({
   }
   if (missing === null) return null
 
-  const queued = collection.isSuccess
-    ? collection.data.length
-    : collection.isError
-      ? collection.error.queued.length
-      : null
   return (
     <section aria-label="missing data" className={panel}>
       <p className="font-medium">Some of this window has not been collected:</p>
@@ -94,42 +76,8 @@ export function MissingDataPrompt({
         ))}
       </ul>
 
-      {queued !== null && queued > 0 && (
-        <p role="status" className="text-emerald-300">
-          Queued {queued} {plural(queued, 'collection', 'collections')}. Follow{' '}
-          {plural(queued, 'it', 'them')} on{' '}
-          <Link to="/collect" className="underline">
-            Collect
-          </Link>{' '}
-          and run again once {plural(queued, 'it has', 'they have')} finished.
-        </p>
-      )}
-      {collection.isError && (
-        <p className="text-red-400">
-          {queued === 0 ? 'Nothing was queued: ' : 'The rest was not queued: '}
-          {apiFailure(collection.error.refusal, 'the server refused the collection.')}
-        </p>
-      )}
-
       <div className="flex flex-wrap gap-3">
-        {onCollectAndRun === undefined ? (
-          <button
-            type="button"
-            disabled={collection.isPending || outstanding === 0}
-            onClick={gate.collect}
-            className={primary}
-          >
-            {collection.isPending
-              ? 'Queueing…'
-              : outstanding === 0
-                ? 'Already queued'
-                : 'Collect what is missing'}
-          </button>
-        ) : (
-          <button type="button" disabled={launching} onClick={onCollectAndRun} className={primary}>
-            {launching ? 'Enqueuing…' : 'Collect and run'}
-          </button>
-        )}
+        {collectButton()}
         {canRun ? (
           runButton('Run with what there is')
         ) : (

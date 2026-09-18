@@ -27,7 +27,7 @@ const { mutate, history, documents, gate } = vi.hoisted(() => {
     mutate: vi.fn(),
     history: vi.fn(),
     documents: reads,
-    gate: { plan, collect: vi.fn(), collectMode: 'take' },
+    gate: { plan },
   }
 })
 
@@ -69,24 +69,6 @@ vi.mock('../api/hooks', () => ({
     isPending: false,
     isError: false,
   }),
-  useCollectMissing: () => ({
-    // `take`: each request is reported as taken and the sending ends, as the real hook does.
-    // `hold`: still sending. `refuse`: the sending ends with nothing taken.
-    mutate: (
-      variables: { bodies: unknown[]; onQueued: (body: unknown) => void },
-      options?: { onSettled?: () => void },
-    ) => {
-      gate.collect(variables.bodies)
-      if (gate.collectMode === 'hold') return
-      if (gate.collectMode === 'take') for (const body of variables.bodies) variables.onQueued(body)
-      options?.onSettled?.()
-    },
-    reset: () => undefined,
-    isPending: false,
-    isSuccess: false,
-    isError: false,
-    data: undefined,
-  }),
   // The server's list, which is what the picker offers — not this tab's memory.
   useStrategies: () => ({
     data: {
@@ -112,7 +94,6 @@ afterEach(() => {
   gate.plan.answer = []
   gate.plan.hold = false
   gate.plan.pending = null
-  gate.collectMode = 'take'
 })
 
 function fillIn(): void {
@@ -315,7 +296,6 @@ describe('LaunchBacktest when data is missing', () => {
     fireEvent.click(runButton())
     fireEvent.click(screen.getByRole('button', { name: 'Collect and run' }))
 
-    expect(gate.collect).not.toHaveBeenCalled()
     expect(mutate).toHaveBeenCalledTimes(1)
     expect((mutate.mock.calls[0]?.[0] as { collect_missing: boolean }).collect_missing).toBe(true)
   })

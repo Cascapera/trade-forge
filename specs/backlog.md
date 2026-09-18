@@ -2428,3 +2428,9 @@ antes, ou recusar reescrever uma partição com menos barras do que ela tinha.
   assimetria é acidental.
 * **Uma coleta que falha derruba o run e as irmãs seguem baixando** sem ninguém esperando por
   elas. Não corrompe nada, mas gasta o agente.
+
+* ✅ **RESOLVIDO na PR-267 (por remoção)** — "Já enfileirado" vivia só enquanto a aba estava
+  aberta. A tela não enfileira mais coleta nenhuma: quem planeja e cria é o lançamento. A defesa
+  contra baixar a mesma janela duas vezes passa a ser só a do servidor, que continua **aberta**:
+  recusar (ou reaproveitar) uma coleta idêntica a uma que já está `queued`/`running`. ⚠️ A cesta
+  multiplica o alcance disso por até 20 por clique.

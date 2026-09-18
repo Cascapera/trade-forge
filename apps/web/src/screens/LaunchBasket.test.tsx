@@ -18,7 +18,7 @@ const { mutate, state, gate, navigate } = vi.hoisted(() => {
   return {
     mutate: vi.fn(),
     state,
-    gate: { plan, collect: vi.fn(), collectMode: 'take' },
+    gate: { plan },
     navigate: vi.fn(),
   }
 })
@@ -56,24 +56,6 @@ vi.mock('../api/hooks', () => ({
     isPending: false,
     isError: false,
   }),
-  useCollectMissing: () => ({
-    // `take`: each request is reported as taken and the sending ends, as the real hook does.
-    // `hold`: still sending. `refuse`: the sending ends with nothing taken.
-    mutate: (
-      variables: { bodies: unknown[]; onQueued: (body: unknown) => void },
-      options?: { onSettled?: () => void },
-    ) => {
-      gate.collect(variables.bodies)
-      if (gate.collectMode === 'hold') return
-      if (gate.collectMode === 'take') for (const body of variables.bodies) variables.onQueued(body)
-      options?.onSettled?.()
-    },
-    reset: () => undefined,
-    isPending: false,
-    isSuccess: false,
-    isError: false,
-    data: undefined,
-  }),
   // The strategy picker asks the server what exists. Empty here: these tests are about the
   // basket's own rules, and the picker has its own test.
   useStrategies: () => ({ data: { total: 0, limit: 200, offset: 0, items: [] }, isPending: false }),
@@ -91,7 +73,6 @@ beforeEach(() => {
   gate.plan.answer = []
   gate.plan.hold = false
   gate.plan.pending = null
-  gate.collectMode = 'take'
 })
 
 afterEach(() => {
@@ -272,29 +253,6 @@ describe('LaunchBasket when data is missing', () => {
     expect(navigate).toHaveBeenCalledWith('/baskets/k9', { state: { skipped } })
   })
 
-  it('queues a market the broker files outside the five classes with the class the catalogue holds', () => {
-    // XAUUSD sits under Metals on this broker, a path the collection endpoint cannot classify —
-    // without the catalogue's answer the whole request would be refused with a 409.
-    gate.plan.answer = [
-      {
-        symbol: 'XAUUSD',
-        timeframe: 'H1',
-        covers: null,
-        in_window: false,
-        windows: [{ date_from: '2024-01-01T00:00:00Z', date_to: '2024-12-31T23:59:59.999999Z' }],
-      },
-    ]
-    useSession.getState().setStrategy('s1', 'MA cross')
-    renderWithProviders(<LaunchBasket />)
-    pick('EURUSD, 8 ticks')
-    pick('XAUUSD, no spread measured')
-    fireEvent.click(screen.getByRole('button', { name: /run 2 markets/i }))
-    fireEvent.click(screen.getByRole('button', { name: 'Collect what is missing' }))
-
-    expect(gate.collect).toHaveBeenCalledWith([
-      expect.objectContaining({ items: [{ symbol: 'XAUUSD', asset_class: 'future' }] }),
-    ])
-  })
 
   it('still offers the run when only one market of the basket is empty', () => {
     // ⚠️ The basket's rule: the markets with data run, and the server names the one left out.
@@ -313,67 +271,42 @@ describe('LaunchBasket when data is missing', () => {
     expect(screen.getByRole('button', { name: 'Run with what there is' })).toBeInTheDocument()
   })
 
-  // ⚠️ Moved here from the backtest screen with PR-266: that screen now asks the server to
-  // collect and run in one press, so queueing downloads from the prompt lives only here until
-  // the basket's launch takes the same flag.
-  const MISSING_GBP = [
-    {
-      symbol: 'GBPUSD',
-      timeframe: 'H4',
-      covers: null,
-      in_window: false,
-      windows: [{ date_from: '2024-01-01T00:00:00Z', date_to: '2024-12-31T23:59:59.999999Z' }],
-    },
-  ]
-
-  it('queues the collection when told to, and does not launch', () => {
-    gate.plan.answer = MISSING_GBP
-    chosen()
-    fireEvent.click(screen.getByRole('button', { name: /run 2 markets/i }))
-    fireEvent.click(screen.getByRole('button', { name: 'Collect what is missing' }))
-
-    expect(gate.collect).toHaveBeenCalledWith([
+  it('collects and runs in one press, letting the server plan every market', () => {
+    // ⚠️ One flag for the whole basket, and the server decides per market: the covered ones
+    // start at once, and only the others wait for their own downloads.
+    gate.plan.answer = [
       {
-        items: [{ symbol: 'GBPUSD' }],
-        rows: [{ timeframe: 'H4', ...MISSING_GBP[0]!.windows[0]! }],
+        symbol: 'GBPUSD',
+        timeframe: 'H4',
+        covers: null,
+        in_window: false,
+        windows: [{ date_from: '2024-01-01T00:00:00Z', date_to: '2024-12-31T23:59:59.999999Z' }],
       },
-    ])
-    expect(mutate).not.toHaveBeenCalled()
-  })
-  it('never queues the same window twice, however often it is pressed', () => {
-    // ⚠️ The server does not merge identical requests: a second press would download the same
-    // year again. Pressed twice before the screen re-renders, and once more after a new Run.
-    gate.plan.answer = MISSING_GBP
+    ]
     chosen()
     fireEvent.click(screen.getByRole('button', { name: /run 2 markets/i }))
-    const collect = screen.getByRole('button', { name: 'Collect what is missing' })
-    fireEvent.click(collect)
-    fireEvent.click(collect)
-    fireEvent.click(screen.getByRole('button', { name: /run 2 markets/i }))
+    fireEvent.click(screen.getByRole('button', { name: 'Collect and run' }))
 
-    expect(gate.collect).toHaveBeenCalledTimes(1)
-    expect(screen.getByRole('button', { name: 'Already queued' })).toBeDisabled()
+    expect(mutate).toHaveBeenCalledTimes(1)
+    const payload = mutate.mock.calls[0]?.[0] as { collect_missing: boolean; symbols: string[] }
+    expect(payload.collect_missing).toBe(true)
+    expect(payload.symbols).toEqual(['EURUSD', 'GBPUSD'])
   })
-  it('sends nothing on a second press while the first is still sending', () => {
-    gate.plan.answer = MISSING_GBP
-    gate.collectMode = 'hold'
+
+  it('runs with what there is without asking for a collection', () => {
+    gate.plan.answer = [
+      {
+        symbol: 'GBPUSD',
+        timeframe: 'H4',
+        covers: null,
+        in_window: false,
+        windows: [{ date_from: '2024-01-01T00:00:00Z', date_to: '2024-12-31T23:59:59.999999Z' }],
+      },
+    ]
     chosen()
     fireEvent.click(screen.getByRole('button', { name: /run 2 markets/i }))
-    fireEvent.click(screen.getByRole('button', { name: 'Collect what is missing' }))
-    fireEvent.click(screen.getByRole('button', { name: 'Collect what is missing' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Run with what there is' }))
 
-    expect(gate.collect).toHaveBeenCalledTimes(1)
-  })
-  it('offers a refused window again', () => {
-    // Nothing was taken, so nothing would be downloaded twice — and the person may have fixed
-    // what the server refused.
-    gate.plan.answer = MISSING_GBP
-    gate.collectMode = 'refuse'
-    chosen()
-    fireEvent.click(screen.getByRole('button', { name: /run 2 markets/i }))
-    fireEvent.click(screen.getByRole('button', { name: 'Collect what is missing' }))
-    fireEvent.click(screen.getByRole('button', { name: 'Collect what is missing' }))
-
-    expect(gate.collect).toHaveBeenCalledTimes(2)
+    expect((mutate.mock.calls[0]?.[0] as { collect_missing: boolean }).collect_missing).toBe(false)
   })
 })

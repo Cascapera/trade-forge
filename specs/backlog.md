@@ -2449,3 +2449,22 @@ antes, ou recusar reescrever uma partição com menos barras do que ela tinha.
   runs dela adiam até a fila ficar em silêncio por `WAIT_LIMIT`.
 * **A tela da varredura ainda não oferece "Collect and run"**: é a próxima fatia. ⚠️
   `anythingToRun` (`collect/missing.ts`) compara só pelo símbolo e não serve para vários charts.
+
+## O que a fatia "a varredura pula o par vazio" (PR-269) deixou de fora
+
+* **A tela ainda bloqueia** o lançamento quando há par sem dado (`LaunchSweep.tsx`, `blocked`),
+  embora o servidor agora pule. É a próxima fatia: "Collect and run" / "rodar com o que tem" e os
+  pulados na tela de resultado (`SweepOut.skipped`).
+* **O dataset exportado e o dashboard não citam os pulados.** `Sweep.skipped` está gravado, mas o
+  CSV/dicionário (`sweep_dataset.py`) e `GET /sweeps/dashboard` não o leem: um par pulado some do
+  dataset sem uma linha de aviso no dicionário.
+* **A lista de varreduras** (`GET /sweeps`) não diz que uma varredura tem buraco.
+* **Ensaio e lançamento com coleta podem discordar no teto.** `PreviewSweepRequest` não tem
+  `collect_missing`, e `preview.runs` conta o lançamento **sem** coletar (o menor dos dois). Um
+  ensaio com `error: null` e 2900 runs pode virar 422 "over the 3000" no "Collect and run", que
+  roda também os pares descobertos. Conserto: o ensaio devolver as duas contagens, ou aceitar o
+  flag.
+* **Para a #270:** `LaunchSweep.tsx` só mostra `serverError` quando `uncovered` está vazio, com
+  o comentário "o servidor põe `error` junto de `uncovered` num buraco de cobertura". Desde a
+  PR-269 isso só vale para "tudo pulado": num buraco parcial com erro de teto, a tela esconderia
+  a frase do teto. Rever a guarda junto com o botão.

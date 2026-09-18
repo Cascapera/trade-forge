@@ -12,10 +12,13 @@ run's timeframe would trip it on every point; setting both from one value means 
 disagree, and the only check left is the DSL's own semantics — which `refusal_of` already gives
 in the words a screen knows how to render.
 
-⚠️ **The preview subtracts refusals; the launch refuses nothing quietly.** A combination that
-cannot run is reported per entry before anything is written, and the sweep then enqueues exactly
-what the preview promised. A sweep that silently dropped points would draw a map of a space it
-never searched, and it would look exactly like a map of one it did.
+⚠️ **The preview subtracts what will not run; the launch drops nothing quietly.** A combination
+the DSL refuses is reported per entry, and a (market, chart) with no candles in the window is
+named as uncovered, before anything is written. Launched without collecting, the sweep enqueues
+exactly what the preview counted and keeps the uncovered pairs as `Sweep.skipped`; told to
+collect, it runs those pairs too, once their downloads land. A sweep that silently dropped points
+would draw a map of a space it never searched, and it would look exactly like a map of one it
+did — which is why a hole is always written down, never merely left.
 """
 
 import json
@@ -56,6 +59,7 @@ from tradeforge_api.schemas import (
     SweepRunCounts,
     SweepRunOut,
     SweepsPage,
+    UncoveredMarket,
 )
 from tradeforge_api.sweep import (
     SweepDocument,
@@ -135,6 +139,54 @@ def _expand(
     return out
 
 
+def _combinations(
+    documents: list[SweepDocument], symbols: list[str], skipped: list[UncoveredMarket]
+) -> list[tuple[SweepDocument, str]]:
+    """Every (document, market) the sweep runs: the product, less the pairs with nothing to read.
+
+    ⚠️ **Skipped by pair, not by market.** A market can hold M15 and not H4, and dropping it from
+    every chart for the want of one would leave out runs that could have read every bar.
+    """
+    empty = {(market.symbol, market.timeframe) for market in skipped}
+    return [
+        (doc, symbol)
+        for doc in documents
+        for symbol in symbols
+        if (symbol, doc.timeframe) not in empty
+    ]
+
+
+def _worth_naming(
+    uncovered: list[UncoveredMarket], documents: list[SweepDocument]
+) -> list[UncoveredMarket]:
+    """The uncovered pairs on a chart where some point can run — the ones that are a hole.
+
+    ⚠️ **A chart the DSL refused everywhere is not missing data.** An H4 filter cannot run on H4,
+    so EURUSD H4 without candles has no run to lose: naming it as skipped would offer a download
+    that produces nothing, and would blur the two absences `Sweep.skipped` exists to keep apart.
+    That chart is reported where it belongs, as the preview's refusals.
+    """
+    charts = {doc.timeframe for doc in documents}
+    return [market for market in uncovered if market.timeframe in charts]
+
+
+def _nothing_to_read(
+    documents: list[SweepDocument],
+    combinations: list[tuple[SweepDocument, str]],
+    skipped: list[UncoveredMarket],
+) -> str | None:
+    """Why a sweep whose every runnable point landed on a skipped pair cannot be launched.
+
+    ⚠️ **Asked before the size rule, and only when there were points to run.** With every pair
+    skipped the sweep is empty, and the size rule's "no combination in this sweep can run" would
+    blame the grid for what is missing data. With no runnable point at all, the grid *is* to
+    blame, and the size rule says so.
+    """
+    if documents and not combinations:
+        return "no candles in this window for: " + ", ".join(map(describe, skipped))
+    return None
+
+
 @router.post("/sweeps/preview", response_model=SweepPreview, responses={**_NOT_FOUND, **_BAD_BODY})
 def preview_sweep(request: PreviewSweepRequest, session: SessionDep) -> SweepPreview:
     """What this sweep would enqueue, without enqueuing any of it.
@@ -144,9 +196,9 @@ def preview_sweep(request: PreviewSweepRequest, session: SessionDep) -> SweepPre
     second copy of the contract, wrong the day either changed.
 
     Reports rather than decides, like the study's preview and for the same reason: a person
-    fixing one axis per round trip is the round trip this endpoint exists to remove. The cap is
-    the one refusal it reports as an `error` instead, because a sweep over the cap has no runs to
-    describe.
+    fixing one axis per round trip is the round trip this endpoint exists to remove. What would
+    make the launch refuse — nothing runnable, every pair without data, a product over the cap —
+    is reported as an `error` instead, in the launch's own words.
     """
     pairs = _entries(session, request.entry_ids)
 
@@ -166,7 +218,6 @@ def preview_sweep(request: PreviewSweepRequest, session: SessionDep) -> SweepPre
     documents = _expand(pairs, timeframes)
 
     per_entry: list[SweepEntryPreview] = []
-    runnable = 0
     for entry, _strategy in pairs:
         mine = [doc for doc in documents if doc.entry_id == str(entry.id)]
         refusals = [
@@ -174,7 +225,6 @@ def preview_sweep(request: PreviewSweepRequest, session: SessionDep) -> SweepPre
             for doc in mine
             if (reason := refusal_of(dict(doc.document))) is not None
         ]
-        runnable += len(mine) - len(refusals)
         per_entry.append(
             SweepEntryPreview(
                 entry_id=entry.id,
@@ -184,23 +234,23 @@ def preview_sweep(request: PreviewSweepRequest, session: SessionDep) -> SweepPre
             )
         )
 
-    uncovered = uncovered_markets(
-        session, list(request.symbols), timeframes, request.date_from, request.date_to
+    runnable_documents = [doc for doc in documents if refusal_of(dict(doc.document)) is None]
+    uncovered = _worth_naming(
+        uncovered_markets(
+            session, list(request.symbols), timeframes, request.date_from, request.date_to
+        ),
+        runnable_documents,
     )
 
-    runs = runnable * len(request.symbols)
-    error = None
-    if uncovered:
-        error = (
-            f"{len(uncovered)} of these markets have no candles in this window; "
-            "move the window or collect them first"
-        )
-    else:
-        # ⚠️ The cap and the empty sweep are asked of the module, not restated here — the
-        # launch below asks the same function, so the two endpoints cannot answer this in
-        # different words. Reported as an `error` rather than raised, which is the one thing
-        # that *is* different: a preview that raised would have nothing to preview.
-        error = size_refusal(runs)
+    # ⚠️ Counted as the launch counts them when told not to collect: the pairs with no candles
+    # are skipped, not refused (his rule, 18/09), so they subtract rather than block.
+    # ⚠️ The empty sweep and the cap are asked of the same functions the launch below asks, so
+    # the two endpoints cannot answer this in different words. Reported as an `error` rather than
+    # raised, which is the one thing that *is* different: a preview that raised would have
+    # nothing to preview.
+    combinations = _combinations(runnable_documents, list(request.symbols), uncovered)
+    runs = len(combinations)
+    error = _nothing_to_read(runnable_documents, combinations, uncovered) or size_refusal(runs)
 
     return SweepPreview(
         runs=runs,
@@ -220,15 +270,17 @@ def preview_sweep(request: PreviewSweepRequest, session: SessionDep) -> SweepPre
 async def create_sweep(request: CreateSweep, session: SessionDep, queue: QueueDep) -> CreatedSweep:
     """Write the sweep, its strategies and its runs in one transaction, then enqueue.
 
-    **Nothing is written until every combination has passed.** A sweep that half-exists is worse
-    than one that was refused: the caller asked one question about a space, and four hundred runs
-    plus an error answers a question nobody asked. The same doctrine as the study, one axis up.
+    **All or nothing in the face of a refusal.** Every refusal is decided before anything is
+    written: a sweep that half-exists is worse than one that was refused, because the caller
+    asked one question about a space, and four hundred runs plus an error answers a question
+    nobody asked. The same doctrine as the study, one axis up.
 
-    ⚠️ **Refused combinations are dropped, and the preview already said which.** That is not the
-    silent trimming the caps refuse — a point that cannot run is not part of the space, and
-    enqueuing it to fail would spend a worker to re-learn what `assert_executable` knew before
-    anything started. What must never be dropped silently is a point that *could* have run, which
-    is why the cap refuses the whole request instead.
+    ⚠️ **Two kinds of point are left out, and both are named.** A combination the DSL refuses is
+    not part of the space — enqueuing it to fail would spend a worker to re-learn what
+    `assert_executable` knew — and the preview names it. A pair with no candles in the window is
+    part of the space and has nothing to read (his answer "do not collect", 18/09): it is left out
+    and written on the sweep as `skipped`. What must never happen is a point that *could* have
+    run disappearing without a name, which is why the cap refuses the whole request instead.
     """
     pairs = _entries(session, request.entry_ids)
     timeframes = list(request.timeframes)
@@ -266,34 +318,43 @@ async def create_sweep(request: CreateSweep, session: SessionDep, queue: QueueDe
     )
     collectable = {(market.symbol, market.timeframe): market for market in planned}
 
-    # ⚠️ Refused, not dropped, and named one by one. Enqueuing a run that cannot read a single
-    # candle spends a worker to re-learn what the `datasets` index already knows — which is what
-    # the first real sweep did, nine times out of twelve.
-    # ⚠️ A pair with something to fetch is not refused when told to collect; an empty plan is
-    # not "covered", though. A window wholly in the future, or older than the broker's first
-    # bar, has nothing to download and nothing to read, and is refused like any other.
-    uncovered = [
-        market
-        for market in uncovered_markets(
-            session, list(request.symbols), timeframes, request.date_from, request.date_to
-        )
-        if (market.symbol, market.timeframe) not in collectable
-    ]
-    if uncovered:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="no candles in this window for: " + ", ".join(map(describe, uncovered)),
-        )
-
+    # ⚠️ **Skipped and named, never enqueued** — his answer "do not collect" (18/09). A run that
+    # cannot read a single candle spends a worker to re-learn what the `datasets` index already
+    # knows, which is what the first real sweep did nine times out of twelve. The sweep used to
+    # refuse the whole launch over one such pair; the rest runs now, and the hole is written on
+    # the sweep itself (`Sweep.skipped`) so the map never passes for complete.
+    # ⚠️ A pair with something to fetch is not skipped when told to collect; an empty plan is not
+    # "covered", though. A window wholly in the future, or older than the broker's first bar, has
+    # nothing to download and nothing to read, and is skipped like any other.
     documents = [
         doc for doc in _expand(pairs, timeframes) if refusal_of(dict(doc.document)) is None
     ]
-    total = len(documents) * len(request.symbols)
-    # The same question the preview asked, of the same function, so the words a person read on
+    skipped = [
+        market
+        for market in _worth_naming(
+            uncovered_markets(
+                session, list(request.symbols), timeframes, request.date_from, request.date_to
+            ),
+            documents,
+        )
+        if (market.symbol, market.timeframe) not in collectable
+    ]
+    combinations = _combinations(documents, list(request.symbols), skipped)
+    # The same questions the preview asked, of the same functions, so the words a person read on
     # the screen are the words they get back from the button.
-    refusal = size_refusal(total)
+    refusal = _nothing_to_read(documents, combinations, skipped) or size_refusal(len(combinations))
     if refusal is not None:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=refusal)
+    # ⚠️ Only after the refusals, which need every runnable document to tell "all skipped" from
+    # "nothing runnable". A chart skipped on every market leaves documents no run reads; writing
+    # them would put points on the map with nothing measured under them.
+    # ⚠️ Read from `combinations`, never re-derived: the rule for which pairs run has one owner,
+    # and a second copy would let the preview's count and the runs written drift apart. Keyed by
+    # `id()`, which holds because every document stays alive in `documents` until the runs exist.
+    markets_of: dict[int, list[str]] = {}
+    for doc, symbol in combinations:
+        markets_of.setdefault(id(doc), []).append(symbol)
+    documents = [doc for doc in documents if id(doc) in markets_of]
 
     sweep = Sweep(
         entry_ids=[str(one) for one in request.entry_ids],
@@ -302,6 +363,7 @@ async def create_sweep(request: CreateSweep, session: SessionDep, queue: QueueDe
         date_from=request.date_from,
         date_to=request.date_to,
         initial_capital=request.initial_capital,
+        skipped=[market.model_dump() for market in skipped],
     )
     session.add(sweep)
 
@@ -331,7 +393,7 @@ async def create_sweep(request: CreateSweep, session: SessionDep, queue: QueueDe
     runs: list[Backtest] = []
     paired: list[tuple[SweepDocument, str, Backtest]] = []
     for doc, strategy in zip(documents, strategies, strict=True):
-        for symbol in request.symbols:
+        for symbol in markets_of[id(doc)]:
             run = Backtest(
                 sweep=sweep,
                 strategy_id=strategy.id,
@@ -376,7 +438,7 @@ async def create_sweep(request: CreateSweep, session: SessionDep, queue: QueueDe
     for run in runs:
         await queue.enqueue_job(RUN_BACKTEST, str(run.id), _job_id=str(run.id))
 
-    return CreatedSweep(id=sweep.id, runs=len(runs))
+    return CreatedSweep(id=sweep.id, runs=len(runs), skipped=skipped)
 
 
 def _collections_for(
@@ -687,6 +749,7 @@ def get_sweep(sweep_id: uuid.UUID, session: SessionDep) -> SweepOut:
         created_at=sweep.created_at,
         entries=summaries,
         runs=out,
+        skipped=[UncoveredMarket.model_validate(one) for one in sweep.skipped],
     )
 
 

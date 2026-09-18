@@ -1835,17 +1835,19 @@ class SweepPreview(BaseModel):
     """
 
     runs: int
+    """What a launch **without collecting** enqueues: refused combinations and the pairs in
+    `uncovered` are both subtracted. ⚠️ Told to collect, the launch runs the uncovered pairs too
+    (those with anything to fetch), so this is the smaller of the two answers."""
     documents: int
     """Strategy documents the sweep would write: entries x timeframes x points, before markets."""
     entries: list[SweepEntryPreview]
     uncovered: list[UncoveredMarket]
-    """Markets and charts with no data in this window — refused by the launch, not dropped.
-
-    ⚠️ Reported rather than subtracted from `runs`, because the launch refuses the whole request
-    over them. A number that quietly excluded them would describe a sweep nobody can start."""
+    """Markets and charts with no data in this window — skipped by the launch and named, unless
+    it is told to collect them (his rule, 18/09). Kept on the sweep as `SweepOut.skipped`."""
     error: str | None = None
     """Set when the sweep cannot be launched at all — an unknown entry, a grid that leads
-    nowhere, a product over the cap. A different kind of no: there is nothing to run."""
+    nowhere, a product over the cap, every pair without data. A different kind of no: there is
+    nothing to run."""
 
 
 class SweepRunOut(BaseModel):
@@ -1913,6 +1915,12 @@ class SweepOut(BaseModel):
     they were **ticked**, not the order the shelf shows them in."""
 
     runs: list[SweepRunOut]
+    skipped: list[UncoveredMarket] = Field(default_factory=list)
+    """Pairs of `symbols` x `timeframes` left out for having no candles in the window.
+
+    ⚠️ **Read this before reading `symbols` and `timeframes` as the space that was measured.**
+    Those are what was asked; a pair named here has no runs because there was nothing to read,
+    not because it was measured and came back empty."""
 
 
 class SweepRunCounts(BaseModel):
@@ -2109,3 +2117,6 @@ class DatasetDictionaryOut(BaseModel):
 class CreatedSweep(BaseModel):
     id: uuid.UUID
     runs: int
+    skipped: list[UncoveredMarket] = Field(default_factory=list)
+    """Pairs left out for having no candles in the window — his answer "do not collect" (18/09).
+    The same list the sweep keeps (`SweepOut.skipped`), so the launch and a later read agree."""

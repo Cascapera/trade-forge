@@ -1686,6 +1686,14 @@ class Sweep(Base):
     A JSONB list rather than a table, on the same terms as `entry_ids` above: the runs point at
     immutable documents, and this column records the question, not a set of live references."""
 
+    skipped: Mapped[list[Any]] = mapped_column(JSONB, nullable=False, server_default="[]")
+    """The (market, chart) pairs asked for and left out for having no candles in the window
+    (`rev_0020`): `symbol`, `timeframe`, and `covers` — what the index held then, or null.
+
+    ⚠️ **The only record of a hole in the map.** `symbols` and `timeframes` are what was asked,
+    and a pair with no runs can also be one whose every point the DSL refused. Without this
+    column the two absences read the same, and a skipped pair passes for a measured one."""
+
     date_from: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     date_to: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     initial_capital: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
@@ -1702,6 +1710,7 @@ class Sweep(Base):
         CheckConstraint("jsonb_typeof(symbols) = 'array'", name="symbols_are_a_list"),
         CheckConstraint("jsonb_typeof(timeframes) = 'array'", name="timeframes_are_a_list"),
         CheckConstraint("jsonb_typeof(points) = 'array'", name="points_are_a_list"),
+        CheckConstraint("jsonb_typeof(skipped) = 'array'", name="skipped_is_a_list"),
         CheckConstraint("date_to > date_from", name="a_window_runs_forwards"),
         Index("ix_sweeps_created_at", "created_at"),
     )

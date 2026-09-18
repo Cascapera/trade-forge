@@ -2503,3 +2503,11 @@ antes, ou recusar reescrever uma partição com menos barras do que ela tinha.
   com a tela (a linha diz "cannot be collected"), mas sem teste.
 * **"Tabela vazia = não sei" depende de outro pacote.** Só vale porque `replace_snapshot` recusa
   snapshot vazio; nada em `coverage` prende isso. Alternativa mais robusta: ler `synced_at`.
+
+## O que a fatia "o estudo pergunta pelo dado" (PR-272) deixou de fora
+
+* **O ensaio do estudo não avisa antes do clique.** O `/studies/preview` não tem `uncovered` (a
+  varredura tem): a falta de dado só aparece quando se aperta "Run the study". Não fura — o clique
+  pergunta o plano —, mas a varredura avisa enquanto se edita.
+* **O walk-forward não pergunta de novo.** Ele parte de um estudo já lançado, cuja janela passou
+  pela checagem; se o dado for apagado entre os dois, o `POST /walkforwards` não sabe.

@@ -919,10 +919,18 @@ class CreateStudyRequest(BaseModel):
     strategy_id: uuid.UUID
     symbol: Symbol
     timeframe: str
-    date_from: dt.datetime
-    date_to: dt.datetime
+    date_from: AwareInstant
+    date_to: AwareInstant
     initial_capital: Decimal = Field(gt=0)
     cost_model: dict[str, Any] = Field(default_factory=lambda: {"type": "none"})
+    collect_missing: bool = False
+    """Collect what the market is missing, and run every point once the downloads have landed.
+
+    ⚠️ **One download for the whole grid.** Every point reads the same (symbol, timeframe) over
+    the same window, so each missing window is collected once and linked to all N runs — the
+    sweep's rule (PR-268) with a single pair. Left false, a window with no candles at all refuses
+    the study: there is one market, so there is nothing to skip to (his rule, as for a single
+    backtest)."""
 
     grid: dict[str, list[Any]] = Field(min_length=1)
     """Paths into the strategy document, and the values to try at each.

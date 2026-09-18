@@ -37,7 +37,6 @@ from tradeforge_api.main import create_app
 from tradeforge_api.queue import RUN_WALK_FORWARD
 from tradeforge_api.runner import execute_backtest
 from tradeforge_api.worker import process_walk_forward
-from tradeforge_collector import write_candles
 from tradeforge_db.models import (
     Backtest,
     BacktestStatus,
@@ -215,13 +214,18 @@ def _drive(session_factory: Callable[[], Session], tmp_path: Path, walk_forward_
 
 @pytest.fixture
 def prepared(
-    session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+    session_factory: Callable[[], Session], settings: Settings, tmp_path: Path, collected: Any
 ) -> Callable[[], Any]:
-    """Seed the instrument and the candles once; hand back a factory for the app."""
+    """Seed the instrument and the candles once; hand back a factory for the app.
+
+    ⚠️ Written **and indexed** (`collected`): since PR-272 the study this experiment starts from
+    asks the `datasets` index before queueing, and bars on disk that the index does not know are
+    bars no launch will read — in production as here.
+    """
     seeding = session_factory()
     _seed_instrument(seeding)
     seeding.close()
-    write_candles(tmp_path, SYMBOL, "H1", _zigzag())
+    collected(tmp_path, SYMBOL, "H1", _zigzag())
 
     def build() -> Any:
         return _app(settings, session_factory, tmp_path)
@@ -712,14 +716,14 @@ def _two_regimes() -> list[Candle]:
 
 @pytest.fixture
 def over_fitting(
-    session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+    session_factory: Callable[[], Session], settings: Settings, tmp_path: Path, collected: Any
 ) -> Callable[[], Any]:
     """The same app, over the two-regime market. `tmp_path` is per-test, so this dataset and
-    the zigzag above never share a directory."""
+    the zigzag above never share a directory. Indexed as well as written, as `prepared` is."""
     seeding = session_factory()
     _seed_instrument(seeding)
     seeding.close()
-    write_candles(tmp_path, SYMBOL, "H1", _two_regimes())
+    collected(tmp_path, SYMBOL, "H1", _two_regimes())
 
     def build() -> Any:
         return _app(settings, session_factory, tmp_path)

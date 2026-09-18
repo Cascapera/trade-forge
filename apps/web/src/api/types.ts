@@ -489,6 +489,9 @@ export interface CreateStudyRequest {
   cost_model: Record<string, unknown>
   /** Dotted paths into the strategy document, and the values to try at each. */
   grid: Record<string, unknown[]>
+  /** Collect what the market is missing, once for every point, and run once it lands (PR-272).
+   *  Left out, a window with no candles refuses the study: there is one market to run. */
+  collect_missing?: boolean
 }
 
 export interface PreviewStudyRequest {

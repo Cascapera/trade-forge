@@ -170,7 +170,11 @@ export function whyNotLaunchable(form: StudyForm): string | null {
  * A study holds one market still, so unlike a basket there is one cost for all of its points —
  * and it has to be one, or the points would not be comparable to each other.
  */
-export function toStudyRequest(form: StudyForm, strategyId: string): CreateStudyRequest {
+export function toStudyRequest(
+  form: StudyForm,
+  strategyId: string,
+  collectMissing = false,
+): CreateStudyRequest {
   return {
     strategy_id: strategyId,
     symbol: form.symbol,
@@ -183,6 +187,7 @@ export function toStudyRequest(form: StudyForm, strategyId: string): CreateStudy
         ? { type: 'none' }
         : { type: 'spread', spread_points: form.spreadTicks.trim() },
     grid: axesOf(form),
+    collect_missing: collectMissing,
   }
 }
 

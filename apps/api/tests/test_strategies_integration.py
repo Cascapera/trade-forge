@@ -24,11 +24,12 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from tradeforge_api.config import Settings
 from tradeforge_api.main import create_app
-from tradeforge_db.models import Instrument
+from tradeforge_db.models import Dataset, Instrument
 from tradeforge_engine.domain import AssetClass
 
 pytestmark = pytest.mark.integration
@@ -58,6 +59,20 @@ def _seed_instrument(session: Session) -> None:
             tick_value=Decimal("1"),
             contract_size=Decimal("100000"),
             digits=5,
+        )
+    )
+    session.flush()
+    # A study asks the `datasets` index before queueing (PR-272); these tests launch one to get a
+    # grid's generated names, so the window they use has to be covered.
+    instrument = session.scalars(select(Instrument).where(Instrument.symbol == SYMBOL)).one()
+    session.add(
+        Dataset(
+            instrument_id=instrument.id,
+            timeframe="H1",
+            date_from=START - dt.timedelta(days=365),
+            date_to=START + dt.timedelta(days=365),
+            candle_count=10_000,
+            parquet_path=f"{SYMBOL}/H1",
         )
     )
     session.commit()

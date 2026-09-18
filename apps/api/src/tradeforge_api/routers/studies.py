@@ -26,6 +26,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
+from tradeforge_api.coverage import describe, to_collect, uncovered_markets
 from tradeforge_api.deps import QueueDep, SessionDep
 from tradeforge_api.grid import (
     GridError,
@@ -36,7 +37,7 @@ from tradeforge_api.grid import (
     named,
     read_point,
 )
-from tradeforge_api.queue import RUN_BACKTEST
+from tradeforge_api.queue import COLLECT_QUEUE, COLLECT_RANGE, RUN_BACKTEST
 from tradeforge_api.routers.backtests import list_item
 from tradeforge_api.routers.strategies import refusal_of, validate_document
 from tradeforge_api.runner import ENGINE_VERSION
@@ -51,8 +52,11 @@ from tradeforge_api.schemas import (
     StudyPreview,
 )
 from tradeforge_collector import step
+from tradeforge_collector.collect import year_slices
+from tradeforge_db.collections import create_collection
 from tradeforge_db.models import (
     Backtest,
+    BacktestCollection,
     BacktestMetrics,
     BacktestStatus,
     Instrument,
@@ -293,6 +297,34 @@ async def create_study(
             detail=f"unknown symbol: {request.symbol}",
         )
 
+    # ⚠️ **Asked of the index before anything is written.** Without it, a window with no data
+    # queues every point and each one fails in a worker, learning in turn what the `datasets`
+    # index already knew — what the first real sweep did to nine runs of twelve. One market, so
+    # no pair to skip — a window with nothing in it
+    # is refused, unless the caller answered "collect it first" and there is something to fetch.
+    # An empty plan is not "covered": a window wholly in the future, or a symbol this broker does
+    # not list (`to_collect`), has nothing to download and still no candle.
+    planned = (
+        to_collect(
+            session,
+            symbols=[instrument.symbol],
+            timeframes=[request.timeframe],
+            date_from=request.date_from,
+            date_to=request.date_to,
+        )
+        if request.collect_missing
+        else []
+    )
+    if not planned:
+        missing = uncovered_markets(
+            session, [instrument.symbol], [request.timeframe], request.date_from, request.date_to
+        )
+        if missing:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=f"no candles in this window for {describe(missing[0])}",
+            )
+
     points = points_for(base, request.grid, request.timeframe)
 
     study = Study(
@@ -334,6 +366,36 @@ async def create_study(
         for strategy in strategies
     ]
     session.add_all(runs)
+    # The runs' ids, for the links below. Said here rather than left to `create_collection`'s own
+    # flush: that one is an implementation detail of another package, and without it every link
+    # would carry a null run id — and meet the database as an `IntegrityError` that the `except`
+    # below would report as two studies colliding.
+    session.flush()
+
+    # ⚠️ **One collection per window, linked to every point.** A collection per run would download
+    # the same window once per point of the grid — five hundred times for a grid of five hundred.
+    # Written in the same transaction as the runs: a collection committed without its links is a
+    # download nothing waits for, and a run committed without them starts on a half-written window.
+    collections = [
+        create_collection(
+            session,
+            symbol=instrument.symbol,
+            timeframe=request.timeframe,
+            date_from=window.date_from,
+            date_to=window.date_to,
+            # The class the catalogue already decided, as the other launches do: the broker's
+            # tree path must not refuse a collection the launch itself asked for.
+            asset_class=instrument.asset_class,
+            years_total=len(year_slices(window.date_from, window.date_to)),
+        )
+        for market in planned
+        for window in market.windows
+    ]
+    session.add_all(
+        BacktestCollection(backtest_id=run.id, collection_id=collection.id)
+        for collection in collections
+        for run in runs
+    )
     try:
         session.commit()
     except IntegrityError as exc:
@@ -368,6 +430,10 @@ async def create_study(
     # study and all N runs are committed while the rest sit `queued` for ever. With the job id
     # derived from the run, re-sending the same study's jobs is safe — arq drops a duplicate —
     # so recovery is a retry rather than an archaeology exercise.
+    # The downloads carry no job id, as the other launches' do not: re-sending them queues each
+    # window again. The idempotency claim above is the runs' alone.
+    for collection in collections:
+        await queue.enqueue_job(COLLECT_RANGE, str(collection.id), _queue_name=COLLECT_QUEUE)
     for run in runs:
         await queue.enqueue_job(RUN_BACKTEST, str(run.id), _job_id=str(run.id))
 

@@ -154,7 +154,13 @@ export function LaunchBacktest(): React.JSX.Element {
           launch(true)
         }}
         launching={create.isPending}
-        canRun={gate.missing === null || anythingToRun([form.symbol], gate.missing)}
+        canRun={
+          gate.missing === null ||
+          // Unreachable while the prompt is open — `run` asks the plan only once the chart is
+          // known — and said rather than asserted, so a null never reaches the plan's key.
+          timeframe === null ||
+          anythingToRun([{ symbol: form.symbol, timeframe }], gate.missing)
+        }
       />
 
       {create.isError && (

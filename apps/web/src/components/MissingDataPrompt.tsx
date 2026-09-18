@@ -9,8 +9,8 @@ import { missingLine } from '../collect/missing'
  *   windows, queues the downloads, links them to the runs, and each run starts by itself once its
  *   own downloads have landed.
  * - **Run with what there is** launches now. The server runs the part of the window that exists;
- *   a single backtest with nothing in the window is refused, and a basket leaves such a market out
- *   and names it.
+ *   a single backtest with nothing in the window is refused; a basket leaves such a market out
+ *   and names it, and a sweep does the same for such a market on that chart.
  *
  * A plan that could not be asked says so and still offers the run: the launch asks the same index
  * itself, so going ahead never runs blind.

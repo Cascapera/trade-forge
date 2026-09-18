@@ -13,7 +13,7 @@ import {
   type BasketForm,
 } from '../basket/settings'
 import { useMissingDataGate } from '../collect/gate'
-import { anythingToRun } from '../collect/missing'
+import { anythingToRun, pairsOf } from '../collect/missing'
 import { MissingDataPrompt } from '../components/MissingDataPrompt'
 import { StrategyPicker } from '../components/StrategyPicker'
 import { SymbolPicker } from '../components/SymbolPicker'
@@ -208,7 +208,7 @@ export function LaunchBasket(): React.JSX.Element {
           launch(true)
         }}
         launching={create.isPending}
-        canRun={gate.missing === null || anythingToRun(form.symbols, gate.missing)}
+        canRun={gate.missing === null || anythingToRun(pairsOf(form.symbols, [timeframe]), gate.missing)}
       />
 
       {create.isError && <p className="text-sm text-red-400">{launchFailure(create.error)}</p>}

@@ -117,6 +117,27 @@ export function SweepResult(): React.JSX.Element {
           {data.symbols.join(', ')} · {data.timeframes.join(', ')} · {day(data.date_from)} →{' '}
           {day(data.date_to)} · {money(data.initial_capital)} per run
         </p>
+        {/* ⚠️ **Right under the axes, because the axes are what was asked.** A pair left out for
+            having no candles has no runs, and without this line the header above reads as the
+            space that was measured — a map with a hole passing for a complete one. */}
+        {data.skipped.length > 0 && (
+          <div role="status" aria-label="left out" className="mt-2 text-sm text-amber-300">
+            <p>
+              Left out — no candles in this window for {data.skipped.length}{' '}
+              {data.skipped.length === 1 ? 'pair' : 'pairs'}:
+            </p>
+            <ul className="mt-1 space-y-0.5 text-xs text-amber-300/80">
+              {data.skipped.map((pair) => (
+                <li key={`${pair.symbol}-${pair.timeframe}`}>
+                  <span className="font-medium">
+                    {pair.symbol} {pair.timeframe}
+                  </span>{' '}
+                  — {pair.covers === null ? 'never collected' : `collected ${pair.covers}`}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
         {/* ⚠️ The file and its legend, always together. A dataset handed over without the
             dictionary is the half an AI misreads — it cannot tell a parameter from a result, or
             an in-sample return from a forecast, by the column's name. Opened by the browser

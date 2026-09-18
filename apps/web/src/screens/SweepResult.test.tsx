@@ -124,6 +124,7 @@ function sweep(over: Partial<SweepOut> = {}, entries?: SweepEntryOut[]): SweepOu
     date_to: '2024-02-01T00:00:00Z',
     initial_capital: '10000',
     created_at: '2024-01-01T00:00:00Z',
+    skipped: [],
     entries: entries ?? [
       {
         entry_id: ZETA.id,
@@ -198,6 +199,28 @@ describe('SweepResult', () => {
     expect(
       screen.getByText('EURUSD, GBPUSD · M15, H1 · 2024-01-01 → 2024-02-01 · 10,000.00 per run'),
     ).toBeInTheDocument()
+    // Nothing left out, so nothing said: the warning is not furniture.
+    expect(screen.queryByText(/left out/i)).not.toBeInTheDocument()
+  })
+
+  it('says which pairs were left out, under the axes that were asked', () => {
+    // ⚠️ The header lists GBPUSD and H1 either way; without this line a pair with no runs reads
+    // as measured. Read from the sweep, so it survives a reload — unlike the basket's.
+    showing(
+      sweep({
+        skipped: [
+          { symbol: 'GBPUSD', timeframe: 'H1', covers: null },
+          { symbol: 'EURUSD', timeframe: 'H1', covers: '2020-01-01 to 2021-01-01' },
+        ],
+      }),
+    )
+
+    renderWithProviders(<SweepResult />)
+
+    const warning = screen.getByRole('status', { name: 'left out' })
+    expect(warning).toHaveTextContent('Left out — no candles in this window for 2 pairs:')
+    expect(warning).toHaveTextContent('GBPUSD H1 — never collected')
+    expect(warning).toHaveTextContent('EURUSD H1 — collected 2020-01-01 to 2021-01-01')
   })
 
   it('offers the dataset beside the dictionary that says what its columns are', () => {

@@ -1056,18 +1056,20 @@ export interface UncoveredMarket {
 }
 
 export interface SweepPreview {
-  /** What would actually be **enqueued** — refusals already subtracted. */
+  /** What a launch **without collecting** enqueues: DSL refusals and the pairs in `uncovered`
+   *  are both subtracted. ⚠️ Told to collect, the launch runs the uncovered pairs too, so this is
+   *  the smaller of the two answers. */
   runs: number
   /** Strategy documents the sweep would write: entries x timeframes x points, before markets. */
   documents: number
   entries: SweepEntryPreview[]
-  /** ⚠️ Reported rather than subtracted from `runs`, because the launch refuses the whole
-   *  request over them. A number that quietly excluded them would describe a sweep nobody can
-   *  start. */
+  /** Pairs with no candles in this window, on a chart where some point can run. The launch skips
+   *  and names them (PR-269), unless it is told to collect them. */
   uncovered: UncoveredMarket[]
-  /** Set when the sweep cannot be launched at all — a product over the cap, nothing runnable,
-   *  or a coverage gap. ⚠️ On a coverage gap it is filled **beside** `uncovered`, never instead
-   *  of it. An unknown entry never lands here: the endpoint answers that with a 404. */
+  /** Set when the sweep cannot be launched at all — a product over the cap, nothing runnable, or
+   *  **every** pair without data. ⚠️ That last one is filled **beside** `uncovered` with `runs`
+   *  at zero, and collecting is its fix; with `runs` above zero the error is never about data.
+   *  An unknown entry never lands here: the endpoint answers that with a 404. */
   error: string | null
 }
 
@@ -1079,11 +1081,16 @@ export interface CreateSweepRequest {
   date_to: string
   initial_capital: string
   cost_model: Record<string, unknown>
+  /** Collect what each pair is missing, once per pair, and run once the downloads land
+   *  (PR-268). Left out, a pair with no candles is skipped and named. */
+  collect_missing?: boolean
 }
 
 export interface CreatedSweep {
   id: string
   runs: number
+  /** Pairs left out for having no candles in the window — also kept on the sweep. */
+  skipped: UncoveredMarket[]
 }
 
 /** One run of a sweep: where it sits on the axes, wrapped around the run-log row itself. */
@@ -1124,6 +1131,10 @@ export interface SweepOut {
   /** In the order the entries were asked for. */
   entries: SweepEntryOut[]
   runs: SweepRunOut[]
+  /** Pairs of `symbols` x `timeframes` left out for having no candles in the window (PR-269).
+   *  ⚠️ `symbols` and `timeframes` are what was **asked**: read this before reading them as the
+   *  space that was measured. */
+  skipped: UncoveredMarket[]
 }
 
 /** How many of a sweep's runs sit in each status. The four always add up to `total`. */

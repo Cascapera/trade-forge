@@ -132,7 +132,7 @@ export function toPreviewRequest(form: SweepForm): PreviewSweepRequest | null {
  * under different costs are not comparable to each other, and comparing them is the only reason
  * to run them together.
  */
-export function toSweepRequest(form: SweepForm): CreateSweepRequest {
+export function toSweepRequest(form: SweepForm, collectMissing = false): CreateSweepRequest {
   return {
     entry_ids: [...form.entryIds],
     symbols: [...form.symbols],
@@ -144,6 +144,7 @@ export function toSweepRequest(form: SweepForm): CreateSweepRequest {
       form.spreadTicks.trim() === ''
         ? { type: 'none' }
         : { type: 'spread', spread_points: form.spreadTicks.trim() },
+    collect_missing: collectMissing,
   }
 }
 

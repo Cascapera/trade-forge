@@ -73,8 +73,11 @@ type Timeframe = Literal["M1", "M5", "M15", "M30", "H1", "H4", "D1", "W1"]
 type PriceSource = Literal["open", "high", "low", "close"]
 
 # A directional setup trades one side; the two-sided version is two of them. The structure
-# family has no side at all — which way it trades follows the structure it reads.
+# family reads `TradeSide` instead — see below.
 type SetupSide = Literal["long", "short"]
+# Which sides a setup may trade, "both" included — his request of 18/09 for every setup. The
+# structure family reads it as a filter on the zones it would otherwise arm on either side.
+type TradeSide = Literal["long", "short", "both"]
 type ZoneEntryPoint = Literal[
     "edge",
     "midpoint",
@@ -724,7 +727,8 @@ class PontoContinuoSetup(_Node):
 class StructureParams(_Node):
     """Shared by every setup that arms a limit order on a zone market structure left behind.
 
-    Not directional: which side is traded follows the structure, so there is no `side` here.
+    Not directional by itself: which side is traded follows the structure. `side` only narrows
+    that — `both`, the default, is the behaviour every recorded result has.
     `stop_buffer` is a *fraction of the zone's width*, not ticks — the zone is the unit.
 
     `entry_point` chooses which of the author's activations the setup uses. `edge` and `midpoint`
@@ -854,6 +858,12 @@ class StructureParams(_Node):
     gives: a clock that is measured instead of stated is a nondeterministic one.
     """
 
+    side: TradeSide = "both"
+    """Which zones may be traded: demand (`long`), supply (`short`) or `both`.
+
+    `both` is the default because it is what the structure family always did — which way it trades
+    follows the zone it reads — so a document written before this field runs exactly as it did.
+    A side only narrows it (his request, 18/09)."""
     allow_secondary: bool = False
     stop_buffer: Annotated[float, Field(ge=0, le=10)] = 0.1
     entry_point: ZoneEntryPoint = "edge"

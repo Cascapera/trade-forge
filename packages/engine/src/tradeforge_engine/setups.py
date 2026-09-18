@@ -2091,6 +2091,7 @@ class StructureStrategy:
         htf: dt.timedelta | None = None,
         htf_offset: dt.timedelta | None = None,
         timeframe: dt.timedelta | None = None,
+        side: Side | None = None,
     ) -> None:
         if stop_buffer < ZERO:
             raise ValueError(f"stop buffer is a fraction of the zone width, got {stop_buffer}")
@@ -2136,6 +2137,16 @@ class StructureStrategy:
 
         self._qualifier = qualifier
         self._name = name
+        # ⚠️ **`None` is both sides, and it is the default** — which way the structure trades
+        # follows the zone it reads (demand is a long, supply a short), and that is what every
+        # recorded result did. A side only narrows it: his request of 18/09, "somente comprado,
+        # somente vendido e ambos" on every setup.
+        #
+        # ⚠️ **It narrows what is traded, not what is drawn.** `zones()` still returns the regions
+        # of the filtered side: the market's structure is the same whichever side is traded, and a
+        # chart that hid the supply zones of a long-only run would show a different market. A
+        # region on the chart that never became an order is the filter working, not a bug.
+        self._side = side
         self._allow_secondary = allow_secondary
         self._stop_buffer = stop_buffer
         # The second seam: *how* a named zone becomes an order. Built from the entry point
@@ -2671,13 +2682,17 @@ class StructureStrategy:
         touches. Every rule about *whether a region may be traded* is therefore enforced here,
         once, on the zone actually about to be armed.
 
-        Seven refusals, in the order they are cheapest to answer:
+        Eight refusals, in the order they are cheapest to answer:
 
         * **The zone already armed.** Re-naming it is not a new setup; acting on the repeat would
           withdraw a resting order and put an identical one back a bar later, moving the fill to
           whichever bar the qualifier last repeated itself.
         * **A secondary zone while `allow_secondary` is off.** The flag is a rule about which
           regions may be traded, so it has to bite where the trade is decided.
+        * **A zone on the side this setup does not trade** (only with `side` set) — his request
+          of 18/09. Asked before the timeframe above only because it is the cheaper question:
+          `HigherTimeframeGate.allows` is a query (a release is spent on a fill, by `spend`), so
+          the order of the two changes no answer.
         * **A zone the timeframe above has not released** (only with the filter on) — price has
           not reached an untouched region above, that region's one entry is spent, the search
           ended (two heights past the region, or a close through it), or this zone's break
@@ -2704,6 +2719,8 @@ class StructureStrategy:
         if self._armed is not None and block == self._armed.block:
             return False
         if not block.primary and not self._allow_secondary:
+            return False
+        if self._side is not None and block.side is not self._side:
             return False
         if self._gate is not None and not self._gate.allows(block):
             return False

@@ -749,7 +749,8 @@ export interface StructureChochSetup {
 /**
  * Shared by every setup that arms a limit order on a zone market structure left behind.
  *
- * Not directional: which side is traded follows the structure, so there is no `side` here.
+ * Not directional by itself: which side is traded follows the structure. `side` only narrows
+ * that — `both`, the default, is the behaviour every recorded result has.
  * `stop_buffer` is a *fraction of the zone's width*, not ticks — the zone is the unit.
  *
  * `entry_point` chooses which of the author's activations the setup uses. `edge` and `midpoint`
@@ -886,6 +887,7 @@ export interface StructureParams {
   gift_stop?: "gift" | "forca";
   htf?: Timeframe | null;
   htf_offset?: HtfOffset;
+  side?: "long" | "short" | "both";
   stop_buffer?: StopBuffer;
   volume_filter?: VolumeFilter2;
 }
@@ -911,6 +913,7 @@ export interface ContinuationParams {
   htf?: Timeframe | null;
   htf_offset?: HtfOffset1;
   max_bos?: MaxBos;
+  side?: "long" | "short" | "both";
   stop_buffer?: StopBuffer1;
   volume_filter?: VolumeFilter3;
 }

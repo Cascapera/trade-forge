@@ -186,6 +186,9 @@ _PROBES: dict[str, dict[str, tuple[Any, Any]]] = {
         "htf": ("H4", dt.timedelta(hours=4)),
         # And the broker's clock beside it (2026-09-09), demanded whenever `htf` is named.
         "htf_offset": (3, dt.timedelta(hours=3)),
+        # The side filter (18/09): the wire string arrives as the engine's enum, and the probe is
+        # `short` because `both` is what the class answers when nothing arrives.
+        "side": ("short", Side.SHORT),
     },
     "structure_continuation": {
         "allow_secondary": (True, True),
@@ -198,6 +201,7 @@ _PROBES: dict[str, dict[str, tuple[Any, Any]]] = {
         "htf": ("H4", dt.timedelta(hours=4)),
         # And the broker's clock beside it (2026-09-09), demanded whenever `htf` is named.
         "htf_offset": (3, dt.timedelta(hours=3)),
+        "side": ("short", Side.SHORT),
     },
 }
 
@@ -249,6 +253,11 @@ def _same(schema_value: Any, engine_value: Any) -> bool:
     """
     if isinstance(schema_value, bool) or isinstance(engine_value, bool):
         return schema_value is engine_value
+    # ⚠️ The structure family's `side` (18/09): the document says `both`, the engine says `None` —
+    # "no side narrows it". One default in two vocabularies, like `2.0` and `Decimal("2")`; any
+    # other pairing of a string with `None` still disagrees.
+    if schema_value == "both" and engine_value is None:
+        return True
     if isinstance(schema_value, int | float | Decimal) and isinstance(
         engine_value, int | float | Decimal
     ):

@@ -2535,3 +2535,16 @@ antes, ou recusar reescrever uma partição com menos barras do que ela tinha.
   dia existir exclusão de run/ponto, a derivação passa a mentir.
 * **A checagem de dado roda antes da poda.** Uma grade em que nada roda, sobre uma janela sem dado,
   recebe "no candles" em vez de "nothing runs" — a causa barata (a grade) fica atrás da cara.
+
+## ⚠️ LIVE — uma sessão nova lê o `venue.outcomes` desde o começo, 500 por barra (achado em 18/09)
+
+`MT5Broker.ensure_group` cria o grupo em `_PENDING = "0"` (o início do stream) e `on_bar` lê no
+máximo `_BATCH = 500` entradas novas por barra. O stream nunca é aparado. Com N entradas de sessões
+antigas, uma sessão nova só alcança os **próprios** fills depois de ~N/500 barras — uma posição real
+que o ledger não vê nesse meio-tempo. Achado porque `test_broker_integration.py` passou a falhar
+local (5 de 8) quando o stream do Redis de desenvolvimento cruzou 500 entradas (523 em 18/09); no
+CI passa porque o Redis nasce vazio. Confirmado que não é a PR-275: falha igual com as mudanças
+dela guardadas. Consertos candidatos: grupo criado em `$` **antes** do aquecimento (o motivo do "0"
+era não perder fill durante o aquecimento — criar cedo em `$` resolve os dois), ou ler em laço até
+esgotar, e aparar o stream (`MAXLEN`/`MINID`). O teste precisa de um stream próprio ou de um Redis
+limpo, senão volta a depender de quantas vezes a suíte já rodou nesta máquina.

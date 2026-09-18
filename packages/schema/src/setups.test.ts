@@ -115,10 +115,19 @@ describe('the parameters a form has to treat specially', () => {
     expect(setupSpec('ponto_continuo').params[0]?.name).toBe('side')
   })
 
-  it('has no side at all for the structure family', () => {
-    // Which way a structure setup trades follows the structure it reads, so there is nothing to ask.
+  it('gives the structure family an optional side that defaults to both', () => {
+    // His request (18/09): long only, short only or both on every setup. The structure family
+    // trades whichever way the zone points, so `both` is what it always did — a default, never a
+    // required answer, and every document written before the field still runs unchanged.
     for (const type of ['structure_choch', 'structure_continuation'] as const) {
-      expect(setupSpec(type).params.map((p) => p.name)).not.toContain('side')
+      expect(param(type, 'side')).toEqual({
+        name: 'side',
+        kind: 'enum',
+        required: false,
+        default: 'both',
+        nullable: false,
+        options: ['long', 'short', 'both'],
+      })
       expect(setupSpec(type).params.every((p) => !p.required)).toBe(true)
     }
   })

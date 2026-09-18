@@ -38,18 +38,12 @@ is the component that owns what a parameter may be. Narrowing them would buy no 
 the validator does not already do, and would cost every caller a cast to say so.
 """
 
-MAX_POINTS = 500
-"""How many combinations one study will expand to.
-
-A cap and not a sample: a grid too large is refused with its own size in the message, never
-quietly trimmed. Half a grid drawn as a heatmap is a picture of a space that was never searched,
-and it looks exactly like a picture of one that was.
-
-The number is a budget rather than a technical limit. Measured on this project's own runs, a
-backtest takes 0.1 to 0.8 seconds, so 500 points is a study of a few minutes — long enough to
-be a deliberate act, short enough to sit through. The queue would happily take more; the reason
-not to is on `Study` in the models, and it is about what a grid this wide does to a conclusion.
-"""
+# ⚠️ **No cap on the size of a grid** (his decision, 18/09). There was one — 500 — justified as a
+# time budget at 0.23 s a run; measured on his own sweep the same day, a run of M30 over six years
+# takes about 43 s. The number was wrong, and the reason was wrong too: he wants every variation
+# of the method searched and will wait hours for it. How long a grid takes is something to show,
+# not a ground to refuse. What is still refused is a grid that cannot be run at all — an empty or
+# unreachable axis, a repeated value — because those are not sizes.
 
 
 class GridError(ValueError):
@@ -159,6 +153,18 @@ def _copy(value: Json) -> Json:
     return value
 
 
+def check_grid(document: Mapping[str, Any], grid: Mapping[str, Sequence[Any]]) -> None:
+    """Raise `GridError` if this grid cannot be applied to this document — without expanding it.
+
+    ⚠️ **For a caller that only needs the verdict.** Saving a catalogue entry used to call
+    `expand` and throw the documents away; bounded by the old cap of 500 that was cheap, and with
+    no cap it would build every combination of a grid of any size just to say it is well formed.
+    The checks are the axes' alone — reachable, populated, distinct — so they cost the number of
+    axes, not the size of the product.
+    """
+    _check_axes(document, grid)
+
+
 def _check_axes(document: Mapping[str, Any], grid: Mapping[str, Sequence[Any]]) -> None:
     """Refuse a grid before expanding it — every axis reachable, populated, distinct.
 
@@ -197,13 +203,12 @@ def size_of(grid: Mapping[str, Sequence[Any]]) -> int:
     return total
 
 
-def expand(
-    document: Mapping[str, Any], grid: Mapping[str, Sequence[Any]], *, limit: int = MAX_POINTS
-) -> list[GridPoint]:
+def expand(document: Mapping[str, Any], grid: Mapping[str, Sequence[Any]]) -> list[GridPoint]:
     """Every combination of the grid, as its own strategy document.
 
     Raises `GridError` — never a partial expansion — if any axis is unreachable, empty or
-    repeats a value, or if the product exceeds `limit`.
+    repeats a value. Never for its size: every combination is expanded (see the note above
+    `GridError`).
 
     The cartesian product is taken in the order the axes were declared, with the **last axis
     varying fastest**, which is `itertools.product`'s own order and the one a reader expects
@@ -211,12 +216,6 @@ def expand(
     study, and a heatmap laid out row by row is reading it.
     """
     _check_axes(document, grid)
-
-    total = size_of(grid)
-    if total > limit:
-        raise GridError(
-            f"this grid expands to {total} combinations, over the {limit} a study will run"
-        )
 
     return [
         GridPoint(

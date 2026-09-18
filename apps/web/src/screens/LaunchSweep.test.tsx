@@ -187,9 +187,9 @@ describe('the three refusals stay apart', () => {
   })
 
   it('refuses a sweep with nothing runnable, in the server’s words', async () => {
-    // The third no, with no list beside it: every combination was refused, or the product is over
-    // the cap after the refusals were subtracted. Only the server knows the net count, so only
-    // its sentence can say this — and the button must follow it.
+    // The third no, with no list beside it: every combination was refused by the DSL. Only the
+    // server knows the net count, so only its sentence can say this — and the button must follow
+    // it.
     previewSweep.mockResolvedValue(
       preview({ runs: 0, error: 'no combination in this sweep can run' }),
     )
@@ -201,10 +201,10 @@ describe('the three refusals stay apart', () => {
   })
 
   it('does not refuse on a count the server does not use', async () => {
-    // ⚠️ **The cap is on what will run, and only the server knows that number.** 3001 points over
-    // one market and one chart, one of them refused by the DSL, is 3000 runs — exactly the cap,
-    // and the server accepts it. A form that capped its own gross count would refuse a sweep the
-    // server starts; this is the shape where the two counts disagree.
+    // ⚠️ **No cap, and a big sweep leaves the button alive** (18/09). 3001 points over one market
+    // and one chart, one of them refused by the DSL, is 3000 runs — past what the old cap let a
+    // form count without refusing. A form that capped its own gross count would refuse a sweep
+    // the server starts.
     listCatalog.mockResolvedValue({ total: 1, items: [entry('a', 'nine one plain', 3001)] })
     previewSweep.mockResolvedValue(
       preview({
@@ -227,20 +227,6 @@ describe('the three refusals stay apart', () => {
     await screen.findByText(/will be left out/i)
     expect(screen.queryByText(/over the 3000/)).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: /run the sweep/i })).toBeEnabled()
-  })
-
-  it('refuses a sweep over the cap in the server’s words', async () => {
-    previewSweep.mockResolvedValue(
-      preview({
-        runs: 3001,
-        error: 'this sweep expands to 3001 backtests, over the 3000 one sweep will run',
-      }),
-    )
-    renderWithProviders(<LaunchSweep />)
-    await fillIn()
-
-    expect(await screen.findByText(/this sweep expands to 3001 backtests/)).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /run the sweep/i })).toBeDisabled()
   })
 
   it('says the form’s own refusal beside the button', async () => {
@@ -346,24 +332,6 @@ describe('the three refusals stay apart', () => {
     expect(screen.queryByText(/nothing to collect for this window either/i)).not.toBeInTheDocument()
   })
 
-  it('still blocks on the cap beside a partial gap, and says why', async () => {
-    // ⚠️ The guard this replaced hid the server's sentence whenever `uncovered` was non-empty.
-    // With runs left the error is never about data — here the cap — and collecting only adds
-    // runs, so it blocks; hidden, the button would be disabled with no reason on screen.
-    const cap = 'this sweep expands to 3100 backtests, over the 3000 one sweep will run'
-    previewSweep.mockResolvedValue(
-      preview({
-        runs: 3100,
-        uncovered: [{ symbol: 'GBPUSD', timeframe: 'M15', covers: null }],
-        error: cap,
-      }),
-    )
-    renderWithProviders(<LaunchSweep />)
-    await fillIn()
-
-    expect(await screen.findByText(cap)).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /run the sweep/i })).toBeDisabled()
-  })
 })
 
 describe('the answer on hand', () => {

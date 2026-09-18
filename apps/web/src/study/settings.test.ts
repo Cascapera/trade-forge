@@ -124,37 +124,18 @@ describe('whyNotLaunchable', () => {
     expect(whyNotLaunchable(repeated)).toMatch(/repeats a value/)
   })
 
-  it('refuses a grid over the cap, and says how big it is', () => {
-    // The number is the message: someone who typed a fourth axis did not add five runs, they
-    // multiplied by five, and nothing else on the form says so.
+  it('does not refuse a grid for its size', () => {
+    // ⚠️ His decision (18/09): 2034 combinations met the old cap of 500. No cap since — a grid
+    // of any size is launchable, and the count is shown, not held against it.
     const huge = form({
       axes: [
-        { path: 'a', raw: '1,2,3,4,5,6,7,8,9,10' },
-        { path: 'b', raw: '1,2,3,4,5,6,7,8,9,10' },
-        { path: 'c', raw: '1,2,3,4,5,6' },
+        { path: 'a', raw: Array.from({ length: 34 }, (_, at) => at + 1).join(',') },
+        { path: 'b', raw: Array.from({ length: 60 }, (_, at) => at + 1).join(',') },
       ],
     })
 
-    expect(whyNotLaunchable(huge)).toBe('That is 600 combinations, over the 500 a study will run.')
-  })
-
-  it('accepts a grid exactly at the cap', () => {
-    // Its own test because `>` and `>=` are indistinguishable everywhere else on this form.
-    const exact = form({
-      axes: [
-        {
-          path: 'a',
-          raw: Array.from({ length: 25 }, (_, at) => at + 1).join(','),
-        },
-        {
-          path: 'b',
-          raw: Array.from({ length: 20 }, (_, at) => at + 1).join(','),
-        },
-      ],
-    })
-
-    expect(combinationCount(exact)).toBe(500)
-    expect(whyNotLaunchable(exact)).toBeNull()
+    expect(combinationCount(huge)).toBe(2040)
+    expect(whyNotLaunchable(huge)).toBeNull()
   })
 
   it('refuses a period that ends before it starts', () => {

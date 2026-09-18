@@ -185,7 +185,8 @@ describe('LaunchStudy', () => {
     expect(await screen.findByRole('status')).toHaveTextContent('Nothing to run yet.')
   })
 
-  it('refuses a grid over the cap and says how big it is', async () => {
+  it('does not refuse a grid for its size', async () => {
+    // ⚠️ His decision (18/09): no cap. 520 combinations used to be refused here, at 500.
     renderWithProviders(<LaunchStudy />)
 
     // ⚠️ The option, not the label. `findByLabelText('Market')` resolves the moment the select
@@ -217,8 +218,11 @@ describe('LaunchStudy', () => {
     })
     setValues(2, Array.from({ length: 20 }, (_, at) => at + 1).join(','))
 
-    expect(screen.getByText(/520 combinations, over the 500/)).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Run the study' })).toBeDisabled()
+    expect(screen.getByText('520 combinations, so 520 backtests.')).toBeInTheDocument()
+    expect(screen.queryByText(/over the/)).not.toBeInTheDocument()
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Run the study' })).toBeEnabled()
+    })
   })
 
   it('sends the grid with its values typed, not as strings', async () => {
@@ -317,7 +321,7 @@ describe('LaunchStudy', () => {
     // the screen used to show. Reported from the screen exactly like that, with the reason the
     // server had actually sent sitting unread in `detail`.
     createStudy.mockRejectedValue(
-      new ApiError(422, 'this grid expands to 900 combinations, over the 500 a study will run'),
+      new ApiError(422, "'setup.params.periodd': this strategy has nothing at 'setup.params.periodd'"),
     )
     renderWithProviders(<LaunchStudy />)
 
@@ -337,9 +341,9 @@ describe('LaunchStudy', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Run the study' }))
 
     // ⚠️ The server's own words, not a generic apology: the refusals it sends are specific
-    // ("nothing at 'setup.params.periodd'", "expands to 900 combinations"), and each of them is
-    // the one sentence that tells the reader what to change.
-    expect(await screen.findByText(/900 combinations/)).toBeInTheDocument()
+    // ("nothing at 'setup.params.periodd'", "repeats a value"), and each of them is the one
+    // sentence that tells the reader what to change.
+    expect(await screen.findByText(/nothing at 'setup.params.periodd'/)).toBeInTheDocument()
   })
 
   it('offers the parameters of the strategy that was chosen, not a list to remember', async () => {

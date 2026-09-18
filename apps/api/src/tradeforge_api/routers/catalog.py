@@ -13,8 +13,9 @@ record of what a study *did* search. `9.1 over every average period` was therefo
 anybody could save, only a thing they could retype.
 
 ⚠️ **The grid is checked for reach, not for meaning, and the difference is the timeframe.**
-`expand` answers whether every axis names a path this document has and whether the product is
-inside the cap — facts about the document alone, true whenever the entry is read. Whether a
+`check_grid` answers whether every axis names a path this document has, holds values and
+repeats none — facts about the document alone, true whenever the entry is read, and asked without
+expanding the product: there is no cap on its size (18/09). Whether a
 *point* can run also depends on the timeframe it runs at (`runner.timeframe_refusal`), and an
 entry does not carry one: the same shelf entry is meant to be swept across several. So the
 semantic verdict belongs to the launch, where a timeframe exists, and `/studies/preview` already
@@ -29,7 +30,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
 from tradeforge_api.deps import SessionDep
-from tradeforge_api.grid import GridError, expand, size_of
+from tradeforge_api.grid import GridError, check_grid, size_of
 from tradeforge_api.routers.strategies import setup_of
 from tradeforge_api.schemas import (
     CatalogEntryOut,
@@ -94,7 +95,7 @@ def create_entry(request: CreateCatalogEntry, session: SessionDep) -> CatalogEnt
 
     if request.grid:
         try:
-            expand(strategy.definition, request.grid)
+            check_grid(strategy.definition, request.grid)
         except GridError as exc:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)

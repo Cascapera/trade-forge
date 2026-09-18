@@ -82,7 +82,7 @@ def points_for(
     door would be the same code until the day one of them was fixed.
 
     Two refusals, and the order matters. `expand` rejects a grid that cannot be applied to
-    *this* document (an unreachable path, an empty axis, a product over the cap). Then each
+    *this* document (an unreachable path, an empty axis, a repeated value). Then each
     resulting document is put through the same validator `POST /strategies` uses, because a
     substituted value can be individually legal and still produce a strategy that cannot run —
     a period of zero, a risk-reward of minus one.

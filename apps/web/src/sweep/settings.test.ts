@@ -3,7 +3,6 @@ import { describe, expect, it } from 'vitest'
 import type { CatalogEntry } from '../api/types'
 
 import {
-  MAX_SWEEP_RUNS,
   emptySweepForm,
   runCount,
   toPreviewRequest,
@@ -105,15 +104,13 @@ describe('whyNotLaunchable', () => {
     expect(whyNotLaunchable(inverted, entries)).toMatch(/after its start/)
   })
 
-  it('leaves the cap to the server, which counts only what will run', () => {
-    // ⚠️ 2 points x 4 charts x 400 markets = 3200 **before** the DSL's refusals, and the cap is on
-    // what is left after them — a number only `/sweeps/preview` has. An earlier draft capped this
-    // gross count and refused sweeps the server would have started. Over the cap is now the
-    // server's sentence, which the screen prints and which blocks its button.
+  it('does not refuse a sweep for its size', () => {
+    // ⚠️ His decision (18/09): no cap — "this sweep expands to 3168 backtests, over the 3000" was
+    // refused, and hours of queue are his to spend. 2 points x 4 charts x 400 markets = 3200.
     const markets = Array.from({ length: 400 }, (_, i) => `SYM${String(i)}`)
     const form = aForm({ symbols: markets, timeframes: ['M15', 'H1', 'H4', 'D1'] })
 
-    expect(runCount(form, entries)).toBeGreaterThan(MAX_SWEEP_RUNS)
+    expect(runCount(form, entries)).toBe(3200)
     expect(whyNotLaunchable(form, entries)).toBeNull()
   })
 

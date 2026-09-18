@@ -2341,8 +2341,9 @@ e hoje ele mede o arquivo como a suíte o deixou.
   hoje a linha só diz em qual ativo e período. É um cálculo novo sobre as velas, não um export.
 - [origem: PR-256] **O painel das varreduras lê tudo, sem teto.** Sem datas, `GET /sweeps/dashboard`
   carrega todo run de toda varredura como objeto ORM. Medido em 16/09: 794 runs em 0,12 s. Mas
-  `MAX_SWEEP_RUNS` é 3000 por varredura e não há limite de varreduras: 20 cheias seriam cerca de 60
-  mil objetos (uns 9 s por extrapolação). Candidatos: agregar em SQL (`percentile_cont`), ou recusar
+  ⚠️ **Piorou na PR-273:** não há mais teto por varredura (era `MAX_SWEEP_RUNS` = 3000), então uma
+  varredura sozinha já pode ter dezenas de milhares de runs — 60 mil objetos seriam uns 9 s por
+  extrapolação. Candidatos: agregar em SQL (`percentile_cont`), ou recusar
   acima de N runs pedindo um período. Cuidado: agregar em SQL cria uma segunda definição de mediana
   e de vencedor, além da do estudo.
 - [origem: PR-256] **O painel mistura retornos de janelas de tamanhos diferentes na mesma mediana.**
@@ -2459,7 +2460,7 @@ antes, ou recusar reescrever uma partição com menos barras do que ela tinha.
   CSV/dicionário (`sweep_dataset.py`) e `GET /sweeps/dashboard` não o leem: um par pulado some do
   dataset sem uma linha de aviso no dicionário.
 * **A lista de varreduras** (`GET /sweeps`) não diz que uma varredura tem buraco.
-* **Ensaio e lançamento com coleta podem discordar no teto.** `PreviewSweepRequest` não tem
+* ✅ **RESOLVIDO na PR-273 (por remoção do teto)** — **Ensaio e lançamento com coleta podem discordar no teto.** `PreviewSweepRequest` não tem
   `collect_missing`, e `preview.runs` conta o lançamento **sem** coletar (o menor dos dois). Um
   ensaio com `error: null` e 2900 runs pode virar 422 "over the 3000" no "Collect and run", que
   roda também os pares descobertos. Conserto: o ensaio devolver as duas contagens, ou aceitar o
@@ -2511,3 +2512,14 @@ antes, ou recusar reescrever uma partição com menos barras do que ela tinha.
   pergunta o plano —, mas a varredura avisa enquanto se edita.
 * **O walk-forward não pergunta de novo.** Ele parte de um estudo já lançado, cuja janela passou
   pela checagem; se o dado for apagado entre os dois, o `POST /walkforwards` não sabe.
+
+## O que a fatia "sem teto de combinações" (PR-273) deixou de fora
+
+* **O ensaio valida cada ponto a cada edição.** `/studies/preview` e `/sweeps/preview` passam todo
+  documento pelo validador do DSL (o da varredura, duas vezes por documento). Em 3168 pontos é
+  rápido; em 10^5 o "enquanto você digita" fica lento e prende uma thread do servidor. Sem teto, o
+  custo do ensaio cresce com a grade — candidatos: validar uma vez por (entrada, chart) e contar.
+* **O tempo não aparece na tela.** A decisão foi "tempo se mostra, não recusa": falta a estimativa
+  (runs x segundos medidos por run, por chart/janela) ao lado do número de backtests.
+* **O estudo recusa em vez de podar** combinações inválidas (ex.: time frame superior não mais
+  grosso que o base), enquanto a varredura poda e nomeia. Pedido dele (18/09) — próxima PR.

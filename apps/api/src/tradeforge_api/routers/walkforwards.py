@@ -37,7 +37,7 @@ from tradeforge_api.schemas import (
     WalkForwardOut,
     WalkForwardVerdict,
 )
-from tradeforge_api.walkforward import MAX_RUNS, Fold, Outcome, WalkForwardError, split, verdict
+from tradeforge_api.walkforward import Fold, Outcome, WalkForwardError, split, verdict
 from tradeforge_collector import read_times
 from tradeforge_db.models import (
     Backtest,
@@ -157,19 +157,8 @@ async def create_walk_forward(
     # let the two halves of the comparison search different spaces.
     points = points_for(base, grid, study.timeframe)
     folds = _folds_for(settings, study, instrument.symbol, request)
-
-    # ⚠️ The multiplication is the whole point of checking here rather than trusting the two
-    # limits separately. A grid inside `MAX_POINTS` and a fold count inside `MAX_FOLDS` still
-    # multiply out past anything worth running, and neither number looks alarming on its own.
+    # Counted to be reported, never to refuse: there is no cap on points x folds (18/09).
     total_runs = len(points) * len(folds)
-    if total_runs > MAX_RUNS:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail=(
-                f"{len(points)} grid points over {len(folds)} folds is {total_runs} backtests, "
-                f"over the {MAX_RUNS} one walk-forward will run"
-            ),
-        )
 
     cost_model = _cost_model_of(session, study)
 

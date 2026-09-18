@@ -22,8 +22,8 @@ from decimal import Decimal
 MIN_TEST_BARS = 20
 """How few candles a test window may hold before the split is refused.
 
-A budget, not a law — the same kind of number as `grid.MAX_POINTS`. A test window's whole job
-is to produce a result that was not searched for, and a window too short to hold a trade
+A floor against nonsense, not a budget of time. A test window's whole job is to produce a
+result that was not searched for, and a window too short to hold a trade
 produces zero, which on screen is indistinguishable from a strategy that looked and declined.
 That is the vacuous-test failure: a number that means "nothing happened" being read as "it
 broke even".
@@ -51,14 +51,10 @@ sample, and past some point the wandering being exposed is just the noise of the
 — the very failure the experiment was built to expose, reintroduced one level up.
 """
 
-MAX_RUNS = 1000
-"""Total backtests one walk-forward will execute: `folds x grid points`, plus one per fold.
-
-Measured on this project's own runs, a backtest takes 0.1 to 0.8 seconds, so this is a
-worst case of some eight minutes — long enough to be a deliberate act, short enough to sit
-through. Refused with the number in the message, never quietly trimmed: half a walk-forward is
-a picture of an experiment that was not run, and it looks exactly like one that was.
-"""
+# ⚠️ **No cap on grid points x folds** (his decision, 18/09). There was one — 1 000, sold as eight
+# minutes at 0.1 to 0.8 s a run, which a run measured at about 43 s the same day made untrue —
+# and it meant a study of his full grid could never be walked forward at all. `MAX_FOLDS` stays:
+# it is about method (a test window too short is noise), not about how long the queue is.
 
 
 class WalkForwardError(ValueError):
@@ -363,7 +359,6 @@ def _median(values: Sequence[Decimal]) -> Decimal | None:
 
 __all__ = [
     "MAX_FOLDS",
-    "MAX_RUNS",
     "MIN_FOLDS",
     "MIN_TEST_BARS",
     "Candidate",

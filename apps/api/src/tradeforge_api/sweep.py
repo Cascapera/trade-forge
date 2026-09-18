@@ -28,32 +28,6 @@ from typing import Any
 
 from tradeforge_api.grid import GridError, GridPoint, expand, fit_name, size_of
 
-SECONDS_PER_BACKTEST = 0.23
-"""What a backtest costs, measured rather than guessed.
-
-The mean over this project's own 1 181 finished runs; the slowest was 2.17 s. Named because the
-cap below is derived from it — a budget stated as a number of runs is a budget that stops being
-true the day the engine gets faster or the histories get longer.
-"""
-
-MAX_SWEEP_RUNS = 3000
-"""How many backtests one sweep will enqueue.
-
-A cap and not a sample: a sweep too large is refused with its own size in the message, never
-quietly trimmed. Half a sweep is a picture of a space that was never searched, and it looks
-exactly like a picture of one that was.
-
-⚠️ **The number is a time budget, and it was raised once already.** The first draft said 2 000,
-which refused three catalogue entries of fifty points each over five markets and three
-timeframes — 2 250 runs, and the exact shape this feature was asked for. A cap that refuses the
-feature is not a cap, and the test that caught it asserts the *budget* rather than that one
-shape: at the measured mean this is under twelve minutes on one worker, and even every run being
-the slowest ever seen keeps it inside two hours.
-
-Higher than `MAX_POINTS` because a sweep multiplies three ways where a study multiplies one.
-Low enough that launching one is still a deliberate act.
-"""
-
 
 class SweepError(ValueError):
     """A sweep that cannot be expanded into runs anyone should launch."""
@@ -155,6 +129,11 @@ def points_in(grid: Mapping[str, Sequence[Any]]) -> int:
 def size_refusal(runs: int) -> str | None:
     """Why a sweep of this many runs cannot be launched, in the words both endpoints say.
 
+    ⚠️ **Only an empty sweep, never a large one** (his decision, 18/09: "não me importa que demore
+    horas rodando"). The cap that was here — 3000 runs, sold as twelve minutes at 0.23 s a run —
+    refused 3168 runs of his own sweep, on a day a run was measured at about 43 s. How long a
+    sweep takes is something to show, not a ground to refuse.
+
     ⚠️ **One sentence with one owner, because two endpoints ask this question.** The preview
     reports it as an `error` and the launch raises it as a 422 — different mechanisms, and that
     part is right: a preview that raised would have nothing to preview. What must not differ is
@@ -165,20 +144,14 @@ def size_refusal(runs: int) -> str | None:
     that cannot be asked, and `0 runs` rendered beside a live launch button invites pressing it.
 
     The count handed in is the **net** one — what would actually be enqueued, refusals already
-    subtracted. The cap is a time budget, and combinations that never run spend no time.
+    subtracted.
     """
-    if runs > MAX_SWEEP_RUNS:
-        return (
-            f"this sweep expands to {runs} backtests, over the {MAX_SWEEP_RUNS} one sweep will run"
-        )
     if runs == 0:
         return "no combination in this sweep can run"
     return None
 
 
 __all__ = [
-    "MAX_SWEEP_RUNS",
-    "SECONDS_PER_BACKTEST",
     "SweepDocument",
     "SweepError",
     "documents_for",

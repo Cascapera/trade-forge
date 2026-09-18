@@ -536,7 +536,7 @@ export function useCreateStudy() {
  * The study's preview one axis up, and for the same reason: whether a combination can run is the
  * DSL's semantics, and those live in Python once. What is new here is that the answer carries
  * **three** independent noes — a combination the DSL refuses, a (symbol, timeframe) with no
- * candles in the window, and a product over the cap — and only the first is about the strategy.
+ * candles in the window, and a sweep with nothing to run — and only the first is about the strategy.
  * A screen that pooled them would send somebody to edit a grid when the fix is a backfill.
  *
  * ⚠️ **The answer carries the question it is about.** Read off `asked`, never assumed from the

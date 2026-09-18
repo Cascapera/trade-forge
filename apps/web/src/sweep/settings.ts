@@ -35,15 +35,6 @@ export const emptySweepForm: SweepForm = {
 }
 
 /**
- * The server's cap, repeated here **only to be printed** beside the warning about searching.
- *
- * ⚠️ Not a check. The server caps the runs that will actually be enqueued, after the DSL's
- * refusals are subtracted, and the form can only count before them — so a form that refused on
- * this would refuse sweeps the server starts. The preview's `error` says when a sweep is over.
- */
-export const MAX_SWEEP_RUNS = 3000
-
-/**
  * How many backtests this form describes.
  *
  * ⚠️ **The entries add; the charts and the markets multiply.** Three entries of ten points each

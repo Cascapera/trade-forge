@@ -257,14 +257,82 @@ class TestTheLaunch:
         )
 
         assert created.status_code == 202, created.text
-        waits = sorted(
-            waits_of(session_factory, created.json()["id"]), key=lambda one: one.date_from
-        )
-        assert [(one.date_from.year, one.date_to.year) for one in waits] == [
-            (2018, 2020),
-            (2022, 2024),
-        ]
+        waits = waits_of(session_factory, created.json()["id"])
+        assert len(waits) == 2
         assert len(queue.of(COLLECT_RANGE)) == 2
+
+        # ⚠️ Oldest window first, asserted of the body rather than sorted here: the order is the
+        # relationship's (`order_by`), and a test that sorted would pass with it deleted.
+        served = client.get(f"/backtests/{created.json()['id']}").json()["waiting_for"]
+        assert [(one["date_from"][:4], one["date_to"][:4]) for one in served] == [
+            ("2018", "2020"),
+            ("2022", "2024"),
+        ]
+
+    def test_the_run_says_what_it_is_waiting_for_and_how_far_along_it_is(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        """⚠️ Waiting looks exactly like queueing from outside — the status is `queued` either
+        way. The screen can only tell the difference if the run says what it is waiting for."""
+        run_id = launch(
+            client,
+            collect_missing=True,
+            date_from=dt.datetime(2023, 3, 1, tzinfo=dt.UTC).isoformat(),
+            date_to=dt.datetime(2024, 7, 1, tzinfo=dt.UTC).isoformat(),
+        ).json()["id"]
+        (collection,) = waits_of(session_factory, run_id)
+        # Two calendar years to fetch, one of them downloaded — the progress the screen shows.
+        move(session_factory, collection, BacktestStatus.RUNNING, years_done=1)
+
+        body = client.get(f"/backtests/{run_id}").json()
+
+        assert body["status"] == "queued"
+        (waiting,) = body["waiting_for"]
+        assert (waiting["symbol"], waiting["timeframe"]) == ("EURUSD", "H1")
+        assert (waiting["status"], waiting["years_done"], waiting["years_total"]) == (
+            "running",
+            1,
+            2,
+        )
+
+    def test_a_run_waiting_for_nothing_says_so_with_an_empty_list(
+        self, client: Any, collected: Any, tmp_path: Any
+    ) -> None:
+        collected(tmp_path, "EURUSD", "H1", CANDLES)
+        created = launch(
+            client,
+            date_from=CANDLES[0].time.isoformat(),
+            date_to=CANDLES[-1].time.isoformat(),
+        )
+        assert client.get(f"/backtests/{created.json()['id']}").json()["waiting_for"] == []
+
+    def test_the_waits_are_served_oldest_window_first(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        """⚠️ Written in the reverse order on purpose. A launch creates its collections oldest
+        first, so the rows come back sorted whether or not anything sorts them — and a test built
+        that way passes with the ordering deleted."""
+        run_id = launch(client, collect_missing=True).json()["id"]
+        with session_factory() as session:
+            for year in (2026, 2019):
+                older = Collection(
+                    symbol="EURUSD",
+                    timeframe="H1",
+                    date_from=dt.datetime(year, 1, 1, tzinfo=dt.UTC),
+                    date_to=dt.datetime(year, 12, 31, tzinfo=dt.UTC),
+                    status=BacktestStatus.QUEUED,
+                    years_total=1,
+                )
+                session.add(older)
+                session.flush()
+                session.add(
+                    BacktestCollection(backtest_id=uuid.UUID(run_id), collection_id=older.id)
+                )
+                session.commit()
+
+        served = client.get(f"/backtests/{run_id}").json()["waiting_for"]
+
+        assert [one["date_from"][:4] for one in served] == ["2019", "2024", "2026"]
 
 
 class TestTheWait:

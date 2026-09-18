@@ -2417,9 +2417,12 @@ antes, ou recusar reescrever uma partição com menos barras do que ela tinha.
   insere linha nova, e o agente executa uma de cada vez (`max_jobs = 1`), então os mesmos anos
   são baixados duas vezes e o segundo run espera o dobro. Conserto: reaproveitar uma coleta
   `queued`/`running` com o mesmo (símbolo, time frame, janela).
-* **Enquanto espera, o run parece "queued" e nada é publicado no canal de progresso.** A tela não
-  tem como dizer "esperando o download". É a próxima fatia (a tela), e pode exigir um estado novo
-  ou um campo de razão.
+* ✅ **RESOLVIDO na PR-266** — o run carrega `waiting_for` (as coletas com o progresso delas) e a
+  tela de resultado diz o que está sendo baixado. ⚠️ Segue valendo que **nada é publicado no canal
+  de progresso**: quem descobre é o poll de 1 s da tela.
+* **O run log não mostra que um run está esperando** (`BacktestListItem` não carrega
+  `waiting_for`): lá ele aparece como `queued` igual a qualquer outro. O lançamento navega para a
+  tela do run, então hoje isso só morde quem chega pelo log.
 * **`collections` não tem o CHECK `failed_needs_error`** que `backtests` tem, então uma coleta
   pode ficar `failed` sem razão registrada. O worker já trata (`no reason recorded`), mas a
   assimetria é acidental.

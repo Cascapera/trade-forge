@@ -1,6 +1,6 @@
 import { fireEvent, screen } from '@testing-library/react'
 
-import type { Backtest, CandlesResponse, Metrics, Trade } from '../api/types'
+import type { Backtest, CandlesResponse, Collection, Metrics, Trade } from '../api/types'
 import { renderWithProviders } from '../test-utils'
 
 vi.mock('../api/hooks', () => ({
@@ -68,6 +68,7 @@ function backtest(over: Partial<Backtest>): Backtest {
     first_candle: null,
     last_candle: null,
     metrics: null,
+    waiting_for: [],
     ...over,
   }
 }
@@ -286,5 +287,106 @@ describe('Results — the price tab', () => {
 
     expect(screen.getByText(/did not record which candles/i)).toBeInTheDocument()
     expect(screen.queryByText(/price chart/)).not.toBeInTheDocument()
+  })
+})
+
+describe('Results, while the data is still being collected', () => {
+  function collection(over: Partial<Collection>): Collection {
+    return {
+      id: 'c1',
+      symbol: 'EURUSD',
+      timeframe: 'H1',
+      date_from: '2024-01-01T00:00:00Z',
+      date_to: '2024-12-31T23:59:59.999999Z',
+      asset_class: null,
+      status: 'running',
+      years_done: 1,
+      years_total: 3,
+      candles: null,
+      gaps: null,
+      error: null,
+      requested_at: '',
+      started_at: null,
+      finished_at: null,
+      ...over,
+    }
+  }
+
+  it('says what is being downloaded and how far along it is', () => {
+    // ⚠️ Waiting and queueing are the same status; without this the screen would say "running
+    // the backtest" for an hour while a download went on.
+    stubBacktest({
+      data: backtest({ status: 'queued', waiting_for: [collection({})] }),
+      isPending: false,
+      isError: false,
+    })
+    renderWithProviders(<Results />, '/results/b1')
+
+    expect(screen.getByRole('status')).toHaveTextContent(
+      'Waiting for the data this run needs: EURUSD H1 1 of 3 years. It starts by itself once the download lands',
+    )
+    expect(screen.queryByText(/Running the backtest/)).not.toBeInTheDocument()
+  })
+
+  it('goes back to the ordinary wording once every download has landed', () => {
+    // The list is kept after a collection finishes: then it is history, not a wait.
+    stubBacktest({
+      data: backtest({ status: 'queued', waiting_for: [collection({ status: 'done' })] }),
+      isPending: false,
+      isError: false,
+    })
+    renderWithProviders(<Results />, '/results/b1')
+
+    expect(screen.getByText(/Running the backtest/)).toBeInTheDocument()
+  })
+
+  it('says nothing about downloads once the run has finished', () => {
+    stubBacktest({
+      data: backtest({ status: 'done', metrics, waiting_for: [collection({ status: 'done' })] }),
+      isPending: false,
+      isError: false,
+    })
+    renderWithProviders(<Results />, '/results/b1')
+
+    expect(screen.queryByText(/Waiting for the data/)).not.toBeInTheDocument()
+  })
+
+  it('says a download failed instead of claiming the run is going', () => {
+    // ⚠️ The run is doomed and still `queued`: the worker finds out on its next wake-up, up to
+    // half a minute later. Until then, "running the backtest" is the one thing certainly false.
+    stubBacktest({
+      data: backtest({
+        status: 'queued',
+        waiting_for: [collection({ status: 'failed', error: 'the terminal said no' })],
+      }),
+      isPending: false,
+      isError: false,
+    })
+    renderWithProviders(<Results />, '/results/b1')
+
+    expect(screen.getByRole('status')).toHaveTextContent(
+      'A download this run needs failed: EURUSD H1 — the terminal said no. This run stops as soon as the worker looks at it.',
+    )
+    expect(screen.queryByText(/Running the backtest/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/Waiting for the data/)).not.toBeInTheDocument()
+  })
+
+  it('leads with the failure even while another download is still going', () => {
+    // Promising "it starts by itself once the download lands" would be a promise already broken.
+    stubBacktest({
+      data: backtest({
+        status: 'queued',
+        waiting_for: [
+          collection({ id: 'c1', status: 'failed', error: 'no history' }),
+          collection({ id: 'c2', status: 'running' }),
+        ],
+      }),
+      isPending: false,
+      isError: false,
+    })
+    renderWithProviders(<Results />, '/results/b1')
+
+    expect(screen.getByRole('status')).toHaveTextContent('A download this run needs failed')
+    expect(screen.queryByText(/starts by itself/)).not.toBeInTheDocument()
   })
 })

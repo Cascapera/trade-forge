@@ -92,6 +92,9 @@ export const doneRun = {
   created_at: '2024-01-01T00:00:00Z',
   started_at: '2024-01-01T00:00:01Z',
   finished_at: '2024-01-01T00:00:02Z',
+  // Nothing was downloaded for this run — the journey is not about waiting for a collection.
+  // Present for the reason the keys below are: the API always sends it, and the screen reads it.
+  waiting_for: [],
   // ⚠️ Present, and that is not padding. `coverageNotice` guards these with `=== null`, so a
   // fixture that simply omits them makes them `undefined`, walks straight past the guard and
   // throws inside the date formatter — a blank screen where the results should be. The API

@@ -69,6 +69,15 @@ export function Results(): React.JSX.Element {
 
   const run = backtest.data
   const coverage = coverageNotice(run)
+  // ⚠️ Only the unfinished ones. The list is kept after a download lands, and a finished
+  // collection beside a run that is about to start is history, not something to wait for.
+  const collecting = run.waiting_for.filter(
+    (one) => one.status !== 'done' && one.status !== 'failed',
+  )
+  // ⚠️ A failed download is neither finished nor a wait. The run is doomed and does not know it
+  // yet — the worker finds out on its next wake-up, up to half a minute later — and in between,
+  // "running the backtest" would be the one thing that is certainly false.
+  const brokenDownloads = run.waiting_for.filter((one) => one.status === 'failed')
   const price = candles.data
 
   return (
@@ -93,9 +102,38 @@ export function Results(): React.JSX.Element {
         </p>
       )}
 
-      {(run.status === 'queued' || run.status === 'running') && (
-        <p className="text-slate-400">Running the backtest — this page updates itself.</p>
+      {(run.status === 'queued' || run.status === 'running') && brokenDownloads.length > 0 && (
+        <p
+          role="status"
+          className="rounded border border-red-800 bg-red-950/40 p-4 text-sm text-red-300"
+        >
+          A download this run needs failed:{' '}
+          {brokenDownloads
+            .map((one) => `${one.symbol} ${one.timeframe} — ${one.error ?? 'no reason recorded'}`)
+            .join('; ')}
+          . This run stops as soon as the worker looks at it.
+        </p>
       )}
+
+      {(run.status === 'queued' || run.status === 'running') &&
+        brokenDownloads.length === 0 &&
+        (collecting.length > 0 ? (
+          <p
+            role="status"
+            className="rounded border border-sky-900 bg-sky-950/40 p-4 text-sm text-sky-200"
+          >
+            Waiting for the data this run needs:{' '}
+            {collecting
+              .map(
+                (one) =>
+                  `${one.symbol} ${one.timeframe} ${String(one.years_done)} of ${String(one.years_total)} years`,
+              )
+              .join(', ')}
+            . It starts by itself once the download lands — this page updates itself.
+          </p>
+        ) : (
+          <p className="text-slate-400">Running the backtest — this page updates itself.</p>
+        ))}
 
       {run.status === 'failed' && (
         <p className="rounded border border-red-800 bg-red-950/40 p-4 text-sm text-red-300">

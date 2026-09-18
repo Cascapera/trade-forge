@@ -80,6 +80,14 @@ export interface Backtest {
   first_candle: string | null
   last_candle: string | null
   metrics: Metrics | null
+  /**
+   * The downloads this run is waiting for before it can start, oldest window first.
+   *
+   * ⚠️ Without them, waiting reads exactly like queueing: both sit at `queued`, and the
+   * difference is minutes against hours. Each row carries its own progress, so the screen can
+   * say what is being fetched. Kept after they finish — then they are history, not a wait.
+   */
+  waiting_for: Collection[]
 }
 
 /**
@@ -322,6 +330,14 @@ export interface CreateBacktestRequest {
   date_to: string
   initial_capital: string
   cost_model: Record<string, unknown>
+  /**
+   * Collect what this window is missing, and run once it has landed.
+   *
+   * ⚠️ The windows are the server's plan, never the client's: a window chosen here could be part
+   * of a year, and the collector replaces whole year partitions. Left out, a window the index
+   * holds no candle of is refused at once.
+   */
+  collect_missing?: boolean
 }
 
 // --------------------------------------------------------------------------- //

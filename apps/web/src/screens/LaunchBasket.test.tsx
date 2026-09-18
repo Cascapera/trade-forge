@@ -15,7 +15,12 @@ const { mutate, state, gate, navigate } = vi.hoisted(() => {
     pending: null as null | (() => void),
     asked: vi.fn(),
   }
-  return { mutate: vi.fn(), state, gate: { plan, collect: vi.fn() }, navigate: vi.fn() }
+  return {
+    mutate: vi.fn(),
+    state,
+    gate: { plan, collect: vi.fn(), collectMode: 'take' },
+    navigate: vi.fn(),
+  }
 })
 
 vi.mock('react-router-dom', async (original) => ({
@@ -52,13 +57,15 @@ vi.mock('../api/hooks', () => ({
     isError: false,
   }),
   useCollectMissing: () => ({
-    // The server takes every request; each one is reported as taken, as the real hook does.
+    // `take`: each request is reported as taken and the sending ends, as the real hook does.
+    // `hold`: still sending. `refuse`: the sending ends with nothing taken.
     mutate: (
       variables: { bodies: unknown[]; onQueued: (body: unknown) => void },
       options?: { onSettled?: () => void },
     ) => {
       gate.collect(variables.bodies)
-      for (const body of variables.bodies) variables.onQueued(body)
+      if (gate.collectMode === 'hold') return
+      if (gate.collectMode === 'take') for (const body of variables.bodies) variables.onQueued(body)
       options?.onSettled?.()
     },
     reset: () => undefined,
@@ -84,6 +91,7 @@ beforeEach(() => {
   gate.plan.answer = []
   gate.plan.hold = false
   gate.plan.pending = null
+  gate.collectMode = 'take'
 })
 
 afterEach(() => {
@@ -303,5 +311,69 @@ describe('LaunchBasket when data is missing', () => {
     fireEvent.click(screen.getByRole('button', { name: /run 2 markets/i }))
 
     expect(screen.getByRole('button', { name: 'Run with what there is' })).toBeInTheDocument()
+  })
+
+  // ⚠️ Moved here from the backtest screen with PR-266: that screen now asks the server to
+  // collect and run in one press, so queueing downloads from the prompt lives only here until
+  // the basket's launch takes the same flag.
+  const MISSING_GBP = [
+    {
+      symbol: 'GBPUSD',
+      timeframe: 'H4',
+      covers: null,
+      in_window: false,
+      windows: [{ date_from: '2024-01-01T00:00:00Z', date_to: '2024-12-31T23:59:59.999999Z' }],
+    },
+  ]
+
+  it('queues the collection when told to, and does not launch', () => {
+    gate.plan.answer = MISSING_GBP
+    chosen()
+    fireEvent.click(screen.getByRole('button', { name: /run 2 markets/i }))
+    fireEvent.click(screen.getByRole('button', { name: 'Collect what is missing' }))
+
+    expect(gate.collect).toHaveBeenCalledWith([
+      {
+        items: [{ symbol: 'GBPUSD' }],
+        rows: [{ timeframe: 'H4', ...MISSING_GBP[0]!.windows[0]! }],
+      },
+    ])
+    expect(mutate).not.toHaveBeenCalled()
+  })
+  it('never queues the same window twice, however often it is pressed', () => {
+    // ⚠️ The server does not merge identical requests: a second press would download the same
+    // year again. Pressed twice before the screen re-renders, and once more after a new Run.
+    gate.plan.answer = MISSING_GBP
+    chosen()
+    fireEvent.click(screen.getByRole('button', { name: /run 2 markets/i }))
+    const collect = screen.getByRole('button', { name: 'Collect what is missing' })
+    fireEvent.click(collect)
+    fireEvent.click(collect)
+    fireEvent.click(screen.getByRole('button', { name: /run 2 markets/i }))
+
+    expect(gate.collect).toHaveBeenCalledTimes(1)
+    expect(screen.getByRole('button', { name: 'Already queued' })).toBeDisabled()
+  })
+  it('sends nothing on a second press while the first is still sending', () => {
+    gate.plan.answer = MISSING_GBP
+    gate.collectMode = 'hold'
+    chosen()
+    fireEvent.click(screen.getByRole('button', { name: /run 2 markets/i }))
+    fireEvent.click(screen.getByRole('button', { name: 'Collect what is missing' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Collect what is missing' }))
+
+    expect(gate.collect).toHaveBeenCalledTimes(1)
+  })
+  it('offers a refused window again', () => {
+    // Nothing was taken, so nothing would be downloaded twice — and the person may have fixed
+    // what the server refused.
+    gate.plan.answer = MISSING_GBP
+    gate.collectMode = 'refuse'
+    chosen()
+    fireEvent.click(screen.getByRole('button', { name: /run 2 markets/i }))
+    fireEvent.click(screen.getByRole('button', { name: 'Collect what is missing' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Collect what is missing' }))
+
+    expect(gate.collect).toHaveBeenCalledTimes(2)
   })
 })

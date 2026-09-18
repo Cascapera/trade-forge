@@ -438,6 +438,17 @@ class BacktestOut(_Out):
     first_candle: dt.datetime | None = None
     last_candle: dt.datetime | None = None
     metrics: MetricsOut | None = None
+    waiting_for: list[CollectionOut] = Field(default_factory=list)
+    """The downloads this run is waiting for before it can start, oldest window first.
+
+    ⚠️ **Without this, waiting is indistinguishable from queueing.** A run told to collect first
+    sits at `queued` exactly like one behind a busy worker, and the difference is minutes against
+    hours. The rows carry their own progress (`years_done` of `years_total`), so a screen can say
+    what is being downloaded rather than only that something is.
+
+    ⚠️ Kept after they finish, like the link rows themselves: it is how a run explains why it
+    started late. A finished collection here is history, not a wait.
+    """
 
 
 class BacktestListItem(_Out):

@@ -45,10 +45,8 @@ from tradeforge_api.walkforward import Candidate, choose
 from tradeforge_collector import read_candles
 from tradeforge_db.models import (
     Backtest,
-    BacktestCollection,
     BacktestMetrics,
     BacktestStatus,
-    Collection,
     Instrument,
     SelectionMetric,
     Strategy,
@@ -468,13 +466,9 @@ async def _still_collecting(ctx: dict[str, Any], session: Session, run_id: uuid.
     run = session.get(Backtest, run_id)
     if run is None:
         return False
-    waits = list(
-        session.scalars(
-            select(Collection)
-            .join(BacktestCollection, BacktestCollection.collection_id == Collection.id)
-            .where(BacktestCollection.backtest_id == run_id)
-        )
-    )
+    # The run's own relationship, so the worker and the screen read one definition of "waiting
+    # for" — including its order — rather than two queries free to drift apart.
+    waits = run.waiting_for
     if not waits:
         return False
 

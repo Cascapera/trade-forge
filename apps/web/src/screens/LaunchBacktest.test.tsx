@@ -253,35 +253,6 @@ describe('LaunchBacktest when data is missing', () => {
     expect((mutate.mock.calls[0]?.[0] as { symbol: string }).symbol).toBe('EURUSD')
   })
 
-  it('queues the collection when told to, and does not launch', () => {
-    gate.plan.answer = MISSING
-    ready()
-    fireEvent.click(runButton())
-    fireEvent.click(screen.getByRole('button', { name: 'Collect what is missing' }))
-
-    expect(gate.collect).toHaveBeenCalledWith([
-      {
-        items: [{ symbol: 'EURUSD' }],
-        rows: [{ timeframe: 'H4', ...MISSING[0]!.windows[0]! }],
-      },
-    ])
-    expect(mutate).not.toHaveBeenCalled()
-  })
-
-  it('never queues the same window twice, however often it is pressed', () => {
-    // ⚠️ The server does not merge identical requests: a second press would download the same
-    // year again. Pressed twice before the screen re-renders, and once more after a new Run.
-    gate.plan.answer = MISSING
-    ready()
-    fireEvent.click(runButton())
-    const collect = screen.getByRole('button', { name: 'Collect what is missing' })
-    fireEvent.click(collect)
-    fireEvent.click(collect)
-    fireEvent.click(runButton())
-
-    expect(gate.collect).toHaveBeenCalledTimes(1)
-    expect(screen.getByRole('button', { name: 'Already queued' })).toBeDisabled()
-  })
 
   it('closes the prompt when the form changes, since it answered the old form', () => {
     gate.plan.answer = MISSING
@@ -314,29 +285,6 @@ describe('LaunchBacktest when data is missing', () => {
     expect(mutate).toHaveBeenCalledTimes(1)
   })
 
-  it('sends nothing on a second press while the first is still sending', () => {
-    gate.plan.answer = MISSING
-    gate.collectMode = 'hold'
-    ready()
-    fireEvent.click(runButton())
-    fireEvent.click(screen.getByRole('button', { name: 'Collect what is missing' }))
-    fireEvent.click(screen.getByRole('button', { name: 'Collect what is missing' }))
-
-    expect(gate.collect).toHaveBeenCalledTimes(1)
-  })
-
-  it('offers a refused window again', () => {
-    // Nothing was taken, so nothing would be downloaded twice — and the person may have fixed
-    // what the server refused.
-    gate.plan.answer = MISSING
-    gate.collectMode = 'refuse'
-    ready()
-    fireEvent.click(runButton())
-    fireEvent.click(screen.getByRole('button', { name: 'Collect what is missing' }))
-    fireEvent.click(screen.getByRole('button', { name: 'Collect what is missing' }))
-
-    expect(gate.collect).toHaveBeenCalledTimes(2)
-  })
 
   it('does not offer to run a market that was never collected', () => {
     // ⚠️ His case on 17/09: an H1 strategy over a pair collected only at M15 and H4. The launch
@@ -357,5 +305,34 @@ describe('LaunchBacktest when data is missing', () => {
     expect(screen.queryByRole('button', { name: 'Run with what there is' })).not.toBeInTheDocument()
     expect(screen.getByText('Nothing would run until this is collected.')).toBeInTheDocument()
     expect(mutate).not.toHaveBeenCalled()
+  })
+
+  it('collects and runs in one press, letting the server plan the windows', () => {
+    // ⚠️ The screen sends no windows of its own: a client-chosen window could be part of a year,
+    // and the collector replaces whole year partitions.
+    gate.plan.answer = MISSING
+    ready()
+    fireEvent.click(runButton())
+    fireEvent.click(screen.getByRole('button', { name: 'Collect and run' }))
+
+    expect(gate.collect).not.toHaveBeenCalled()
+    expect(mutate).toHaveBeenCalledTimes(1)
+    expect((mutate.mock.calls[0]?.[0] as { collect_missing: boolean }).collect_missing).toBe(true)
+  })
+
+  it('runs with what there is without asking for a collection', () => {
+    gate.plan.answer = MISSING
+    ready()
+    fireEvent.click(runButton())
+    fireEvent.click(screen.getByRole('button', { name: 'Run with what there is' }))
+
+    expect((mutate.mock.calls[0]?.[0] as { collect_missing: boolean }).collect_missing).toBe(false)
+  })
+
+  it('an ordinary launch asks for no collection either', () => {
+    ready()
+    fireEvent.click(runButton())
+
+    expect((mutate.mock.calls[0]?.[0] as { collect_missing: boolean }).collect_missing).toBe(false)
   })
 })

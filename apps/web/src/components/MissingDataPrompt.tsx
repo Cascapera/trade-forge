@@ -9,10 +9,13 @@ function plural(count: number, one: string, many: string): string {
 }
 
 /**
- * The prompt: what is missing, and the two answers.
+ * The prompt: what is missing, and the answers.
  *
- * - **Collect what is missing** queues the collections the plan names. ⚠️ It does not launch: until
- *   a run can wait for its collection, the person runs again once the collection has finished.
+ * - **Collect and run** (`onCollectAndRun`, where the launch takes `collect_missing`) hands the
+ *   whole thing to the server: it plans the windows, queues the downloads, and the run starts by
+ *   itself when they land.
+ * - **Collect what is missing** is the older answer, still the basket's: the downloads are queued
+ *   from here, and the person runs again once they have finished.
  * - **Run with what there is** launches now. The server runs the part of the window that exists;
  *   a single backtest with nothing in the window is refused, and a basket leaves such a market out
  *   and names it.
@@ -26,11 +29,16 @@ function plural(count: number, one: string, many: string): string {
 export function MissingDataPrompt({
   gate,
   onRunAnyway,
+  onCollectAndRun,
   launching,
   canRun,
 }: {
   gate: MissingDataGate
   onRunAnyway: () => void
+  /** Launch now and let the server collect first, where it can (`collect_missing`). ⚠️ Absent on
+   *  a screen whose launch does not take that flag — the basket, until its own slice — and there
+   *  the prompt queues the downloads by itself and the person runs again. */
+  onCollectAndRun?: () => void
   launching: boolean
   /** Whether any market being launched would read a candle. ⚠️ False hides the run: the launch
    *  would be refused, and offering it offers nothing. A plan that could not be asked cannot
@@ -52,7 +60,21 @@ export function MissingDataPrompt({
           Could not check which data is on disk:{' '}
           {apiFailure(plan.error, 'the server did not answer.')}
         </p>
-        {runButton('Run anyway')}
+        <div className="flex flex-wrap gap-3">
+          {/* ⚠️ Offered here too, and it is the better answer: this button needs no plan — the
+              server makes its own and collects whatever the window is missing. */}
+          {onCollectAndRun !== undefined && (
+            <button
+              type="button"
+              disabled={launching}
+              onClick={onCollectAndRun}
+              className={primary}
+            >
+              {launching ? 'Enqueuing…' : 'Collect and run'}
+            </button>
+          )}
+          {runButton('Run anyway')}
+        </div>
       </section>
     )
   }
@@ -90,18 +112,24 @@ export function MissingDataPrompt({
       )}
 
       <div className="flex flex-wrap gap-3">
-        <button
-          type="button"
-          disabled={collection.isPending || outstanding === 0}
-          onClick={gate.collect}
-          className="rounded bg-sky-600 px-3 py-1.5 font-medium text-white enabled:hover:bg-sky-500 disabled:opacity-40"
-        >
-          {collection.isPending
-            ? 'Queueing…'
-            : outstanding === 0
-              ? 'Already queued'
-              : 'Collect what is missing'}
-        </button>
+        {onCollectAndRun === undefined ? (
+          <button
+            type="button"
+            disabled={collection.isPending || outstanding === 0}
+            onClick={gate.collect}
+            className={primary}
+          >
+            {collection.isPending
+              ? 'Queueing…'
+              : outstanding === 0
+                ? 'Already queued'
+                : 'Collect what is missing'}
+          </button>
+        ) : (
+          <button type="button" disabled={launching} onClick={onCollectAndRun} className={primary}>
+            {launching ? 'Enqueuing…' : 'Collect and run'}
+          </button>
+        )}
         {canRun ? (
           runButton('Run with what there is')
         ) : (
@@ -115,6 +143,9 @@ export function MissingDataPrompt({
     </section>
   )
 }
+
+const primary =
+  'rounded bg-sky-600 px-3 py-1.5 font-medium text-white enabled:hover:bg-sky-500 disabled:opacity-40'
 
 const panel =
   'space-y-3 rounded border border-amber-800 bg-amber-950/40 p-4 text-sm text-amber-200'

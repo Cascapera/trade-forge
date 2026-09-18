@@ -127,7 +127,9 @@ def list_item(
 
 
 def _load(session: SessionDep, backtest_id: uuid.UUID) -> Backtest:
-    backtest = session.get(Backtest, backtest_id)
+    # ⚠️ `waiting_for` eagerly **here**, where the body carries it, and nowhere else: loading it
+    # on every read of a run would buy a second query for the run log, which never shows it.
+    backtest = session.get(Backtest, backtest_id, options=[selectinload(Backtest.waiting_for)])
     if backtest is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="backtest not found")
     return backtest

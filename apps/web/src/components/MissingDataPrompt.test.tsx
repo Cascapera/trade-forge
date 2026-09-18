@@ -144,4 +144,29 @@ describe('MissingDataPrompt', () => {
     })
     expect(screen.getByRole('button', { name: 'Run anyway' })).toBeInTheDocument()
   })
+
+  it('offers collect and run even when the plan could not be asked', () => {
+    // ⚠️ That button needs no plan: the server makes its own. Offering only "Run anyway" would
+    // send the person into the refusal this whole flow exists to avoid.
+    const collectAndRun = vi.fn()
+    renderWithProviders(
+      <MissingDataPrompt
+        gate={gate({ missing: null, plan: { isError: true, error: new ApiError(404, 'Not Found') } })}
+        onRunAnyway={vi.fn()}
+        onCollectAndRun={collectAndRun}
+        launching={false}
+        canRun
+      />,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Collect and run' }))
+    expect(collectAndRun).toHaveBeenCalledTimes(1)
+    expect(screen.getByRole('button', { name: 'Run anyway' })).toBeInTheDocument()
+  })
+
+  it('offers only the run when the screen has no collect-and-run to give', () => {
+    // The basket, until its launch takes the flag.
+    show(gate({ missing: null, plan: { isError: true, error: new ApiError(404, 'Not Found') } }))
+    expect(screen.queryByRole('button', { name: 'Collect and run' })).not.toBeInTheDocument()
+  })
 })

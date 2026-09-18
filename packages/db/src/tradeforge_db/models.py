@@ -887,6 +887,21 @@ class Backtest(Base):
     trades: Mapped[list[Trade]] = relationship(
         back_populates="backtest", cascade="all, delete-orphan", passive_deletes=True
     )
+    waiting_for: Mapped[list[Collection]] = relationship(
+        secondary="backtest_collections",
+        order_by="Collection.date_from",
+        viewonly=True,
+    )
+    """The downloads this run was told to wait for (`rev_0019`), oldest window first.
+
+    ⚠️ **View-only.** The link rows are written by the launch, in the same transaction as the
+    run; letting this relationship write them too would give the same fact two authors.
+
+    ⚠️ **Loaded lazily, and eagerly only where it is served.** Two readers want it — the worker,
+    deciding whether to start, and `GET /backtests/{id}`, saying what the wait is for — while
+    every other read of a run (the log, a basket, a sweep, a walk-forward) would pay a second
+    query for a list it never renders. The run detail asks for it with `selectinload`.
+    """
 
     __table_args__ = (
         _timeframe_check(),

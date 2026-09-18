@@ -72,15 +72,21 @@ export function LaunchBacktest(): React.JSX.Element {
             : null
   const blocked = noStrategy ?? whyNotRunnable(form, instruments.data)
 
-  const launch = (): void => {
+  const launch = (collectMissing = false): void => {
     if (strategyId === null || timeframe === null) return
-    create.mutate(toBacktestRequest(form, strategyId, timeframe), {
-      onSuccess: (created) => {
-        void navigate(`/results/${created.id}`)
+    create.mutate(
+      { ...toBacktestRequest(form, strategyId, timeframe), collect_missing: collectMissing },
+      {
+        onSuccess: (created) => {
+          void navigate(`/results/${created.id}`)
+        },
       },
-    })
+    )
   }
-  const gate = useMissingDataGate(launch, instruments.data)
+  // ⚠️ The plan is asked with the flag off: nothing missing means launch as an ordinary run.
+  const gate = useMissingDataGate(() => {
+    launch()
+  }, instruments.data)
 
   // Asked first, launched only if nothing is missing — otherwise the prompt below decides.
   const run = (): void => {
@@ -138,7 +144,15 @@ export function LaunchBacktest(): React.JSX.Element {
 
       <MissingDataPrompt
         gate={gate}
-        onRunAnyway={launch}
+        onRunAnyway={() => {
+          launch()
+        }}
+        // The server plans, queues the downloads and links them to the run, which then starts by
+        // itself. ⚠️ The screen does not send windows of its own: a client-chosen window could be
+        // part of a year, and a partial year erases the rest of that year's partition.
+        onCollectAndRun={() => {
+          launch(true)
+        }}
         launching={create.isPending}
         canRun={gate.missing === null || anythingToRun([form.symbol], gate.missing)}
       />

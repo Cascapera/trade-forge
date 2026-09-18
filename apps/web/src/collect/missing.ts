@@ -15,11 +15,28 @@ function years(from: string, to: string): string {
   return year(from) === year(to) ? year(from) : `${year(from)}–${year(to)}`
 }
 
-/** `EURUSD H1 — on disk 2021-01-04 to 2025-12-31; would fetch 2019–2020, 2026`. */
+/**
+ * `EURUSD H1 — on disk 2021-01-04 to 2025-12-31; would fetch 2019–2020, 2026`, or, for a symbol
+ * the broker does not list, `AAPL H1 — never collected; not listed by the broker, cannot be
+ * collected`.
+ */
 export function missingLine(market: PlannedCollection): string {
   const held = market.covers === null ? 'never collected' : `on disk ${market.covers}`
+  if (market.at_broker === false) {
+    return `${market.symbol} ${market.timeframe} — ${held}; not listed by the broker, cannot be collected`
+  }
   const fetched = market.windows.map((w) => years(w.date_from, w.date_to)).join(', ')
   return `${market.symbol} ${market.timeframe} — ${held}; would fetch ${fetched}`
+}
+
+/**
+ * Would "Collect and run" fetch anything at all?
+ *
+ * ⚠️ `null` counts as collectable: an unsynced symbol list is a question nobody has asked, and
+ * the launch still collects it (`to_collect` on the server). Only `false` is a no.
+ */
+export function anythingToCollect(plan: readonly PlannedCollection[]): boolean {
+  return plan.some((market) => market.at_broker !== false)
 }
 
 /** One market on one chart — what a run reads, and what the plan answers about. */

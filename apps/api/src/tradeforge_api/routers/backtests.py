@@ -17,7 +17,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
 
 from tradeforge_api.config import Settings
-from tradeforge_api.coverage import describe, plan_for, uncovered_markets
+from tradeforge_api.coverage import describe, to_collect, uncovered_markets
 from tradeforge_api.deps import QueueDep, SessionDep, SettingsDep
 from tradeforge_api.queue import COLLECT_QUEUE, COLLECT_RANGE, RUN_BACKTEST
 from tradeforge_api.routers.strategies import assert_runnable_at
@@ -247,7 +247,7 @@ async def create_backtest(
     # cannot read one candle would spend a worker to learn it. A window covered in part runs.
     # Unless the caller answered "collect it first", in which case the gap is work to queue.
     planned = (
-        plan_for(
+        to_collect(
             session,
             symbols=[instrument.symbol],
             timeframes=[request.timeframe],

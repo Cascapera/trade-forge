@@ -24,6 +24,7 @@ from tradeforge_api.config import Settings
 from tradeforge_api.main import create_app
 from tradeforge_api.queue import COLLECT_QUEUE, COLLECT_RANGE, RUN_BACKTEST
 from tradeforge_api.worker import WAIT_POLL_SECONDS, run_backtest
+from tradeforge_db.broker_symbols import BrokerSymbolEntry, replace_snapshot
 from tradeforge_db.models import (
     Backtest,
     BacktestCollection,
@@ -163,6 +164,18 @@ def work(session_factory: Callable[[], Session], queue: _Queue, run_id: str, tmp
     asyncio.run(run_backtest(ctx, run_id))
 
 
+def broker_lists(session_factory: Callable[[], Session], *symbols: str) -> None:
+    """The host agent's snapshot of the broker's symbols, naming only these."""
+    with session_factory() as session:
+        replace_snapshot(
+            session,
+            [BrokerSymbolEntry(symbol=symbol) for symbol in symbols],
+            server="Tradeview-Demo",
+            synced_at=dt.datetime(2026, 9, 10, tzinfo=dt.UTC),
+        )
+        session.commit()
+
+
 class TestTheLaunch:
     def test_without_the_flag_a_window_with_no_candles_is_still_refused(self, client: Any) -> None:
         """The answer "no" keeps PR-262's behaviour: nothing is collected, nothing is queued."""
@@ -188,6 +201,22 @@ class TestTheLaunch:
         # The collection goes on the host's queue, the run on the worker's.
         assert queue.of(COLLECT_RANGE) == [{"_queue_name": COLLECT_QUEUE}]
         assert len(queue.of(RUN_BACKTEST)) == 1
+
+    def test_with_the_flag_a_symbol_the_broker_does_not_list_is_not_collected(
+        self, client: Any, session_factory: Callable[[], Session], queue: _Queue
+    ) -> None:
+        """⚠️ AAPL and US500 on 18/09: catalogue seeds this broker does not have. Collecting them
+        asked MetaTrader for bars of a symbol it does not know and failed; now the launch knows
+        before, and refuses as it would any window with nothing to fetch."""
+        broker_lists(session_factory, "GBPUSD")
+
+        refused = launch(client, collect_missing=True)
+
+        assert refused.status_code == 422
+        assert "never collected" in refused.json()["detail"]
+        with session_factory() as session:
+            assert session.scalars(select(Collection)).all() == []
+        assert queue.of(COLLECT_RANGE) == []
 
     def test_with_the_flag_and_nothing_missing_it_is_an_ordinary_launch(
         self,

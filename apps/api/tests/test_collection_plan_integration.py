@@ -138,6 +138,8 @@ def test_a_symbol_never_collected_is_planned_whole(client: TestClient) -> None:
             "covers": None,
             "in_window": False,
             "windows": [{"date_from": year_start(2019), "date_to": year_end(2021)}],
+            # No sync has ever run here: "I do not know", which is not "no".
+            "at_broker": None,
         }
     ]
 
@@ -199,6 +201,7 @@ def test_the_probe_is_read_per_timeframe(
             "covers": "2020-05-10 to 2022-12-30",
             "in_window": True,
             "windows": [{"date_from": year_start(2019), "date_to": year_end(2020)}],
+            "at_broker": None,
         }
     ]
 
@@ -306,3 +309,51 @@ class TestWhetherAnythingCanRunNow:
             None,
             False,
         )
+
+
+def synced(session_factory: Callable[[], Session], *symbols: str) -> None:
+    with session_factory() as session:
+        replace_snapshot(
+            session,
+            [BrokerSymbolEntry(symbol=symbol) for symbol in symbols],
+            server="Tradeview-Demo",
+            synced_at=at(2026, 9, 10),
+        )
+        session.commit()
+
+
+class TestWhetherTheBrokerHasIt:
+    """⚠️ Found on 18/09, in his first sweep with "collect": AAPL and US500 are catalogue seeds,
+    not symbols of this broker, and their downloads came back with "no bars anywhere". Three
+    answers, because an unsynced list is a question nobody has asked yet."""
+
+    def test_a_listed_symbol_is_at_the_broker(
+        self, client: TestClient, session_factory: Callable[[], Session]
+    ) -> None:
+        synced(session_factory, "EURUSD", "GBPUSD")
+        (planned,) = a_plan(client).json()
+        assert planned["at_broker"] is True
+
+    def test_a_symbol_the_synced_list_does_not_name_is_not(
+        self, client: TestClient, session_factory: Callable[[], Session]
+    ) -> None:
+        synced(session_factory, "GBPUSD", "SPXm")
+        (planned,) = a_plan(client, symbols=["EURUSD"]).json()
+        # Still planned, with its windows: the person is told it cannot be collected rather than
+        # finding it silently missing from the list.
+        assert planned["at_broker"] is False
+        assert planned["windows"] != []
+
+    def test_an_unsynced_list_is_not_an_answer(self, client: TestClient) -> None:
+        (planned,) = a_plan(client).json()
+        assert planned["at_broker"] is None
+
+    def test_each_symbol_is_answered_for_itself(
+        self, client: TestClient, session_factory: Callable[[], Session]
+    ) -> None:
+        synced(session_factory, "GBPUSD")
+        plan = a_plan(client, symbols=["EURUSD", "GBPUSD"]).json()
+        assert {one["symbol"]: one["at_broker"] for one in plan} == {
+            "EURUSD": False,
+            "GBPUSD": True,
+        }

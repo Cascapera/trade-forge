@@ -2480,3 +2480,26 @@ antes, ou recusar reescrever uma partição com menos barras do que ela tinha.
 * **Plano que falhou oferece "Run anyway" mesmo sem nada para rodar.** O ramo `plan.isError` do
   `MissingDataPrompt` ignora `canRun`; na varredura com `dataGap`, o botão vai a 422 (falha
   fechado, com a frase do servidor). Valia antes para backtest e cesta.
+
+## O que a fatia "o plano consulta a corretora" (PR-271) deixou de fora
+
+* **As sementes continuam oferecidas nos seletores.** `AAPL` e `US500` estão em `instruments` (semente
+  de exemplo) e não nesta corretora (o S&P aqui é `SPXm`). A PR-271 impede de **coletá-las**, mas o
+  `SymbolPicker` ainda as lista como se fossem mercados. Casa com a fatia do seletor "qualquer ativo
+  do MT5".
+* **O snapshot da corretora pode estar velho.** O plano confia no último `replace_snapshot` (10/09
+  hoje). Trocar de conta sem sincronizar deixa o `at_broker` respondendo pela conta anterior. O
+  snapshot tem `synced_at`; a tela poderia dizer a idade dele.
+* **O ensaio da varredura não sabe da corretora.** O `uncovered` do `/sweeps/preview` lista AAPL como
+  "never collected" (verdade), e o aviso âmbar diz que apertar o botão pergunta se dá para coletar —
+  a pergunta então responde que não.
+* **O 422 do backtest avulso não diz que a corretora não tem o ativo.** Com `collect_missing` num
+  símbolo fora da corretora, a recusa sai como "no candles in this window for AAPL H1 (never
+  collected)". Morde quando o plano falhou (`plan.isError`), porque ali a tela ainda oferece coletar.
+* **Os pulados não guardam o porquê.** `Sweep.skipped` (e o `skipped` da cesta) grava AAPL como
+  `UncoveredMarket` "never collected": não separa "você escolheu não coletar" de "a corretora não
+  tem". Recarregada, a tela de resultado diz só "no candles".
+* **Par coberto em parte e fora da corretora roda sobre o que existe, mesmo com "collect".** Coerente
+  com a tela (a linha diz "cannot be collected"), mas sem teste.
+* **"Tabela vazia = não sei" depende de outro pacote.** Só vale porque `replace_snapshot` recusa
+  snapshot vazio; nada em `coverage` prende isso. Alternativa mais robusta: ler `synced_at`.

@@ -1,6 +1,6 @@
 import type { PlannedCollection } from '../api/types'
 
-import { anythingToRun, missingLine, pairsOf } from './missing'
+import { anythingToCollect, anythingToRun, missingLine, pairsOf } from './missing'
 
 const Y2019 = { date_from: '2019-01-01T00:00:00Z', date_to: '2020-12-31T23:59:59.999999Z' }
 const Y2026 = { date_from: '2026-01-01T00:00:00Z', date_to: '2026-09-17T12:00:00Z' }
@@ -8,9 +8,19 @@ const Y2026 = { date_from: '2026-01-01T00:00:00Z', date_to: '2026-09-17T12:00:00
 function planned(
   symbol: string,
   windows = [Y2019],
-  { timeframe = 'H1', covers = null as string | null, inWindow = false } = {},
+  {
+    timeframe = 'H1',
+    covers = null,
+    inWindow = false,
+    atBroker = true,
+  }: {
+    timeframe?: string
+    covers?: string | null
+    inWindow?: boolean
+    atBroker?: boolean | null
+  } = {},
 ): PlannedCollection {
-  return { symbol, timeframe, covers, windows, in_window: inWindow }
+  return { symbol, timeframe, covers, windows, in_window: inWindow, at_broker: atBroker }
 }
 
 describe('missingLine', () => {
@@ -22,6 +32,20 @@ describe('missingLine', () => {
     expect(
       missingLine(planned('EURUSD', [Y2019, Y2026], { covers: '2021-01-04 to 2025-12-31' })),
     ).toBe('EURUSD H1 — on disk 2021-01-04 to 2025-12-31; would fetch 2019–2020, 2026')
+  })
+
+  it('says a symbol the broker does not list cannot be collected, instead of what it would fetch', () => {
+    // ⚠️ AAPL on 18/09: a catalogue seed this broker does not have. "would fetch 2019–2020" was a
+    // promise the download then broke with "no bars anywhere".
+    expect(missingLine(planned('AAPL', [Y2019], { atBroker: false }))).toBe(
+      'AAPL H1 — never collected; not listed by the broker, cannot be collected',
+    )
+  })
+
+  it('still says what it would fetch when nobody has asked the broker', () => {
+    expect(missingLine(planned('GBPUSD', [Y2019], { atBroker: null }))).toBe(
+      'GBPUSD H1 — never collected; would fetch 2019–2020',
+    )
   })
 
   it('names a single year once rather than as a range', () => {
@@ -87,5 +111,22 @@ describe('anythingToRun', () => {
         planned('EURUSD', [Y2019], { timeframe: 'H4' }),
       ]),
     ).toBe(false)
+  })
+})
+
+describe('anythingToCollect', () => {
+  it('is false only when every missing pair is one the broker does not list', () => {
+    expect(anythingToCollect([planned('AAPL', [Y2019], { atBroker: false })])).toBe(false)
+    expect(
+      anythingToCollect([
+        planned('AAPL', [Y2019], { atBroker: false }),
+        planned('EURUSD', [Y2019], { atBroker: true }),
+      ]),
+    ).toBe(true)
+  })
+
+  it('counts an unsynced list as collectable', () => {
+    // "I do not know" is not "no": the launch still collects it.
+    expect(anythingToCollect([planned('EURUSD', [Y2019], { atBroker: null })])).toBe(true)
   })
 })

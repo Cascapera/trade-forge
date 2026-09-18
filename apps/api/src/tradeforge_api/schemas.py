@@ -1492,6 +1492,18 @@ class PlannedCollection(BaseModel):
     windows: list[PlannedWindow]
     """⚠️ Possibly wider than the request: a window always reaches the data already on disk,
     so the index never has to describe a hole it cannot represent (`collection_plan`)."""
+    at_broker: bool | None = None
+    """Whether the broker's symbol list names this symbol — **three answers, not two**.
+
+    `False` only when the list has been synced and does not name it: a download would ask
+    MetaTrader for bars of a symbol it does not have and fail with "no bars anywhere", which is
+    what the first real sweep with "collect" did for AAPL and US500 (18/09) — catalogue seeds,
+    not symbols of this broker. Such a pair is never collected (`coverage.to_collect`): the basket
+    and the sweep skip and name it, the single backtest refuses it.
+
+    ⚠️ `None` when the list has never been synced, and that is "I do not know", not "yes". It is
+    still offered for collection, as before this field existed: refusing on an unanswered
+    question would block every collection on a machine whose agent has not run a sync yet."""
 
 
 class KillSwitchOut(BaseModel):

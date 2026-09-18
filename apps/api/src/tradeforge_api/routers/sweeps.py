@@ -32,7 +32,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, defer, selectinload
 
 from tradeforge_api import sweep_dashboard as dashboard
-from tradeforge_api.coverage import describe, plan_for, uncovered_markets
+from tradeforge_api.coverage import describe, to_collect, uncovered_markets
 from tradeforge_api.deps import QueueDep, SessionDep
 from tradeforge_api.grid import GridPoint
 from tradeforge_api.queue import COLLECT_QUEUE, COLLECT_RANGE, RUN_BACKTEST
@@ -306,7 +306,7 @@ async def create_sweep(request: CreateSweep, session: SessionDep, queue: QueueDe
         )
 
     planned = (
-        plan_for(
+        to_collect(
             session,
             symbols=list(request.symbols),
             timeframes=timeframes,

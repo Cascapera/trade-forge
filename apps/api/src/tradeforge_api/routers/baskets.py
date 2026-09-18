@@ -19,7 +19,7 @@ from fastapi import APIRouter, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
-from tradeforge_api.coverage import describe, plan_for, uncovered_markets
+from tradeforge_api.coverage import describe, to_collect, uncovered_markets
 from tradeforge_api.deps import QueueDep, SessionDep
 from tradeforge_api.queue import COLLECT_QUEUE, COLLECT_RANGE, RUN_BACKTEST
 from tradeforge_api.routers.backtests import list_item
@@ -121,7 +121,7 @@ async def create_basket(
         )
 
     planned = (
-        plan_for(
+        to_collect(
             session,
             symbols=list(request.symbols),
             timeframes=[request.timeframe],

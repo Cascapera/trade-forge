@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 from tradeforge_api.collection_plan import Window, missing_windows
 from tradeforge_api.schemas import PlannedCollection, PlannedWindow, UncoveredMarket
 from tradeforge_collector import step
-from tradeforge_db.models import Dataset, Instrument, SymbolHistory
+from tradeforge_db.models import BrokerSymbol, Dataset, Instrument, SymbolHistory
 
 
 def uncovered_markets(
@@ -145,6 +145,16 @@ def plan_for(
         )
     }
 
+    # ⚠️ **"Not listed" only means something once the list exists.** The snapshot is replaced
+    # whole and never emptied (`replace_snapshot` refuses an empty one), so an empty table is a
+    # sync that has never run — "I do not know" — and every symbol stays `None`, offered as before.
+    # The snapshot is `symbols_get()` in full, not the Market Watch: absent from it is absent from
+    # the broker.
+    synced = session.scalar(select(BrokerSymbol.id).limit(1)) is not None
+    listed = set(
+        session.scalars(select(BrokerSymbol.symbol).where(BrokerSymbol.symbol.in_(symbols)))
+    )
+
     out: list[PlannedCollection] = []
     for symbol in symbols:
         for timeframe in timeframes:
@@ -175,6 +185,39 @@ def plan_for(
                     windows=[
                         PlannedWindow(date_from=w.date_from, date_to=w.date_to) for w in windows
                     ],
+                    at_broker=(symbol in listed) if synced else None,
                 )
             )
     return out
+
+
+def to_collect(
+    session: Session,
+    *,
+    symbols: list[str],
+    timeframes: list[str],
+    date_from: dt.datetime,
+    date_to: dt.datetime,
+) -> list[PlannedCollection]:
+    """What a launch told to collect actually downloads: the plan, less what the broker lacks.
+
+    ⚠️ **The one filter every launch goes through.** The single backtest, the basket and the
+    sweep each turned the plan into collections on their own; a filter written into each would be
+    forgotten in the next one. A pair the broker does not list stays out of this list, so no
+    collection is written for it and the launch treats it as any pair with nothing to fetch —
+    the basket and the sweep skip and name it, the single backtest is refused.
+
+    The screen's plan (`POST /collections/plan`) is `plan_for` itself, unfiltered: the person
+    must be told a pair cannot be collected, not find it silently missing from the list.
+    """
+    return [
+        market
+        for market in plan_for(
+            session,
+            symbols=symbols,
+            timeframes=timeframes,
+            date_from=date_from,
+            date_to=date_to,
+        )
+        if market.at_broker is not False
+    ]

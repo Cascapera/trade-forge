@@ -34,6 +34,7 @@ from sqlalchemy.orm import Session
 from tradeforge_api.config import Settings
 from tradeforge_api.main import create_app
 from tradeforge_api.queue import COLLECT_QUEUE, COLLECT_RANGE, RUN_BACKTEST
+from tradeforge_db.broker_symbols import BrokerSymbolEntry, replace_snapshot
 from tradeforge_db.models import (
     Backtest,
     BacktestCollection,
@@ -922,6 +923,18 @@ class TestTheDataHasToBeThere:
         assert preview["error"] == refused.json()["detail"]
 
 
+def broker_lists(session_factory: Callable[[], Session], *symbols: str) -> None:
+    """The host agent's snapshot of the broker's symbols, naming only these."""
+    with session_factory() as session:
+        replace_snapshot(
+            session,
+            [BrokerSymbolEntry(symbol=symbol) for symbol in symbols],
+            server="Tradeview-Demo",
+            synced_at=dt.datetime(2026, 9, 10, tzinfo=dt.UTC),
+        )
+        session.commit()
+
+
 class TestCollectingWhatASweepIsMissing:
     """His rule (18/09), now for the sweep: "a tela de varredura tb tem que fazer essa coleta".
 
@@ -1154,6 +1167,24 @@ class TestCollectingWhatASweepIsMissing:
         assert collection.symbol == "GBPUSD"
         waits = self.waits(session, created["id"])
         assert waits == {("GBPUSD", "M15"): {collection.id}}
+
+    def test_a_pair_the_broker_does_not_list_is_skipped_not_collected(
+        self, client: Any, session: Session, session_factory: Callable[[], Session]
+    ) -> None:
+        """The sweep of 18/09 in miniature: two markets never collected, one of them not at this
+        broker. One download, for the market it has; the other is skipped and named."""
+        self.never_collected(session, "EURUSD", "M15")
+        self.never_collected(session, "GBPUSD", "M15")
+        broker_lists(session_factory, "EURUSD")
+
+        created = self.launch(client, ["EURUSD", "GBPUSD"], ["M15"], collect_missing=True)
+
+        assert [(one["symbol"], one["timeframe"]) for one in created["skipped"]] == [
+            ("GBPUSD", "M15")
+        ]
+        session.expire_all()
+        (collection,) = session.scalars(select(Collection)).all()
+        assert collection.symbol == "EURUSD"
 
     def test_without_the_flag_nothing_is_collected(self, client: Any, session: Session) -> None:
         self.never_collected(session, "GBPUSD", "M15")

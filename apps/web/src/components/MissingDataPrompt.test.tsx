@@ -13,6 +13,7 @@ const MISSING: PlannedCollection[] = [
     covers: null,
     in_window: false,
     windows: [{ date_from: '2024-01-01T00:00:00Z', date_to: '2024-12-31T23:59:59.999999Z' }],
+    at_broker: true,
   },
 ]
 
@@ -55,6 +56,27 @@ describe('MissingDataPrompt', () => {
     )
   })
 
+  it('withdraws collecting when the broker lists none of the missing pairs', () => {
+    // ⚠️ 18/09: "Collect and run" over AAPL, a seed this broker does not have, queued downloads
+    // that failed with "no bars anywhere". Nothing here can be fetched, so the button is gone and
+    // the line says why.
+    show(
+      gate({
+        missing: [{ ...MISSING[0]!, symbol: 'AAPL', at_broker: false }],
+      }),
+    )
+    expect(screen.getByRole('region', { name: 'missing data' })).toHaveTextContent(
+      'AAPL H1 — never collected; not listed by the broker, cannot be collected',
+    )
+    expect(screen.queryByRole('button', { name: 'Collect and run' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Run with what there is' })).toBeInTheDocument()
+  })
+
+  it('keeps collecting when one missing pair can still be fetched', () => {
+    show(gate({ missing: [{ ...MISSING[0]!, symbol: 'AAPL', at_broker: false }, MISSING[0]!] }))
+    expect(screen.getByRole('button', { name: 'Collect and run' })).toBeInTheDocument()
+  })
+
   it('hands the collecting to the server in one press', () => {
     // ⚠️ The screen sends no windows: the server plans them, queues the downloads and links them
     // to the runs, which start by themselves.
@@ -78,6 +100,20 @@ describe('MissingDataPrompt', () => {
     expect(screen.queryByRole('button', { name: 'Run with what there is' })).not.toBeInTheDocument()
     expect(screen.getByText('Nothing would run until this is collected.')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Collect and run' })).toBeEnabled()
+  })
+
+  it('says there is no way forward when nothing can be collected or run', () => {
+    // ⚠️ Found reviewing PR-271: AAPL alone, not at this broker, never collected. The collect
+    // button is withdrawn, and the old sentence still said "until this is collected".
+    show(gate({ missing: [{ ...MISSING[0]!, symbol: 'AAPL', at_broker: false }] }), {
+      canRun: false,
+    })
+
+    expect(
+      screen.getByText('Nothing here can be collected or run. Choose other markets or another window.'),
+    ).toBeInTheDocument()
+    expect(screen.queryByText(/until this is collected/)).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Collect and run' })).not.toBeInTheDocument()
   })
 
   it('offers both answers when the plan could not be asked', () => {

@@ -850,6 +850,11 @@ export interface PlannedCollection {
   in_window: boolean
   /** ⚠️ Possibly wider than asked: a window always reaches the data already on disk. */
   windows: PlannedWindow[]
+  /** Whether the broker's symbol list names this symbol. `false` only when the list was synced
+   *  and does not: such a pair cannot be collected — the basket and the sweep skip it, the single
+   *  backtest refuses it. `null` when the list has never been synced — unknown, and still offered
+   *  for collection. */
+  at_broker: boolean | null
 }
 
 export interface Collection {

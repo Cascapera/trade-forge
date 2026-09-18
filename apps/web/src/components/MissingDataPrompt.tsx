@@ -1,6 +1,6 @@
 import { apiFailure } from '../api/failure'
 import type { MissingDataGate } from '../collect/gate'
-import { missingLine } from '../collect/missing'
+import { anythingToCollect, missingLine } from '../collect/missing'
 
 /**
  * The prompt: what is missing, and the answers.
@@ -77,14 +77,22 @@ export function MissingDataPrompt({
       </ul>
 
       <div className="flex flex-wrap gap-3">
-        {collectButton()}
+        {/* ⚠️ Withdrawn when every missing pair is one the broker does not list: the button would
+            queue nothing and run what "run with what there is" runs, under a name that promises
+            a download. */}
+        {anythingToCollect(missing) && collectButton()}
         {canRun ? (
           runButton('Run with what there is')
         ) : (
           // Announced, not merely drawn: this replaces a button, and a reader who cannot see
           // the panel would otherwise find the run gone with nothing said.
+          // ⚠️ Two sentences, because "until this is collected" is false when nothing can be:
+          // the line above has just said the broker does not list it, and the collect button is
+          // gone — telling him to collect would leave him with no way forward and no reason why.
           <p role="status" className="self-center text-amber-300">
-            Nothing would run until this is collected.
+            {anythingToCollect(missing)
+              ? 'Nothing would run until this is collected.'
+              : 'Nothing here can be collected or run. Choose other markets or another window.'}
           </p>
         )}
       </div>

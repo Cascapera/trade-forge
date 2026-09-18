@@ -71,6 +71,7 @@ function planned(symbol: string, timeframe: string): PlannedCollection {
     covers: null,
     in_window: false,
     windows: [{ date_from: '2025-01-01T00:00:00Z', date_to: '2025-12-31T23:59:59.999999Z' }],
+    at_broker: true,
   }
 }
 

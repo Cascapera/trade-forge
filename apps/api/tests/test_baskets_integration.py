@@ -26,6 +26,7 @@ from tradeforge_api.config import Settings
 from tradeforge_api.main import create_app
 from tradeforge_api.queue import COLLECT_QUEUE, COLLECT_RANGE, RUN_BACKTEST
 from tradeforge_api.worker import process_backtest
+from tradeforge_db.broker_symbols import BrokerSymbolEntry, replace_snapshot
 from tradeforge_db.models import (
     Backtest,
     BacktestCollection,
@@ -647,6 +648,18 @@ class TestAMarketWithNoCandlesInTheWindow:
         assert response.json()["detail"] == "unknown symbols: EURUSDX"
 
 
+def broker_lists(session_factory: Callable[[], Session], *symbols: str) -> None:
+    """The host agent's snapshot of the broker's symbols, naming only these."""
+    with session_factory() as session:
+        replace_snapshot(
+            session,
+            [BrokerSymbolEntry(symbol=symbol) for symbol in symbols],
+            server="Tradeview-Demo",
+            synced_at=dt.datetime(2026, 9, 10, tzinfo=dt.UTC),
+        )
+        session.commit()
+
+
 class TestCollectingWhatABasketIsMissing:
     """His rule, now for the basket: answered "collect", every market runs — each waiting for its
     own downloads — instead of the empty ones being left out."""
@@ -692,6 +705,19 @@ class TestCollectingWhatABasketIsMissing:
         assert self.waits(session_factory, by_symbol["EURUSD"]) == []
         (waiting,) = self.waits(session_factory, by_symbol["GBPUSD"])
         assert (waiting.symbol, waiting.timeframe) == ("GBPUSD", "H1")
+
+    def test_a_market_the_broker_does_not_list_is_skipped_not_collected(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        # Neither market was ever collected; the broker has only EURUSD.
+        broker_lists(session_factory, "EURUSD")
+
+        body = self._launch(client, ["EURUSD", "GBPUSD"], collect_missing=True).json()
+
+        assert [run["symbol"] for run in body["runs"]] == ["EURUSD"]
+        assert [market["symbol"] for market in body["skipped"]] == ["GBPUSD"]
+        with session_factory() as session:
+            assert [one.symbol for one in session.scalars(select(Collection))] == ["EURUSD"]
 
     def test_a_market_covered_in_part_waits_for_its_gap(
         self, client: Any, session_factory: Callable[[], Session], indexed: Callable[..., None]

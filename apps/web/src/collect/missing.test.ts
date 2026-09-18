@@ -1,6 +1,6 @@
 import type { PlannedCollection } from '../api/types'
 
-import { anythingToRun, missingLine } from './missing'
+import { anythingToRun, missingLine, pairsOf } from './missing'
 
 const Y2019 = { date_from: '2019-01-01T00:00:00Z', date_to: '2020-12-31T23:59:59.999999Z' }
 const Y2026 = { date_from: '2026-01-01T00:00:00Z', date_to: '2026-09-17T12:00:00Z' }
@@ -30,26 +30,62 @@ describe('missingLine', () => {
   })
 })
 
+describe('pairsOf', () => {
+  it('is every market on every chart', () => {
+    expect(pairsOf(['EURUSD', 'GBPUSD'], ['M15', 'H4'])).toEqual([
+      { symbol: 'EURUSD', timeframe: 'M15' },
+      { symbol: 'GBPUSD', timeframe: 'M15' },
+      { symbol: 'EURUSD', timeframe: 'H4' },
+      { symbol: 'GBPUSD', timeframe: 'H4' },
+    ])
+  })
+})
+
 describe('anythingToRun', () => {
+  const h1 = (...symbols: string[]) => pairsOf(symbols, ['H1'])
+
   it('is true for a market with candles inside the window', () => {
-    expect(anythingToRun(['EURUSD'], [planned('EURUSD', [Y2019], { inWindow: true })])).toBe(true)
+    expect(anythingToRun(h1('EURUSD'), [planned('EURUSD', [Y2019], { inWindow: true })])).toBe(
+      true,
+    )
   })
 
   it('is false when the only market has none', () => {
     // ⚠️ Even with a `covers` string: collected for other years is nothing to run over.
     expect(
       anythingToRun(
-        ['EURUSD'],
+        h1('EURUSD'),
         [planned('EURUSD', [Y2019], { covers: '2015-01-05 to 2016-12-30' })],
       ),
     ).toBe(false)
   })
 
   it('is true when one market of a basket has none and another does', () => {
-    expect(anythingToRun(['EURUSD', 'GBPUSD'], [planned('GBPUSD')])).toBe(true)
+    expect(anythingToRun(h1('EURUSD', 'GBPUSD'), [planned('GBPUSD')])).toBe(true)
   })
 
   it('is false when every market of a basket has none', () => {
-    expect(anythingToRun(['EURUSD', 'GBPUSD'], [planned('EURUSD'), planned('GBPUSD')])).toBe(false)
+    expect(anythingToRun(h1('EURUSD', 'GBPUSD'), [planned('EURUSD'), planned('GBPUSD')])).toBe(
+      false,
+    )
+  })
+
+  it('reads the empty chart of a market as that chart, not the market', () => {
+    // ⚠️ The sweep's case. EURUSD has no H4 and says nothing about M15, so its M15 runs: keyed by
+    // symbol alone, the empty H4 would have emptied EURUSD on both charts.
+    expect(
+      anythingToRun(pairsOf(['EURUSD'], ['M15', 'H4']), [
+        planned('EURUSD', [Y2019], { timeframe: 'H4' }),
+      ]),
+    ).toBe(true)
+  })
+
+  it('is false only when every chart of every market is empty', () => {
+    expect(
+      anythingToRun(pairsOf(['EURUSD'], ['M15', 'H4']), [
+        planned('EURUSD', [Y2019], { timeframe: 'M15' }),
+        planned('EURUSD', [Y2019], { timeframe: 'H4' }),
+      ]),
+    ).toBe(false)
   })
 })

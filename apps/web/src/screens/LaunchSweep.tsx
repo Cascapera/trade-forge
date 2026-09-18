@@ -3,6 +3,9 @@ import { useNavigate } from 'react-router-dom'
 
 import { useCatalog, useCreateSweep, useInstruments } from '../api/hooks'
 import type { CatalogEntry } from '../api/types'
+import { useMissingDataGate } from '../collect/gate'
+import { anythingToRun, pairsOf } from '../collect/missing'
+import { MissingDataPrompt } from '../components/MissingDataPrompt'
 import { SymbolPicker } from '../components/SymbolPicker'
 import { TIMEFRAMES } from '../strategy/builder'
 import { useSweepRehearsal } from '../sweep/preview'
@@ -43,6 +46,9 @@ export function LaunchSweep(): React.JSX.Element {
   const navigate = useNavigate()
 
   const [form, setForm] = useState<SweepForm>(emptySweepForm)
+  // Set when the plan came back empty for a sweep whose every pair lacks data: there is nothing
+  // to collect either, and the all-skipped refusal stands. Cleared by any edit, like the prompt.
+  const [nothingToFetch, setNothingToFetch] = useState(false)
   const entries: CatalogEntry[] = catalog.data?.items ?? []
 
   const rehearsal = useSweepRehearsal(form)
@@ -65,9 +71,46 @@ export function LaunchSweep(): React.JSX.Element {
   const uncovered = stale ? [] : rehearsal.uncovered
   const serverError = stale ? null : rehearsal.error
 
-  const blocked = local ?? (uncovered.length > 0 ? 'Some markets have no candles in this window.' : serverError)
+  // ⚠️ **The one server error that must not block: every pair without data.** Collecting is its
+  // fix, and a disabled button would keep the reader from the prompt that offers it. It is told
+  // apart by shape, not by wording: `uncovered` names only pairs on a chart that can run, so a
+  // non-empty list with nothing left to run *is* "all skipped". With runs above zero the error is
+  // the cap — and collecting only adds runs, so that one blocks.
+  //
+  // ⚠️ **Until the plan says there is nothing to fetch.** A window wholly in the future, or older
+  // than the broker's first bar, is "all skipped" too, and no download can mend it: the plan
+  // comes back empty, and launching would meet the same refusal as a 422. Then it blocks again.
+  const dataGap = uncovered.length > 0 && rehearsal.runs === 0
+  const blocked = local ?? (dataGap && !nothingToFetch ? null : serverError)
 
+  const launch = (collectMissing = false): void => {
+    // Straight to the sweep, where its runs land section by section as the worker drains them —
+    // the same move a study makes. The pairs left out are kept on the sweep and read there, so
+    // nothing needs carrying across the navigation.
+    create.mutate(toSweepRequest(form, collectMissing), {
+      onSuccess: (created) => {
+        void navigate(`/sweeps/${created.id}`)
+      },
+    })
+  }
+  // An empty plan launches with `collect_missing` off: nothing missing means an ordinary launch —
+  // unless nothing would run either, which an empty plan cannot change (see `dataGap`).
+  //
+  // ⚠️ **Asked on the click, not read off the rehearsal.** `uncovered` lists only pairs with *no*
+  // candle in the window; a pair covered in part is absent from it, and would run over half the
+  // window without anybody being asked. The plan sees the gap — the same one the launch collects.
+  const gate = useMissingDataGate(() => {
+    if (dataGap) {
+      setNothingToFetch(true)
+      return
+    }
+    launch()
+  })
+
+  // A prompt answers the form it was asked about; any edit closes it.
   const set = (patch: Partial<SweepForm>) => {
+    gate.dismiss()
+    setNothingToFetch(false)
     setForm((current) => ({ ...current, ...patch }))
   }
 
@@ -87,14 +130,12 @@ export function LaunchSweep(): React.JSX.Element {
         onSubmit={(event) => {
           event.preventDefault()
           if (blocked !== null) return
-          // Straight to the sweep, where its runs land section by section as the worker drains
-          // them — the same move a study makes. Until `/sweeps/:id` existed this reported here
-          // and pointed at the run log, because the router's catch-all would have turned the
-          // navigation into a silent trip to `/`.
-          create.mutate(toSweepRequest(form), {
-            onSuccess: (created) => {
-              void navigate(`/sweeps/${created.id}`)
-            },
+          const request = toSweepRequest(form)
+          gate.check({
+            symbols: request.symbols,
+            timeframes: request.timeframes,
+            date_from: request.date_from,
+            date_to: request.date_to,
           })
         }}
       >
@@ -239,10 +280,14 @@ export function LaunchSweep(): React.JSX.Element {
         <div className="flex flex-wrap items-center gap-4">
           <button
             type="submit"
-            disabled={blocked !== null || create.isPending}
+            disabled={blocked !== null || create.isPending || gate.plan.isPending}
             className="rounded bg-sky-600 px-4 py-2 text-sm font-medium text-white disabled:cursor-not-allowed disabled:bg-slate-700"
           >
-            {create.isPending ? 'Launching…' : 'Run the sweep'}
+            {create.isPending
+              ? 'Launching…'
+              : gate.plan.isPending
+                ? 'Checking the data…'
+                : 'Run the sweep'}
           </button>
           {/* ⚠️ **A count it could not make is said in words, never as `0`.** `runCount` returns
               null when a ticked entry has left the shelf, and printing that as zero would claim
@@ -262,15 +307,40 @@ export function LaunchSweep(): React.JSX.Element {
           <p className="text-sm text-amber-300">{local}</p>
         )}
 
+        {/* The prompt: what the plan says is missing, and the two answers — collect and run
+            everything once the downloads land, or run now and leave out what has nothing to
+            read. The same one the single backtest and the basket open. */}
+        <MissingDataPrompt
+          gate={gate}
+          onRunAnyway={() => {
+            launch()
+          }}
+          // One download per pair, and every run over it waits for it (PR-268).
+          onCollectAndRun={() => {
+            launch(true)
+          }}
+          launching={create.isPending}
+          // ⚠️ By pair: a market can hold M15 and not H4. And `dataGap` first, because the
+          // rehearsal knows what the plan cannot — which charts the DSL refuses — so "every pair
+          // with a runnable point is empty" is its answer, not the plan's.
+          canRun={
+            gate.missing === null ||
+            (!dataGap && anythingToRun(pairsOf(form.symbols, form.timeframes), gate.missing))
+          }
+        />
+
         {/* ⚠️ **The coverage gap is its own message, above the DSL refusals, and it names every
             pair.** It is the only one of the three whose fix is outside this screen. A pair
             never collected and one collected for other years are said differently, because one
-            is a backfill to run and the other is a window to move. */}
+            is a backfill to run and the other is a window to move. An early warning: pressing
+            the button asks what to do about it. */}
         {uncovered.length > 0 && (
           <div className="space-y-1">
             <p className="text-sm text-amber-300">
-              No candles in this window for {String(uncovered.length)} of these markets, so the
-              sweep will not start.
+              No candles in this window for {String(uncovered.length)}{' '}
+              {uncovered.length === 1 ? 'pair' : 'pairs'}: running leaves{' '}
+              {uncovered.length === 1 ? 'it' : 'them'} out, and pressing run asks whether{' '}
+              {uncovered.length === 1 ? 'it' : 'they'} can be collected first.
             </p>
             <ul className="space-y-1 text-xs text-amber-300/80">
               {uncovered.map((pair) => (
@@ -302,11 +372,20 @@ export function LaunchSweep(): React.JSX.Element {
           </div>
         )}
 
-        {/* ⚠️ Printed only when the list above has not already said it. The server fills `error`
-            beside `uncovered` on a coverage gap, so without this guard one no reaches the reader
-            twice — once as the list of markets, once as a sentence under it. */}
-        {serverError !== null && uncovered.length === 0 && (
+        {/* ⚠️ Printed unless it is the all-skipped sentence, which the list above already says.
+            Keyed on `dataGap`, not on the list being empty: a partial gap beside a sweep over
+            the cap carries the cap's sentence, and hiding it would leave a disabled button with
+            no reason given. */}
+        {serverError !== null && !dataGap && (
           <p className="text-sm text-amber-300">{serverError}</p>
+        )}
+        {/* The reason the button went back to disabled: said, because the list above promised a
+            question about collecting, and the answer is that there is nothing to collect. */}
+        {nothingToFetch && dataGap && (
+          <p role="status" className="text-sm text-amber-300">
+            Nothing to collect for this window either — the broker holds no bars in it for these
+            pairs. Move the window.
+          </p>
         )}
 
         {/* ⚠️ **A failed check is not a passed one.** Without this line a preview that errored

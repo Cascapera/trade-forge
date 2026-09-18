@@ -22,27 +22,38 @@ export function missingLine(market: PlannedCollection): string {
   return `${market.symbol} ${market.timeframe} — ${held}; would fetch ${fetched}`
 }
 
+/** One market on one chart — what a run reads, and what the plan answers about. */
+export interface Pair {
+  symbol: string
+  timeframe: string
+}
+
+/** Every market on every chart: the pairs a launch over these axes reads. */
+export function pairsOf(symbols: readonly string[], timeframes: readonly string[]): Pair[] {
+  return timeframes.flatMap((timeframe) => symbols.map((symbol) => ({ symbol, timeframe })))
+}
+
 /**
  * Would anything run right now, if the person declined to collect?
  *
- * True when at least one of the markets being launched has a candle inside the window. A symbol
- * the plan does not mention needs no collection, and is taken to run.
+ * True when at least one of the pairs being launched has a candle inside the window. A pair the
+ * plan does not mention needs no collection, and is taken to run.
  *
- * ⚠️ **Keyed by symbol alone**, because both launch screens ask the plan about one chart. A plan
- * covering several timeframes would need the pair, and `PlanCollectionRequest.timeframes` is a
- * list, so a third caller must not reuse this as it stands.
+ * ⚠️ **Keyed by the pair, not the symbol.** The sweep asks the plan about several charts at
+ * once, and a market can hold M15 and not H4: keyed by symbol, its empty H4 would read as the
+ * whole market being empty, or its full M15 as the whole market being full, depending on which
+ * entry the plan happened to list.
  *
  * ⚠️ **"Needs no collection" is not quite "has candles".** A window entirely before the broker's
  * oldest bar, or entirely in the future, is planned as nothing to fetch and still holds no
- * candle. The launch answers that one: the basket leaves the market out and names it, the single
- * backtest is refused.
+ * candle. The launch answers that one: the basket and the sweep leave the pair out and name it,
+ * the single backtest is refused.
  */
 export function anythingToRun(
-  symbols: readonly string[],
+  pairs: readonly Pair[],
   plan: readonly PlannedCollection[],
 ): boolean {
-  const empty = new Set(
-    plan.filter((market) => !market.in_window).map((market) => market.symbol),
-  )
-  return symbols.some((symbol) => !empty.has(symbol))
+  const key = (pair: Pair): string => `${pair.symbol}|${pair.timeframe}`
+  const empty = new Set(plan.filter((market) => !market.in_window).map(key))
+  return pairs.some((pair) => !empty.has(key(pair)))
 }

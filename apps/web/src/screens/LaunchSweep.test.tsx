@@ -3,7 +3,7 @@ import { Route, Routes, useParams } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { ApiError, api } from '../api/client'
-import type { CatalogEntry, SweepPreview } from '../api/types'
+import type { CatalogEntry, PlannedCollection, SweepPreview } from '../api/types'
 import { renderWithProviders } from '../test-utils'
 
 import { LaunchSweep } from './LaunchSweep'
@@ -18,6 +18,7 @@ vi.mock('../api/client', async () => {
       listCatalog: vi.fn(),
       createSweep: vi.fn(),
       previewSweep: vi.fn(),
+      planCollections: vi.fn(),
     },
   }
 })
@@ -26,6 +27,7 @@ const listInstruments = vi.mocked(api.listInstruments)
 const listCatalog = vi.mocked(api.listCatalog)
 const createSweep = vi.mocked(api.createSweep)
 const previewSweep = vi.mocked(api.previewSweep)
+const planCollections = vi.mocked(api.planCollections)
 
 function instrument(symbol: string) {
   return {
@@ -58,7 +60,19 @@ function entry(id: string, name: string, points: number): CatalogEntry {
   }
 }
 
-const COVERAGE_ERROR = '2 of these markets have no candles in this window; move the window or collect them first'
+// The server's all-skipped sentence (PR-269): `_nothing_to_read`, in `coverage.describe`'s words.
+const COVERAGE_ERROR =
+  'no candles in this window for: GBPUSD M15 (never collected), EURUSD M15 (on disk: 2020-01-01 to 2021-01-01)'
+
+function planned(symbol: string, timeframe: string): PlannedCollection {
+  return {
+    symbol,
+    timeframe,
+    covers: null,
+    in_window: false,
+    windows: [{ date_from: '2025-01-01T00:00:00Z', date_to: '2025-12-31T23:59:59.999999Z' }],
+  }
+}
 
 function preview(patch: Partial<SweepPreview> = {}): SweepPreview {
   return { runs: 2, documents: 2, entries: [], uncovered: [], error: null, ...patch }
@@ -89,7 +103,9 @@ beforeEach(() => {
     items: [entry('a', 'nine one plain', 1), entry('b', 'nine one swept', 3)],
   })
   previewSweep.mockResolvedValue(preview())
-  createSweep.mockResolvedValue({ id: 'sweep-1', runs: 2 })
+  // Nothing missing unless a test says otherwise: the click then launches as it always did.
+  planCollections.mockResolvedValue([])
+  createSweep.mockResolvedValue({ id: 'sweep-1', runs: 2, skipped: [] })
 })
 
 describe('the count on screen', () => {
@@ -284,24 +300,68 @@ describe('the three refusals stay apart', () => {
     expect(screen.getByRole('button', { name: /run the sweep/i })).toBeEnabled()
   })
 
-  it('blocks the launch when a market has no candles at all', async () => {
-    // The other side of the pair above: this one the server refuses whole, so the screen must
-    // not offer a button that is going to 422.
-    //
-    // ⚠️ `error: null` beside a non-empty `uncovered` is **deliberately** a shape today's server
-    // never sends. The screen blocks on the list itself, not only on the sentence, so a server
-    // that stopped filling `error` on a coverage gap would still fail closed — this is the one
-    // test that can see that guard, and it can only see it through the impossible shape.
+  it('does not block a sweep whose every pair lacks data, because collecting is the fix', async () => {
+    // ⚠️ Before PR-269 this blocked. Now the server's `error` on that shape is the all-skipped
+    // sentence, and a disabled button would keep the reader from the prompt that collects.
     previewSweep.mockResolvedValue(
-      preview({ runs: 0, uncovered: [{ symbol: 'EURUSD', timeframe: 'M15', covers: null }] }),
+      preview({
+        runs: 0,
+        uncovered: [{ symbol: 'EURUSD', timeframe: 'M15', covers: null }],
+        error: 'no candles in this window for: EURUSD M15 (never collected)',
+      }),
     )
     renderWithProviders(<LaunchSweep />)
     await fillIn()
 
     await screen.findByText(/never collected/i)
-    await waitFor(() => {
-      expect(screen.getByRole('button', { name: /run the sweep/i })).toBeDisabled()
-    })
+    expect(screen.getByRole('button', { name: /run the sweep/i })).toBeEnabled()
+  })
+
+  it('blocks again, without launching, when there is nothing to collect either', async () => {
+    // ⚠️ Found reviewing this PR. A window wholly in the future is "all skipped" too, but the plan
+    // has nothing to fetch: an empty plan used to launch at once, straight into the same refusal
+    // as a 422, from a button the screen had just enabled with a promise to ask about collecting.
+    const allSkipped = 'no candles in this window for: EURUSD M15 (never collected)'
+    previewSweep.mockResolvedValue(
+      preview({
+        runs: 0,
+        uncovered: [{ symbol: 'EURUSD', timeframe: 'M15', covers: null }],
+        error: allSkipped,
+      }),
+    )
+    planCollections.mockResolvedValue([])
+    renderWithProviders(<LaunchSweep />)
+    await fillIn()
+    await screen.findByText(/never collected/i)
+
+    fireEvent.click(screen.getByRole('button', { name: /run the sweep/i }))
+
+    expect(await screen.findByText(/nothing to collect for this window either/i)).toBeInTheDocument()
+    expect(createSweep).not.toHaveBeenCalled()
+    expect(screen.getByRole('button', { name: /run the sweep/i })).toBeDisabled()
+
+    // Any edit asks again: the verdict was about that window.
+    fireEvent.change(screen.getByLabelText('Initial capital'), { target: { value: '20000' } })
+    expect(screen.queryByText(/nothing to collect for this window either/i)).not.toBeInTheDocument()
+  })
+
+  it('still blocks on the cap beside a partial gap, and says why', async () => {
+    // ⚠️ The guard this replaced hid the server's sentence whenever `uncovered` was non-empty.
+    // With runs left the error is never about data — here the cap — and collecting only adds
+    // runs, so it blocks; hidden, the button would be disabled with no reason on screen.
+    const cap = 'this sweep expands to 3100 backtests, over the 3000 one sweep will run'
+    previewSweep.mockResolvedValue(
+      preview({
+        runs: 3100,
+        uncovered: [{ symbol: 'GBPUSD', timeframe: 'M15', covers: null }],
+        error: cap,
+      }),
+    )
+    renderWithProviders(<LaunchSweep />)
+    await fillIn()
+
+    expect(await screen.findByText(cap)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /run the sweep/i })).toBeDisabled()
   })
 })
 
@@ -398,6 +458,95 @@ describe('launching', () => {
     // The id the server handed back reaches the address. Asserted as text rather than as "some
     // sweep screen rendered", which a navigation carrying the wrong field would also satisfy.
     expect(await screen.findByText('sweep screen for sweep-1')).toBeInTheDocument()
+  })
+
+  it('asks the plan about every market on every chart, and launches at once if nothing is missing', async () => {
+    renderWithProviders(<LaunchSweep />)
+    await fillIn()
+    fireEvent.click(screen.getByLabelText('H4'))
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /run the sweep/i })).toBeEnabled()
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: /run the sweep/i }))
+
+    await waitFor(() => {
+      expect(createSweep).toHaveBeenCalledWith(
+        expect.objectContaining({ collect_missing: false }),
+      )
+    })
+    expect(planCollections).toHaveBeenCalledWith(
+      expect.objectContaining({ symbols: ['EURUSD'], timeframes: ['M15', 'H4'] }),
+    )
+  })
+
+  it('asks before launching when a pair is missing, and collects on request', async () => {
+    // ⚠️ A pair covered **in part** — the case the rehearsal's `uncovered` cannot see, and the
+    // reason the click asks the plan. `in_window: true`: it has candles, just not all of them.
+    planCollections.mockResolvedValue([
+      { ...planned('EURUSD', 'M15'), covers: '2025-03-01 to 2025-12-31', in_window: true },
+    ])
+    renderWithProviders(<LaunchSweep />)
+    await fillIn()
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /run the sweep/i })).toBeEnabled()
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: /run the sweep/i }))
+
+    expect(await screen.findByRole('region', { name: 'missing data' })).toHaveTextContent(
+      'EURUSD M15 — on disk 2025-03-01 to 2025-12-31; would fetch 2025',
+    )
+    expect(createSweep).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Collect and run' }))
+
+    await waitFor(() => {
+      expect(createSweep).toHaveBeenCalledWith(expect.objectContaining({ collect_missing: true }))
+    })
+  })
+
+  it('offers running with what there is when one chart of a market has data', async () => {
+    // ⚠️ By pair. EURUSD has no H4, and its M15 is not in the plan at all: keyed by symbol, the
+    // empty H4 would read as EURUSD being empty and the run would be withdrawn.
+    planCollections.mockResolvedValue([planned('EURUSD', 'H4')])
+    renderWithProviders(<LaunchSweep />)
+    await fillIn()
+    fireEvent.click(screen.getByLabelText('H4'))
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /run the sweep/i })).toBeEnabled()
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: /run the sweep/i }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Run with what there is' }))
+
+    await waitFor(() => {
+      expect(createSweep).toHaveBeenCalledWith(expect.objectContaining({ collect_missing: false }))
+    })
+  })
+
+  it('withdraws running with what there is when every pair with a runnable point is empty', async () => {
+    // ⚠️ The rehearsal's answer, not the plan's. The plan here mentions only H4, so by the plan
+    // alone M15 would run — but the rehearsal says nothing runs (the DSL refuses M15 for this
+    // entry, say), and "run" would be a button that 422s.
+    previewSweep.mockResolvedValue(
+      preview({
+        runs: 0,
+        uncovered: [{ symbol: 'EURUSD', timeframe: 'H4', covers: null }],
+        error: 'no candles in this window for: EURUSD H4 (never collected)',
+      }),
+    )
+    planCollections.mockResolvedValue([planned('EURUSD', 'H4')])
+    renderWithProviders(<LaunchSweep />)
+    await fillIn()
+    fireEvent.click(screen.getByLabelText('H4'))
+    await screen.findByText(/never collected/i)
+
+    fireEvent.click(screen.getByRole('button', { name: /run the sweep/i }))
+
+    expect(await screen.findByText('Nothing would run until this is collected.')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Run with what there is' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Collect and run' })).toBeInTheDocument()
   })
 
   it('does not ask the server about a sweep with no window yet', async () => {

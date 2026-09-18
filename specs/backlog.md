@@ -2447,12 +2447,12 @@ antes, ou recusar reescrever uma partição com menos barras do que ela tinha.
 * **As coletas vão para a fila sem `_job_id`** (igual à cesta): reenviar duplica downloads, e
   um crash entre o `commit` e o enqueue deixa uma coleta `queued` que nunca entra na fila. Os
   runs dela adiam até a fila ficar em silêncio por `WAIT_LIMIT`.
-* **A tela da varredura ainda não oferece "Collect and run"**: é a próxima fatia. ⚠️
+* ✅ **RESOLVIDO na PR-270** — **A tela da varredura ainda não oferece "Collect and run"**: é a próxima fatia. ⚠️
   `anythingToRun` (`collect/missing.ts`) compara só pelo símbolo e não serve para vários charts.
 
 ## O que a fatia "a varredura pula o par vazio" (PR-269) deixou de fora
 
-* **A tela ainda bloqueia** o lançamento quando há par sem dado (`LaunchSweep.tsx`, `blocked`),
+* ✅ **RESOLVIDO na PR-270** — **A tela ainda bloqueia** o lançamento quando há par sem dado (`LaunchSweep.tsx`, `blocked`),
   embora o servidor agora pule. É a próxima fatia: "Collect and run" / "rodar com o que tem" e os
   pulados na tela de resultado (`SweepOut.skipped`).
 * **O dataset exportado e o dashboard não citam os pulados.** `Sweep.skipped` está gravado, mas o
@@ -2464,7 +2464,19 @@ antes, ou recusar reescrever uma partição com menos barras do que ela tinha.
   ensaio com `error: null` e 2900 runs pode virar 422 "over the 3000" no "Collect and run", que
   roda também os pares descobertos. Conserto: o ensaio devolver as duas contagens, ou aceitar o
   flag.
-* **Para a #270:** `LaunchSweep.tsx` só mostra `serverError` quando `uncovered` está vazio, com
+* ✅ **RESOLVIDO na PR-270** (a guarda agora é `dataGap`) — **Para a #270:** `LaunchSweep.tsx` só mostra `serverError` quando `uncovered` está vazio, com
   o comentário "o servidor põe `error` junto de `uncovered` num buraco de cobertura". Desde a
   PR-269 isso só vale para "tudo pulado": num buraco parcial com erro de teto, a tela esconderia
   a frase do teto. Rever a guarda junto com o botão.
+
+## O que a tela da varredura (PR-270) deixou de fora
+
+* **O prompt lista par num chart que o DSL recusa.** O portão pergunta o plano sobre todos os
+  `timeframes` do formulário, mas o `uncovered` do ensaio (`_worth_naming`, PR-269) só nomeia
+  charts em que algum ponto roda. Se M15 é recusado por todas as entradas e está vazio, o clique
+  abre o painel "EURUSD M15 — never collected" em vez de lançar. O servidor não baixa à toa (a
+  PR-268 só cria coleta para par com run), mas o painel pergunta sobre um par irrelevante.
+  Conserto: perguntar o plano só sobre os charts com ponto executável (o ensaio teria de dizê-los).
+* **Plano que falhou oferece "Run anyway" mesmo sem nada para rodar.** O ramo `plan.isError` do
+  `MissingDataPrompt` ignora `canRun`; na varredura com `dataGap`, o botão vai a 422 (falha
+  fechado, com a frase do servidor). Valia antes para backtest e cesta.

@@ -47,6 +47,7 @@ from tradeforge_db.models import (
     Backtest,
     BacktestMetrics,
     BacktestStatus,
+    Collection,
     Instrument,
     SelectionMetric,
     Strategy,
@@ -425,13 +426,17 @@ A collection advances one calendar year at a time and a cold year takes minutes 
 so asking every second would be hundreds of questions about a row that changes five times."""
 
 WAIT_LIMIT = dt.timedelta(hours=2)
-"""How long a run may wait for its data before it is failed instead.
+"""How long the **collection queue** may go silent before a run waiting on it is failed.
 
-⚠️ **A ceiling on the wait, not an estimate of it.** Measured on this broker, a year of H1 takes
-about three minutes and a year of M1 rather more; two hours covers a large backfill with room to
-spare. Without it a collection that never finishes — an agent that stopped, a terminal nobody
-logged in — leaves a run queued for ever, which is the failure `arq`'s own retries exist to
-avoid and the one this project has already paid for once (the run stuck `queued` on 15/09)."""
+⚠️ **Measured from the queue's last delivery, not from the run's birth.** The host agent
+downloads one collection at a time (`max_jobs = 1`), and a basket may ask for twenty markets in
+one click: the last of them has not started hours in, though nothing is wrong. A clock started at
+the launch would fail those runs on a healthy system — so what is timed is silence, and every
+collection that lands anywhere resets it.
+
+⚠️ **A ceiling on the wait, not an estimate of it.** Two hours of nothing finishing anywhere is
+an agent that stopped or a terminal nobody logged in to — the failure this limit exists for,
+and the one this project has already paid for once (the run stuck `queued` on 15/09)."""
 
 MAX_TRIES = 8
 """How many times a backtest job runs before a database that will not answer is its result.
@@ -488,10 +493,24 @@ async def _still_collecting(ctx: dict[str, Any], session: Session, run_id: uuid.
     if not unfinished:
         return False
 
-    waited = _now() - run.created_at
-    if waited > WAIT_LIMIT:
+    # The queue's last sign of life, or this run's birth when nothing has ever landed.
+    # ⚠️ Ordered rather than `func.max`: arq's own `func` registers this module's jobs at
+    # the bottom of the file, and importing SQLAlchemy's `func` over it breaks the worker at
+    # import time — which is how this was found.
+    last_delivery = session.scalar(
+        select(Collection.finished_at)
+        .where(Collection.finished_at.is_not(None))
+        .order_by(Collection.finished_at.desc())
+        .limit(1)
+    )
+    silent_since = max(run.created_at, last_delivery) if last_delivery else run.created_at
+    if _now() - silent_since > WAIT_LIMIT:
         names = ", ".join(f"{one.symbol} {one.timeframe}" for one in unfinished)
-        _fail(session, run, f"waited {WAIT_LIMIT} for the collection of {names} and gave up")
+        _fail(
+            session,
+            run,
+            f"nothing has been collected for {WAIT_LIMIT} while waiting for {names}; gave up",
+        )
         await _announce(ctx["redis"], run_id, {"status": "failed", "error": run.error})
         return True
 

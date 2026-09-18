@@ -19,9 +19,9 @@ from fastapi import APIRouter, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
-from tradeforge_api.coverage import describe, uncovered_markets
+from tradeforge_api.coverage import describe, plan_for, uncovered_markets
 from tradeforge_api.deps import QueueDep, SessionDep
-from tradeforge_api.queue import RUN_BACKTEST
+from tradeforge_api.queue import COLLECT_QUEUE, COLLECT_RANGE, RUN_BACKTEST
 from tradeforge_api.routers.backtests import list_item
 from tradeforge_api.routers.strategies import assert_runnable_at
 from tradeforge_api.runner import ENGINE_VERSION
@@ -33,8 +33,11 @@ from tradeforge_api.schemas import (
     CreatedBasket,
 )
 from tradeforge_collector import step
+from tradeforge_collector.collect import year_slices
+from tradeforge_db.collections import create_collection
 from tradeforge_db.models import (
     Backtest,
+    BacktestCollection,
     BacktestMetrics,
     BacktestStatus,
     Basket,
@@ -117,9 +120,27 @@ async def create_basket(
             detail=f"unknown symbols: {', '.join(unknown)}",
         )
 
+    planned = (
+        plan_for(
+            session,
+            symbols=list(request.symbols),
+            timeframes=[request.timeframe],
+            date_from=request.date_from,
+            date_to=request.date_to,
+        )
+        if request.collect_missing
+        else []
+    )
+    collectable = {market.symbol: market for market in planned}
+
     skipped = uncovered_markets(
         session, list(request.symbols), [request.timeframe], request.date_from, request.date_to
     )
+    # ⚠️ A market with no candles is skipped **unless there is something to fetch for it**. An
+    # empty plan is not "covered": a window wholly in the future, or older than the broker's
+    # first bar, has nothing to download and nothing to read, and a run over it would spend a
+    # worker to learn what the index already knows.
+    skipped = [market for market in skipped if market.symbol not in collectable]
     empty = {market.symbol for market in skipped}
     symbols = [symbol for symbol in request.symbols if symbol not in empty]
     if not symbols:
@@ -157,6 +178,30 @@ async def create_basket(
         for symbol in symbols
     ]
     session.add_all(runs)
+
+    # ⚠️ Each run waits for **its own** downloads. Linking every collection to every run would
+    # hold a covered market behind its neighbour's backfill, which is the opposite of the rule:
+    # what can run, runs.
+    session.flush()
+    collections = []
+    for symbol, run in zip(symbols, runs, strict=True):
+        market = collectable.get(symbol)
+        if market is None:
+            continue
+        for window in market.windows:
+            collection = create_collection(
+                session,
+                symbol=symbol,
+                timeframe=request.timeframe,
+                date_from=window.date_from,
+                date_to=window.date_to,
+                # The class the catalogue already decided, so the broker's tree path never
+                # refuses a collection the launch itself asked for.
+                asset_class=found[symbol].asset_class,
+                years_total=len(year_slices(window.date_from, window.date_to)),
+            )
+            collections.append(collection)
+            session.add(BacktestCollection(backtest_id=run.id, collection_id=collection.id))
     session.commit()
     for run in runs:
         session.refresh(run)
@@ -164,6 +209,8 @@ async def create_basket(
     # Enqueued only after the commit, exactly as the single-run endpoint does it. A worker is
     # fast enough to pick up a job before an uncommitted row is visible, and would then fail
     # looking up a backtest that does exist.
+    for collection in collections:
+        await queue.enqueue_job(COLLECT_RANGE, str(collection.id), _queue_name=COLLECT_QUEUE)
     for run in runs:
         await queue.enqueue_job(RUN_BACKTEST, str(run.id))
 

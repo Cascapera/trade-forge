@@ -86,7 +86,7 @@ export function LaunchBacktest(): React.JSX.Element {
   // ⚠️ The plan is asked with the flag off: nothing missing means launch as an ordinary run.
   const gate = useMissingDataGate(() => {
     launch()
-  }, instruments.data)
+  })
 
   // Asked first, launched only if nothing is missing — otherwise the prompt below decides.
   const run = (): void => {

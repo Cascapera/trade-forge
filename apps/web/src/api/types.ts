@@ -360,6 +360,13 @@ export interface CreateBasketRequest {
   date_from: string
   date_to: string
   initial_capital: string
+  /**
+   * Collect what each market is missing, and run it once its own downloads have landed.
+   *
+   * ⚠️ Per market: the covered ones start at once, and only the others wait. Left out, a market
+   * with no candles in the window is skipped and named in `skipped`.
+   */
+  collect_missing?: boolean
 }
 
 /** One symbol's place in the basket: which run it became, and what it is being charged. */

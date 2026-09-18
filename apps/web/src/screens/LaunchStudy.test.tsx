@@ -17,6 +17,7 @@ vi.mock('../api/client', async () => {
       listStrategies: vi.fn(),
       createStudy: vi.fn(),
       previewStudy: vi.fn(),
+      planCollections: vi.fn(),
     },
   }
 })
@@ -25,6 +26,7 @@ const listInstruments = vi.mocked(api.listInstruments)
 const createStudy = vi.mocked(api.createStudy)
 const listStrategies = vi.mocked(api.listStrategies)
 const previewStudy = vi.mocked(api.previewStudy)
+const planCollections = vi.mocked(api.planCollections)
 
 function instrument(symbol: string) {
   return {
@@ -64,6 +66,8 @@ beforeEach(() => {
   // Clean by default: the tests that care about the server's verdict say so themselves,
   // and the rest must not be blocked by a preview they never set up.
   previewStudy.mockResolvedValue({ points: 2, refusals: [], grid_error: null })
+  // Nothing missing unless a test says otherwise: the click then launches as it always did.
+  planCollections.mockResolvedValue([])
   useSession.setState({ strategyId: 'strategy-1', strategyName: 'MME9' })
 })
 
@@ -544,6 +548,85 @@ describe('LaunchStudy', () => {
 
     await waitFor(() => {
       expect(screen.getByRole('button', { name: 'Run the study' })).toBeEnabled()
+    })
+  })
+
+  describe('the data has to be there (PR-272)', () => {
+    /** Market, window and one axis of two values: a study that could launch. */
+    async function fillIn(): Promise<void> {
+      await screen.findByRole('option', { name: 'AAPL' })
+      await screen.findByRole('option', { name: 'period' })
+      fireEvent.change(screen.getByLabelText('Market'), { target: { value: 'AAPL' } })
+      fireEvent.change(screen.getByLabelText('From'), { target: { value: '2024-01-01' } })
+      fireEvent.change(screen.getByLabelText('To'), { target: { value: '2025-01-01' } })
+      fireEvent.change(screen.getByLabelText('Parameter 1'), {
+        target: { value: 'setup.params.period' },
+      })
+      setValues(1, '5, 9')
+      await waitFor(() => {
+        expect(screen.getByRole('button', { name: 'Run the study' })).toBeEnabled()
+      })
+    }
+
+    const missingAapl = {
+      symbol: 'AAPL',
+      timeframe: 'H1',
+      covers: null,
+      in_window: false,
+      windows: [{ date_from: '2024-01-01T00:00:00Z', date_to: '2025-12-31T23:59:59.999999Z' }],
+      at_broker: true,
+    }
+
+    it('asks the plan about its one market and chart, and launches if nothing is missing', async () => {
+      createStudy.mockResolvedValue({ id: 'study-1', points: [] })
+      renderWithProviders(<LaunchStudy />)
+      await fillIn()
+
+      fireEvent.click(screen.getByRole('button', { name: 'Run the study' }))
+
+      await waitFor(() => {
+        expect(createStudy).toHaveBeenCalledWith(
+          expect.objectContaining({ collect_missing: false }),
+        )
+      })
+      expect(planCollections).toHaveBeenCalledWith(
+        expect.objectContaining({ symbols: ['AAPL'], timeframes: ['H1'] }),
+      )
+    })
+
+    it('asks before launching when the window is missing, and collects on request', async () => {
+      // ⚠️ What the study used to do instead: queue every point, and let each fail in a worker.
+      planCollections.mockResolvedValue([missingAapl])
+      createStudy.mockResolvedValue({ id: 'study-1', points: [] })
+      renderWithProviders(<LaunchStudy />)
+      await fillIn()
+
+      fireEvent.click(screen.getByRole('button', { name: 'Run the study' }))
+
+      expect(await screen.findByRole('region', { name: 'missing data' })).toHaveTextContent(
+        'AAPL H1 — never collected; would fetch 2024–2025',
+      )
+      expect(createStudy).not.toHaveBeenCalled()
+      // Nothing in the window: running without collecting would be refused, so it is not offered.
+      expect(screen.queryByRole('button', { name: 'Run with what there is' })).not.toBeInTheDocument()
+
+      fireEvent.click(screen.getByRole('button', { name: 'Collect and run' }))
+
+      await waitFor(() => {
+        expect(createStudy).toHaveBeenCalledWith(expect.objectContaining({ collect_missing: true }))
+      })
+    })
+
+    it('closes the question when the form changes', async () => {
+      planCollections.mockResolvedValue([missingAapl])
+      renderWithProviders(<LaunchStudy />)
+      await fillIn()
+      fireEvent.click(screen.getByRole('button', { name: 'Run the study' }))
+      await screen.findByRole('region', { name: 'missing data' })
+
+      fireEvent.change(screen.getByLabelText('To'), { target: { value: '2024-06-01' } })
+
+      expect(screen.queryByRole('region', { name: 'missing data' })).not.toBeInTheDocument()
     })
   })
 })

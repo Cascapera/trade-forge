@@ -31,10 +31,15 @@ from sqlalchemy.orm import Session
 
 from tradeforge_api.config import Settings
 from tradeforge_api.main import create_app
+from tradeforge_api.queue import COLLECT_RANGE, RUN_BACKTEST
+from tradeforge_db.broker_symbols import BrokerSymbolEntry, replace_snapshot
 from tradeforge_db.models import (
     Backtest,
+    BacktestCollection,
     BacktestMetrics,
     BacktestStatus,
+    Collection,
+    Dataset,
     Instrument,
     Strategy,
     Study,
@@ -71,6 +76,23 @@ def _seed_instruments(session: Session) -> None:
                 tick_value=Decimal("1"),
                 contract_size=Decimal("100000"),
                 digits=5,
+            )
+        )
+    session.commit()
+
+    # ⚠️ **Coverage rows, and without them every launch below is refused** (PR-272): a study asks
+    # the `datasets` index before queueing, as the sweep has since its first real run lost nine of
+    # twelve runs to a window the data did not reach. Wide enough that `_body`'s window sits inside
+    # it, so a test about something else is about that.
+    for instrument in session.scalars(select(Instrument)):
+        session.add(
+            Dataset(
+                instrument_id=instrument.id,
+                timeframe="H1",
+                date_from=START - dt.timedelta(days=365),
+                date_to=START + dt.timedelta(days=365),
+                candle_count=10_000,
+                parquet_path=f"{instrument.symbol}/H1",
             )
         )
     session.commit()
@@ -561,3 +583,163 @@ def test_a_strange_but_legal_symbol_reaches_the_handler(
 
     assert response.status_code == 422
     assert response.json()["detail"] == f"unknown symbol: {symbol}"
+
+
+class TestTheDataHasToBeThere:
+    """PR-272: a study asks the `datasets` index before queueing, as every other launch does.
+
+    ⚠️ **One market, N runs.** The download is the sweep's shape with a single pair — one per
+    missing window, linked to every point — and the answer "do not collect" is the single
+    backtest's: there is no other market to fall back on, so an empty window is refused.
+    """
+
+    @pytest.fixture
+    def client(
+        self, session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+    ) -> Any:
+        seeding = session_factory()
+        _seed_instruments(seeding)
+        seeding.close()
+        self.app = _app(settings, session_factory, tmp_path)
+        with TestClient(self.app) as opened:
+            yield opened
+
+    def never_collected(self, session_factory: Callable[[], Session]) -> None:
+        with session_factory() as session:
+            for dataset in session.scalars(
+                select(Dataset).join(Instrument).where(Instrument.symbol == SYMBOL)
+            ):
+                session.delete(dataset)
+            session.commit()
+
+    def launched(self, client: Any, **overrides: Any) -> Any:
+        created = client.post("/strategies", json=_strategy())
+        assert created.status_code == 201, created.text
+        return client.post("/studies", json=_body(created.json()["id"], **overrides))
+
+    def waits(self, session_factory: Callable[[], Session]) -> dict[uuid.UUID, set[uuid.UUID]]:
+        """Each run of the study, mapped to the collections it waits for."""
+        with session_factory() as session:
+            out: dict[uuid.UUID, set[uuid.UUID]] = {
+                run.id: set() for run in session.scalars(select(Backtest))
+            }
+            for link in session.scalars(select(BacktestCollection)):
+                out[link.backtest_id].add(link.collection_id)
+            return out
+
+    def test_a_window_with_no_candles_is_refused_and_nothing_is_written(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        """Without the question, all six points would be queued and each would learn in a
+        worker what the index already knew."""
+        self.never_collected(session_factory)
+
+        refused = self.launched(client)
+
+        assert refused.status_code == 422
+        assert refused.json()["detail"] == (
+            f"no candles in this window for {SYMBOL} H1 (never collected)"
+        )
+        # The base strategy only: no study, no points, no runs, no jobs.
+        assert _counts(session_factory) == (1, 0, 0)
+        assert self.app.state.arq_pool.jobs == []
+
+    def test_told_to_collect_the_window_is_downloaded_once_for_every_point(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        """⚠️ **The test this slice exists for.** Six points over one pair: a collection per run
+        would fetch the same year six times. One, and all six runs wait for it."""
+        self.never_collected(session_factory)
+
+        created = self.launched(client, collect_missing=True)
+
+        assert created.status_code == 202, created.text
+        with session_factory() as session:
+            (collection,) = session.scalars(select(Collection)).all()
+        assert (collection.symbol, collection.timeframe) == (SYMBOL, "H1")
+        waits = self.waits(session_factory)
+        assert len(waits) == 6
+        assert all(linked == {collection.id} for linked in waits.values())
+        functions = [function for function, _ in self.app.state.arq_pool.jobs]
+        assert functions.count(COLLECT_RANGE) == 1
+        assert functions.count(RUN_BACKTEST) == 6
+
+    def test_a_window_covered_in_part_waits_for_its_gap_when_told_to_collect(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        """A month missing at the start of a two-month window: without the flag it runs over what
+        exists, with it every point waits for the month. (Four days at an edge would be forgiven
+        by `EDGE_SLACK`, which is why the gap is a month.)"""
+        with session_factory() as session:
+            for dataset in session.scalars(
+                select(Dataset).join(Instrument).where(Instrument.symbol == SYMBOL)
+            ):
+                dataset.date_from = START + dt.timedelta(days=30)
+            session.commit()
+        window = {"date_to": (START + dt.timedelta(days=60)).isoformat()}
+
+        created = self.launched(client, collect_missing=True, **window)
+
+        assert created.status_code == 202, created.text
+        with session_factory() as session:
+            (collection,) = session.scalars(select(Collection)).all()
+        assert collection.date_from <= START
+        assert all(linked == {collection.id} for linked in self.waits(session_factory).values())
+
+    def test_told_to_collect_a_covered_window_collects_nothing(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        """The flag asks for what is missing, not for a download: nothing missing, an ordinary
+        launch — no collection written, no run left waiting."""
+        created = self.launched(client, collect_missing=True)
+
+        assert created.status_code == 202, created.text
+        with session_factory() as session:
+            assert session.scalars(select(Collection)).all() == []
+        assert all(linked == set() for linked in self.waits(session_factory).values())
+        functions = [function for function, _ in self.app.state.arq_pool.jobs]
+        assert COLLECT_RANGE not in functions
+
+    def test_without_the_flag_a_window_covered_in_part_runs_at_once(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        with session_factory() as session:
+            for dataset in session.scalars(
+                select(Dataset).join(Instrument).where(Instrument.symbol == SYMBOL)
+            ):
+                dataset.date_from = START + dt.timedelta(days=30)
+            session.commit()
+
+        created = self.launched(client, date_to=(START + dt.timedelta(days=60)).isoformat())
+
+        assert created.status_code == 202, created.text
+        with session_factory() as session:
+            assert session.scalars(select(Collection)).all() == []
+
+    def test_told_to_collect_a_symbol_the_broker_does_not_list_is_refused(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        """AAPL on 18/09, now through a study: nothing to fetch, nothing to read."""
+        self.never_collected(session_factory)
+        with session_factory() as session:
+            replace_snapshot(
+                session,
+                [BrokerSymbolEntry(symbol="GBPUSD")],
+                server="Tradeview-Demo",
+                synced_at=dt.datetime(2026, 9, 10, tzinfo=dt.UTC),
+            )
+            session.commit()
+
+        refused = self.launched(client, collect_missing=True)
+
+        assert refused.status_code == 422
+        with session_factory() as session:
+            assert session.scalars(select(Collection)).all() == []
+
+    def test_a_window_without_a_zone_is_refused(self, client: Any) -> None:
+        """⚠️ The index compares instants; a naive one would reach it as a 500. Refused at the
+        door, as every other launch's window has been since PR-262."""
+        refused = self.launched(client, date_from="2024-01-01T00:00:00")
+
+        assert refused.status_code == 422
+        assert "timezone" in refused.text

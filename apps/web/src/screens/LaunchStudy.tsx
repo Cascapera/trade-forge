@@ -2,6 +2,9 @@ import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 
 import { useCreateStudy, useInstruments, useStrategies } from '../api/hooks'
+import { useMissingDataGate } from '../collect/gate'
+import { anythingToRun } from '../collect/missing'
+import { MissingDataPrompt } from '../components/MissingDataPrompt'
 import { GridEditor } from '../components/GridEditor'
 import { StrategyPicker } from '../components/StrategyPicker'
 import { useSession } from '../store'
@@ -70,7 +73,25 @@ export function LaunchStudy(): React.JSX.Element {
   const blocked = local ?? refused
   const total = combinationCount(form)
 
+  const launch = (collectMissing = false): void => {
+    if (strategyId === null) return
+    create.mutate(toStudyRequest(form, strategyId, collectMissing), {
+      onSuccess: (created) => {
+        setStudy(created.id, studyLabel(form))
+        void navigate(`/studies/${created.id}`)
+      },
+    })
+  }
+  // ⚠️ Asked before launching, as the single backtest, the basket and the sweep ask (PR-272). The
+  // study used to queue every point straight away, and each one then learnt in a worker what the
+  // `datasets` index already knew. An empty plan launches with `collect_missing` off.
+  const gate = useMissingDataGate(() => {
+    launch()
+  })
+
+  // A prompt answers the form it was asked about; any edit closes it.
   const set = (patch: Partial<StudyForm>) => {
+    gate.dismiss()
     setForm((current) => ({ ...current, ...patch }))
   }
 
@@ -89,11 +110,12 @@ export function LaunchStudy(): React.JSX.Element {
         onSubmit={(event) => {
           event.preventDefault()
           if (blocked !== null || strategyId === null) return
-          create.mutate(toStudyRequest(form, strategyId), {
-            onSuccess: (created) => {
-              setStudy(created.id, studyLabel(form))
-              void navigate(`/studies/${created.id}`)
-            },
+          const request = toStudyRequest(form, strategyId)
+          gate.check({
+            symbols: [request.symbol],
+            timeframes: [request.timeframe],
+            date_from: request.date_from,
+            date_to: request.date_to,
           })
         }}
       >
@@ -104,6 +126,7 @@ export function LaunchStudy(): React.JSX.Element {
           <StrategyPicker
             value={strategyId ?? ''}
             onChange={(picked) => {
+              gate.dismiss()
               setStrategy(picked.id, picked.name)
               // The axes belong to the setup that was just replaced, so keeping them would leave
               // paths pointing at a document that no longer has them — refused by the server,
@@ -211,10 +234,14 @@ export function LaunchStudy(): React.JSX.Element {
         <div className="flex flex-wrap items-center gap-4">
           <button
             type="submit"
-            disabled={blocked !== null || create.isPending}
+            disabled={blocked !== null || create.isPending || gate.plan.isPending}
             className="rounded bg-sky-600 px-4 py-2 text-sm font-medium text-white disabled:cursor-not-allowed disabled:bg-slate-700"
           >
-            {create.isPending ? 'Launching…' : 'Run the study'}
+            {create.isPending
+              ? 'Launching…'
+              : gate.plan.isPending
+                ? 'Checking the data…'
+                : 'Run the study'}
           </button>
           {/* The count is a live reading, not a validation message: it is worth seeing at 12 as
               well as at 600, because the jump between them is what people misjudge. */}
@@ -242,6 +269,23 @@ export function LaunchStudy(): React.JSX.Element {
             </ul>
           </div>
         )}
+        {/* One market, one chart: the plan answers about one pair, and every point reads it. */}
+        <MissingDataPrompt
+          gate={gate}
+          onRunAnyway={() => {
+            launch()
+          }}
+          // One download per missing window, and every point waits for it.
+          onCollectAndRun={() => {
+            launch(true)
+          }}
+          launching={create.isPending}
+          canRun={
+            gate.missing === null ||
+            anythingToRun([{ symbol: form.symbol, timeframe: form.timeframe }], gate.missing)
+          }
+        />
+
         {create.isError && (
           <p className="text-sm text-red-400">{launchFailure(create.error)}</p>
         )}

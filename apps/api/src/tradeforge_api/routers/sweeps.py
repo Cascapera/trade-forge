@@ -26,13 +26,13 @@ from fastapi import APIRouter, HTTPException, Query, Response, status
 from pydantic import AwareDatetime
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import defer, selectinload
+from sqlalchemy.orm import Session, defer, selectinload
 
 from tradeforge_api import sweep_dashboard as dashboard
-from tradeforge_api.coverage import describe, uncovered_markets
+from tradeforge_api.coverage import describe, plan_for, uncovered_markets
 from tradeforge_api.deps import QueueDep, SessionDep
 from tradeforge_api.grid import GridPoint
-from tradeforge_api.queue import RUN_BACKTEST
+from tradeforge_api.queue import COLLECT_QUEUE, COLLECT_RANGE, RUN_BACKTEST
 from tradeforge_api.routers.backtests import list_item
 from tradeforge_api.routers.strategies import refusal_of
 from tradeforge_api.routers.studies import aggregate_points, strategies_for
@@ -44,6 +44,7 @@ from tradeforge_api.schemas import (
     DatasetDictionaryOut,
     DatasetOmissionOut,
     GridRefusal,
+    PlannedCollection,
     PreviewSweepRequest,
     SweepDashboardOut,
     SweepEntryOut,
@@ -64,11 +65,15 @@ from tradeforge_api.sweep import (
     size_refusal,
 )
 from tradeforge_api.sweep_dataset import CAVEATS, OMITTED, ROW, DatasetRun, columns_for, to_csv
+from tradeforge_collector.collect import year_slices
+from tradeforge_db.collections import create_collection
 from tradeforge_db.models import (
     Backtest,
+    BacktestCollection,
     BacktestMetrics,
     BacktestStatus,
     CatalogEntry,
+    Collection,
     Instrument,
     Strategy,
     Sweep,
@@ -248,12 +253,32 @@ async def create_sweep(request: CreateSweep, session: SessionDep, queue: QueueDe
             detail=f"unknown symbols: {', '.join(unknown)}",
         )
 
+    planned = (
+        plan_for(
+            session,
+            symbols=list(request.symbols),
+            timeframes=timeframes,
+            date_from=request.date_from,
+            date_to=request.date_to,
+        )
+        if request.collect_missing
+        else []
+    )
+    collectable = {(market.symbol, market.timeframe): market for market in planned}
+
     # ⚠️ Refused, not dropped, and named one by one. Enqueuing a run that cannot read a single
     # candle spends a worker to re-learn what the `datasets` index already knows — which is what
     # the first real sweep did, nine times out of twelve.
-    uncovered = uncovered_markets(
-        session, list(request.symbols), timeframes, request.date_from, request.date_to
-    )
+    # ⚠️ A pair with something to fetch is not refused when told to collect; an empty plan is
+    # not "covered", though. A window wholly in the future, or older than the broker's first
+    # bar, has nothing to download and nothing to read, and is refused like any other.
+    uncovered = [
+        market
+        for market in uncovered_markets(
+            session, list(request.symbols), timeframes, request.date_from, request.date_to
+        )
+        if (market.symbol, market.timeframe) not in collectable
+    ]
     if uncovered:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -325,6 +350,8 @@ async def create_sweep(request: CreateSweep, session: SessionDep, queue: QueueDe
             paired.append((doc, symbol, run))
     session.add_all(runs)
 
+    collections = _collections_for(session, paired, collectable, found)
+
     try:
         session.commit()
     except IntegrityError as exc:
@@ -341,10 +368,59 @@ async def create_sweep(request: CreateSweep, session: SessionDep, queue: QueueDe
     # claim a job before an uncommitted row is visible; and the derived job id makes the enqueue
     # idempotent, so a crash halfway through this loop is recovered by re-sending rather than by
     # working out which of two thousand runs were reached.
+    # ⚠️ **That claim is the runs' alone.** The downloads carry no job id, as the basket's do not:
+    # re-sending them queues each window again, and a crash before one is sent leaves it
+    # `queued` with its runs deferring until the queue has been silent for `WAIT_LIMIT`.
+    for collection in collections:
+        await queue.enqueue_job(COLLECT_RANGE, str(collection.id), _queue_name=COLLECT_QUEUE)
     for run in runs:
         await queue.enqueue_job(RUN_BACKTEST, str(run.id), _job_id=str(run.id))
 
     return CreatedSweep(id=sweep.id, runs=len(runs))
+
+
+def _collections_for(
+    session: Session,
+    paired: list[tuple[SweepDocument, str, Backtest]],
+    collectable: dict[tuple[str, str], PlannedCollection],
+    found: dict[str, Instrument],
+) -> list[Collection]:
+    """Write one collection per window of each pair to collect, linked to every run over it.
+
+    ⚠️ **Grouped by pair before anything is written — this is what the basket's loop cannot be
+    copied for.** A basket has one run per market, so a collection per run is a collection per
+    market. A sweep has every point of every entry over the same pair, and a collection per run
+    would download the same window once per point. The link table's key is the pair of ids, so
+    many runs waiting on one collection is a row each, and the worker needs no change: each run
+    asks whether *its* collections have landed.
+    """
+    waiting: dict[tuple[str, str], list[Backtest]] = {}
+    for doc, symbol, run in paired:
+        if (symbol, doc.timeframe) in collectable:
+            waiting.setdefault((symbol, doc.timeframe), []).append(run)
+    if not waiting:
+        return []
+
+    session.flush()  # the runs' ids, for the links
+    collections: list[Collection] = []
+    for (symbol, timeframe), runs in waiting.items():
+        for window in collectable[symbol, timeframe].windows:
+            collection = create_collection(
+                session,
+                symbol=symbol,
+                timeframe=timeframe,
+                date_from=window.date_from,
+                date_to=window.date_to,
+                # The class the catalogue already decided, as the basket does it: the broker's
+                # tree path must not refuse a collection the launch itself asked for.
+                asset_class=found[symbol].asset_class,
+                years_total=len(year_slices(window.date_from, window.date_to)),
+            )
+            collections.append(collection)
+            session.add_all(
+                BacktestCollection(backtest_id=run.id, collection_id=collection.id) for run in runs
+            )
+    return collections
 
 
 @router.get("/sweeps", response_model=SweepsPage)

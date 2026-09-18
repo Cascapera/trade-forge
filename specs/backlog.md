@@ -2434,3 +2434,18 @@ antes, ou recusar reescrever uma partição com menos barras do que ela tinha.
   contra baixar a mesma janela duas vezes passa a ser só a do servidor, que continua **aberta**:
   recusar (ou reaproveitar) uma coleta idêntica a uma que já está `queued`/`running`. ⚠️ A cesta
   multiplica o alcance disso por até 20 por clique.
+
+## O que a fatia "a varredura coleta o que falta" (PR-268) deixou de fora
+
+* **O 409 de estudo e varredura não pega a colisão que diz pegar** (anterior à PR-268, achado
+  na revisão dela). As estratégias vão ao banco no `session.flush()` logo depois de
+  `strategies_for`, **fora** do `try` que traduz `IntegrityError` em 409. Como
+  `uq_strategies_name_version` não é DEFERRABLE, dois lançamentos idênticos ao mesmo tempo
+  estouram nesse flush, e o perdedor recebe 500. Vale para `routers/sweeps.py` e
+  `routers/studies.py` (flush na linha ~319). Nenhum teste de 409 existe em `test_studies*` nem
+  em `test_sweeps*`. Conserto: pôr o flush dentro do `try`, com um teste que force a colisão.
+* **As coletas vão para a fila sem `_job_id`** (igual à cesta): reenviar duplica downloads, e
+  um crash entre o `commit` e o enqueue deixa uma coleta `queued` que nunca entra na fila. Os
+  runs dela adiam até a fila ficar em silêncio por `WAIT_LIMIT`.
+* **A tela da varredura ainda não oferece "Collect and run"**: é a próxima fatia. ⚠️
+  `anythingToRun` (`collect/missing.ts`) compara só pelo símbolo e não serve para vários charts.

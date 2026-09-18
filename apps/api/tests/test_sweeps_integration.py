@@ -33,10 +33,13 @@ from sqlalchemy.orm import Session
 
 from tradeforge_api.config import Settings
 from tradeforge_api.main import create_app
+from tradeforge_api.queue import COLLECT_QUEUE, COLLECT_RANGE, RUN_BACKTEST
 from tradeforge_db.models import (
     Backtest,
+    BacktestCollection,
     BacktestMetrics,
     BacktestStatus,
+    Collection,
     Dataset,
     Instrument,
     Sweep,
@@ -771,6 +774,217 @@ class TestTheDataHasToBeThere:
         assert refused.json()["detail"] == (
             f"no candles in this window for: GBPUSD M15 (on disk: {held})"
         )
+
+
+class TestCollectingWhatASweepIsMissing:
+    """His rule (18/09), now for the sweep: "a tela de varredura tb tem que fazer essa coleta".
+
+    ⚠️ **What is different from the basket is the multiplicity.** A pair (market, chart) here is
+    shared by every point of every entry, so the download is one per pair and the waiting is
+    one row per run. Every test below has several runs on a pair for that reason: with one run
+    per pair, a collection per run and a collection per pair are the same number.
+    """
+
+    def never_collected(self, session: Session, symbol: str, timeframe: str) -> None:
+        for dataset in session.scalars(
+            select(Dataset)
+            .join(Instrument)
+            .where(Instrument.symbol == symbol, Dataset.timeframe == timeframe)
+        ):
+            session.delete(dataset)
+        session.commit()
+
+    def launch(
+        self, client: Any, symbols: list[str], timeframes: list[str], **over: Any
+    ) -> dict[str, Any]:
+        entry = an_entry(
+            client, name=f"swept {uuid.uuid4()}", grid={"setup.params.period": [5, 9, 21]}
+        )
+        body = {**a_sweep_body([entry], symbols, timeframes), **over}
+        launched = client.post("/sweeps", json=body)
+        assert launched.status_code == 202, launched.text
+        return dict(launched.json())
+
+    def waits(self, session: Session, sweep_id: str) -> dict[tuple[str, str], set[uuid.UUID]]:
+        """Each pair of the sweep, mapped to the collections its runs wait for.
+
+        ⚠️ Asserts on the way that **every** run over a pair waits for the same ones. Linking
+        only the first run of a pair would leave the others free to start on a window still
+        being downloaded, and a union over the pair would not notice.
+        """
+        seen: dict[tuple[str, str], list[set[uuid.UUID]]] = {}
+        for run in session.scalars(
+            select(Backtest).where(Backtest.sweep_id == uuid.UUID(sweep_id))
+        ):
+            symbol = session.get(Instrument, run.instrument_id)
+            assert symbol is not None
+            linked = set(
+                session.scalars(
+                    select(BacktestCollection.collection_id).where(
+                        BacktestCollection.backtest_id == run.id
+                    )
+                )
+            )
+            seen.setdefault((symbol.symbol, run.timeframe), []).append(linked)
+        out: dict[tuple[str, str], set[uuid.UUID]] = {}
+        for pair, each in seen.items():
+            assert all(one == each[0] for one in each), pair
+            out[pair] = each[0]
+        return out
+
+    def test_a_pair_is_collected_once_however_many_runs_read_it(
+        self, client: Any, session: Session
+    ) -> None:
+        """⚠️ **The test this PR exists for.** Three points over GBPUSD M15: a loop copied from the
+        basket writes three collections of the same window, and this counts one."""
+        self.never_collected(session, "GBPUSD", "M15")
+
+        created = self.launch(client, ["EURUSD", "GBPUSD"], ["M15"], collect_missing=True)
+
+        assert created["runs"] == 6
+        session.expire_all()
+        (collection,) = session.scalars(select(Collection)).all()
+        assert (collection.symbol, collection.timeframe) == ("GBPUSD", "M15")
+        waits = self.waits(session, created["id"])
+        assert waits[("GBPUSD", "M15")] == {collection.id}
+        # The covered market waits for nothing: what can run, runs.
+        assert waits[("EURUSD", "M15")] == set()
+        assert len(session.scalars(select(BacktestCollection)).all()) == 3
+
+    def test_each_chart_of_a_market_waits_for_its_own_download(
+        self, client: Any, session: Session
+    ) -> None:
+        """A grouping by market alone would pass the test above and hold every M15 run behind
+        the H4 backfill here — two charts of one market are two pairs."""
+        self.never_collected(session, "GBPUSD", "M15")
+        self.never_collected(session, "GBPUSD", "H4")
+
+        created = self.launch(client, ["GBPUSD"], ["M15", "H4"], collect_missing=True)
+
+        session.expire_all()
+        by_chart = {one.timeframe: one.id for one in session.scalars(select(Collection))}
+        assert set(by_chart) == {"M15", "H4"}
+        waits = self.waits(session, created["id"])
+        assert waits[("GBPUSD", "M15")] == {by_chart["M15"]}
+        assert waits[("GBPUSD", "H4")] == {by_chart["H4"]}
+
+    def test_the_downloads_go_on_the_hosts_queue_and_the_runs_keep_their_job_ids(
+        self, client: Any, session: Session, queue: _CapturingQueue
+    ) -> None:
+        self.never_collected(session, "GBPUSD", "M15")
+        queue.jobs.clear()
+
+        self.launch(client, ["EURUSD", "GBPUSD"], ["M15"], collect_missing=True)
+
+        collects = [job for job in queue.jobs if job[0] == COLLECT_RANGE]
+        runs = [job for job in queue.jobs if job[0] == RUN_BACKTEST]
+        assert [options for _, _, options in collects] == [{"_queue_name": COLLECT_QUEUE}]
+        assert len(runs) == 6
+        # ⚠️ The idempotency claim survives the new jobs beside it.
+        assert all(options == {"_job_id": args[0]} for _, args, options in runs)
+
+    def test_a_market_covered_in_part_waits_for_its_gap(
+        self, client: Any, session: Session
+    ) -> None:
+        """⚠️ Without the flag this sweep runs over the half that exists (the overlap test
+        above). Told to collect, it waits for the rest instead: a heading that says the whole
+        window over a measurement of half of it is what collecting exists to prevent.
+
+        ⚠️ The gap is a month, not a day: `EDGE_SLACK` forgives four days at an edge, and a
+        one-day gap plans nothing — which is how the first draft of this test found it."""
+        for dataset in session.scalars(
+            select(Dataset).join(Instrument).where(Instrument.symbol == "EURUSD")
+        ):
+            dataset.date_from = START + dt.timedelta(days=30)
+        session.commit()
+
+        created = self.launch(
+            client,
+            ["EURUSD", "GBPUSD"],
+            ["M15"],
+            collect_missing=True,
+            date_to=(START + dt.timedelta(days=60)).isoformat(),
+        )
+
+        session.expire_all()
+        (collection,) = session.scalars(select(Collection)).all()
+        assert collection.symbol == "EURUSD"
+        assert collection.date_from <= START
+        waits = self.waits(session, created["id"])
+        assert waits[("EURUSD", "M15")] == {collection.id}
+        assert waits[("GBPUSD", "M15")] == set()
+
+    def test_a_pair_missing_both_edges_waits_for_both_downloads(
+        self, client: Any, session: Session
+    ) -> None:
+        """Two windows of one pair: every other test here plans one, so a loop that collected
+        only the first window of a plan would pass all of them and start these runs on a year
+        still missing.
+
+        ⚠️ **Years of disk between the gaps, or the plan joins them.** Each gap reaches the year
+        the disk starts or ends in, so data for 2024 alone and a request from mid-2023 to
+        mid-2025 plan one window, 2023 to 2025 — which is how the first draft of this test found
+        it. EURUSD holds 2021-2023 here; the sweep asks from mid-2020 to mid-2024."""
+        for dataset in session.scalars(
+            select(Dataset).join(Instrument).where(Instrument.symbol == "EURUSD")
+        ):
+            dataset.date_from = dt.datetime(2021, 1, 4, tzinfo=dt.UTC)
+            dataset.date_to = dt.datetime(2023, 12, 29, tzinfo=dt.UTC)
+        session.commit()
+
+        created = self.launch(
+            client,
+            ["EURUSD"],
+            ["M15"],
+            collect_missing=True,
+            date_from=dt.datetime(2020, 6, 1, tzinfo=dt.UTC).isoformat(),
+            date_to=dt.datetime(2024, 6, 1, tzinfo=dt.UTC).isoformat(),
+        )
+
+        session.expire_all()
+        collections = session.scalars(select(Collection).order_by(Collection.date_from)).all()
+        assert [(one.date_from.year, one.date_to.year) for one in collections] == [
+            (2020, 2021),
+            (2023, 2024),
+        ]
+        waits = self.waits(session, created["id"])
+        assert waits[("EURUSD", "M15")] == {one.id for one in collections}
+
+    def test_a_pair_with_nothing_to_collect_and_nothing_to_read_still_refuses_the_sweep(
+        self, client: Any, session: Session, queue: _CapturingQueue
+    ) -> None:
+        """⚠️ An empty plan is not "covered". A window wholly in the future has nothing to fetch
+        and no candle either; the sweep is refused whole, and nothing is written."""
+        entry = an_entry(client, name=f"real {uuid.uuid4()}")
+        ahead = dt.datetime.now(tz=dt.UTC) + dt.timedelta(days=30)
+        queue.jobs.clear()
+
+        refused = client.post(
+            "/sweeps",
+            json={
+                **a_sweep_body([entry], ["EURUSD"], ["M15"]),
+                "date_from": ahead.isoformat(),
+                "date_to": (ahead + dt.timedelta(days=10)).isoformat(),
+                "collect_missing": True,
+            },
+        )
+
+        assert refused.status_code == 422
+        assert "EURUSD M15" in refused.text
+        assert queue.jobs == []
+        session.expire_all()
+        assert session.scalars(select(Sweep)).all() == []
+        assert session.scalars(select(Collection)).all() == []
+
+    def test_without_the_flag_nothing_is_collected(self, client: Any, session: Session) -> None:
+        self.never_collected(session, "GBPUSD", "M15")
+        entry = an_entry(client, name=f"real {uuid.uuid4()}")
+
+        refused = client.post("/sweeps", json=a_sweep_body([entry], ["GBPUSD"], ["M15"]))
+
+        assert refused.status_code == 422
+        session.expire_all()
+        assert session.scalars(select(Collection)).all() == []
 
 
 def launch(client: Any, entries: list[str], symbols: list[str]) -> str:

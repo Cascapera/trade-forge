@@ -1742,6 +1742,15 @@ class CreateSweep(BaseModel):
     date_to: AwareInstant
     initial_capital: Decimal = Field(gt=0)
     cost_model: dict[str, Any]
+    collect_missing: bool = False
+    """Collect what each (market, chart) is missing, and run once those downloads have landed.
+
+    ⚠️ **One collection per pair, not per run.** A pair here is shared by every point of every
+    entry — sixty runs is an ordinary sweep — and a download per run would fetch the same window
+    sixty times. Each window of a pair is collected once and every run over that pair waits for
+    it; a pair that is covered whole waits for nothing. Left false, a pair with no candles in the
+    window refuses the whole sweep, as it always has.
+    """
 
     @field_validator("entry_ids", "symbols", "timeframes")
     @classmethod

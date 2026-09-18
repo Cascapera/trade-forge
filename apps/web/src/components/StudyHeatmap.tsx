@@ -78,15 +78,22 @@ export function StudyHeatmap({ study }: { study: StudyOut }): React.JSX.Element 
                       // cell's edge legible where two strong ones meet.
                       className="min-w-16 rounded px-2 py-2 text-center text-xs tabular-nums ring-1 ring-slate-950"
                       style={{ backgroundColor: cell?.fill ?? 'transparent' }}
-                      title={cell === undefined ? undefined : cell.label}
+                      title={cell === undefined ? 'cannot run at this chart' : cell.label}
                     >
                       {/* The number is on every cell on purpose. Colour alone is not an
                           encoding a colourblind reader or a printed page can use, and the
                           value is what someone comparing two neighbours actually wants. */}
+                      {/* ⚠️ **No point here is not the same as no result yet.** Every
+                          combination used to have a point, so an empty cell only ever meant a run
+                          still going. Since the study drops what cannot run (18/09), a cell with
+                          no point is a combination the DSL refused at this chart — said in words,
+                          never as the "—" of a run that has not finished. */}
                       <span className="text-slate-100">
-                        {cell?.ret === undefined || cell.ret === null
-                          ? '—'
-                          : percent(String(cell.ret))}
+                        {cell === undefined
+                          ? "can't run"
+                          : cell.ret === null
+                            ? '—'
+                            : percent(String(cell.ret))}
                       </span>
                     </td>
                   )

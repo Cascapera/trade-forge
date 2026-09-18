@@ -144,6 +144,28 @@ describe('StudyHeatmap', () => {
     expect(within(table).getByText('—')).toBeInTheDocument()
   })
 
+  it('says a combination the study left out cannot run, not that it has not finished', () => {
+    // ⚠️ Since the study drops what cannot run at its chart (18/09), a cell with no point is a
+    // refused combination — here period=9, rr=3 — and the "—" of a run still going would say the
+    // opposite. The unfinished point beside it keeps its dash, so the two are told apart.
+    const base = study(['1000', null, '0', '2000'])
+    const dropped = 'p9r3'
+    const left = {
+      ...base,
+      points: base.points.filter((point) => point.backtest_id !== dropped),
+      runs: base.runs.filter((one) => one.id !== dropped),
+    }
+
+    renderWithProviders(<StudyHeatmap study={left} />)
+
+    const table = screen.getByRole('table')
+    expect(within(table).getByText("can't run").closest('td')).toHaveAttribute(
+      'title',
+      'cannot run at this chart',
+    )
+    expect(within(table).getByText('—')).toBeInTheDocument()
+  })
+
   it('says which axes it is not drawing rather than flattening them', () => {
     // A grid of three parameters is a cube. Folding one onto the rectangle would stack cells,
     // and the picture would look like a search of a space half its real size.

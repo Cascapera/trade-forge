@@ -1003,10 +1003,10 @@ class GridRefusal(_Out):
 class StudyPreview(_Out):
     """What a grid would produce: how many points, and every one that could not run.
 
-    ⚠️ **`refusals` is a list because the answer has to be complete.** Launching a study stops at
-    the first bad point — it must, since nothing may be half-written — but a preview that stopped
-    there would hand back one problem at a time, and fixing a grid would become the round trip
-    this endpoint exists to remove.
+    ⚠️ **`refusals` is a list because the answer has to be complete** — it is exactly the set of
+    points the launch will leave out (since 18/09 a study drops a point that cannot run rather
+    than refusing the grid; only a grid where none can is refused). A preview that named one at a
+    time would make reading a grid the round trip this endpoint exists to remove.
 
     A 200 with refusals in it is a *successful answer*, not a failure. The endpoint reports; it
     does not decide, and reporting that the news is bad is still reporting.
@@ -1769,7 +1769,8 @@ class CreateSweep(BaseModel):
     entry — sixty runs is an ordinary sweep — and a download per run would fetch the same window
     sixty times. Each window of a pair is collected once and every run over that pair waits for
     it; a pair that is covered whole waits for nothing. Left false, a pair with no candles in the
-    window refuses the whole sweep, as it always has.
+    window is skipped and named (`CreatedSweep.skipped`, PR-269) — the whole sweep is refused only
+    when every pair is.
     """
 
     @field_validator("entry_ids", "symbols", "timeframes")

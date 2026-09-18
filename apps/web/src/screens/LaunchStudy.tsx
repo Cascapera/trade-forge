@@ -59,18 +59,30 @@ export function LaunchStudy(): React.JSX.Element {
   // trip away. Neither can be folded into the other without moving a rule to the wrong side.
   const preview = useGridPreview(strategyId, form)
   const local = strategyId === null ? 'Choose a strategy.' : whyNotLaunchable(form)
+  const total = combinationCount(form)
+  // ⚠️ **A point that cannot run is left out, not a reason to refuse the grid** (his request,
+  // 18/09) — the sweep's rule, now the study's: a higher timeframe no coarser than the chart is
+  // dropped by the server and named here. Only a grid where *nothing* can run blocks the button.
+  const dropped = preview.settled ? preview.refusals.length : 0
+  const nothingRuns = preview.settled && total > 0 && dropped >= total
   const refused = !preview.settled
     ? null
     : (preview.gridError ??
-      (preview.refusals.length === 0
+      (dropped === 0
         ? null
-        : `${String(preview.refusals.length)} of these combinations cannot run, so the study will not start.`))
+        : nothingRuns
+          ? 'None of these combinations can run at this chart, so the study will not start.'
+          : `${String(dropped)} of these combinations cannot run at this chart and will be left out.`))
   // ⚠️ Shown side by side rather than one winning: the local message is about the run — a market,
   // a period — and the server's is about the axes, which is what somebody
   // filling in axes needs to see. Suppressing the second until the first is answered would hide
   // the axis problem behind an unrelated blank field.
-  const blocked = local ?? refused
-  const total = combinationCount(form)
+  // Only a grid that cannot be applied, or one where nothing runs, blocks: `refused` is already
+  // the "None…" sentence exactly when `nothingRuns`.
+  const blocked = local ?? (preview.settled ? preview.gridError : null) ?? (nothingRuns ? refused : null)
+  // Floored at zero: the count is the form's own and the refusals are the server's, and a parse
+  // the two ever disagreed on must not print a negative number of backtests.
+  const backtests = Math.max(total - dropped, 0)
 
   const launch = (collectMissing = false): void => {
     if (strategyId === null) return
@@ -247,7 +259,7 @@ export function LaunchStudy(): React.JSX.Element {
           <p className="text-sm text-slate-300" role="status">
             {total === 0
               ? 'Nothing to run yet.'
-              : `${String(total)} combination${total === 1 ? '' : 's'}, so ${String(total)} backtest${total === 1 ? '' : 's'}.`}
+              : `${String(total)} combination${total === 1 ? '' : 's'}, so ${String(backtests)} backtest${backtests === 1 ? '' : 's'}.`}
           </p>
         </div>
 

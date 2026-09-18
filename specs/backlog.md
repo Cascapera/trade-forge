@@ -2521,5 +2521,17 @@ antes, ou recusar reescrever uma partição com menos barras do que ela tinha.
   custo do ensaio cresce com a grade — candidatos: validar uma vez por (entrada, chart) e contar.
 * **O tempo não aparece na tela.** A decisão foi "tempo se mostra, não recusa": falta a estimativa
   (runs x segundos medidos por run, por chart/janela) ao lado do número de backtests.
-* **O estudo recusa em vez de podar** combinações inválidas (ex.: time frame superior não mais
-  grosso que o base), enquanto a varredura poda e nomeia. Pedido dele (18/09) — próxima PR.
+* ✅ **RESOLVIDO na PR-274** — **O estudo recusa em vez de podar** combinações inválidas: agora
+  descarta e nomeia, como a varredura.
+
+## O que a fatia "o estudo poda o que não roda" (PR-274) deixou de fora
+
+* **O resumo do estudo conta só o que sobrou.** `points_total`/`points_profitable` são sobre os
+  pontos que rodaram: uma grade pedida de 9 com 2 podados vira "X de 7", e a tela de resultado não
+  diz que o espaço pedido era 9. O heatmap mostra "can't run" só onde **toda** combinação empilhada
+  na célula foi podada — numa grade de 3+ eixos a poda parcial some. Derivável de `grid` + `points`:
+  uma linha "N of M combinations could not run at this chart".
+* **"Célula sem ponto = podada" não tem guarda.** Vale porque antes toda combinação tinha ponto; se um
+  dia existir exclusão de run/ponto, a derivação passa a mentir.
+* **A checagem de dado roda antes da poda.** Uma grade em que nada roda, sobre uma janela sem dado,
+  recebe "no candles" em vez de "nothing runs" — a causa barata (a grade) fica atrás da cara.

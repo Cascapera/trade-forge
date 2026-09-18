@@ -288,15 +288,14 @@ def test_a_grid_naming_a_path_this_strategy_lacks_writes_nothing_at_all(
     assert _counts(session_factory) == before
 
 
-def test_a_grid_whose_values_make_an_unrunnable_strategy_writes_nothing_at_all(
+def test_a_grid_whose_values_make_no_runnable_strategy_writes_nothing_at_all(
     session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
 ) -> None:
     """The other refusal, and it is a different one: the path is fine and the *value* is not.
 
-    A period of zero reaches a document the grid could apply and the DSL will not accept. Both
-    halves are tested because they fail in different places — one in the expansion, one in the
-    validator — and a study that refused only the first would write five good documents and
-    then raise on the sixth, leaving five behind.
+    A period of zero reaches a document the grid could apply and the DSL will not accept. With
+    **every** point like that there is nothing to run, and the study is refused in the
+    validator's own body — nothing written, nothing queued.
     """
     seeding = session_factory()
     _seed_instruments(seeding)
@@ -307,12 +306,73 @@ def test_a_grid_whose_values_make_an_unrunnable_strategy_writes_nothing_at_all(
         before = _counts(session_factory)
         response = client.post(
             "/studies",
-            json=_body(created.json()["id"], grid={"setup.params.period": [9, 0]}),
+            json=_body(created.json()["id"], grid={"setup.params.period": [0]}),
         )
 
     assert response.status_code == 422
     assert response.json()["detail"]["message"] == "strategy failed schema validation"
     assert _counts(session_factory) == before
+
+
+def test_a_point_that_cannot_run_is_left_out_and_the_rest_runs(
+    session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+) -> None:
+    """⚠️ His request (18/09): a point the DSL refuses is dropped, not a reason to refuse the grid
+    — the sweep's rule, now the study's. Period 0 cannot run; 9 and 20 can, and only they are
+    written and queued."""
+    seeding = session_factory()
+    _seed_instruments(seeding)
+    seeding.close()
+
+    app = _app(settings, session_factory, tmp_path)
+    with TestClient(app) as client:
+        created = client.post("/strategies", json=_strategy())
+        response = client.post(
+            "/studies",
+            json=_body(created.json()["id"], grid={"setup.params.period": [9, 0, 20]}),
+        )
+
+    assert response.status_code == 202, response.text
+    labels = sorted(point["label"] for point in response.json()["points"])
+    assert labels == ["period=20", "period=9"]
+    # The base strategy plus the two points that run; one study; two runs, two jobs.
+    assert _counts(session_factory) == (3, 1, 2)
+    assert len(app.state.arq_pool.jobs) == 2
+
+
+def test_a_higher_timeframe_no_coarser_than_the_chart_is_left_out(
+    session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+) -> None:
+    """⚠️ The shape he asked about (18/09): the higher-timeframe axis swept across every chart,
+    over a study at H1. M30 is finer than H1 — the DSL's rule refuses it — so that point is left
+    out; H4 and D1 run. The preview names the one dropped, and the launch agrees with it."""
+    seeding = session_factory()
+    _seed_instruments(seeding)
+    seeding.close()
+    filtered = {
+        "schema_version": "1.0",
+        "name": "CHoCH under a higher timeframe",
+        "timeframe": "H1",
+        "setup": {"type": "structure_choch", "params": {"htf": "H4", "htf_offset": 3}},
+        "risk": {"sizing": {"type": "percent_risk", "params": {"percent": 1.0}}},
+    }
+    grid = {"setup.params.htf": ["M30", "H4", "D1"]}
+
+    app = _app(settings, session_factory, tmp_path)
+    with TestClient(app) as client:
+        created = client.post("/strategies", json=filtered)
+        assert created.status_code == 201, created.text
+        strategy_id = created.json()["id"]
+        preview = client.post(
+            "/studies/preview", json={"strategy_id": strategy_id, "grid": grid, "timeframe": "H1"}
+        ).json()
+        response = client.post("/studies", json=_body(strategy_id, grid=grid))
+
+    (dropped,) = preview["refusals"]
+    assert dropped["values"] == {"setup.params.htf": "M30"}
+    assert response.status_code == 202, response.text
+    ran = sorted(point["values"]["setup.params.htf"] for point in response.json()["points"])
+    assert ran == ["D1", "H4"]
 
 
 def test_the_points_come_back_placed_on_the_grid_not_in_the_order_postgres_returns_them(

@@ -465,11 +465,46 @@ describe('LaunchStudy', () => {
     fireEvent.change(screen.getByLabelText('Parameter 1'), {
       target: { value: 'setup.params.period' },
     })
-    setValues(1, '5, 9')
+    setValues(1, '5, 9, 20')
 
-    expect(await screen.findByText(/2 of these combinations cannot run/)).toBeInTheDocument()
+    expect(
+      await screen.findByText(
+        '2 of these combinations cannot run at this chart and will be left out.',
+      ),
+    ).toBeInTheDocument()
     expect(screen.getByText("htf='M1'")).toBeInTheDocument()
     expect(screen.getByText("htf='M5'")).toBeInTheDocument()
+    // ⚠️ Left out, not refused (his request, 18/09): the one that can run still launches, and the
+    // count says so — three combinations, one backtest.
+    expect(screen.getByRole('button', { name: 'Run the study' })).toBeEnabled()
+    expect(screen.getByText('3 combinations, so 1 backtest.')).toBeInTheDocument()
+  })
+
+  it('blocks only when no combination can run at this chart', async () => {
+    previewStudy.mockResolvedValue({
+      points: 2,
+      refusals: [
+        { label: "htf='M1'", values: { 'setup.params.htf': 'M1' }, reason: 'must be coarser' },
+        { label: "htf='M5'", values: { 'setup.params.htf': 'M5' }, reason: 'must be coarser' },
+      ],
+      grid_error: null,
+    })
+
+    renderWithProviders(<LaunchStudy />)
+    await screen.findByRole('option', { name: /MME9/ })
+    fireEvent.change(screen.getByLabelText(/Market/), { target: { value: 'AAPL' } })
+    fireEvent.change(screen.getByLabelText(/From/), { target: { value: '2024-01-01' } })
+    fireEvent.change(screen.getByLabelText(/To/), { target: { value: '2024-06-01' } })
+    fireEvent.change(screen.getByLabelText('Parameter 1'), {
+      target: { value: 'setup.params.period' },
+    })
+    setValues(1, '5, 9')
+
+    expect(
+      await screen.findByText(
+        'None of these combinations can run at this chart, so the study will not start.',
+      ),
+    ).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Run the study' })).toBeDisabled()
   })
 
@@ -503,9 +538,12 @@ describe('LaunchStudy', () => {
     // 400ms after a keystroke the query is still keyed on the previous grid, so what is on hand
     // is a real verdict about a grid nobody is looking at any more. Blocking on it means the
     // reader fixes the axis and the screen goes on refusing what they just corrected.
+    // Every point refused, which is the one answer that still blocks since the study drops what
+    // cannot run (18/09) — a blocking verdict is what a stale one can wrongly keep in force.
     previewStudy.mockResolvedValue({
       points: 2,
       refusals: [
+        { label: "htf='M1'", values: { 'setup.params.htf': 'M1' }, reason: 'must be coarser' },
         { label: "htf='M5'", values: { 'setup.params.htf': 'M5' }, reason: 'must be coarser' },
       ],
       grid_error: null,

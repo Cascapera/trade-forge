@@ -27,7 +27,14 @@ from tradeforge_engine.setups import (
     StructureStrategy,
     ZoneEntryPoint,
 )
-from tradeforge_engine.swing import Mme9BreakoutStrategy, PontoContinuoStrategy
+from tradeforge_engine.swing import (
+    BothSides,
+    Mme9BreakoutStrategy,
+    Mme9FailedTurnStrategy,
+    Mme9PullbackStrategy,
+    Mme9TurnStrategy,
+    PontoContinuoStrategy,
+)
 
 
 def _built(kind: str, **params: object) -> object:
@@ -451,3 +458,57 @@ def test_a_long_average_period_that_is_not_an_integer_is_refused() -> None:
 def test_a_long_average_period_the_class_rejects_still_raises() -> None:
     with pytest.raises(ValueError, match="long average period must be >= 1"):
         _built("mme9_breakout", side="long", long_average_period=0)
+
+
+# --------------------------------------------------------------------------- #
+# "both" on the swing setups (his request of 18/09, second half)                #
+# --------------------------------------------------------------------------- #
+
+# Every setup written for one side, and the name its class gives its orders. Written out here on
+# purpose: the factory reads the base off the class, and this is what says which base it must find.
+_SWING: dict[str, tuple[type[object], str]] = {
+    "mme9_breakout": (Mme9BreakoutStrategy, "mme9"),
+    "mme9_turn": (Mme9TurnStrategy, "mme9turn"),
+    "mme9_failed_turn": (Mme9FailedTurnStrategy, "mme9fail"),
+    "mme9_pullback": (Mme9PullbackStrategy, "mme9pull"),
+    "ponto_continuo": (PontoContinuoStrategy, "ponto-continuo"),
+}
+
+
+@pytest.mark.parametrize("kind", list(_SWING))
+def test_both_builds_a_long_and_a_short_of_the_same_setup(kind: str) -> None:
+    """The document's `both` becomes two halves of the named class, one per side, each with its own
+    name — the name is what keeps two halves from minting the same order name on one bar. Every
+    other parameter reaches **both** halves, probed off its default on each, so a factory that
+    built the second half from defaults would fail here."""
+    cls, base = _SWING[kind]
+    setup = _built(kind, side="both", period=21, stop_buffer_ticks=3)
+    assert isinstance(setup, BothSides)
+    [(long_side, long), (short_side, short)] = setup._halves
+    assert (long_side, short_side) == (Side.LONG, Side.SHORT)
+    for half, side in ((long, Side.LONG), (short, Side.SHORT)):
+        assert type(half) is cls
+        assert half._side is side  # type: ignore[attr-defined]
+        assert half._name == f"{base}-{side.value}"  # type: ignore[attr-defined]
+        assert half._period == 21  # type: ignore[attr-defined]
+        assert half._stop_buffer_ticks == Decimal(3)  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("kind", list(_SWING))
+@pytest.mark.parametrize(("side", "expected"), [("long", Side.LONG), ("short", Side.SHORT)])
+def test_one_side_is_the_bare_setup_under_its_own_name(
+    kind: str, side: str, expected: Side
+) -> None:
+    """A document naming one side builds exactly what it built before 18/09: the class itself, not
+    a composition of one, and the class's own name — so every saved run still names its orders the
+    way it always did."""
+    cls, base = _SWING[kind]
+    setup = _built(kind, side=side)
+    assert type(setup) is cls
+    assert setup._side is expected  # type: ignore[attr-defined]
+    assert setup._name == base  # type: ignore[attr-defined]
+
+
+def test_a_refused_side_names_all_three_it_would_take() -> None:
+    with pytest.raises(EngineError, match="'long', 'short' or 'both'"):
+        _built("ponto_continuo", side="ambos")

@@ -657,7 +657,7 @@
           "type": "integer"
         },
         "side": {
-          "$ref": "#/$defs/SetupSide"
+          "$ref": "#/$defs/TradeSide"
         },
         "stop_buffer_ticks": {
           "default": 0,
@@ -723,7 +723,7 @@
           "type": "integer"
         },
         "side": {
-          "$ref": "#/$defs/SetupSide"
+          "$ref": "#/$defs/TradeSide"
         },
         "stop_buffer_ticks": {
           "default": 0,
@@ -791,7 +791,7 @@
           "type": "integer"
         },
         "side": {
-          "$ref": "#/$defs/SetupSide"
+          "$ref": "#/$defs/TradeSide"
         },
         "stop_buffer_ticks": {
           "default": 0,
@@ -852,7 +852,7 @@
           "type": "integer"
         },
         "side": {
-          "$ref": "#/$defs/SetupSide"
+          "$ref": "#/$defs/TradeSide"
         },
         "stop_buffer_ticks": {
           "default": 0,
@@ -1037,7 +1037,7 @@
           "type": "integer"
         },
         "side": {
-          "$ref": "#/$defs/SetupSide"
+          "$ref": "#/$defs/TradeSide"
         },
         "stop_buffer_ticks": {
           "default": 0,
@@ -1259,13 +1259,6 @@
           "$ref": "#/$defs/StructureContinuationSetup"
         }
       ]
-    },
-    "SetupSide": {
-      "enum": [
-        "long",
-        "short"
-      ],
-      "type": "string"
     },
     "StructureChochSetup": {
       "additionalProperties": false,

@@ -2429,6 +2429,9 @@ antes, ou recusar reescrever uma partição com menos barras do que ela tinha.
   assimetria é acidental.
 * **Uma coleta que falha derruba o run e as irmãs seguem baixando** sem ninguém esperando por
   elas. Não corrompe nada, mas gasta o agente.
+  ⚠️ **Decidido pelo Guilherme (22/09): a coleta que falha não derruba o run.** O run roda com o
+  que tem no disco e **avisa que a coleta falhou**, dizendo qual (símbolo, time frame, janela) e
+  por quê. Vale para o backtest, a cesta e a varredura.
 
 * ✅ **RESOLVIDO na PR-267 (por remoção)** — "Já enfileirado" vivia só enquanto a aba estava
   aberta. A tela não enfileira mais coleta nenhuma: quem planeja e cria é o lançamento. A defesa
@@ -2459,6 +2462,8 @@ antes, ou recusar reescrever uma partição com menos barras do que ela tinha.
 * **O dataset exportado e o dashboard não citam os pulados.** `Sweep.skipped` está gravado, mas o
   CSV/dicionário (`sweep_dataset.py`) e `GET /sweeps/dashboard` não o leem: um par pulado some do
   dataset sem uma linha de aviso no dicionário.
+  ⚠️ **Decidido pelo Guilherme (22/09): só o dashboard.** O dataset exportado **não** precisa
+  citar os pulados; o `GET /sweeps/dashboard` e a tela dele precisam.
 * **A lista de varreduras** (`GET /sweeps`) não diz que uma varredura tem buraco.
 * ✅ **RESOLVIDO na PR-273 (por remoção do teto)** — **Ensaio e lançamento com coleta podem discordar no teto.** `PreviewSweepRequest` não tem
   `collect_missing`, e `preview.runs` conta o lançamento **sem** coletar (o menor dos dois). Um
@@ -2521,6 +2526,8 @@ antes, ou recusar reescrever uma partição com menos barras do que ela tinha.
   custo do ensaio cresce com a grade — candidatos: validar uma vez por (entrada, chart) e contar.
 * **O tempo não aparece na tela.** A decisão foi "tempo se mostra, não recusa": falta a estimativa
   (runs x segundos medidos por run, por chart/janela) ao lado do número de backtests.
+  ⚠️ **Decidido pelo Guilherme (22/09): estimar as duas coisas**, o tempo da **coleta** (o que
+  falta baixar) e o dos **backtests**, cada um com o seu número.
 * ✅ **RESOLVIDO na PR-274** — **O estudo recusa em vez de podar** combinações inválidas: agora
   descarta e nomeia, como a varredura.
 

@@ -900,6 +900,9 @@ class BasketOut(_Out):
 
     aggregate: BasketAggregate
     runs: list[BacktestListItem]
+    failed_collections: list[CollectionOut] = Field(default_factory=list)
+    """Downloads that failed under this basket's runs, once each (his rule of 22/09): those runs
+    went ahead on what was on disk, and this is where the basket says so."""
 
 
 class CreateStudyRequest(BaseModel):
@@ -1938,6 +1941,9 @@ class SweepOut(BaseModel):
 
     runs: list[SweepRunOut]
     skipped: list[UncoveredMarket] = Field(default_factory=list)
+    failed_collections: list[CollectionOut] = Field(default_factory=list)
+    """Downloads that failed under this sweep's runs, once each (his rule of 22/09). Apart from
+    `skipped`, which is markets the launch never ran: these runs *did* run, on what was on disk."""
     """Pairs of `symbols` x `timeframes` left out for having no candles in the window.
 
     ⚠️ **Read this before reading `symbols` and `timeframes` as the space that was measured.**

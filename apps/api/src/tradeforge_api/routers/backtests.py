@@ -13,8 +13,8 @@ from decimal import Decimal, localcontext
 from typing import Annotated, Any
 
 from fastapi import APIRouter, HTTPException, Query, status
-from sqlalchemy import func, select
-from sqlalchemy.orm import selectinload
+from sqlalchemy import ColumnElement, func, select
+from sqlalchemy.orm import Session, selectinload
 
 from tradeforge_api.config import Settings
 from tradeforge_api.coverage import describe, to_collect, uncovered_markets
@@ -28,6 +28,7 @@ from tradeforge_api.schemas import (
     BacktestsPage,
     CandleOut,
     CandlesOut,
+    CollectionOut,
     CreateBacktestRequest,
     CreatedBacktest,
     EquityPointOut,
@@ -49,6 +50,7 @@ from tradeforge_db.models import (
     BacktestCollection,
     BacktestMetrics,
     BacktestStatus,
+    Collection,
     Instrument,
     Strategy,
     Trade,
@@ -124,6 +126,31 @@ def list_item(
         finished_at=run.finished_at,
         metrics=(None if run.metrics is None else MetricsOut.model_validate(run.metrics)),
     )
+
+
+def failed_collections(session: Session, runs: ColumnElement[bool]) -> list[CollectionOut]:
+    """The downloads that failed under the runs `runs` selects — once each, however many shared it.
+
+    His rule of 22/09: a run whose download failed goes ahead on what is on disk, and **says so**.
+    One run says it through `waiting_for`; a basket or a sweep holds many, and nobody opens three
+    thousand runs to find the one whose download broke, so the group says it once, at the top.
+
+    ⚠️ **Derived, not stored.** The link rows are written with the runs and `failed` is terminal
+    (`finish_collection` closes a row once), so reading them back is the same fact the worker acted
+    on — a second copy on the basket or the sweep would be one more place for it to disagree.
+
+    ⚠️ **Distinct.** A sweep collects once per market and chart (PR-268) and every point on that
+    market waits on the same row, so the join repeats it once per run; the list is of downloads.
+    """
+    rows = session.scalars(
+        select(Collection)
+        .join(BacktestCollection, BacktestCollection.collection_id == Collection.id)
+        .join(Backtest, Backtest.id == BacktestCollection.backtest_id)
+        .where(runs, Collection.status == BacktestStatus.FAILED)
+        .distinct()
+        .order_by(Collection.symbol, Collection.timeframe, Collection.date_from)
+    )
+    return [CollectionOut.model_validate(row) for row in rows]
 
 
 def _load(session: SessionDep, backtest_id: uuid.UUID) -> Backtest:

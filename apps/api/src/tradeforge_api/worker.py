@@ -447,6 +447,10 @@ connect timeout is set. A database that comes back within the budget gets the ru
 done or failed; one that never does leaves the row as it was, with the error in arq's result."""
 
 
+_ENDED = frozenset({BacktestStatus.DONE, BacktestStatus.FAILED})
+"""The states a collection never leaves, and so the ones a waiting run stops waiting on."""
+
+
 def retry_delay(job_try: int) -> int:
     """Seconds to wait before try `job_try + 1`: 5, 10, 15 … — room for a database to start."""
     return 5 * job_try
@@ -455,9 +459,18 @@ def retry_delay(job_try: int) -> int:
 async def _still_collecting(ctx: dict[str, Any], session: Session, run_id: uuid.UUID) -> bool:
     """Is this run waiting for data, and has the waiting been dealt with?
 
-    True means the caller must stop: the run was either deferred (the download is still going) or
-    failed (the download failed, or the wait outlived `WAIT_LIMIT`). False means there is nothing
-    to wait for — no collection was ever linked, or every one of them has finished.
+    True means the caller must stop: the run was either deferred (a download is still going) or
+    failed (the wait outlived `WAIT_LIMIT`). False means there is nothing left to wait for — no
+    collection was ever linked, or every one of them has ended, done **or failed**.
+
+    ⚠️ **A failed download does not fail the run — his rule of 22/09.** It used to: *"half a window
+    is not a shorter measurement, it is a different one"*. He chose the other side of that: the run
+    goes ahead with what is on disk and **says** which download failed and why. Nothing here has to
+    write that down: the link row stays and `failed` is terminal (`finish_collection` closes a row
+    once), so every reader — the run's screen, a basket's, a sweep's — derives the warning from
+    `waiting_for`. And the window the run actually covered is already reported beside the one that
+    was asked for (`coverage`), which is what keeps the shorter measurement from passing as the
+    requested one. A run left with nothing at all on disk still fails, on the data, as it should.
 
     ⚠️ **Deferred by enqueuing a new job, never by `Retry`.** `run_backtest`'s retry budget exists
     for a database that is not answering, and it is eight tries; a wait of two hours is two
@@ -477,19 +490,9 @@ async def _still_collecting(ctx: dict[str, Any], session: Session, run_id: uuid.
     if not waits:
         return False
 
-    failed = [one for one in waits if one.status is BacktestStatus.FAILED]
-    if failed:
-        first = failed[0]
-        _fail(
-            session,
-            run,
-            f"the collection of {first.symbol} {first.timeframe} failed: "
-            f"{first.error or 'no reason recorded'}",
-        )
-        await _announce(ctx["redis"], run_id, {"status": "failed", "error": run.error})
-        return True
-
-    unfinished = [one for one in waits if one.status is not BacktestStatus.DONE]
+    # Ended is done or failed: a failed download is waited for no longer, and the run reads what is
+    # there. The siblings still downloading are waited for as before — the run takes all it can get.
+    unfinished = [one for one in waits if one.status not in _ENDED]
     if not unfinished:
         return False
 

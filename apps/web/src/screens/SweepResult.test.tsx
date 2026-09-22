@@ -125,6 +125,7 @@ function sweep(over: Partial<SweepOut> = {}, entries?: SweepEntryOut[]): SweepOu
     initial_capital: '10000',
     created_at: '2024-01-01T00:00:00Z',
     skipped: [],
+    failed_collections: [],
     entries: entries ?? [
       {
         entry_id: ZETA.id,
@@ -221,6 +222,41 @@ describe('SweepResult', () => {
     expect(warning).toHaveTextContent('Left out — no candles in this window for 2 pairs:')
     expect(warning).toHaveTextContent('GBPUSD H1 — never collected')
     expect(warning).toHaveTextContent('EURUSD H1 — collected 2020-01-01 to 2021-01-01')
+  })
+
+  it('says which downloads failed, apart from the pairs that were left out', () => {
+    // His rule (22/09): these runs *did* run, on what was on disk — a different claim from
+    // `skipped`, and a different line.
+    showing(
+      sweep({
+        failed_collections: [
+          {
+            id: 'c1',
+            symbol: 'GBPUSD',
+            timeframe: 'M15',
+            date_from: '2024-01-01T00:00:00Z',
+            date_to: '2024-12-31T00:00:00Z',
+            asset_class: null,
+            status: 'failed',
+            years_done: 0,
+            years_total: 1,
+            candles: null,
+            gaps: null,
+            error: 'the terminal said no',
+            requested_at: '',
+            started_at: null,
+            finished_at: null,
+          },
+        ],
+      }),
+    )
+
+    renderWithProviders(<SweepResult />)
+
+    expect(screen.getByRole('status', { name: 'failed downloads' })).toHaveTextContent(
+      'GBPUSD M15 — the terminal said no',
+    )
+    expect(screen.queryByRole('status', { name: 'left out' })).not.toBeInTheDocument()
   })
 
   it('offers the dataset beside the dictionary that says what its columns are', () => {

@@ -92,6 +92,7 @@ function stub(runs: BacktestListItem[], over: Partial<BasketAggregate> = {}): Ba
     created_at: '2026-08-12T12:00:00Z',
     aggregate: aggregate({ runs_total: runs.length, ...over }),
     runs,
+    failed_collections: [],
   }
   mockedBasket.mockReturnValue({ isPending: false, isError: false, data } as never)
   return data
@@ -120,6 +121,35 @@ describe('BasketResult', () => {
     expect(screen.getByRole('heading', { name: /Ponto Contínuo v2 across 2 markets/ })).toBeInTheDocument()
     // Per market, not in total: every run started with the whole balance.
     expect(screen.getByText(/10,000.00 per market/)).toBeInTheDocument()
+  })
+
+  it('says which downloads failed, and that their runs went ahead on what was on disk', () => {
+    // His rule (22/09). Read from the basket itself, so it survives a reload.
+    const data = stub([run({ id: 'a', symbol: 'GBPUSD' })])
+    data.failed_collections = [
+      {
+        id: 'c1',
+        symbol: 'GBPUSD',
+        timeframe: 'H1',
+        date_from: '2024-01-01T00:00:00Z',
+        date_to: '2024-12-31T00:00:00Z',
+        asset_class: null,
+        status: 'failed',
+        years_done: 0,
+        years_total: 1,
+        candles: null,
+        gaps: null,
+        error: 'the terminal said no',
+        requested_at: '',
+        started_at: null,
+        finished_at: null,
+      },
+    ]
+    renderWithProviders(<BasketResult />, '/baskets/k1')
+
+    expect(screen.getByRole('status', { name: 'failed downloads' })).toHaveTextContent(
+      'GBPUSD H1 — the terminal said no',
+    )
   })
 
   it('puts the finished runs on the chart without anyone ticking a box', () => {

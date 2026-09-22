@@ -22,7 +22,7 @@ from sqlalchemy.orm import selectinload
 from tradeforge_api.coverage import describe, to_collect, uncovered_markets
 from tradeforge_api.deps import QueueDep, SessionDep
 from tradeforge_api.queue import COLLECT_QUEUE, COLLECT_RANGE, RUN_BACKTEST
-from tradeforge_api.routers.backtests import list_item
+from tradeforge_api.routers.backtests import failed_collections, list_item
 from tradeforge_api.routers.strategies import assert_runnable_at
 from tradeforge_api.runner import ENGINE_VERSION
 from tradeforge_api.schemas import (
@@ -319,4 +319,5 @@ def get_basket(basket_id: uuid.UUID, session: SessionDep) -> BasketOut:
         created_at=basket.created_at,
         aggregate=_aggregate(runs, basket.initial_capital),
         runs=[list_item(run, symbol, strategy.name, strategy.version) for run, symbol in runs],
+        failed_collections=failed_collections(session, Backtest.basket_id == basket.id),
     )

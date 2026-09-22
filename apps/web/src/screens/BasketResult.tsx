@@ -15,6 +15,7 @@ import {
 import { newlyComparable } from '../basket/settings'
 import { BasketDispersion } from '../components/BasketDispersion'
 import { ComparisonChart } from '../components/ComparisonChart'
+import { FailedDownloads } from '../components/FailedDownloads'
 import { RunTable } from '../components/RunTable'
 import { money } from '../format'
 
@@ -114,6 +115,8 @@ export function BasketResult(): React.JSX.Element {
           .
         </p>
       )}
+
+      <FailedDownloads downloads={data.failed_collections} />
 
       {/* The poll is visible rather than silent: a screen that showed dashes without saying why
           reads as a basket that produced nothing. */}

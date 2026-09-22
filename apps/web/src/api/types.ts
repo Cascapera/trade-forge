@@ -436,6 +436,9 @@ export interface BasketOut {
   created_at: string
   aggregate: BasketAggregate
   runs: BacktestListItem[]
+  /** Downloads that failed under this basket's runs, once each. Those runs went ahead on what
+   *  was on disk (his rule of 22/09); this is where the basket says so. */
+  failed_collections: Collection[]
 }
 
 /** One combination of a study's grid: the run it became, and where it sits on the axes. */
@@ -1143,6 +1146,9 @@ export interface SweepOut {
    *  ⚠️ `symbols` and `timeframes` are what was **asked**: read this before reading them as the
    *  space that was measured. */
   skipped: UncoveredMarket[]
+  /** Downloads that failed under this sweep's runs, once each (his rule of 22/09). Unlike
+   *  `skipped`, these runs *did* run — on what was on disk. */
+  failed_collections: Collection[]
 }
 
 /** How many of a sweep's runs sit in each status. The four always add up to `total`. */

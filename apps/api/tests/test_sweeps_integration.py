@@ -1002,6 +1002,28 @@ class TestCollectingWhatASweepIsMissing:
         assert waits[("EURUSD", "M15")] == set()
         assert len(session.scalars(select(BacktestCollection)).all()) == 3
 
+    def test_a_failed_download_is_named_once_however_many_runs_read_it(
+        self, client: Any, session: Session
+    ) -> None:
+        """His rule (22/09): the sweep says which download failed. Three points read GBPUSD M15
+        through one collection, so the join finds it three times — and the sweep names it once,
+        because what failed is one download, not three."""
+        self.never_collected(session, "GBPUSD", "M15")
+        created = self.launch(client, ["EURUSD", "GBPUSD"], ["M15"], collect_missing=True)
+        assert client.get(f"/sweeps/{created['id']}").json()["failed_collections"] == []
+
+        session.expire_all()
+        (collection,) = session.scalars(select(Collection)).all()
+        collection.status, collection.error = BacktestStatus.FAILED, "the terminal said no"
+        session.commit()
+
+        [failed] = client.get(f"/sweeps/{created['id']}").json()["failed_collections"]
+        assert (failed["symbol"], failed["timeframe"], failed["error"]) == (
+            "GBPUSD",
+            "M15",
+            "the terminal said no",
+        )
+
     def test_each_chart_of_a_market_waits_for_its_own_download(
         self, client: Any, session: Session
     ) -> None:

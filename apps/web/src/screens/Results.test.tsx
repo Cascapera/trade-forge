@@ -351,9 +351,9 @@ describe('Results, while the data is still being collected', () => {
     expect(screen.queryByText(/Waiting for the data/)).not.toBeInTheDocument()
   })
 
-  it('says a download failed instead of claiming the run is going', () => {
-    // ⚠️ The run is doomed and still `queued`: the worker finds out on its next wake-up, up to
-    // half a minute later. Until then, "running the backtest" is the one thing certainly false.
+  it('says a download failed and that the run goes ahead on what is on disk', () => {
+    // His rule (22/09): a failed download no longer fails the run. The sentence has to say both
+    // halves — what broke, and what the run is doing about it — or it reads as a doomed run.
     stubBacktest({
       data: backtest({
         status: 'queued',
@@ -365,14 +365,16 @@ describe('Results, while the data is still being collected', () => {
     renderWithProviders(<Results />, '/results/b1')
 
     expect(screen.getByRole('status')).toHaveTextContent(
-      'A download this run needs failed: EURUSD H1 — the terminal said no. This run stops as soon as the worker looks at it.',
+      'A download this run needs failed: EURUSD H1 — the terminal said no. The run goes ahead on the data already on disk.',
     )
-    expect(screen.queryByText(/Running the backtest/)).not.toBeInTheDocument()
+    // Nothing is left to wait for, so the ordinary line says what happens next.
+    expect(screen.getByText(/Running the backtest/)).toBeInTheDocument()
     expect(screen.queryByText(/Waiting for the data/)).not.toBeInTheDocument()
   })
 
-  it('leads with the failure even while another download is still going', () => {
-    // Promising "it starts by itself once the download lands" would be a promise already broken.
+  it('names the failure and still waits for the download that is going', () => {
+    // A failed download ends its own wait, not the run's: the sibling still downloading is data
+    // the run will read, and the screen goes on promising it.
     stubBacktest({
       data: backtest({
         status: 'queued',
@@ -386,7 +388,29 @@ describe('Results, while the data is still being collected', () => {
     })
     renderWithProviders(<Results />, '/results/b1')
 
-    expect(screen.getByRole('status')).toHaveTextContent('A download this run needs failed')
-    expect(screen.queryByText(/starts by itself/)).not.toBeInTheDocument()
+    const notes = screen.getAllByRole('status').map((one) => one.textContent)
+    expect(notes).toEqual([
+      expect.stringContaining('A download this run needs failed: EURUSD H1 — no history'),
+      expect.stringContaining('Waiting for the data this run needs: EURUSD H1 1 of 3 years'),
+    ])
+  })
+
+  it('keeps saying a download failed once the run has finished', () => {
+    // ⚠️ After the run, not only before it: every metric on this screen is measured over what
+    // reached the disk, and the reader of a finished run is the one who needs to know that.
+    stubBacktest({
+      data: backtest({
+        status: 'done',
+        metrics,
+        waiting_for: [collection({ status: 'failed', error: 'the terminal said no' })],
+      }),
+      isPending: false,
+      isError: false,
+    })
+    renderWithProviders(<Results />, '/results/b1')
+
+    expect(
+      screen.getByText(/A download this run needed failed: EURUSD H1 — the terminal said no/),
+    ).toHaveTextContent('The run went ahead on the data already on disk.')
   })
 })

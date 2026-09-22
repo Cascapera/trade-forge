@@ -74,10 +74,11 @@ export function Results(): React.JSX.Element {
   const collecting = run.waiting_for.filter(
     (one) => one.status !== 'done' && one.status !== 'failed',
   )
-  // ⚠️ A failed download is neither finished nor a wait. The run is doomed and does not know it
-  // yet — the worker finds out on its next wake-up, up to half a minute later — and in between,
-  // "running the backtest" would be the one thing that is certainly false.
+  // ⚠️ A failed download no longer fails the run (his rule of 22/09): the run goes ahead on what
+  // is on disk. What it owes the reader is the sentence saying so — before it runs, while it runs
+  // and after, because every metric it shows is measured over whatever reached the disk.
   const brokenDownloads = run.waiting_for.filter((one) => one.status === 'failed')
+  const underway = run.status === 'queued' || run.status === 'running'
   const price = candles.data
 
   return (
@@ -102,21 +103,20 @@ export function Results(): React.JSX.Element {
         </p>
       )}
 
-      {(run.status === 'queued' || run.status === 'running') && brokenDownloads.length > 0 && (
+      {brokenDownloads.length > 0 && (
         <p
           role="status"
-          className="rounded border border-red-800 bg-red-950/40 p-4 text-sm text-red-300"
+          className="rounded border border-amber-800 bg-amber-950/40 p-4 text-sm text-amber-200"
         >
-          A download this run needs failed:{' '}
+          A download this run {underway ? 'needs' : 'needed'} failed:{' '}
           {brokenDownloads
             .map((one) => `${one.symbol} ${one.timeframe} — ${one.error ?? 'no reason recorded'}`)
             .join('; ')}
-          . This run stops as soon as the worker looks at it.
+          . {underway ? 'The run goes ahead' : 'The run went ahead'} on the data already on disk.
         </p>
       )}
 
-      {(run.status === 'queued' || run.status === 'running') &&
-        brokenDownloads.length === 0 &&
+      {underway &&
         (collecting.length > 0 ? (
           <p
             role="status"

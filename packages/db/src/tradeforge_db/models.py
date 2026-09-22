@@ -583,11 +583,12 @@ class BacktestCollection(Base):
     """One run waiting for one collection (`rev_0019`).
 
     ⚠️ **The wait is a row, and it stays.** A run told to collect first is enqueued like any
-    other; the worker asks this table what it is waiting for, defers itself while any of them is
-    still downloading, and **fails the run outright if one of them failed** — half a window is
-    not a shorter measurement, it is a different one. Removing the row on completion would make
-    that question depend on rows disappearing under it, and would erase why a run started ten
-    minutes after it was created.
+    other; the worker asks this table what it is waiting for and defers itself while any of them
+    is still downloading. **A failed one ends the wait, not the run** (his rule of 22/09, which
+    replaced "half a window is a different measurement"): the run reads what is on disk, and this
+    row is what lets every screen say which download failed. Removing the row on completion would
+    make both questions depend on rows disappearing under them, and would erase why a run started
+    ten minutes after it was created.
     """
 
     __tablename__ = "backtest_collections"

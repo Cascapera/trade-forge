@@ -671,6 +671,7 @@ def get_sweep_dashboard(
             sweep_id=str(sweep.id),
             created_at=sweep.created_at,
             entry_names=[names.get(one) for one in sweep.entry_ids],
+            skipped=tuple((one["symbol"], one["timeframe"]) for one in sweep.skipped),
         )
         for sweep in sweeps
     ]

@@ -2459,11 +2459,11 @@ antes, ou recusar reescrever uma partição com menos barras do que ela tinha.
 * ✅ **RESOLVIDO na PR-270** — **A tela ainda bloqueia** o lançamento quando há par sem dado (`LaunchSweep.tsx`, `blocked`),
   embora o servidor agora pule. É a próxima fatia: "Collect and run" / "rodar com o que tem" e os
   pulados na tela de resultado (`SweepOut.skipped`).
-* **O dataset exportado e o dashboard não citam os pulados.** `Sweep.skipped` está gravado, mas o
-  CSV/dicionário (`sweep_dataset.py`) e `GET /sweeps/dashboard` não o leem: um par pulado some do
-  dataset sem uma linha de aviso no dicionário.
-  ⚠️ **Decidido pelo Guilherme (22/09): só o dashboard.** O dataset exportado **não** precisa
-  citar os pulados; o `GET /sweeps/dashboard` e a tela dele precisam.
+* ✅ **RESOLVIDO na PR-284 (o dashboard)** — **O dataset exportado e o dashboard não citam os
+  pulados.** Decidido pelo Guilherme (22/09): **só o dashboard.** `GET /sweeps/dashboard` ganhou
+  `totals.left_out` (cada par pulado, com em quantas varreduras) e `left_out` por varredura na
+  linha do tempo; a tela lista os pares logo abaixo de "Markets · Charts". O dataset exportado
+  continua sem citá-los, **por decisão**, não por esquecimento.
 * **A lista de varreduras** (`GET /sweeps`) não diz que uma varredura tem buraco.
 * ✅ **RESOLVIDO na PR-273 (por remoção do teto)** — **Ensaio e lançamento com coleta podem discordar no teto.** `PreviewSweepRequest` não tem
   `collect_missing`, e `preview.runs` conta o lançamento **sem** coletar (o menor dos dois). Um

@@ -1526,6 +1526,36 @@ class TestTheDashboard:
         assert (timeline[again]["runs"], timeline[again]["finished"]) == (2, 2)
         assert Decimal(timeline[again]["median_return"]) == Decimal("0.02")
 
+    def test_the_dashboard_names_the_pairs_its_sweeps_left_out(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        """His call (22/09): read from each sweep's `skipped`, which the launch already records.
+        Written by hand here because what is under test is the read, not the launch's rule."""
+        entry = an_entry(client, name=f"left out {uuid.uuid4()}")
+        first = launch(client, [entry], ["EURUSD"])
+        second = launch(client, [entry], ["EURUSD"])
+        with session_factory() as session:
+            for sweep_id, pairs in (
+                (first, [("GBPUSD", "H1"), ("USDJPY", "M15")]),
+                (second, [("GBPUSD", "H1")]),
+            ):
+                row = session.get(Sweep, uuid.UUID(sweep_id))
+                assert row is not None
+                row.skipped = [
+                    {"symbol": symbol, "timeframe": timeframe, "covers": None}
+                    for symbol, timeframe in pairs
+                ]
+            session.commit()
+
+        body = client.get("/sweeps/dashboard").json()
+
+        assert body["totals"]["left_out"] == [
+            {"symbol": "GBPUSD", "timeframe": "H1", "sweeps": 2},
+            {"symbol": "USDJPY", "timeframe": "M15", "sweeps": 1},
+        ]
+        timeline = {one["id"]: one["left_out"] for one in body["sweeps"]}
+        assert timeline == {first: 2, second: 1}
+
     def test_the_dashboard_reads_no_equity_curve(
         self, client: Any, session_factory: Callable[[], Session], migrated_engine: Engine
     ) -> None:

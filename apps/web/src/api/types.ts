@@ -1203,6 +1203,15 @@ export interface DashboardTotals {
   measurements: number
   trades: number
   runs_without_trades: number
+  /** Pairs a sweep in the period asked for and skipped for having no candles, with how many
+   *  sweeps skipped each. They have no runs, so no table below can show them. */
+  left_out: DashboardLeftOut[]
+}
+
+export interface DashboardLeftOut {
+  symbol: string
+  timeframe: string
+  sweeps: number
 }
 
 /** One sweep on the timeline. Its median pools the sweep's entries. */
@@ -1214,6 +1223,8 @@ export interface DashboardSweep {
   finished: number
   winners: number
   median_return: string | null
+  /** Pairs this sweep asked for and skipped for having no candles. */
+  left_out: number
 }
 
 export interface SweepDashboard {

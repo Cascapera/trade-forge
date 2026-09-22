@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 from tradeforge_api.schemas import (
+    DashboardLeftOut,
     DashboardRatio,
     DashboardSlice,
     DashboardSweep,
@@ -84,6 +85,8 @@ class DashboardSweepRow:
     sweep_id: str
     created_at: dt.datetime
     entry_names: list[str | None]
+    skipped: tuple[tuple[str, str], ...] = ()
+    """The (symbol, timeframe) pairs the launch skipped for having no candles (`Sweep.skipped`)."""
 
 
 def distinct(runs: Iterable[DashboardRun]) -> list[DashboardRun]:
@@ -192,6 +195,22 @@ def by_timeframe(runs: Sequence[DashboardRun]) -> list[DashboardSlice]:
     return _grouped(runs, lambda run: run.timeframe, lambda run: run.timeframe)
 
 
+def left_out(sweeps: Iterable[DashboardSweepRow]) -> list[DashboardLeftOut]:
+    """Every pair some sweep skipped, with how many sweeps skipped it, by symbol then chart.
+
+    ⚠️ **Counted per sweep, not per mention.** A pair named twice in one sweep's `skipped` is still
+    one sweep that could not measure it; the number is how often the period asked and got nothing.
+    """
+    counted: dict[tuple[str, str], int] = defaultdict(int)
+    for sweep in sweeps:
+        for pair in set(sweep.skipped):
+            counted[pair] += 1
+    return [
+        DashboardLeftOut(symbol=symbol, timeframe=timeframe, sweeps=times)
+        for (symbol, timeframe), times in sorted(counted.items())
+    ]
+
+
 def totals(sweeps: Sequence[DashboardSweepRow], runs: Sequence[DashboardRun]) -> DashboardTotals:
     """What was launched (every run) beside what was measured (each measurement once)."""
     counted = dict.fromkeys(BacktestStatus, 0)
@@ -214,6 +233,7 @@ def totals(sweeps: Sequence[DashboardSweepRow], runs: Sequence[DashboardRun]) ->
         measurements=len(measured),
         trades=sum(result.total_trades for result in finished),
         runs_without_trades=sum(1 for result in finished if result.total_trades == 0),
+        left_out=left_out(sweeps),
     )
 
 
@@ -241,6 +261,7 @@ def per_sweep(
                 finished=len(returns),
                 winners=sum(1 for value in returns if value > 0),
                 median_return=median(returns),
+                left_out=len(set(sweep.skipped)),
             )
         )
     return out

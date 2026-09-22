@@ -67,6 +67,7 @@ describe('runsPerDay', () => {
       finished: runs,
       winners: 0,
       median_return: null,
+      left_out: 0,
     }
   }
 

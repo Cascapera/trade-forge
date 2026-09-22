@@ -15,6 +15,7 @@ from tradeforge_api.sweep_dashboard import (
     by_symbol,
     by_timeframe,
     distinct,
+    left_out,
     median,
     per_sweep,
     ratios,
@@ -231,9 +232,11 @@ class TestGroups:
 LAUNCH = dt.datetime(2026, 9, 15, 22, tzinfo=dt.UTC)
 
 
-def sweep_row(sweep_id: str, *names: str | None) -> DashboardSweepRow:
+def sweep_row(
+    sweep_id: str, *names: str | None, skipped: tuple[tuple[str, str], ...] = ()
+) -> DashboardSweepRow:
     return DashboardSweepRow(
-        sweep_id=sweep_id, created_at=LAUNCH, entry_names=list(names) or ["alpha"]
+        sweep_id=sweep_id, created_at=LAUNCH, entry_names=list(names) or ["alpha"], skipped=skipped
     )
 
 
@@ -304,3 +307,41 @@ class TestPerSweep:
         assert [one.median_return for one in got] == [Decimal("-0.02"), Decimal("0.02"), None]
         assert got[0].entry_names == ["beta", None]
         assert got[0].created_at == LAUNCH
+
+
+class TestLeftOut:
+    """His call (22/09): the dashboard names the pairs its sweeps skipped. They have no runs, so
+    no table can show them, and the market and chart breakdowns would otherwise read as the whole
+    space that was asked for."""
+
+    def test_each_pair_is_named_once_with_how_many_sweeps_skipped_it(self) -> None:
+        sweeps = [
+            sweep_row(S1, skipped=(("GBPUSD", "H1"), ("EURUSD", "M15"))),
+            sweep_row(S2, skipped=(("GBPUSD", "H1"),)),
+            sweep_row(S3),
+        ]
+
+        got = [(one.symbol, one.timeframe, one.sweeps) for one in left_out(sweeps)]
+
+        # By symbol, then chart — the same order the totals list their markets in.
+        assert got == [("EURUSD", "M15", 1), ("GBPUSD", "H1", 2)]
+
+    def test_a_pair_named_twice_by_one_sweep_is_one_sweep(self) -> None:
+        # The count is how often the period asked and got nothing, not how often it was written.
+        sweeps = [sweep_row(S1, skipped=(("GBPUSD", "H1"), ("GBPUSD", "H1")))]
+
+        [only] = left_out(sweeps)
+
+        assert only.sweeps == 1
+
+    def test_nothing_skipped_is_an_empty_list(self) -> None:
+        assert left_out([sweep_row(S1), sweep_row(S2)]) == []
+
+    def test_the_totals_carry_it_and_each_sweep_counts_its_own(self) -> None:
+        sweeps = [
+            sweep_row(S1, skipped=(("GBPUSD", "H1"), ("EURUSD", "M15"), ("GBPUSD", "H1"))),
+            sweep_row(S2),
+        ]
+
+        assert [one.symbol for one in totals(sweeps, []).left_out] == ["EURUSD", "GBPUSD"]
+        assert [one.left_out for one in per_sweep(sweeps, [])] == [2, 0]

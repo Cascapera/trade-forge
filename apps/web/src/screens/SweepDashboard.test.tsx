@@ -47,6 +47,7 @@ function body(over: Partial<Body> = {}): Body {
       measurements: 534,
       trades: 99737,
       runs_without_trades: 106,
+      left_out: [],
     },
     overall: slice({
       key: 'all',
@@ -77,6 +78,7 @@ function body(over: Partial<Body> = {}): Body {
         finished: 500,
         winners: 169,
         median_return: '-0.0098',
+        left_out: 0,
       },
     ],
     ...over,
@@ -171,6 +173,38 @@ describe('SweepDashboard', () => {
     expect(screen.getByText('99,737')).toBeInTheDocument()
     expect(screen.getByText('106 finished runs never traded')).toBeInTheDocument()
     expect(screen.getByText('Markets: AUDUSD, EURUSD · Charts: H4, M15')).toBeInTheDocument()
+  })
+
+  it('names the pairs the sweeps left out, and says nothing when none were', () => {
+    // His call (22/09). They have no runs, so no table can show them — the list is the only place.
+    serve(
+      body({
+        totals: {
+          ...body().totals,
+          left_out: [
+            { symbol: 'GBPUSD', timeframe: 'H1', sweeps: 2 },
+            { symbol: 'USDJPY', timeframe: 'M15', sweeps: 1 },
+          ],
+        },
+        sweeps: body().sweeps.map((one) => ({ ...one, left_out: 2 })),
+      }),
+    )
+    renderWithProviders(<SweepDashboard />)
+
+    const note = screen.getByRole('status', { name: 'left out' })
+    expect(note).toHaveTextContent('Left out — no candles in the window')
+    expect(note).toHaveTextContent('GBPUSD H1 — in 2 sweeps')
+    expect(note).toHaveTextContent('USDJPY M15 — in 1 sweep')
+    // And on the sweep that skipped them, in the timeline.
+    expect(screen.getByText(/2 pairs left out/)).toBeInTheDocument()
+  })
+
+  it('says nothing about left-out pairs when every pair ran', () => {
+    serve(body())
+    renderWithProviders(<SweepDashboard />)
+
+    expect(screen.queryByRole('status', { name: 'left out' })).not.toBeInTheDocument()
+    expect(screen.queryByText(/left out/)).not.toBeInTheDocument()
   })
 
   it('splits the finished runs into winners, flat and losers, never by colour alone', () => {

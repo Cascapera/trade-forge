@@ -2060,6 +2060,19 @@ class DashboardTotals(BaseModel):
     runs_without_trades: int
     """Finished measurements that never traded — flat by construction, not evidence of anything."""
 
+    left_out: list[DashboardLeftOut] = Field(default_factory=list)
+    """Pairs some sweep in the period asked for and skipped for having no candles (PR-269). They
+    have no runs, so no table below can show them — and without this list the market and chart
+    breakdowns read as the whole space that was asked for. His call, 22/09."""
+
+
+class DashboardLeftOut(BaseModel):
+    """One pair the period's sweeps left out, and in how many of them."""
+
+    symbol: str
+    timeframe: str
+    sweeps: int
+
 
 class DashboardSweep(BaseModel):
     """One sweep on the dashboard's timeline.
@@ -2075,6 +2088,8 @@ class DashboardSweep(BaseModel):
     finished: int
     winners: int
     median_return: Money | None
+    left_out: int = 0
+    """Pairs this sweep asked for and skipped for having no candles — its `skipped`, counted."""
 
 
 class SweepDashboardOut(BaseModel):

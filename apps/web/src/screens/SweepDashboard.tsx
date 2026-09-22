@@ -217,6 +217,13 @@ function Timeline({ sweeps }: { sweeps: DashboardSweep[] }): React.JSX.Element {
                   </td>
                   <td className="px-3 py-2">
                     {sweep.entry_names.map((name) => name ?? 'removed entry').join(', ')}
+                    {sweep.left_out > 0 && (
+                      <span className="text-amber-300">
+                        {' '}
+                        · {sweep.left_out === 1 ? '1 pair' : `${String(sweep.left_out)} pairs`} left
+                        out
+                      </span>
+                    )}
                   </td>
                   <td className="px-3 py-2 text-right tabular-nums">
                     {count(sweep.finished)}
@@ -288,6 +295,31 @@ function Report({ body }: { body: Body }): React.JSX.Element {
         <p className="text-sm text-slate-400">
           Markets: {totals.symbols.join(', ')} · Charts: {totals.timeframes.join(', ')}
         </p>
+        {/* ⚠️ **Right under the markets and charts, because those are what ran.** A pair a sweep
+            skipped has no runs, so none of the tables below can show it — and without this list
+            the market and chart breakdowns read as the whole space that was asked for. His call,
+            22/09. */}
+        {totals.left_out.length > 0 && (
+          <div
+            role="status"
+            aria-label="left out"
+            className="rounded border border-amber-800 bg-amber-950/40 p-3 text-sm text-amber-200"
+          >
+            <p>
+              Left out — no candles in the window, so no runs and no row in the tables below:
+            </p>
+            <ul className="mt-1 space-y-0.5 text-xs text-amber-200/80">
+              {totals.left_out.map((pair) => (
+                <li key={`${pair.symbol}-${pair.timeframe}`}>
+                  <span className="font-medium">
+                    {pair.symbol} {pair.timeframe}
+                  </span>{' '}
+                  — in {pair.sweeps === 1 ? '1 sweep' : `${String(pair.sweeps)} sweeps`}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
       </section>
 
       <section className="space-y-3">

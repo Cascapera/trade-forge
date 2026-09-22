@@ -2524,10 +2524,20 @@ antes, ou recusar reescrever uma partição com menos barras do que ela tinha.
   documento pelo validador do DSL (o da varredura, duas vezes por documento). Em 3168 pontos é
   rápido; em 10^5 o "enquanto você digita" fica lento e prende uma thread do servidor. Sem teto, o
   custo do ensaio cresce com a grade — candidatos: validar uma vez por (entrada, chart) e contar.
-* **O tempo não aparece na tela.** A decisão foi "tempo se mostra, não recusa": falta a estimativa
-  (runs x segundos medidos por run, por chart/janela) ao lado do número de backtests.
-  ⚠️ **Decidido pelo Guilherme (22/09): estimar as duas coisas**, o tempo da **coleta** (o que
-  falta baixar) e o dos **backtests**, cada um com o seu número.
+* ✅ **RESOLVIDO na PR-285** — **O tempo não aparece na tela.** Decidido pelo Guilherme (22/09):
+  estimar as duas coisas, cada uma com o seu número. **Medido do próprio banco, nunca escrito em
+  constante** (`estimates.py`): backtest = mediana de segundos por barra de calendário dos últimos
+  200 runs terminados × as barras pedidas; coleta = mediana de segundos por ano das últimas 200
+  coletas bem-sucedidas, **por time frame** (a geral como reserva) × os anos planejados. Somados,
+  porque as duas filas são seriais. Sem histórico, a tela diz que não há estimativa em vez de zero.
+  Aparece no ensaio da varredura (`backtest_time`) e no painel "faltam dados" (`time` por par do
+  `POST /collections/plan`, e o total).
+  * **Fica de fora: o estudo.** O `/studies/preview` não recebe a janela (`PreviewStudyRequest` não
+    tem datas), então não há barras para multiplicar. Vale a mesma função (`backtests_time`) no dia
+    em que o ensaio do estudo souber a janela — a tela de lançamento do estudo já a tem.
+  * **Uma mediana para todos os setups.** A estrutura custa mais por barra que um MME9; uma taxa
+    por tipo de setup seria mais justa, e exige saber o tipo de cada run medido (está no documento
+    da estratégia, não numa coluna).
 * ✅ **RESOLVIDO na PR-274** — **O estudo recusa em vez de podar** combinações inválidas: agora
   descarta e nomeia, como a varredura.
 

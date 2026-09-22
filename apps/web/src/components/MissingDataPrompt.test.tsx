@@ -14,6 +14,7 @@ const MISSING: PlannedCollection[] = [
     in_window: false,
     windows: [{ date_from: '2024-01-01T00:00:00Z', date_to: '2024-12-31T23:59:59.999999Z' }],
     at_broker: true,
+    time: null,
   },
 ]
 
@@ -54,6 +55,24 @@ describe('MissingDataPrompt', () => {
     expect(screen.getByRole('region', { name: 'missing data' })).toHaveTextContent(
       'GBPUSD H1 — never collected; would fetch 2024',
     )
+  })
+
+  it('says how long collecting would take, or that nothing here can say yet', () => {
+    // His call (22/09): the download's time, apart from the runs' time.
+    const [first] = MISSING
+    if (first === undefined) throw new Error('MISSING has a pair')
+    show(gate({ missing: [{ ...first, time: { seconds: 45 * 60, based_on: 6 } }] }))
+    expect(screen.getByText('Collecting all of it: about 45 min, one download after another.'))
+      .toBeInTheDocument()
+  })
+
+  it('says there is no estimate rather than printing a zero', () => {
+    show(gate({}))
+    expect(
+      screen.getByText(
+        'No download has finished here yet, so there is no estimate of how long collecting takes.',
+      ),
+    ).toBeInTheDocument()
   })
 
   it('withdraws collecting when the broker lists none of the missing pairs', () => {

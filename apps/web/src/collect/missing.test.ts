@@ -1,6 +1,6 @@
 import type { PlannedCollection } from '../api/types'
 
-import { anythingToCollect, anythingToRun, missingLine, pairsOf } from './missing'
+import { anythingToCollect, anythingToRun, downloadTime, missingLine, pairsOf } from './missing'
 
 const Y2019 = { date_from: '2019-01-01T00:00:00Z', date_to: '2020-12-31T23:59:59.999999Z' }
 const Y2026 = { date_from: '2026-01-01T00:00:00Z', date_to: '2026-09-17T12:00:00Z' }
@@ -20,7 +20,15 @@ function planned(
     atBroker?: boolean | null
   } = {},
 ): PlannedCollection {
-  return { symbol, timeframe, covers, windows, in_window: inWindow, at_broker: atBroker }
+  return {
+    symbol,
+    timeframe,
+    covers,
+    windows,
+    in_window: inWindow,
+    at_broker: atBroker,
+    time: null,
+  }
 }
 
 describe('missingLine', () => {
@@ -128,5 +136,36 @@ describe('anythingToCollect', () => {
   it('counts an unsynced list as collectable', () => {
     // "I do not know" is not "no": the launch still collects it.
     expect(anythingToCollect([planned('EURUSD', [Y2019], { atBroker: null })])).toBe(true)
+  })
+})
+
+describe('the time a download would take', () => {
+  function timed(symbol: string, seconds: number | null, atBroker: boolean | null = true) {
+    return {
+      ...planned(symbol, [Y2019], { atBroker }),
+      time: seconds === null ? null : { seconds, based_on: 4 },
+    }
+  }
+
+  it('is said at the end of the market’s line, and left out when there is none', () => {
+    expect(missingLine(timed('GBPUSD', 720))).toBe(
+      'GBPUSD H1 — never collected; would fetch 2019–2020, about 12 min',
+    )
+    expect(missingLine(timed('GBPUSD', null))).toBe(
+      'GBPUSD H1 — never collected; would fetch 2019–2020',
+    )
+  })
+
+  it('adds up one download after another', () => {
+    expect(downloadTime([timed('GBPUSD', 600), timed('EURUSD', 120)])).toBe(720)
+  })
+
+  it('leaves out a pair the broker does not list, since nothing would be fetched for it', () => {
+    expect(downloadTime([timed('GBPUSD', 600), timed('AAPL', null, false)])).toBe(600)
+  })
+
+  it('has no total when any pair it would fetch has no estimate', () => {
+    // A sum missing a term is smaller than the truth, and would be read as the truth.
+    expect(downloadTime([timed('GBPUSD', 600), timed('EURUSD', null)])).toBeNull()
   })
 })

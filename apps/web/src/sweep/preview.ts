@@ -10,7 +10,7 @@ import { useEffect, useState } from 'react'
 
 import { apiFailure } from '../api/failure'
 import { useSweepPreview } from '../api/hooks'
-import type { GridRefusal, SweepEntryPreview, UncoveredMarket } from '../api/types'
+import type { GridRefusal, SweepEntryPreview, TimeEstimate, UncoveredMarket } from '../api/types'
 
 import { toPreviewRequest, type SweepForm } from './settings'
 
@@ -42,6 +42,8 @@ export interface SweepRehearsal {
    * twice, once as a list and once as a sentence. An unknown entry is not here — that is a 404.
    */
   error: string | null
+  /** How long the runs would take one after another, or null with nothing to measure by. */
+  backtestTime: TimeEstimate | null
   /**
    * Why the question itself could not be answered — the request failed — or null.
    *
@@ -69,6 +71,7 @@ const NOTHING: Omit<SweepRehearsal, 'settled' | 'asking' | 'failure'> = {
   refusals: [],
   uncovered: [],
   error: null,
+  backtestTime: null,
 }
 
 /**
@@ -128,6 +131,7 @@ export function useSweepRehearsal(form: SweepForm): SweepRehearsal {
     ),
     uncovered: preview.uncovered,
     error: preview.error,
+    backtestTime: preview.backtest_time,
     failure: null,
     settled,
     asking: query.isFetching,

@@ -92,3 +92,21 @@ export function duration(iso: string | null): string {
     .map(([value, unit]) => `${String(value)}${unit}`)
     .join(' ')
 }
+
+/**
+ * A wait, said the way a person plans around it: `under a minute`, `about 12 min`,
+ * `about 3 h 20 min`, `about 2 days`. ⚠️ Rounded on purpose — the estimate it prints is a median
+ * rate multiplied out, and `about 3 h 20 min` claims precision enough; `3 h 19 min 42 s` would
+ * claim a measurement nobody made.
+ */
+export function roughly(seconds: number): string {
+  if (seconds < 60) return 'under a minute'
+  const minutes = Math.round(seconds / 60)
+  if (minutes < 60) return `about ${String(minutes)} min`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 48) {
+    const rest = minutes - hours * 60
+    return rest === 0 ? `about ${String(hours)} h` : `about ${String(hours)} h ${String(rest)} min`
+  }
+  return `about ${String(Math.round(hours / 24))} days`
+}

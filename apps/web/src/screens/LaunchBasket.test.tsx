@@ -222,6 +222,7 @@ describe('LaunchBasket when data is missing', () => {
         covers: null,
         in_window: false,
         windows: [{ date_from: '2024-01-01T00:00:00Z', date_to: '2024-12-31T23:59:59.999999Z' }],
+        time: null,
       },
     ]
     chosen()
@@ -263,6 +264,7 @@ describe('LaunchBasket when data is missing', () => {
         covers: null,
         in_window: false,
         windows: [{ date_from: '2024-01-01T00:00:00Z', date_to: '2024-12-31T23:59:59.999999Z' }],
+        time: null,
       },
     ]
     chosen()
@@ -281,6 +283,7 @@ describe('LaunchBasket when data is missing', () => {
         covers: null,
         in_window: false,
         windows: [{ date_from: '2024-01-01T00:00:00Z', date_to: '2024-12-31T23:59:59.999999Z' }],
+        time: null,
       },
     ]
     chosen()
@@ -301,6 +304,7 @@ describe('LaunchBasket when data is missing', () => {
         covers: null,
         in_window: false,
         windows: [{ date_from: '2024-01-01T00:00:00Z', date_to: '2024-12-31T23:59:59.999999Z' }],
+        time: null,
       },
     ]
     chosen()

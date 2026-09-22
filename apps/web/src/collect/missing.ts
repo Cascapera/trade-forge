@@ -6,6 +6,7 @@
 // collecting. No React, so both launch screens say the same thing.
 
 import type { PlannedCollection } from '../api/types'
+import { roughly } from '../format'
 
 function year(iso: string): string {
   return iso.slice(0, 4)
@@ -26,7 +27,26 @@ export function missingLine(market: PlannedCollection): string {
     return `${market.symbol} ${market.timeframe} — ${held}; not listed by the broker, cannot be collected`
   }
   const fetched = market.windows.map((w) => years(w.date_from, w.date_to)).join(', ')
-  return `${market.symbol} ${market.timeframe} — ${held}; would fetch ${fetched}`
+  const wait = market.time === null ? '' : `, ${roughly(market.time.seconds)}`
+  return `${market.symbol} ${market.timeframe} — ${held}; would fetch ${fetched}${wait}`
+}
+
+/**
+ * How long "Collect and run" would spend downloading, one pair after another — the host agent
+ * takes one at a time. Only the pairs it would actually fetch count (`at_broker !== false`).
+ *
+ * `null` when any of those has no estimate: a sum missing a term is a smaller number than the
+ * truth, and "about 5 min" said over a download nobody could measure would be the one number on
+ * the screen that is wrong without looking it.
+ */
+export function downloadTime(plan: readonly PlannedCollection[]): number | null {
+  let total = 0
+  for (const market of plan) {
+    if (market.at_broker === false) continue
+    if (market.time === null) return null
+    total += market.time.seconds
+  }
+  return total
 }
 
 /**

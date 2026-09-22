@@ -1500,6 +1500,10 @@ class PlannedCollection(BaseModel):
     windows: list[PlannedWindow]
     """⚠️ Possibly wider than the request: a window always reaches the data already on disk,
     so the index never has to describe a hole it cannot represent (`collection_plan`)."""
+    time: TimeEstimate | None = None
+    """How long these windows would take to download, or `None` with no finished download to
+    measure by (his call, 22/09). Set by `POST /collections/plan`, which is what a screen asks
+    before collecting; the launch's own use of the plan has nothing to show it to."""
     at_broker: bool | None = None
     """Whether the broker's symbol list names this symbol — **three answers, not two**.
 
@@ -1837,6 +1841,19 @@ class SweepEntryPreview(BaseModel):
     coarser than H4` says nothing about which shelf label caused it."""
 
 
+class TimeEstimate(BaseModel):
+    """How long something is expected to take, and what the expectation rests on (`estimates`).
+
+    ⚠️ **An order of magnitude, not a promise** — a median rate over this installation's own
+    history, multiplied out. `based_on` is how many past runs or downloads the rate is the median
+    of: a screen shows it, because an estimate from three is a smaller claim than one from two
+    hundred.
+    """
+
+    seconds: float
+    based_on: int
+
+
 class UncoveredMarket(BaseModel):
     """One (symbol, timeframe) with no candles inside the requested window."""
 
@@ -1865,6 +1882,10 @@ class SweepPreview(BaseModel):
     uncovered: list[UncoveredMarket]
     """Markets and charts with no data in this window — skipped by the launch and named, unless
     it is told to collect them (his rule, 18/09). Kept on the sweep as `SweepOut.skipped`."""
+    backtest_time: TimeEstimate | None = None
+    """How long `runs` would take one after another, or `None` with no finished run to measure by.
+    His call (22/09): shown beside the count, never used to refuse it. ⚠️ For the runs counted
+    here, so like `runs` it leaves out the uncovered pairs a launch told to collect would add."""
     error: str | None = None
     """Set when the sweep cannot be launched at all — a grid that leads nowhere, nothing
     runnable, every pair without data. Never for its size (no cap since 18/09). A different kind

@@ -7,6 +7,7 @@ import { useMissingDataGate } from '../collect/gate'
 import { anythingToRun, pairsOf } from '../collect/missing'
 import { MissingDataPrompt } from '../components/MissingDataPrompt'
 import { SymbolPicker } from '../components/SymbolPicker'
+import { roughly } from '../format'
 import { TIMEFRAMES } from '../strategy/builder'
 import { useSweepRehearsal } from '../sweep/preview'
 import {
@@ -299,6 +300,15 @@ export function LaunchSweep(): React.JSX.Element {
                 ? 'Nothing to run yet.'
                 : `${String(total)} backtest${total === 1 ? '' : 's'}.`}
           </p>
+          {/* His call (22/09): the time beside the count, never in place of it. Only once the
+              rehearsal is about this very sweep — a stale estimate would time a different one. */}
+          {total !== null && total > 0 && !stale && (
+            <p className="text-xs text-slate-400">
+              {rehearsal.backtestTime === null
+                ? 'No run has finished here yet, so there is no estimate of how long this takes.'
+                : `${roughly(rehearsal.backtestTime.seconds)} to run, one after another — measured on the last ${String(rehearsal.backtestTime.based_on)} finished run${rehearsal.backtestTime.based_on === 1 ? '' : 's'}.`}
+            </p>
+          )}
           {rehearsal.asking && <p className="text-xs text-slate-500">Checking…</p>}
         </div>
 

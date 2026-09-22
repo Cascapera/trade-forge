@@ -38,9 +38,9 @@ function show(chosen: AxisOption | undefined, initial = ''): { line: () => strin
 
 describe('an axis over a set of names', () => {
   it('offers exactly the values the schema declares, and nothing written here', () => {
-    // ⚠️ `side` is `long | short` because the Pydantic model says so. A hand-written pair here
-    // would be a second copy of the DSL, and the day a third side exists this test would still
-    // pass while the form offered two.
+    // ⚠️ `side` is `long | short | both` because the Pydantic model says so. A hand-written list
+    // here would be a second copy of the DSL — and the third side arrived on 22/09 (`both`, his
+    // request of 18/09), which is exactly the day a hand-written pair would have kept passing.
     const side = option('mme9_breakout', 'side')
     show(side)
 
@@ -48,6 +48,7 @@ describe('an axis over a set of names', () => {
     expect(screen.getAllByRole('checkbox').map((box) => box.getAttribute('aria-label'))).toEqual([
       `${LABEL} long`,
       `${LABEL} short`,
+      `${LABEL} both`,
     ])
   })
 

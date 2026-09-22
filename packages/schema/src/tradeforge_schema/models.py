@@ -72,11 +72,10 @@ INDICATOR_ID_PATTERN = r"^[a-z_][a-z0-9_]*$"
 type Timeframe = Literal["M1", "M5", "M15", "M30", "H1", "H4", "D1", "W1"]
 type PriceSource = Literal["open", "high", "low", "close"]
 
-# A directional setup trades one side; the two-sided version is two of them. The structure
-# family reads `TradeSide` instead — see below.
-type SetupSide = Literal["long", "short"]
 # Which sides a setup may trade, "both" included — his request of 18/09 for every setup. The
-# structure family reads it as a filter on the zones it would otherwise arm on either side.
+# structure family reads it as a filter on the zones it would otherwise arm on either side. The
+# swing family (the MME9 setups and the Ponto Contínuo) is written for one side, so there "both"
+# is two of them over one account, one position at a time (`BothSides` in the engine).
 type TradeSide = Literal["long", "short", "both"]
 type ZoneEntryPoint = Literal[
     "edge",
@@ -563,7 +562,7 @@ class Mme9BreakoutParams(_Node):
     setup desconfigurar"*), and an open trade is conducted exactly as before.
     """
 
-    side: SetupSide
+    side: TradeSide
     period: Annotated[int, Field(ge=AVERAGE_FLOOR, le=1000)] = 9
     stop_buffer_ticks: Annotated[int, Field(ge=0, le=10_000)] = 0
     breakeven_at_r: Annotated[float | None, Field(gt=0, le=100)] = 2.0
@@ -601,7 +600,7 @@ class Mme9TurnParams(_Node):
     the author's grafts onto his own setups, and this one is here to say what the book says.
     """
 
-    side: SetupSide
+    side: TradeSide
     period: Annotated[int, Field(ge=AVERAGE_FLOOR, le=1000)] = 9
     stop_buffer_ticks: Annotated[int, Field(ge=0, le=10_000)] = 0
     breakeven_at_r: Annotated[float | None, Field(gt=0, le=100)] = None
@@ -629,7 +628,7 @@ class Mme9FailedTurnParams(_Node):
     `breakeven_at_r` defaults to `null` — off — like the rest of the published family.
     """
 
-    side: SetupSide
+    side: TradeSide
     period: Annotated[int, Field(ge=AVERAGE_FLOOR, le=1000)] = 9
     stop_buffer_ticks: Annotated[int, Field(ge=0, le=10_000)] = 0
     breakeven_at_r: Annotated[float | None, Field(gt=0, le=100)] = None
@@ -665,7 +664,7 @@ class Mme9PullbackParams(_Node):
     the source names an entry and a protective stop and nothing about moving one.
     """
 
-    side: SetupSide
+    side: TradeSide
     corrections: Annotated[int, Field(ge=1, le=2)] = 1
     period: Annotated[int, Field(ge=AVERAGE_FLOOR, le=1000)] = 9
     stop_buffer_ticks: Annotated[int, Field(ge=0, le=10_000)] = 0
@@ -708,7 +707,7 @@ class PontoContinuoParams(_Node):
     about direction. His answer named an exponential one for it.
     """
 
-    side: SetupSide
+    side: TradeSide
     period: Annotated[int, Field(ge=AVERAGE_FLOOR, le=1000)] = 20
     average: AverageKind = "EMA"
     stop_buffer_ticks: Annotated[int, Field(ge=0, le=10_000)] = 0

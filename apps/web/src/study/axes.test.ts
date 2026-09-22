@@ -64,8 +64,8 @@ describe('axesFor', () => {
   it('lists the choices for a parameter that has them', () => {
     const [side] = axesFor('mme9_breakout').filter((axis) => axis.path === 'setup.params.side')
 
-    expect(side?.hint).toMatch(/one or more of long, short/)
-    expect(side?.example).toBe('long, short')
+    expect(side?.hint).toMatch(/one or more of long, short, both/)
+    expect(side?.example).toBe('long, short, both')
   })
 
   it('says true and false for a flag', () => {

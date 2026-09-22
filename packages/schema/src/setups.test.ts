@@ -107,7 +107,9 @@ describe('the parameters a form has to treat specially', () => {
       required: true,
       default: null,
       nullable: false,
-      options: ['long', 'short'],
+      // `both` since 22/09: his request of 18/09 reaching the swing setups, as two halves over one
+      // account. Still required and still without a default, for the reason above.
+      options: ['long', 'short', 'both'],
     })
   })
 

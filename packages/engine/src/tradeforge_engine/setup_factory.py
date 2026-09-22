@@ -19,7 +19,8 @@ and the one that silently disagrees.
 """
 
 import datetime as dt
-from collections.abc import Mapping
+import inspect
+from collections.abc import Callable, Mapping
 from decimal import Decimal
 from enum import StrEnum
 from typing import Any
@@ -36,6 +37,7 @@ from tradeforge_engine.setups import (
     ZoneEntryPoint,
 )
 from tradeforge_engine.swing import (
+    BothSides,
     Mme9BreakoutStrategy,
     Mme9FailedTurnStrategy,
     Mme9PullbackStrategy,
@@ -44,6 +46,15 @@ from tradeforge_engine.swing import (
 )
 
 _SIDES: Mapping[str, Side] = {"long": Side.LONG, "short": Side.SHORT}
+
+# The setups written for one side, which `both` composes out of two instances (`_one_or_both`).
+type _Swing = (
+    Mme9BreakoutStrategy
+    | Mme9FailedTurnStrategy
+    | Mme9PullbackStrategy
+    | Mme9TurnStrategy
+    | PontoContinuoStrategy
+)
 
 
 def _params(node: Mapping[str, object]) -> Mapping[str, object]:
@@ -57,7 +68,7 @@ def _side(params: Mapping[str, object]) -> Side:
     raw = params.get("side")
     side = _SIDES.get(raw) if isinstance(raw, str) else None
     if side is None:
-        raise EngineError(f"setup side must be 'long' or 'short', got {raw!r}")
+        raise EngineError(f"setup side must be 'long', 'short' or 'both', got {raw!r}")
     return side
 
 
@@ -196,8 +207,30 @@ def _optional_hours(params: Mapping[str, object], key: str, into: dict[str, Any]
     into[key] = dt.timedelta(hours=hours)
 
 
+def _one_or_both(
+    build: Callable[..., _Swing], params: Mapping[str, object], kwargs: dict[str, Any]
+) -> Strategy:
+    """One side of a swing setup, or both of them behind `BothSides` (his request of 18/09).
+
+    ⚠️ **Each half gets its own name**, the class's own default with the side after it
+    (`mme9-long`, `mme9-short`). Order names are `name-time-count`, and two halves sharing a name
+    could mint the same one on the same bar — the broker would answer the second with silence
+    (`BothSides`, point 3). The base is read off the class's signature rather than written here,
+    for the rule in this module's docstring: a copy of a default kept beside the class is the one
+    that silently disagrees. A document naming one side keeps the class's name untouched, so every
+    run saved before 18/09 still names its orders exactly as it did.
+    """
+    if params.get("side") != "both":
+        return build(side=_side(params), **kwargs)
+    base = inspect.signature(build).parameters["name"].default
+    return BothSides(
+        long=build(side=Side.LONG, name=f"{base}-long", **kwargs),
+        short=build(side=Side.SHORT, name=f"{base}-short", **kwargs),
+    )
+
+
 def _mme9(params: Mapping[str, object], _timeframe: dt.timedelta | None) -> Strategy:
-    kwargs: dict[str, Any] = {"side": _side(params)}
+    kwargs: dict[str, Any] = {}
     _int(params, "period", kwargs)
     _int(params, "stop_buffer_ticks", kwargs)
     _optional_decimal(params, "breakeven_at_r", kwargs)
@@ -205,36 +238,36 @@ def _mme9(params: Mapping[str, object], _timeframe: dt.timedelta | None) -> Stra
     _choice(params, "gift_stop", GiftStop, kwargs)
     _flag(params, "volume_filter", kwargs)
     _optional_int(params, "long_average_period", kwargs)
-    return Mme9BreakoutStrategy(**kwargs)
+    return _one_or_both(Mme9BreakoutStrategy, params, kwargs)
 
 
 def _mme9_turn(params: Mapping[str, object], _timeframe: dt.timedelta | None) -> Strategy:
-    kwargs: dict[str, Any] = {"side": _side(params)}
+    kwargs: dict[str, Any] = {}
     _int(params, "period", kwargs)
     _int(params, "stop_buffer_ticks", kwargs)
     _optional_decimal(params, "breakeven_at_r", kwargs)
-    return Mme9TurnStrategy(**kwargs)
+    return _one_or_both(Mme9TurnStrategy, params, kwargs)
 
 
 def _mme9_failed_turn(params: Mapping[str, object], _timeframe: dt.timedelta | None) -> Strategy:
-    kwargs: dict[str, Any] = {"side": _side(params)}
+    kwargs: dict[str, Any] = {}
     _int(params, "period", kwargs)
     _int(params, "stop_buffer_ticks", kwargs)
     _optional_decimal(params, "breakeven_at_r", kwargs)
-    return Mme9FailedTurnStrategy(**kwargs)
+    return _one_or_both(Mme9FailedTurnStrategy, params, kwargs)
 
 
 def _mme9_pullback(params: Mapping[str, object], _timeframe: dt.timedelta | None) -> Strategy:
-    kwargs: dict[str, Any] = {"side": _side(params)}
+    kwargs: dict[str, Any] = {}
     _int(params, "corrections", kwargs)
     _int(params, "period", kwargs)
     _int(params, "stop_buffer_ticks", kwargs)
     _optional_decimal(params, "breakeven_at_r", kwargs)
-    return Mme9PullbackStrategy(**kwargs)
+    return _one_or_both(Mme9PullbackStrategy, params, kwargs)
 
 
 def _ponto_continuo(params: Mapping[str, object], _timeframe: dt.timedelta | None) -> Strategy:
-    kwargs: dict[str, Any] = {"side": _side(params)}
+    kwargs: dict[str, Any] = {}
     _int(params, "period", kwargs)
     _int(params, "stop_buffer_ticks", kwargs)
     _optional_decimal(params, "breakeven_at_r", kwargs)
@@ -247,7 +280,7 @@ def _ponto_continuo(params: Mapping[str, object], _timeframe: dt.timedelta | Non
         if average not in ("EMA", "SMA"):
             raise EngineError(f"setup average must be 'EMA' or 'SMA', got {average!r}")
         kwargs["average"] = average
-    return PontoContinuoStrategy(**kwargs)
+    return _one_or_both(PontoContinuoStrategy, params, kwargs)
 
 
 def _structure_kwargs(

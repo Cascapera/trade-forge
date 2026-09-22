@@ -70,7 +70,7 @@ from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Final, Literal
+from typing import Final, Literal, Protocol, cast
 
 from tradeforge_engine.average_setups import AverageEntryPoint, PatternOrder, PatternWatch
 from tradeforge_engine.bar_setups import GiftStop
@@ -89,7 +89,7 @@ from tradeforge_engine.domain import (
     SnapshotSeries,
 )
 from tradeforge_engine.indicators import EMA, SMA
-from tradeforge_engine.protocols import Indicator
+from tradeforge_engine.protocols import Indicator, Strategy
 from tradeforge_engine.structure import MarketStructure, StructureBreak
 
 logger = logging.getLogger(__name__)
@@ -1953,3 +1953,128 @@ class PontoContinuoStrategy:
 
     def _withdraw(self, armed: _Armed, candle: Candle) -> Signal:
         return _withdraw(armed, candle, side=self._side, name=self._name)
+
+
+class _OneSide(Strategy, Protocol):
+    """What `BothSides` needs from each half: a strategy that also names the curves it reads.
+
+    Every setup in this module is one. Declared rather than assumed so a half that cannot chart
+    is refused by the type checker, not discovered by a price chart that draws nothing.
+    """
+
+    def overlays(self) -> Mapping[str, Indicator]: ...
+
+
+class BothSides:
+    """A long and a short of the same setup over one account, one position at a time.
+
+    His request of 18/09 — *"somente comprado, somente vendido e ambos"* — for the setups in this
+    module. Each of them is written for **one** side, and "both" is not a sixth machine: it is the
+    long instance and the short instance of the same class, fed the same bars, with this class
+    standing between them and the account. Rewriting five state machines to hold two sides each
+    would double their state and touch the most-tested code in the engine; composing them leaves
+    every one exactly as it is, so a document naming `long` or `short` runs byte for byte as before.
+
+    **What goes wrong without a referee, and why this class exists.** Each half reads
+    `context.position` as *its own* trade, and in three places that stops being true:
+
+    1. **The fill.** `_observe_fill` takes an open position as the fallback sign that the armed
+       order filled (ADR-0015), and forgets the order. When the position is the *other* half's,
+       the order was never filled — it is still resting at the broker, owned by nobody, and it
+       would fill the moment the account is flat again, into a trade no half conducts.
+    2. **The conduction.** `_conduct` measures the position with the half's own side. The short
+       half would compute a breakeven and a trail for a long trade, mirrored — and `tighten` does
+       not check, because inside one half the question could never arise.
+    3. **The names.** Order names are `name-time-count`. Two halves with one name can mint the same
+       name on the same bar, and the broker answers the second with silence (`_consumed`). The
+       factory gives each half its own name; this class only relies on it.
+
+    So the rules, each answering one of those:
+
+    * **Every bar reaches both halves**, position or not. The averages have to see every bar —
+      one fed only on the bars that reached it is a different average (`_AverageTrail`).
+    * **The half whose side the position is not has its order withdrawn, here.** That half has
+      just forgotten it (point 1), and this class is the one place that still knows the name. This
+      is his rule, confirmed on 22/09: when one side fills, the other side's order is cancelled and
+      does **not** come back when the trade ends — the half needs a new setup, exactly as it would
+      after losing its turn to a trade of its own. The Ponto Contínuo even burns its two
+      corrections, which its `_observe_fill` docstring predicted for this very composition.
+    * **A stop the other half asks to move is dropped.** It is a conduction of somebody else's
+      trade (point 2). The half that owns the position conducts it, as it always has.
+    * **Nothing arms beside an open trade**, and nothing here has to say so: every half already
+      refuses to arm while `context.position` is set. That is the "one position at a time" rule,
+      and it stays where it already lives.
+
+    ⚠️ **A trade that opens and closes inside one bar leaves the other half's order resting.** The
+    position is gone by the time the context is built, so the other half never sees it and never
+    forgets its order — and this class does not withdraw one its owner still believes in. That is
+    deliberate: withdrawing it here would leave the half believing in an order the broker no longer
+    holds, which is the phantom ADR-0023 measured, in the opposite direction. One position at a time
+    still holds, because the account is flat again when that order can fill.
+
+    ⚠️ **Measured on 22/09: with today's five setups, the withdrawal and the dropped stop never
+    fire.** Driven over 12 000 random bars per setup and entry point (about 5 000 trades), not once
+    were both halves armed together, and not once did a half ask to move a stop on the other's
+    trade. The reason is the setups', not this class's: each withdraws its order on the close
+    that crosses back over its average — which is the same close that lets the other side arm —
+    and a stop asked for from the wrong side is never tighter than the one in force, so `tighten`
+    stays silent. The two rules are kept for the day that stops being true (a filter that arms
+    without the cross, a sixth setup), and `test_both_sides.py` drives them with scripted halves
+    because the real ones cannot reach them. What does carry weight today is the other two lines:
+    every bar to both halves, and one name per half.
+
+    The names this class tracks are the ones each half **sent**, not the ones the broker holds. A
+    name the risk manager vetoed is still in the set, and withdrawing it later costs one `cancel`
+    answered `False` — harmless by the broker's own contract (`_withdraw`).
+    """
+
+    def __init__(self, *, long: _OneSide, short: _OneSide) -> None:
+        if long is short:
+            raise ValueError("the two sides must be two instances; one object cannot hold both")
+        self._halves: tuple[tuple[Side, _OneSide], ...] = ((Side.LONG, long), (Side.SHORT, short))
+        self._resting: dict[Side, set[str]] = {Side.LONG: set(), Side.SHORT: set()}
+
+    def overlays(self) -> Mapping[str, Indicator]:
+        """The long half's averages — see `protocols.Charted`.
+
+        Either half would do, and neither can be merged with the other: both are built from one
+        document, so they read the same averages under the same labels, and a chart drawing both
+        would draw every curve twice on top of itself.
+        """
+        return self._halves[0][1].overlays()
+
+    def on_bar(self, context: Context) -> tuple[Signal, ...]:
+        position = context.position
+        filled = {fill.order.client_id for fill in context.fills}
+        signals: list[Signal] = []
+        for side, half in self._halves:
+            resting = self._resting[side]
+            resting -= filled
+            for signal in half.on_bar(context):
+                if signal.kind is SignalKind.ENTRY:
+                    resting.add(cast(str, signal.client_id))
+                elif signal.kind is SignalKind.CANCEL:
+                    resting.discard(cast(str, signal.client_id))
+                elif position is None or position.side is not side:
+                    # A stop move (or an exit) for a trade this half does not own — point 2 above.
+                    logger.debug("%s half: dropped %s, not its trade", side, signal.kind)
+                    continue
+                signals.append(signal)
+            if position is None:
+                continue
+            # With a position open, every half has forgotten whatever it had armed
+            # (`_observe_fill`). The owner's order *is* the position; the other half's is still at
+            # the broker, and nobody but this class remembers its name.
+            if position.side is not side:
+                signals.extend(
+                    Signal(
+                        kind=SignalKind.CANCEL,
+                        side=side,
+                        reference_price=context.candle.close,
+                        reason="cancel.other-side-filled",
+                        client_id=client_id,
+                    )
+                    for client_id in sorted(resting)
+                )
+            resting.clear()
+        return tuple(signals)

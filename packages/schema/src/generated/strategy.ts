@@ -257,7 +257,7 @@ export type Setup =
 export type BreakevenAtR = number | null;
 export type LongAveragePeriod = number | null;
 export type Period3 = number;
-export type SetupSide = "long" | "short";
+export type TradeSide = "long" | "short" | "both";
 export type StopBufferTicks = number;
 export type VolumeFilter = boolean;
 export type Type11 = "mme9_breakout";
@@ -597,7 +597,7 @@ export interface Mme9BreakoutParams {
   gift_stop?: "gift" | "forca";
   long_average_period?: LongAveragePeriod;
   period?: Period3;
-  side: SetupSide;
+  side: TradeSide;
   stop_buffer_ticks?: StopBufferTicks;
   volume_filter?: VolumeFilter;
 }
@@ -624,7 +624,7 @@ export interface Mme9FailedTurnSetup {
 export interface Mme9FailedTurnParams {
   breakeven_at_r?: BreakevenAtR1;
   period?: Period4;
-  side: SetupSide;
+  side: TradeSide;
   stop_buffer_ticks?: StopBufferTicks1;
 }
 export interface Mme9PullbackSetup {
@@ -659,7 +659,7 @@ export interface Mme9PullbackParams {
   breakeven_at_r?: BreakevenAtR2;
   corrections?: Corrections;
   period?: Period5;
-  side: SetupSide;
+  side: TradeSide;
   stop_buffer_ticks?: StopBufferTicks2;
 }
 export interface Mme9TurnSetup {
@@ -691,7 +691,7 @@ export interface Mme9TurnSetup {
 export interface Mme9TurnParams {
   breakeven_at_r?: BreakevenAtR3;
   period?: Period6;
-  side: SetupSide;
+  side: TradeSide;
   stop_buffer_ticks?: StopBufferTicks3;
 }
 export interface PontoContinuoSetup {
@@ -735,7 +735,7 @@ export interface PontoContinuoParams {
   gift_stop?: "gift" | "forca";
   long_average_period?: LongAveragePeriod1;
   period?: Period7;
-  side: SetupSide;
+  side: TradeSide;
   stop_buffer_ticks?: StopBufferTicks4;
   volume_filter?: VolumeFilter1;
 }

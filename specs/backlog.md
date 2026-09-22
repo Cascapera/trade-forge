@@ -2548,3 +2548,14 @@ dela guardadas. Consertos candidatos: grupo criado em `$` **antes** do aquecimen
 era não perder fill durante o aquecimento — criar cedo em `$` resolve os dois), ou ler em laço até
 esgotar, e aparar o stream (`MAXLEN`/`MINID`). O teste precisa de um stream próprio ou de um Redis
 limpo, senão volta a depender de quantas vezes a suíte já rodou nesta máquina.
+
+## `BothSides`: o cancel do outro lado chega um bar depois (achado na revisão da PR-282)
+
+Com `side: both` nos setups swing, quando um lado executa no bar K a ordem do outro lado é
+cancelada no **fechamento** de K e só sai do livro em K+1. Se os dois lados estivessem armados
+juntos, a ordem do outro lado ainda poderia executar dentro de K — o broker recusa a segunda
+entrada com posição aberta, mas o caso nunca foi exercitado ponta a ponta. **Hoje é inalcançável:**
+medido em 22/09, com ~5 000 trades aleatórios nos cinco setups, os dois lados nunca ficaram armados
+ao mesmo tempo (o fechamento que desarma um é o que arma o outro). Volta a importar no dia em que um
+filtro ou um setup novo armar sem o cruzamento da média — aí vale um teste com a `BacktestBroker`
+real e as duas metades armadas.

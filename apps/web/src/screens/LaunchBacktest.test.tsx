@@ -189,6 +189,7 @@ describe('LaunchBacktest when data is missing', () => {
       covers: '2023-03-01 to 2026-09-10',
       in_window: true,
       windows: [{ date_from: '2023-01-01T00:00:00Z', date_to: '2023-12-31T23:59:59.999999Z' }],
+      time: null,
     },
   ]
 
@@ -278,6 +279,7 @@ describe('LaunchBacktest when data is missing', () => {
         covers: null,
         in_window: false,
         windows: [{ date_from: '2024-01-01T00:00:00Z', date_to: '2024-12-31T23:59:59.999999Z' }],
+        time: null,
       },
     ]
     ready()

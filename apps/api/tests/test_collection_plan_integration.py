@@ -140,6 +140,8 @@ def test_a_symbol_never_collected_is_planned_whole(client: TestClient) -> None:
             "windows": [{"date_from": year_start(2019), "date_to": year_end(2021)}],
             # No sync has ever run here: "I do not know", which is not "no".
             "at_broker": None,
+            # And no download has finished here either: no estimate rather than a zero (22/09).
+            "time": None,
         }
     ]
 
@@ -202,6 +204,7 @@ def test_the_probe_is_read_per_timeframe(
             "in_window": True,
             "windows": [{"date_from": year_start(2019), "date_to": year_end(2020)}],
             "at_broker": None,
+            "time": None,
         }
     ]
 

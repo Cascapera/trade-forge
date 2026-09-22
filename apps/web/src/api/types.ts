@@ -840,6 +840,14 @@ export interface PlannedWindow {
 }
 
 /** One (symbol, timeframe) not fully on disk. Covered pairs are left out of the answer. */
+/** How long something is expected to take, measured from this installation's own history (his
+ *  call, 22/09). ⚠️ An order of magnitude, not a promise; `based_on` is how many past runs or
+ *  downloads the rate is the median of. */
+export interface TimeEstimate {
+  seconds: number
+  based_on: number
+}
+
 export interface PlannedCollection {
   symbol: string
   timeframe: string
@@ -860,6 +868,9 @@ export interface PlannedCollection {
    *  and does not: such a pair cannot be collected — the basket and the sweep skip it, the single
    *  backtest refuses it. `null` when the list has never been synced — unknown, and still offered
    *  for collection. */
+  /** How long these windows would take to download, or `null` with no finished download to
+   *  measure by. */
+  time: TimeEstimate | null
   at_broker: boolean | null
 }
 
@@ -1081,6 +1092,9 @@ export interface SweepPreview {
    *  **every** pair without data. ⚠️ That last one is filled **beside** `uncovered` with `runs`
    *  at zero, and collecting is its fix; with `runs` above zero the error is never about data.
    *  An unknown entry never lands here: the endpoint answers that with a 404. */
+  /** How long `runs` would take one after another, or `null` with no finished run to measure
+   *  by. Shown beside the count, never used to refuse it (22/09). */
+  backtest_time: TimeEstimate | null
   error: string | null
 }
 

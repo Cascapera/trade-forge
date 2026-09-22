@@ -1,4 +1,4 @@
-import { count, duration, money, percent, ratio, sign, signedMoney } from './format'
+import { count, duration, money, percent, ratio, roughly, sign, signedMoney } from './format'
 
 describe('format', () => {
   it('renders money with two decimals and thousands separators', () => {
@@ -81,5 +81,31 @@ describe('format', () => {
     expect(duration('P')).toBe('—')
     expect(duration('2 days')).toBe('—')
     expect(duration('PT1H30')).toBe('—')
+  })
+})
+
+describe('roughly', () => {
+  it('says a short wait in words rather than as seconds', () => {
+    expect(roughly(0)).toBe('under a minute')
+    expect(roughly(59)).toBe('under a minute')
+  })
+
+  it('rounds to whole minutes under an hour', () => {
+    expect(roughly(60)).toBe('about 1 min')
+    expect(roughly(12 * 60 + 29)).toBe('about 12 min')
+    expect(roughly(12 * 60 + 31)).toBe('about 13 min')
+  })
+
+  it('says hours and minutes, and drops a zero minute', () => {
+    expect(roughly(3 * 3600 + 20 * 60)).toBe('about 3 h 20 min')
+    expect(roughly(2 * 3600)).toBe('about 2 h')
+    // 59.6 minutes rounds to the hour, and is said as one — not as "about 60 min".
+    expect(roughly(3575)).toBe('about 1 h')
+  })
+
+  it('switches to days past two of them', () => {
+    expect(roughly(47 * 3600)).toBe('about 47 h')
+    expect(roughly(48 * 3600)).toBe('about 2 days')
+    expect(roughly(5 * 86400 + 3600)).toBe('about 5 days')
   })
 })

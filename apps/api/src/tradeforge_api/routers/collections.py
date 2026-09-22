@@ -23,6 +23,7 @@ from fastapi import APIRouter, HTTPException, status
 
 from tradeforge_api.coverage import plan_for
 from tradeforge_api.deps import QueueDep, SessionDep
+from tradeforge_api.estimates import collection_rates, collection_time, planned_years
 from tradeforge_api.queue import COLLECT_QUEUE, COLLECT_RANGE
 from tradeforge_api.schemas import (
     CollectionOut,
@@ -139,14 +140,31 @@ def plan(session: SessionDep, request: PlanCollectionRequest) -> list[PlannedCol
     ⚠️ **A symbol the instruments table does not know is planned as never collected**, not
     refused: a collection is how a symbol gets into that table, so its absence is the very case
     this plan exists for. Whether the broker can classify it is `POST /collections`'s question.
+
+    Each pair carries how long its windows would take to download (`time`, his call of 22/09),
+    measured from this installation's own finished downloads (`estimates`). Added here rather than
+    in `plan_for`, which a launch also calls and which has nobody to show a duration to.
     """
-    return plan_for(
+    planned = plan_for(
         session,
         symbols=list(request.symbols),
         timeframes=list(request.timeframes),
         date_from=request.date_from,
         date_to=request.date_to,
     )
+    rates = collection_rates(session)
+    return [
+        one.model_copy(
+            update={
+                "time": collection_time(
+                    rates,
+                    one.timeframe,
+                    planned_years((window.date_from, window.date_to) for window in one.windows),
+                )
+            }
+        )
+        for one in planned
+    ]
 
 
 @router.get("/collections", response_model=list[CollectionOut])

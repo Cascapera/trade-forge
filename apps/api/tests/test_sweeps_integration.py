@@ -269,6 +269,32 @@ class TestTheProduct:
         assert preview.json()["runs"] == 12
         assert launched.json()["runs"] == 12
 
+    def test_the_preview_says_how_long_the_runs_would_take(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        """His call (22/09): the time beside the count, measured from this database's own runs."""
+        entry = an_entry(client, name=f"timed {uuid.uuid4()}")
+        body = a_sweep_body([entry], ["EURUSD"], ["H1", "M15"])
+        asked = {k: body[k] for k in ("entry_ids", "symbols", "timeframes", "date_from", "date_to")}
+
+        # Nothing has finished here yet: no estimate, rather than a zero that reads as instant.
+        assert client.post("/sweeps/preview", json=asked).json()["backtest_time"] is None
+
+        # One finished run to measure by: 100 H1 bars (the window is 100 hours) in 200 s.
+        launched = client.post("/sweeps", json=a_sweep_body([entry], ["EURUSD"], ["H1"])).json()
+        [row] = client.get(f"/sweeps/{launched['id']}").json()["runs"]
+        finish(session_factory, row["run"]["id"], 100)
+        with session_factory() as session:
+            run = session.get(Backtest, uuid.UUID(row["run"]["id"]))
+            assert run is not None
+            run.started_at = dt.datetime(2026, 9, 20, 12, tzinfo=dt.UTC)
+            run.finished_at = run.started_at + dt.timedelta(seconds=200)
+            session.commit()
+
+        # 2 s a bar; the sweep asks for 100 H1 bars and 400 M15 bars — 1000 s, on one run.
+        preview = client.post("/sweeps/preview", json=asked).json()
+        assert preview["backtest_time"] == {"seconds": 1000.0, "based_on": 1}
+
 
 class TestTheTimeframeIsRealHere:
     def test_each_timeframe_becomes_its_own_run(self, client: Any) -> None:

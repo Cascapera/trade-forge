@@ -72,11 +72,20 @@ function planned(symbol: string, timeframe: string): PlannedCollection {
     in_window: false,
     windows: [{ date_from: '2025-01-01T00:00:00Z', date_to: '2025-12-31T23:59:59.999999Z' }],
     at_broker: true,
+    time: null,
   }
 }
 
 function preview(patch: Partial<SweepPreview> = {}): SweepPreview {
-  return { runs: 2, documents: 2, entries: [], uncovered: [], error: null, ...patch }
+  return {
+    runs: 2,
+    documents: 2,
+    entries: [],
+    uncovered: [],
+    backtest_time: null,
+    error: null,
+    ...patch,
+  }
 }
 
 /**
@@ -184,6 +193,30 @@ describe('the three refusals stay apart', () => {
     expect(screen.queryByText(/cannot run and will be left out/i)).not.toBeInTheDocument()
     // And said once, as the list — not a second time as the server's sentence under it.
     expect(screen.queryByText(COVERAGE_ERROR)).not.toBeInTheDocument()
+  })
+
+  it('says how long the runs would take beside the count, measured here', async () => {
+    // His call (22/09): shown beside the count, never in place of it.
+    previewSweep.mockResolvedValue(preview({ backtest_time: { seconds: 3 * 3600, based_on: 37 } }))
+    renderWithProviders(<LaunchSweep />)
+    await fillIn()
+
+    expect(
+      await screen.findByText(
+        'about 3 h to run, one after another — measured on the last 37 finished runs.',
+      ),
+    ).toBeInTheDocument()
+  })
+
+  it('says there is no estimate yet when nothing has finished here', async () => {
+    renderWithProviders(<LaunchSweep />)
+    await fillIn()
+
+    expect(
+      await screen.findByText(
+        'No run has finished here yet, so there is no estimate of how long this takes.',
+      ),
+    ).toBeInTheDocument()
   })
 
   it('refuses a sweep with nothing runnable, in the server’s words', async () => {

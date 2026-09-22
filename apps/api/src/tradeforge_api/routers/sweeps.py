@@ -34,6 +34,7 @@ from sqlalchemy.orm import Session, defer, selectinload
 from tradeforge_api import sweep_dashboard as dashboard
 from tradeforge_api.coverage import describe, to_collect, uncovered_markets
 from tradeforge_api.deps import QueueDep, SessionDep
+from tradeforge_api.estimates import backtests_time
 from tradeforge_api.grid import GridPoint
 from tradeforge_api.queue import COLLECT_QUEUE, COLLECT_RANGE, RUN_BACKTEST
 from tradeforge_api.routers.backtests import failed_collections, list_item
@@ -257,6 +258,12 @@ def preview_sweep(request: PreviewSweepRequest, session: SessionDep) -> SweepPre
         documents=len(documents),
         entries=per_entry,
         uncovered=uncovered,
+        # Every run of a sweep reads the same window, so what varies from run to run is the
+        # chart: the bars in the window depend on the document's timeframe, not on the market.
+        backtest_time=backtests_time(
+            session,
+            ((request.date_from, request.date_to, doc.timeframe) for doc, _symbol in combinations),
+        ),
         error=error,
     )
 

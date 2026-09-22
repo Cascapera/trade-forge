@@ -1,6 +1,7 @@
 import { apiFailure } from '../api/failure'
 import type { MissingDataGate } from '../collect/gate'
-import { anythingToCollect, missingLine } from '../collect/missing'
+import { anythingToCollect, downloadTime, missingLine } from '../collect/missing'
+import { roughly } from '../format'
 
 /**
  * The prompt: what is missing, and the answers.
@@ -66,6 +67,7 @@ export function MissingDataPrompt({
     )
   }
   if (missing === null) return null
+  const download = downloadTime(missing)
 
   return (
     <section aria-label="missing data" className={panel}>
@@ -75,6 +77,14 @@ export function MissingDataPrompt({
           <li key={`${market.symbol}|${market.timeframe}`}>{missingLine(market)}</li>
         ))}
       </ul>
+      {/* His call (22/09): how long the downloads take, apart from how long the runs take. */}
+      {anythingToCollect(missing) && (
+        <p className="text-xs text-amber-200/80">
+          {download === null
+            ? 'No download has finished here yet, so there is no estimate of how long collecting takes.'
+            : `Collecting all of it: ${roughly(download)}, one download after another.`}
+        </p>
+      )}
 
       <div className="flex flex-wrap gap-3">
         {/* ⚠️ Withdrawn when every missing pair is one the broker does not list: the button would

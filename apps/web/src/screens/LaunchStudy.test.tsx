@@ -617,6 +617,7 @@ describe('LaunchStudy', () => {
       in_window: false,
       windows: [{ date_from: '2024-01-01T00:00:00Z', date_to: '2025-12-31T23:59:59.999999Z' }],
       at_broker: true,
+      time: null,
     }
 
     it('asks the plan about its one market and chart, and launches if nothing is missing', async () => {

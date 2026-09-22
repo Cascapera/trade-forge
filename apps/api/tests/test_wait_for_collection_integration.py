@@ -404,11 +404,12 @@ class TestTheWait:
         assert queue.of(RUN_BACKTEST) == [{"_defer_by": dt.timedelta(seconds=30)}]
         assert self.run_status(session_factory, waiting).status is BacktestStatus.QUEUED
 
-    def test_one_failed_collection_of_two_fails_the_run(
+    def test_one_failed_collection_of_two_still_waits_for_the_other(
         self, waiting: str, session_factory: Callable[[], Session], queue: _Queue, tmp_path: Any
     ) -> None:
-        """⚠️ A run waits for **all** of them, so one failure is the run's failure — waiting for
-        the survivor would mean running over a window whose other half never arrived."""
+        """His rule (22/09): a failed download ends *its* wait, not the run's. The sibling still
+        downloading is data the run will read, so the run goes on waiting for it — starting now
+        would throw away a download that is about to land."""
         (collection,) = waits_of(session_factory, waiting)
         with session_factory() as session:
             second = Collection(
@@ -427,15 +428,41 @@ class TestTheWait:
         queue.jobs.clear()
         work(session_factory, queue, waiting, tmp_path)
 
-        run = self.run_status(session_factory, waiting)
-        assert run.status is BacktestStatus.FAILED
-        assert run.error is not None
-        assert "the terminal said no" in run.error
-        assert queue.of(RUN_BACKTEST) == []
+        assert queue.of(RUN_BACKTEST) == [{"_defer_by": dt.timedelta(seconds=30)}]
+        assert self.run_status(session_factory, waiting).status is BacktestStatus.QUEUED
 
-    def test_a_failed_collection_fails_the_run_with_its_reason(
+    def test_a_failed_collection_lets_the_run_go_ahead_on_what_is_on_disk(
+        self,
+        waiting: str,
+        session_factory: Callable[[], Session],
+        queue: _Queue,
+        collected: Any,
+        tmp_path: Any,
+    ) -> None:
+        """His rule (22/09): the run happens anyway, over the bars that are there, and says which
+        download failed. The bars here are the first fifty hours of a two-hundred-day window —
+        a shorter measurement, which the run's own coverage already reports beside the one asked
+        for. What used to happen was a failed run and not a single metric."""
+        collected(tmp_path, "EURUSD", "H1", CANDLES)
+        (collection,) = waits_of(session_factory, waiting)
+        move(session_factory, collection, BacktestStatus.FAILED, error="the terminal said no")
+        queue.jobs.clear()
+        work(session_factory, queue, waiting, tmp_path)
+
+        run = self.run_status(session_factory, waiting)
+        assert run.status is BacktestStatus.DONE
+        assert run.error is None
+        assert queue.of(RUN_BACKTEST) == []
+        # And the link that says so stays: the failed download, with its reason, is what every
+        # screen reads the warning from (`waiting_for`, `failed_collections`).
+        [wait] = waits_of(session_factory, waiting)
+        assert (wait.status, wait.error) == (BacktestStatus.FAILED, "the terminal said no")
+
+    def test_a_failed_collection_over_an_empty_disk_fails_on_the_data(
         self, waiting: str, session_factory: Callable[[], Session], queue: _Queue, tmp_path: Any
     ) -> None:
+        """Nothing on disk and nothing coming: the run still fails, but on the data — "no candles"
+        is the true reason, and the download's failure is on the body beside it."""
         (collection,) = waits_of(session_factory, waiting)
         move(session_factory, collection, BacktestStatus.FAILED, error="the terminal said no")
         queue.jobs.clear()
@@ -444,9 +471,7 @@ class TestTheWait:
         run = self.run_status(session_factory, waiting)
         assert run.status is BacktestStatus.FAILED
         assert run.error is not None
-        assert "EURUSD H1" in run.error
-        assert "the terminal said no" in run.error
-        # Nothing is waited for any more.
+        assert "the terminal said no" not in run.error
         assert queue.of(RUN_BACKTEST) == []
 
     def test_a_finished_collection_lets_the_run_go_ahead(

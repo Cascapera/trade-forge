@@ -36,7 +36,7 @@ from tradeforge_api.coverage import describe, to_collect, uncovered_markets
 from tradeforge_api.deps import QueueDep, SessionDep
 from tradeforge_api.grid import GridPoint
 from tradeforge_api.queue import COLLECT_QUEUE, COLLECT_RANGE, RUN_BACKTEST
-from tradeforge_api.routers.backtests import list_item
+from tradeforge_api.routers.backtests import failed_collections, list_item
 from tradeforge_api.routers.strategies import refusal_of
 from tradeforge_api.routers.studies import aggregate_points, strategies_for
 from tradeforge_api.runner import ENGINE_VERSION
@@ -751,6 +751,7 @@ def get_sweep(sweep_id: uuid.UUID, session: SessionDep) -> SweepOut:
         entries=summaries,
         runs=out,
         skipped=[UncoveredMarket.model_validate(one) for one in sweep.skipped],
+        failed_collections=failed_collections(session, Backtest.sweep_id == sweep.id),
     )
 
 

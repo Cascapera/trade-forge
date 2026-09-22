@@ -30,6 +30,7 @@ from tradeforge_db.broker_symbols import BrokerSymbolEntry, replace_snapshot
 from tradeforge_db.models import (
     Backtest,
     BacktestCollection,
+    BacktestStatus,
     Basket,
     Collection,
     Dataset,
@@ -705,6 +706,29 @@ class TestCollectingWhatABasketIsMissing:
         assert self.waits(session_factory, by_symbol["EURUSD"]) == []
         (waiting,) = self.waits(session_factory, by_symbol["GBPUSD"])
         assert (waiting.symbol, waiting.timeframe) == ("GBPUSD", "H1")
+
+    def test_a_failed_download_is_named_on_the_basket_and_nothing_else_is(
+        self, client: Any, session_factory: Callable[[], Session], indexed: Callable[..., None]
+    ) -> None:
+        """His rule (22/09): the run goes ahead on what is on disk, and the basket says which
+        download failed — once, at the top, where a basket of twenty is actually read."""
+        indexed("EURUSD")
+        body = self._launch(client, ["EURUSD", "GBPUSD"], collect_missing=True).json()
+        by_symbol = {run["symbol"]: run["backtest_id"] for run in body["runs"]}
+        (download,) = self.waits(session_factory, by_symbol["GBPUSD"])
+
+        # Still downloading is not a failure, and must not be announced as one.
+        assert client.get(f"/baskets/{body['id']}").json()["failed_collections"] == []
+
+        with session_factory() as session:
+            row = session.get(Collection, download.id)
+            assert row is not None
+            row.status, row.error = BacktestStatus.FAILED, "the terminal said no"
+            session.commit()
+
+        [failed] = client.get(f"/baskets/{body['id']}").json()["failed_collections"]
+        assert (failed["symbol"], failed["timeframe"]) == ("GBPUSD", "H1")
+        assert (failed["status"], failed["error"]) == ("failed", "the terminal said no")
 
     def test_a_market_the_broker_does_not_list_is_skipped_not_collected(
         self, client: Any, session_factory: Callable[[], Session]

@@ -2427,11 +2427,15 @@ antes, ou recusar reescrever uma partição com menos barras do que ela tinha.
 * **`collections` não tem o CHECK `failed_needs_error`** que `backtests` tem, então uma coleta
   pode ficar `failed` sem razão registrada. O worker já trata (`no reason recorded`), mas a
   assimetria é acidental.
-* **Uma coleta que falha derruba o run e as irmãs seguem baixando** sem ninguém esperando por
-  elas. Não corrompe nada, mas gasta o agente.
-  ⚠️ **Decidido pelo Guilherme (22/09): a coleta que falha não derruba o run.** O run roda com o
-  que tem no disco e **avisa que a coleta falhou**, dizendo qual (símbolo, time frame, janela) e
-  por quê. Vale para o backtest, a cesta e a varredura.
+* ✅ **RESOLVIDO na PR-283** — **Uma coleta que falha derruba o run.** Decidido pelo Guilherme
+  (22/09): o run roda com o que tem no disco e **avisa** qual coleta falhou e por quê — na tela do
+  run, e uma vez só no topo da cesta e da varredura (`failed_collections`). O aviso é derivado do
+  `waiting_for`, sem coluna nova: `failed` é terminal. Sem nada no disco, o run ainda falha, pelo
+  dado.
+  * **Fica de fora: o timeout de 2 h (`WAIT_LIMIT`) continua falhando o run.** Uma coleta parada
+    ainda pode terminar depois, e um aviso derivado do estado dela passaria a dizer "nada faltou"
+    sobre um run que rodou sem o dado. Rodar com o que tem também no timeout exige **gravar** o
+    aviso no run (coluna ou tabela), não derivar.
 
 * ✅ **RESOLVIDO na PR-267 (por remoção)** — "Já enfileirado" vivia só enquanto a aba estava
   aberta. A tela não enfileira mais coleta nenhuma: quem planeja e cria é o lançamento. A defesa

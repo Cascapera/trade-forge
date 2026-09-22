@@ -11,6 +11,7 @@ import {
   toggleSeat,
 } from '../backtest/compare'
 import { ComparisonChart } from '../components/ComparisonChart'
+import { FailedDownloads } from '../components/FailedDownloads'
 import { RunTable } from '../components/RunTable'
 import { StudyDispersion } from '../components/StudyDispersion'
 import { money } from '../format'
@@ -138,6 +139,9 @@ export function SweepResult(): React.JSX.Element {
             </ul>
           </div>
         )}
+        <div className="mt-2">
+          <FailedDownloads downloads={data.failed_collections} />
+        </div>
         {/* ⚠️ The file and its legend, always together. A dataset handed over without the
             dictionary is the half an AI misreads — it cannot tell a parameter from a result, or
             an in-sample return from a forecast, by the column's name. Opened by the browser

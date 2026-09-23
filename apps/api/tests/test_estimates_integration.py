@@ -136,6 +136,25 @@ class TestTheBacktestRate:
         assert estimate is not None
         assert (estimate.seconds, estimate.based_on) == (240.0, 1)
 
+    def test_the_estimate_is_shared_by_the_workers_running_side_by_side(
+        self, session: Session
+    ) -> None:
+        """Twelve workers, one core each: 240 s of runs take a twelfth of the wall clock. The rate
+        is each run's own duration, which already paid for sharing the machine with the others."""
+        ran(session, seconds=48)  # 2 s per H1 bar
+        session.commit()
+
+        estimate = backtests_time(
+            session,
+            [
+                (START, START + dt.timedelta(days=1), "H1"),
+                (START, START + dt.timedelta(days=1), "M15"),
+            ],
+            workers=12,
+        )
+        assert estimate is not None
+        assert estimate.seconds == 20.0
+
     def test_only_the_most_recent_two_hundred_count(self, session: Session) -> None:
         # The engine changes; a median over every run ever made keeps answering for the old one.
         for minute in range(200):

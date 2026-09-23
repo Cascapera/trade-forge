@@ -12,6 +12,7 @@ wrong database.
 
 from pathlib import Path
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from tradeforge_db.config import PostgresSettings
@@ -50,6 +51,12 @@ class Settings(PostgresSettings, RedisConfig):
     # `--data-dir` (`data/ohlcv`) so a fresh clone's backfill and backtest line up with no
     # configuration. Env-driven (`PARQUET_ROOT`) so dev, CI and prod each point their own.
     parquet_root: Path = Path("data/ohlcv")
+
+    # How many backtest workers compose runs (`TRADEFORGE_WORKERS`, 23/09). One worker is one core:
+    # a backtest is synchronous CPU, so a worker runs one at a time and more speed comes only from
+    # more processes. Read here so the time estimates can divide by it — the same variable sets the
+    # worker's replicas in docker-compose.yml, so the two cannot disagree.
+    tradeforge_workers: int = Field(default=1, ge=1)
 
     # How many distinct days of paper trading a strategy must have on record before a live
     # session is allowed. **Policy, not invariant** — the database refuses a strategy that has

@@ -655,6 +655,11 @@ class WorkerSettings:
     # Built from RedisConfig, not Settings: this line runs at import, and importing the worker
     # must not require the Postgres password. The DB config is read later, in `startup`.
     redis_settings = redis_settings(RedisConfig())
+    # ⚠️ **One job at a time** (23/09). arq's default is ten, which suits I/O; a backtest is
+    # synchronous CPU that blocks the event loop, so the other nine jobs this worker took would
+    # sit claimed and idle behind it — while another worker has nothing — and run into arq's job
+    # timeout without ever starting. More speed comes from more workers (`TRADEFORGE_WORKERS`).
+    max_jobs = 1
     on_startup = startup
     on_shutdown = shutdown
 

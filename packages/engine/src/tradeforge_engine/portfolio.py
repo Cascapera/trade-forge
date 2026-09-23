@@ -31,6 +31,7 @@ from tradeforge_engine.domain import (
     InstrumentSpec,
     Money,
     Position,
+    Side,
     SignalKind,
 )
 from tradeforge_engine.errors import EngineError
@@ -97,6 +98,42 @@ class Portfolio:
         """
         self._equity = self._balance + self._unrealised(candle.close)
 
+    def observe_price(self, price: Money) -> None:
+        """The position traded at `price` — typically its exit fill. Extends both extremes.
+
+        For a position leaving at its stop this is the **only** observation of that bar: the
+        bar's high may have come after the exit, so it is not the position's
+        (`Position.best_price`).
+        """
+        position = self._position
+        if position is None:
+            return
+        best, worst = _extremes(position)
+        if position.side is Side.LONG:
+            best, worst = max(best, price), min(worst, price)
+        else:
+            best, worst = min(best, price), max(worst, price)
+        self._position = replace(position, best_price=best, worst_price=worst)
+
+    def observe_bar(self, candle: Candle, *, favourable: bool = True, adverse: bool = True) -> None:
+        """The position lived through this bar's range — or the half of it the broker can vouch
+        for. `favourable=False` is a bar whose favourable extreme may not have been the
+        position's (it was born inside the bar); `adverse=False` the other way round.
+
+        The broker decides which, because only it knows how the position entered and left the
+        bar. The ledger only keeps the extremes.
+        """
+        position = self._position
+        if position is None:
+            return
+        best, worst = _extremes(position)
+        long = position.side is Side.LONG
+        if favourable:
+            best = max(best, candle.high) if long else min(best, candle.low)
+        if adverse:
+            worst = min(worst, candle.low) if long else max(worst, candle.high)
+        self._position = replace(position, best_price=best, worst_price=worst)
+
     def amend_stop(self, stop_loss: Money) -> None:
         """Record that the open position's stop now sits at `stop_loss` (ADR-0018).
 
@@ -148,6 +185,9 @@ class Portfolio:
             take_profit=fill.order.take_profit,
             context=fill.order.context,
             snapshot=snapshot,
+            # The entry is the first price the position provably traded at, in both directions.
+            best_price=fill.price,
+            worst_price=fill.price,
         )
 
     def _close(self, fill: Fill) -> ClosedTrade:
@@ -199,6 +239,10 @@ class Portfolio:
             r_multiple=self._r_multiple(position, net),
             context=position.context,
             snapshot=position.snapshot,
+            mfe_price=position.best_price,
+            mae_price=position.worst_price,
+            mfe_r=_in_r(position, position.best_price),
+            mae_r=_in_r(position, position.worst_price),
         )
         self._trades.append(trade)
         return trade
@@ -239,3 +283,26 @@ class Portfolio:
         if position is None:
             return Decimal(0)
         return self._pnl(position, position.entry_price, price)
+
+
+def _in_r(position: Position, price: Money | None) -> Money | None:
+    """How far `price` is from the entry, in multiples of the distance to the initial stop.
+
+    Always non-negative: which way it went is the field's name (`mfe_r` or `mae_r`), not its sign.
+    A price ratio, not money, so it carries no costs — see `ClosedTrade.mfe_r`.
+    """
+    if price is None or position.initial_stop_loss is None:
+        return None
+    risk = abs(position.entry_price - position.initial_stop_loss)
+    if risk <= ZERO:
+        return None
+    return abs(price - position.entry_price) / risk
+
+
+def _extremes(position: Position) -> tuple[Money, Money]:
+    """The position's best and worst prices so far. Set at `_open` and never cleared, so a
+    position without them was built somewhere other than this ledger — and measuring it would
+    start from a price it never had."""
+    if position.best_price is None or position.worst_price is None:
+        raise EngineError("a position opened outside the ledger carries no excursion to extend")
+    return position.best_price, position.worst_price

@@ -6,6 +6,7 @@ and precision. The one thing only a real Postgres can prove — that the rows sa
 table's CHECK constraints — is `test_results_integration.py`.
 """
 
+import dataclasses
 import datetime as dt
 import json
 import uuid
@@ -313,6 +314,36 @@ def test_the_snapshot_is_json_safe_all_the_way_down() -> None:
     assert json.loads(json.dumps(row.snapshot)) == row.snapshot
 
 
+def test_the_excursions_are_carried_across_as_they_came() -> None:
+    """Already rounded by nobody: the ledger measured them, the row stores them."""
+    trade = dataclasses.replace(
+        a_trade(),
+        mfe_price=Decimal("1.10250"),
+        mae_price=Decimal("1.09900"),
+        mfe_r=Decimal("2.5"),
+        mae_r=Decimal("1"),
+    )
+    row = map_one(trade)
+    assert (row.mfe_price, row.mae_price, row.mfe_r, row.mae_r) == (
+        Decimal("1.10250"),
+        Decimal("1.09900"),
+        Decimal("2.5"),
+        Decimal("1"),
+    )
+    values = close_trade_values(trade)
+    assert (values["mfe_price"], values["mae_price"], values["mfe_r"], values["mae_r"]) == (
+        Decimal("1.10250"),
+        Decimal("1.09900"),
+        Decimal("2.5"),
+        Decimal("1"),
+    )
+
+
+def test_a_trade_that_was_not_measured_stores_null_not_zero() -> None:
+    row = map_one(a_trade())
+    assert (row.mfe_price, row.mae_price, row.mfe_r, row.mae_r) == (None, None, None, None)
+
+
 def test_one_trade_row_is_built_per_closed_trade() -> None:
     _, rows = to_rows(
         trades=[a_trade(net="100"), a_trade(net="-50"), a_trade(net="20")],
@@ -594,6 +625,11 @@ def test_closing_sets_the_exit_and_leaves_the_entry_alone() -> None:
         "costs",
         "net_pnl",
         "r_multiple",
+        # How far the trade went is only known when it ends, so it arrives with the exit.
+        "mfe_price",
+        "mae_price",
+        "mfe_r",
+        "mae_r",
     }
     assert "entry_price" not in values
     assert "volume" not in values

@@ -443,10 +443,26 @@ class MT5Broker:
         # `SignalKind.EXIT` sorts before `ENTRY` because `False < True`; `sorted` is stable, so
         # two fills of the same kind keep the order the venue reported them in.
         born: list[Fill] = []
+        # How far the position went (`Position.best_price`), read against the trade as the
+        # backtest reads it. Every fill here happened somewhere inside the bar that just closed,
+        # and the stream does not say where in its range: an exit vouches only for its own price,
+        # and a position that entered during the bar cannot claim the bar's favourable extreme.
+        entered = False
         for wire in sorted(arrived, key=lambda fill: fill.intent_is_entry):
             fill = self._fill_from(wire)
+            if fill.order.intent is SignalKind.EXIT:
+                self._portfolio.observe_price(fill.price)
             self._portfolio.apply(fill)
+            entered = entered or fill.order.intent is SignalKind.ENTRY
             born.append(fill)
+        self._portfolio.observe_bar(candle, favourable=not entered)
+        # The close is the bar's last tick, after any fill in it.
+        # ⚠️ **Assumed, not checked:** every fill drained here happened inside the bar that just
+        # closed. A fill from the last seconds of an earlier bar that arrives late was already
+        # missed by that bar's reading, which saw it whole — and a high printed after that exit
+        # was then counted as the position's. The one route to an overstated MFE; live only, and
+        # recorded in the backlog.
+        self._portfolio.observe_price(candle.close)
         self._portfolio.mark_to_market(candle)
         return tuple(born)
 

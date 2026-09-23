@@ -1100,6 +1100,16 @@ class Trade(Base):
     net_pnl: Mapped[Decimal | None] = mapped_column(MONEY)
     r_multiple: Mapped[Decimal | None] = mapped_column(RATIO)
 
+    # How far the trade went, both ways (2026-09-23): the most and least favourable prices it
+    # provably traded at, and the same distances in R of the stop it was sized against. Read
+    # against the trade when a bar is ambiguous, so the favourable side can only err low — which
+    # is what lets a target be derived from it (`tradeforge_engine.excursion`). NULL is "not
+    # measured": every trade recorded before this, and an R with no stop to divide by.
+    mfe_price: Mapped[Decimal | None] = mapped_column(PRICE)
+    mae_price: Mapped[Decimal | None] = mapped_column(PRICE)
+    mfe_r: Mapped[Decimal | None] = mapped_column(RATIO)
+    mae_r: Mapped[Decimal | None] = mapped_column(RATIO)
+
     context: Mapped[dict[str, Any]] = mapped_column(
         JSONB, nullable=False, server_default=text("'{}'::jsonb")
     )
@@ -1137,6 +1147,10 @@ class Trade(Base):
         # two call sites can disagree about the sign — the same trap as gross_loss above.
         CheckConstraint("costs IS NULL OR costs >= 0", name="costs_non_negative"),
         CheckConstraint("net_pnl IS NULL OR net_pnl = gross_pnl - costs", name="net_pnl_balances"),
+        # Distances, not signed moves: which way is the column's name. A negative one is a sign
+        # error upstream, and a derived target would read it as a trade that never moved.
+        CheckConstraint("mfe_r IS NULL OR mfe_r >= 0", name="mfe_r_non_negative"),
+        CheckConstraint("mae_r IS NULL OR mae_r >= 0", name="mae_r_non_negative"),
         Index("ix_trades_backtest_id_entry_time", "backtest_id", "entry_time"),
         # `<>` on two booleans is XOR: exactly one parent, never both, never neither.
         CheckConstraint(

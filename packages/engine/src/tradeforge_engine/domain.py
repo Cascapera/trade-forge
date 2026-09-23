@@ -951,6 +951,21 @@ class Position:
     Carried on the position for the same reason `context` is: nothing else survives from the
     fill to the close, and the `ClosedTrade` is built at the close."""
 
+    best_price: Money | None = None
+    """The most favourable price this position has **provably** traded at — the high for a long,
+    the low for a short — starting at the entry (2026-09-23).
+
+    "Provably" is the whole rule. Without ticks nobody knows the order of a bar's high and low,
+    so the broker hands the ledger only the part of each bar the position certainly lived
+    through, and every doubt is resolved against the trade: a bar the position left at its stop
+    adds nothing here, because the high may have come after the exit. So this can understate how
+    far the trade went and never overstates it — which is what lets a target be derived from it
+    later without claiming a hit that may not have happened. See `Portfolio.observe_bar`.
+    """
+    worst_price: Money | None = None
+    """The least favourable price, under the same rule turned the other way: every doubt counts
+    against the trade, so this can overstate how far it went against and never understates it."""
+
 
 @dataclass(frozen=True, slots=True)
 class AccountState:
@@ -1012,6 +1027,24 @@ class ClosedTrade:
 
     snapshot: EntrySnapshot | None = None
     """The bars around the entry, arming window included. See `EntrySnapshot`."""
+
+    mfe_price: Money | None = None
+    """The most favourable price the trade provably reached — its maximum favourable excursion
+    (MFE) as a price. The position's `best_price` at the close; see there for why it can only
+    err low. `None` on a trade built by something that did not measure it."""
+    mae_price: Money | None = None
+    """The least favourable price — the maximum adverse excursion (MAE) — which can only err
+    high. See `Position.worst_price`."""
+    mfe_r: Money | None = None
+    """How far the trade went in its favour, in multiples of the distance to the stop it was sized
+    against: `|mfe_price - entry| / |entry - stop_loss|`. A price ratio, so **gross** of costs —
+    unlike `r_multiple`, which is money and net. `None` without a stop.
+
+    It is what a target is derived from: a trade whose `mfe_r` reached 3 would have been closed by
+    a 3R target (`tradeforge_engine.excursion.with_target`)."""
+    mae_r: Money | None = None
+    """How far against, in the same unit. A trade stopped out at its initial stop reads 1 here,
+    or more if the bar gapped through it."""
 
 
 @dataclass(frozen=True, slots=True)

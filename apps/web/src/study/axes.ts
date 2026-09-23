@@ -7,7 +7,14 @@
 // tightens the hint here. A hand-written copy would be a second version of the DSL that drifts
 // from it silently, which is the one failure mode this whole file exists to avoid.
 
-import { offIsASetting, setupSpec, type SchemaParam, type SetupType } from '@tradeforge/schema'
+import {
+  TAKE_PROFIT_RR,
+  TAKE_PROFIT_RR_PATH,
+  offIsASetting,
+  setupSpec,
+  type SchemaParam,
+  type SetupType,
+} from '@tradeforge/schema'
 
 import { OFF } from './settings'
 
@@ -40,6 +47,11 @@ export interface AxisOption {
  * accepts a typed path, and the server refuses one that leads nowhere.
  */
 export function axesFor(setup: string | null): AxisOption[] {
+  // ⚠️ **Not even the target's axis here**, though every document has one. Options and no options
+  // are two different controls: with options the path is a dropdown, and without them it is the
+  // free text field a DSL strategy needs to reach `indicators.0.params.period`. Returning one
+  // option would take that field away and leave those strategies with a single axis they did not
+  // ask for. The path is still typeable, and the server still knows it.
   if (setup === null) return []
   let spec
   try {
@@ -49,13 +61,38 @@ export function axesFor(setup: string | null): AxisOption[] {
     // and a screen that threw here would go blank over a strategy it merely could not describe.
     return []
   }
-  return spec.params.map((param) => ({
-    path: `setup.params.${param.name}`,
-    label: param.name,
-    hint: hintFor(param),
-    example: exampleFor(param),
-    param,
-  }))
+  return [
+    ...spec.params.map((param) => ({
+      path: `setup.params.${param.name}`,
+      label: param.name,
+      hint: hintFor(param),
+      example: exampleFor(param),
+      param,
+    })),
+    // ⚠️ **Last, and not a parameter of the setup at all**: the target lives in `exit`. His ask
+    // (22/09) — search 2R against 3R against **no target**, because a setup that conducts its own
+    // stop is a different method rather than a slower one.
+    takeProfitAxis(),
+  ]
+}
+
+/**
+ * The target as an axis: `off, 2, 3` over `exit.take_profit.params.rr`.
+ *
+ * ⚠️ **The example is written here, and it is the only one in this file that is.** Every other
+ * example is built around the parameter's default — the value the author chose — and `rr` has
+ * none: the DSL makes the whole target optional rather than giving it a number nobody asked for.
+ * So the line offers the two multiples his setups are written around and the `off` that is the
+ * reason the axis exists, rather than a range around a default that does not exist.
+ */
+function takeProfitAxis(): AxisOption {
+  return {
+    path: TAKE_PROFIT_RR_PATH,
+    label: 'take profit (R)',
+    hint: hintFor(TAKE_PROFIT_RR),
+    example: `2, 3, ${OFF}`,
+    param: TAKE_PROFIT_RR,
+  }
 }
 
 /** What to type in the values field, in the parameter's own terms. */

@@ -14,7 +14,7 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, HTTPException, Query, status
 from sqlalchemy import ColumnElement, func, select
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.orm import Session, defer, selectinload
 
 from tradeforge_api.config import Settings
 from tradeforge_api.coverage import describe, to_collect, uncovered_markets
@@ -480,7 +480,11 @@ def list_backtests(  # noqa: PLR0913 — one filter per column a run is chosen b
         .where(*filters)
     )
     rows = session.execute(
-        base.options(selectinload(Backtest.metrics).defer(BacktestMetrics.equity_curve))
+        base.options(
+            selectinload(Backtest.metrics).options(
+                defer(BacktestMetrics.equity_curve), defer(BacktestMetrics.targets)
+            )
+        )
         .order_by(Backtest.created_at.desc(), Backtest.id)
         .limit(limit)
         .offset(offset)

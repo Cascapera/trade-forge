@@ -26,7 +26,14 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from tradeforge_api.grid import GridError, GridPoint, expand, fit_name, size_of
+from tradeforge_api.grid import (
+    TAKE_PROFIT_RR,
+    GridError,
+    GridPoint,
+    expand,
+    fit_name,
+    size_of,
+)
 
 
 class SweepError(ValueError):
@@ -78,6 +85,14 @@ def documents_for(
     if not timeframes:
         raise SweepError("a sweep needs at least one timeframe")
 
+    # ⚠️ **No target unless the grid names one** (his call, 23/09). The target is measured, not
+    # guessed: a run without one records how far each trade went (MFE), and every target on the
+    # ladder is scored from that afterwards (`excursion.target_ladder`) — one run instead of one
+    # per target. Left alone, every point would inherit whatever target the saved document had,
+    # the author's 5 R on his template, and the ladder above that rung could not be read.
+    if TAKE_PROFIT_RR not in grid:
+        definition = _without_target(definition)
+
     try:
         points = expand(definition, grid) if grid else [_whole(definition)]
     except GridError as exc:
@@ -107,6 +122,15 @@ def documents_for(
                 )
             )
     return out
+
+
+def _without_target(definition: Mapping[str, Any]) -> dict[str, Any]:
+    """The document with its target removed, and nothing else touched. A document with no `exit`
+    block has no target to remove, and is returned as it came."""
+    exit_block = definition.get("exit")
+    if not isinstance(exit_block, Mapping) or exit_block.get("take_profit") is None:
+        return dict(definition)
+    return {**definition, "exit": {**exit_block, "take_profit": None}}
 
 
 def _whole(definition: Mapping[str, Any]) -> GridPoint:

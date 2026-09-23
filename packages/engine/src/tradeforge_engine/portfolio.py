@@ -134,6 +134,18 @@ class Portfolio:
             worst = min(worst, candle.low) if long else max(worst, candle.high)
         self._position = replace(position, best_price=best, worst_price=worst)
 
+    def record_target(self, take_profit: Money) -> None:
+        """Record the target the broker armed for the open position.
+
+        A target set as a multiple of the risk (`take_profit_rr`) is computed by the broker at the
+        fill, from the price it filled at — the order never carried it. Without this the trade
+        would report no target while having left at one, and every reading of how far it could
+        have gone (`excursion.with_target`) would take a target exit for the trade's own course.
+        """
+        if self._position is None:
+            raise EngineError("cannot record a target on a position that is not open")
+        self._position = replace(self._position, take_profit=take_profit)
+
     def amend_stop(self, stop_loss: Money) -> None:
         """Record that the open position's stop now sits at `stop_loss` (ADR-0018).
 

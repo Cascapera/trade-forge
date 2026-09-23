@@ -915,6 +915,8 @@ class BacktestBroker:
             risk = abs(entry_price - order.stop_loss)
             sign = 1 if order.side is Side.LONG else -1
             target = entry_price + sign * self._rr * risk
+            # On the position too, so the trade says it had one (`Portfolio.record_target`).
+            self._portfolio.record_target(target)
         self._protection = _Protection(
             stop=order.stop_loss,
             decided_at=order.decided_at,

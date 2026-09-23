@@ -185,6 +185,13 @@ export function LaunchSweep(): React.JSX.Element {
               ))}
             </ul>
           )}
+          {/* His call of 23/09, said where the entries are chosen because it changes what each of
+              them runs: the target is measured, not set, unless the entry's grid names it. */}
+          <p className="text-xs text-slate-500">
+            Runs go <strong>without a target</strong> unless an entry&apos;s grid varies the take
+            profit. Every target from 0.5 to 10 R is then scored from how far each trade went, and
+            shown per entry on the sweep&apos;s page.
+          </p>
         </fieldset>
 
         {/* The basket's own picker, not a second one. A copy would be a second place to decide

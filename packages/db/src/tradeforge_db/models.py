@@ -897,6 +897,12 @@ class Backtest(Base):
     """What this run kept — see `Recorded`. Meaningful once it is `done`; `full` before that, which
     is what every run recorded before 2026-09-23 was."""
 
+    @property
+    def targets(self) -> dict[str, Any] | None:
+        """The target ladder this run scored (`BacktestMetrics.targets`), or `None` before it has
+        results. A read-through for the API's `BacktestOut`, which is built from the run."""
+        return None if self.metrics is None else self.metrics.targets
+
     created_at: Mapped[dt.datetime] = _created_at()
     started_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
@@ -1017,6 +1023,14 @@ class BacktestMetrics(Base):
     # drawdown and the CAGR above come from it — and does not store it. `[]` would claim a run
     # that saw no bars.
     equity_curve: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB)
+
+    # What the run's trades would have made at each target of the ladder (2026-09-23), in R net of
+    # costs: `{"2": {"trades": 40, "hits": 17, "net_r": "3.4", ...}, "3": null, ...}`. Computed by
+    # the worker from the trades **while they are in memory**, because a sweep's losing run does not
+    # keep them — and a run that loses without a target may win with one. A rung is null when some
+    # trade cannot answer it (`excursion.target_ladder`); the column is null for every run recorded
+    # before this, and for none after.
+    targets: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
 
     backtest: Mapped[Backtest] = relationship(back_populates="metrics")
 

@@ -15,6 +15,7 @@ import { count } from '../format'
 import { EquityCurve } from '../components/EquityCurve'
 import { MetricCards } from '../components/MetricCards'
 import { PriceChart } from '../components/PriceChart'
+import { RunTargets } from '../components/TargetLadder'
 import { TradesTable } from '../components/TradesTable'
 
 const badge: Record<BacktestStatus, string> = {
@@ -228,6 +229,17 @@ export function Results(): React.JSX.Element {
                   equity.data !== undefined && <EquityCurve points={equity.data} />
                 )}
               </section>
+              {run.targets !== null && (
+                <section>
+                  <h3 className="mb-2 font-medium">Result by target</h3>
+                  <p className="mb-2 text-xs text-slate-500">
+                    What these trades would have made at each target, from how far each one went —
+                    in R, net of costs. Per trade: with a target a trade ends earlier, and a real
+                    run with it could have taken an entry this one never saw.
+                  </p>
+                  <RunTargets targets={run.targets} />
+                </section>
+              )}
               <section>
                 <h3 className="mb-2 font-medium">Trades</h3>
                 {run.recorded === 'metrics' && (

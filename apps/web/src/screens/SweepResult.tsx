@@ -14,6 +14,7 @@ import { ComparisonChart } from '../components/ComparisonChart'
 import { FailedDownloads } from '../components/FailedDownloads'
 import { RunTable } from '../components/RunTable'
 import { StudyDispersion } from '../components/StudyDispersion'
+import { SweepTargets } from '../components/TargetLadder'
 import { money } from '../format'
 import { settled, summarise, tally } from '../sweep/progress'
 import { RANKINGS, type RankKey, pageOf, rank, rankingOf } from '../sweep/ranking'
@@ -236,6 +237,8 @@ export function SweepResult(): React.JSX.Element {
               <p className="text-sm text-slate-400">{backtests(mine.length)}</p>
             </div>
             <StudyDispersion aggregate={entry.aggregate} />
+            {/* Every target scored from how far the trades went: the sweep ran once, without one. */}
+            <SweepTargets rungs={entry.targets} />
             <p className="text-xs text-slate-500">
               {page.first === 0
                 ? 'No runs yet.'

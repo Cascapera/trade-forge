@@ -413,6 +413,34 @@ class MetricsOut(_Out):
     avg_trade_duration: dt.timedelta | None
 
 
+class TargetOutcomeOut(BaseModel):
+    """One rung of a run's target ladder: what its trades would have made at this target, in R net
+    of each trade's costs (`excursion.target_ladder`)."""
+
+    trades: int
+    hits: int
+    net_r: Money
+    expectancy_r: Money
+    max_drawdown_r: Money
+
+
+class TargetRungOut(BaseModel):
+    """One rung of the ladder across a sweep entry's runs — never pooled across entries, for the
+    reason `SweepEntryOut` gives. Median, like everything else a sweep summarises."""
+
+    rung: str
+    """The target in R, as the ladder writes it: `"0.5"`, `"2"`, `"10"`."""
+    runs_scored: int
+    """Runs that could answer this rung. A run with a target of its own below it cannot, and a run
+    recorded before the ladder existed has none."""
+    runs_positive: int
+    """Of those, the ones whose net R at this rung is above zero."""
+    median_expectancy_r: Money | None
+    """The median run's expectancy per trade, in R net. `None` when no run was scored."""
+    best_label: str | None
+    best_net_r: Money | None
+
+
 class BacktestOut(_Out):
     """A run: its request, what it actually read, its lifecycle status, and its metrics.
 
@@ -442,6 +470,10 @@ class BacktestOut(_Out):
     first_candle: dt.datetime | None = None
     last_candle: dt.datetime | None = None
     metrics: MetricsOut | None = None
+    targets: dict[str, TargetOutcomeOut | None] | None = None
+    """What the run's trades would have made at each rung of the target ladder, keyed by the
+    target in R (`"2"`). `None` for a run recorded before the ladder existed; a rung is `None` when
+    some trade could not answer it."""
     waiting_for: list[CollectionOut] = Field(default_factory=list)
     """The downloads this run is waiting for before it can start, oldest window first.
 
@@ -1955,6 +1987,9 @@ class SweepEntryOut(BaseModel):
     aggregate: StudyAggregate
     """`best_label` and `worst_label` lead with the symbol (`EURUSD · M15 · period=9`), because
     the point label alone repeats once per market and would name several runs at once."""
+
+    targets: list[TargetRungOut] = Field(default_factory=list)
+    """The target ladder across this entry's runs, one rung per row, lowest target first."""
 
 
 class SweepOut(BaseModel):

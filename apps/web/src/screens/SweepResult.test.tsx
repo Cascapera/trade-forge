@@ -139,6 +139,7 @@ function sweep(over: Partial<SweepOut> = {}, entries?: SweepEntryOut[]): SweepOu
           best_return: '0.03',
           worst_return: '0.02',
         }),
+        targets: [],
       },
       {
         entry_id: ALPHA.id,
@@ -150,6 +151,7 @@ function sweep(over: Partial<SweepOut> = {}, entries?: SweepEntryOut[]): SweepOu
           best_return: '-0.02',
           worst_return: '-0.02',
         }),
+        targets: [],
       },
     ],
     runs: [

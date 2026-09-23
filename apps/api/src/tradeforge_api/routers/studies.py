@@ -24,7 +24,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import defer, selectinload
 
 from tradeforge_api.coverage import describe, to_collect, uncovered_markets
 from tradeforge_api.deps import QueueDep, SessionDep
@@ -540,7 +540,11 @@ def get_study(study_id: uuid.UUID, session: SessionDep) -> StudyOut:
         select(Backtest, Strategy)
         .join(Strategy, Strategy.id == Backtest.strategy_id)
         .where(Backtest.study_id == study.id)
-        .options(selectinload(Backtest.metrics).defer(BacktestMetrics.equity_curve))
+        .options(
+            selectinload(Backtest.metrics).options(
+                defer(BacktestMetrics.equity_curve), defer(BacktestMetrics.targets)
+            )
+        )
     ).all()
 
     grid: dict[str, list[Any]] = dict(study.grid)

@@ -21,6 +21,7 @@ function run(over: Partial<Backtest>): Backtest {
     first_candle: null,
     last_candle: null,
     metrics: null,
+    targets: null,
     waiting_for: [],
     ...over,
   }

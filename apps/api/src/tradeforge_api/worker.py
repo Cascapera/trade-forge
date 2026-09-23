@@ -41,7 +41,7 @@ from tradeforge_api.config import RedisConfig, Settings
 from tradeforge_api.grid import coordinates, label_for, read_point
 from tradeforge_api.queue import RUN_BACKTEST, progress_channel, redis_settings
 from tradeforge_api.retention import recorded_for
-from tradeforge_api.runner import ENGINE_VERSION, execute_backtest
+from tradeforge_api.runner import ENGINE_VERSION, execute_backtest, instrument_spec
 from tradeforge_api.walkforward import Candidate, choose
 from tradeforge_collector import read_candles
 from tradeforge_db.models import (
@@ -55,8 +55,9 @@ from tradeforge_db.models import (
     WalkForward,
     WalkForwardFold,
 )
-from tradeforge_db.results import to_rows
+from tradeforge_db.results import ladder_row, to_rows
 from tradeforge_db.session import create_db_engine, create_session_factory
+from tradeforge_engine.excursion import target_ladder
 
 
 def _now() -> dt.datetime:
@@ -151,12 +152,16 @@ async def process_backtest(
             record_snapshots=not in_sweep,
         )
 
+        # Every rung of the target ladder, scored now: a sweep's losing run keeps no trades, and
+        # without them this cannot be computed later (`backtest_metrics.targets`).
+        ladder = target_ladder(trades, instrument_spec(instrument))
         # Decided here and stamped on the run, never re-derived later: see `Recorded`.
         recorded = recorded_for(
             in_sweep=in_sweep,
             timeframe=backtest.timeframe,
             net_profit=metrics.net_profit,
             total_trades=metrics.total_trades,
+            target_net_r=[None if rung is None else rung.net_r for rung in ladder.values()],
         )
         metrics_row, trade_rows = to_rows(
             trades=trades,
@@ -165,6 +170,7 @@ async def process_backtest(
             instrument_id=instrument.id,
             recorded=recorded,
         )
+        metrics_row.targets = ladder_row(ladder)
         backtest.recorded = recorded
         session.add(metrics_row)
         session.add_all(trade_rows)

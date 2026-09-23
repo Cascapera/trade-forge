@@ -5,6 +5,7 @@ wrong here is what every point becomes: which document, under which name, at whi
 router's job is writing those and is the integration suite's.
 """
 
+import copy
 import re
 from typing import Any
 
@@ -194,3 +195,55 @@ class TestWhatTheSizeRefuses:
         message = size_refusal(0)
 
         assert message == "no combination in this sweep can run"
+
+
+# His template's shape: a setup that brings a 5 R target with it.
+BASE: dict[str, Any] = {
+    **a_document(),
+    "exit": {
+        "stop_loss": None,
+        "take_profit": {"type": "risk_multiple", "params": {"rr": 5}},
+        "conditions": [],
+    },
+}
+
+
+class TestNoTargetUnlessTheGridNamesOne:
+    """His call of 23/09: a sweep runs without a target and scores every target from how far the
+    trades went. Only a grid that names the target axis runs with the targets it names."""
+
+    def test_a_grid_without_the_target_axis_runs_every_point_without_a_target(self) -> None:
+        docs = documents_for(
+            entry_id="e1",
+            entry_name="9.1",
+            definition=BASE,
+            grid={"setup.params.period": [9, 21]},
+            timeframes=["M15"],
+        )
+        assert [doc.document["exit"]["take_profit"] for doc in docs] == [None, None]
+        # The rest of the exit block is the saved one.
+        assert all(doc.document["exit"]["conditions"] == [] for doc in docs)
+
+    def test_an_entry_with_no_grid_runs_without_a_target_too(self) -> None:
+        [doc] = documents_for(
+            entry_id="e1", entry_name="9.1", definition=BASE, grid={}, timeframes=["M15"]
+        )
+        assert doc.document["exit"]["take_profit"] is None
+
+    def test_a_grid_that_names_the_target_runs_with_exactly_those(self) -> None:
+        docs = documents_for(
+            entry_id="e1",
+            entry_name="9.1",
+            definition=BASE,
+            grid={"exit.take_profit.params.rr": [2, None]},
+            timeframes=["M15"],
+        )
+        assert [doc.document["exit"]["take_profit"] for doc in docs] == [
+            {"type": "risk_multiple", "params": {"rr": 2}},
+            None,
+        ]
+
+    def test_the_saved_document_is_left_as_it_was(self) -> None:
+        before = copy.deepcopy(BASE)
+        documents_for(entry_id="e1", entry_name="9.1", definition=BASE, grid={}, timeframes=["H1"])
+        assert before == BASE

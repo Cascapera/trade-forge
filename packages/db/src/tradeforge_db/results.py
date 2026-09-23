@@ -36,6 +36,7 @@ from typing import Any
 
 from tradeforge_db.models import BacktestMetrics, ExitReason, Recorded, Trade
 from tradeforge_engine.domain import ClosedTrade, EntrySnapshot, EquityPoint, Position
+from tradeforge_engine.excursion import TargetOutcome
 from tradeforge_engine.metrics import BacktestMetrics as RunMetrics
 
 # Every `ClosedTrade` carries the reason of its *exit* fill, and the engine emits exactly
@@ -387,3 +388,27 @@ def close_trade_values(trade: ClosedTrade) -> dict[str, Any]:
 
 
 __all__ = ["close_trade_values", "closed_trade_row", "open_trade_row", "to_rows"]
+
+
+def ladder_row(ladder: Mapping[Decimal, TargetOutcome | None]) -> dict[str, Any]:
+    """The target ladder as the `backtest_metrics.targets` document: rungs keyed by their R as
+    written (`"0.5"`, `"2"`), numbers as strings for the same precision reason as `context`, and
+    a rung nobody could score kept as `null` rather than dropped — absent would read as never asked.
+    """
+    return {
+        _rung(rung): None
+        if outcome is None
+        else {
+            "trades": outcome.trades,
+            "hits": outcome.hits,
+            "net_r": str(outcome.net_r),
+            "expectancy_r": str(outcome.expectancy_r),
+            "max_drawdown_r": str(outcome.max_drawdown_r),
+        }
+        for rung, outcome in ladder.items()
+    }
+
+
+def _rung(rung: Decimal) -> str:
+    """`2` rather than `2.0`, `0.5` as it is: the key a reader types."""
+    return format(rung.normalize(), "f")

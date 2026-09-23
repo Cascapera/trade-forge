@@ -80,3 +80,44 @@ def test_a_run_that_is_not_a_sweeps_keeps_everything_whatever_it_did() -> None:
 def test_a_chart_with_no_floor_is_refused_rather_than_guessed() -> None:
     with pytest.raises(KeyError):
         recorded_for(in_sweep=True, timeframe="M2", net_profit=Decimal(1), total_trades=100)
+
+
+def test_a_run_that_loses_without_a_target_but_wins_with_one_keeps_its_trades() -> None:
+    """The run a sweep without a target exists to find: negative as it ran, positive at 2 R. It is
+    the one to open later, so its trades stay."""
+    assert (
+        recorded_for(
+            in_sweep=True,
+            timeframe="H1",
+            net_profit=Decimal(-300),
+            total_trades=40,
+            target_net_r=[Decimal("-4"), Decimal("2.5"), None],
+        )
+        is Recorded.TRADES
+    )
+
+
+def test_a_rung_that_could_not_be_scored_passes_nothing() -> None:
+    assert (
+        recorded_for(
+            in_sweep=True,
+            timeframe="H1",
+            net_profit=Decimal(-300),
+            total_trades=40,
+            target_net_r=[None, Decimal(0), Decimal("-1")],
+        )
+        is Recorded.METRICS
+    )
+
+
+def test_a_winning_rung_still_needs_the_charts_floor_of_trades() -> None:
+    assert (
+        recorded_for(
+            in_sweep=True,
+            timeframe="M5",
+            net_profit=Decimal(-1),
+            total_trades=59,
+            target_net_r=[Decimal(9)],
+        )
+        is Recorded.METRICS
+    )

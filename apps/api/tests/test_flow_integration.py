@@ -881,10 +881,19 @@ def test_a_single_run_keeps_everything(
         backtest_id = _launch(client)
         _work(session_factory, tmp_path, backtest_id)
 
-        assert client.get(f"/backtests/{backtest_id}").json()["recorded"] == "full"
+        run = client.get(f"/backtests/{backtest_id}").json()
+        assert run["recorded"] == "full"
         trades = client.get(f"/backtests/{backtest_id}/trades").json()["items"]
         assert [trade["has_snapshot"] for trade in trades] == [True]
         assert client.get(f"/backtests/{backtest_id}/equity").status_code == 200
+
+        # Every run scores the target ladder (migration 0023). This document carries a 2 R target
+        # of its own, so the rungs up to it are scored and the ones above it cannot be.
+        ladder = run["targets"]
+        assert ladder is not None
+        assert ladder["1"]["trades"] == run["metrics"]["total_trades"]
+        assert ladder["2"] is not None
+        assert ladder["3"] is None
 
 
 def test_a_sweeps_run_below_the_floor_keeps_only_its_metrics(

@@ -67,6 +67,26 @@ export interface Metrics {
  */
 export type Recorded = 'full' | 'trades' | 'metrics'
 
+/** One rung of a run's target ladder, in R net of each trade's costs. Numbers are strings. */
+export interface TargetOutcome {
+  trades: number
+  hits: number
+  net_r: string
+  expectancy_r: string
+  max_drawdown_r: string
+}
+
+/** One rung of the ladder across a sweep entry's runs. */
+export interface TargetRung {
+  /** The target in R as the ladder writes it: `'0.5'`, `'2'`, `'10'`. */
+  rung: string
+  runs_scored: number
+  runs_positive: number
+  median_expectancy_r: string | null
+  best_label: string | null
+  best_net_r: string | null
+}
+
 export interface Backtest {
   id: string
   strategy_id: string
@@ -89,6 +109,12 @@ export interface Backtest {
   first_candle: string | null
   last_candle: string | null
   metrics: Metrics | null
+  /**
+   * What the run's trades would have made at each target of the ladder, keyed by the target in R.
+   * Null for a run recorded before the ladder existed; a rung is null when a trade could not
+   * answer it (it had a target of its own below that rung).
+   */
+  targets: Record<string, TargetOutcome | null> | null
   /**
    * The downloads this run is waiting for before it can start, oldest window first.
    *
@@ -1152,6 +1178,8 @@ export interface SweepEntryOut {
   entry_name: string | null
   /** `best_label`/`worst_label` lead with the symbol: `EURUSD · M15 · period=9`. */
   aggregate: StudyAggregate
+  /** The target ladder across this entry's runs, lowest target first. */
+  targets: TargetRung[]
 }
 
 export interface SweepOut {

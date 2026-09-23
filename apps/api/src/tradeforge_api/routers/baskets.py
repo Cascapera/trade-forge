@@ -17,7 +17,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, status
 from sqlalchemy import select
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import defer, selectinload
 
 from tradeforge_api.coverage import describe, to_collect, uncovered_markets
 from tradeforge_api.deps import QueueDep, SessionDep
@@ -302,7 +302,11 @@ def get_basket(basket_id: uuid.UUID, session: SessionDep) -> BasketOut:
         select(Backtest, Instrument.symbol)
         .join(Instrument, Instrument.id == Backtest.instrument_id)
         .where(Backtest.basket_id == basket.id)
-        .options(selectinload(Backtest.metrics).defer(BacktestMetrics.equity_curve))
+        .options(
+            selectinload(Backtest.metrics).options(
+                defer(BacktestMetrics.equity_curve), defer(BacktestMetrics.targets)
+            )
+        )
         .order_by(Instrument.symbol)
     ).all()
     runs = [(run, symbol) for run, symbol in rows]

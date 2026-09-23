@@ -2640,3 +2640,14 @@ diz o que cada run guardou; o botão "re-rodar este ponto" reconstrói tudo (eng
    mas comparando só até a primeira divergência de sequência).
 3. **`testing.ImmediateFillBroker` não observa excursões**: seus trades saem com MFE = MAE = entrada
    (`mfe_r = 0`), não `None`. Só afeta testes.
+
+## Varredura sem alvo e escada de alvos (PR-290) — o que ficou para depois
+
+1. **Falta um teste de integração do caminho que justifica a escada**: um run de varredura que perde
+   sem alvo, ganha num degrau e por isso guarda os trades. As peças estão testadas em separado
+   (`target_ladder`, `recorded_for(target_net_r=...)`); o worker juntando as duas só é coberto pelo
+   run avulso do teste de fluxo. Precisa de um cenário de candles que perca sem alvo e ganhe com um.
+2. **Com eixo de RR na grade, os degraus abaixo do próprio alvo também contam para a régua**: um run
+   com alvo de 5 R pode guardar os trades por causa do degrau de 0,5 R. É a regra como combinada
+   (qualquer degrau), mas vale perguntar a ele se quer restringir aos degraus que o run de fato
+   poderia ter (≤ alvo próprio) — hoje isso já é o que acontece, porque acima do alvo o degrau é nulo.

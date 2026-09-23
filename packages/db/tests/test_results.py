@@ -23,6 +23,7 @@ from tradeforge_db.results import (
     _trade_row,
     close_trade_values,
     closed_trade_row,
+    ladder_row,
     open_trade_row,
     to_rows,
 )
@@ -37,6 +38,7 @@ from tradeforge_engine.domain import (
     SnapshotRegion,
     SnapshotSeries,
 )
+from tradeforge_engine.excursion import TargetOutcome
 from tradeforge_engine.metrics import BacktestMetrics
 
 START = dt.datetime(2024, 1, 1, tzinfo=dt.UTC)
@@ -716,3 +718,31 @@ def test_a_trade_row_refuses_to_belong_to_both_parents_or_neither() -> None:
             backtest_id=uuid.uuid4(),
             live_session_id=uuid.uuid4(),
         )
+
+
+def test_the_ladder_is_stored_by_rung_with_strings_and_nulls_kept() -> None:
+    row = ladder_row(
+        {
+            Decimal("0.5"): TargetOutcome(
+                trades=4,
+                hits=3,
+                net_r=Decimal("0.7"),
+                expectancy_r=Decimal("0.175"),
+                max_drawdown_r=Decimal("1.2"),
+            ),
+            Decimal("2"): None,
+            Decimal("10"): None,
+        }
+    )
+    assert row == {
+        "0.5": {
+            "trades": 4,
+            "hits": 3,
+            "net_r": "0.7",
+            "expectancy_r": "0.175",
+            "max_drawdown_r": "1.2",
+        },
+        "2": None,
+        "10": None,
+    }
+    json.dumps(row)  # JSONB-safe all the way down

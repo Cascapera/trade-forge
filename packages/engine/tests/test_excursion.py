@@ -20,6 +20,7 @@ Every number is the broker's, read off these bars; the risk is 5 everywhere (ent
 so an R is five points.
 """
 
+import dataclasses
 from decimal import Decimal
 
 import pytest
@@ -36,7 +37,7 @@ from tradeforge_engine.domain import (
     Signal,
     SignalKind,
 )
-from tradeforge_engine.excursion import gross_r, with_target
+from tradeforge_engine.excursion import LADDER, gross_r, target_ladder, with_target
 from tradeforge_engine.loop import run
 from tradeforge_engine.portfolio import Portfolio
 from tradeforge_engine.risk import PercentRiskManager
@@ -363,3 +364,99 @@ def test_an_unmeasured_trade_cannot_be_derived() -> None:
 def test_a_target_must_be_positive() -> None:
     with pytest.raises(ValueError, match="positive multiple"):
         with_target(_closed(mfe_r="1"), Decimal(0))
+
+
+# --------------------------------------------------------------------------- #
+# The ladder a sweep run is scored at                                          #
+# --------------------------------------------------------------------------- #
+
+
+def _costed(
+    *, mfe_r: str, exit_price: str, costs: str = "0", side: Side = Side.LONG
+) -> ClosedTrade:
+    """Two AAPL shares from 100 with the stop 5 away: a risk of 10 dollars, so two dollars are
+    0.2 R. ⚠️ Two, not one: with one share a cost in R that forgot the volume would come out
+    right by accident."""
+    return dataclasses.replace(
+        _closed(mfe_r=mfe_r, exit_price=exit_price, side=side),
+        costs=Decimal(costs),
+        volume=Decimal(2),
+    )
+
+
+def test_the_ladder_scores_every_rung_net_of_each_trades_costs() -> None:
+    """Two trades. The first reached 2.4 R and left at 97 (-0.6 R); the second reached 0.8 R and
+    left at 95 (-1 R). Each paid two dollars, 0.2 R of its risk.
+
+    At 2 R the first is a hit (+2) and the second is not (-1): 1 R gross, 0.6 R net.
+    At 3 R neither hits: -1.6 gross, -2 net."""
+    trades = [
+        _costed(mfe_r="2.4", exit_price="97", costs="2"),
+        _costed(mfe_r="0.8", exit_price="95", costs="2"),
+    ]
+    ladder = target_ladder(trades, AAPL, (Decimal(2), Decimal(3)))
+
+    two = ladder[Decimal(2)]
+    assert two is not None
+    assert (two.trades, two.hits, two.net_r, two.expectancy_r) == (
+        2,
+        1,
+        Decimal("0.6"),
+        Decimal("0.3"),
+    )
+    # The running sum goes +1.8 then -0.4: a fall of 1.2 from its peak.
+    assert two.max_drawdown_r == Decimal("1.2")
+
+    three = ladder[Decimal(3)]
+    assert three is not None
+    assert (three.hits, three.net_r) == (0, Decimal("-2.0"))
+    # -0.8 then -2.0, never above the zero it started from: the whole fall is the drawdown.
+    assert three.max_drawdown_r == Decimal("2.0")
+
+
+def test_a_short_trades_costs_are_taken_off_in_r_of_its_own_risk() -> None:
+    """Short from 100 with the stop at 105: the same 10 dollars of risk on two shares, above the
+    entry this time. It reached 1 R and left at 103 (-0.6 R), paying 0.2 R in costs."""
+    [trade] = [_costed(mfe_r="1", exit_price="103", costs="2", side=Side.SHORT)]
+    ladder = target_ladder([trade], AAPL, (Decimal(1), Decimal(2)))
+
+    one, two = ladder[Decimal(1)], ladder[Decimal(2)]
+    assert one is not None
+    assert two is not None
+    assert (one.hits, one.net_r) == (1, Decimal("0.8"))
+    assert (two.hits, two.net_r) == (0, Decimal("-0.8"))
+
+
+def test_reaching_the_target_exactly_is_a_hit() -> None:
+    [rung] = target_ladder([_costed(mfe_r="2", exit_price="97")], AAPL, (Decimal(2),)).values()
+    assert rung is not None
+    assert (rung.hits, rung.net_r) == (1, Decimal(2))
+
+
+def test_a_rung_some_trade_cannot_answer_is_none_for_the_whole_run() -> None:
+    """A sum over the trades that could answer would be a different set of trades at each rung."""
+    trades = [_costed(mfe_r="2", exit_price="97"), _closed(mfe_r=None)]
+    assert target_ladder(trades, AAPL, (Decimal(1),)) == {Decimal(1): None}
+
+
+def test_a_run_with_no_trades_scores_zero_everywhere() -> None:
+    [(rung, outcome)] = target_ladder([], AAPL, (Decimal(2),)).items()
+    assert rung == Decimal(2)
+    assert outcome is not None
+    assert (outcome.trades, outcome.net_r, outcome.max_drawdown_r) == (0, Decimal(0), Decimal(0))
+
+
+def test_the_ladder_is_his() -> None:
+    assert [str(k) for k in LADDER] == [
+        "0.5",
+        "1",
+        "1.5",
+        "2",
+        "2.5",
+        "3",
+        "4",
+        "5",
+        "6",
+        "8",
+        "10",
+    ]

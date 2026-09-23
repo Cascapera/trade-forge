@@ -23,7 +23,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import defer, selectinload
 
 from tradeforge_api.deps import QueueDep, SessionDep, SettingsDep
 from tradeforge_api.grid import label_for, read_point
@@ -438,7 +438,11 @@ def _in_sample_runs(
             Backtest.study_id.in_({study_id for study_id, _ in pairs}),
             Backtest.strategy_id.in_({strategy_id for _, strategy_id in pairs}),
         )
-        .options(selectinload(Backtest.metrics).defer(BacktestMetrics.equity_curve))
+        .options(
+            selectinload(Backtest.metrics).options(
+                defer(BacktestMetrics.equity_curve), defer(BacktestMetrics.targets)
+            )
+        )
     )
     found = {(run.study_id, run.strategy_id): run for run in runs if run.study_id is not None}
     return {pair: found[pair] for pair in pairs if pair in found}
@@ -452,7 +456,11 @@ def _test_runs(session: SessionDep, rows: Sequence[WalkForwardFold]) -> dict[uui
     runs = session.scalars(
         select(Backtest)
         .where(Backtest.id.in_(ids))
-        .options(selectinload(Backtest.metrics).defer(BacktestMetrics.equity_curve))
+        .options(
+            selectinload(Backtest.metrics).options(
+                defer(BacktestMetrics.equity_curve), defer(BacktestMetrics.targets)
+            )
+        )
     )
     return {run.id: run for run in runs}
 

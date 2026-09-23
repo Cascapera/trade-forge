@@ -70,6 +70,7 @@ from tradeforge_api.sweep import (
     size_refusal,
 )
 from tradeforge_api.sweep_dataset import CAVEATS, OMITTED, ROW, DatasetRun, columns_for, to_csv
+from tradeforge_api.targets import rungs_across
 from tradeforge_collector.collect import year_slices
 from tradeforge_db.collections import create_collection
 from tradeforge_db.models import (
@@ -632,7 +633,11 @@ def get_sweep_dashboard(
         # Launch order, so which copy of a repeated measurement is kept does not change between
         # two reads of the same data.
         .order_by(Backtest.created_at, Backtest.id)
-        .options(selectinload(Backtest.metrics).defer(BacktestMetrics.equity_curve))
+        .options(
+            selectinload(Backtest.metrics).options(
+                defer(BacktestMetrics.equity_curve), defer(BacktestMetrics.targets)
+            )
+        )
     ).all()
 
     runs: list[dashboard.DashboardRun] = []
@@ -743,6 +748,7 @@ def get_sweep(sweep_id: uuid.UUID, session: SessionDep) -> SweepOut:
             entry_id=uuid.UUID(entry_id),
             entry_name=shelved.name if (shelved := entries.get(entry_id)) is not None else None,
             aggregate=aggregate_points(scored[entry_id], sweep.initial_capital),
+            targets=rungs_across(scored[entry_id]),
         )
         for entry_id in sweep.entry_ids
     ]

@@ -596,14 +596,22 @@ class Mme9TurnParams(_Node):
     a protective stop and says nothing about moving it. It is a parameter rather than a constant
     so that "what would this earn with his 2x1 on top" stays askable.
 
-    No `entry_point` and no `long_average_period`: the bar patterns and the direction filter are
-    the author's grafts onto his own setups, and this one is here to say what the book says.
+    No `entry_point`: the bar patterns are the author's graft onto his own setups, and this one is
+    here to say what the book says.
+
+    `long_average_period` is his direction filter, offered here since 22/09 (*"nos setups da MME9
+    aqueles que ainda não tem vamos pôr opção de filtro de média móvel igual no MME9 breakout"*)
+    and `null` — the default — is the filter **off**, which is the published setup unchanged. Named,
+    an order is placed only when the price it would **enter** at is beyond an exponential average
+    of that period: above it for a buy, below it for a sell. It gates placing and never withdraws,
+    and an open trade is conducted as before — the same rule as on his own 9.1.
     """
 
     side: TradeSide
     period: Annotated[int, Field(ge=AVERAGE_FLOOR, le=1000)] = 9
     stop_buffer_ticks: Annotated[int, Field(ge=0, le=10_000)] = 0
     breakeven_at_r: Annotated[float | None, Field(gt=0, le=100)] = None
+    long_average_period: Annotated[int | None, Field(ge=AVERAGE_FLOOR, le=1000)] = None
 
 
 class Mme9TurnSetup(_Node):
@@ -626,12 +634,18 @@ class Mme9FailedTurnParams(_Node):
     Two bars down and it is not this setup: whatever turns the line back up later is a 9.1.
 
     `breakeven_at_r` defaults to `null` — off — like the rest of the published family.
+
+    `long_average_period` is his direction filter, offered on the published family since 22/09 and
+    `null` — the default — is it **off**, which is this setup exactly as the book states it. Named,
+    an order is placed only when the price it would **enter** at is beyond an exponential average
+    of that period. It gates placing, never withdraws, and leaves an open trade alone.
     """
 
     side: TradeSide
     period: Annotated[int, Field(ge=AVERAGE_FLOOR, le=1000)] = 9
     stop_buffer_ticks: Annotated[int, Field(ge=0, le=10_000)] = 0
     breakeven_at_r: Annotated[float | None, Field(gt=0, le=100)] = None
+    long_average_period: Annotated[int | None, Field(ge=AVERAGE_FLOOR, le=1000)] = None
 
 
 class Mme9FailedTurnSetup(_Node):
@@ -662,6 +676,11 @@ class Mme9PullbackParams(_Node):
 
     `breakeven_at_r` defaults to `null` — off — for the same reason as the other published setups:
     the source names an entry and a protective stop and nothing about moving one.
+
+    `long_average_period` is his direction filter, offered on the published family since 22/09 and
+    `null` — the default — is it **off**, which is this setup exactly as the book states it. Named,
+    an order is placed only when the price it would **enter** at is beyond an exponential average
+    of that period. It gates placing, never withdraws, and leaves an open trade alone.
     """
 
     side: TradeSide
@@ -669,6 +688,7 @@ class Mme9PullbackParams(_Node):
     period: Annotated[int, Field(ge=AVERAGE_FLOOR, le=1000)] = 9
     stop_buffer_ticks: Annotated[int, Field(ge=0, le=10_000)] = 0
     breakeven_at_r: Annotated[float | None, Field(gt=0, le=100)] = None
+    long_average_period: Annotated[int | None, Field(ge=AVERAGE_FLOOR, le=1000)] = None
 
 
 class Mme9PullbackSetup(_Node):

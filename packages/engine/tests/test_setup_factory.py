@@ -428,13 +428,17 @@ def test_a_clock_written_as_a_string_of_digits_is_read() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_the_long_average_period_reaches_both_swing_setups() -> None:
-    """Both hosts take the filter — his answer 5 — and `_optional_int` is what routes it. The
-    probe is a period that is not either setup's own, so a factory handing the setup's `period`
-    through by mistake would fail here rather than agree by coincidence."""
+def test_the_long_average_period_reaches_every_swing_setup() -> None:
+    """Every host takes the filter — his answer 5 for the first two, and the published MME9 family
+    since 22/09 — and `_optional_int` is what routes it. The probe is a period that is not any
+    setup's own, so a factory handing the setup's `period` through by mistake would fail here
+    rather than agree by coincidence."""
     for kind, cls in (
         ("mme9_breakout", Mme9BreakoutStrategy),
         ("ponto_continuo", PontoContinuoStrategy),
+        ("mme9_turn", Mme9TurnStrategy),
+        ("mme9_pullback", Mme9PullbackStrategy),
+        ("mme9_failed_turn", Mme9FailedTurnStrategy),
     ):
         setup = _built(kind, side="long", long_average_period=200)
         assert isinstance(setup, cls)

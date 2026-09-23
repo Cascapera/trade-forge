@@ -2596,3 +2596,14 @@ porque `null` não é um valor que o eixo enumera — "com filtro contra sem fil
 estudos. O conserto agora tem precedente: o eixo aceitar `off` e o servidor tratar o `null` como
 "parâmetro ausente" em vez de "parâmetro nulo". ⚠️ Não é a mesma mecânica: ali o campo existe e é
 `None` legítimo, aqui o bloco inteiro some.
+
+## Filtro de média longa nos MME9 publicados (PR-287) — o que a revisão deixou
+
+1. **"Trade aberto conduz independente da média longa" não tem teste próprio** no 9.1, no 9.2/9.3
+   e no 9.4. Hoje vale pela estrutura: nos três, o `return` com posição aberta e a condução vêm
+   **antes** do bloqueio do filtro, então ele não alcança a condução. Um teste com
+   `breakeven_at_r` ligado e o filtro recusando fecharia isso — o sinal de condução tem que sair.
+2. **O mesmo buraco da regra "a média longa conta em todo candle" existe no breakout e no ponto
+   contínuo**: `test_long_average_filter.py` não passa nenhum candle com posição aberta, então um
+   mutante que pula o `update` durante o trade sobrevive lá. O teste que a PR-287 escreveu para os
+   três publicados (`test_the_long_average_keeps_counting_while_a_trade_is_open`) é o molde.

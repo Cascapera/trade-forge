@@ -19,6 +19,8 @@ x-backend-env: &backend-env
   REDIS_PORT: '6379'
   # Where the collector wrote the Parquet candles, inside the mounted ./data volume (ADR-05).
   PARQUET_ROOT: /data/ohlcv
+  # How many backtest workers run (below). The api reads it too, to divide its time estimates.
+  TRADEFORGE_WORKERS: ${TRADEFORGE_WORKERS:-1}
 
 services:
   postgres:
@@ -134,6 +136,17 @@ services:
     image: tradeforge-api
     command: ['arq', 'tradeforge_api.worker.WorkerSettings']
     environment: *backend-env
+    # One core per worker, and as many workers as TRADEFORGE_WORKERS asks for (23/09). A backtest
+    # is synchronous CPU: one worker runs one at a time on one core, so the count is the speed and
+    # the cap is what leaves the rest of the machine to whoever is using it. On his i9-14900K
+    # (32 threads) 12 workers hold a sweep near 40% of the CPU.
+    # ⚠️ Changing either value recreates the workers, and a recreated worker drops the run it was
+    # in the middle of: change it with the queue empty.
+    deploy:
+      replicas: ${TRADEFORGE_WORKERS:-1}
+      resources:
+        limits:
+          cpus: '1'
     volumes:
       - ./data:/data:ro
     depends_on:

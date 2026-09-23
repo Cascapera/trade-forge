@@ -11,10 +11,11 @@ database's own recent history, and an installation with no history gets no estim
 somebody else's. The answer carries how many runs or downloads it rests on, because an estimate
 from three runs is a smaller claim than one from two hundred.
 
-⚠️ **Sums, because both queues are serial.** The host agent downloads one collection at a time
-(`max_jobs = 1`), and a backtest is synchronous CPU inside the worker's event loop, so jobs do not
-overlap in practice. Were either to run in parallel, the sum would overstate — which is the safe
-side for "how long do I leave it", and the place to divide if that day comes.
+⚠️ **Sums, divided by the workers that share them.** The host agent downloads one collection at a
+time (`max_jobs = 1`), so a collection estimate is a plain sum. Backtests are synchronous CPU, one
+per worker at a time, and since 23/09 compose runs `TRADEFORGE_WORKERS` of them side by side — so
+the sum is divided by that count. Each measured run's own duration already carries whatever the
+others cost it (they share the machine and the database), so the division is not optimistic twice.
 
 **Backtests are measured per calendar bar**: the window divided by the timeframe's step, weekends
 and closures included. That is not the number of candles the engine read, and it does not need to
@@ -93,19 +94,24 @@ def backtest_rate(session: Session) -> Rate | None:
 
 
 def backtests_time(
-    session: Session, runs: Iterable[tuple[dt.datetime, dt.datetime, str]]
+    session: Session,
+    runs: Iterable[tuple[dt.datetime, dt.datetime, str]],
+    workers: int = 1,
 ) -> TimeEstimate | None:
-    """How long these runs would take, one after the other. `None` with no history to measure by.
+    """How long these runs would take across `workers` running side by side. `None` with no
+    history to measure by.
 
     Each run is (date_from, date_to, timeframe). An empty launch takes no time and still says what
     the rate rests on, so a screen can tell "nothing to run" from "nothing to measure by".
     """
+    if workers < 1:
+        raise ValueError(f"at least one worker runs the backtests, got {workers}")
     rate = backtest_rate(session)
     if rate is None:
         return None
     seconds_per_bar, based_on = rate
     bars = sum(calendar_bars(start, end, timeframe) for start, end, timeframe in runs)
-    return TimeEstimate(seconds=bars * seconds_per_bar, based_on=based_on)
+    return TimeEstimate(seconds=bars * seconds_per_bar / workers, based_on=based_on)
 
 
 def collection_rates(session: Session) -> CollectionRates | None:

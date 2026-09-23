@@ -243,3 +243,10 @@ class TestTheBudget:
         assert registered["run_backtest"].max_tries == MAX_TRIES
         # Stated on that job alone: the walk-forward keeps arq's default.
         assert "run_walk_forward" not in registered
+
+
+def test_a_worker_takes_one_backtest_at_a_time() -> None:
+    """A backtest is synchronous CPU: the jobs a worker took beyond the one it runs would sit
+    claimed and idle behind it — while another worker has nothing — and could time out unstarted.
+    More speed comes from more workers, never from more jobs per worker."""
+    assert WorkerSettings.max_jobs == 1

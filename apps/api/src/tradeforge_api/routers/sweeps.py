@@ -33,7 +33,7 @@ from sqlalchemy.orm import Session, defer, selectinload
 
 from tradeforge_api import sweep_dashboard as dashboard
 from tradeforge_api.coverage import describe, to_collect, uncovered_markets
-from tradeforge_api.deps import QueueDep, SessionDep
+from tradeforge_api.deps import QueueDep, SessionDep, SettingsDep
 from tradeforge_api.estimates import backtests_time
 from tradeforge_api.grid import GridPoint
 from tradeforge_api.queue import COLLECT_QUEUE, COLLECT_RANGE, RUN_BACKTEST
@@ -190,7 +190,9 @@ def _nothing_to_read(
 
 
 @router.post("/sweeps/preview", response_model=SweepPreview, responses={**_NOT_FOUND, **_BAD_BODY})
-def preview_sweep(request: PreviewSweepRequest, session: SessionDep) -> SweepPreview:
+def preview_sweep(
+    request: PreviewSweepRequest, session: SessionDep, settings: SettingsDep
+) -> SweepPreview:
     """What this sweep would enqueue, without enqueuing any of it.
 
     ⚠️ **The browser cannot answer this and must not try.** Whether a combination can run is the
@@ -264,6 +266,7 @@ def preview_sweep(request: PreviewSweepRequest, session: SessionDep) -> SweepPre
         backtest_time=backtests_time(
             session,
             ((request.date_from, request.date_to, doc.timeframe) for doc, _symbol in combinations),
+            workers=settings.tradeforge_workers,
         ),
         error=error,
     )

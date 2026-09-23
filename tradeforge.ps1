@@ -237,13 +237,19 @@ try {
         'up' {
             Start-DockerIfNeeded
             Write-Step 'docker compose up -d'
-            if ($Build) { docker compose up -d --build } else { docker compose up -d }
+            # Through Invoke-Native: compose writes its progress to stderr, and 5.1 would end the
+            # script on the first line of it -- before `web` was restarted and the agent started.
+            if ($Build) {
+                Invoke-Native { docker compose up -d --build }
+            } else {
+                Invoke-Native { docker compose up -d }
+            }
             if ($LASTEXITCODE -ne 0) { throw 'docker compose up failed.' }
             # A recreated `api` comes back on a new IP, and the web container's nginx resolved the
             # old one when it started: the screens answer 502 with every container healthy.
             # Restarting web costs a second and makes that impossible.
             Write-Step 'docker compose restart web'
-            docker compose restart web
+            Invoke-Native { docker compose restart web }
             if ($LASTEXITCODE -ne 0) { throw 'docker compose restart web failed.' }
             Write-Step 'Waiting for Redis'
             Wait-RedisHealthy
@@ -252,7 +258,7 @@ try {
         'down' {
             if (Test-Docker) {
                 Write-Step 'docker compose down'
-                docker compose down
+                Invoke-Native { docker compose down }
                 if ($LASTEXITCODE -ne 0) { throw 'docker compose down failed.' }
             }
             Stop-Agent

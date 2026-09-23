@@ -262,20 +262,23 @@ export type StopBufferTicks = number;
 export type VolumeFilter = boolean;
 export type Type11 = "mme9_breakout";
 export type BreakevenAtR1 = number | null;
+export type LongAveragePeriod1 = number | null;
 export type Period4 = number;
 export type StopBufferTicks1 = number;
 export type Type12 = "mme9_failed_turn";
 export type BreakevenAtR2 = number | null;
 export type Corrections = number;
+export type LongAveragePeriod2 = number | null;
 export type Period5 = number;
 export type StopBufferTicks2 = number;
 export type Type13 = "mme9_pullback";
 export type BreakevenAtR3 = number | null;
+export type LongAveragePeriod3 = number | null;
 export type Period6 = number;
 export type StopBufferTicks3 = number;
 export type Type14 = "mme9_turn";
 export type BreakevenAtR4 = number | null;
-export type LongAveragePeriod1 = number | null;
+export type LongAveragePeriod4 = number | null;
 export type Period7 = number;
 export type StopBufferTicks4 = number;
 export type VolumeFilter1 = boolean;
@@ -620,9 +623,15 @@ export interface Mme9FailedTurnSetup {
  * Two bars down and it is not this setup: whatever turns the line back up later is a 9.1.
  *
  * `breakeven_at_r` defaults to `null` — off — like the rest of the published family.
+ *
+ * `long_average_period` is his direction filter, offered on the published family since 22/09 and
+ * `null` — the default — is it **off**, which is this setup exactly as the book states it. Named,
+ * an order is placed only when the price it would **enter** at is beyond an exponential average
+ * of that period. It gates placing, never withdraws, and leaves an open trade alone.
  */
 export interface Mme9FailedTurnParams {
   breakeven_at_r?: BreakevenAtR1;
+  long_average_period?: LongAveragePeriod1;
   period?: Period4;
   side: TradeSide;
   stop_buffer_ticks?: StopBufferTicks1;
@@ -654,10 +663,16 @@ export interface Mme9PullbackSetup {
  *
  * `breakeven_at_r` defaults to `null` — off — for the same reason as the other published setups:
  * the source names an entry and a protective stop and nothing about moving one.
+ *
+ * `long_average_period` is his direction filter, offered on the published family since 22/09 and
+ * `null` — the default — is it **off**, which is this setup exactly as the book states it. Named,
+ * an order is placed only when the price it would **enter** at is beyond an exponential average
+ * of that period. It gates placing, never withdraws, and leaves an open trade alone.
  */
 export interface Mme9PullbackParams {
   breakeven_at_r?: BreakevenAtR2;
   corrections?: Corrections;
+  long_average_period?: LongAveragePeriod2;
   period?: Period5;
   side: TradeSide;
   stop_buffer_ticks?: StopBufferTicks2;
@@ -685,11 +700,19 @@ export interface Mme9TurnSetup {
  * a protective stop and says nothing about moving it. It is a parameter rather than a constant
  * so that "what would this earn with his 2x1 on top" stays askable.
  *
- * No `entry_point` and no `long_average_period`: the bar patterns and the direction filter are
- * the author's grafts onto his own setups, and this one is here to say what the book says.
+ * No `entry_point`: the bar patterns are the author's graft onto his own setups, and this one is
+ * here to say what the book says.
+ *
+ * `long_average_period` is his direction filter, offered here since 22/09 (*"nos setups da MME9
+ * aqueles que ainda não tem vamos pôr opção de filtro de média móvel igual no MME9 breakout"*)
+ * and `null` — the default — is the filter **off**, which is the published setup unchanged. Named,
+ * an order is placed only when the price it would **enter** at is beyond an exponential average
+ * of that period: above it for a buy, below it for a sell. It gates placing and never withdraws,
+ * and an open trade is conducted as before — the same rule as on his own 9.1.
  */
 export interface Mme9TurnParams {
   breakeven_at_r?: BreakevenAtR3;
+  long_average_period?: LongAveragePeriod3;
   period?: Period6;
   side: TradeSide;
   stop_buffer_ticks?: StopBufferTicks3;
@@ -733,7 +756,7 @@ export interface PontoContinuoParams {
   breakeven_at_r?: BreakevenAtR4;
   entry_point?: "classic" | "martelo" | "martelo_forca" | "gift" | "barra_ignorada";
   gift_stop?: "gift" | "forca";
-  long_average_period?: LongAveragePeriod1;
+  long_average_period?: LongAveragePeriod4;
   period?: Period7;
   side: TradeSide;
   stop_buffer_ticks?: StopBufferTicks4;

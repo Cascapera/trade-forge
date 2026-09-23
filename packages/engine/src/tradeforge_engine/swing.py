@@ -868,7 +868,7 @@ class Mme9TurnStrategy:
     Both are the author's, both are grafts onto his own setups, and neither is part of this one.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 — keyword-only; each names one knob of the setup
         self,
         *,
         side: Side = Side.LONG,
@@ -876,6 +876,7 @@ class Mme9TurnStrategy:
         name: str = "mme9turn",
         stop_buffer_ticks: int = 0,
         breakeven_at_r: Decimal | None = None,
+        long_average_period: int | None = None,
     ) -> None:
         if period < 1:
             raise ValueError(f"MME period must be >= 1, got {period}")
@@ -891,6 +892,11 @@ class Mme9TurnStrategy:
         self._breakeven_at_r = breakeven_at_r
         self._ema = EMA(period=period, source="close")
         self._trail_of_the_average = _AverageTrail()
+        self._long: LongAverageFilter | None = (
+            None
+            if long_average_period is None
+            else LongAverageFilter(period=long_average_period, side=side)
+        )
 
         self._armed: _Armed | None = None
         self._armed_count = 0
@@ -901,8 +907,13 @@ class Mme9TurnStrategy:
         self._slope = _Slope()
 
     def overlays(self) -> Mapping[str, Indicator]:
-        """The average this setup is defined by — see `protocols.Charted`."""
-        return {f"EMA {self._period}": self._ema}
+        """The average this setup is defined by, and the long one when the filter is on — see
+        `protocols.Charted`. A chart drawing only the MME9 would show entries being skipped with
+        nothing on it to say why."""
+        overlays: dict[str, Indicator] = {f"EMA {self._period}": self._ema}
+        if self._long is not None:
+            overlays[self._long.label] = self._long.indicator
+        return overlays
 
     def on_bar(  # noqa: PLR0911 — one flat return per rule, the shape the sibling uses too
         self, context: Context
@@ -911,6 +922,10 @@ class Mme9TurnStrategy:
         # Every bar feeds the average, open trade or not: the slope is a property of the line,
         # and a line fed only on the bars that reached the arming branch is a different line.
         self._ema.update(candle)
+        # And the filter's own, for the same reason — one fed only on the bars that reached it is
+        # a different average, and its curve would be drawn compressed (`_AverageTrail`).
+        if self._long is not None:
+            self._long.update(candle)
         average = self._ema.value()
         self._trail_of_the_average.record(candle, average)
 
@@ -960,6 +975,16 @@ class Mme9TurnStrategy:
             # trade would carry no risk. The turn is spent all the same — this bar was it.
             return tuple(signals)
 
+        if self._long is not None and not self._long.allows(entry.stop_price):
+            # His filter, on the price the break would enter at rather than on this bar's close
+            # (`LongAverageFilter`). Returning early is what makes it *place* nothing while
+            # withdrawing nothing: *"ela fica, só retira se o setup desconfigurar"*.
+            # ⚠️ **And the turn is gone with it**, because this setup's reference never moves:
+            # by the next bar the line has not bent again, so there is nothing left to arm. That
+            # is the filter doing its job on a setup whose arming is an event rather than a state.
+            logger.debug("long average refused the 9.1 turn at %s", candle.time)
+            return tuple(signals)
+
         # ⚠️ **Not reachable, and kept for the failure mode rather than for the coverage.**
         # `turned` requires the previous direction to have been against us, and the bar that made
         # it so left through the branch above, which withdrew and forgot whatever was resting — so
@@ -981,9 +1006,10 @@ class Mme9TurnStrategy:
                 reason=f"entry.{self._name}",
                 client_id=client_id,
                 # The average that bent, as a scalar for aggregation and as the curve that shows
-                # the bend. Neither can be derived from the other.
-                context={"average": average},
-                series=self._trail_of_the_average.series(),
+                # the bend. Neither can be derived from the other. The long one joins both when
+                # the filter is on: it is half of why this entry was allowed.
+                context=_entry_context(average, self._long),
+                series=self._trail_of_the_average.series() + _long_series(self._long),
             )
         )
         return tuple(signals)
@@ -1101,6 +1127,7 @@ class Mme9PullbackStrategy:
         name: str = "mme9pull",
         stop_buffer_ticks: int = 0,
         breakeven_at_r: Decimal | None = None,
+        long_average_period: int | None = None,
     ) -> None:
         if period < 1:
             raise ValueError(f"MME period must be >= 1, got {period}")
@@ -1119,6 +1146,11 @@ class Mme9PullbackStrategy:
         self._breakeven_at_r = breakeven_at_r
         self._ema = EMA(period=period, source="close")
         self._trail_of_the_average = _AverageTrail()
+        self._long: LongAverageFilter | None = (
+            None
+            if long_average_period is None
+            else LongAverageFilter(period=long_average_period, side=side)
+        )
 
         self._armed: _Armed | None = None
         self._armed_count = 0
@@ -1133,14 +1165,23 @@ class Mme9PullbackStrategy:
         self._spent = False
 
     def overlays(self) -> Mapping[str, Indicator]:
-        """The average this setup is defined by — see `protocols.Charted`."""
-        return {f"EMA {self._period}": self._ema}
+        """The average this setup is defined by, and the long one when the filter is on — see
+        `protocols.Charted`. A chart drawing only the MME9 would show entries being skipped with
+        nothing on it to say why."""
+        overlays: dict[str, Indicator] = {f"EMA {self._period}": self._ema}
+        if self._long is not None:
+            overlays[self._long.label] = self._long.indicator
+        return overlays
 
-    def on_bar(  # noqa: PLR0911 — one flat return per rule of the setup
+    def on_bar(  # noqa: PLR0911, PLR0912 — one flat return, and one branch, per rule of the setup
         self, context: Context
     ) -> tuple[Signal, ...]:
         candle = context.candle
         self._ema.update(candle)
+        # And the filter's own average on every bar, for the reason the trail is recorded on every
+        # bar: one fed only on the bars that reached it is a different average.
+        if self._long is not None:
+            self._long.update(candle)
         average = self._ema.value()
         self._trail_of_the_average.record(candle, average)
 
@@ -1197,6 +1238,13 @@ class Mme9PullbackStrategy:
         if entry is None:
             return tuple(signals)
 
+        if self._long is not None and not self._long.allows(entry.stop_price):
+            # His filter, on the price the break would enter at rather than on this bar's close
+            # (`LongAverageFilter`). Returning early is what makes it *place* nothing while
+            # withdrawing nothing: *"ela fica, só retira se o setup desconfigurar"*.
+            # The correction stands: this bar failed to be an entry, it did not undo one.
+            return tuple(signals)
+
         if self._armed is not None:
             # The trigger follows the newest bar of the correction, so what is resting is replaced
             # rather than left where the previous bar put it.
@@ -1216,8 +1264,11 @@ class Mme9PullbackStrategy:
                 # The average that allowed this, and the anchor the correction was measured
                 # against. Without the second one a chart of this entry shows a bar bought for no
                 # stated reason, because the anchor is the whole qualification.
-                context={"average": average, "reference_close": reference.close},
-                series=self._trail_of_the_average.series(),
+                context={
+                    **_entry_context(average, self._long),
+                    "reference_close": reference.close,
+                },
+                series=self._trail_of_the_average.series() + _long_series(self._long),
             )
         )
         return tuple(signals)
@@ -1344,7 +1395,7 @@ class Mme9FailedTurnStrategy:
     `breakeven_at_r` defaults to `None`, like the rest of the published family.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 — keyword-only; each names one knob of the setup
         self,
         *,
         side: Side = Side.LONG,
@@ -1352,6 +1403,7 @@ class Mme9FailedTurnStrategy:
         name: str = "mme9fail",
         stop_buffer_ticks: int = 0,
         breakeven_at_r: Decimal | None = None,
+        long_average_period: int | None = None,
     ) -> None:
         if period < 1:
             raise ValueError(f"MME period must be >= 1, got {period}")
@@ -1368,6 +1420,11 @@ class Mme9FailedTurnStrategy:
         self._ema = EMA(period=period, source="close")
         self._trail_of_the_average = _AverageTrail()
         self._slope = _Slope()
+        self._long: LongAverageFilter | None = (
+            None
+            if long_average_period is None
+            else LongAverageFilter(period=long_average_period, side=side)
+        )
 
         self._armed: _Armed | None = None
         self._armed_count = 0
@@ -1378,14 +1435,23 @@ class Mme9FailedTurnStrategy:
         self._dip: Money | None = None
 
     def overlays(self) -> Mapping[str, Indicator]:
-        """The average this setup is defined by — see `protocols.Charted`."""
-        return {f"EMA {self._period}": self._ema}
+        """The average this setup is defined by, and the long one when the filter is on — see
+        `protocols.Charted`. A chart drawing only the MME9 would show entries being skipped with
+        nothing on it to say why."""
+        overlays: dict[str, Indicator] = {f"EMA {self._period}": self._ema}
+        if self._long is not None:
+            overlays[self._long.label] = self._long.indicator
+        return overlays
 
     def on_bar(  # noqa: PLR0911 — one flat return per rule, the shape the siblings use too
         self, context: Context
     ) -> tuple[Signal, ...]:
         candle = context.candle
         self._ema.update(candle)
+        # And the filter's own average on every bar, for the reason the trail is recorded on every
+        # bar: one fed only on the bars that reached it is a different average.
+        if self._long is not None:
+            self._long.update(candle)
         average = self._ema.value()
         self._trail_of_the_average.record(candle, average)
 
@@ -1448,6 +1514,16 @@ class Mme9FailedTurnStrategy:
         if entry is None:
             return tuple(signals)
 
+        if self._long is not None and not self._long.allows(entry.stop_price):
+            # His filter, on the price the break would enter at rather than on this bar's close
+            # (`LongAverageFilter`). Returning early is what makes it *place* nothing while
+            # withdrawing nothing: *"ela fica, só retira se o setup desconfigurar"*.
+            # ⚠️ **And the pattern goes with it**, like the turn's: the failure bar is consumed
+            # by the very next bar either way, so there is nothing resting to keep and nothing to
+            # come back to. A 9.4 the filter refused is a 9.4 that did not happen.
+            logger.debug("long average refused the 9.4 at %s", candle.time)
+            return tuple(signals)
+
         self._armed_count += 1
         client_id = f"{self._name}-{candle.time:%Y%m%dT%H%M}-{self._armed_count}"
         self._armed = _Armed(reference=candle, client_id=client_id)
@@ -1463,8 +1539,11 @@ class Mme9FailedTurnStrategy:
                 # The average now, and the average at the bottom of its dip. The second one is the
                 # whole reason this entry exists and no column downstream would otherwise carry
                 # it: without it the record shows a breakout from an average that only ever rose.
-                context={"average": average, "average_at_failure": dip},
-                series=self._trail_of_the_average.series(),
+                context={
+                    **_entry_context(average, self._long),
+                    "average_at_failure": dip,
+                },
+                series=self._trail_of_the_average.series() + _long_series(self._long),
             )
         )
         return tuple(signals)

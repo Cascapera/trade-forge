@@ -246,6 +246,7 @@ def _mme9_turn(params: Mapping[str, object], _timeframe: dt.timedelta | None) ->
     _int(params, "period", kwargs)
     _int(params, "stop_buffer_ticks", kwargs)
     _optional_decimal(params, "breakeven_at_r", kwargs)
+    _optional_int(params, "long_average_period", kwargs)
     return _one_or_both(Mme9TurnStrategy, params, kwargs)
 
 
@@ -254,6 +255,7 @@ def _mme9_failed_turn(params: Mapping[str, object], _timeframe: dt.timedelta | N
     _int(params, "period", kwargs)
     _int(params, "stop_buffer_ticks", kwargs)
     _optional_decimal(params, "breakeven_at_r", kwargs)
+    _optional_int(params, "long_average_period", kwargs)
     return _one_or_both(Mme9FailedTurnStrategy, params, kwargs)
 
 
@@ -263,6 +265,7 @@ def _mme9_pullback(params: Mapping[str, object], _timeframe: dt.timedelta | None
     _int(params, "period", kwargs)
     _int(params, "stop_buffer_ticks", kwargs)
     _optional_decimal(params, "breakeven_at_r", kwargs)
+    _optional_int(params, "long_average_period", kwargs)
     return _one_or_both(Mme9PullbackStrategy, params, kwargs)
 
 

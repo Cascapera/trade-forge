@@ -138,6 +138,8 @@ _PROBES: dict[str, dict[str, tuple[Any, Any]]] = {
         "period": (21, 21),
         "stop_buffer_ticks": (3, 3),
         "breakeven_at_r": (3.3, Decimal("3.3")),
+        # His direction filter, offered on the published family since 22/09 and off by default.
+        "long_average_period": (200, 200),
     },
     # The published 9.2 and 9.3, which are one type and a count.
     "mme9_pullback": {
@@ -148,6 +150,8 @@ _PROBES: dict[str, dict[str, tuple[Any, Any]]] = {
         "period": (21, 21),
         "stop_buffer_ticks": (3, 3),
         "breakeven_at_r": (3.3, Decimal("3.3")),
+        # His direction filter, offered on the published family since 22/09 and off by default.
+        "long_average_period": (200, 200),
     },
     # The published 9.1. Four fields only: no bar patterns, no direction filter.
     "mme9_turn": {
@@ -157,6 +161,8 @@ _PROBES: dict[str, dict[str, tuple[Any, Any]]] = {
         # ⚠️ Probed with a number because the *default* is `None` here, the mirror of every other
         # setup: on this one it is the switched-on state that has to prove it reaches the class.
         "breakeven_at_r": (3.3, Decimal("3.3")),
+        # His direction filter, offered on the published family since 22/09 and off by default.
+        "long_average_period": (200, 200),
     },
     "ponto_continuo": {
         "side": ("short", Side.SHORT),

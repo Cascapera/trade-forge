@@ -317,6 +317,13 @@ export function useCreateBacktest() {
   })
 }
 
+/** Run a point again, keeping everything: what a sweep's run did not keep comes back this way. */
+export function useRerunBacktest() {
+  return useMutation<CreatedBacktest, Error, string>({
+    mutationFn: (id) => api.rerunBacktest(id),
+  })
+}
+
 export function useBacktest(id: string | undefined) {
   // `skipToken` disables the query when there is no id *and* narrows `id` to a string inside the
   // function — the v5 idiom that needs neither a cast nor a non-null assertion.

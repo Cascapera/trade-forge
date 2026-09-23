@@ -39,6 +39,7 @@ function listed(over: Partial<BacktestListItem>): BacktestListItem {
     cost_model: { type: 'none' },
     status: 'done',
     error: null,
+    recorded: 'full',
     created_at: '2026-08-06T12:00:00Z',
     finished_at: '2026-08-06T12:00:30Z',
     metrics,
@@ -86,6 +87,41 @@ describe('RunTable', () => {
     const run = listed({ status: 'running', metrics: null })
     renderWithProviders(<RunTable runs={[run]} seats={EMPTY_SEATS} onToggle={vi.fn()} />)
     expect(box(run)).toBeDisabled()
+  })
+
+  it('will not let a run that kept no curve be ticked, and says why', () => {
+    // A sweep's run keeps no equity curve (`Recorded`): ticking it would draw nothing while
+    // looking like a run that went nowhere.
+    for (const recorded of ['trades', 'metrics'] as const) {
+      const run = listed({ id: recorded, recorded })
+      const { unmount } = renderWithProviders(
+        <RunTable runs={[run]} seats={EMPTY_SEATS} onToggle={vi.fn()} />,
+      )
+      expect(box(run)).toBeDisabled()
+      expect(box(run)).toHaveAttribute(
+        'title',
+        'This run kept no equity curve — open it to run the point again',
+      )
+      unmount()
+    }
+  })
+
+  it('says what a sweep run kept, and nothing for one that kept everything', () => {
+    renderWithProviders(
+      <RunTable
+        runs={[
+          listed({ id: 'a', recorded: 'full' }),
+          listed({ id: 'b', recorded: 'trades' }),
+          listed({ id: 'c', recorded: 'metrics' }),
+        ]}
+        seats={EMPTY_SEATS}
+        onToggle={vi.fn()}
+      />,
+    )
+    expect(screen.getAllByText(/^kept:/).map((node) => node.textContent)).toEqual([
+      'kept: metrics and trades',
+      'kept: metrics only',
+    ])
   })
 
   it('reports the run that was ticked', () => {

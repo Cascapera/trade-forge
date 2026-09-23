@@ -40,6 +40,7 @@ from sqlalchemy.orm import Session
 from tradeforge_api.config import RedisConfig, Settings
 from tradeforge_api.grid import coordinates, label_for, read_point
 from tradeforge_api.queue import RUN_BACKTEST, progress_channel, redis_settings
+from tradeforge_api.retention import recorded_for
 from tradeforge_api.runner import ENGINE_VERSION, execute_backtest
 from tradeforge_api.walkforward import Candidate, choose
 from tradeforge_collector import read_candles
@@ -135,6 +136,8 @@ async def process_backtest(
             raise ValueError("backtest references a missing strategy or instrument")
 
         candles = read_candles(parquet_root, instrument.symbol, backtest.timeframe)
+        # A sweep's run keeps no pictures, so it does not build them either (`retention`).
+        in_sweep = backtest.sweep_id is not None
         trades, metrics, window = execute_backtest(
             definition=strategy.definition,
             instrument=instrument,
@@ -145,14 +148,24 @@ async def process_backtest(
             cost_model=backtest.cost_model,
             slippage_ticks=Decimal(0),
             candles=candles,
+            record_snapshots=not in_sweep,
         )
 
+        # Decided here and stamped on the run, never re-derived later: see `Recorded`.
+        recorded = recorded_for(
+            in_sweep=in_sweep,
+            timeframe=backtest.timeframe,
+            net_profit=metrics.net_profit,
+            total_trades=metrics.total_trades,
+        )
         metrics_row, trade_rows = to_rows(
             trades=trades,
             metrics=metrics,
             backtest_id=backtest.id,
             instrument_id=instrument.id,
+            recorded=recorded,
         )
+        backtest.recorded = recorded
         session.add(metrics_row)
         session.add_all(trade_rows)
         # Recorded on the run, not derived later: the Parquet underneath can be re-collected

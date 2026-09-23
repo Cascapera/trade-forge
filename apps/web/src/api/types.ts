@@ -59,6 +59,14 @@ export interface Metrics {
   avg_trade_duration: string | null
 }
 
+/**
+ * What a finished run kept of itself (2026-09-23). A sweep's runs keep less — see the server's
+ * `retention`: `trades` has no entry pictures and no equity curve, `metrics` has the metrics alone.
+ * A screen reads this to say what is missing and why, rather than drawing an empty chart as if
+ * the run had produced one. What was not kept comes back by running the point again.
+ */
+export type Recorded = 'full' | 'trades' | 'metrics'
+
 export interface Backtest {
   id: string
   strategy_id: string
@@ -70,6 +78,7 @@ export interface Backtest {
   status: BacktestStatus
   error: string | null
   engine_version: string
+  recorded: Recorded
   created_at: string
   started_at: string | null
   finished_at: string | null
@@ -115,6 +124,7 @@ export interface BacktestListItem {
   cost_model: Record<string, unknown>
   status: BacktestStatus
   error: string | null
+  recorded: Recorded
   created_at: string
   finished_at: string | null
   metrics: Metrics | null

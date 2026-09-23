@@ -19,6 +19,12 @@ const badge: Record<BacktestStatus, string> = {
   failed: 'bg-red-900 text-red-200',
 }
 
+/** What a sweep's run kept, in the words the row shows — see `Recorded`. */
+const KEPT = {
+  trades: 'kept: metrics and trades',
+  metrics: 'kept: metrics only',
+} as const
+
 const toneClass = { up: 'text-emerald-400', down: 'text-red-400', flat: 'text-slate-100' } as const
 
 /** The calendar day of an ISO instant — the granularity a window is actually read at. */
@@ -106,8 +112,10 @@ export function RunTable(props: {
           {props.runs.map((run) => {
             const metrics = run.metrics
             // Only a finished run has a curve to draw or metrics to line up. Ticking a queued one
-            // would put an empty series on the chart and a row of dashes in the comparison.
-            const comparable = run.status === 'done' && metrics !== null
+            // would put an empty series on the chart and a row of dashes in the comparison. And
+            // only one that kept its curve: a sweep's run did not (`Recorded`), and ticking it
+            // would draw nothing while looking like a run that went nowhere.
+            const comparable = run.status === 'done' && metrics !== null && run.recorded === 'full'
             const picked = isSelected(props.seats, run.id)
             const color = colorOf(props.seats, run.id)
             const blocked = !picked && full
@@ -135,11 +143,13 @@ export function RunTable(props: {
                       }}
                       aria-label={compareLabel(run)}
                       title={
-                        !comparable
-                          ? 'Only a finished run has a curve to compare'
-                          : blocked
-                            ? `Already comparing ${String(MAX_COMPARED)} runs — untick one first`
-                            : undefined
+                        run.status === 'done' && run.recorded !== 'full'
+                          ? 'This run kept no equity curve — open it to run the point again'
+                          : !comparable
+                            ? 'Only a finished run has a curve to compare'
+                            : blocked
+                              ? `Already comparing ${String(MAX_COMPARED)} runs — untick one first`
+                              : undefined
                       }
                       className="size-4 accent-sky-500 disabled:opacity-30"
                     />
@@ -153,6 +163,9 @@ export function RunTable(props: {
                     {run.strategy_name} v{run.strategy_version} · {day(run.date_from)} →{' '}
                     {day(run.date_to)}
                   </div>
+                  {run.recorded !== 'full' && (
+                    <div className="text-xs text-slate-500">{KEPT[run.recorded]}</div>
+                  )}
                 </td>
                 <td className="px-3 py-2">
                   <span className={`rounded px-2 py-1 text-xs font-medium ${badge[run.status]}`}>

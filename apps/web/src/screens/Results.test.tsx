@@ -10,6 +10,13 @@ vi.mock('../api/hooks', () => ({
   useCandles: vi.fn(),
   useOverlays: vi.fn(),
   useTradeSnapshot: vi.fn(),
+  useRerunBacktest: vi.fn(),
+}))
+
+const navigate = vi.fn()
+vi.mock('react-router-dom', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('react-router-dom')>()),
+  useNavigate: () => navigate,
 }))
 
 // Both charts draw to a canvas jsdom lacks; stub them out — each has its own test.
@@ -20,7 +27,14 @@ vi.mock('../components/PriceChart', () => ({
   ),
 }))
 
-import { useBacktest, useCandles, useEquity, useOverlays, useTrades } from '../api/hooks'
+import {
+  useBacktest,
+  useCandles,
+  useEquity,
+  useOverlays,
+  useRerunBacktest,
+  useTrades,
+} from '../api/hooks'
 import { Results } from './Results'
 
 const mockedBacktest = vi.mocked(useBacktest)
@@ -28,6 +42,8 @@ const mockedTrades = vi.mocked(useTrades)
 const mockedEquity = vi.mocked(useEquity)
 const mockedCandles = vi.mocked(useCandles)
 const mockedOverlays = vi.mocked(useOverlays)
+const mockedRerun = vi.mocked(useRerunBacktest)
+const rerun = vi.fn()
 
 const metrics: Metrics = {
   net_profit: '100',
@@ -61,6 +77,7 @@ function backtest(over: Partial<Backtest>): Backtest {
     status: 'queued',
     error: null,
     engine_version: '0.1.0',
+    recorded: 'full',
     created_at: '',
     started_at: null,
     finished_at: null,
@@ -113,6 +130,9 @@ function candles(over: Partial<CandlesResponse> = {}): CandlesResponse {
 }
 
 beforeEach(() => {
+  rerun.mockReset()
+  navigate.mockReset()
+  mockedRerun.mockReturnValue({ mutate: rerun, isPending: false, isError: false } as never)
   mockedTrades.mockReturnValue({ data: { total: 0, limit: 100, offset: 0, items: [] } } as never)
   mockedEquity.mockReturnValue({ data: [] } as never)
   mockedCandles.mockReturnValue({ data: candles(), isPending: false, isError: false } as never)
@@ -412,5 +432,62 @@ describe('Results, while the data is still being collected', () => {
     expect(
       screen.getByText(/A download this run needed failed: EURUSD H1 — the terminal said no/),
     ).toHaveTextContent('The run went ahead on the data already on disk.')
+  })
+})
+
+describe('Results, for a sweep run that kept less', () => {
+  it('says nothing about keeping when the run kept everything', () => {
+    stubBacktest({ isPending: false, isError: false, data: backtest({ status: 'done', metrics }) })
+    renderWithProviders(<Results />)
+    expect(screen.queryByRole('status', { name: 'what this run kept' })).not.toBeInTheDocument()
+    expect(mockedEquity).toHaveBeenLastCalledWith(undefined, true)
+  })
+
+  it('says the curve was not kept, and does not ask for it', () => {
+    stubBacktest({
+      isPending: false,
+      isError: false,
+      data: backtest({ status: 'done', metrics, recorded: 'trades' }),
+    })
+    renderWithProviders(<Results />, '/results/b1')
+    expect(screen.getByRole('status', { name: 'what this run kept' })).toHaveTextContent(
+      /kept its metrics and trades, but not the equity curve/,
+    )
+    expect(screen.getByText('Not kept by this run.')).toBeInTheDocument()
+    expect(screen.queryByText('equity chart')).not.toBeInTheDocument()
+    // Not asked for at all: the server answers 404 for what the run did not keep, and a failed
+    // query would read as a broken page.
+    expect(mockedEquity).toHaveBeenLastCalledWith(undefined, false)
+    expect(mockedTrades).toHaveBeenLastCalledWith(undefined, true)
+  })
+
+  it('says the trades were not kept, and how many there were', () => {
+    stubBacktest({
+      isPending: false,
+      isError: false,
+      data: backtest({ status: 'done', metrics: { ...metrics, total_trades: 12 }, recorded: 'metrics' }),
+    })
+    renderWithProviders(<Results />)
+    expect(screen.getByRole('status', { name: 'what this run kept' })).toHaveTextContent(
+      /kept its metrics only/,
+    )
+    expect(screen.getByText('Not kept by this run — 12 were made.')).toBeInTheDocument()
+    expect(mockedTrades).toHaveBeenLastCalledWith(undefined, false)
+  })
+
+  it('runs the point again and takes the reader to the new run', () => {
+    stubBacktest({
+      isPending: false,
+      isError: false,
+      data: backtest({ status: 'done', metrics, recorded: 'metrics' }),
+    })
+    renderWithProviders(<Results />)
+    fireEvent.click(screen.getByRole('button', { name: 'Run this point again with everything' }))
+
+    expect(rerun).toHaveBeenCalledTimes(1)
+    const [id, options] = rerun.mock.calls[0] as [string, { onSuccess: (c: { id: string }) => void }]
+    expect(id).toBe('b1')
+    options.onSuccess({ id: 'b2' })
+    expect(navigate).toHaveBeenCalledWith('/results/b2')
   })
 })

@@ -431,6 +431,10 @@ class BacktestOut(_Out):
     status: str
     error: str | None
     engine_version: str
+    recorded: str = "full"
+    """What the run kept: `full`, `trades` (no pictures, no equity curve) or `metrics` (the metrics
+    alone). A sweep's runs keep less (`retention`); a screen reads this to say what is missing and
+    why, instead of showing an empty chart as if the run had drawn one."""
     created_at: dt.datetime
     started_at: dt.datetime | None
     finished_at: dt.datetime | None
@@ -482,6 +486,9 @@ class BacktestListItem(_Out):
     cost_model: dict[str, Any]
     status: str
     error: str | None
+    recorded: str = "full"
+    """See `BacktestOut.recorded`. On the list because comparing curves starts here, and a run
+    with no curve must be told apart before it is ticked, not after."""
     created_at: dt.datetime
     finished_at: dt.datetime | None
     metrics: MetricsOut | None = None

@@ -67,6 +67,33 @@ class BacktestStatus(StrEnum):
     FAILED = "failed"
 
 
+class Recorded(StrEnum):
+    """What a finished run kept of itself (2026-09-23).
+
+    A sweep of hundreds of assets cannot keep everything, and what it keeps depends on the run: a
+    run judged worth reading keeps its trades, one that is not keeps only its metrics, and no run
+    of a sweep keeps the pictures or the equity curve. The engine is deterministic, so what was not
+    kept is recomputed by running the same point again.
+
+    ⚠️ **Written, never derived.** "Has a sweep_id and lost money" would say the same thing today
+    and a different thing the day the rule changes: a run judged under a 30-trade floor must not be
+    re-read under a 40-trade one and suddenly claim trades it never stored. The row says what was
+    kept on the day it was kept.
+    """
+
+    FULL = "full"
+    """Everything: metrics, trades, each entry's picture, the equity curve. A single backtest, a
+    study, a basket — anything a person reads run by run."""
+
+    TRADES = "trades"
+    """Metrics and trades, with each trade's context; no pictures, no equity curve. A sweep's run
+    that passed the bar (`tradeforge_api.retention`)."""
+
+    METRICS = "metrics"
+    """The metrics row alone. A sweep's run that did not pass the bar — kept because the losers are
+    the denominator every winner is judged against."""
+
+
 class SelectionMetric(StrEnum):
     """What a walk-forward fold maximises when it picks a winner from its training grid.
 
@@ -861,6 +888,14 @@ class Backtest(Base):
     )
     error: Mapped[str | None] = mapped_column(Text)
     engine_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    recorded: Mapped[Recorded] = mapped_column(
+        _enum(Recorded, "backtest_recorded"),
+        nullable=False,
+        default=Recorded.FULL,
+        server_default=Recorded.FULL.value,
+    )
+    """What this run kept — see `Recorded`. Meaningful once it is `done`; `full` before that, which
+    is what every run recorded before 2026-09-23 was."""
 
     created_at: Mapped[dt.datetime] = _created_at()
     started_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
@@ -978,7 +1013,10 @@ class BacktestMetrics(Base):
 
     # The equity curve is a time series, read whole and never queried by element —
     # a JSONB array, not ten thousand rows in a table nobody joins against.
-    equity_curve: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False)
+    # `NULL` is "not kept" (`Recorded`), never "empty": a sweep's run computes its curve — the
+    # drawdown and the CAGR above come from it — and does not store it. `[]` would claim a run
+    # that saw no bars.
+    equity_curve: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB)
 
     backtest: Mapped[Backtest] = relationship(back_populates="metrics")
 

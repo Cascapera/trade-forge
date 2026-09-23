@@ -2607,3 +2607,22 @@ estudos. O conserto agora tem precedente: o eixo aceitar `off` e o servidor trat
    contínuo**: `test_long_average_filter.py` não passa nenhum candle com posição aberta, então um
    mutante que pula o `update` durante o trade sobrevive lá. O teste que a PR-287 escreveu para os
    três publicados (`test_the_long_average_keeps_counting_while_a_trade_is_open`) é o molde.
+
+## Varredura guarda só o que precisa (PR-288) — o que ficou para depois
+
+Decidido com ele em 22–23/09, para varreduras de 500–800 ativos: run de varredura guarda **métricas
+sempre**, **trades só se passou na régua** (lucro líquido > 0 e mínimo de trades por gráfico: M1/M5
+60, M15/M30/H1 30, H4/D1/W1 nenhum) e **nunca** retrato nem curva de equity. `backtests.recorded`
+diz o que cada run guardou; o botão "re-rodar este ponto" reconstrói tudo (engine determinística).
+
+1. **Medir o "depois".** A mesma consulta de 22/09 (tamanho de retrato, curva e trades por run)
+   sobre uma varredura pequena real, com o Docker de pé e a fila vazia. Até lá o ganho é estimativa
+   (~549 kB → ~0,4 kB por run negativo).
+2. **As ~5 mil runs de varredura antigas continuam `full`** e ocupam os 2,9 GB de hoje. Limpar
+   retrato e curva delas é uma operação à parte, que pede o ok dele.
+3. **Os próximos passos do plano** (`docs/localdocs/banco-de-combinacoes-e-ml.md`, local): MFE/MAE
+   em R em cada trade; RR sem eixo = varredura sem alvo; features da decisão; decisões recusadas
+   gravadas; paralelizar os workers.
+4. **O teste de propriedade do retrato quase não exercita o Ponto Contínuo nem a continuação**:
+   caminhada aleatória raramente os qualifica. A chave vive no loop, fora do alcance dos setups, mas
+   um gerador de mercado que os qualifique fecharia a lacuna.

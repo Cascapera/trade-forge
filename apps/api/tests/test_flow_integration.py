@@ -22,10 +22,11 @@ from sqlalchemy import Engine, event, func, select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
+from tradeforge_api import retention
 from tradeforge_api.config import Settings
 from tradeforge_api.main import create_app
 from tradeforge_api.worker import process_backtest
-from tradeforge_db.models import BacktestMetrics, Instrument
+from tradeforge_db.models import Backtest, BacktestMetrics, Instrument, Sweep
 from tradeforge_engine.domain import AssetClass, Candle
 from tradeforge_engine.testing import bar
 
@@ -837,3 +838,135 @@ def test_a_retry_of_a_finished_run_leaves_its_result_alone(
         finally:
             reading.close()
         assert rows == 1
+
+
+# --------------------------------------------------------------------------- #
+# What a sweep's run keeps (`retention`, 2026-09-23)                           #
+# --------------------------------------------------------------------------- #
+
+
+def _into_a_sweep(session_factory: Callable[[], Session], backtest_id: str) -> None:
+    """Make a launched run a sweep's, the way `POST /sweeps` would have written it."""
+    session = session_factory()
+    try:
+        sweep = Sweep(
+            entry_ids=[],
+            symbols=["EURUSD"],
+            timeframes=["H1"],
+            date_from=START,
+            date_to=START + 100 * HOUR,
+            initial_capital=Decimal(10000),
+        )
+        session.add(sweep)
+        session.flush()
+        run = session.get(Backtest, uuid.UUID(backtest_id))
+        assert run is not None
+        run.sweep_id = sweep.id
+        session.commit()
+    finally:
+        session.close()
+
+
+def test_a_single_run_keeps_everything(
+    session_factory: Callable[[], Session],
+    settings: Settings,
+    tmp_path: Path,
+    collected: Callable[..., None],
+) -> None:
+    with _app(session_factory, settings, tmp_path, collected) as client:
+        backtest_id = _launch(client)
+        _work(session_factory, tmp_path, backtest_id)
+
+        assert client.get(f"/backtests/{backtest_id}").json()["recorded"] == "full"
+        trades = client.get(f"/backtests/{backtest_id}/trades").json()["items"]
+        assert [trade["has_snapshot"] for trade in trades] == [True]
+        assert client.get(f"/backtests/{backtest_id}/equity").status_code == 200
+
+
+def test_a_sweeps_run_below_the_floor_keeps_only_its_metrics(
+    session_factory: Callable[[], Session],
+    settings: Settings,
+    tmp_path: Path,
+    collected: Callable[..., None],
+) -> None:
+    """The fixture makes one trade and a profit on H1, where the floor is 30: a profit over one
+    trade is not a run worth reading trade by trade, so only the metrics stay — and every number a
+    sweep ranks by is still there."""
+    with _app(session_factory, settings, tmp_path, collected) as client:
+        backtest_id = _launch(client)
+        _into_a_sweep(session_factory, backtest_id)
+        _work(session_factory, tmp_path, backtest_id)
+
+        run = client.get(f"/backtests/{backtest_id}").json()
+        assert run["status"] == "done"
+        assert run["recorded"] == "metrics"
+        assert run["metrics"]["total_trades"] == 1
+        assert Decimal(run["metrics"]["net_profit"]) > 0
+
+        assert client.get(f"/backtests/{backtest_id}/trades").json()["items"] == []
+        equity = client.get(f"/backtests/{backtest_id}/equity")
+        assert equity.status_code == 404
+        assert "kept no equity curve" in equity.json()["detail"]
+
+
+def test_a_sweeps_run_over_the_floor_keeps_its_trades_without_pictures(
+    session_factory: Callable[[], Session],
+    settings: Settings,
+    tmp_path: Path,
+    collected: Callable[..., None],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same run with H1's floor lowered to one trade: now it passed, and its trades stay —
+    without the entry pictures, which the engine did not build, and without the curve."""
+    monkeypatch.setitem(retention.MIN_TRADES, "H1", 1)
+    with _app(session_factory, settings, tmp_path, collected) as client:
+        backtest_id = _launch(client)
+        _into_a_sweep(session_factory, backtest_id)
+        _work(session_factory, tmp_path, backtest_id)
+
+        assert client.get(f"/backtests/{backtest_id}").json()["recorded"] == "trades"
+        trades = client.get(f"/backtests/{backtest_id}/trades").json()["items"]
+        assert [trade["has_snapshot"] for trade in trades] == [False]
+        assert client.get(f"/backtests/{backtest_id}/equity").status_code == 404
+
+
+def test_running_a_sweeps_point_again_keeps_everything_and_changes_nothing(
+    session_factory: Callable[[], Session],
+    settings: Settings,
+    tmp_path: Path,
+    collected: Callable[..., None],
+) -> None:
+    """⚠️ The promise the whole cut rests on: what a sweep's run did not keep is rebuilt, exactly,
+    by running the point again. A new run in no sweep, so it keeps everything — and its metrics
+    are the sweep run's to the last digit, because the engine is deterministic."""
+    with _app(session_factory, settings, tmp_path, collected) as client:
+        backtest_id = _launch(client)
+        _into_a_sweep(session_factory, backtest_id)
+        _work(session_factory, tmp_path, backtest_id)
+
+        again = client.post(f"/backtests/{backtest_id}/rerun")
+        assert again.status_code == 202, again.text
+        again_id = again.json()["id"]
+        assert again_id != backtest_id
+        _work(session_factory, tmp_path, again_id)
+
+        original = client.get(f"/backtests/{backtest_id}").json()
+        rerun = client.get(f"/backtests/{again_id}").json()
+        assert rerun["recorded"] == "full"
+        assert rerun["metrics"] == original["metrics"]
+        assert client.get(f"/backtests/{again_id}/equity").status_code == 200
+        trades = client.get(f"/backtests/{again_id}/trades").json()["items"]
+        assert [trade["has_snapshot"] for trade in trades] == [True]
+
+
+def test_a_run_not_yet_finished_cannot_be_run_again(
+    session_factory: Callable[[], Session],
+    settings: Settings,
+    tmp_path: Path,
+    collected: Callable[..., None],
+) -> None:
+    with _app(session_factory, settings, tmp_path, collected) as client:
+        backtest_id = _launch(client)
+        refused = client.post(f"/backtests/{backtest_id}/rerun")
+        assert refused.status_code == 409
+        assert "queued" in refused.json()["detail"]

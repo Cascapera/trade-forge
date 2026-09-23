@@ -22,6 +22,7 @@ function run(id: string, netProfit: string | null): BacktestListItem {
     cost_model: { type: 'none' },
     status: netProfit === null ? 'queued' : 'done',
     error: null,
+    recorded: 'full',
     created_at: '2024-01-01T00:00:00Z',
     finished_at: null,
     metrics:

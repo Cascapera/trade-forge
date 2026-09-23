@@ -20,6 +20,7 @@ from tradeforge_db.models import (
     Dataset,
     ExitReason,
     Instrument,
+    Recorded,
     Strategy,
     Trade,
 )
@@ -42,6 +43,7 @@ __all__ = [
     "ExitReason",
     "Instrument",
     "PostgresSettings",
+    "Recorded",
     "Strategy",
     "Trade",
     "__version__",

@@ -43,6 +43,7 @@ function listed(over: Partial<BacktestListItem>): BacktestListItem {
     cost_model: { type: 'none' },
     status: 'done',
     error: null,
+    recorded: 'full',
     created_at: '2026-08-12T12:00:00Z',
     finished_at: '2026-08-12T12:00:30Z',
     metrics: { net_profit: '100' } as BacktestListItem['metrics'],

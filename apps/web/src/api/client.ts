@@ -146,6 +146,9 @@ export const api = {
   createBacktest: (payload: CreateBacktestRequest): Promise<CreatedBacktest> =>
     request('POST', '/backtests', payload),
   getBacktest: (id: string): Promise<Backtest> => request('GET', `/backtests/${id}`),
+  /** The same point as a new run that keeps everything — see `Recorded`. */
+  rerunBacktest: (id: string): Promise<CreatedBacktest> =>
+    request('POST', `/backtests/${id}/rerun`),
   getTrades: (id: string, limit = 100, offset = 0): Promise<TradesPage> =>
     request('GET', `/backtests/${id}/trades?limit=${String(limit)}&offset=${String(offset)}`),
   getEquity: (id: string): Promise<EquityPoint[]> => request('GET', `/backtests/${id}/equity`),

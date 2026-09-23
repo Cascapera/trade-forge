@@ -251,11 +251,15 @@ def execute_backtest(  # noqa: PLR0913 — keyword-only; each names one axis of 
     cost_model: Mapping[str, Any],
     slippage_ticks: Decimal,
     candles: Sequence[Candle],
+    record_snapshots: bool = True,
 ) -> tuple[list[ClosedTrade], EngineMetrics, CandleWindow]:
     """Run the strategy over the windowed candles and fold the result into the §5 metrics.
 
     Returns the window it actually read along with the result, so the caller can record what
     the run saw rather than what it was asked for.
+
+    `record_snapshots=False` builds no entry pictures — a sweep's run, which keeps none
+    (`retention`). The trades and metrics are the same either way (`loop.run`).
     """
     windowed = _candles_to_run(candles, instrument.symbol, timeframe, date_from, date_to)
 
@@ -274,6 +278,7 @@ def execute_backtest(  # noqa: PLR0913 — keyword-only; each names one axis of 
         strategy=compile_strategy(definition),
         broker=broker,
         risk=PercentRiskManager(percent=risk_percent(definition)),
+        record_snapshots=record_snapshots,
     )
     metrics = compute_metrics(
         trades=result.trades,

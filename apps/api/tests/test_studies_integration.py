@@ -186,6 +186,55 @@ def test_a_grid_becomes_one_strategy_one_run_and_one_job_per_combination(
     assert len(app.state.arq_pool.jobs) == 6
 
 
+def test_a_grid_over_the_target_stores_one_document_with_it_and_one_without(
+    session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+) -> None:
+    """His ask (22/09): search 2R against 3R against **no target**, in one study.
+
+    The axis names a leaf (`exit.take_profit.params.rr`) that may not exist — "no target" is not
+    an `rr` of anything, it is `take_profit: null`. This is the whole path: the grid goes over
+    HTTP, the server expands it, and what is *stored* is checked, because the document is what
+    the worker will run and the point's label is only a caption.
+    """
+    seeding = session_factory()
+    _seed_instruments(seeding)
+    seeding.close()
+
+    # ⚠️ No `exit.stop_loss`: a setup places its own stop from the reference bar, and the DSL
+    # refuses a document that names a second one (`semantic.py`). A target beside it is legal
+    # precisely because of that — the risk it multiplies is the setup's.
+    no_target = {**_strategy(), "exit": {"take_profit": None, "conditions": []}}
+    app = _app(settings, session_factory, tmp_path)
+    with TestClient(app) as client:
+        created = client.post("/strategies", json=no_target)
+        assert created.status_code == 201, created.text
+        launched = client.post(
+            "/studies",
+            json=_body(created.json()["id"], grid={"exit.take_profit.params.rr": [2.0, None]}),
+        )
+
+    assert launched.status_code == 202, launched.text
+    body = launched.json()
+    # Labelled by the multiple, not by the block — what naming the leaf buys.
+    assert [point["label"] for point in body["points"]] == ["rr=2.0", "rr=None"]
+
+    session = session_factory()
+    try:
+        stored = session.scalars(
+            select(Strategy).where(
+                Strategy.id.in_([point["strategy_id"] for point in body["points"]])
+            )
+        ).all()
+        targets = sorted(
+            (one.definition["exit"]["take_profit"] for one in stored),
+            key=lambda target: target is not None,
+        )
+    finally:
+        session.close()
+
+    assert targets == [None, {"type": "risk_multiple", "params": {"rr": 2.0}}]
+
+
 def test_every_point_runs_its_own_document_not_one_shared_strategy(
     session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
 ) -> None:

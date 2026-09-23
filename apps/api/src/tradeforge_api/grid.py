@@ -46,6 +46,24 @@ the validator does not already do, and would cost every caller a cast to say so.
 # unreachable axis, a repeated value — because those are not sizes.
 
 
+TAKE_PROFIT = "exit.take_profit"
+"""Where the target lives in a document — a **block**, or `null` for no target at all."""
+
+TAKE_PROFIT_RR = f"{TAKE_PROFIT}.params.rr"
+"""The one axis that does not name a value: it names a rule that may be absent (his ask, 22/09).
+
+Every other path substitutes a value into a container that is already there. This one has to
+build or remove the container: a target is `{"type": "risk_multiple", "params": {"rr": 3}}`, and
+"no target" is not an `rr` of anything — it is `take_profit: null`, which is what a setup that
+conducts its own stop wants to be compared against.
+
+⚠️ **The axis names the leaf, not the block, and that is the whole reason it is legible.** A grid
+over `exit.take_profit` would carry those dictionaries as its values: the point's label would read
+`take_profit={'type': 'risk_multiple', ...}`, the heatmap's axis would be objects, and the dataset
+column with it. Named at the leaf, the values stay `3` and `None` — which every reader already
+knows how to print, sort and plot, and `None` is the `off` the screen already writes."""
+
+
 class GridError(ValueError):
     """A grid that cannot be expanded into documents anyone should run."""
 
@@ -126,6 +144,9 @@ def _descend(current: Json, part: str, path: str, depth: int) -> Json:
 
 def _set(document: dict[str, Any], path: str, value: Any) -> None:  # noqa: ANN401
     """Substitute `value` at `path` in an already-copied document."""
+    if path == TAKE_PROFIT_RR:
+        _set_take_profit(document, value)
+        return
     container, key = _walk(document, path)
     if isinstance(container, list):
         container[int(key)] = value
@@ -136,6 +157,24 @@ def _set(document: dict[str, Any], path: str, value: Any) -> None:  # noqa: ANN4
         # that guarantee ever weakens this is the difference between a loud refusal and a
         # substitution that silently does nothing while the study reports N identical runs.
         raise GridError(f"{path!r} does not name a place a value can be put")
+
+
+def _set_take_profit(document: dict[str, Any], value: Any) -> None:  # noqa: ANN401
+    """Put a target of `value` times the risk on this document, or none at all for `None`.
+
+    Written rather than substituted because the block is what changes: a document saved without a
+    target has `take_profit: null`, so there is no `params` to reach into, and one saved with a
+    target must lose the whole block rather than keep an `rr` of nothing.
+
+    ⚠️ **The block is rebuilt, not patched.** `RiskMultipleParams` holds `rr` alone today; the day
+    it holds a second field, patching would carry the base document's value for it into every
+    point while the label claimed only `rr` varied. Rebuilding fails loudly instead — the new
+    field would be missing and the DSL would refuse the point.
+    """
+    container, key = _walk(document, TAKE_PROFIT)
+    if not isinstance(container, dict):  # pragma: no cover — `exit` is an object in every document
+        raise GridError(f"{TAKE_PROFIT!r} does not name a place a value can be put")
+    container[key] = None if value is None else {"type": "risk_multiple", "params": {"rr": value}}
 
 
 def _copy(value: Json) -> Json:
@@ -183,7 +222,9 @@ def _check_axes(document: Mapping[str, Any], grid: Mapping[str, Sequence[Any]]) 
         # takes the parameters it knows and ignores the rest. The study would then run N
         # identical backtests, produce N identical results, and draw a perfectly flat heatmap
         # that looks like a finding about the market.
-        _walk(dict(document), path)
+        # The target's axis is checked against the **block**, which every document has (as an
+        # object or as `null`): its leaf is exactly what may not be there yet.
+        _walk(dict(document), TAKE_PROFIT if path == TAKE_PROFIT_RR else path)
         if not values:
             raise GridError(f"{path!r} has no values to try")
         if len(set(map(repr, values))) != len(values):
@@ -243,6 +284,8 @@ def value_at(document: Mapping[str, Any], path: str) -> Any:  # noqa: ANN401
     axes; doing that from a caption means splitting on commas and equals signs, which works
     until a value contains one.
     """
+    if path == TAKE_PROFIT_RR:
+        return _take_profit_of(document)
     container, key = _walk(dict(document), path)
     if isinstance(container, list):
         return container[int(key)]
@@ -256,6 +299,25 @@ def value_at(document: Mapping[str, Any], path: str) -> Any:  # noqa: ANN401
     raise GridError(  # pragma: no cover — unreachable while `_walk` resolves the last segment
         f"{path!r} does not name a place a value can be read from"
     )
+
+
+def _take_profit_of(document: Mapping[str, Any]) -> Any:  # noqa: ANN401
+    """The R multiple this document targets, or `None` when it has no target at all.
+
+    The inverse of `_set_take_profit`, and it is what puts a run back on the axis it belongs to:
+    a heatmap reading `exit.take_profit.params.rr` off a document saved without a target must get
+    `None` — the value the grid was given — rather than a refusal about a path into `null`.
+    """
+    container, key = _walk(dict(document), TAKE_PROFIT)
+    target = container[key] if isinstance(container, dict) else None
+    if target is None:
+        return None
+    if not isinstance(target, dict):
+        raise GridError(f"{TAKE_PROFIT!r} holds {target!r}, which is not a target")
+    params = target.get("params")
+    if not isinstance(params, dict) or "rr" not in params:
+        raise GridError(f"{TAKE_PROFIT!r} holds a target with no {'rr'!r}")
+    return params["rr"]
 
 
 def read_point(document: Mapping[str, Any], grid: Mapping[str, Sequence[Any]]) -> dict[str, Any]:

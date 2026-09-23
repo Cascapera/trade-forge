@@ -50,6 +50,9 @@ describe('axesFor', () => {
       'setup.params.period',
       'setup.params.stop_buffer_ticks',
       'setup.params.volume_filter',
+      // Not a parameter of the setup: the target lives in `exit`, and since 22/09 it is an axis
+      // like any other — including its `off`, which is the run with no target at all.
+      'exit.take_profit.params.rr',
     ])
   })
 
@@ -148,5 +151,27 @@ describe('axesFor', () => {
     )
 
     expect(breakeven?.example.split(', ')).not.toContain('0')
+  })
+})
+
+describe('the target as an axis', () => {
+  it('offers it under every setup, with off spelled out', () => {
+    // His ask (22/09). `off` is the whole point — the run with no target, which a setup that
+    // conducts its own stop wants to be compared against — so the hint has to name the word.
+    const [target] = axesFor('ponto_continuo').filter(
+      (axis) => axis.path === 'exit.take_profit.params.rr',
+    )
+
+    expect(target?.label).toBe('take profit (R)')
+    expect(target?.hint).toBe(
+      'numbers greater than 0 and at most 100, or off for none, separated by commas',
+    )
+    expect(target?.example).toBe('2, 3, off')
+  })
+
+  it('is not offered where the path field is, since that would replace it', () => {
+    // A strategy built from indicators has no dropdown at all: the row is a free text field, and
+    // one option would take it away. The path can still be typed, and the server knows it.
+    expect(axesFor(null)).toEqual([])
   })
 })

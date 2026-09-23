@@ -2580,3 +2580,19 @@ medido em 22/09, com ~5 000 trades aleatórios nos cinco setups, os dois lados n
 ao mesmo tempo (o fechamento que desarma um é o que arma o outro). Volta a importar no dia em que um
 filtro ou um setup novo armar sem o cruzamento da média — aí vale um teste com a `BacktestBroker`
 real e as duas metades armadas.
+
+## O alvo virou eixo de grade (PR-286), e o filtro de média longa ainda não
+
+Pedido dele em 22/09: ao cadastrar uma variação no catálogo, escolher **vários riscos/retornos**,
+incluindo **sem alvo** — porque há setups que conduzem o stop sozinhos e o alvo atrapalha. Feito:
+o eixo é `exit.take_profit.params.rr`, com valores `off, 2, 3`. O servidor conhece esse caminho por
+nome (`grid.TAKE_PROFIT_RR`): um número **constrói** o bloco `{type: risk_multiple, params: {rr}}`,
+`off` o **apaga**, e a leitura inversa devolve `None` para um documento sem alvo, que é o que põe o
+run de volta no eixo no heatmap.
+
+⚠️ **O mesmo problema continua aberto em `long_average_period`** (anotado no teste de eixos): uma
+grade pode variar o período do filtro de média longa, mas **não pode pedir o filtro desligado**,
+porque `null` não é um valor que o eixo enumera — "com filtro contra sem filtro" ainda são dois
+estudos. O conserto agora tem precedente: o eixo aceitar `off` e o servidor tratar o `null` como
+"parâmetro ausente" em vez de "parâmetro nulo". ⚠️ Não é a mesma mecânica: ali o campo existe e é
+`None` legítimo, aqui o bloco inteiro some.

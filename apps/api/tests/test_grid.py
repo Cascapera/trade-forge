@@ -11,7 +11,15 @@ from typing import Any
 
 import pytest
 
-from tradeforge_api.grid import GridError, coordinates, expand, named, read_point, size_of
+from tradeforge_api.grid import (
+    GridError,
+    coordinates,
+    expand,
+    named,
+    read_point,
+    size_of,
+    value_at,
+)
 from tradeforge_schema import assert_executable
 from tradeforge_schema.models import Strategy
 
@@ -330,3 +338,108 @@ def test_a_point_that_switches_a_rule_off_is_named_for_it() -> None:
     # keeps its quotes there, so the unfiltered point reads as the absence it is rather than as
     # a timeframe called "None".
     assert names == ["base [htf=None]", "base [htf='H4']"]
+
+
+# --------------------------------------------------------------------------- #
+# The target's axis — a rule that may be absent (his ask, 22/09)                #
+# --------------------------------------------------------------------------- #
+
+_WITH_TARGET: dict[str, Any] = {
+    **_BASE,
+    "exit": {
+        "stop_loss": {"type": "candle_extreme", "params": {"lookback": 2, "side": "low"}},
+        "take_profit": {"type": "risk_multiple", "params": {"rr": 2.0}},
+        "conditions": [],
+    },
+}
+
+_WITHOUT_TARGET: dict[str, Any] = {
+    **_BASE,
+    "exit": {
+        "stop_loss": {"type": "candle_extreme", "params": {"lookback": 2, "side": "low"}},
+        "take_profit": None,
+        "conditions": [],
+    },
+}
+
+
+def _target(document: dict[str, Any]) -> Any:
+    return document["exit"]["take_profit"]
+
+
+class TestTheTargetAxis:
+    """`exit.take_profit.params.rr` names a leaf that may not exist, and that is the point: a
+    setup which conducts its own stop is compared against the same setup with a target."""
+
+    def test_a_number_builds_the_whole_block_and_off_removes_it(self) -> None:
+        points = expand(_WITH_TARGET, {"exit.take_profit.params.rr": [3, None]})
+
+        assert _target(points[0].document) == {"type": "risk_multiple", "params": {"rr": 3}}
+        assert _target(points[1].document) is None
+        # The base is untouched, as with every other axis.
+        assert _target(_WITH_TARGET) == {"type": "risk_multiple", "params": {"rr": 2.0}}
+
+    def test_a_document_saved_without_a_target_can_still_be_given_one(self) -> None:
+        """The case the axis exists for: `take_profit` is `null`, so there is no `params` to
+        substitute into, and an axis that walked to the leaf would refuse the grid."""
+        points = expand(_WITHOUT_TARGET, {"exit.take_profit.params.rr": [None, 5]})
+
+        assert _target(points[0].document) is None
+        assert _target(points[1].document) == {"type": "risk_multiple", "params": {"rr": 5}}
+
+    def test_the_point_is_labelled_by_the_multiple_not_by_the_block(self) -> None:
+        # What the leaf buys: `rr=3`, not a dictionary printed into a run's name.
+        [three, off] = expand(_WITH_TARGET, {"exit.take_profit.params.rr": [3, None]})
+
+        assert three.label == "rr=3"
+        assert off.label == "rr=None"
+
+    def test_a_document_with_no_exit_at_all_is_refused_loudly(self) -> None:
+        # The typo's defence, unchanged: a grid that reached nowhere would add a key nothing
+        # reads and draw a flat heatmap over N identical runs.
+        with pytest.raises(GridError, match="nothing at 'exit'"):
+            expand(_BASE, {"exit.take_profit.params.rr": [3]})
+
+    @pytest.mark.parametrize(
+        ("document", "expected"), [(_WITH_TARGET, 2.0), (_WITHOUT_TARGET, None)]
+    )
+    def test_a_point_is_read_back_off_its_own_document(
+        self, document: dict[str, Any], expected: Any
+    ) -> None:
+        """What puts a finished run back on the axis — the heatmap's question. Reading the leaf
+        directly would refuse the run that has no target, which is a point of the grid."""
+        assert read_point(document, {"exit.take_profit.params.rr": [None, 2.0]}) == {
+            "exit.take_profit.params.rr": expected
+        }
+
+    def test_a_target_that_is_not_a_target_is_refused_rather_than_read_as_none(self) -> None:
+        # `null` means "no target"; anything else there is a document nobody should run, and
+        # reading it as "no target" would file the run under a point it does not belong to.
+        broken = {**_BASE, "exit": {"take_profit": "5R", "conditions": []}}
+        with pytest.raises(GridError, match="not a target"):
+            value_at(broken, "exit.take_profit.params.rr")
+
+    def test_a_target_block_without_its_multiple_is_refused(self) -> None:
+        broken = {**_BASE, "exit": {"take_profit": {"type": "risk_multiple"}, "conditions": []}}
+        with pytest.raises(GridError, match="no 'rr'"):
+            value_at(broken, "exit.take_profit.params.rr")
+
+    def test_the_documents_it_builds_are_ones_the_dsl_accepts(self) -> None:
+        """The end of the contract: every point has to be a legal strategy, target or none.
+
+        ⚠️ Built from its own base, not from `_BASE`: that one carries a `take_profit_rr` the DSL
+        does not have — harmless to the paths the other tests walk, and fatal to a validation."""
+        legal = {
+            "schema_version": "1.0",
+            "name": "MME9 breakout",
+            "timeframe": "H1",
+            "setup": {"type": "mme9_breakout", "params": {"side": "long", "period": 9}},
+            "exit": {
+                "stop_loss": {"type": "candle_extreme", "params": {"lookback": 2, "side": "low"}},
+                "take_profit": None,
+                "conditions": [],
+            },
+            "risk": {"sizing": {"type": "percent_risk", "params": {"percent": 1.0}}},
+        }
+        for point in expand(legal, {"exit.take_profit.params.rr": [1.5, None]}):
+            Strategy.model_validate(point.document)

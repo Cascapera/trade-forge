@@ -171,6 +171,23 @@ def test_a_target_counts_up_to_the_fill_and_the_whole_adverse_side(side: Side) -
 
 
 @_SIDES
+def test_a_target_the_broker_armed_is_on_the_trade_and_no_rung_above_it_is_scored(
+    side: Side,
+) -> None:
+    """⚠️ Found by the integration suite, not by review. A target set as a multiple of the risk is
+    computed by the broker at the fill; the order never carried it, and for a while neither did
+    the trade. The ladder then read an exit at the 2 R target as the trade's own course and scored
+    the 3 R rung at +2 — a number for a target the trade never had a chance to reach."""
+    rows = [("100", "101", "99", "100"), ("100", "104", "99", "102"), ("102", "111", "101", "109")]
+    trade = _trade(side, rows, {0: [_entry(side)]}, rr="2")
+
+    assert trade.take_profit == _flip("110", side)
+    ladder = target_ladder([trade], AAPL, (Decimal(2), Decimal(3)))
+    assert ladder[Decimal(2)] is not None
+    assert ladder[Decimal(3)] is None
+
+
+@_SIDES
 def test_an_exit_at_the_open_saw_only_the_open(side: Side) -> None:
     """The strategy's exit, decided on bar 2, leaves at bar 3's open of 109 — a gap past the best
     price held so far, which the exit itself proves was traded. The rest of bar 3, 110 up and 103

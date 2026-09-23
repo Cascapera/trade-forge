@@ -89,6 +89,11 @@ export const doneRun = {
   status: 'done',
   error: null,
   engine_version: '0.1.0',
+  // Both present for the reason every key below is: the screen reads them, and a missing one is
+  // `undefined`, which walks past a `!== null` guard. Without `targets` the run page threw while
+  // drawing the ladder; without `recorded` it said this single run had kept less than it did.
+  recorded: 'full',
+  targets: null,
   created_at: '2024-01-01T00:00:00Z',
   started_at: '2024-01-01T00:00:01Z',
   finished_at: '2024-01-01T00:00:02Z',

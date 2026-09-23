@@ -15,7 +15,8 @@ from typing import Any
 import pytest
 
 from tradeforge_db.base import MONEY
-from tradeforge_db.models import ExitReason, Trade
+from tradeforge_db.models import BacktestMetrics as BacktestMetricsRow
+from tradeforge_db.models import ExitReason, Recorded, Trade
 from tradeforge_db.results import (
     _MONEY_QUANTUM,
     _trade_row,
@@ -320,6 +321,54 @@ def test_one_trade_row_is_built_per_closed_trade() -> None:
         instrument_id=INSTRUMENT_ID,
     )
     assert [row.net_pnl for row in rows] == [Decimal("100"), Decimal("-50"), Decimal("20")]
+
+
+# --------------------------------------------------------------------------- #
+# How much of the run is kept (`Recorded`, 2026-09-23)                          #
+# --------------------------------------------------------------------------- #
+
+
+def _kept(recorded: Recorded) -> tuple[Any, list[Trade]]:
+    return to_rows(
+        trades=[a_trade(net="100", snapshot=a_snapshot()), a_trade(net="-50")],
+        metrics=a_metrics(),
+        backtest_id=BACKTEST_ID,
+        instrument_id=INSTRUMENT_ID,
+        recorded=recorded,
+    )
+
+
+def test_full_keeps_the_curve_the_trades_and_their_pictures() -> None:
+    """The default, and what every run kept before a sweep's runs learned to keep less."""
+    metrics, trades = _kept(Recorded.FULL)
+    assert metrics.equity_curve is not None
+    assert len(trades) == 2
+    assert trades[0].snapshot != {}
+
+
+def test_trades_keeps_the_trades_without_their_pictures_or_the_curve() -> None:
+    """⚠️ The picture is dropped here even when the engine built one: the row must not depend on
+    the caller having remembered to switch it off upstream as well."""
+    metrics, trades = _kept(Recorded.TRADES)
+    assert metrics.equity_curve is None
+    assert [row.net_pnl for row in trades] == [Decimal("100"), Decimal("-50")]
+    assert [row.snapshot for row in trades] == [{}, {}]
+
+
+def test_metrics_keeps_the_metrics_alone() -> None:
+    metrics, trades = _kept(Recorded.METRICS)
+    assert metrics.equity_curve is None
+    assert trades == []
+
+
+@pytest.mark.parametrize("recorded", list(Recorded))
+def test_the_metrics_row_is_the_same_whatever_is_kept(recorded: Recorded) -> None:
+    """The curve is computed either way, and what it produced — drawdown, Sharpe, CAGR — is kept.
+    Only the curve itself goes, so every number a sweep ranks by is the same in all three."""
+    full, _ = _kept(Recorded.FULL)
+    other, _ = _kept(recorded)
+    columns = [c.key for c in BacktestMetricsRow.__table__.columns if c.key != "equity_curve"]
+    assert [getattr(other, c) for c in columns] == [getattr(full, c) for c in columns]
 
 
 # --------------------------------------------------------------------------- #

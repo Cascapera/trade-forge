@@ -1,8 +1,15 @@
 import { useMemo, useState } from 'react'
-import { Link, useParams } from 'react-router-dom'
+import { Link, useNavigate, useParams } from 'react-router-dom'
 
-import { useBacktest, useCandles, useEquity, useOverlays, useTrades } from '../api/hooks'
-import type { BacktestStatus, OverlaySeries, Zone } from '../api/types'
+import {
+  useBacktest,
+  useCandles,
+  useEquity,
+  useOverlays,
+  useRerunBacktest,
+  useTrades,
+} from '../api/hooks'
+import type { BacktestStatus, OverlaySeries, Recorded, Zone } from '../api/types'
 import { coverageNotice } from '../backtest/coverage'
 import { count } from '../format'
 import { EquityCurve } from '../components/EquityCurve'
@@ -25,6 +32,14 @@ function StatusBadge({ status }: { status: BacktestStatus }): React.JSX.Element 
 
 type Tab = 'results' | 'price'
 
+/** What a sweep's run left out, in a sentence — see `Recorded`. `full` needs none. */
+const LEFT_OUT: Record<Exclude<Recorded, 'full'>, string> = {
+  trades:
+    'This run belongs to a sweep and kept its metrics and trades, but not the equity curve or the picture of each entry.',
+  metrics:
+    'This run belongs to a sweep and kept its metrics only: it did not pass the bar for keeping trades (a profit, and enough trades for its chart).',
+}
+
 // A module constant, not `[]` inline: a fresh array each render would recompute every curve
 // and rebuild the chart, throwing away the zoom the reader had set.
 const EMPTY_SERIES: OverlaySeries[] = []
@@ -39,8 +54,13 @@ export function Results(): React.JSX.Element {
   const { id } = useParams()
   const backtest = useBacktest(id)
   const done = backtest.data?.status === 'done'
-  const trades = useTrades(id, done)
-  const equity = useEquity(id, done)
+  const recorded = backtest.data?.recorded ?? 'full'
+  // Asked for only when the run kept them: a sweep's run answers 404 for what it did not keep,
+  // and a failed query there would read as a broken page rather than a deliberate absence.
+  const trades = useTrades(id, done && recorded !== 'metrics')
+  const equity = useEquity(id, done && recorded === 'full')
+  const rerun = useRerunBacktest()
+  const navigate = useNavigate()
 
   const [tab, setTab] = useState<Tab>('results')
   // Which trade the price chart is looking at. Lives here rather than in either component,
@@ -141,6 +161,37 @@ export function Results(): React.JSX.Element {
         </p>
       )}
 
+      {run.status === 'done' && run.recorded !== 'full' && (
+        <div
+          role="status"
+          aria-label="what this run kept"
+          className="flex flex-wrap items-center justify-between gap-3 rounded border border-slate-700 bg-slate-900/60 p-4 text-sm text-slate-300"
+        >
+          <p>
+            {LEFT_OUT[run.recorded]} Running the point again rebuilds everything. The engine is
+            deterministic, so the new run is this one exactly — unless the candles for this window
+            were re-collected or the engine changed since; the new run records both.
+          </p>
+          <button
+            type="button"
+            disabled={rerun.isPending}
+            onClick={() => {
+              rerun.mutate(run.id, {
+                onSuccess: (created) => {
+                  void navigate(`/results/${created.id}`)
+                },
+              })
+            }}
+            className="rounded bg-sky-700 px-3 py-1.5 font-medium text-white hover:bg-sky-600 disabled:opacity-50"
+          >
+            {rerun.isPending ? 'Queueing…' : 'Run this point again with everything'}
+          </button>
+          {rerun.isError && (
+            <p className="w-full text-red-400">Could not queue the run: {rerun.error.message}</p>
+          )}
+        </div>
+      )}
+
       {run.status === 'done' && run.metrics !== null && (
         <>
           <div role="tablist" aria-label="Backtest views" className="flex gap-1 border-b border-slate-800">
@@ -171,10 +222,19 @@ export function Results(): React.JSX.Element {
               <MetricCards metrics={run.metrics} />
               <section>
                 <h3 className="mb-2 font-medium">Equity curve</h3>
-                {equity.data !== undefined && <EquityCurve points={equity.data} />}
+                {run.recorded !== 'full' ? (
+                  <p className="text-sm text-slate-500">Not kept by this run.</p>
+                ) : (
+                  equity.data !== undefined && <EquityCurve points={equity.data} />
+                )}
               </section>
               <section>
                 <h3 className="mb-2 font-medium">Trades</h3>
+                {run.recorded === 'metrics' && (
+                  <p className="text-sm text-slate-500">
+                    Not kept by this run — {count(run.metrics.total_trades)} were made.
+                  </p>
+                )}
                 {trades.data !== undefined && (
                   <TradesTable
                     trades={trades.data.items}

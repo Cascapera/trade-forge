@@ -59,6 +59,7 @@ function listed(over: Partial<BacktestListItem>): BacktestListItem {
     cost_model: { type: 'spread', spread_points: '12' },
     status: 'done',
     error: null,
+    recorded: 'full',
     created_at: '2026-08-06T12:00:00Z',
     finished_at: '2026-08-06T12:00:30Z',
     metrics,

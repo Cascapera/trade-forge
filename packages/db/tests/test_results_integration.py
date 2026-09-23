@@ -170,6 +170,7 @@ def test_a_run_persists_and_reads_back(session: Session) -> None:
     assert summary.total_trades == 2
     assert summary.long_trades == 1
     assert summary.short_trades == 1
+    assert summary.equity_curve is not None
     assert [point["equity"] for point in summary.equity_curve] == ["10000", "10200", "10100"]
 
 

@@ -157,6 +157,7 @@ def iter_run(  # noqa: PLR0913 — keyword-only; see run()
     broker: Broker,
     risk: RiskManager,
     refusals: tuple[Refusal, ...] = (),
+    record_snapshots: bool = True,
 ) -> Iterator[BarOutcome]:
     """The loop itself, one `BarOutcome` at a time, for as long as candles keep arriving.
 
@@ -193,6 +194,8 @@ def iter_run(  # noqa: PLR0913 — keyword-only; see run()
     handed to the next bar on which the strategy speaks, and for these that is the first one
     there is. A backtest has no hand-over and therefore no producer, which is why `run()` does
     not take this: a parameter nothing can fill is a promise nobody can keep.
+
+    `record_snapshots=False` builds no `EntrySnapshot` for any order — see `run`.
     """
     if timeframe <= dt.timedelta(0):
         raise ValueError(f"timeframe must be positive, got {timeframe}")
@@ -209,6 +212,7 @@ def iter_run(  # noqa: PLR0913 — keyword-only; see run()
         broker=broker,
         risk=risk,
         refusals=refusals,
+        record_snapshots=record_snapshots,
     )
 
 
@@ -220,6 +224,7 @@ def run(  # noqa: PLR0913 — keyword-only; each one names a real axis of a back
     strategy: Strategy,
     broker: Broker,
     risk: RiskManager,
+    record_snapshots: bool = True,
 ) -> RunResult:
     """Drive a strategy over a stream of closed candles, to the end, and report.
 
@@ -237,6 +242,13 @@ def run(  # noqa: PLR0913 — keyword-only; each one names a real axis of a back
     ⚠️ **To the end.** Handed a stream that never ends — a live one — this never returns, and
     the lists below grow without bound. That is not a defect to be patched here; it is what
     `iter_run` is for.
+
+    `record_snapshots=False` is for a run nobody will read trade by trade — a sweep's (2026-09-23).
+    No entry carries the window of bars it was decided on, so no trade carries a picture. It is a
+    record-keeping switch and **nothing else**: the window is only ever copied into the order,
+    never read by a decision, so trades, fills and equity come out identical either way
+    (`test_snapshots_off_change_nothing_but_the_snapshots`). It is not built and dropped later
+    because the copy is the cost — up to 51 bars per entry, over millions of runs.
     """
     fills: list[Fill] = []
     refusals: list[Refusal] = []
@@ -250,6 +262,7 @@ def run(  # noqa: PLR0913 — keyword-only; each one names a real axis of a back
         strategy=strategy,
         broker=broker,
         risk=risk,
+        record_snapshots=record_snapshots,
     ):
         fills.extend(outcome.fills)
         refusals.extend(outcome.refusals)
@@ -282,6 +295,7 @@ def _iter_run(  # noqa: PLR0913 — see run()
     broker: Broker,
     risk: RiskManager,
     refusals: tuple[Refusal, ...] = (),
+    record_snapshots: bool = True,
 ) -> Iterator[BarOutcome]:
     previous: Candle | None = None
     # Refusals born on the bar before the one about to run, waiting to be shown to the strategy.
@@ -303,7 +317,10 @@ def _iter_run(  # noqa: PLR0913 — see run()
     # SNAPSHOT_BARS_BEFORE. The loop owns it because the loop is the only component that sees
     # the stream, in backtest and in live alike, and because it is here that `decided_at` is
     # stamped: the window and the instant the anti-lookahead guard checks come from one place.
-    window: deque[Candle] = deque(maxlen=SNAPSHOT_BARS_BEFORE + 1)
+    # `None` when nothing is recorded: no window, so no order can be handed one (`run`).
+    window: deque[Candle] | None = (
+        deque(maxlen=SNAPSHOT_BARS_BEFORE + 1) if record_snapshots else None
+    )
 
     for index, candle in enumerate(candles):
         # The engine's arithmetic is pinned for the whole of a bar's work and released before
@@ -315,7 +332,8 @@ def _iter_run(  # noqa: PLR0913 — see run()
             # Before anything else looks at this bar. The strategy is about to be shown it, so
             # it belongs in any window describing what the strategy had seen — and nothing
             # below can decide an entry without it being the window's last bar.
-            window.append(candle)
+            if window is not None:
+                window.append(candle)
 
             outcome, gates = _step(
                 index=index,
@@ -371,7 +389,7 @@ def _step(  # noqa: PLR0913 — one bar of the loop; every argument is a seam or
     *,
     index: int,
     candle: Candle,
-    window: deque[Candle],
+    window: deque[Candle] | None,
     timeframe: dt.timedelta,
     instrument: InstrumentSpec,
     strategy: Strategy,
@@ -545,7 +563,7 @@ def _to_order(
     context: Context,
     instrument: InstrumentSpec,
     risk: RiskManager,
-    window: Iterable[Candle],
+    window: Iterable[Candle] | None,
 ) -> OrderRequest | Refusal:
     """Turn intent into a sized order, or into the reason it did not become one.
 
@@ -611,7 +629,10 @@ def _to_order(
         # Entries only. An exit has already returned above, and neither a cancel nor a stop
         # modification ever becomes an order — so every window built here ends on the bar the
         # strategy is being shown right now, which is what `decided_at` says one line up.
-        snapshot=EntrySnapshot(
+        # No window is a run that records no pictures (`run`), and the order carries none.
+        snapshot=None
+        if window is None
+        else EntrySnapshot(
             bars=tuple(window),
             decided_at=context.candle.time,
             regions=signal.regions,

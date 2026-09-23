@@ -122,6 +122,7 @@ def list_item(
         cost_model=run.cost_model,
         status=run.status,
         error=run.error,
+        recorded=run.recorded,
         created_at=run.created_at,
         finished_at=run.finished_at,
         metrics=(None if run.metrics is None else MetricsOut.model_validate(run.metrics)),
@@ -345,6 +346,55 @@ async def create_backtest(
     return backtest
 
 
+@router.post(
+    "/backtests/{backtest_id}/rerun",
+    response_model=CreatedBacktest,
+    status_code=status.HTTP_202_ACCEPTED,
+    responses={**_NOT_FOUND, status.HTTP_409_CONFLICT: {"description": "not finished"}},
+)
+async def rerun_backtest(backtest_id: uuid.UUID, session: SessionDep, queue: QueueDep) -> Backtest:
+    """Run the same point again, keeping everything — for a sweep's run that did not (2026-09-23).
+
+    A sweep's run keeps its metrics and, at most, its trades (`retention`); the pictures and the
+    equity curve are rebuilt on demand, and this is the demand. The engine is deterministic, so the
+    new run is the same run with everything kept: same strategy version, market, chart, window,
+    capital and costs.
+
+    ⚠️ **A new, separate run, in no sweep.** Writing the pictures into the sweep's own row would
+    make a sweep whose runs keep different things depending on which ones somebody opened — and
+    the new run keeps `full` precisely because it belongs to no sweep.
+
+    ⚠️ **Exactly the same run only if nothing underneath moved.** It reads today's Parquet under
+    today's engine: candles re-collected inside the window, or an engine change, and the two runs
+    can differ. Both are recorded on each run (`candles_seen`, `first_candle`, `last_candle`,
+    `engine_version`), so a difference can be seen rather than assumed away.
+
+    Only a finished run: one still queued or running has nothing yet to be run again.
+    """
+    source = _load(session, backtest_id)
+    if source.status is not BacktestStatus.DONE:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"only a finished run can be run again; this one is {source.status}",
+        )
+    again = Backtest(
+        strategy_id=source.strategy_id,
+        instrument_id=source.instrument_id,
+        timeframe=source.timeframe,
+        date_from=source.date_from,
+        date_to=source.date_to,
+        initial_capital=source.initial_capital,
+        cost_model=source.cost_model,
+        status=BacktestStatus.QUEUED,
+        engine_version=ENGINE_VERSION,
+    )
+    session.add(again)
+    session.commit()
+    session.refresh(again)
+    await queue.enqueue_job(RUN_BACKTEST, str(again.id))
+    return again
+
+
 @router.get("/backtests", response_model=BacktestsPage)
 def list_backtests(  # noqa: PLR0913 — one filter per column a run is chosen by
     session: SessionDep,
@@ -519,13 +569,21 @@ def get_trade_snapshot(
     responses=_NOT_FOUND,
 )
 def get_equity(backtest_id: uuid.UUID, session: SessionDep) -> list[EquityPointOut]:
-    """The equity curve, once the run has finished. 404 while there are no results yet."""
+    """The equity curve, once the run has finished. 404 while there are no results yet, and 404
+    for a run that finished without keeping it — a sweep's (`Recorded`). Two different details,
+    because "not yet" and "never" ask different things of the reader: wait, or run it again."""
     backtest = _load(session, backtest_id)
     if backtest.metrics is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="backtest has no results yet"
         )
-    return [EquityPointOut.model_validate(point) for point in backtest.metrics.equity_curve]
+    curve = backtest.metrics.equity_curve
+    if curve is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="this run kept no equity curve; run the point again to see it",
+        )
+    return [EquityPointOut.model_validate(point) for point in curve]
 
 
 @router.get(

@@ -28,12 +28,13 @@ the backtest it was supposed to reproduce.
 
 from __future__ import annotations
 
+import dataclasses
 import uuid
 from collections.abc import Mapping, Sequence
 from decimal import Decimal
 from typing import Any
 
-from tradeforge_db.models import BacktestMetrics, ExitReason, Trade
+from tradeforge_db.models import BacktestMetrics, ExitReason, Recorded, Trade
 from tradeforge_engine.domain import ClosedTrade, EntrySnapshot, EquityPoint, Position
 from tradeforge_engine.metrics import BacktestMetrics as RunMetrics
 
@@ -88,6 +89,7 @@ def to_rows(
     metrics: RunMetrics,
     backtest_id: uuid.UUID,
     instrument_id: uuid.UUID,
+    recorded: Recorded = Recorded.FULL,
 ) -> tuple[BacktestMetrics, list[Trade]]:
     """The finished run as persistable rows: one metrics row, one trade row per round trip.
 
@@ -95,10 +97,28 @@ def to_rows(
     — this function only translates. `backtest_id` and `instrument_id` are the foreign keys
     the run belongs to; the engine's `ClosedTrade` carries a symbol, but the database keys on
     the instrument's UUID, which only the caller knows.
+
+    `recorded` is how much of the run to keep (`Recorded`), decided by the caller and stamped by
+    it on the run: `full` is everything; `trades` drops the equity curve and every entry's picture;
+    `metrics` drops the trades too. The metrics row itself is identical in all three — the curve
+    was computed either way, and what it produced (drawdown, CAGR) is kept.
     """
     metrics_row = _metrics_row(metrics, backtest_id)
-    trade_rows = [_trade_row(trade, instrument_id, backtest_id=backtest_id) for trade in trades]
-    return metrics_row, trade_rows
+    if recorded is Recorded.FULL:
+        return metrics_row, [
+            _trade_row(trade, instrument_id, backtest_id=backtest_id) for trade in trades
+        ]
+    metrics_row.equity_curve = None
+    if recorded is Recorded.METRICS:
+        return metrics_row, []
+    # Pictures dropped here as well as not built upstream (`run(record_snapshots=False)`): the
+    # row must not depend on the caller having remembered both halves.
+    return metrics_row, [
+        _trade_row(
+            dataclasses.replace(trade, snapshot=None), instrument_id, backtest_id=backtest_id
+        )
+        for trade in trades
+    ]
 
 
 def closed_trade_row(

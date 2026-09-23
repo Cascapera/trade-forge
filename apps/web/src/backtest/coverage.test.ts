@@ -13,6 +13,7 @@ function run(over: Partial<Backtest>): Backtest {
     status: 'done',
     error: null,
     engine_version: '0.1.0',
+    recorded: 'full',
     created_at: '',
     started_at: null,
     finished_at: null,

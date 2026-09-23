@@ -2626,3 +2626,17 @@ diz o que cada run guardou; o botão "re-rodar este ponto" reconstrói tudo (eng
 4. **O teste de propriedade do retrato quase não exercita o Ponto Contínuo nem a continuação**:
    caminhada aleatória raramente os qualifica. A chave vive no loop, fora do alcance dos setups, mas
    um gerador de mercado que os qualifique fecharia a lacuna.
+
+## MFE/MAE em cada trade (PR-289) — o que ficou para depois
+
+1. **Ao vivo, um fill atrasado pode superestimar o MFE.** O broker ao vivo assume que todo fill
+   drenado aconteceu no candle que acabou de fechar. Um stop executado nos últimos segundos do
+   candle N que só chega depois de `on_bar(N)` faz o candle N ser lido inteiro — inclusive uma
+   máxima impressa depois da saída. É o único caminho para um MFE alto demais; só no ao vivo, nunca
+   em backtest ou varredura. Conserto: comparar `fill.time` com o candle antes de ler o candle.
+2. **`with_target` é exato por trade, não por run**: com alvo, um trade termina antes e pode abrir
+   espaço para uma entrada que a run sem alvo não viu. Medir o tamanho desse efeito por setup antes
+   de confiar em somas de alvos derivados (o guardião mediu 0 divergências de acerto em 889 pares,
+   mas comparando só até a primeira divergência de sequência).
+3. **`testing.ImmediateFillBroker` não observa excursões**: seus trades saem com MFE = MAE = entrada
+   (`mfe_r = 0`), não `None`. Só afeta testes.

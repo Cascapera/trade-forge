@@ -176,6 +176,10 @@ def _trade_row(
         costs=costs,
         net_pnl=gross_pnl - costs,
         r_multiple=trade.r_multiple,
+        mfe_price=trade.mfe_price,
+        mae_price=trade.mae_price,
+        mfe_r=trade.mfe_r,
+        mae_r=trade.mae_r,
         context=_context(trade.context),
         snapshot=_snapshot(trade.snapshot),
     )
@@ -375,6 +379,10 @@ def close_trade_values(trade: ClosedTrade) -> dict[str, Any]:
         "costs": costs,
         "net_pnl": gross_pnl - costs,
         "r_multiple": trade.r_multiple,
+        "mfe_price": trade.mfe_price,
+        "mae_price": trade.mae_price,
+        "mfe_r": trade.mfe_r,
+        "mae_r": trade.mae_r,
     }
 
 

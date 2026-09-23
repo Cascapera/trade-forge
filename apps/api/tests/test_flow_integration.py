@@ -348,6 +348,10 @@ def test_create_enqueue_run_and_read(
         assert len(trades["items"]) == trades["total"]
         first = trades["items"][0]
         assert first["direction"] in {"long", "short"}
+        # How far it went, measured by the engine and stored through migration 0022.
+        assert first["mfe_r"] is not None
+        assert Decimal(first["mfe_r"]) >= 0
+        assert Decimal(first["mae_r"]) >= 0
         assert isinstance(first["net_pnl"], str)  # money is a string on the wire, never a float
 
         _assert_the_snapshot_is_advertised_then_served(client, backtest_id, strategy_id, first)

@@ -601,6 +601,11 @@ class TradeOut(_Out):
     costs: Money | None
     net_pnl: Money | None
     r_multiple: Money | None
+    mfe_r: Money | None = None
+    """How far the trade went in its favour, in R of its initial stop — gross of costs, and read
+    against the trade on an ambiguous bar, so it can only err low. `None` when not measured."""
+    mae_r: Money | None = None
+    """How far against, in the same unit; it can only err high."""
     context: dict[str, str | None]
     has_snapshot: bool = Field(
         default=False,

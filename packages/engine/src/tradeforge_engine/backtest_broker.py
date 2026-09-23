@@ -422,6 +422,9 @@ class BacktestBroker:
         # construction (give or take slippage, which is a tick or two either side of it), so
         # it never held the market past the first tick and never sets this.
         held_past_open = False
+        # Whether the position standing at the close was born *inside* this bar — by a resting
+        # order that did not fill at the open. Its bar's favourable extreme may predate it.
+        born_inside = False
 
         carried = self._check_protective(candle)
         if carried is not None:
@@ -473,14 +476,20 @@ class BacktestBroker:
                 # tick, and the whole bar belongs to the position. Same test as steps 1 and 3,
                 # for the same reason; hard-coding `True` would deny a position the target its
                 # bar demonstrably reached.
-                same_bar = self._check_protective(
-                    candle, born_this_bar=resting.price != candle.open
-                )
+                born_inside = resting.price != candle.open
+                same_bar = self._check_protective(candle, born_this_bar=born_inside)
                 if same_bar is not None:
                     fills.append(same_bar)
 
-        # 5. Value the account at the close (obligation of the protocol: the loop reads equity
-        #    straight after this, once per bar).
+        # 5. A position still open at the close lived through this bar — all of it, unless it was
+        #    born inside it, in which case the favourable extreme may predate the fill and only
+        #    the adverse one is the position's (`Position.best_price`). Then value the account
+        #    at the close (obligation of the protocol: the loop reads equity straight after
+        #    this, once per bar).
+        self._portfolio.observe_bar(candle, favourable=not born_inside)
+        # The close is the bar's last tick, after any fill in it, so a position standing at the
+        # close traded there even when it was born inside the bar.
+        self._portfolio.observe_price(candle.close)
         self._portfolio.mark_to_market(candle)
 
         fills.sort(key=lambda fill: fill.order.intent is SignalKind.ENTRY)
@@ -611,6 +620,9 @@ class BacktestBroker:
         price = self._exit_price(position.side, candle)
         cost = self._cost_model.exit_cost(order, self._instrument, price, candle)
         fill = Fill(order=order, time=candle.time, price=price, volume=position.volume, costs=cost)
+        # The strategy's exit leaves at the open: of this bar the position saw one price, and
+        # the rest of the range was traded by nobody's position.
+        self._portfolio.observe_price(price)
         self._portfolio.apply(fill)
         self._disarm_protection()
         return fill
@@ -759,6 +771,13 @@ class BacktestBroker:
         fill = Fill(
             order=exit_order, time=candle.time, price=price, volume=position.volume, costs=cost
         )
+        # The bar that ended the position, read against the trade like every ambiguous bar here
+        # (`Position.best_price`). Out at the stop: the high may have come after the exit, so
+        # the only price the bar vouches for is the fill. Out at the target: the target was
+        # reached, and the low may have come before it, so the whole adverse side counts.
+        if reason == "tp":
+            self._portfolio.observe_bar(candle, favourable=False)
+        self._portfolio.observe_price(price)
         self._portfolio.apply(fill)
         self._disarm_protection()
         return fill

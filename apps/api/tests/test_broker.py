@@ -431,6 +431,41 @@ def test_the_ledger_reproduces_the_account_after_a_round_trip() -> None:
     assert broker.account().balance == Decimal("10193")
 
 
+def test_how_far_a_live_trade_went_is_read_against_it_like_a_backtest_s() -> None:
+    """The stream says a fill happened inside the bar, never where in its range. So the entry bar
+    lends the position only its adverse extreme, a bar held whole lends both, and the exit bar
+    lends nothing past the exit's own price — the backtest's rule, on the venue's fills.
+
+    Entry at the bid 1.16660 inside a bar ranging 1.16600 to 1.16950: that high is not the
+    position's, and it is the highest price of the whole test — claiming it would be the mistake
+    this pins. Its close of 1.16900 is: the bar's last tick came after the fill. The next bar,
+    held whole, reaches 1.16850; the exit sells at 1.16867 inside a bar that runs on to 1.16950 —
+    after the position was gone.
+    """
+    client = FakeStreams()
+    broker = a_broker(client, capital="10000")
+    broker.submit(an_order())
+    publish_fill(client, price="1.16667", spread="0.00007")
+    broker.on_bar(a_candle(close="1.16900"))
+    broker.on_bar(a_candle(time=NOON + 2 * HOUR, close="1.16800"))
+
+    broker.submit(an_order(intent=SignalKind.EXIT, client_id="exit-1", decided_at=NOON + 2 * HOUR))
+    publish_fill(
+        client,
+        client_id="exit-1",
+        price="1.16867",
+        spread="0.00007",
+        at=NOON + 3 * HOUR + dt.timedelta(seconds=18),
+    )
+    broker.on_bar(a_candle(time=NOON + 3 * HOUR, close="1.16900"))
+
+    (trade,) = broker.trades()
+    assert trade.mfe_price == Decimal("1.16900")
+    assert trade.mae_price == Decimal("1.16600")
+    # No stop on the entry, so no distance to measure an R against.
+    assert trade.mfe_r is None
+
+
 def test_the_account_is_marked_to_market_on_a_bar_with_no_fill() -> None:
     """⚠️ The protocol's first obligation, and the one a broker forgets silently: the loop reads
     equity straight after every `on_bar`. A broker that only marked on bars where something

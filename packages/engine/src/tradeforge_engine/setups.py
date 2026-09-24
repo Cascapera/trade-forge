@@ -31,12 +31,13 @@ price too, and the two rules run at once with the tighter one winning (`conducti
 
 import datetime as dt
 import logging
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from enum import StrEnum
-from typing import Protocol
+from types import MappingProxyType
+from typing import Final, Protocol
 
 from tradeforge_engine.bar_setups import (
     DEFAULT_BODY_FRACTION,
@@ -1842,6 +1843,38 @@ class ForceFollowActivation:
             self._region.spend(block, f"the order lived its {self.bars_to_fill} bars unfilled")
 
 
+ENTRY_DIALS: Final = frozenset({"stop_buffer", "gift_stop", "volume_filter"})
+"""The structure setups' parameters that only some entry points read — see `DIALS_READ`."""
+
+DIALS_READ: Final[Mapping[ZoneEntryPoint, frozenset[str]]] = MappingProxyType(
+    {
+        ZoneEntryPoint.EDGE: frozenset({"stop_buffer"}),
+        ZoneEntryPoint.MIDPOINT: frozenset({"stop_buffer"}),
+        ZoneEntryPoint.RETURN_PASS: frozenset({"stop_buffer"}),
+        ZoneEntryPoint.BOTINHA: frozenset(),
+        ZoneEntryPoint.FFFD: frozenset(),
+        ZoneEntryPoint.MARTELO: frozenset(),
+        ZoneEntryPoint.MARTELO_FORCA: frozenset(),
+        ZoneEntryPoint.GIFT: frozenset({"gift_stop", "volume_filter"}),
+        ZoneEntryPoint.BARRA_IGNORADA: frozenset({"volume_filter"}),
+    }
+)
+"""Which of `ENTRY_DIALS` each entry point's activation reads — `activation_for`, as a table.
+
+A sweep reads this to run once the points that differ only in a dial their entry never reads
+(24/09): `stop_buffer` under `martelo` is four documents and one behaviour. ⚠️ **A dial listed
+here that the activation does not read costs only speed; one left out that it does read would
+merge runs that differ.** So the table errs towards listing, and `test_entry_dials` holds the
+other direction: changing a dial this table says is unread never changes a trade. Keep it beside
+the chain below — the two are one fact, and a new entry point has to be added to both.
+
+⚠️ **Nothing outside the activation keeps a dial.** `StructureStrategy` used to store its
+`stop_buffer` beside the activation it built, unread — the one place a later change could have
+read it from without this table knowing (engine-guardian, 24/09). `test_entry_dials` compares the
+whole state of two setups built from documents that differ only in unread dials.
+"""
+
+
 def activation_for(  # noqa: PLR0911 - one flat branch per value, which the docstring argues for
     entry_point: ZoneEntryPoint,
     *,
@@ -2149,7 +2182,6 @@ class StructureStrategy:
         # region on the chart that never became an order is the filter working, not a bug.
         self._side = side
         self._allow_secondary = allow_secondary
-        self._stop_buffer = stop_buffer
         # The second seam: *how* a named zone becomes an order. Built from the entry point
         # rather than branched on later, so a new way of entering is a new implementation
         # instead of a fourth `if` in two methods that would then have to agree.

@@ -1925,6 +1925,11 @@ class SweepPreview(BaseModel):
     (those with anything to fetch), so this is the smaller of the two answers."""
     documents: int
     """Strategy documents the sweep would write: entries x timeframes x points, before markets."""
+    shared: int = 0
+    """Runnable points that run nothing of their own, because another point of the same entry
+    runs the same (24/09): they differ only in a parameter their entry point never reads. Their
+    runs are **not** in `runs`; each is answered by that other point's (`SweepRunOut.equivalents`),
+    and the dataset keeps a row for each."""
     entries: list[SweepEntryPreview]
     uncovered: list[UncoveredMarket]
     """Markets and charts with no data in this window — skipped by the launch and named, unless
@@ -1938,6 +1943,13 @@ class SweepPreview(BaseModel):
     runnable, every pair without data. Never for its size (no cap since 18/09). A different kind
     of no: there is
     nothing to run."""
+
+
+class SweepPoint(BaseModel):
+    """A point of a sweep answered by another point's run: where it sits, nothing else."""
+
+    label: str
+    values: dict[str, Any]
 
 
 class SweepRunOut(BaseModel):
@@ -1962,6 +1974,12 @@ class SweepRunOut(BaseModel):
     """The coordinates, keyed by the grid's own dotted paths plus `timeframe`."""
 
     run: BacktestListItem
+
+    equivalents: list[SweepPoint] = Field(default_factory=list)
+    """The other points this run answers: same entry and timeframe, differing only in parameters
+    their entry point never reads, so they were not run again (24/09). Listed here rather than
+    as rows of their own, because a row is a run — counted, paged, linked — and these share one.
+    The dataset is where each of them is a row."""
 
 
 class SweepEntryOut(BaseModel):
@@ -2228,6 +2246,8 @@ class DatasetDictionaryOut(BaseModel):
 class CreatedSweep(BaseModel):
     id: uuid.UUID
     runs: int
+    shared: int = 0
+    """Points answered by another point's run rather than their own — `SweepPreview.shared`."""
     skipped: list[UncoveredMarket] = Field(default_factory=list)
     """Pairs left out for having no candles in the window — his answer "do not collect" (18/09).
     The same list the sweep keeps (`SweepOut.skipped`), so the launch and a later read agree."""

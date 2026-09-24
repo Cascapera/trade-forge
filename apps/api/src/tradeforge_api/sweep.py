@@ -22,7 +22,8 @@ same window returns the identical number and is not a second opinion. Only data 
 **not chosen on** is: a walk-forward, another market, a reserved window.
 """
 
-from collections.abc import Mapping, Sequence
+import json
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -145,6 +146,51 @@ def _whole(definition: Mapping[str, Any]) -> GridPoint:
     return GridPoint(values={}, document=dict(definition))
 
 
+UnreadParams = Callable[[Mapping[str, Any]], frozenset[str]]
+"""Given a document's `setup` block, the parameters its setup never reads — the engine's
+`unread_params`, handed in so that this module stays free of the engine."""
+
+
+def shared(documents: Sequence[SweepDocument], unread: UnreadParams) -> dict[int, SweepDocument]:
+    """The documents another one answers, keyed by `id()`: each to the first that runs the same.
+
+    Two points of one entry at one timeframe run trade for trade the same when their documents
+    differ only in a parameter the setup never reads — `stop_buffer` under the `martelo` entry is
+    four documents and one behaviour (24/09). His answer was to run it once and let the others
+    point at it: every point stays in the sweep, and the dataset keeps a row for each.
+
+    ⚠️ **The key is the document, less its name and less what the setup does not read — and the
+    entry.** The name carries the point's label, so it differs by construction and decides
+    nothing. The entry is kept in the key although two entries can hold the same document: a
+    point answered by another entry's run would lose the entry it belongs to on every screen that
+    groups by entry. Anything left in the key can only split a group that could have been one,
+    which costs a run; anything wrongly left out would merge two behaviours, which costs the
+    answer — so the engine's table is the only thing trusted to leave something out.
+
+    The first document of a group, in the order given, answers for the rest: launch order, so
+    which point owns the run does not change between a preview and the launch.
+    """
+    owners: dict[str, SweepDocument] = {}
+    answered: dict[int, SweepDocument] = {}
+    for doc in documents:
+        owner = owners.setdefault(_behaviour(doc, unread), doc)
+        if owner is not doc:
+            answered[id(doc)] = owner
+    return answered
+
+
+def _behaviour(doc: SweepDocument, unread: UnreadParams) -> str:
+    """What decides how `doc` runs, as text two equal behaviours spell the same way."""
+    body = {key: value for key, value in doc.document.items() if key != "name"}
+    setup = body.get("setup")
+    if isinstance(setup, Mapping) and isinstance(params := setup.get("params"), Mapping):
+        ignored = unread(setup)
+        if ignored:
+            kept = {key: value for key, value in params.items() if key not in ignored}
+            body["setup"] = {**setup, "params": kept}
+    return json.dumps([doc.entry_id, body], sort_keys=True)
+
+
 def points_in(grid: Mapping[str, Sequence[Any]]) -> int:
     """How many points one entry's grid holds — 1 for an entry that varies nothing."""
     return size_of(grid)
@@ -178,7 +224,9 @@ def size_refusal(runs: int) -> str | None:
 __all__ = [
     "SweepDocument",
     "SweepError",
+    "UnreadParams",
     "documents_for",
     "points_in",
+    "shared",
     "size_refusal",
 ]

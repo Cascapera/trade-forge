@@ -16,8 +16,10 @@ from tradeforge_api.sweep import (
     SweepError,
     documents_for,
     points_in,
+    shared,
     size_refusal,
 )
+from tradeforge_engine.setup_factory import unread_params
 
 
 def a_document(timeframe: str = "M15") -> dict[str, Any]:
@@ -247,3 +249,100 @@ class TestNoTargetUnlessTheGridNamesOne:
         before = copy.deepcopy(BASE)
         documents_for(entry_id="e1", entry_name="9.1", definition=BASE, grid={}, timeframes=["H1"])
         assert before == BASE
+
+
+def a_zone_document() -> dict[str, Any]:
+    """His CHOCH entry, the setup whose entry points leave some dials unread."""
+    return {
+        "schema_version": "1.0",
+        "name": "CHOCH COMPLETO",
+        "timeframe": "M15",
+        "setup": {
+            "type": "structure_choch",
+            "params": {
+                "entry_point": "edge",
+                "stop_buffer": 0.1,
+                "gift_stop": "gift",
+                "volume_filter": False,
+            },
+        },
+        "risk": {"sizing": {"type": "percent_risk", "params": {"percent": 1.0}}},
+    }
+
+
+class TestPointsThatRunTheSameShareOneRun:
+    """His answer, 24/09: a point that differs from another only in a parameter its entry point
+    never reads is answered by that one's run."""
+
+    GRID: dict[str, list[Any]] = {  # noqa: RUF012 — read-only, a class-level fixture
+        "setup.params.entry_point": ["edge", "martelo"],
+        "setup.params.stop_buffer": [0, 0.1, 0.2],
+    }
+
+    def test_the_buffer_is_shared_where_the_entry_does_not_read_it(self) -> None:
+        docs = expand_one(a_zone_document(), self.GRID, ["M15"], name="CHOCH")
+
+        answered = shared(docs, unread_params)
+
+        by_label = {doc.label: doc for doc in docs}
+        followers = {by_label[doc.label].label for doc in docs if id(doc) in answered}
+        # Every martelo point but the first is answered; no edge point is: edge reads the buffer.
+        martelo = [doc for doc in docs if doc.values["setup.params.entry_point"] == "martelo"]
+        assert followers == {doc.label for doc in martelo[1:]}
+        assert all(answered[id(doc)] is martelo[0] for doc in martelo[1:])
+
+    def test_the_first_point_in_launch_order_owns_the_run(self) -> None:
+        docs = expand_one(a_zone_document(), self.GRID, ["M15"])
+        order = [id(doc) for doc in docs]
+
+        answered = shared(docs, unread_params)
+
+        assert answered
+        for follower, owner in answered.items():
+            assert order.index(id(owner)) < order.index(follower)
+            assert id(owner) not in answered
+
+    def test_never_across_charts(self) -> None:
+        grid: dict[str, list[Any]] = {
+            "setup.params.entry_point": ["martelo"],
+            "setup.params.stop_buffer": [0, 0.1],
+        }
+        docs = expand_one(a_zone_document(), grid, ["M15", "H1"])
+
+        answered = shared(docs, unread_params)
+
+        assert len(answered) == 2
+        assert all(
+            doc.timeframe == answered[id(doc)].timeframe for doc in docs if id(doc) in answered
+        )
+
+    def test_never_across_entries(self) -> None:
+        """Two entries can hold the same document; a point answered by the other's run would lose
+        the entry it belongs to on every screen that groups by entry."""
+        grid = {"setup.params.entry_point": ["martelo"]}
+        mine = expand_one(a_zone_document(), grid, ["M15"], name="A")
+        theirs = documents_for(
+            entry_id="e2",
+            entry_name="B",
+            definition=a_zone_document(),
+            grid=grid,
+            timeframes=["M15"],
+        )
+
+        assert shared([*mine, *theirs], unread_params) == {}
+
+    def test_nothing_is_shared_that_the_setup_reads(self) -> None:
+        grid: dict[str, list[Any]] = {
+            "setup.params.entry_point": ["edge"],
+            "setup.params.stop_buffer": [0, 0.1, 0.2],
+        }
+        docs = expand_one(a_zone_document(), grid, ["M15"])
+
+        assert shared(docs, unread_params) == {}
+
+    def test_nothing_is_shared_for_a_setup_the_engine_vouches_nothing_for(self) -> None:
+        grid = {"setup.params.period": [5, 9]}
+        docs = expand_one(a_document(), grid, ["M15"])
+
+        assert shared(docs, unread_params) == {}
+        assert shared(docs, lambda _setup: frozenset({"period"})) != {}

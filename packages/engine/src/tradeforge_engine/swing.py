@@ -72,7 +72,12 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Final, Literal, Protocol, cast
 
-from tradeforge_engine.average_setups import AverageEntryPoint, PatternOrder, PatternWatch
+from tradeforge_engine.average_setups import (
+    AverageEntryPoint,
+    PatternOrder,
+    PatternWatch,
+    watch_for,
+)
 from tradeforge_engine.bar_setups import GiftStop
 from tradeforge_engine.conduction import StructuralTrail, breakeven_candidate, tighten
 from tradeforge_engine.domain import (
@@ -493,15 +498,8 @@ class Mme9BreakoutStrategy:
         # The pattern's clock, or nothing for the classic entry — which needs none, because its
         # reference is re-read on every bar of the turn. Built here rather than branched on later,
         # so the two ways of entering are two objects and not a flag inside `on_bar`.
-        self._watch: PatternWatch | None = (
-            None
-            if entry_point is AverageEntryPoint.CLASSIC
-            else PatternWatch(
-                entry_point=entry_point,
-                side=side,
-                gift_stop=gift_stop,
-                volume_filter=volume_filter,
-            )
+        self._watch: PatternWatch | None = watch_for(
+            entry_point, side=side, gift_stop=gift_stop, volume_filter=volume_filter
         )
         self._ema = EMA(period=period, source="close")
         # His direction filter, or nothing. Built here rather than branched on later, so "the
@@ -1774,15 +1772,8 @@ class PontoContinuoStrategy:
         self._entry_point = entry_point
         # The pattern's clock, or nothing for the classic entry — the same seam the MME9 has, and
         # the same object: what differs between the two hosts is who feeds it, not what it counts.
-        self._watch: PatternWatch | None = (
-            None
-            if entry_point is AverageEntryPoint.CLASSIC
-            else PatternWatch(
-                entry_point=entry_point,
-                side=side,
-                gift_stop=gift_stop,
-                volume_filter=volume_filter,
-            )
+        self._watch: PatternWatch | None = watch_for(
+            entry_point, side=side, gift_stop=gift_stop, volume_filter=volume_filter
         )
 
         # His direction filter, or nothing — the same seam the MME9 has, and the same object.

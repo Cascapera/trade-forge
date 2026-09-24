@@ -346,3 +346,25 @@ class TestPointsThatRunTheSameShareOneRun:
 
         assert shared(docs, unread_params) == {}
         assert shared(docs, lambda _setup: frozenset({"period"})) != {}
+
+
+class TestTheAverageSetupsShareToo:
+    """The MME9 and the ponto contínuo read `gift_stop` only under the gift entry and
+    `volume_filter` only under the gift and the ignored bar (`AVERAGE_DIALS_READ`, 24/09)."""
+
+    def test_the_gift_stop_is_shared_where_the_entry_does_not_read_it(self) -> None:
+        document = a_document()
+        document["setup"]["params"].update(
+            {"side": "long", "entry_point": "martelo", "gift_stop": "gift", "volume_filter": False}
+        )
+        grid: dict[str, list[Any]] = {
+            "setup.params.entry_point": ["martelo", "gift"],
+            "setup.params.gift_stop": ["gift", "forca"],
+        }
+        docs = expand_one(document, grid, ["M15"])
+
+        answered = shared(docs, unread_params)
+
+        # The two martelo points are one behaviour; the two gift points are two.
+        followers = [doc for doc in docs if id(doc) in answered]
+        assert [doc.values["setup.params.entry_point"] for doc in followers] == ["martelo"]

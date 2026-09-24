@@ -31,6 +31,8 @@ from tradeforge_engine.domain import TIMEFRAME_DELTAS, Side
 from tradeforge_engine.errors import EngineError
 from tradeforge_engine.protocols import Strategy
 from tradeforge_engine.setups import (
+    DIALS_READ,
+    ENTRY_DIALS,
     ChochQualifier,
     ContinuationQualifier,
     StructureStrategy,
@@ -364,4 +366,27 @@ def build_setup(node: Mapping[str, object], *, timeframe: dt.timedelta | None = 
     return build(_params(node), timeframe)
 
 
-__all__ = ["build_setup"]
+_ZONE_SETUPS = frozenset({"structure_choch", "structure_continuation"})
+"""The setups whose entry point is a `ZoneEntryPoint`, and so whose dials `DIALS_READ` knows."""
+
+
+def unread_params(node: Mapping[str, object]) -> frozenset[str]:
+    """The parameters of this `setup` block that the setup it builds never reads.
+
+    Two documents that differ only in these run the same, trade for trade — which is what lets a
+    sweep run the pair once (`tradeforge_api.sweep`). Empty for every setup this does not know,
+    and for a block too malformed to say: an answer of "nothing is unread" is never wrong, only
+    slower.
+    """
+    if node.get("type") not in _ZONE_SETUPS:
+        return frozenset()
+    raw = node.get("params", {})
+    if not isinstance(raw, Mapping):
+        return frozenset()
+    entry = raw.get("entry_point", ZoneEntryPoint.EDGE.value)
+    if not isinstance(entry, str) or entry not in {one.value for one in ZoneEntryPoint}:
+        return frozenset()
+    return ENTRY_DIALS - DIALS_READ[ZoneEntryPoint(entry)]
+
+
+__all__ = ["build_setup", "unread_params"]

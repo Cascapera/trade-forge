@@ -527,6 +527,101 @@ class TestReadingItBack:
         assert dictionary.status_code == 404
 
 
+def a_zone_document(name: str) -> dict[str, Any]:
+    """His CHOCH, with the three dials only some entry points read written out for a grid."""
+    return {
+        "schema_version": "1.0",
+        "name": name,
+        "timeframe": "M15",
+        "setup": {
+            "type": "structure_choch",
+            "params": {
+                "entry_point": "edge",
+                "stop_buffer": 0.1,
+                "gift_stop": "gift",
+                "volume_filter": False,
+            },
+        },
+        "risk": {"sizing": {"type": "percent_risk", "params": {"percent": 1.0}}},
+    }
+
+
+class TestPointsThatRunTheSameShareOneRun:
+    """His answer, 24/09: `stop_buffer` under `martelo` is three points and one behaviour, so it is
+    run once and the other two point at that run — on the screen as its equivalents, in the
+    dataset as rows of their own."""
+
+    GRID: dict[str, list[Any]] = {  # noqa: RUF012 — read-only, a class-level fixture
+        "setup.params.entry_point": ["edge", "martelo"],
+        "setup.params.stop_buffer": [0, 0.1, 0.2],
+    }
+
+    def launched(self, client: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+        entry = an_entry(
+            client,
+            name=f"zones {uuid.uuid4()}",
+            grid=self.GRID,
+            document=a_zone_document(f"doc {uuid.uuid4()}"),
+        )
+        body = a_sweep_body([entry], ["EURUSD"], ["M15"])
+        preview = client.post(
+            "/sweeps/preview",
+            json={
+                k: body[k] for k in ("entry_ids", "symbols", "timeframes", "date_from", "date_to")
+            },
+        )
+        created = client.post("/sweeps", json=body)
+        assert preview.status_code == 200, preview.text
+        assert created.status_code == 202, created.text
+        return preview.json(), created.json()
+
+    def test_the_preview_and_the_launch_count_one_run_for_the_three(
+        self, client: Any, queue: _CapturingQueue
+    ) -> None:
+        preview, created = self.launched(client)
+
+        # Three edge points, each reading its buffer; three martelo points, one run.
+        assert (preview["documents"], preview["runs"], preview["shared"]) == (6, 4, 2)
+        assert (created["runs"], created["shared"]) == (4, 2)
+        assert len([job for job in queue.jobs if job[0] == RUN_BACKTEST]) == 4
+
+    def test_the_run_names_the_points_it_answers(self, client: Any) -> None:
+        _preview, created = self.launched(client)
+
+        runs = client.get(f"/sweeps/{created['id']}").json()["runs"]
+
+        assert len(runs) == 4
+        (martelo,) = [row for row in runs if row["values"]["setup.params.entry_point"] == "martelo"]
+        assert sorted(
+            one["values"]["setup.params.stop_buffer"] for one in martelo["equivalents"]
+        ) == [
+            0.1,
+            0.2,
+        ]
+        assert martelo["values"]["setup.params.stop_buffer"] == 0
+        assert all(row["equivalents"] == [] for row in runs if row is not martelo)
+
+    def test_the_dataset_keeps_a_row_for_every_point(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        _preview, created = self.launched(client)
+        address = f"/sweeps/{created['id']}"
+        runs = client.get(address).json()["runs"]
+        (martelo,) = [row for row in runs if row["values"]["setup.params.entry_point"] == "martelo"]
+        finish(session_factory, martelo["run"]["id"], 250)
+
+        rows = list(csv.DictReader(io.StringIO(client.get(f"{address}/dataset.csv").text)))
+
+        assert len(rows) == 6
+        followers = [row for row in rows if row["same_as"]]
+        assert len(followers) == 2
+        assert {row["same_as"] for row in followers} == {martelo["label"]}
+        # The follower's run is the one that answers it, and so is every outcome.
+        assert {row["run_id"] for row in followers} == {martelo["run"]["id"]}
+        assert {row["return"] for row in followers} == {"0.025"}
+        assert sorted(row["param:setup.params.stop_buffer"] for row in followers) == ["0.1", "0.2"]
+
+
 class TestTheGeneratedName:
     def test_a_grid_whose_label_outgrows_the_name_still_runs(self, client: Any) -> None:
         """⚠️ **This is the sweep that produced nothing.**

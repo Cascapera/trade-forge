@@ -2683,3 +2683,14 @@ Achado pelo `engine-guardian` no PR das varreduras de zonas: trocar `StructureSt
 `return True` passa na suíte inteira do motor. Falta o cenário em que uma zona armada, com a ordem
 parada no book, é empurrada para fora da janela de `_MAX_ZONES` regiões — a ordem tem que ser
 cancelada. O buraco é anterior ao PR (a forma antiga com `any(...)` passaria igual).
+
+## Varredura: pontos equivalentes compartilham um run — o que ficou para depois (24/09)
+
+O PR que faz a varredura rodar uma vez os pontos que só diferem num parâmetro que a entrada não lê
+cobre só os setups de estrutura (`structure_choch`, `structure_continuation`), porque é onde a tabela
+`DIALS_READ` foi provada contra `activation_for`. Fica em aberto:
+- os setups de média (MME9 e Ponto Contínuo) têm `entry_point`, `stop_buffer_ticks`, `gift_stop` e
+  `volume_filter` com a mesma forma — falta a tabela deles, provada da mesma maneira;
+- o estudo (`/studies`) expande grades pelo mesmo caminho e ainda roda cada ponto;
+- a chave de equivalência compara o JSON do documento: `0` e `0.0` no mesmo eixo contam como
+  diferentes (só custa um run a mais, nunca junta o que difere).

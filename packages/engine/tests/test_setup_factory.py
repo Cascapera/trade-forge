@@ -24,6 +24,7 @@ from tradeforge_engine.setup_factory import build_setup
 from tradeforge_engine.setups import (
     ChochQualifier,
     ContinuationQualifier,
+    EdgeActivation,
     StructureStrategy,
     ZoneEntryPoint,
 )
@@ -70,7 +71,9 @@ def test_the_choch_setup_is_built_on_its_qualifier() -> None:
     assert isinstance(setup, StructureStrategy)
     assert isinstance(setup._qualifier, ChochQualifier)
     assert setup._allow_secondary is True
-    assert setup._stop_buffer == Decimal("0.25")
+    # Held by the activation, the only thing that reads it (`DIALS_READ`); the default entry is
+    # the edge, which does.
+    assert setup._activation == EdgeActivation(stop_buffer=Decimal("0.25"))
 
 
 def test_the_continuation_setup_carries_its_cap_into_the_qualifier() -> None:
@@ -103,7 +106,7 @@ def test_a_setup_block_with_no_params_at_all_is_built_on_defaults() -> None:
     document is allowed to say nothing, and the schema gives `params` a default for that reason."""
     setup = build_setup({"type": "structure_choch"})
     assert isinstance(setup, StructureStrategy)
-    assert setup._stop_buffer == StructureStrategy(qualifier=ChochQualifier())._stop_buffer
+    assert setup._activation == StructureStrategy(qualifier=ChochQualifier())._activation
 
 
 # --------------------------------------------------------------------------- #
@@ -141,8 +144,8 @@ def test_a_fractional_parameter_does_not_inherit_a_float_s_binary_dust() -> None
     keeps the number the user typed — the same route the runner uses for the risk percent."""
     setup = _built("structure_choch", stop_buffer=0.1)
     assert isinstance(setup, StructureStrategy)
-    assert setup._stop_buffer == Decimal("0.1")
-    assert setup._stop_buffer != Decimal(0.1)  # noqa: RUF032 — the dust is the point
+    assert setup._activation == EdgeActivation(stop_buffer=Decimal("0.1"))
+    assert setup._activation != EdgeActivation(stop_buffer=Decimal(0.1))  # noqa: RUF032 — the dust is the point
 
 
 # --------------------------------------------------------------------------- #

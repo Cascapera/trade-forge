@@ -56,6 +56,7 @@ from tradeforge_api.schemas import (
     SweepListEntry,
     SweepListItem,
     SweepOut,
+    SweepPoint,
     SweepPreview,
     SweepRunCounts,
     SweepRunOut,
@@ -67,6 +68,7 @@ from tradeforge_api.sweep import (
     SweepError,
     documents_for,
     points_in,
+    shared,
     size_refusal,
 )
 from tradeforge_api.sweep_dataset import CAVEATS, OMITTED, ROW, DatasetRun, columns_for, to_csv
@@ -84,6 +86,7 @@ from tradeforge_db.models import (
     Strategy,
     Sweep,
 )
+from tradeforge_engine.setup_factory import unread_params
 
 router = APIRouter(tags=["sweeps"])
 
@@ -238,7 +241,10 @@ def preview_sweep(
             )
         )
 
-    runnable_documents = [doc for doc in documents if refusal_of(dict(doc.document)) is None]
+    runnable = [doc for doc in documents if refusal_of(dict(doc.document)) is None]
+    # ⚠️ Counted as the launch counts them: a point another point answers runs nothing (24/09).
+    answered = shared(runnable, unread_params)
+    runnable_documents = [doc for doc in runnable if id(doc) not in answered]
     uncovered = _worth_naming(
         uncovered_markets(
             session, list(request.symbols), timeframes, request.date_from, request.date_to
@@ -259,6 +265,7 @@ def preview_sweep(
     return SweepPreview(
         runs=runs,
         documents=len(documents),
+        shared=len(answered),
         entries=per_entry,
         uncovered=uncovered,
         # Every run of a sweep reads the same window, so what varies from run to run is the
@@ -338,9 +345,13 @@ async def create_sweep(request: CreateSweep, session: SessionDep, queue: QueueDe
     # ⚠️ A pair with something to fetch is not skipped when told to collect; an empty plan is not
     # "covered", though. A window wholly in the future, or older than the broker's first bar, has
     # nothing to download and nothing to read, and is skipped like any other.
-    documents = [
-        doc for doc in _expand(pairs, timeframes) if refusal_of(dict(doc.document)) is None
-    ]
+    runnable = [doc for doc in _expand(pairs, timeframes) if refusal_of(dict(doc.document)) is None]
+    # ⚠️ **One run for points that run the same** (his answer, 24/09): a point that differs from
+    # an earlier one only in a parameter its entry point never reads is answered by that one's
+    # run. It is still a point of the sweep — written in `points` below, pointing at the run that
+    # answers it — and never a run of its own. The same call the preview makes, so the two agree.
+    answered = shared(runnable, unread_params)
+    documents = [doc for doc in runnable if id(doc) not in answered]
     skipped = [
         market
         for market in _worth_naming(
@@ -367,6 +378,10 @@ async def create_sweep(request: CreateSweep, session: SessionDep, queue: QueueDe
     for doc, symbol in combinations:
         markets_of.setdefault(id(doc), []).append(symbol)
     documents = [doc for doc in documents if id(doc) in markets_of]
+    # A point is kept only if the point answering it runs: the same chart, so the same pairs.
+    followers = [
+        doc for doc in runnable if id(doc) in answered and id(answered[id(doc)]) in markets_of
+    ]
 
     sweep = Sweep(
         entry_ids=[str(one) for one in request.entry_ids],
@@ -392,14 +407,31 @@ async def create_sweep(request: CreateSweep, session: SessionDep, queue: QueueDe
     # alternative is recovering them later from the document's name — and a name is a caption:
     # `{entry} [{label}]` splits cleanly until one entry's name is a prefix of another's, or a
     # value contains the separator. Both are things a person will do, and neither would raise.
+    # ⚠️ **A point answered by another carries that point's strategy and says so** (`same_as`).
+    # The strategy id is the join every read already makes from a run to its coordinates, so a
+    # read that knows nothing of this still finds the run's own point — the one without
+    # `same_as` — and a read that does (`_points_of`) finds the others beside it.
+    strategy_of = {id(doc): strategy for doc, strategy in zip(documents, strategies, strict=True)}
     sweep.points = [
-        {
-            "strategy_id": str(strategy.id),
-            "entry_id": doc.entry_id,
-            "label": doc.label,
-            "values": dict(doc.values),
-        }
-        for doc, strategy in zip(documents, strategies, strict=True)
+        *(
+            {
+                "strategy_id": str(strategy_of[id(doc)].id),
+                "entry_id": doc.entry_id,
+                "label": doc.label,
+                "values": dict(doc.values),
+            }
+            for doc in documents
+        ),
+        *(
+            {
+                "strategy_id": str(strategy_of[id(answered[id(doc)])].id),
+                "entry_id": doc.entry_id,
+                "label": doc.label,
+                "values": dict(doc.values),
+                "same_as": answered[id(doc)].label,
+            }
+            for doc in followers
+        ),
     ]
 
     runs: list[Backtest] = []
@@ -450,7 +482,7 @@ async def create_sweep(request: CreateSweep, session: SessionDep, queue: QueueDe
     for run in runs:
         await queue.enqueue_job(RUN_BACKTEST, str(run.id), _job_id=str(run.id))
 
-    return CreatedSweep(id=sweep.id, runs=len(runs), skipped=skipped)
+    return CreatedSweep(id=sweep.id, runs=len(runs), shared=len(followers), skipped=skipped)
 
 
 def _collections_for(
@@ -719,7 +751,7 @@ def get_sweep(sweep_id: uuid.UUID, session: SessionDep) -> SweepOut:
     entry's name is a prefix of another's or a value contains the separator. The first draft of
     this endpoint did exactly that; the column exists because of it.
     """
-    sweep, entries, coordinates, rows = _read_sweep(session, sweep_id)
+    sweep, entries, coordinates, followers, rows = _read_sweep(session, sweep_id)
 
     out: list[SweepRunOut] = []
     scored: dict[str, list[tuple[Backtest, str]]] = {one: [] for one in sweep.entry_ids}
@@ -738,6 +770,10 @@ def get_sweep(sweep_id: uuid.UUID, session: SessionDep) -> SweepOut:
                 label=label,
                 values=dict(point.get("values", {})),
                 run=list_item(run, instrument.symbol, strategy.name, strategy.version),
+                equivalents=[
+                    SweepPoint(label=str(one["label"]), values=dict(one["values"]))
+                    for one in followers.get(str(run.strategy_id), [])
+                ],
             )
         )
         if entry_id in scored:
@@ -773,12 +809,32 @@ def get_sweep(sweep_id: uuid.UUID, session: SessionDep) -> SweepOut:
 
 
 _SweepRows = list[tuple[Backtest, Strategy, Instrument]]
+_Point = dict[str, Any]
+
+
+def _points_of(sweep: Sweep) -> tuple[dict[str, _Point], dict[str, list[_Point]]]:
+    """A sweep's points by strategy: the one each run is, and the ones it answers besides.
+
+    ⚠️ **Split on `same_as`, never on order.** A point answered by another's run carries that
+    run's strategy id (`create_sweep`), so a plain `{strategy_id: point}` would keep whichever came
+    last — and a run would be shown at a follower's coordinates rather than its own.
+    """
+    own: dict[str, _Point] = {}
+    followers: dict[str, list[_Point]] = {}
+    for point in sweep.points:
+        key = str(point["strategy_id"])
+        if point.get("same_as") is None:
+            own[key] = point
+        else:
+            followers.setdefault(key, []).append(point)
+    return own, followers
 
 
 def _read_sweep(
     session: SessionDep, sweep_id: uuid.UUID
-) -> tuple[Sweep, dict[str, CatalogEntry], dict[str, dict[str, Any]], _SweepRows]:
-    """A sweep, its surviving shelf entries, its coordinates by strategy, and every run joined.
+) -> tuple[Sweep, dict[str, CatalogEntry], dict[str, _Point], dict[str, list[_Point]], _SweepRows]:
+    """A sweep, its surviving shelf entries, its coordinates by strategy — each run's own point,
+    and the points it answers besides — and every run joined.
 
     ⚠️ **One read for every view of a sweep**, the screen's and the dataset's. The query below
     carries the guard that keeps a poll from dragging every equity curve out of Postgres, and a
@@ -795,7 +851,7 @@ def _read_sweep(
         )
     }
     # Keyed by the strategy each point produced, which is the join the runs already carry.
-    coordinates = {str(point["strategy_id"]): point for point in sweep.points}
+    coordinates, followers = _points_of(sweep)
 
     rows = session.execute(
         select(Backtest, Strategy, Instrument)
@@ -817,6 +873,7 @@ def _read_sweep(
         sweep,
         entries,
         coordinates,
+        followers,
         [(run, strategy, instrument) for run, strategy, instrument in rows],
     )
 
@@ -832,24 +889,29 @@ def _dataset_runs(session: SessionDep, sweep_id: uuid.UUID) -> list[DatasetRun]:
     that `SweepRunOut.entry_name` falls back to, which carries one point's label and would name
     the entry after that point.
     """
-    sweep, entries, coordinates, rows = _read_sweep(session, sweep_id)
+    sweep, entries, coordinates, followers, rows = _read_sweep(session, sweep_id)
     out: list[DatasetRun] = []
     for run, strategy, instrument in rows:
         point = coordinates.get(str(run.strategy_id), {})
         entry_id = str(point.get("entry_id", ""))
         shelved = entries.get(entry_id)
-        out.append(
-            DatasetRun(
-                sweep_id=str(sweep.id),
-                run=run,
-                entry_id=entry_id,
-                entry_name=None if shelved is None else shelved.name,
-                strategy_version=strategy.version,
-                symbol=instrument.symbol,
-                asset_class=str(instrument.asset_class),
-                values=dict(point.get("values", {})),
+        # ⚠️ **A row for every point, the ones a run answers besides its own included** (his
+        # answer, 24/09) — each at its own coordinates, each saying whose run it is.
+        for one in [point, *followers.get(str(run.strategy_id), [])]:
+            same_as = one.get("same_as")
+            out.append(
+                DatasetRun(
+                    sweep_id=str(sweep.id),
+                    run=run,
+                    entry_id=entry_id,
+                    entry_name=None if shelved is None else shelved.name,
+                    strategy_version=strategy.version,
+                    symbol=instrument.symbol,
+                    asset_class=str(instrument.asset_class),
+                    values=dict(one.get("values", {})),
+                    same_as=None if same_as is None else str(same_as),
+                )
             )
-        )
     return out
 
 

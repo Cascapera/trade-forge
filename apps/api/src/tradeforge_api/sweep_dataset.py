@@ -53,8 +53,8 @@ sweep this path, and its document's own value applied". Writing both as empty wo
 that "no break-even" and "break-even at 2R" are the same run."""
 
 ROW = (
-    "One backtest run of this sweep: one shelf entry, at one grid point, on one chart, "
-    "over one market."
+    "One grid point of this sweep, over one market: one shelf entry, at one grid point, on one "
+    "chart. Each row is its own backtest run unless same_as names the point whose run answers it."
 )
 
 CAVEATS: tuple[str, ...] = (
@@ -67,6 +67,9 @@ CAVEATS: tuple[str, ...] = (
     "and test data by entry_id or by window, never by row, or the model is graded on near-copies "
     "of what it trained on.",
     "Read every other outcome through total_trades: over a handful of trades any ratio is a draw.",
+    "A row with same_as is not a measurement of its own: its point differs from the named one only "
+    "in a parameter its entry point never reads, so both are one run and every outcome is that "
+    "run's. Keep one row per run_id when counting evidence, or one run is counted several times.",
     "An empty cell means not measured, undefined or not applicable — never zero. In a param: "
     "column, empty means the entry does not sweep that path, and `null` means it swept the path "
     "and chose null (the setting off).",
@@ -118,6 +121,10 @@ class DatasetRun:
     asset_class: str
     values: Mapping[str, Any]
     """The coordinates written at launch: the grid's dotted paths, plus `timeframe`."""
+
+    same_as: str | None = None
+    """The label of the point whose run answers this one, or `None` for a point that ran itself
+    (24/09): a row for every point, and this says which rows share a run."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,6 +191,15 @@ _BEFORE_PARAMS: tuple[Column, ...] = (
         "id",
         "The backtest run; its page in the web app is /results/{run_id}.",
         lambda r: r.run.id,
+    ),
+    Column(
+        "same_as",
+        "identity",
+        "text",
+        "Empty when this row's point ran itself. Otherwise the label of the point whose run "
+        "answers it: the two differ only in a parameter this entry point never reads, so they are "
+        "one run, and run_id and every outcome are that run's.",
+        lambda r: r.same_as,
     ),
     Column(
         "entry_id",

@@ -12,6 +12,7 @@ import pytest
 from arq.worker import Function, Retry
 from sqlalchemy.exc import IntegrityError, OperationalError
 
+from tradeforge_api.candle_cache import CandleCache
 from tradeforge_api.worker import (
     MAX_TRIES,
     WorkerSettings,
@@ -112,6 +113,7 @@ def context(job_try: int, sessions: list[Any]) -> dict[str, Any]:
         "session_factory": factory,
         "settings": type("S", (), {"parquet_root": "unused"})(),
         "redis": _Redis(),
+        "candles": CandleCache(),
     }
 
 

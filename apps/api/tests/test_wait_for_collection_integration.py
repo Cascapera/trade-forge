@@ -20,6 +20,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from tradeforge_api.candle_cache import CandleCache
 from tradeforge_api.config import Settings
 from tradeforge_api.main import create_app
 from tradeforge_api.queue import COLLECT_QUEUE, COLLECT_RANGE, RUN_BACKTEST
@@ -160,6 +161,7 @@ def work(session_factory: Callable[[], Session], queue: _Queue, run_id: str, tmp
         "redis": queue,
         "settings": Settings().model_copy(update={"parquet_root": tmp_path}),
         "job_try": 1,
+        "candles": CandleCache(),
     }
     asyncio.run(run_backtest(ctx, run_id))
 

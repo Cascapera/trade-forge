@@ -37,6 +37,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import DBAPIError, OperationalError
 from sqlalchemy.orm import Session
 
+from tradeforge_api.candle_cache import CandleCache, CandleReader
 from tradeforge_api.config import RedisConfig, Settings
 from tradeforge_api.grid import coordinates, label_for, read_point
 from tradeforge_api.queue import RUN_BACKTEST, progress_channel, redis_settings
@@ -95,13 +96,14 @@ def database_unreachable(exc: BaseException) -> bool:
     return sqlstate.startswith("08") or sqlstate in _UNREACHABLE_STATES
 
 
-async def process_backtest(
+async def process_backtest(  # noqa: PLR0913 — keyword-only; each names one thing the run needs
     *,
     session: Session,
     redis: Redis,
     parquet_root: Path,
     backtest_id: uuid.UUID,
     retry_unreachable: bool = True,
+    read: CandleReader = read_candles,
 ) -> None:
     """Run one backtest end to end, driving its row through the status state machine.
 
@@ -111,6 +113,9 @@ async def process_backtest(
     `retry_unreachable=False` is for a caller that cannot retry — the walk-forward runs its folds
     inline — and records an unreachable database as the run's failure, as before, rather than
     leaving the run `running` with nobody coming back for it.
+
+    `read` is where the bars come from: the worker passes its `CandleCache`, so a sweep's runs
+    over one symbol read the Parquet once rather than once each (`candle_cache`).
     """
     # ⚠️ Outside the `try`, on purpose: a database that cannot answer this is not a failed run,
     # and the error must reach the caller — `run_backtest`, which retries or records it.
@@ -136,7 +141,7 @@ async def process_backtest(
         if strategy is None or instrument is None:
             raise ValueError("backtest references a missing strategy or instrument")
 
-        candles = read_candles(parquet_root, instrument.symbol, backtest.timeframe)
+        candles = read(parquet_root, instrument.symbol, backtest.timeframe)
         # A sweep's run keeps no pictures, so it does not build them either (`retention`).
         in_sweep = backtest.sweep_id is not None
         trades, metrics, window = execute_backtest(
@@ -225,6 +230,7 @@ async def process_walk_forward(
     redis: Redis,
     parquet_root: Path,
     walk_forward_id: uuid.UUID,
+    read: CandleReader = read_candles,
 ) -> None:
     """Run every fold in order: train the whole grid, choose, then test the choice.
 
@@ -267,6 +273,7 @@ async def process_walk_forward(
                 parquet_root=parquet_root,
                 walk_forward=walk_forward,
                 fold=fold,
+                read=read,
             )
 
         walk_forward.status = BacktestStatus.DONE
@@ -278,13 +285,14 @@ async def process_walk_forward(
         _record_walk_forward_failure(session, walk_forward_id, exc)
 
 
-async def _process_fold(
+async def _process_fold(  # noqa: PLR0913 — keyword-only; each names one thing the fold needs
     *,
     session: Session,
     redis: Redis,
     parquet_root: Path,
     walk_forward: WalkForward,
     fold: WalkForwardFold,
+    read: CandleReader,
 ) -> None:
     """One fold: every training run, the choice, and the single run that scores it."""
     if fold.test_backtest_id is not None:
@@ -309,6 +317,7 @@ async def _process_fold(
             parquet_root=parquet_root,
             backtest_id=run.id,
             retry_unreachable=False,
+            read=read,
         )
 
     ranked = _candidates(session, fold, training, walk_forward.metric)
@@ -345,6 +354,7 @@ async def _process_fold(
         parquet_root=parquet_root,
         backtest_id=test.id,
         retry_unreachable=False,
+        read=read,
     )
 
     # Linked after the run exists, never before: `test_backtest_id` is a foreign key, and the
@@ -583,6 +593,7 @@ async def run_backtest(ctx: dict[str, Any], backtest_id: str) -> None:
             redis=ctx["redis"],
             parquet_root=settings.parquet_root,
             backtest_id=run_id,
+            read=ctx["candles"].read,
         )
     except DBAPIError as exc:
         job_try: int = ctx.get("job_try", 1)
@@ -629,6 +640,7 @@ async def run_walk_forward(ctx: dict[str, Any], walk_forward_id: str) -> None:
             redis=ctx["redis"],
             parquet_root=settings.parquet_root,
             walk_forward_id=uuid.UUID(walk_forward_id),
+            read=ctx["candles"].read,
         )
     finally:
         session.close()
@@ -640,6 +652,8 @@ async def startup(ctx: dict[str, Any]) -> None:
     ctx["settings"] = settings
     ctx["engine"] = engine
     ctx["session_factory"] = create_session_factory(engine)
+    # One per worker process, for as long as it lives (`candle_cache`).
+    ctx["candles"] = CandleCache()
 
 
 async def shutdown(ctx: dict[str, Any]) -> None:

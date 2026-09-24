@@ -38,9 +38,12 @@ the watch learning what a correction is.
 """
 
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import StrEnum
+from types import MappingProxyType
+from typing import Final
 
 from tradeforge_engine.bar_setups import (
     DEFAULT_BODY_FRACTION,
@@ -91,6 +94,31 @@ class AverageEntryPoint(StrEnum):
     MARTELO_FORCA = "martelo_forca"
     GIFT = "gift"
     BARRA_IGNORADA = "barra_ignorada"
+
+
+AVERAGE_DIALS: Final = frozenset({"gift_stop", "volume_filter"})
+"""The average setups' parameters that only some entry points read — see `AVERAGE_DIALS_READ`."""
+
+AVERAGE_DIALS_READ: Final[Mapping[AverageEntryPoint, frozenset[str]]] = MappingProxyType(
+    {
+        AverageEntryPoint.CLASSIC: frozenset(),
+        AverageEntryPoint.MARTELO: frozenset(),
+        AverageEntryPoint.MARTELO_FORCA: frozenset(),
+        AverageEntryPoint.GIFT: frozenset({"gift_stop", "volume_filter"}),
+        AverageEntryPoint.BARRA_IGNORADA: frozenset({"volume_filter"}),
+    }
+)
+"""Which of `AVERAGE_DIALS` each entry point reads — `PatternWatch._second_bar`, as a table.
+
+The average setups' counterpart of `setups.DIALS_READ` (24/09): a sweep runs once the points that
+differ only in a dial their entry never reads. `stop_buffer_ticks` is not a dial here — the
+conduction reads it under every entry, to put the stop past the bar that closed across.
+
+⚠️ **The watch is only ever built through `watch_for`**, which hands it the dials its entry reads
+and the defaults for the rest, so two setups that differ only in unread dials hold the same watch.
+`test_entry_dials` compares their whole state. Keep this table beside `_second_bar`: the two are
+one fact.
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -343,10 +371,29 @@ class PatternWatch:
         )
 
 
+def watch_for(
+    entry_point: AverageEntryPoint, *, side: Side, gift_stop: GiftStop, volume_filter: bool
+) -> "PatternWatch | None":
+    """The watch an entry point needs — `None` for the classic breakout, which keeps none —
+    holding only the dials that entry reads (`AVERAGE_DIALS_READ`) and the defaults for the rest."""
+    if entry_point is AverageEntryPoint.CLASSIC:
+        return None
+    read = AVERAGE_DIALS_READ[entry_point]
+    return PatternWatch(
+        entry_point=entry_point,
+        side=side,
+        gift_stop=gift_stop if "gift_stop" in read else GiftStop.GIFT,
+        volume_filter=volume_filter if "volume_filter" in read else False,
+    )
+
+
 __all__ = [
+    "AVERAGE_DIALS",
+    "AVERAGE_DIALS_READ",
     "DEFAULT_BARS_AFTER_TOUCH",
     "DEFAULT_BARS_TO_FILL",
     "AverageEntryPoint",
     "PatternOrder",
     "PatternWatch",
+    "watch_for",
 ]

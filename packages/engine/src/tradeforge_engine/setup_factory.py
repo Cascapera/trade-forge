@@ -25,7 +25,7 @@ from decimal import Decimal
 from enum import StrEnum
 from typing import Any
 
-from tradeforge_engine.average_setups import AverageEntryPoint
+from tradeforge_engine.average_setups import AVERAGE_DIALS, AVERAGE_DIALS_READ, AverageEntryPoint
 from tradeforge_engine.bar_setups import GiftStop
 from tradeforge_engine.domain import TIMEFRAME_DELTAS, Side
 from tradeforge_engine.errors import EngineError
@@ -370,23 +370,35 @@ _ZONE_SETUPS = frozenset({"structure_choch", "structure_continuation"})
 """The setups whose entry point is a `ZoneEntryPoint`, and so whose dials `DIALS_READ` knows."""
 
 
+_AVERAGE_SETUPS = frozenset({"mme9_breakout", "ponto_continuo"})
+"""The setups hosted by an average whose entry point is an `AverageEntryPoint`, and so whose dials
+`AVERAGE_DIALS_READ` knows."""
+
+
 def unread_params(node: Mapping[str, object]) -> frozenset[str]:
     """The parameters of this `setup` block that the setup it builds never reads.
 
     Two documents that differ only in these run the same, trade for trade — which is what lets a
-    sweep run the pair once (`tradeforge_api.sweep`). Empty for every setup this does not know,
-    and for a block too malformed to say: an answer of "nothing is unread" is never wrong, only
-    slower.
+    sweep run the pair once (`tradeforge_api.sweep`). Known for the structure setups
+    (`DIALS_READ`) and the two average setups with entry points (`AVERAGE_DIALS_READ`). Empty for
+    every other setup, and for a block too malformed to say: an answer of "nothing is unread" is
+    never wrong, only slower.
     """
-    if node.get("type") not in _ZONE_SETUPS:
-        return frozenset()
+    kind = node.get("type")
     raw = node.get("params", {})
     if not isinstance(raw, Mapping):
         return frozenset()
-    entry = raw.get("entry_point", ZoneEntryPoint.EDGE.value)
-    if not isinstance(entry, str) or entry not in {one.value for one in ZoneEntryPoint}:
-        return frozenset()
-    return ENTRY_DIALS - DIALS_READ[ZoneEntryPoint(entry)]
+    if kind in _ZONE_SETUPS:
+        zone = raw.get("entry_point", ZoneEntryPoint.EDGE.value)
+        if not isinstance(zone, str) or zone not in {one.value for one in ZoneEntryPoint}:
+            return frozenset()
+        return ENTRY_DIALS - DIALS_READ[ZoneEntryPoint(zone)]
+    if kind in _AVERAGE_SETUPS:
+        average = raw.get("entry_point", AverageEntryPoint.CLASSIC.value)
+        if not isinstance(average, str) or average not in {one.value for one in AverageEntryPoint}:
+            return frozenset()
+        return AVERAGE_DIALS - AVERAGE_DIALS_READ[AverageEntryPoint(average)]
+    return frozenset()
 
 
 __all__ = ["build_setup", "unread_params"]

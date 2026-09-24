@@ -1762,3 +1762,149 @@ class TestTheDashboard:
         one, three = counted
         assert one > 0, "the listener saw nothing, so this proves nothing"
         assert one == three, f"one sweep took {one} queries and three took {three}"
+
+
+def finish_trading(
+    session_factory: Callable[[], Session], run_id: str, net: int, trades: int
+) -> None:
+    """`finish`, with trades: a run the holdout can rank has to have traded past the floor."""
+    finish(session_factory, run_id, net)
+    with session_factory() as session:
+        run = session.get(Backtest, uuid.UUID(run_id))
+        assert run is not None
+        assert run.metrics is not None
+        run.metrics.total_trades = trades
+        run.metrics.long_trades = trades
+        session.commit()
+
+
+class TestTheReservedWindow:
+    """His ask (24/09): run a sweep's best points again on a window none of them was chosen on."""
+
+    def swept(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """A finished sweep of five points over EURUSD H1, ranked 100..500 by net."""
+        entry = an_entry(
+            client, name=f"held {uuid.uuid4()}", grid={"setup.params.period": [5, 7, 9, 11, 13]}
+        )
+        launched = client.post("/sweeps", json=a_sweep_body([entry], ["EURUSD"], ["H1"]))
+        assert launched.status_code == 202, launched.text
+        sweep_id = launched.json()["id"]
+        runs = client.get(f"/sweeps/{sweep_id}").json()["runs"]
+        for row in runs:
+            period = row["values"]["setup.params.period"]
+            finish_trading(session_factory, row["run"]["id"], net=period * 100, trades=40)
+        return sweep_id, runs
+
+    def after(self, **over: Any) -> dict[str, Any]:
+        return {
+            "date_from": (START + 200 * HOUR).isoformat(),
+            "date_to": (START + 300 * HOUR).isoformat(),
+            "top_n": 2,
+            **over,
+        }
+
+    def test_the_best_points_run_again_on_the_reserved_window(
+        self, client: Any, session_factory: Callable[[], Session], queue: _CapturingQueue
+    ) -> None:
+        sweep_id, runs = self.swept(client, session_factory)
+        queued_before = len(queue.jobs)
+
+        created = client.post(f"/sweeps/{sweep_id}/holdout", json=self.after())
+
+        assert created.status_code == 202, created.text
+        assert created.json()["runs"] == 2
+        assert len(queue.jobs) - queued_before == 2
+        holdout = client.get(f"/sweeps/{created.json()['id']}").json()
+        assert holdout["holdout_of"] == sweep_id
+        assert holdout["holdout_rule"] == {
+            "metric": "net_profit",
+            "top_n": 2,
+            "min_trades": {"H1": 30},
+        }
+        # The two best — periods 13 and 11 — on the same documents, over the new window.
+        by_strategy = {row["run"]["strategy_id"]: row for row in runs}
+        tested = holdout["runs"]
+        assert sorted(row["values"]["setup.params.period"] for row in tested) == [11, 13]
+        assert {row["run"]["strategy_id"] for row in tested} <= set(by_strategy)
+        assert {dt.datetime.fromisoformat(row["run"]["date_from"]) for row in tested} == {
+            START + 200 * HOUR
+        }
+
+    def test_the_comparison_sets_each_point_beside_the_run_it_was_chosen_by(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        sweep_id, _runs = self.swept(client, session_factory)
+        holdout_id = client.post(f"/sweeps/{sweep_id}/holdout", json=self.after()).json()["id"]
+        for row in client.get(f"/sweeps/{holdout_id}").json()["runs"]:
+            # Period 13 held up, period 11 did not.
+            net = 50 if row["values"]["setup.params.period"] == 13 else -80
+            finish_trading(session_factory, row["run"]["id"], net=net, trades=10)
+
+        compared = client.get(f"/sweeps/{holdout_id}/holdout")
+
+        assert compared.status_code == 200, compared.text
+        body = compared.json()
+        assert body["holdout_of"] == sweep_id
+        by_period = {row["values"]["setup.params.period"]: row for row in body["rows"]}
+        assert Decimal(by_period[13]["in_sample"]["net_return"]) == Decimal("0.13")
+        assert Decimal(by_period[13]["out_of_sample"]["net_return"]) == Decimal("0.005")
+        assert Decimal(by_period[11]["out_of_sample"]["net_return"]) == Decimal("-0.008")
+        (group,) = body["groups"]
+        assert (group["points"], group["done"]) == (2, 2)
+        assert Decimal(group["in_sample_median_return"]) == Decimal("0.12")
+        assert Decimal(group["out_of_sample_positive"]) == Decimal("0.5")
+
+    def test_a_window_that_shares_a_bar_with_the_search_is_refused(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        sweep_id, _runs = self.swept(client, session_factory)
+
+        inside = client.post(
+            f"/sweeps/{sweep_id}/holdout",
+            json=self.after(date_from=(START + 50 * HOUR).isoformat()),
+        )
+
+        assert inside.status_code == 422
+        assert "out of sample" in inside.json()["detail"]
+
+    def test_a_test_is_not_tested_again(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        sweep_id, _runs = self.swept(client, session_factory)
+        holdout_id = client.post(f"/sweeps/{sweep_id}/holdout", json=self.after()).json()["id"]
+
+        again = client.post(
+            f"/sweeps/{holdout_id}/holdout",
+            json=self.after(
+                date_from=(START + 400 * HOUR).isoformat(), date_to=(START + 500 * HOUR).isoformat()
+            ),
+        )
+
+        assert again.status_code == 422
+        assert "reserved-window test" in again.json()["detail"]
+
+    def test_a_sweep_with_nothing_past_the_trade_floor_is_refused(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        entry = an_entry(client, name=f"thin {uuid.uuid4()}")
+        sweep_id = client.post("/sweeps", json=a_sweep_body([entry], ["EURUSD"], ["H1"])).json()[
+            "id"
+        ]
+        (row,) = client.get(f"/sweeps/{sweep_id}").json()["runs"]
+        finish_trading(session_factory, row["run"]["id"], net=900, trades=29)
+
+        refused = client.post(f"/sweeps/{sweep_id}/holdout", json=self.after())
+
+        assert refused.status_code == 422
+        assert "trade floor" in refused.json()["detail"]
+
+    def test_an_ordinary_sweep_has_no_comparison(self, client: Any) -> None:
+        entry = an_entry(client, name=f"plain {uuid.uuid4()}")
+        sweep_id = client.post("/sweeps", json=a_sweep_body([entry], ["EURUSD"], ["H1"])).json()[
+            "id"
+        ]
+
+        assert client.get(f"/sweeps/{sweep_id}/holdout").status_code == 404
+        assert client.post(f"/sweeps/{uuid.uuid4()}/holdout", json=self.after()).status_code == 404

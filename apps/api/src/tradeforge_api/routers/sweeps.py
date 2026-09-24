@@ -36,18 +36,25 @@ from tradeforge_api.coverage import describe, to_collect, uncovered_markets
 from tradeforge_api.deps import QueueDep, SessionDep, SettingsDep
 from tradeforge_api.estimates import backtests_time
 from tradeforge_api.grid import GridPoint
+from tradeforge_api.holdout import Candidate, choose, median_of, overlaps, positive_share
 from tradeforge_api.queue import COLLECT_QUEUE, COLLECT_RANGE, RUN_BACKTEST
+from tradeforge_api.retention import MIN_TRADES
 from tradeforge_api.routers.backtests import failed_collections, list_item
 from tradeforge_api.routers.strategies import refusal_of
 from tradeforge_api.routers.studies import aggregate_points, strategies_for
 from tradeforge_api.runner import ENGINE_VERSION
 from tradeforge_api.schemas import (
     CreatedSweep,
+    CreateHoldout,
     CreateSweep,
     DatasetColumnOut,
     DatasetDictionaryOut,
     DatasetOmissionOut,
     GridRefusal,
+    HoldoutGroup,
+    HoldoutOut,
+    HoldoutRow,
+    HoldoutSide,
     PlannedCollection,
     PreviewSweepRequest,
     SweepDashboardOut,
@@ -741,6 +748,252 @@ def get_sweep_dashboard(
     )
 
 
+@router.post(
+    "/sweeps/{sweep_id}/holdout",
+    response_model=CreatedSweep,
+    status_code=status.HTTP_202_ACCEPTED,
+    responses={**_NOT_FOUND, **_BAD_BODY},
+)
+async def create_holdout(
+    sweep_id: uuid.UUID, request: CreateHoldout, session: SessionDep, queue: QueueDep
+) -> CreatedSweep:
+    """Run a sweep's best points again, on a window none of them was chosen on (24/09).
+
+    The test is a sweep of its own — the chosen points on the reserved window, linked back by
+    `holdout_of` — so it is queued, run, read and exported by everything a sweep already has, and
+    compared by `GET /sweeps/{id}/holdout`. Chosen per (entry, chart, market), among the finished
+    runs past the chart's trade floor, by `request.metric` (`holdout.choose`).
+
+    ⚠️ **Refused, not warned:** a window that shares a bar with the one searched, and a test of a
+    test — its points would be chosen on the reserved window itself.
+    """
+    parent = session.get(Sweep, sweep_id)
+    if parent is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="sweep not found")
+    if parent.holdout_of is not None or parent.holdout_rule is not None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="this sweep is itself a reserved-window test; test the sweep it came from",
+        )
+    if request.date_to <= request.date_from:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="date_to precedes date_from"
+        )
+    if overlaps(request.date_from, request.date_to, parent.date_from, parent.date_to):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=(
+                "the test window shares bars with the searched one "
+                f"({parent.date_from:%Y-%m-%d} to {parent.date_to:%Y-%m-%d}): it would not be "
+                "out of sample"
+            ),
+        )
+
+    own, _followers = _points_of(parent)
+    runs_of: dict[int, tuple[Backtest, str]] = {}
+    candidates: list[Candidate] = []
+    for order, (run, symbol) in enumerate(_runs_of(session, parent.id, done_only=True)):
+        point = own.get(str(run.strategy_id))
+        if point is None or run.metrics is None:
+            continue
+        runs_of[order] = (run, symbol)
+        candidates.append(
+            Candidate(
+                group=(str(point["entry_id"]), run.timeframe, symbol),
+                order=order,
+                metrics=run.metrics,
+            )
+        )
+    chosen = choose(candidates, metric=request.metric, top_n=request.top_n, floors=MIN_TRADES)
+    if not chosen:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="no finished run of this sweep can be ranked: none passed its chart's trade "
+            f"floor with a {request.metric.value} to rank by",
+        )
+
+    picked = [runs_of[one.order] for one in chosen]
+    symbols = [one for one in parent.symbols if any(symbol == one for _run, symbol in picked)]
+    timeframes = [
+        one for one in parent.timeframes if any(run.timeframe == one for run, _ in picked)
+    ]
+    uncovered = uncovered_markets(session, symbols, timeframes, request.date_from, request.date_to)
+    empty = {(market.symbol, market.timeframe) for market in uncovered}
+    runnable = [(run, symbol) for run, symbol in picked if (symbol, run.timeframe) not in empty]
+    if not runnable:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="no candles in this window for: " + ", ".join(map(describe, uncovered)),
+        )
+
+    found = {
+        instrument.symbol: instrument
+        for instrument in session.scalars(select(Instrument).where(Instrument.symbol.in_(symbols)))
+    }
+    tested = {str(run.strategy_id) for run, _symbol in runnable}
+    holdout = Sweep(
+        entry_ids=list(parent.entry_ids),
+        symbols=symbols,
+        timeframes=timeframes,
+        date_from=request.date_from,
+        date_to=request.date_to,
+        initial_capital=parent.initial_capital,
+        skipped=[market.model_dump() for market in uncovered],
+        # The parent's own point records, copied: the same strategies at the same coordinates —
+        # the one thing this sweep changes is the window.
+        points=[point for key, point in own.items() if key in tested],
+        holdout_of=parent.id,
+        holdout_rule={
+            "metric": request.metric.value,
+            "top_n": request.top_n,
+            "min_trades": {one: max(MIN_TRADES.get(one, 0), 1) for one in timeframes},
+        },
+    )
+    session.add(holdout)
+    runs = [
+        Backtest(
+            sweep=holdout,
+            strategy_id=run.strategy_id,
+            instrument_id=found[symbol].id,
+            timeframe=run.timeframe,
+            date_from=request.date_from,
+            date_to=request.date_to,
+            initial_capital=run.initial_capital,
+            # Charged exactly as the run it was chosen by: a test under other costs would differ
+            # from its in-sample side in the one respect the comparison is about.
+            cost_model=dict(run.cost_model),
+            status=BacktestStatus.QUEUED,
+            engine_version=ENGINE_VERSION,
+        )
+        for run, symbol in runnable
+    ]
+    session.add_all(runs)
+    session.commit()
+    # After the commit, and with the run's own id as the job id — the sweep launch's reasons.
+    for one in runs:
+        await queue.enqueue_job(RUN_BACKTEST, str(one.id), _job_id=str(one.id))
+    return CreatedSweep(id=holdout.id, runs=len(runs), skipped=uncovered)
+
+
+def _runs_of(
+    session: Session, sweep_id: uuid.UUID, *, done_only: bool = False
+) -> list[tuple[Backtest, str]]:
+    """A sweep's runs with their market, in launch order, metrics loaded without the heavy
+    columns — the curve and the ladder, which neither a choice nor a comparison reads."""
+    query = (
+        select(Backtest, Instrument.symbol)
+        .join(Instrument, Instrument.id == Backtest.instrument_id)
+        .where(Backtest.sweep_id == sweep_id)
+        .order_by(Backtest.created_at, Backtest.id)
+        .options(
+            selectinload(Backtest.metrics).options(
+                defer(BacktestMetrics.equity_curve), defer(BacktestMetrics.targets)
+            )
+        )
+    )
+    if done_only:
+        query = query.where(Backtest.status == BacktestStatus.DONE)
+    return [(run, symbol) for run, symbol in session.execute(query).all()]
+
+
+def _side(run: Backtest) -> HoldoutSide:
+    metrics = run.metrics
+    return HoldoutSide(
+        run_id=run.id,
+        status=run.status.value,
+        net_return=None if metrics is None else metrics.net_profit / run.initial_capital,
+        total_trades=None if metrics is None else metrics.total_trades,
+        profit_factor=None if metrics is None else metrics.profit_factor,
+        max_drawdown_pct=None if metrics is None else metrics.max_drawdown_pct,
+    )
+
+
+@router.get("/sweeps/{sweep_id}/holdout", response_model=HoldoutOut, responses=_NOT_FOUND)
+def get_holdout(sweep_id: uuid.UUID, session: SessionDep) -> HoldoutOut:
+    """A reserved-window test beside the runs its points were chosen by — point by point, and
+    per (entry, chart). A 404 for a sweep that is not such a test."""
+    holdout = session.get(Sweep, sweep_id)
+    if holdout is None or holdout.holdout_rule is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="holdout not found")
+    parent = None if holdout.holdout_of is None else session.get(Sweep, holdout.holdout_of)
+    chosen_by = (
+        {}
+        if parent is None
+        else {
+            (run.strategy_id, symbol, run.timeframe): run
+            for run, symbol in _runs_of(session, parent.id)
+        }
+    )
+    own, _followers = _points_of(holdout)
+    names = {
+        str(entry.id): entry.name
+        for entry in session.scalars(
+            select(CatalogEntry).where(
+                CatalogEntry.id.in_([uuid.UUID(one) for one in holdout.entry_ids])
+            )
+        )
+    }
+
+    rows: list[HoldoutRow] = []
+    for run, symbol in _runs_of(session, holdout.id):
+        point = own.get(str(run.strategy_id), {})
+        entry_id = str(point.get("entry_id", ""))
+        before = chosen_by.get((run.strategy_id, symbol, run.timeframe))
+        rows.append(
+            HoldoutRow(
+                entry_id=entry_id,
+                entry_name=names.get(entry_id),
+                symbol=symbol,
+                timeframe=run.timeframe,
+                label=str(point.get("label", "")),
+                values=dict(point.get("values", {})),
+                in_sample=None if before is None else _side(before),
+                out_of_sample=_side(run),
+            )
+        )
+
+    grouped: dict[tuple[str, str], list[HoldoutRow]] = {}
+    for row in rows:
+        grouped.setdefault((row.entry_id, row.timeframe), []).append(row)
+    groups: list[HoldoutGroup] = []
+    for (entry_id, timeframe), members in grouped.items():
+        after = [
+            row.out_of_sample.net_return
+            for row in members
+            if row.out_of_sample.status == BacktestStatus.DONE.value
+            and row.out_of_sample.net_return is not None
+        ]
+        before_returns = [
+            row.in_sample.net_return
+            for row in members
+            if row.in_sample is not None and row.in_sample.net_return is not None
+        ]
+        groups.append(
+            HoldoutGroup(
+                entry_id=entry_id,
+                entry_name=names.get(entry_id),
+                timeframe=timeframe,
+                points=len(members),
+                done=len(after),
+                in_sample_median_return=median_of(before_returns),
+                out_of_sample_median_return=median_of(after),
+                out_of_sample_positive=positive_share(after),
+            )
+        )
+
+    return HoldoutOut(
+        id=holdout.id,
+        holdout_of=holdout.holdout_of,
+        rule=dict(holdout.holdout_rule),
+        date_from=holdout.date_from,
+        date_to=holdout.date_to,
+        searched_from=None if parent is None else parent.date_from,
+        searched_to=None if parent is None else parent.date_to,
+        groups=groups,
+        rows=rows,
+    )
+
+
 @router.get("/sweeps/{sweep_id}", response_model=SweepOut, responses=_NOT_FOUND)
 def get_sweep(sweep_id: uuid.UUID, session: SessionDep) -> SweepOut:
     """A sweep read back: the question that was asked, and every run it became.
@@ -801,6 +1054,8 @@ def get_sweep(sweep_id: uuid.UUID, session: SessionDep) -> SweepOut:
         date_to=sweep.date_to,
         initial_capital=sweep.initial_capital,
         created_at=sweep.created_at,
+        holdout_of=sweep.holdout_of,
+        holdout_rule=sweep.holdout_rule,
         entries=summaries,
         runs=out,
         skipped=[UncoveredMarket.model_validate(one) for one in sweep.skipped],

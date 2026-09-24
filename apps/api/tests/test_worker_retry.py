@@ -5,11 +5,12 @@ are fakes that raise what psycopg raises through SQLAlchemy while the server is 
 """
 
 import asyncio
+import inspect
 import uuid
 from typing import Any
 
 import pytest
-from arq.worker import Function, Retry
+from arq.worker import Function, Retry, Worker
 from sqlalchemy.exc import IntegrityError, OperationalError
 
 from tradeforge_api.candle_cache import CandleCache
@@ -252,3 +253,12 @@ def test_a_worker_takes_one_backtest_at_a_time() -> None:
     claimed and idle behind it — while another worker has nothing — and could time out unstarted.
     More speed comes from more workers, never from more jobs per worker."""
     assert WorkerSettings.max_jobs == 1
+
+
+def test_a_worker_starts_the_next_backtest_without_waiting_half_a_second() -> None:
+    """A run holds the event loop through the poll that falls due while it runs, so each run used
+    to wait a whole `poll_delay` — arq's 0.5 s — before the next started: 0.508 s between runs of
+    1.24 s, measured on a CHOCH sweep (24/09). The name is checked against `Worker`'s own
+    signature too: arq drops a setting it does not know, so a misspelt one would be ignored."""
+    assert "poll_delay" in inspect.signature(Worker).parameters
+    assert WorkerSettings.poll_delay <= 0.1

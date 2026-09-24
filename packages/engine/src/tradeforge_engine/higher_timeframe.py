@@ -273,6 +273,12 @@ class HigherTimeframeGate:
         self._structure = MarketStructure()
         self._blocks = OrderBlockDetector()
         self._touched: set[OrderBlock] = set()
+        # ⚠️ **The regions a base bar can still touch, in the detector's order.** Every region
+        # already in `_touched` would be skipped anyway; asking the set about each of them on every
+        # base bar re-hashed a frozen dataclass two hundred times a bar — 6.6 million hashes in one
+        # CHOCH run with an H4 gate (24/09). The detector's list only changes when a higher bar
+        # closes, so this is rebuilt there, and shrinks on the bar a region is reached.
+        self._untouched: list[OrderBlock] = []
         self._releases: dict[Side, Release] = {}
 
     @property
@@ -305,6 +311,7 @@ class HigherTimeframeGate:
         then the endings: a bar that reaches a new region and runs two heights past it in one go
         releases and ends on the same call, which is what his rule says about that bar.
         """
+        closed = False
         for bar in self._bars.update(candle):
             self._blocks.update(bar, self._structure.update(bar))
             # The detector keeps a bounded history; so does this record, and only membership is
@@ -312,14 +319,25 @@ class HigherTimeframeGate:
             # detector's list can change.
             held = {tracked.block for tracked in self._blocks.zones}
             self._touched.intersection_update(held)
+            closed = True
+        if closed:
+            self._untouched = [
+                tracked.block
+                for tracked in self._blocks.zones
+                if tracked.block not in self._touched
+            ]
 
         reached: dict[Side, list[OrderBlock]] = {}
-        for tracked in self._blocks.zones:
-            block = tracked.block
-            if block in self._touched or not _reaches(block, candle):
+        for block in self._untouched:
+            # The same two questions as ever, the cheap one first: only a region the bar reaches
+            # is looked up. Still asked, because two equal regions in the detector's list are one
+            # region here — the first reached spends the second.
+            if not _reaches(block, candle) or block in self._touched:
                 continue
             self._touched.add(block)
             reached.setdefault(block.side, []).append(block)
+        if reached:
+            self._untouched = [block for block in self._untouched if block not in self._touched]
         for side, blocks in reached.items():
             # A side already released keeps the bar that released it: *from that bar on* is
             # counted from the first region price came to, and only the reference moves. A region

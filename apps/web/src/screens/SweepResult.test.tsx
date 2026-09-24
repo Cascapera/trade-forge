@@ -16,6 +16,7 @@ vi.mock('../api/hooks', async (importOriginal) => ({
   // offer a test on a sweep still running without any test noticing.
   isSweepSettled: (await importOriginal<typeof import('../api/hooks')>()).isSweepSettled,
   useSweep: vi.fn(),
+  useSweepRuns: vi.fn(),
   useEquityCurves: vi.fn(),
 }))
 
@@ -44,12 +45,40 @@ vi.mock('../components/ComparisonChart', () => ({
   ),
 }))
 
-import { useEquityCurves, useSweep } from '../api/hooks'
+import { useEquityCurves, useSweep, useSweepRuns } from '../api/hooks'
+import { rankingOf, type RankKey } from '../sweep/ranking'
 
 import { SweepResult } from './SweepResult'
 
 const mockedSweep = vi.mocked(useSweep)
 const mockedCurves = vi.mocked(useEquityCurves)
+const mockedRuns = vi.mocked(useSweepRuns)
+
+/**
+ * The server's page, played from the fixture's runs: one entry's, best first by the measure, the
+ * ones with nothing to rank by last in arrival order, then sliced. The server's own order is held
+ * by the API's tests; this is only what lets the screen be read against a sweep here.
+ */
+function served(
+  data: SweepOut | undefined,
+  page: { entryId: string; rankBy: RankKey; offset: number; limit: number },
+) {
+  const mine = (data?.runs ?? []).filter((one) => one.entry_id === page.entryId)
+  const { score } = rankingOf(page.rankBy)
+  const scored = mine.map((one) => ({
+    one,
+    value: one.run.metrics === null ? null : score(one.run.metrics),
+  }))
+  const ranked = scored.filter((x): x is { one: SweepRunOut; value: number } => x.value !== null)
+  ranked.sort((a, b) => (a.value === b.value ? 0 : a.value > b.value ? -1 : 1))
+  const ordered = [...ranked, ...scored.filter((x) => x.value === null)].map((x) => x.one)
+  return {
+    total: mine.length,
+    offset: page.offset,
+    limit: page.limit,
+    items: ordered.slice(page.offset, page.offset + page.limit),
+  }
+}
 
 function metrics(netProfit: string): Metrics {
   return {
@@ -183,6 +212,14 @@ function showing(data: SweepOut | undefined, state: 'pending' | 'error' | 'ok' =
     isError: state === 'error',
     error: state === 'error' ? new Error('nope') : null,
   } as unknown as ReturnType<typeof useSweep>)
+  mockedRuns.mockImplementation(
+    (_id, page) =>
+      ({
+        data: served(data, page),
+        isPending: false,
+        isError: false,
+      }) as unknown as ReturnType<typeof useSweepRuns>,
+  )
   // A curve **per selected run**, not a fixed empty map — otherwise every assertion about the
   // chart would pass because nothing could ever be drawn.
   mockedCurves.mockImplementation((ids: readonly string[]) => ({
@@ -606,5 +643,41 @@ describe('SweepResult — the reserved-window test', () => {
     renderWithProviders(<SweepResult />, '/sweeps/test-1')
 
     expect(screen.getByTestId('holdout-comparison')).toBeInTheDocument()
+  })
+})
+
+describe('SweepResult — read without its runs', () => {
+  it('counts from the server when the body carries no runs', () => {
+    showing(
+      sweep({
+        runs: [],
+        counts: { total: 22176, done: 22000, running: 6, queued: 170, failed: 0 },
+      }),
+    )
+    renderWithProviders(<SweepResult />, '/sweeps/sweep-1')
+
+    expect(screen.getByText(/over 22176 backtests/)).toBeInTheDocument()
+    expect(screen.getByRole('status')).toHaveTextContent('22000 of 22176 done · 6 running · 170 queued')
+  })
+
+  it('asks each entry for its own page, and stops asking once the sweep has landed', () => {
+    showing(sweep())
+    renderWithProviders(<SweepResult />, '/sweeps/sweep-1')
+
+    const asked = mockedRuns.mock.calls.map(([id, page, polling]) => [id, page.entryId, polling])
+    expect(asked).toContainEqual(['sweep-1', ZETA.id, false])
+    expect(asked).toContainEqual(['sweep-1', ALPHA.id, false])
+  })
+
+  it('says so when an entry cannot read its runs', () => {
+    showing(sweep())
+    mockedRuns.mockReturnValue({
+      data: undefined,
+      isPending: false,
+      isError: true,
+    } as unknown as ReturnType<typeof useSweepRuns>)
+    renderWithProviders(<SweepResult />, '/sweeps/sweep-1')
+
+    expect(screen.getAllByText(/Could not load this entry/)).toHaveLength(2)
   })
 })

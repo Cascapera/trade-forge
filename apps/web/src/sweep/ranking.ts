@@ -1,10 +1,11 @@
-// Ranking a sweep entry's runs, best first, by a measure the reader picks — and paging through them.
+// The measures a sweep entry's runs can be ranked by — their names, and what each one scores.
 //
-// ⚠️ **Done on the screen, not on the server.** The sweep page already holds every run (the
-// counter and the chart read them), so sorting and slicing here costs nothing and changes with
-// no round trip. A server-side page would be a second request for data already in hand.
+// ⚠️ **The ranking itself is the server's since 24/09** (`GET /sweeps/{id}/runs`): the screen used
+// to hold every run and sort them here, which on a sweep of 22 thousand runs meant 89 MB a poll.
+// `score` stays as the written statement of each rule — the server's order is held to it by the
+// API's own tests — and is what a single run's measure reads as.
 
-import type { BacktestListItem, Metrics } from '../api/types'
+import type { Metrics } from '../api/types'
 
 export type RankKey = 'return' | 'profit_factor' | 'win_rate' | 'expectancy' | 'drawdown'
 
@@ -52,47 +53,4 @@ export function rankingOf(key: RankKey): Ranking {
   return found
 }
 
-/**
- * The runs, best first by `key`.
- *
- * Runs with nothing to rank by — unfinished, or with no score under this measure — come last, in
- * the order they arrived. Ties keep their arrival order too (the sort is stable), so the same
- * data always ranks the same way.
- */
-export function rank(runs: readonly BacktestListItem[], key: RankKey): BacktestListItem[] {
-  const { score } = rankingOf(key)
-  const scored = runs.map((run) => ({
-    run,
-    value: run.metrics === null ? null : score(run.metrics),
-  }))
-  const ranked = scored.filter((one): one is { run: BacktestListItem; value: number } => one.value !== null)
-  const unranked = scored.filter((one) => one.value === null)
-  ranked.sort((a, b) => (a.value === b.value ? 0 : a.value > b.value ? -1 : 1))
-  return [...ranked, ...unranked].map((one) => one.run)
-}
-
 export const RUNS_PER_PAGE = 10
-
-export interface Page<T> {
-  items: T[]
-  /** Zero-based, and clamped: a page past the end becomes the last page. */
-  index: number
-  pages: number
-  /** 1-based position of the first and last item shown; 0 and 0 when there is nothing. */
-  first: number
-  last: number
-}
-
-export function pageOf<T>(items: readonly T[], index: number, size = RUNS_PER_PAGE): Page<T> {
-  const pages = Math.max(1, Math.ceil(items.length / size))
-  const clamped = Math.min(Math.max(0, index), pages - 1)
-  const start = clamped * size
-  const shown = items.slice(start, start + size)
-  return {
-    items: shown,
-    index: clamped,
-    pages,
-    first: shown.length === 0 ? 0 : start + 1,
-    last: start + shown.length,
-  }
-}

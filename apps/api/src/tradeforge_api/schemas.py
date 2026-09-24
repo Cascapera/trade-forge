@@ -2108,6 +2108,8 @@ class SweepOut(BaseModel):
     chosen from. Its comparison is `GET /sweeps/{id}/holdout`."""
     holdout_rule: dict[str, Any] | None = None
     """How those points were chosen — `metric`, `top_n`, `min_trades` per chart."""
+    counts: SweepRunCounts | None = None
+    """How many runs sit in each status — what a screen polls on, without the runs themselves."""
     entries: list[SweepEntryOut]
     """In the order the request listed the entries — which, from the launch screen, is the order
     they were **ticked**, not the order the shelf shows them in."""
@@ -2122,6 +2124,16 @@ class SweepOut(BaseModel):
     ⚠️ **Read this before reading `symbols` and `timeframes` as the space that was measured.**
     Those are what was asked; a pair named here has no runs because there was nothing to read,
     not because it was measured and came back empty."""
+
+
+class SweepRunsPage(BaseModel):
+    """One page of a sweep's runs, best first by the measure asked (`GET /sweeps/{id}/runs`)."""
+
+    total: int
+    """How many runs the filter holds, across every page."""
+    offset: int
+    limit: int
+    items: list[SweepRunOut]
 
 
 class SweepRunCounts(BaseModel):

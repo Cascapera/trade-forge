@@ -23,11 +23,12 @@ did — which is why a hole is always written down, never merely left.
 
 import json
 import uuid
-from typing import Annotated, Any
+from collections.abc import Iterable
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query, Response, status
 from pydantic import AwareDatetime
-from sqlalchemy import func, select
+from sqlalchemy import ColumnElement, and_, case, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, defer, selectinload
 
@@ -67,6 +68,7 @@ from tradeforge_api.schemas import (
     SweepPreview,
     SweepRunCounts,
     SweepRunOut,
+    SweepRunsPage,
     SweepsPage,
     UncoveredMarket,
 )
@@ -996,8 +998,17 @@ def get_holdout(sweep_id: uuid.UUID, session: SessionDep) -> HoldoutOut:
 
 
 @router.get("/sweeps/{sweep_id}", response_model=SweepOut, responses=_NOT_FOUND)
-def get_sweep(sweep_id: uuid.UUID, session: SessionDep) -> SweepOut:
+def get_sweep(
+    sweep_id: uuid.UUID,
+    session: SessionDep,
+    runs: Annotated[Literal["all", "none"], Query()] = "all",
+) -> SweepOut:
     """A sweep read back: the question that was asked, and every run it became.
+
+    ⚠️ **`runs=none` is what a screen polls.** A sweep of 22 thousand runs answered with all of them
+    is 89 MB, and the screen asked every three seconds while it ran (measured 24/09). Without the
+    runs the body carries the header, each entry's summary and `counts`; a screen reads the runs a
+    page at a time from `GET /sweeps/{id}/runs`. `all` stays the default for every other reader.
 
     ⚠️ **The coordinates come from `sweeps.points`, never from the strategy's name.** The name
     carries the label (`9.1 sem filtro [M15 · period=5]`) because that is what a run log row
@@ -1012,24 +1023,11 @@ def get_sweep(sweep_id: uuid.UUID, session: SessionDep) -> SweepOut:
     for run, strategy, instrument in rows:
         point = coordinates.get(str(run.strategy_id), {})
         entry_id = str(point.get("entry_id", ""))
-        entry = entries.get(entry_id)
         label = str(point.get("label", ""))
-        out.append(
-            SweepRunOut(
-                entry_id=uuid.UUID(entry_id) if entry_id else uuid.UUID(int=0),
-                # ⚠️ The shelf label if the entry is still there, and the document's own name if
-                # it is not. Removing an entry is allowed by design and must not blank a finished
-                # sweep — what it costs is the label, never the measurement.
-                entry_name=entry.name if entry is not None else strategy.name,
-                label=label,
-                values=dict(point.get("values", {})),
-                run=list_item(run, instrument.symbol, strategy.name, strategy.version),
-                equivalents=[
-                    SweepPoint(label=str(one["label"]), values=dict(one["values"]))
-                    for one in followers.get(str(run.strategy_id), [])
-                ],
+        if runs == "all":
+            out.append(
+                _run_out((run, strategy, instrument), point, entries=entries, followers=followers)
             )
-        )
         if entry_id in scored:
             # The symbol leads because the point label repeats once per market: `M15 · period=9`
             # over three symbols is three runs, and a best that named only the point would name
@@ -1057,6 +1055,7 @@ def get_sweep(sweep_id: uuid.UUID, session: SessionDep) -> SweepOut:
         created_at=sweep.created_at,
         holdout_of=sweep.holdout_of,
         holdout_rule=sweep.holdout_rule,
+        counts=_counts(run for run, _strategy, _instrument in rows),
         entries=summaries,
         runs=out,
         skipped=[UncoveredMarket.model_validate(one) for one in sweep.skipped],
@@ -1066,6 +1065,141 @@ def get_sweep(sweep_id: uuid.UUID, session: SessionDep) -> SweepOut:
 
 _SweepRows = list[tuple[Backtest, Strategy, Instrument]]
 _Point = dict[str, Any]
+
+
+def _run_out(
+    row: tuple[Backtest, Strategy, Instrument],
+    point: _Point,
+    *,
+    entries: dict[str, CatalogEntry],
+    followers: dict[str, list[_Point]],
+) -> SweepRunOut:
+    """One run of a sweep with its coordinates, as every view of the runs shows it."""
+    run, strategy, instrument = row
+    entry_id = str(point.get("entry_id", ""))
+    entry = entries.get(entry_id)
+    return SweepRunOut(
+        entry_id=uuid.UUID(entry_id) if entry_id else uuid.UUID(int=0),
+        # ⚠️ The shelf label if the entry is still there, and the document's own name if it is
+        # not. Removing an entry is allowed by design and must not blank a finished sweep — what
+        # it costs is the label, never the measurement.
+        entry_name=entry.name if entry is not None else strategy.name,
+        label=str(point.get("label", "")),
+        values=dict(point.get("values", {})),
+        run=list_item(run, instrument.symbol, strategy.name, strategy.version),
+        equivalents=[
+            SweepPoint(label=str(one["label"]), values=dict(one["values"]))
+            for one in followers.get(str(run.strategy_id), [])
+        ],
+    )
+
+
+def _counts(runs: Iterable[Backtest]) -> SweepRunCounts:
+    counted = dict.fromkeys(BacktestStatus, 0)
+    for run in runs:
+        counted[run.status] += 1
+    return SweepRunCounts(
+        total=sum(counted.values()),
+        done=counted[BacktestStatus.DONE],
+        running=counted[BacktestStatus.RUNNING],
+        queued=counted[BacktestStatus.QUEUED],
+        failed=counted[BacktestStatus.FAILED],
+    )
+
+
+RankBy = Literal["return", "profit_factor", "win_rate", "expectancy", "drawdown"]
+
+
+def _ranked(rank_by: RankBy) -> tuple[ColumnElement[Any], ...]:
+    """How `GET /sweeps/{id}/runs` orders: best first, nothing to rank by last, ties by launch.
+
+    The screen's own rule (`sweep/ranking.ts`), moved to where the runs are: a profit factor with
+    gains and no loss is the best there is, not a blank; a win rate over no trade is not a
+    measurement; the smallest drawdown ranks first; an unfinished run has no score at all.
+    """
+    metrics = BacktestMetrics
+    if rank_by == "return":
+        tier = case((metrics.net_profit.is_(None), 2), else_=1)
+        return (tier, metrics.net_profit.desc())
+    if rank_by == "profit_factor":
+        tier = case(
+            (and_(metrics.profit_factor.is_(None), metrics.gross_profit > 0), 0),
+            (metrics.profit_factor.is_not(None), 1),
+            else_=2,
+        )
+        return (tier, metrics.profit_factor.desc())
+    if rank_by == "win_rate":
+        tier = case((and_(metrics.total_trades.is_not(None), metrics.total_trades > 0), 1), else_=2)
+        return (tier, metrics.win_rate.desc())
+    if rank_by == "expectancy":
+        tier = case((metrics.expectancy.is_(None), 2), else_=1)
+        return (tier, metrics.expectancy.desc())
+    tier = case((metrics.max_drawdown_pct.is_(None), 2), else_=1)
+    return (tier, metrics.max_drawdown_pct.asc())
+
+
+@router.get("/sweeps/{sweep_id}/runs", response_model=SweepRunsPage, responses=_NOT_FOUND)
+def get_sweep_runs(  # noqa: PLR0913 — one query parameter per thing a page is asked by
+    sweep_id: uuid.UUID,
+    session: SessionDep,
+    *,
+    entry_id: uuid.UUID | None = None,
+    rank_by: RankBy = "return",
+    offset: Annotated[int, Query(ge=0)] = 0,
+    limit: Annotated[int, Query(ge=1, le=100)] = 10,
+) -> SweepRunsPage:
+    """One page of a sweep's runs — of one entry, when named — best first by `rank_by`.
+
+    Ranked by the database rather than by the screen (24/09): the screen used to hold every run and
+    sort them itself, which on a sweep of 22 thousand runs meant 89 MB per poll.
+    """
+    sweep = session.get(Sweep, sweep_id)
+    if sweep is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="sweep not found")
+    own, followers = _points_of(sweep)
+    strategies = [
+        uuid.UUID(key)
+        for key, point in own.items()
+        if entry_id is None or str(point.get("entry_id")) == str(entry_id)
+    ]
+    where = (Backtest.sweep_id == sweep.id, Backtest.strategy_id.in_(strategies))
+    total = session.scalar(select(func.count()).select_from(Backtest).where(*where)) or 0
+    rows = session.execute(
+        select(Backtest, Strategy, Instrument)
+        .join(Strategy, Strategy.id == Backtest.strategy_id)
+        .join(Instrument, Instrument.id == Backtest.instrument_id)
+        .outerjoin(BacktestMetrics, BacktestMetrics.backtest_id == Backtest.id)
+        .where(*where)
+        # Ties keep the order `_read_sweep` reads in, which is the order the screen ranked in.
+        .order_by(*_ranked(rank_by), Backtest.created_at, Strategy.name, Instrument.symbol)
+        .offset(offset)
+        .limit(limit)
+        .options(
+            selectinload(Backtest.metrics).options(
+                defer(BacktestMetrics.equity_curve), defer(BacktestMetrics.targets)
+            )
+        )
+    ).all()
+    entries = {
+        str(entry.id): entry
+        for entry in session.scalars(
+            select(CatalogEntry).where(CatalogEntry.id.in_([uuid.UUID(x) for x in sweep.entry_ids]))
+        )
+    }
+    return SweepRunsPage(
+        total=total,
+        offset=offset,
+        limit=limit,
+        items=[
+            _run_out(
+                (run, strategy, instrument),
+                own.get(str(run.strategy_id), {}),
+                entries=entries,
+                followers=followers,
+            )
+            for run, strategy, instrument in rows
+        ],
+    )
 
 
 def _points_of(sweep: Sweep) -> tuple[dict[str, _Point], dict[str, list[_Point]]]:

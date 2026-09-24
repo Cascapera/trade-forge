@@ -2,10 +2,12 @@ import { useMemo, useState } from 'react'
 import { useParams } from 'react-router-dom'
 
 import { apiUrl } from '../api/client'
-import { isSweepSettled, useEquityCurves, useSweep } from '../api/hooks'
+import { isSweepSettled, useEquityCurves, useSweep, useSweepRuns } from '../api/hooks'
+import type { BacktestListItem, SweepEntryOut } from '../api/types'
 import {
   EMPTY_SEATS,
   MAX_COMPARED,
+  type Seats,
   buildSeries,
   selectedIds,
   toggleSeat,
@@ -19,7 +21,7 @@ import { StudyDispersion } from '../components/StudyDispersion'
 import { SweepTargets } from '../components/TargetLadder'
 import { money } from '../format'
 import { settled, summarise, tally } from '../sweep/progress'
-import { RANKINGS, type RankKey, pageOf, rank, rankingOf } from '../sweep/ranking'
+import { RANKINGS, RUNS_PER_PAGE, type RankKey, rankingOf } from '../sweep/ranking'
 
 /** The calendar day of an ISO instant — the granularity a window is read at. */
 function day(iso: string): string {
@@ -68,6 +70,76 @@ function Pager(props: {
 }
 
 /**
+ * One entry of a sweep: its summary, then its runs a ranked page at a time.
+ *
+ * ⚠️ **The page comes from the server, ranked there** (24/09). The screen used to hold every run
+ * and sort them itself; on a sweep of 22 thousand runs that was 89 MB a poll. The summary above
+ * the table is still the whole entry's — the server computes it over every run.
+ */
+function EntryRuns(props: {
+  sweepId: string
+  entry: SweepEntryOut
+  rankBy: RankKey
+  index: number
+  onPage: (index: number) => void
+  polling: boolean
+  seats: Seats
+  onToggle: (run: BacktestListItem) => void
+}): React.JSX.Element {
+  const { entry } = props
+  const runs = useSweepRuns(
+    props.sweepId,
+    {
+      entryId: entry.entry_id,
+      rankBy: props.rankBy,
+      offset: props.index * RUNS_PER_PAGE,
+      limit: RUNS_PER_PAGE,
+    },
+    props.polling,
+  )
+  const heading = `sweep-entry-${entry.entry_id}`
+  const name = entry.entry_name ?? 'An entry since removed from the shelf'
+  const total = runs.data?.total ?? 0
+  const items = (runs.data?.items ?? []).map((row) => row.run)
+  const pages = Math.max(1, Math.ceil(total / RUNS_PER_PAGE))
+  const first = items.length === 0 ? 0 : props.index * RUNS_PER_PAGE + 1
+  const last = first === 0 ? 0 : first + items.length - 1
+  return (
+    <section aria-labelledby={heading} className="space-y-3 border-t border-slate-800 pt-5">
+      <div>
+        <h3 id={heading} className="text-lg font-medium text-sky-400">
+          {name}
+        </h3>
+        <p className="text-sm text-slate-400">{backtests(total)}</p>
+      </div>
+      <StudyDispersion aggregate={entry.aggregate} />
+      {/* Every target scored from how far the trades went: the sweep ran once, without one. */}
+      <SweepTargets rungs={entry.targets} />
+      {runs.isError ? (
+        <p className="text-sm text-red-400">Could not load this entry&apos;s runs.</p>
+      ) : (
+        <p className="text-xs text-slate-500">
+          {first === 0
+            ? runs.isPending
+              ? 'Loading the runs…'
+              : 'No runs yet.'
+            : `Runs ${String(first)}–${String(last)} of ${String(total)}, best ${rankingOf(props.rankBy).label.toLowerCase()} first. Runs with nothing to rank by — unfinished, failed, or without this measure — come last.`}
+        </p>
+      )}
+      <RunTable
+        runs={items}
+        seats={props.seats}
+        onToggle={(runId) => {
+          const run = items.find((one) => one.id === runId)
+          if (run !== undefined) props.onToggle(run)
+        }}
+      />
+      <Pager label={`${name} pages`} index={props.index} pages={pages} onPage={props.onPage} />
+    </section>
+  )
+}
+
+/**
  * One sweep read back: every entry it ran, each summarised on its own.
  *
  * ⚠️ **A section per entry, and never one summary for the whole sweep.** The entries of a sweep
@@ -93,13 +165,20 @@ export function SweepResult(): React.JSX.Element {
   // One page per entry, by entry id. Changing the measure starts every entry from its best again.
   const [pageOfEntry, setPageOfEntry] = useState<Record<string, number>>({})
 
-  const runs = useMemo(() => (sweep.data?.runs ?? []).map((row) => row.run), [sweep.data])
+  // ⚠️ **The runs on the chart are kept here, not looked up in a page.** A page holds ten runs
+  // and changes as the reader pages and the sweep runs; a run ticked on page one must stay on the
+  // chart while page three is on screen.
+  const [pinned, setPinned] = useState<ReadonlyMap<string, BacktestListItem>>(new Map())
   const picked = useMemo(() => selectedIds(seats), [seats])
   const { curves } = useEquityCurves(picked)
-  const series = useMemo(() => buildSeries(seats, runs, curves), [seats, runs, curves])
+  const series = useMemo(
+    () => buildSeries(seats, [...pinned.values()], curves),
+    [seats, pinned, curves],
+  )
 
-  function toggle(runId: string): void {
-    setSeats((current) => toggleSeat(current, runId))
+  function toggle(run: BacktestListItem): void {
+    setSeats((current) => toggleSeat(current, run.id))
+    setPinned((current) => new Map(current).set(run.id, run))
   }
 
   if (sweep.isPending) return <p className="text-slate-400">Loading the sweep…</p>
@@ -108,14 +187,14 @@ export function SweepResult(): React.JSX.Element {
   }
 
   const data = sweep.data
-  const counts = tally(data.runs)
+  const counts = data.counts ?? tally(data.runs)
 
   return (
     <div className="space-y-6">
       <div>
         <h2 className="text-xl font-semibold">
           {data.entries.length} {data.entries.length === 1 ? 'entry' : 'entries'} over{' '}
-          {backtests(data.runs.length)}
+          {backtests(counts.total)}
         </h2>
         <p className="text-sm text-slate-400">
           {data.symbols.join(', ')} · {data.timeframes.join(', ')} · {day(data.date_from)} →{' '}
@@ -228,45 +307,21 @@ export function SweepResult(): React.JSX.Element {
         </p>
       </section>
 
-      {data.entries.map((entry) => {
-        // By id, from the coordinates the server wrote at launch — never by matching the entry's
-        // name against a strategy name, which breaks the day one entry's name prefixes another's.
-        const mine = data.runs.filter((row) => row.entry_id === entry.entry_id).map((row) => row.run)
-        const heading = `sweep-entry-${entry.entry_id}`
-        const name = entry.entry_name ?? 'An entry since removed from the shelf'
-        const page = pageOf(rank(mine, rankBy), pageOfEntry[entry.entry_id] ?? 0)
-        return (
-          <section
-            key={entry.entry_id}
-            aria-labelledby={heading}
-            className="space-y-3 border-t border-slate-800 pt-5"
-          >
-            <div>
-              <h3 id={heading} className="text-lg font-medium text-sky-400">
-                {name}
-              </h3>
-              <p className="text-sm text-slate-400">{backtests(mine.length)}</p>
-            </div>
-            <StudyDispersion aggregate={entry.aggregate} />
-            {/* Every target scored from how far the trades went: the sweep ran once, without one. */}
-            <SweepTargets rungs={entry.targets} />
-            <p className="text-xs text-slate-500">
-              {page.first === 0
-                ? 'No runs yet.'
-                : `Runs ${String(page.first)}–${String(page.last)} of ${String(mine.length)}, best ${rankingOf(rankBy).label.toLowerCase()} first. Runs with nothing to rank by — unfinished, failed, or without this measure — come last.`}
-            </p>
-            <RunTable runs={page.items} seats={seats} onToggle={toggle} />
-            <Pager
-              label={`${name} pages`}
-              index={page.index}
-              pages={page.pages}
-              onPage={(index) => {
-                setPageOfEntry((current) => ({ ...current, [entry.entry_id]: index }))
-              }}
-            />
-          </section>
-        )
-      })}
+      {data.entries.map((entry) => (
+        <EntryRuns
+          key={entry.entry_id}
+          sweepId={data.id}
+          entry={entry}
+          rankBy={rankBy}
+          index={pageOfEntry[entry.entry_id] ?? 0}
+          onPage={(index) => {
+            setPageOfEntry((current) => ({ ...current, [entry.entry_id]: index }))
+          }}
+          polling={!settled(counts)}
+          seats={seats}
+          onToggle={toggle}
+        />
+      ))}
     </div>
   )
 }

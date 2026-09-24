@@ -1182,6 +1182,73 @@ export interface SweepEntryOut {
   targets: TargetRung[]
 }
 
+/** How a reserved-window test chose the points it runs again. */
+export interface HoldoutRule {
+  metric: SelectionMetric
+  top_n: number
+  /** The fewest trades a run needed to be ranked, per chart. */
+  min_trades: Record<string, number>
+}
+
+/** Test a sweep's best points on a window none of them was chosen on. */
+export interface CreateHoldoutRequest {
+  date_from: string
+  date_to: string
+  top_n: number
+  metric: SelectionMetric
+  /** Per chart, over the sweep's own floor; a chart left out keeps that floor. */
+  min_trades: Record<string, number>
+}
+
+/** One run's result, on one side of the comparison. */
+export interface HoldoutSide {
+  run_id: string
+  status: BacktestStatus
+  /** Net profit over the initial capital, as a fraction. */
+  net_return: string | null
+  total_trades: number | null
+  profit_factor: string | null
+  max_drawdown_pct: string | null
+}
+
+/** A tested point beside the run it was chosen by. */
+export interface HoldoutRow {
+  entry_id: string
+  entry_name: string | null
+  symbol: string
+  timeframe: string
+  label: string
+  values: Record<string, unknown>
+  /** `null` only once the searched sweep is gone. */
+  in_sample: HoldoutSide | null
+  out_of_sample: HoldoutSide
+}
+
+/** One (entry, chart) of a test, summed up both ways — medians, never the best. */
+export interface HoldoutGroup {
+  entry_id: string
+  entry_name: string | null
+  timeframe: string
+  points: number
+  done: number
+  in_sample_median_return: string | null
+  out_of_sample_median_return: string | null
+  /** The fraction of the finished tests that made money on the reserved window. */
+  out_of_sample_positive: string | null
+}
+
+export interface HoldoutOut {
+  id: string
+  holdout_of: string | null
+  rule: HoldoutRule
+  date_from: string
+  date_to: string
+  searched_from: string | null
+  searched_to: string | null
+  groups: HoldoutGroup[]
+  rows: HoldoutRow[]
+}
+
 export interface SweepOut {
   id: string
   entry_ids: string[]
@@ -1191,6 +1258,10 @@ export interface SweepOut {
   date_to: string
   initial_capital: string
   created_at: string
+  /** Set on a reserved-window test: the sweep whose best points it runs again (24/09). */
+  holdout_of?: string | null
+  /** How a test chose its points — `metric`, `top_n`, `min_trades` per chart. */
+  holdout_rule?: HoldoutRule | null
   /** In the order the entries were asked for. */
   entries: SweepEntryOut[]
   runs: SweepRunOut[]

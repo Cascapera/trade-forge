@@ -106,4 +106,29 @@ describe('api client', () => {
     expect(fetchMock).toHaveBeenCalledWith('/api/backtests/x/trades?limit=100&offset=0', expect.anything())
     expect(fetchMock).toHaveBeenCalledWith('/api/backtests', expect.objectContaining({ method: 'POST' }))
   })
+
+  it('reaches the reserved-window test of a sweep, and its comparison', async () => {
+    const fetchMock = mockFetch(202, { id: 't', runs: 1, skipped: [] })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await api.createHoldout('s-1', {
+      date_from: '2026-01-01T00:00:00Z',
+      date_to: '2026-09-19T00:00:00Z',
+      top_n: 3,
+      metric: 'net_profit',
+      min_trades: {},
+    })
+    await api.getHoldout('t')
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      '/api/sweeps/s-1/holdout',
+      expect.objectContaining({ method: 'POST' }),
+    )
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      '/api/sweeps/t/holdout',
+      expect.objectContaining({ method: 'GET' }),
+    )
+  })
 })

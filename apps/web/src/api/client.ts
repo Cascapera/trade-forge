@@ -16,6 +16,7 @@ import type {
   CreateCatalogEntry,
   CreateCollection,
   CreateStudyRequest,
+  CreateHoldoutRequest,
   CreateSweepRequest,
   CreateWalkForwardRequest,
   CreatedBacktest,
@@ -40,6 +41,7 @@ import type {
   StrategyOut,
   StudyOut,
   StudyPreview,
+  HoldoutOut,
   SweepOut,
   SweepPreview,
   SweepDashboard,
@@ -183,6 +185,11 @@ export const api = {
   createSweep: (payload: CreateSweepRequest): Promise<CreatedSweep> =>
     request('POST', '/sweeps', payload),
   getSweep: (id: string): Promise<SweepOut> => request('GET', `/sweeps/${id}`),
+  // A sweep's best points, run again on a window none of them was chosen on (24/09) — itself a
+  // sweep, read back by `getSweep` and compared by `getHoldout`.
+  createHoldout: (sweepId: string, payload: CreateHoldoutRequest): Promise<CreatedSweep> =>
+    request('POST', `/sweeps/${sweepId}/holdout`, payload),
+  getHoldout: (id: string): Promise<HoldoutOut> => request('GET', `/sweeps/${id}/holdout`),
   listSweeps: (page: { limit: number; offset: number }): Promise<SweepsPage> =>
     request('GET', `/sweeps${query(page)}`),
   getSweepDashboard: (launched: LaunchWindow): Promise<SweepDashboard> =>

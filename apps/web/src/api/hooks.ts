@@ -25,6 +25,7 @@ import type {
   CreateBasketRequest,
   CreateCollection,
   CreateStudyRequest,
+  CreateHoldoutRequest,
   CreateSweepRequest,
   CreateWalkForwardRequest,
   CreatedBacktest,
@@ -50,6 +51,7 @@ import type {
   StudyOut,
   StudyPreview,
   PreviewSweepRequest,
+  HoldoutOut,
   SweepOut,
   SweepPreview,
   LaunchWindow,
@@ -592,6 +594,30 @@ export function useSweep(id: string | undefined) {
     queryKey: ['sweep', id],
     queryFn: id === undefined ? skipToken : () => api.getSweep(id),
     refetchInterval: (query) => (isSweepSettled(query.state.data) ? false : STUDY_POLL_MS),
+  })
+}
+
+/** Launch a reserved-window test of a sweep's best points. */
+export function useCreateHoldout(sweepId: string) {
+  return useMutation<CreatedSweep, Error, CreateHoldoutRequest>({
+    mutationFn: (payload) => api.createHoldout(sweepId, payload),
+  })
+}
+
+/** Whether every tested point has landed — the moment the comparison's poll can stop. */
+export function isHoldoutSettled(holdout: HoldoutOut | undefined): boolean {
+  return holdout?.rows.every((row) => isTerminal(row.out_of_sample.status)) ?? false
+}
+
+/**
+ * A reserved-window test read against the sweep it came from, polled until every point lands.
+ * `id` is `undefined` for a sweep that is not a test, which asks nothing.
+ */
+export function useHoldout(id: string | undefined) {
+  return useQuery<HoldoutOut>({
+    queryKey: ['holdout', id],
+    queryFn: id === undefined ? skipToken : () => api.getHoldout(id),
+    refetchInterval: (query) => (isHoldoutSettled(query.state.data) ? false : STUDY_POLL_MS),
   })
 }
 

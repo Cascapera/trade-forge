@@ -126,7 +126,10 @@ def client(
     seeding.commit()
     seeding.close()
     app = create_app(
-        settings=settings.model_copy(update={"parquet_root": tmp_path}),
+        # ⚠️ One worker, whatever the machine running the suite has in its `.env`: the preview's
+        # time is divided by the workers, and a developer's `TRADEFORGE_WORKERS=6` failed the
+        # estimate's test locally while CI, with no `.env`, passed it (24/09).
+        settings=settings.model_copy(update={"parquet_root": tmp_path, "tradeforge_workers": 1}),
         session_factory=session_factory,
         arq_pool=queue,
     )

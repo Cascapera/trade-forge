@@ -1765,6 +1765,17 @@ class Sweep(Base):
     date_to: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     initial_capital: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
 
+    holdout_of: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("sweeps.id", ondelete="SET NULL"), nullable=True
+    )
+    """The sweep whose best points this one tests on a window they were not chosen on, or null
+    for an ordinary sweep (`rev_0024`). Null too once that sweep is deleted: the test's runs are
+    measurements of their own, and what the deletion costs is the comparison."""
+
+    holdout_rule: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    """How the tested points were chosen — `metric`, `top_n` per (entry, chart, market), and the
+    trade floor per chart. "The best" means nothing without "by what"."""
+
     created_at: Mapped[dt.datetime] = _created_at()
 
     backtests: Mapped[list[Backtest]] = relationship(back_populates="sweep", passive_deletes="all")
@@ -1779,5 +1790,10 @@ class Sweep(Base):
         CheckConstraint("jsonb_typeof(points) = 'array'", name="points_are_a_list"),
         CheckConstraint("jsonb_typeof(skipped) = 'array'", name="skipped_is_a_list"),
         CheckConstraint("date_to > date_from", name="a_window_runs_forwards"),
+        CheckConstraint(
+            "holdout_rule IS NULL OR jsonb_typeof(holdout_rule) = 'object'",
+            name="a_holdout_rule_is_an_object",
+        ),
         Index("ix_sweeps_created_at", "created_at"),
+        Index("ix_sweeps_holdout_of", "holdout_of"),
     )

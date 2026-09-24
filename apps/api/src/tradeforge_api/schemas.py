@@ -2010,6 +2010,82 @@ class SweepEntryOut(BaseModel):
     """The target ladder across this entry's runs, one rung per row, lowest target first."""
 
 
+class CreateHoldout(BaseModel):
+    """Test a sweep's best points on a window none of them was chosen on (24/09).
+
+    ⚠️ **The window must not touch the one searched**, and that is refused rather than warned: a
+    test that shares bars with the search is partly the search again, and would read as a second
+    opinion it is not.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    date_from: AwareInstant
+    date_to: AwareInstant
+    top_n: int = Field(default=3, ge=1, le=100)
+    """How many points to test per (entry, chart, market)."""
+    metric: SelectionMetric = SelectionMetric.NET_PROFIT
+    """What "best" means. A run with no value for it is not ranked, never ranked as zero."""
+
+
+class HoldoutSide(BaseModel):
+    """One run's result, on one side of the comparison."""
+
+    run_id: uuid.UUID
+    status: str
+    net_return: Money | None
+    """Net profit over the initial capital, as the dataset's `return`."""
+    total_trades: int | None
+    profit_factor: Money | None
+    max_drawdown_pct: Money | None
+
+
+class HoldoutRow(BaseModel):
+    """A tested point: where it sits, what it made where it was chosen, and what it made after."""
+
+    entry_id: str
+    entry_name: str | None
+    symbol: str
+    timeframe: str
+    label: str
+    values: dict[str, Any]
+    in_sample: HoldoutSide | None
+    """The run it was chosen by. `None` only if that sweep is gone."""
+    out_of_sample: HoldoutSide
+
+
+class HoldoutGroup(BaseModel):
+    """One (entry, chart) of the test, summed up both ways.
+
+    ⚠️ **Medians, never the best.** The best out-of-sample run is again the best of several draws;
+    whether the method held is what the median and the share still positive say.
+    """
+
+    entry_id: str
+    entry_name: str | None
+    timeframe: str
+    points: int
+    done: int
+    in_sample_median_return: Money | None
+    out_of_sample_median_return: Money | None
+    out_of_sample_positive: Money | None
+    """The fraction of the finished tests that made money on the reserved window."""
+
+
+class HoldoutOut(BaseModel):
+    """A reserved-window test read against the sweep it came from."""
+
+    id: uuid.UUID
+    holdout_of: uuid.UUID | None
+    rule: dict[str, Any]
+    date_from: dt.datetime
+    date_to: dt.datetime
+    searched_from: dt.datetime | None
+    searched_to: dt.datetime | None
+    groups: list[HoldoutGroup]
+    rows: list[HoldoutRow]
+
+
 class SweepOut(BaseModel):
     """A sweep read back: the question that was asked, and every run it became."""
 
@@ -2021,6 +2097,11 @@ class SweepOut(BaseModel):
     date_to: dt.datetime
     initial_capital: Decimal
     created_at: dt.datetime
+    holdout_of: uuid.UUID | None = None
+    """Set on a sweep that tests another's best points on a reserved window: the sweep they were
+    chosen from. Its comparison is `GET /sweeps/{id}/holdout`."""
+    holdout_rule: dict[str, Any] | None = None
+    """How those points were chosen — `metric`, `top_n`, `min_trades` per chart."""
     entries: list[SweepEntryOut]
     """In the order the request listed the entries — which, from the launch screen, is the order
     they were **ticked**, not the order the shelf shows them in."""

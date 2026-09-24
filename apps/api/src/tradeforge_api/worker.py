@@ -674,6 +674,13 @@ class WorkerSettings:
     # sit claimed and idle behind it — while another worker has nothing — and run into arq's job
     # timeout without ever starting. More speed comes from more workers (`TRADEFORGE_WORKERS`).
     max_jobs = 1
+    # ⚠️ **A twentieth of a second, not arq's half** (24/09). The run is synchronous CPU, so it
+    # holds the event loop through the poll that falls due while it runs, and the slot it frees is
+    # only seen on the poll after that: every run paid one whole `poll_delay` before the next one
+    # started. Measured on a CHOCH sweep, 0.508 s between runs of 1.24 s — 29% of the worker idle.
+    # The cost is an idle worker asking Redis twenty times a second instead of two, which is
+    # nothing to Redis even with forty workers asking.
+    poll_delay = 0.05
     on_startup = startup
     on_shutdown = shutdown
 

@@ -11,9 +11,22 @@ import type {
 } from '../api/types'
 import { renderWithProviders } from '../test-utils'
 
-vi.mock('../api/hooks', () => ({
+vi.mock('../api/hooks', async (importOriginal) => ({
+  // The real `isSweepSettled`: it is a pure reading of the body, and a stub would let this screen
+  // offer a test on a sweep still running without any test noticing.
+  isSweepSettled: (await importOriginal<typeof import('../api/hooks')>()).isSweepSettled,
   useSweep: vi.fn(),
   useEquityCurves: vi.fn(),
+}))
+
+// Each has its own tests; here only whether the screen shows the right one.
+vi.mock('../components/HoldoutLauncher', () => ({
+  HoldoutLauncher: () => <div data-testid="holdout-launcher" />,
+}))
+vi.mock('../components/HoldoutComparison', () => ({
+  HoldoutComparison: ({ sweepId }: { sweepId: string }) => (
+    <div data-testid="holdout-comparison">{sweepId}</div>
+  ),
 }))
 
 // ⚠️ A prefix the real client never produces. With the real module a test run spells `/api` both
@@ -549,5 +562,49 @@ describe('SweepResult', () => {
     renderWithProviders(<SweepResult />)
 
     expect(screen.getByText(/Could not load this sweep/)).toBeInTheDocument()
+  })
+})
+
+describe('SweepResult — the reserved-window test', () => {
+  it('offers the test on a sweep whose every run has landed', () => {
+    showing(sweep())
+    renderWithProviders(<SweepResult />, '/sweeps/sweep-1')
+
+    expect(screen.getByTestId('holdout-launcher')).toBeInTheDocument()
+    expect(screen.queryByTestId('holdout-comparison')).not.toBeInTheDocument()
+  })
+
+  it('does not offer it while "the best" is still moving', () => {
+    showing(sweep({ runs: [row('a1', ALPHA, 'M15', null)] }))
+    renderWithProviders(<SweepResult />, '/sweeps/sweep-1')
+
+    expect(screen.queryByTestId('holdout-launcher')).not.toBeInTheDocument()
+  })
+
+  it('reads a test against the sweep it came from, and never offers to test a test', () => {
+    showing(
+      sweep({
+        id: 'test-1',
+        holdout_of: 'sweep-1',
+        holdout_rule: { metric: 'net_profit', top_n: 3, min_trades: { M15: 30 } },
+      }),
+    )
+    renderWithProviders(<SweepResult />, '/sweeps/test-1')
+
+    expect(screen.getByTestId('holdout-comparison')).toHaveTextContent('test-1')
+    expect(screen.queryByTestId('holdout-launcher')).not.toBeInTheDocument()
+  })
+
+  it('still reads as a test once the searched sweep is gone', () => {
+    showing(
+      sweep({
+        id: 'test-1',
+        holdout_of: null,
+        holdout_rule: { metric: 'net_profit', top_n: 3, min_trades: { M15: 30 } },
+      }),
+    )
+    renderWithProviders(<SweepResult />, '/sweeps/test-1')
+
+    expect(screen.getByTestId('holdout-comparison')).toBeInTheDocument()
   })
 })

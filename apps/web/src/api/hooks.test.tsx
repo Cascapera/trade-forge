@@ -21,12 +21,13 @@ vi.mock('./client', () => ({
   },
 }))
 
-import type { BasketOut, SweepOut, SweepsPage } from './types'
+import type { BasketOut, HoldoutOut, SweepOut, SweepsPage } from './types'
 import { api } from './client'
 import {
   SWEEPS_PER_PAGE,
   isHistorySettled,
   isSettled,
+  isHoldoutSettled,
   isSweepSettled,
   isTerminal,
   useBasket,
@@ -92,6 +93,20 @@ describe('isSettled', () => {
     // The API refuses fewer than two symbols so this cannot be created, but `every` is true of an
     // empty list — reading that as unsettled would be a query polling a shape that cannot happen.
     expect(isSettled(basket())).toBe(true)
+  })
+})
+
+describe('isHoldoutSettled', () => {
+  function holdout(...statuses: string[]): HoldoutOut {
+    return {
+      rows: statuses.map((status) => ({ out_of_sample: { status } })),
+    } as unknown as HoldoutOut
+  }
+
+  it('waits for every tested point, and for the body itself', () => {
+    expect(isHoldoutSettled(undefined)).toBe(false)
+    expect(isHoldoutSettled(holdout('done', 'running'))).toBe(false)
+    expect(isHoldoutSettled(holdout('done', 'failed'))).toBe(true)
   })
 })
 

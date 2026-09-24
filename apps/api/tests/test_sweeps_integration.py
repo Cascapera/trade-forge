@@ -1908,3 +1908,27 @@ class TestTheReservedWindow:
 
         assert client.get(f"/sweeps/{sweep_id}/holdout").status_code == 404
         assert client.post(f"/sweeps/{uuid.uuid4()}/holdout", json=self.after()).status_code == 404
+
+    def test_the_trade_floor_can_be_raised_per_chart(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        """His ask (24/09): the sweep's floor is 1 trade on D1 and W1, which ranked runs of one to
+        four trades there. Raised here to 41 on H1, every run of 40 falls below it."""
+        sweep_id, _runs = self.swept(client, session_factory)
+
+        raised = client.post(f"/sweeps/{sweep_id}/holdout", json=self.after(min_trades={"H1": 41}))
+        kept = client.post(f"/sweeps/{sweep_id}/holdout", json=self.after(min_trades={"H1": 40}))
+
+        assert raised.status_code == 422
+        assert kept.status_code == 202, kept.text
+        rule = client.get(f"/sweeps/{kept.json()['id']}").json()["holdout_rule"]
+        assert rule["min_trades"] == {"H1": 40}
+
+    def test_a_floor_below_one_or_on_an_unknown_chart_is_refused(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        sweep_id, _runs = self.swept(client, session_factory)
+
+        for floors in ({"H1": 0}, {"H7": 5}):
+            refused = client.post(f"/sweeps/{sweep_id}/holdout", json=self.after(min_trades=floors))
+            assert refused.status_code == 422, floors

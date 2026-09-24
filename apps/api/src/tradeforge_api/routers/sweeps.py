@@ -804,7 +804,8 @@ async def create_holdout(
                 metrics=run.metrics,
             )
         )
-    chosen = choose(candidates, metric=request.metric, top_n=request.top_n, floors=MIN_TRADES)
+    floors = {**MIN_TRADES, **request.min_trades}
+    chosen = choose(candidates, metric=request.metric, top_n=request.top_n, floors=floors)
     if not chosen:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -846,7 +847,7 @@ async def create_holdout(
         holdout_rule={
             "metric": request.metric.value,
             "top_n": request.top_n,
-            "min_trades": {one: max(MIN_TRADES.get(one, 0), 1) for one in timeframes},
+            "min_trades": {one: max(floors.get(one, 0), 1) for one in timeframes},
         },
     )
     session.add(holdout)

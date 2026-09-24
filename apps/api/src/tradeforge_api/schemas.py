@@ -2026,6 +2026,12 @@ class CreateHoldout(BaseModel):
     """How many points to test per (entry, chart, market)."""
     metric: SelectionMetric = SelectionMetric.NET_PROFIT
     """What "best" means. A run with no value for it is not ranked, never ranked as zero."""
+    min_trades: dict[Timeframe, Annotated[int, Field(ge=1, le=1_000_000)]] = Field(
+        default_factory=dict
+    )
+    """The fewest trades a run needs to be ranked, per chart, over the sweep's own floor
+    (`retention.MIN_TRADES`, never below 1). His ask (24/09): on D1 and W1 that floor is 1, and the
+    first test ranked runs of one to four trades there."""
 
 
 class HoldoutSide(BaseModel):

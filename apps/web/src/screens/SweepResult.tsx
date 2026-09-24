@@ -2,7 +2,7 @@ import { useMemo, useState } from 'react'
 import { useParams } from 'react-router-dom'
 
 import { apiUrl } from '../api/client'
-import { useEquityCurves, useSweep } from '../api/hooks'
+import { isSweepSettled, useEquityCurves, useSweep } from '../api/hooks'
 import {
   EMPTY_SEATS,
   MAX_COMPARED,
@@ -12,6 +12,8 @@ import {
 } from '../backtest/compare'
 import { ComparisonChart } from '../components/ComparisonChart'
 import { FailedDownloads } from '../components/FailedDownloads'
+import { HoldoutComparison } from '../components/HoldoutComparison'
+import { HoldoutLauncher } from '../components/HoldoutLauncher'
 import { RunTable } from '../components/RunTable'
 import { StudyDispersion } from '../components/StudyDispersion'
 import { SweepTargets } from '../components/TargetLadder'
@@ -166,6 +168,15 @@ export function SweepResult(): React.JSX.Element {
           </a>
         </p>
       </div>
+
+      {/* A test reads against the sweep it came from; a finished sweep offers to be tested. Not
+          offered on a test itself — its points would be chosen on the reserved window — and not
+          before every run has landed, when "the best" is still moving. */}
+      {data.holdout_rule !== undefined && data.holdout_rule !== null ? (
+        <HoldoutComparison sweepId={data.id} />
+      ) : (
+        isSweepSettled(data) && <HoldoutLauncher sweep={data} />
+      )}
 
       {/* ⚠️ **Always on screen, and waiting kept apart from executing.** The line this replaced
           read `1 of 10 backtests still running`, vanished once nothing was outstanding, and

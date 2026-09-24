@@ -84,6 +84,7 @@ from tradeforge_engine.structure import (
     StructureKind,
     TrackedZone,
     ZoneKind,
+    holding,
 )
 from tradeforge_engine.vwap_setups import (
     DEFAULT_BARS_TO_TRIGGER,
@@ -365,8 +366,8 @@ class ChochQualifier:
 
         while self._ladder:
             rung = self._ladder[0]
-            tracked = next((zone for zone in context.zones if zone.block == rung), None)
-            if tracked is not None and tracked.usable:
+            held = holding(context.zones, rung)
+            if held and held[0].usable:
                 return rung
             # Dead with no trade taken — aged out of the tracker, or spent before price ever
             # came back to the order. The next zone toward the origin answers; the machinery
@@ -458,8 +459,8 @@ class ContinuationQualifier:
 
         while self._ladder:
             rung = self._ladder[0]
-            tracked = next((zone for zone in context.zones if zone.block == rung), None)
-            if tracked is not None and tracked.usable:
+            held = holding(context.zones, rung)
+            if held and held[0].usable:
                 return rung
             # Dead with no trade taken — aged out, or spent before price returned. The next zone
             # toward the origin answers; the machinery would refuse this one anyway.
@@ -1902,7 +1903,7 @@ def _mitigated(block: OrderBlock, zones: Sequence[TrackedZone]) -> bool:
     bearing: the strategy asks `_tracked` first at the one call site, and a dropped region takes
     its order with it regardless of what this would have said.
     """
-    return any(tracked.block == block and tracked.mitigated for tracked in zones)
+    return any(tracked.mitigated for tracked in holding(zones, block))
 
 
 def _ran_away(block: OrderBlock, candle: Candle, zones: Sequence[TrackedZone]) -> bool:
@@ -2777,10 +2778,8 @@ class StructureStrategy:
         A zone the detector has dropped is as dead as a mitigated one — it aged out of the window
         the method looks back over.
         """
-        for tracked in self._blocks.zones:
-            if tracked.block == block:
-                return tracked.usable
-        return False
+        held = holding(self._blocks.zones, block)
+        return bool(held) and held[0].usable
 
     def _tracked(self, block: OrderBlock) -> bool:
         """Is the detector still holding this region at all?
@@ -2790,7 +2789,7 @@ class StructureStrategy:
         window takes its order with it — nothing downstream would notice the region breaking, and
         an order left resting there fills off a level no longer being maintained.
         """
-        return any(tracked.block == block for tracked in self._blocks.zones)
+        return bool(holding(self._blocks.zones, block))
 
     def _release(self, armed: _Armed, candle: Candle) -> tuple[Signal, ...]:
         """Give up an armed zone: a cancel if its order reached the book, silence if it never did.

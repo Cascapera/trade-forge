@@ -2676,3 +2676,10 @@ Fica em aberto:
 - a regra olha só o **fechamento**, como a validação do sinal: uma ordem segura por vários candles
   cuja máxima passou do nível mas cujo fechamento voltou ainda é colocada depois, num nível que o
   preço já negociou.
+
+## Teste: ordem armada numa zona que sai da janela de 200 regiões (24/09)
+
+Achado pelo `engine-guardian` no PR das varreduras de zonas: trocar `StructureStrategy._tracked` por
+`return True` passa na suíte inteira do motor. Falta o cenário em que uma zona armada, com a ordem
+parada no book, é empurrada para fora da janela de `_MAX_ZONES` regiões — a ordem tem que ser
+cancelada. O buraco é anterior ao PR (a forma antiga com `any(...)` passaria igual).

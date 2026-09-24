@@ -26,10 +26,11 @@ context.
 """
 
 from collections import deque
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
-from typing import Final
+from typing import Final, Self
 
 from tradeforge_engine.domain import Candle, Money, Side
 
@@ -1113,6 +1114,47 @@ class _Region:
         return candle.high >= self.near_edge
 
 
+class ZoneView(tuple[TrackedZone, ...]):
+    """The detector's regions, oldest first — a plain tuple, plus the lookup its readers need.
+
+    Every reader of the regions asks the same question of them: *which tracked region holds this
+    block?* Asked by walking the tuple, it compared whole `OrderBlock`s field by field against up
+    to two hundred regions, several times a bar — 17 million comparisons in one CHOCH run over 82k
+    bars, more than half its time (24/09). The index answers the same thing from a dict.
+
+    ⚠️ **Exactly what the walk answered, in the walk's order.** A block maps to *every* region
+    holding an equal block, oldest first, so "the first match" and "any match" both read the same
+    as before. The detector never offers one region twice — a break clears the leg's regions — so
+    the tuple is one or empty in practice; it is kept a tuple so that nothing here rests on that.
+    Built once per view, and a view is built only when the detector's list changes.
+    """
+
+    _index: dict[OrderBlock, tuple[TrackedZone, ...]]
+
+    def __new__(cls, zones: Iterable[TrackedZone] = ()) -> Self:
+        view = super().__new__(cls, zones)
+        index: dict[OrderBlock, tuple[TrackedZone, ...]] = {}
+        for tracked in view:
+            index[tracked.block] = (*index.get(tracked.block, ()), tracked)
+        view._index = index
+        return view
+
+    def holding(self, block: OrderBlock) -> tuple[TrackedZone, ...]:
+        """Every region holding an equal block, oldest first."""
+        return self._index.get(block, ())
+
+
+def holding(zones: Sequence[TrackedZone], block: OrderBlock) -> tuple[TrackedZone, ...]:
+    """Every region in `zones` holding an equal block, oldest first — indexed when it can be.
+
+    A `ZoneView` answers from its index; any other sequence (a test's hand-built tuple) is walked,
+    which is the same answer.
+    """
+    if isinstance(zones, ZoneView):
+        return zones.holding(block)
+    return tuple(tracked for tracked in zones if tracked.block == block)
+
+
 class OrderBlockDetector:
     """Marks supply and demand zones from the impulse legs that break structure.
 
@@ -1153,15 +1195,23 @@ class OrderBlockDetector:
         self._window: deque[Candle] = deque(maxlen=3)
         self._regions: list[_Region] = []
         self._zones: list[TrackedZone] = []
+        # ⚠️ **Only the zones still standing are advanced**, and the two lists must name the same
+        # objects. A touch is permanent (`_advance`), so folding a candle into a region already
+        # taken changes nothing — and with two hundred regions kept, doing it anyway was 16
+        # million calls in one CHOCH run over 82k bars, a quarter of its time (24/09). `_live` is
+        # `_zones` minus the mitigated, in the same order, and loses a region the moment it is
+        # taken or trimmed; `_view` is what `zones` hands out, rebuilt only when `_zones` changes.
+        self._live: list[TrackedZone] = []
+        self._view = ZoneView()
         self._index = -1
         # The author's latch, one per direction: a run of gapping bars marks one region, not one
         # per bar. Cleared by any bar that completes no gap that way.
         self._gapping: dict[FVGKind, bool] = {FVGKind.BULLISH: False, FVGKind.BEARISH: False}
 
     @property
-    def zones(self) -> tuple[TrackedZone, ...]:
+    def zones(self) -> ZoneView:
         """Every region offered so far, oldest first, each with whether price has taken it."""
-        return tuple(self._zones)
+        return self._view
 
     def update(self, candle: Candle, break_: StructureBreak | None) -> tuple[OrderBlock, ...]:
         """Fold in one closed candle and the break it confirmed (if any); return the zones offered.
@@ -1174,8 +1224,12 @@ class OrderBlockDetector:
         # Everything already being followed advances *before* this bar can mark anything new. A
         # region cannot be taken by the bar that created it — his gap condition puts price clear
         # of the region on that bar, so the first touch can only come later.
-        for tracked in self._zones:
+        taken = False
+        for tracked in self._live:
             self._advance(tracked, candle)
+            taken = taken or tracked.mitigated
+        if taken:
+            self._live = [tracked for tracked in self._live if not tracked.mitigated]
         for region in self._regions:
             region.mitigated = region.mitigated or region.touched_by(candle)
 
@@ -1208,9 +1262,17 @@ class OrderBlockDetector:
             self._zone(region, break_, primary=position == 0)
             for position, region in enumerate(in_leg)
         )
-        self._zones.extend(TrackedZone(block=block) for block in marked)
+        fresh = [TrackedZone(block=block) for block in marked]
+        self._zones.extend(fresh)
+        self._live.extend(fresh)
         if len(self._zones) > self._MAX_ZONES:
+            # A trimmed region is no longer followed at all — the same as before `_live` existed,
+            # when the loop above only ever walked `_zones`.
+            trimmed = {id(tracked) for tracked in self._zones[: -self._MAX_ZONES]}
             del self._zones[: -self._MAX_ZONES]
+            self._live = [tracked for tracked in self._live if id(tracked) not in trimmed]
+        if marked:
+            self._view = ZoneView(self._zones)
         return marked
 
     @staticmethod
@@ -1267,4 +1329,6 @@ __all__ = [
     "TrackedZone",
     "Trend",
     "ZoneKind",
+    "ZoneView",
+    "holding",
 ]

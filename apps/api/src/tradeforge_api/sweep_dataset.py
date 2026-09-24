@@ -29,6 +29,7 @@ from enum import Enum
 from typing import Any, Literal
 
 from tradeforge_db.models import Backtest
+from tradeforge_engine.excursion import LADDER
 
 Role = Literal["identity", "choice", "condition", "outcome"]
 """What a column is *for*, which is what a reader most needs and cannot infer from a name.
@@ -424,6 +425,71 @@ _AFTER_PARAMS: tuple[Column, ...] = (
 )
 
 
+def _rung_key(rung: Decimal) -> str:
+    """The rung as `backtest_metrics.targets` keys it: `2`, not `2.0`; `0.5` as it is."""
+    return format(rung.normalize(), "f")
+
+
+def _rung_field(key: str, field: str) -> Callable[[DatasetRun], object]:
+    def read(row: DatasetRun) -> object:
+        metrics = row.run.metrics
+        ladder = None if metrics is None else metrics.targets
+        outcome = None if ladder is None else ladder.get(key)
+        if outcome is None:
+            return None
+        value = outcome[field]
+        # The document keeps the R figures as text, for their precision; the file writes numbers.
+        return Decimal(value) if isinstance(value, str) else value
+
+    return read
+
+
+_RUNG_FIELDS: tuple[tuple[str, str, str], ...] = (
+    (
+        "net_r",
+        "R, net of costs",
+        "What the run's trades would have made with this target instead of their own exit, "
+        "summed: each trade scored alone, in R of its own risk, less its own costs in R.",
+    ),
+    ("expectancy_r", "R, net of costs", "net_r over trades: what one trade was worth on average."),
+    ("hits", "count", "How many of the trades this target would have closed."),
+    (
+        "trades",
+        "count",
+        "The trades the rung was scored over — every trade of the run, or the rung is empty.",
+    ),
+    (
+        "max_drawdown_r",
+        "R",
+        "The deepest fall of the running sum of net R from its peak. 0 for one that never fell.",
+    ),
+)
+
+_LADDER_NOTE = (
+    "Scored per trade while the run's trades were in memory (2026-09-23), so it exists for every "
+    "run, the ones that kept no trades included. ⚠️ Per trade, not per run: a real run with this "
+    "target frees its position earlier and can take trades this one never saw (measured on "
+    "24/09: the median net R did not move, the sign changed on 0-4% of runs). Empty when the run "
+    "is not done, or when some trade cannot answer the rung: no stop, not measured, or a target of "
+    "its own closer than this one."
+)
+
+_LADDER: tuple[Column, ...] = tuple(
+    Column(
+        f"target_{_rung_key(rung)}r_{field}",
+        "outcome",
+        unit,
+        f"At a {_rung_key(rung)} R target. {description} {_LADDER_NOTE}",
+        _rung_field(_rung_key(rung), field),
+    )
+    for rung in LADDER
+    for field, unit, description in _RUNG_FIELDS
+)
+"""The target ladder, one column per rung and figure — what the ML plan reads to choose a target
+without a run per target (his plan, 23/09). Built from the engine's `LADDER`, so a rung added there
+is a column here."""
+
+
 def _value_at(path: str) -> Callable[[DatasetRun], object]:
     def read(row: DatasetRun) -> object:
         if path not in row.values:
@@ -454,7 +520,7 @@ def columns_for(runs: Sequence[DatasetRun]) -> list[Column]:
         )
         for path in paths
     ]
-    return [*_BEFORE_PARAMS, *grid, *_AFTER_PARAMS]
+    return [*_BEFORE_PARAMS, *grid, *_AFTER_PARAMS, *_LADDER]
 
 
 def cell(value: object) -> str:

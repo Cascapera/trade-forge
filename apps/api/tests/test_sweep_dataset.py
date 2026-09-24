@@ -22,6 +22,7 @@ from tradeforge_api.sweep_dataset import (
     to_csv,
 )
 from tradeforge_db.models import Backtest, BacktestMetrics, BacktestStatus
+from tradeforge_engine.excursion import LADDER
 
 START = dt.datetime(2024, 1, 1, tzinfo=dt.UTC)
 
@@ -282,3 +283,58 @@ class TestTheCells:
         assert cell(BacktestStatus.DONE) == "done"
         # Keys sorted and no spaces, so one cost model is one string however it was written.
         assert cell({"type": "spread", "spread_points": 8}) == '{"spread_points":8,"type":"spread"}'
+
+
+def _rows(runs: Sequence[DatasetRun]) -> list[dict[str, str]]:
+    return list(csv.DictReader(io.StringIO(to_csv(runs))))
+
+
+class TestTheTargetLadder:
+    """Every rung of the engine's ladder, as columns — what the ML plan reads to choose a target
+    without a run per target (24/09)."""
+
+    def test_every_rung_has_its_five_columns_in_ladder_order(self) -> None:
+        names = [column.name for column in columns_for([a_run()])]
+        ladder = [name for name in names if name.startswith("target_")]
+
+        rungs = [format(rung.normalize(), "f") for rung in LADDER]
+        fields = ["net_r", "expectancy_r", "hits", "trades", "max_drawdown_r"]
+        assert ladder == [f"target_{rung}r_{field}" for rung in rungs for field in fields]
+        assert all(
+            column.role == "outcome" for column in columns_for([a_run()]) if column.name in ladder
+        )
+
+    def test_a_scored_rung_is_read_as_numbers(self) -> None:
+        run = a_run()
+        assert run.run.metrics is not None
+        run.run.metrics.targets = {
+            "2": {
+                "trades": 12,
+                "hits": 4,
+                "net_r": "1.50000000000000000000",
+                "expectancy_r": "0.125",
+                "max_drawdown_r": "3",
+            },
+            "3": None,
+        }
+
+        (row,) = _rows([run])
+
+        assert row["target_2r_net_r"] == "1.50000000000000000000"
+        assert Decimal(row["target_2r_expectancy_r"]) == Decimal("0.125")
+        assert (row["target_2r_hits"], row["target_2r_trades"]) == ("4", "12")
+        assert row["target_2r_max_drawdown_r"] == "3"
+
+    def test_a_rung_that_cannot_be_scored_is_empty_never_zero(self) -> None:
+        """`null` in the document is a rung some trade could not answer — a target of its own closer
+        than this one, above all. Written as 0 it would read as a target that broke even."""
+        scored = a_run()
+        assert scored.run.metrics is not None
+        scored.run.metrics.targets = {"3": None}
+        unscored = a_run(net_profit=None, status=BacktestStatus.QUEUED)
+        legacy = a_run()  # a run from before the ladder existed
+
+        rows = _rows([scored, unscored, legacy])
+
+        assert {row["target_3r_net_r"] for row in rows} == {""}
+        assert {row["target_0.5r_hits"] for row in rows} == {""}

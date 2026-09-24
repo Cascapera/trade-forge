@@ -1262,8 +1262,12 @@ export interface SweepOut {
   holdout_of?: string | null
   /** How a test chose its points — `metric`, `top_n`, `min_trades` per chart. */
   holdout_rule?: HoldoutRule | null
+  /** How many runs sit in each status — what the screen polls on (24/09). */
+  counts?: SweepRunCounts | null
   /** In the order the entries were asked for. */
   entries: SweepEntryOut[]
+  /** Empty when read with `runs=none`, which is how the screen reads it: the runs come a page at a
+   *  time from `getSweepRuns`. */
   runs: SweepRunOut[]
   /** Pairs of `symbols` x `timeframes` left out for having no candles in the window (PR-269).
    *  ⚠️ `symbols` and `timeframes` are what was **asked**: read this before reading them as the
@@ -1272,6 +1276,14 @@ export interface SweepOut {
   /** Downloads that failed under this sweep's runs, once each (his rule of 22/09). Unlike
    *  `skipped`, these runs *did* run — on what was on disk. */
   failed_collections: Collection[]
+}
+
+/** One page of a sweep's runs, best first by the measure asked — ranked by the server. */
+export interface SweepRunsPage {
+  total: number
+  offset: number
+  limit: number
+  items: SweepRunOut[]
 }
 
 /** How many of a sweep's runs sit in each status. The four always add up to `total`. */

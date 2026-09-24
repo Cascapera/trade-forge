@@ -131,4 +131,20 @@ describe('api client', () => {
       expect.objectContaining({ method: 'GET' }),
     )
   })
+
+  it('reads a sweep without its runs, and its runs a ranked page at a time', async () => {
+    const fetchMock = mockFetch(200, {})
+    vi.stubGlobal('fetch', fetchMock)
+
+    await api.getSweep('s-1', 'none')
+    await api.getSweepRuns('s-1', { entryId: 'e-1', rankBy: 'drawdown', offset: 20, limit: 10 })
+    await api.getSweep('s-1')
+
+    const paths = fetchMock.mock.calls.map((call) => String(call[0]))
+    expect(paths).toEqual([
+      '/api/sweeps/s-1?runs=none',
+      '/api/sweeps/s-1/runs?entry_id=e-1&rank_by=drawdown&offset=20&limit=10',
+      '/api/sweeps/s-1',
+    ])
+  })
 })

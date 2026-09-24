@@ -111,6 +111,14 @@ describe('isHoldoutSettled', () => {
 })
 
 describe('isSweepSettled', () => {
+  it('reads the counts when the body carries them instead of the runs', () => {
+    const counted = (running: number, queued: number) =>
+      ({ runs: [], counts: { total: 5, done: 5 - running - queued, running, queued, failed: 0 } }) as unknown as SweepOut
+    expect(isSweepSettled(counted(0, 0))).toBe(true)
+    expect(isSweepSettled(counted(1, 0))).toBe(false)
+    expect(isSweepSettled(counted(0, 2))).toBe(false)
+  })
+
   function sweep(...statuses: string[]): SweepOut {
     return { runs: statuses.map((status) => ({ run: { status } })) } as SweepOut
   }

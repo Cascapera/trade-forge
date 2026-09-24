@@ -1932,3 +1932,90 @@ class TestTheReservedWindow:
         for floors in ({"H1": 0}, {"H7": 5}):
             refused = client.post(f"/sweeps/{sweep_id}/holdout", json=self.after(min_trades=floors))
             assert refused.status_code == 422, floors
+
+
+class TestTheScreenReadsAPage:
+    """A sweep of 22 thousand runs answered with all of them was 89 MB per poll (24/09): the screen
+    now polls without the runs and reads them a ranked page at a time."""
+
+    def five(self, client: Any, session_factory: Callable[[], Session]) -> tuple[str, list[str]]:
+        """Five points of one entry; four finished with nets 100..400, the fifth still queued."""
+        entry = an_entry(
+            client, name=f"paged {uuid.uuid4()}", grid={"setup.params.period": [5, 7, 9, 11, 13]}
+        )
+        sweep_id = client.post("/sweeps", json=a_sweep_body([entry], ["EURUSD"], ["H1"])).json()[
+            "id"
+        ]
+        runs = client.get(f"/sweeps/{sweep_id}").json()["runs"]
+        by_period = {row["values"]["setup.params.period"]: row["run"]["id"] for row in runs}
+        for period, net in ((5, 100), (7, 400), (9, 200), (11, 300)):
+            finish_trading(session_factory, by_period[period], net=net, trades=10)
+        return sweep_id, [by_period[p] for p in (7, 11, 9, 5, 13)]
+
+    def test_polling_carries_the_counts_and_no_runs(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        sweep_id, _ = self.five(client, session_factory)
+
+        body = client.get(f"/sweeps/{sweep_id}", params={"runs": "none"}).json()
+
+        assert body["runs"] == []
+        assert body["counts"] == {"total": 5, "done": 4, "running": 0, "queued": 1, "failed": 0}
+        # The summaries are still the whole sweep's.
+        (entry,) = body["entries"]
+        assert entry["aggregate"]["points_finished"] == 4
+        assert client.get(f"/sweeps/{sweep_id}").json()["counts"]["total"] == 5
+
+    def test_a_page_is_ranked_best_first_with_the_unfinished_last(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        sweep_id, best_first = self.five(client, session_factory)
+
+        first = client.get(f"/sweeps/{sweep_id}/runs", params={"limit": 2}).json()
+        rest = client.get(f"/sweeps/{sweep_id}/runs", params={"limit": 2, "offset": 2}).json()
+        last = client.get(f"/sweeps/{sweep_id}/runs", params={"limit": 2, "offset": 4}).json()
+
+        assert first["total"] == 5
+        ids = [row["run"]["id"] for page in (first, rest, last) for row in page["items"]]
+        assert ids == best_first
+
+    def test_the_smallest_drawdown_ranks_first_and_a_profit_factor_with_no_loss_leads(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        sweep_id, best_first = self.five(client, session_factory)
+        with session_factory() as session:
+            for run_id, (drawdown, factor) in zip(
+                best_first[:4],
+                [("0.30", "1.5"), ("0.10", None), ("0.20", "2.5"), ("0.05", "0.8")],
+                strict=True,
+            ):
+                run = session.get(Backtest, uuid.UUID(run_id))
+                assert run is not None
+                assert run.metrics is not None
+                run.metrics.max_drawdown_pct = Decimal(drawdown)
+                run.metrics.profit_factor = None if factor is None else Decimal(factor)
+            session.commit()
+
+        def ranked(by: str) -> list[str]:
+            page = client.get(f"/sweeps/{sweep_id}/runs", params={"rank_by": by}).json()
+            return [row["run"]["id"] for row in page["items"]]
+
+        n7, n11, n9, n5, queued = best_first
+        assert ranked("drawdown") == [n5, n11, n9, n7, queued]
+        # Period 11 won with no loss (its net is positive): the best profit factor there is.
+        assert ranked("profit_factor") == [n11, n9, n7, n5, queued]
+
+    def test_a_page_of_one_entry_holds_only_its_runs(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        mine = an_entry(client, name=f"mine {uuid.uuid4()}", grid={"setup.params.period": [5, 7]})
+        other = an_entry(client, name=f"other {uuid.uuid4()}")
+        sweep_id = client.post(
+            "/sweeps", json=a_sweep_body([mine, other], ["EURUSD"], ["H1"])
+        ).json()["id"]
+
+        page = client.get(f"/sweeps/{sweep_id}/runs", params={"entry_id": mine}).json()
+
+        assert page["total"] == 2
+        assert {row["entry_id"] for row in page["items"]} == {mine}
+        assert client.get(f"/sweeps/{uuid.uuid4()}/runs").status_code == 404

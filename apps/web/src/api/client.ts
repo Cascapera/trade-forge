@@ -2,6 +2,7 @@
 // non-2xx into a typed `ApiError` carrying the parsed `detail` — so a caller (and a test) can
 // branch on the status and read the backend's message instead of a bare rejection.
 
+import type { RankKey } from '../sweep/ranking'
 import type {
   Backtest,
   BacktestFilters,
@@ -45,6 +46,7 @@ import type {
   SweepOut,
   SweepPreview,
   SweepDashboard,
+  SweepRunsPage,
   SweepsPage,
   LaunchWindow,
   SymbolHistory,
@@ -184,7 +186,18 @@ export const api = {
   getStudy: (id: string): Promise<StudyOut> => request('GET', `/studies/${id}`),
   createSweep: (payload: CreateSweepRequest): Promise<CreatedSweep> =>
     request('POST', '/sweeps', payload),
-  getSweep: (id: string): Promise<SweepOut> => request('GET', `/sweeps/${id}`),
+  // ⚠️ `none` is what the screen polls: a sweep of 22 thousand runs with all of them was 89 MB a
+  // poll (24/09). The runs then come a ranked page at a time.
+  getSweep: (id: string, runs: 'all' | 'none' = 'all'): Promise<SweepOut> =>
+    request('GET', `/sweeps/${id}${runs === 'none' ? '?runs=none' : ''}`),
+  getSweepRuns: (
+    id: string,
+    page: { entryId: string; rankBy: RankKey; offset: number; limit: number },
+  ): Promise<SweepRunsPage> =>
+    request(
+      'GET',
+      `/sweeps/${id}/runs${query({ entry_id: page.entryId, rank_by: page.rankBy, offset: page.offset, limit: page.limit })}`,
+    ),
   // A sweep's best points, run again on a window none of them was chosen on (24/09) — itself a
   // sweep, read back by `getSweep` and compared by `getHoldout`.
   createHoldout: (sweepId: string, payload: CreateHoldoutRequest): Promise<CreatedSweep> =>

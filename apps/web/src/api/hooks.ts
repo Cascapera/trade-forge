@@ -8,6 +8,7 @@ import type { Strategy } from '@tradeforge/schema'
 import { useEffect, useRef } from 'react'
 
 import { settled } from '../sweep/progress'
+import type { RankKey } from '../sweep/ranking'
 
 import { api } from './client'
 import type {
@@ -54,6 +55,7 @@ import type {
   HoldoutOut,
   SweepOut,
   SweepPreview,
+  SweepRunsPage,
   LaunchWindow,
   SweepDashboard,
   SweepsPage,
@@ -579,7 +581,12 @@ export function useCreateSweep() {
  * silently applies to the other. Here the status sits one level down, inside `run`.
  */
 export function isSweepSettled(sweep: SweepOut | undefined): boolean {
-  return sweep?.runs.every((row) => isTerminal(row.run.status)) ?? false
+  if (sweep === undefined) return false
+  // The counts when the body carries them — it does when read without its runs, which is how the
+  // screen reads it — and the runs otherwise.
+  const counts = sweep.counts
+  if (counts !== undefined && counts !== null) return counts.running === 0 && counts.queued === 0
+  return sweep.runs.every((row) => isTerminal(row.run.status))
 }
 
 /**
@@ -592,8 +599,26 @@ export function isSweepSettled(sweep: SweepOut | undefined): boolean {
 export function useSweep(id: string | undefined) {
   return useQuery<SweepOut>({
     queryKey: ['sweep', id],
-    queryFn: id === undefined ? skipToken : () => api.getSweep(id),
+    queryFn: id === undefined ? skipToken : () => api.getSweep(id, 'none'),
     refetchInterval: (query) => (isSweepSettled(query.state.data) ? false : STUDY_POLL_MS),
+  })
+}
+
+/**
+ * One page of one entry's runs, ranked by the server — polled while the sweep runs, because a
+ * finishing run can move into the page being read. The previous page stays on screen while the
+ * next one loads, so paging never blanks the table.
+ */
+export function useSweepRuns(
+  id: string,
+  page: { entryId: string; rankBy: RankKey; offset: number; limit: number },
+  polling: boolean,
+) {
+  return useQuery<SweepRunsPage>({
+    queryKey: ['sweep-runs', id, page.entryId, page.rankBy, page.offset, page.limit],
+    queryFn: () => api.getSweepRuns(id, page),
+    placeholderData: (previous) => previous,
+    refetchInterval: polling ? STUDY_POLL_MS : false,
   })
 }
 

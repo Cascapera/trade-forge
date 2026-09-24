@@ -336,6 +336,24 @@ def _reconcile_pattern(  # noqa: PLR0913 — one host's whole identity, passed f
         logger.debug("%s wants %s, which the long average does not allow", name, wanted.price)
         return signals, armed, count
 
+    if _passed_by(wanted, side, candle.close):
+        # ⚠️ **The pattern has expired, and it is dropped** (his call, 23/09: option A). Its order
+        # was due on an earlier bar and was held back — by the long filter warming up, in the case
+        # that found this — and by now price has gone through the level: a buy stop below the
+        # market, or a buy limit above it. Sent as it is, the order would be a market order at a
+        # price the method never named, and the signal refuses it by raising, which used to end
+        # the whole run (144 runs of the 23/09 sweep). The trade the pattern described no longer
+        # exists, so nothing is placed and the clock starts over — which also closes the touch
+        # window: a later hammer needs a new touch of the average.
+        #
+        # ⚠️ **After the filter, and his second answer (option a).** While the filter holds the
+        # order back the pattern stays alive, as it did before: the filter gates placing and never
+        # takes the setup apart. So this fires only on the bar the filter lets the order through
+        # and price has already passed it — exactly the bars that used to raise, and no others.
+        logger.debug("%s: %s was passed by the close %s; dropped", name, wanted, candle.close)
+        watch.reset()
+        return signals, armed, count
+
     count += 1
     client_id = f"{name}-{candle.time:%Y%m%dT%H%M}-{count}"
     armed = _Armed(reference=candle, client_id=client_id, order=wanted)
@@ -354,6 +372,18 @@ def _reconcile_pattern(  # noqa: PLR0913 — one host's whole identity, passed f
         )
     )
     return signals, armed, count
+
+
+def _passed_by(order: PatternOrder, side: Side, close: Money) -> bool:
+    """Has price already gone through where this order would rest? The mirror of `Signal`'s own
+    wrong-side refusal, so the two can never disagree: a buy stop *below* the close, a sell stop
+    above it, a buy limit *above* it, a sell limit below it. A level exactly at the close is not
+    passed — the signal accepts it, and so does this."""
+    long = side is Side.LONG
+    if order.stop_price is not None:
+        return order.stop_price < close if long else order.stop_price > close
+    limit = order.price
+    return limit > close if long else limit < close
 
 
 def _entry_context(average: Money, long_average: "LongAverageFilter | None") -> dict[str, Money]:

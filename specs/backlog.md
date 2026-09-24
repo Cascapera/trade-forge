@@ -2652,16 +2652,27 @@ diz o que cada run guardou; o botão "re-rodar este ponto" reconstrói tudo (eng
    (qualquer degrau), mas vale perguntar a ele se quer restringir aos degraus que o run de fato
    poderia ter (≤ alvo próprio) — hoje isso já é o que acontece, porque acima do alvo o degrau é nulo.
 
-## MME9 breakout: martelo + filtro de média longa derruba o run (achado na varredura de 23/09)
+## MME9 breakout: martelo + filtro de média longa derrubava o run — resolvido na PR-292
 
-**61 runs falharam** na varredura de teste de 23/09, todos no mesmo ponto da grade: `mme9_breakout`,
-M15, `entry_point: martelo`, `long_average_period: 100`. O erro é da validação do sinal —
-`a long stop at 1.16221 is on the wrong side of 1.16281: a buy stop rests above the market` — e o
-run inteiro cai. Reproduzido fora do Docker (GBPUSD M15, 2020–2026, run `acc29ccb…`); **existe
-também no código anterior às PRs 287–290**, e **sem o filtro o mesmo ponto roda** (1.285 trades).
+**144 runs** da varredura de teste de 23/09 caíram com `a long stop at 1.16221 is on the wrong side
+of 1.16281`, todos `mme9_breakout` + `entry_point: martelo` + `long_average_period: 100` em M15.
+Causa confirmada no GBPUSD M15: o martelo fechou às 05:30 de 12/09/2022; a média longa de 100 ainda
+aquecia (os dados começam em 09/09/2022 05:00), então o filtro segurou a ordem; às 05:45 a média
+ficou pronta, a janela do martelo ainda estava aberta, e a ordem foi oferecida num candle que já
+tinha ido a 1.16284 e fechado em 1.16281 — compra stop abaixo do mercado, e o sinal recusa lançando.
+(A primeira hipótese anotada aqui, "o filtro recusa por estar abaixo da média", estava errada.)
 
-Hipótese (não confirmada): o filtro recusa a entrada num candle, o padrão do martelo continua sendo
-vigiado, e candles depois a ordem é armada na máxima do martelo — que o preço já passou. Uma compra
-stop abaixo do mercado é inválida. **Pede decisão dele**: um padrão cuja ordem ficou do lado errado
-do preço é descartado (o padrão venceu) ou vira outra coisa? E, qualquer que seja a regra, um sinal
-inválido deveria virar uma recusa registrada, não derrubar o run.
+**Decisão dele (23/09, opção A):** o padrão venceu — nada é colocado e o relógio do padrão recomeça.
+Feito em `swing._reconcile_pattern` (`_passed_by`), que é compartilhado com o Ponto Contínuo.
+
+**Onde a trava fica (opção a, 23/09):** depois do filtro de média longa. Enquanto o filtro segura a
+ordem, o padrão continua vivo, como antes; ele só é descartado no candle em que o filtro libera e o
+preço já passou — exatamente os candles que antes quebravam. Conferido: 150 runs da varredura, que não
+quebraram, reproduzem o banco até a última casa com a correção.
+
+Fica em aberto:
+- um sinal inválido por outro motivo ainda derrubaria o run inteiro em vez de virar uma recusa
+  registrada;
+- a regra olha só o **fechamento**, como a validação do sinal: uma ordem segura por vários candles
+  cuja máxima passou do nível mas cujo fechamento voltou ainda é colocada depois, num nível que o
+  preço já negociou.

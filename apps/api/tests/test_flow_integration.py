@@ -915,6 +915,16 @@ def test_a_sweeps_run_below_the_floor_keeps_only_its_metrics(
         assert run["recorded"] == "metrics"
         assert run["metrics"]["total_trades"] == 1
         assert Decimal(run["metrics"]["net_profit"]) > 0
+        # ⚠️ The risk in R is computed while the trades are in memory (25/09), so a run that keeps
+        # none still carries it — the losers are exactly what a selection is judged against. One
+        # winning trade: positive R, no fall from a peak, no losing streak, one year and no share.
+        metrics = run["metrics"]
+        assert Decimal(metrics["net_r"]) > 0
+        assert Decimal(metrics["max_drawdown_r"]) == 0
+        assert (metrics["losing_streak"], Decimal(metrics["losing_streak_r"])) == (0, Decimal(0))
+        assert metrics["positive_year_share"] is None
+        (only,) = metrics["yearly_r"].values()
+        assert Decimal(only) == Decimal(metrics["net_r"])
 
         assert client.get(f"/backtests/{backtest_id}/trades").json()["items"] == []
         equity = client.get(f"/backtests/{backtest_id}/equity")

@@ -41,6 +41,7 @@ from tradeforge_api.candle_cache import CandleCache, CandleReader
 from tradeforge_api.config import RedisConfig, Settings
 from tradeforge_api.grid import coordinates, label_for, read_point
 from tradeforge_api.queue import RUN_BACKTEST, progress_channel, redis_settings
+from tradeforge_api.r_metrics import r_metrics
 from tradeforge_api.retention import recorded_for
 from tradeforge_api.runner import ENGINE_VERSION, execute_backtest, instrument_spec
 from tradeforge_api.walkforward import Candidate, choose
@@ -177,6 +178,14 @@ async def process_backtest(  # noqa: PLR0913 — keyword-only; each names one th
             recorded=recorded,
         )
         metrics_row.targets = ladder_row(ladder)
+        # The run's risk in R, for every run — its trades may not be kept (`r_metrics`).
+        in_r = r_metrics(trades)
+        metrics_row.net_r = in_r.net_r
+        metrics_row.max_drawdown_r = in_r.max_drawdown_r
+        metrics_row.losing_streak = in_r.losing_streak
+        metrics_row.losing_streak_r = in_r.losing_streak_r
+        metrics_row.positive_year_share = in_r.positive_year_share
+        metrics_row.yearly_r = {str(year): str(r) for year, r in sorted(in_r.yearly_r.items())}
         backtest.recorded = recorded
         session.add(metrics_row)
         session.add_all(trade_rows)

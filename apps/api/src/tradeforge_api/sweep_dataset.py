@@ -53,6 +53,8 @@ off, like `breakeven_at_r: null`.
 sweep this path, and its document's own value applied". Writing both as empty would tell a model
 that "no break-even" and "break-even at 2R" are the same run."""
 
+_BEFORE_R = "Empty for a run recorded before 25/09/2026, when these were first computed."
+
 ROW = (
     "One grid point of this sweep, over one market: one shelf entry, at one grid point, on one "
     "chart. Each row is its own backtest run unless same_as names the point whose run answers it."
@@ -394,6 +396,46 @@ _AFTER_PARAMS: tuple[Column, ...] = (
         "fraction of peak equity",
         f"The deepest fall from a running peak, relative to that peak. {_DONE_ONLY}",
         _metric("max_drawdown_pct"),
+    ),
+    Column(
+        "net_r",
+        "outcome",
+        "R",
+        "Sum of every trade's result in R: net profit over the risk its stop defined, after costs "
+        f"and swap. Trades with no stop are left out. {_DONE_ONLY} {_BEFORE_R}",
+        _metric("net_r"),
+    ),
+    Column(
+        "max_drawdown_r",
+        "outcome",
+        "R",
+        "The deepest fall of the cumulative R from its running peak (the peak starts at 0). "
+        f"Comparable across runs and windows, unlike max_drawdown_pct. {_DONE_ONLY} {_BEFORE_R}",
+        _metric("max_drawdown_r"),
+    ),
+    Column(
+        "losing_streak",
+        "outcome",
+        "count",
+        f"The most consecutive losing trades; a break-even trade ends a streak. {_DONE_ONLY} "
+        f"{_BEFORE_R}",
+        _metric("losing_streak"),
+    ),
+    Column(
+        "losing_streak_r",
+        "outcome",
+        "R",
+        "The deepest run of consecutive losing trades, summed in R (zero or negative). May be a "
+        f"different streak from the longest. {_DONE_ONLY} {_BEFORE_R}",
+        _metric("losing_streak_r"),
+    ),
+    Column(
+        "positive_year_share",
+        "outcome",
+        "fraction of years with a trade",
+        "Calendar years (by entry) that ended above zero R, over the years that had a trade. "
+        f"{_DONE_ONLY} Empty too with fewer than two such years. {_BEFORE_R}",
+        _metric("positive_year_share"),
     ),
     Column(
         "sharpe",

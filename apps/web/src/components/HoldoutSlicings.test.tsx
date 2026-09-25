@@ -146,6 +146,16 @@ describe('HoldoutSlicings', () => {
     expect(within(article).getByText('(2 tested)')).toBeInTheDocument()
   })
 
+  it('offers the points that passed as a cluster, and only those', async () => {
+    listSlicings.mockResolvedValue([judged])
+    renderWithProviders(<HoldoutSlicings sweepId="t1" settled />)
+
+    const link = await screen.findByRole('link', {
+      name: 'Replay the 1 that passed on one account (cluster)',
+    })
+    expect(link).toHaveAttribute('href', '/clusters')
+  })
+
   it('says a run with no trades kept was not judged, rather than calling it a failure', async () => {
     listSlicings.mockResolvedValue([judged])
     renderWithProviders(<HoldoutSlicings sweepId="t1" settled />)

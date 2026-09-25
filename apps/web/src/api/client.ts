@@ -17,6 +17,9 @@ import type {
   CreateCatalogEntry,
   CreateCollection,
   CreateStudyRequest,
+  ClusterListItem,
+  ClusterOut,
+  CreateClusterRequest,
   CreateHoldoutRequest,
   CreateMonteCarloRequest,
   CreateSlicingRequest,
@@ -211,6 +214,11 @@ export const api = {
   createSlicing: (id: string, payload: CreateSlicingRequest): Promise<SlicingOut> =>
     request('POST', `/sweeps/${id}/slicings`, payload),
   listSlicings: (id: string): Promise<SlicingOut[]> => request('GET', `/sweeps/${id}/slicings`),
+  // Several finished runs replayed on one shared account (25/09). Replayed by the worker.
+  createCluster: (payload: CreateClusterRequest): Promise<ClusterOut> =>
+    request('POST', '/clusters', payload),
+  listClusters: (): Promise<ClusterListItem[]> => request('GET', '/clusters'),
+  getCluster: (id: string): Promise<ClusterOut> => request('GET', `/clusters/${id}`),
   // A finished test's points resampled, and kept (25/09). Runs nothing; takes seconds.
   createMonteCarlo: (id: string, payload: CreateMonteCarloRequest): Promise<MonteCarloOut> =>
     request('POST', `/sweeps/${id}/montecarlos`, payload),

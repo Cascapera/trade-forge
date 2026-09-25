@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { Link } from 'react-router-dom'
 
 import { apiFailure } from '../api/failure'
 import { useCreateSlicing, useSlicings } from '../api/hooks'
@@ -74,6 +75,7 @@ function describe(slicing: SlicingOut): string {
 
 function Slicing(props: { slicing: SlicingOut }): React.JSX.Element {
   const { slicing } = props
+  const passed = slicing.points.filter((point) => point.passed)
   const groups = [...slicing.groups].sort(
     (left, right) =>
       (left.entry_name ?? '').localeCompare(right.entry_name ?? '') ||
@@ -82,6 +84,23 @@ function Slicing(props: { slicing: SlicingOut }): React.JSX.Element {
   return (
     <article aria-label={describe(slicing)} className="space-y-3 rounded border border-slate-800 p-4">
       <p className="text-sm text-slate-300">{describe(slicing)}</p>
+      {passed.length > 0 && (
+        <p className="text-sm">
+          <Link
+            to="/clusters"
+            state={{
+              name: `The ${String(passed.length)} that passed — ${describe(slicing)}`,
+              members: passed.map((point) => ({
+                backtest_id: point.run_id,
+                label: `${point.symbol} ${point.timeframe} · ${point.label}`,
+              })),
+            }}
+            className="text-sky-400 hover:text-sky-300"
+          >
+            Replay the {String(passed.length)} that passed on one account (cluster)
+          </Link>
+        </p>
+      )}
 
       <table className="w-full border-collapse text-left text-sm">
         <caption className="mb-2 text-left font-semibold">Passed, by entry and chart</caption>

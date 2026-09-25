@@ -2783,3 +2783,17 @@ Plano, na ordem:
 3. **Só se o bruto for claramente negativo**: construir a opção "inverter direção" no motor (não
    existe hoje; passa pelo `engine-guardian`) e testar o espelho **fora da amostra**, com o mesmo
    rigor dos vencedores (teste reservado + fatiamento por ano/blocos).
+
+## O painel geral de varreduras (`GET /sweeps/dashboard`) leva 10 s (25/09) — PENDENTE
+
+Medido em 25/09 com cerca de 80 mil runs no banco: **10,3 s**. É o mesmo problema que o PR-313
+resolveu no resumo de uma varredura: lê todos os runs de todas as varreduras como objetos do ORM
+para calcular medianas. O conserto segue o mesmo molde:
+
+1. ler só as colunas usadas;
+2. guardar o resumo de cada varredura já assentada (o `sweeps.summary` do PR-313 já tem as
+   contagens e, por entrada, as medianas);
+3. recalcular só as varreduras que ainda rodam.
+
+⚠️ O painel remove medições duplicadas entre varreduras (`distinct`), então o resumo por varredura
+não pode ser somado direto. É preciso ver o que dá para reaproveitar.

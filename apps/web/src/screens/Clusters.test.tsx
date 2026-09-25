@@ -1,7 +1,7 @@
 import { fireEvent, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { api } from '../api/client'
+import { ApiError, api } from '../api/client'
 import type { ClusterOut } from '../api/types'
 import { renderWithProviders } from '../test-utils'
 
@@ -73,6 +73,59 @@ describe('Clusters', () => {
     expect(screen.getByRole('button', { name: 'Replay on one account' })).toBeDisabled()
 
     fireEvent.click(screen.getByRole('button', { name: 'Remove EURUSD H4 · edge' }))
+    expect(screen.getByText('Add at least one member.')).toBeInTheDocument()
+  })
+
+  it('says what is wrong with the account, one thing at a time', () => {
+    openedWith([{ backtest_id: A, label: 'EURUSD H4 · edge' }])
+    const say = (text: RegExp): void => {
+      expect(screen.getByText(text)).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Replay on one account' })).toBeDisabled()
+    }
+
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: ' ' } })
+    say(/Give the cluster a name/)
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'ok' } })
+    fireEvent.change(screen.getByLabelText('Capital'), { target: { value: '-1' } })
+    say(/capital must be positive/)
+    fireEvent.change(screen.getByLabelText('Capital'), { target: { value: '10000' } })
+    fireEvent.change(screen.getByLabelText('Open positions, at most'), { target: { value: '0' } })
+    say(/Open positions is a whole number/)
+    fireEvent.change(screen.getByLabelText('Open positions, at most'), { target: { value: '5' } })
+    fireEvent.change(screen.getByLabelText('Open risk, at most (%)'), { target: { value: '120' } })
+    say(/Open risk is a percent/)
+  })
+
+  it('lists the clusters built, and says a refused one in the server words', async () => {
+    listClusters.mockResolvedValue([
+      {
+        id: 'c1',
+        name: 'H4 majors',
+        status: 'done',
+        members: 12,
+        created_at: '2026-09-25T18:00:00Z',
+        net_return: '0.08',
+        max_drawdown_pct: '0.064',
+      },
+    ])
+    createCluster.mockRejectedValue(new ApiError(422, 'these members cannot be replayed: x'))
+    openedWith([{ backtest_id: A, label: 'EURUSD H4 · edge' }])
+
+    expect(await screen.findByRole('link', { name: 'H4 majors' })).toHaveAttribute(
+      'href',
+      '/clusters/c1',
+    )
+    expect(screen.getByText(/12 members · done · 8.0% · deepest fall 6.4%/)).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Replay on one account' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('cannot be replayed')
+  })
+
+  it('opens empty when nothing was handed over', async () => {
+    renderWithProviders(<Clusters />)
+
+    expect(await screen.findByText('No cluster yet.')).toBeInTheDocument()
+    expect(screen.getByText('Give the cluster a name.')).toBeInTheDocument()
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'empty' } })
     expect(screen.getByText('Add at least one member.')).toBeInTheDocument()
   })
 

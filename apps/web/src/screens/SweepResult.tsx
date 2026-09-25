@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react'
-import { useParams } from 'react-router-dom'
+import { Link, useParams } from 'react-router-dom'
 
 import { apiUrl } from '../api/client'
 import { isSweepSettled, useEquityCurves, useSweep, useSweepRuns } from '../api/hooks'
@@ -201,6 +201,20 @@ export function SweepResult(): React.JSX.Element {
           {data.symbols.join(', ')} · {data.timeframes.join(', ')} · {day(data.date_from)} →{' '}
           {day(data.date_to)} · {money(data.initial_capital)} per run
         </p>
+        {/* A combination runs nothing of its own: it reads finished sweeps together (26/09). */}
+        {data.combines !== undefined && data.combines !== null && (
+          <p className="text-sm text-sky-300">
+            Read together from {String(data.combines.length)} sweeps:{' '}
+            {data.combines.map((one, k) => (
+              <span key={one}>
+                {k > 0 && ', '}
+                <Link to={`/sweeps/${one}`} className="hover:underline">
+                  {one.slice(0, 8)}
+                </Link>
+              </span>
+            ))}
+          </p>
+        )}
         {/* ⚠️ **Right under the axes, because the axes are what was asked.** A pair left out for
             having no candles has no runs, and without this line the header above reads as the
             space that was measured — a map with a hole passing for a complete one. */}

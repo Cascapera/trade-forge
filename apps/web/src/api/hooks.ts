@@ -30,6 +30,10 @@ import type {
   ClusterOut,
   CreateClusterRequest,
   CreateHoldoutRequest,
+  CreateSweepTemplateRequest,
+  QueueMarket,
+  SweepTemplateListItem,
+  SweepTemplateOut,
   CreateSweepWalkForwardRequest,
   CreatedSweepWalkForward,
   SweepWalkForwardOut,
@@ -672,6 +676,75 @@ export function useCreateSlicing(id: string) {
     onSuccess: () => {
       void client.invalidateQueries({ queryKey: ['slicings', id] })
     },
+  })
+}
+
+/** Whether nothing in a template's queue is waiting or running — when its poll can stop. */
+export function isTemplateSettled(template: SweepTemplateOut | undefined): boolean {
+  if (template === undefined) return false
+  return !template.items.some(
+    (one) => one.status === 'waiting' || (one.status === 'launched' && !one.finished),
+  )
+}
+
+/** Every template, newest first. */
+export function useSweepTemplates() {
+  return useQuery<SweepTemplateListItem[]>({
+    queryKey: ['sweep-templates'],
+    queryFn: api.listSweepTemplates,
+  })
+}
+
+/** One template and its queue, polled while any market is waiting or running. */
+export function useSweepTemplate(id: string | undefined) {
+  return useQuery<SweepTemplateOut>({
+    queryKey: ['sweep-template', id],
+    queryFn: id === undefined ? skipToken : () => api.getSweepTemplate(id),
+    refetchInterval: (query) => (isTemplateSettled(query.state.data) ? false : STUDY_POLL_MS * 5),
+  })
+}
+
+export function useCreateSweepTemplate() {
+  const client = useQueryClient()
+  return useMutation<SweepTemplateOut, Error, CreateSweepTemplateRequest>({
+    mutationFn: (payload) => api.createSweepTemplate(payload),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: ['sweep-templates'] })
+    },
+  })
+}
+
+/** Change a template's queue — add markets, pause, resume, remove one — and show the answer. */
+export function useTemplateQueue(id: string) {
+  const client = useQueryClient()
+  const settle = (template: SweepTemplateOut): void => {
+    client.setQueryData(['sweep-template', id], template)
+    void client.invalidateQueries({ queryKey: ['sweep-templates'] })
+  }
+  return {
+    add: useMutation<SweepTemplateOut, Error, QueueMarket[]>({
+      mutationFn: (markets) => api.queueMarkets(id, markets),
+      onSuccess: settle,
+    }),
+    pause: useMutation<SweepTemplateOut, Error, undefined>({
+      mutationFn: () => api.pauseTemplate(id),
+      onSuccess: settle,
+    }),
+    resume: useMutation<SweepTemplateOut, Error, undefined>({
+      mutationFn: () => api.resumeTemplate(id),
+      onSuccess: settle,
+    }),
+    remove: useMutation<SweepTemplateOut, Error, string>({
+      mutationFn: (itemId) => api.removeTemplateItem(id, itemId),
+      onSuccess: settle,
+    }),
+  }
+}
+
+/** Read finished sweeps together as one. */
+export function useCombineSweeps() {
+  return useMutation<CreatedSweep, Error, string[]>({
+    mutationFn: (sweepIds) => api.combineSweeps(sweepIds),
   })
 }
 

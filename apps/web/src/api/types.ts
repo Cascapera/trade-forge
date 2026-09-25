@@ -1517,6 +1517,69 @@ export interface SweepWalkForwardOut {
   groups: SweepWalkForwardGroup[]
 }
 
+/** A sweep without its markets, kept to run one market at a time (26/09). */
+export interface CreateSweepTemplateRequest {
+  name: string
+  entry_ids: string[]
+  timeframes: string[]
+  date_from: string
+  date_to: string
+  initial_capital?: string
+}
+
+/** One market to queue. A blank spread is the market's measured one. */
+export interface QueueMarket {
+  symbol: string
+  spread_points?: string
+  commission_per_unit?: string
+  swap_long_per_lot?: string
+  swap_short_per_lot?: string
+}
+
+export type TemplateItemStatus = 'waiting' | 'launched' | 'failed' | 'removed'
+
+export interface TemplateItem {
+  id: string
+  symbol: string
+  cost_model: Record<string, string>
+  position: number
+  status: TemplateItemStatus
+  sweep_id: string | null
+  error: string | null
+  runs: number
+  done: number
+  failed: number
+  /** Its sweep exists and nothing of it is still queued or running. */
+  finished: boolean
+}
+
+export interface SweepTemplateOut {
+  id: string
+  name: string
+  entry_ids: string[]
+  entry_names: (string | null)[]
+  timeframes: string[]
+  date_from: string
+  date_to: string
+  initial_capital: string
+  paused: boolean
+  created_at: string
+  items: TemplateItem[]
+}
+
+export interface SweepTemplateListItem {
+  id: string
+  name: string
+  timeframes: string[]
+  date_from: string
+  date_to: string
+  paused: boolean
+  waiting: number
+  launched: number
+  failed: number
+  created_at: string
+}
+
 export interface SweepOut {
   id: string
   entry_ids: string[]
@@ -1530,6 +1593,9 @@ export interface SweepOut {
   holdout_of?: string | null
   /** How a test chose its points — `metric`, `top_n`, `min_trades` per chart. */
   holdout_rule?: HoldoutRule | null
+  /** The sweeps this one reads together (26/09); null for a sweep that ran. */
+  combines?: string[] | null
+  template_id?: string | null
   /** How many runs sit in each status — what the screen polls on (24/09). */
   counts?: SweepRunCounts | null
   /** In the order the entries were asked for. */

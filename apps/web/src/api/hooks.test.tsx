@@ -21,13 +21,14 @@ vi.mock('./client', () => ({
   },
 }))
 
-import type { BasketOut, HoldoutOut, SweepOut, SweepsPage } from './types'
+import type { BasketOut, HoldoutOut, SweepOut, SweepsPage, TemplateItem } from './types'
 import { api } from './client'
 import {
   SWEEPS_PER_PAGE,
   isHistorySettled,
   isSettled,
   isHoldoutSettled,
+  isTemplateSettled,
   isSweepSettled,
   isTerminal,
   useBasket,
@@ -93,6 +94,46 @@ describe('isSettled', () => {
     // The API refuses fewer than two symbols so this cannot be created, but `every` is true of an
     // empty list — reading that as unsettled would be a query polling a shape that cannot happen.
     expect(isSettled(basket())).toBe(true)
+  })
+})
+
+describe('isTemplateSettled', () => {
+  const base = {
+    id: 't',
+    name: 'n',
+    entry_ids: [],
+    entry_names: [],
+    timeframes: [],
+    date_from: '',
+    date_to: '',
+    initial_capital: '1',
+    paused: false,
+    created_at: '',
+  }
+  const item = (status: TemplateItem['status'], finished: boolean): TemplateItem => ({
+    id: status,
+    symbol: 'EURUSD',
+    cost_model: {},
+    position: 0,
+    status,
+    sweep_id: null,
+    error: null,
+    runs: 0,
+    done: 0,
+    failed: 0,
+    finished,
+  })
+
+  it('keeps polling while a market waits or runs, and stops once none does', () => {
+    expect(isTemplateSettled(undefined)).toBe(false)
+    expect(isTemplateSettled({ ...base, items: [item('waiting', false)] })).toBe(false)
+    expect(isTemplateSettled({ ...base, items: [item('launched', false)] })).toBe(false)
+    expect(
+      isTemplateSettled({
+        ...base,
+        items: [item('launched', true), item('failed', false), item('removed', false)],
+      }),
+    ).toBe(true)
   })
 })
 

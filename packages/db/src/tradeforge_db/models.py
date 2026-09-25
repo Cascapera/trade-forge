@@ -1042,6 +1042,18 @@ class BacktestMetrics(Base):
     # before this, and for none after.
     targets: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
 
+    # The run's risk and stability in R (2026-09-25, `r_metrics`): computed by the worker from the
+    # trades while they are in memory, for every run — a sweep's loser keeps no trades, and it is
+    # the runs a selection is judged against. All null for a run recorded before this; for one
+    # after, only `positive_year_share` can be null (fewer than two years with a trade).
+    net_r: Mapped[Decimal | None] = mapped_column(RATIO)
+    max_drawdown_r: Mapped[Decimal | None] = mapped_column(RATIO)
+    losing_streak: Mapped[int | None] = mapped_column(Integer)
+    losing_streak_r: Mapped[Decimal | None] = mapped_column(RATIO)
+    positive_year_share: Mapped[Decimal | None] = mapped_column(RATIO)
+    # `{"2019": "3.25", ...}` — R per calendar year of entry, for the years that had a trade.
+    yearly_r: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+
     backtest: Mapped[Backtest] = relationship(back_populates="metrics")
 
     __table_args__ = (
@@ -1054,6 +1066,22 @@ class BacktestMetrics(Base):
         CheckConstraint("max_drawdown_abs >= 0", name="max_drawdown_abs_non_negative"),
         CheckConstraint("max_drawdown_pct BETWEEN 0 AND 1", name="max_drawdown_pct_is_a_fraction"),
         CheckConstraint("max_dd_duration_days >= 0", name="max_dd_duration_non_negative"),
+        CheckConstraint(
+            "max_drawdown_r IS NULL OR max_drawdown_r >= 0", name="max_drawdown_r_non_negative"
+        ),
+        CheckConstraint(
+            "losing_streak IS NULL OR losing_streak >= 0", name="losing_streak_non_negative"
+        ),
+        CheckConstraint(
+            "losing_streak_r IS NULL OR losing_streak_r <= 0", name="losing_streak_r_non_positive"
+        ),
+        CheckConstraint(
+            "positive_year_share IS NULL OR positive_year_share BETWEEN 0 AND 1",
+            name="positive_year_share_is_a_fraction",
+        ),
+        CheckConstraint(
+            "yearly_r IS NULL OR jsonb_typeof(yearly_r) = 'object'", name="yearly_r_is_an_object"
+        ),
     )
 
 

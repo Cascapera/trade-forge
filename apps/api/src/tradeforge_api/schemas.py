@@ -412,6 +412,16 @@ class MetricsOut(_Out):
     cagr: Money | None
     avg_trade_duration: dt.timedelta | None
 
+    # In R (25/09, `r_metrics`). All null for a run recorded before them.
+    net_r: Money | None = None
+    max_drawdown_r: Money | None = None
+    losing_streak: int | None = None
+    losing_streak_r: Money | None = None
+    positive_year_share: Money | None = None
+    """Null too for a run with fewer than two years that had a trade."""
+    yearly_r: dict[str, str] | None = None
+    """R per calendar year of entry, as decimal strings: `{"2019": "3.25"}`."""
+
 
 class TargetOutcomeOut(BaseModel):
     """One rung of a run's target ladder: what its trades would have made at this target, in R net

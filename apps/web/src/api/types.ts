@@ -57,6 +57,15 @@ export interface Metrics {
   sortino: string | null
   cagr: string | null
   avg_trade_duration: string | null
+  // In R (25/09). Null for a run recorded before them; optional so older fixtures still type.
+  net_r?: string | null
+  max_drawdown_r?: string | null
+  losing_streak?: number | null
+  losing_streak_r?: string | null
+  /** Null too with fewer than two years that had a trade. */
+  positive_year_share?: string | null
+  /** R per calendar year of entry: `{ "2019": "3.25" }`. */
+  yearly_r?: Record<string, string> | null
 }
 
 /**

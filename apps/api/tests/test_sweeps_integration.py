@@ -35,6 +35,7 @@ from tradeforge_api.cluster_job import process_cluster
 from tradeforge_api.config import Settings
 from tradeforge_api.main import create_app
 from tradeforge_api.queue import COLLECT_QUEUE, COLLECT_RANGE, RUN_BACKTEST
+from tradeforge_api.routers import sweeps as sweeps_router
 from tradeforge_api.sweep_walkforward_job import advance
 from tradeforge_db.broker_symbols import BrokerSymbolEntry, replace_snapshot
 from tradeforge_db.models import (
@@ -2318,6 +2319,63 @@ class TestTheSweepWalksForward:
         assert of_a_test.status_code == 422
         assert client.post(f"/sweeps/{uuid.uuid4()}/walkforward", json=self.BODY).status_code == 404
         assert client.get(f"/sweep-walkforwards/{uuid.uuid4()}").status_code == 404
+
+
+class TestTheDashboardIsKept:
+    """26/09: the dashboard is computed once per state of what it reads, and read back after."""
+
+    def test_a_second_read_of_the_same_state_is_the_kept_one(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        sweeps_router._DASHBOARD.clear()
+        entry = an_entry(client, name=f"kept board {uuid.uuid4()}")
+        sweep_id = launch(client, [entry], ["EURUSD"])
+        for run_id in run_ids(client, sweep_id):
+            finish(session_factory, run_id, 100)
+        first = client.get("/sweeps/dashboard").json()
+
+        # ⚠️ Proof that the kept copy is served: poison it, and the next read says the poison.
+        ((key, kept),) = sweeps_router._DASHBOARD.items()
+        sweeps_router._DASHBOARD[key] = kept.model_copy(update={"win_rate": Decimal("0.123")})
+        again = client.get("/sweeps/dashboard").json()
+
+        assert first["totals"] == again["totals"]
+        assert Decimal(again["win_rate"]) == Decimal("0.123")
+
+    def test_a_run_that_lands_is_seen_at_once(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        sweeps_router._DASHBOARD.clear()
+        entry = an_entry(client, name=f"moving board {uuid.uuid4()}")
+        sweep_id = launch(client, [entry], ["EURUSD", "GBPUSD"])
+        first, second = run_ids(client, sweep_id)
+        finish(session_factory, first, 100)
+        before = client.get("/sweeps/dashboard").json()
+
+        finish(session_factory, second, -50)
+        after = client.get("/sweeps/dashboard").json()
+
+        assert (before["overall"]["finished"], after["overall"]["finished"]) == (1, 2)
+
+    def test_an_entry_renamed_is_seen_at_once(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        sweeps_router._DASHBOARD.clear()
+        entry = an_entry(client, name=f"old name {uuid.uuid4()}")
+        sweep_id = launch(client, [entry], ["EURUSD"])
+        for run_id in run_ids(client, sweep_id):
+            finish(session_factory, run_id, 100)
+        client.get("/sweeps/dashboard")
+        with session_factory() as session:
+            shelved = session.get(CatalogEntry, uuid.UUID(entry))
+            assert shelved is not None
+            shelved.name = f"new name {uuid.uuid4()}"
+            renamed = shelved.name
+            session.commit()
+
+        board = client.get("/sweeps/dashboard").json()
+
+        assert [one["label"] for one in board["by_entry"]] == [renamed]
 
 
 class TestTheSummaryIsKept:

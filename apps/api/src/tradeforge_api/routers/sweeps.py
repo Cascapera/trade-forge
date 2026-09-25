@@ -767,6 +767,11 @@ def get_sweep_dashboard(
         window.append(Sweep.created_at >= launched_from)
     if launched_to is not None:
         window.append(Sweep.created_at < launched_to)
+    key = _dashboard_key(session, window, launched_from, launched_to)
+    kept = _DASHBOARD.get(key)
+    if kept is not None:
+        return kept
+
     sweeps = session.scalars(
         select(Sweep).where(*window).order_by(Sweep.created_at, Sweep.id)
     ).all()
@@ -871,7 +876,7 @@ def get_sweep_dashboard(
     # launches. See the module's note on why a copy must not vote twice.
     measured = dashboard.distinct(runs)
     win_rate, profit_factor, expectancy = dashboard.ratios(measured)
-    return SweepDashboardOut(
+    out = SweepDashboardOut(
         launched_from=launched_from,
         launched_to=launched_to,
         totals=dashboard.totals(listed, runs),
@@ -884,6 +889,62 @@ def get_sweep_dashboard(
         by_timeframe=dashboard.by_timeframe(measured),
         sweeps=dashboard.per_sweep(listed, runs),
     )
+    if len(_DASHBOARD) >= _DASHBOARD_KEPT:
+        _DASHBOARD.clear()
+    _DASHBOARD[key] = out
+    return out
+
+
+_DASHBOARD: dict[tuple[Any, ...], SweepDashboardOut] = {}
+"""The dashboards last computed, by what they were computed from (`_dashboard_key`) — 26/09.
+
+⚠️ **A cache the key keeps honest.** Nothing is invalidated by hand: a run that lands, fails, is
+retried or deleted, a sweep launched or removed, an entry renamed — each changes the key, and the
+next read computes again. Measured 25/09: ~5 s to compute over 130 thousand runs, spread across
+the read, the loop and the medians with no one part worth a rewrite; the key costs one query.
+One process serves the API, so one dictionary is the whole cache; it is lost on a restart, and
+the first read after costs what it always did."""
+
+_DASHBOARD_KEPT = 16
+"""Windows remembered at once — the screen asks for a handful; past this it starts over."""
+
+
+def _dashboard_key(
+    session: Session,
+    window: list[ColumnElement[bool]],
+    launched_from: dt.datetime | None,
+    launched_to: dt.datetime | None,
+) -> tuple[Any, ...]:
+    """What the dashboard over `window` depends on, read in one aggregate and one small query:
+    how many sweeps, runs, results, runs still open, the latest to end and to be launched, and
+    the names of the entries it would print."""
+    measured = session.execute(
+        select(
+            func.count(func.distinct(Sweep.id)),
+            func.count(Backtest.id),
+            func.count(BacktestMetrics.backtest_id),
+            func.count(Backtest.id).filter(Backtest.status == BacktestStatus.RUNNING),
+            func.count(Backtest.id).filter(Backtest.status == BacktestStatus.FAILED),
+            func.max(Backtest.finished_at),
+            func.max(Sweep.created_at),
+        )
+        .select_from(Sweep)
+        .outerjoin(Backtest, Backtest.sweep_id == Sweep.id)
+        .outerjoin(BacktestMetrics, BacktestMetrics.backtest_id == Backtest.id)
+        .where(*window)
+    ).one()
+    asked = {
+        one for (ids,) in session.execute(select(Sweep.entry_ids).where(*window)) for one in ids
+    }
+    names = sorted(
+        (str(entry_id), name)
+        for entry_id, name in session.execute(
+            select(CatalogEntry.id, CatalogEntry.name).where(
+                CatalogEntry.id.in_([uuid.UUID(one) for one in asked])
+            )
+        )
+    )
+    return (launched_from, launched_to, tuple(measured), tuple(names))
 
 
 @router.post(

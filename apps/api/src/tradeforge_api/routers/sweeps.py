@@ -21,7 +21,6 @@ would draw a map of a space it never searched, and it would look exactly like a 
 did — which is why a hole is always written down, never merely left.
 """
 
-import json
 import secrets
 import uuid
 from collections.abc import Callable
@@ -30,7 +29,7 @@ from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query, Response, status
 from pydantic import AwareDatetime
-from sqlalchemy import ColumnElement, and_, case, func, or_, select
+from sqlalchemy import ColumnElement, Text, and_, case, cast, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import InstrumentedAttribute, Session, defer, selectinload
 
@@ -784,54 +783,76 @@ def get_sweep_dashboard(
         for sweep in sweeps
     }
 
+    # ⚠️ **Columns, not rows** (25/09). Every run of every sweep read as an ORM object with its
+    # metrics loaded beside it took 10.3 s on 80 thousand runs; the dashboard reads eleven of their
+    # fields and six of the metrics', and a tuple per run is what it needs.
     rows = session.execute(
-        select(Backtest, Instrument.symbol)
+        select(
+            Backtest.sweep_id,
+            Backtest.strategy_id,
+            Backtest.instrument_id,
+            Backtest.timeframe,
+            Backtest.status,
+            Backtest.date_from,
+            Backtest.date_to,
+            Backtest.initial_capital,
+            # As text, from Postgres: the key two copies of a measurement are compared by, and
+            # `jsonb`'s own text is canonical — equal values print alike — so parsing it into a
+            # dict only to print it again was 2 s of 5 on the same read.
+            cast(Backtest.cost_model, Text).label("cost_model"),
+            Backtest.engine_version,
+            Instrument.symbol,
+            BacktestMetrics.backtest_id,
+            BacktestMetrics.net_profit,
+            BacktestMetrics.total_trades,
+            BacktestMetrics.win_rate,
+            BacktestMetrics.profit_factor,
+            BacktestMetrics.expectancy,
+            BacktestMetrics.max_drawdown_pct,
+        )
         .join(Instrument, Instrument.id == Backtest.instrument_id)
+        .outerjoin(BacktestMetrics, BacktestMetrics.backtest_id == Backtest.id)
         .where(Backtest.sweep_id.in_(list(entry_of)))
         # Launch order, so which copy of a repeated measurement is kept does not change between
         # two reads of the same data.
         .order_by(Backtest.created_at, Backtest.id)
-        .options(
-            selectinload(Backtest.metrics).options(
-                defer(BacktestMetrics.equity_curve), defer(BacktestMetrics.targets)
-            )
-        )
     ).all()
 
     runs: list[dashboard.DashboardRun] = []
-    for run, symbol in rows:
-        if run.sweep_id is None:  # pragma: no cover — the filter above selects by sweep
+    for row in rows:
+        if row.sweep_id is None:  # pragma: no cover — the filter above selects by sweep
             continue
-        entry_id = entry_of[run.sweep_id].get(str(run.strategy_id), "")
-        metrics = run.metrics
+        entry_id = entry_of[row.sweep_id].get(str(row.strategy_id), "")
         runs.append(
             dashboard.DashboardRun(
-                sweep_id=str(run.sweep_id),
+                sweep_id=str(row.sweep_id),
                 entry_id=entry_id,
                 entry_name=names.get(entry_id),
-                symbol=symbol,
-                timeframe=run.timeframe,
-                status=run.status,
-                initial_capital=run.initial_capital,
+                symbol=row.symbol,
+                timeframe=row.timeframe,
+                status=row.status,
+                initial_capital=row.initial_capital,
                 measurement=(
-                    run.strategy_id,
-                    run.instrument_id,
-                    run.timeframe,
-                    run.date_from,
-                    run.date_to,
-                    run.initial_capital,
-                    json.dumps(run.cost_model, sort_keys=True),
-                    run.engine_version,
+                    row.strategy_id,
+                    row.instrument_id,
+                    row.timeframe,
+                    row.date_from,
+                    row.date_to,
+                    row.initial_capital,
+                    row.cost_model,
+                    row.engine_version,
                 ),
+                # A run has a result once its metrics row exists — `done` alone is not enough
+                # (`aggregate_points` says why), and the outer join says which is which.
                 result=None
-                if metrics is None
+                if row.backtest_id is None
                 else dashboard.RunResult(
-                    net_profit=metrics.net_profit,
-                    total_trades=metrics.total_trades,
-                    win_rate=metrics.win_rate,
-                    profit_factor=metrics.profit_factor,
-                    expectancy=metrics.expectancy,
-                    max_drawdown_pct=metrics.max_drawdown_pct,
+                    net_profit=row.net_profit,
+                    total_trades=row.total_trades,
+                    win_rate=row.win_rate,
+                    profit_factor=row.profit_factor,
+                    expectancy=row.expectancy,
+                    max_drawdown_pct=row.max_drawdown_pct,
                 ),
             )
         )

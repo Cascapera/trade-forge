@@ -1729,7 +1729,9 @@ class TestTheDashboard:
             event.remove(migrated_engine, "before_cursor_execute", record)
 
         assert read.status_code == 200
-        metrics = [text for text in statements if "FROM backtest_metrics" in text]
+        # Joined into the runs' read since 25/09 rather than a query of its own: any statement
+        # that touches the metrics table is the one to check.
+        metrics = [text for text in statements if "backtest_metrics" in text]
         assert metrics, "no statement read the metrics, so the check below is vacuous"
         assert not any("equity_curve" in text for text in metrics)
 

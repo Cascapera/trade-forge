@@ -41,10 +41,17 @@ from tradeforge_api.candle_cache import CandleCache, CandleReader
 from tradeforge_api.cluster_job import process_cluster
 from tradeforge_api.config import RedisConfig, Settings
 from tradeforge_api.grid import coordinates, label_for, read_point
-from tradeforge_api.queue import RUN_BACKTEST, RUN_CLUSTER, progress_channel, redis_settings
+from tradeforge_api.queue import (
+    RUN_BACKTEST,
+    RUN_CLUSTER,
+    RUN_SWEEP_WALK_FORWARD,
+    progress_channel,
+    redis_settings,
+)
 from tradeforge_api.r_metrics import r_metrics
 from tradeforge_api.retention import recorded_for
 from tradeforge_api.runner import ENGINE_VERSION, execute_backtest, spec_document, spec_for
+from tradeforge_api.sweep_walkforward_job import advance
 from tradeforge_api.walkforward import Candidate, choose
 from tradeforge_collector import read_candles
 from tradeforge_db.models import (
@@ -694,6 +701,23 @@ async def run_cluster(ctx: dict[str, Any], cluster_id: str) -> None:
         )
 
 
+async def run_sweep_walk_forward(ctx: dict[str, Any], walk_forward_id: str) -> None:
+    """One step of a sweep's walk-forward (`sweep_walkforward_job.advance`): launch the tests
+    whose training has ended, queue their runs, and look again later while any fold is open."""
+    session: Session = ctx["session_factory"]()
+    try:
+        runs, pending = advance(session, uuid.UUID(walk_forward_id))
+        run_ids = [str(one.id) for one in runs]
+    finally:
+        session.close()
+    for run_id in run_ids:
+        await ctx["redis"].enqueue_job(RUN_BACKTEST, run_id, _job_id=run_id)
+    if pending:
+        await ctx["redis"].enqueue_job(
+            RUN_SWEEP_WALK_FORWARD, walk_forward_id, _defer_by=dt.timedelta(seconds=30)
+        )
+
+
 async def startup(ctx: dict[str, Any]) -> None:
     settings = Settings()
     engine = create_db_engine(settings.sqlalchemy_dsn)
@@ -713,7 +737,12 @@ class WorkerSettings:
 
     # `run_backtest` spends the last try itself, so arq must be told the same number — stated on
     # that function alone. The walk-forward keeps arq's default: it does not raise `Retry`.
-    functions = (func(run_backtest, max_tries=MAX_TRIES), run_walk_forward, run_cluster)
+    functions = (
+        func(run_backtest, max_tries=MAX_TRIES),
+        run_walk_forward,
+        run_cluster,
+        run_sweep_walk_forward,
+    )
     # Built from RedisConfig, not Settings: this line runs at import, and importing the worker
     # must not require the Postgres password. The DB config is read later, in `startup`.
     redis_settings = redis_settings(RedisConfig())

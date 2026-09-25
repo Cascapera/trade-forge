@@ -2332,6 +2332,76 @@ class ClusterListItem(BaseModel):
     max_drawdown_pct: Money | None = None
 
 
+class CreateSweepWalkForward(BaseModel):
+    """Walk a finished sweep forward (25/09): windows of whole years and each fold's choice rule —
+    a reserved-window test's, without its window, which each fold's own test supplies."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    start_year: int = Field(ge=1970, le=2100)
+    train_years: int = Field(ge=1, le=50)
+    test_years: int = Field(ge=1, le=50)
+    folds: int = Field(ge=2, le=20)
+    anchored: bool = True
+    top_n: int = Field(default=3, ge=1, le=100)
+    metric: HoldoutRank = HoldoutRank.NET_PROFIT
+    min_trades: dict[Timeframe, Annotated[int, Field(ge=1, le=1_000_000)]] = Field(
+        default_factory=dict
+    )
+    max_drawdown_r: Decimal | None = Field(default=None, gt=0)
+    min_positive_year_share: Decimal | None = Field(default=None, gt=0, le=1)
+
+
+class CreatedSweepWalkForward(BaseModel):
+    id: uuid.UUID
+    folds: int
+    runs: int
+    """Training runs queued now; each fold's test runs are queued when its training ends."""
+
+
+class SweepWalkForwardGroupOut(BaseModel):
+    """One (entry, chart) across the folds: each fold's out-of-sample median, and stability."""
+
+    entry_id: str
+    entry_name: str | None
+    timeframe: str
+    medians: list[Money | None]
+    """Per fold, in order; null where the fold has no test for this group yet."""
+    folds: int
+    positive_folds: int
+    most_chosen: str | None
+    most_chosen_folds: int
+
+
+class SweepWalkForwardFoldOut(BaseModel):
+    index: int
+    train_from: dt.datetime
+    train_to: dt.datetime
+    test_from: dt.datetime
+    test_to: dt.datetime
+    train_sweep_id: uuid.UUID | None
+    test_sweep_id: uuid.UUID | None
+    stage: str
+    """`training`, `testing`, `done` or `failed`."""
+    error: str | None
+
+
+class SweepWalkForwardOut(BaseModel):
+    id: uuid.UUID
+    parent_sweep_id: uuid.UUID | None
+    start_year: int
+    train_years: int
+    test_years: int
+    anchored: bool
+    rule: dict[str, Any]
+    status: str
+    error: str | None
+    created_at: dt.datetime
+    finished_at: dt.datetime | None
+    folds: list[SweepWalkForwardFoldOut]
+    groups: list[SweepWalkForwardGroupOut]
+
+
 class SweepOut(BaseModel):
     """A sweep read back: the question that was asked, and every run it became."""
 

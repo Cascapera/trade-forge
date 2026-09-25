@@ -60,6 +60,9 @@ EXPECTED_TABLES = {
     "sweep_montecarlos",
     # Several finished runs replayed on one shared account (rev_0030).
     "clusters",
+    # A sweep run again fold by fold, its choices tested after each (rev_0032).
+    "sweep_walk_forwards",
+    "sweep_walk_forward_folds",
     "walk_forwards",
     "walk_forward_folds",
     "backtests",

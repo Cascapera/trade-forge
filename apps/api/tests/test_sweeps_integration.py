@@ -35,6 +35,7 @@ from tradeforge_api.cluster_job import process_cluster
 from tradeforge_api.config import Settings
 from tradeforge_api.main import create_app
 from tradeforge_api.queue import COLLECT_QUEUE, COLLECT_RANGE, RUN_BACKTEST
+from tradeforge_api.sweep_walkforward_job import advance
 from tradeforge_db.broker_symbols import BrokerSymbolEntry, replace_snapshot
 from tradeforge_db.models import (
     Backtest,
@@ -2198,6 +2199,125 @@ class TestClusterMembersRunAgain:
         assert waiting is False
         assert read["status"] == "failed"
         assert twin_id in read["error"]
+
+
+class TestTheSweepWalksForward:
+    """25/09, path B: the sweep run again fold by fold, each fold's choice tested after it.
+
+    The fixture's candles cover 2023 and 2024, so from 2023 with one year of each: fold 0 trains on
+    2023 and tests 2024 — the whole road — and fold 1 trains on 2023-24 and would test 2025, where
+    there is nothing: a fold that cannot be tested while the other goes on.
+    """
+
+    BODY: dict[str, Any] = {  # noqa: RUF012 — read-only
+        "start_year": 2023,
+        "train_years": 1,
+        "test_years": 1,
+        "folds": 2,
+        "anchored": True,
+        "top_n": 1,
+    }
+
+    def parent(self, client: Any) -> str:
+        entry = an_entry(
+            client, name=f"walked {uuid.uuid4()}", grid={"setup.params.period": [5, 7, 9]}
+        )
+        launched = client.post("/sweeps", json=a_sweep_body([entry], ["EURUSD"], ["H1"]))
+        assert launched.status_code == 202, launched.text
+        return str(launched.json()["id"])
+
+    def step(self, session_factory: Callable[[], Session], walk_id: str) -> bool:
+        with session_factory() as session:
+            _runs, pending = advance(session, uuid.UUID(walk_id))
+        return pending
+
+    def finish_sweep(
+        self, client: Any, session_factory: Callable[[], Session], sweep_id: str
+    ) -> None:
+        for row in client.get(f"/sweeps/{sweep_id}").json()["runs"]:
+            period = row["values"]["setup.params.period"]
+            finish_trading(session_factory, row["run"]["id"], net=period * 100, trades=40)
+
+    def test_every_training_is_queued_at_launch_on_its_own_window(
+        self, client: Any, queue: _CapturingQueue
+    ) -> None:
+        parent = self.parent(client)
+        queued = len(queue.jobs)
+
+        made = client.post(f"/sweeps/{parent}/walkforward", json=self.BODY)
+
+        assert made.status_code == 202, made.text
+        assert (made.json()["folds"], made.json()["runs"]) == (2, 6)
+        kinds = [job[0] for job in queue.jobs[queued:]]
+        assert kinds.count("run_backtest") == 6
+        assert kinds[-1] == "run_sweep_walk_forward"
+        walk = client.get(f"/sweep-walkforwards/{made.json()['id']}").json()
+        assert [fold["stage"] for fold in walk["folds"]] == ["training", "training"]
+        first = client.get(f"/sweeps/{walk['folds'][0]['train_sweep_id']}").json()
+        assert first["date_from"].startswith("2023-01-01")
+        assert first["date_to"].startswith("2024-01-01")
+        assert len(first["runs"]) == 3
+
+    def test_the_folds_are_trained_chosen_tested_and_read_together(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        parent = self.parent(client)
+        walk_id = client.post(f"/sweeps/{parent}/walkforward", json=self.BODY).json()["id"]
+
+        # Nothing trained yet: nothing to test, and more to come.
+        assert self.step(session_factory, walk_id) is True
+        walk = client.get(f"/sweep-walkforwards/{walk_id}").json()
+        for fold in walk["folds"]:
+            self.finish_sweep(client, session_factory, fold["train_sweep_id"])
+
+        assert self.step(session_factory, walk_id) is True
+        walk = client.get(f"/sweep-walkforwards/{walk_id}").json()
+        tested, empty = walk["folds"]
+        assert tested["stage"] == "testing"
+        assert tested["test_sweep_id"] is not None
+        # 2025 has no candles: that fold says so, and the other goes on.
+        assert empty["stage"] == "failed"
+        assert "no candles" in empty["error"]
+
+        test = client.get(f"/sweeps/{tested['test_sweep_id']}").json()
+        # Top 1 of the training, where period 9 made the most.
+        assert [row["values"]["setup.params.period"] for row in test["runs"]] == [9]
+        for row in test["runs"]:
+            finish_trading(session_factory, row["run"]["id"], net=50, trades=10)
+
+        assert self.step(session_factory, walk_id) is False
+        walk = client.get(f"/sweep-walkforwards/{walk_id}").json()
+        assert walk["status"] == "done"
+        (group,) = walk["groups"]
+        assert group["timeframe"] == "H1"
+        assert [None if one is None else Decimal(one) for one in group["medians"]] == [
+            Decimal("0.005"),
+            None,
+        ]
+        assert (group["folds"], group["positive_folds"], group["most_chosen_folds"]) == (1, 1, 1)
+        assert group["most_chosen"].startswith("EURUSD · ")
+        listed = client.get(f"/sweeps/{parent}/walkforwards").json()
+        assert [one["id"] for one in listed] == [walk_id]
+
+    def test_what_cannot_walk_forward_is_refused(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        parent = self.parent(client)
+        future = client.post(
+            f"/sweeps/{parent}/walkforward", json={**self.BODY, "start_year": 2090}
+        )
+        one_fold = client.post(f"/sweeps/{parent}/walkforward", json={**self.BODY, "folds": 1})
+        window = TestTheReservedWindow()
+        swept, _runs = window.swept(client, session_factory)
+        test_id = client.post(f"/sweeps/{swept}/holdout", json=window.after()).json()["id"]
+        of_a_test = client.post(f"/sweeps/{test_id}/walkforward", json=self.BODY)
+
+        assert future.status_code == 422
+        assert "in the future" in future.json()["detail"]
+        assert one_fold.status_code == 422
+        assert of_a_test.status_code == 422
+        assert client.post(f"/sweeps/{uuid.uuid4()}/walkforward", json=self.BODY).status_code == 404
+        assert client.get(f"/sweep-walkforwards/{uuid.uuid4()}").status_code == 404
 
 
 class TestTheSummaryIsKept:

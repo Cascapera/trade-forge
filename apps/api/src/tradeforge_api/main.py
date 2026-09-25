@@ -34,6 +34,7 @@ from tradeforge_api.routers import (
     live_sessions,
     strategies,
     studies,
+    sweep_walkforwards,
     sweeps,
     symbols,
     walkforwards,
@@ -125,6 +126,8 @@ def create_app(
     app.include_router(live_sessions.router)
     app.include_router(baskets.router)
     app.include_router(studies.router)
+    # Before `sweeps`: `/sweeps/{id}/walkforward` must not be read by a broader sweeps path.
+    app.include_router(sweep_walkforwards.router)
     app.include_router(sweeps.router)
     app.include_router(walkforwards.router)
     app.include_router(clusters.router)

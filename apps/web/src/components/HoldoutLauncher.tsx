@@ -3,14 +3,26 @@ import { useNavigate } from 'react-router-dom'
 
 import { apiFailure } from '../api/failure'
 import { useCreateHoldout } from '../api/hooks'
-import type { SelectionMetric, SweepOut } from '../api/types'
+import type { HoldoutRank, SweepOut } from '../api/types'
 
-const METRICS: { value: SelectionMetric; label: string }[] = [
+const METRICS: { value: HoldoutRank; label: string }[] = [
   { value: 'net_profit', label: 'Net profit' },
   { value: 'profit_factor', label: 'Profit factor' },
   { value: 'sharpe', label: 'Sharpe' },
   { value: 'expectancy', label: 'Expectancy' },
+  { value: 'net_r', label: 'Net R' },
+  { value: 'recovery_r', label: 'Net R per R of drawdown' },
+  { value: 'positive_years', label: 'Share of years positive' },
 ]
+
+/** A limit typed by hand: blank is "no limit", anything else must be a positive number. */
+function limitOf(value: string): { ok: boolean; value: string | undefined } {
+  if (value.trim() === '') return { ok: true, value: undefined }
+  const number = Number(value)
+  return Number.isFinite(number) && number > 0
+    ? { ok: true, value: String(number) }
+    : { ok: false, value: undefined }
+}
 
 /** The calendar day of an ISO instant, which is what a date input holds. */
 function day(iso: string): string {
@@ -40,7 +52,10 @@ export function HoldoutLauncher(props: { sweep: SweepOut }): React.JSX.Element {
   const [dateFrom, setDateFrom] = useState(day(sweep.date_to))
   const [dateTo, setDateTo] = useState(day(new Date().toISOString()))
   const [topN, setTopN] = useState(3)
-  const [metric, setMetric] = useState<SelectionMetric>('net_profit')
+  const [metric, setMetric] = useState<HoldoutRank>('net_profit')
+  // 25/09: limits on the run's risk in R, typed as R and as a percentage. Blank is no limit.
+  const [maxDrawdownR, setMaxDrawdownR] = useState('')
+  const [minYearsPercent, setMinYearsPercent] = useState('')
   const [floors, setFloors] = useState<Record<string, string>>({})
 
   const overlaps = dateFrom < day(sweep.date_to) && day(sweep.date_from) < dateTo
@@ -48,7 +63,12 @@ export function HoldoutLauncher(props: { sweep: SweepOut }): React.JSX.Element {
   const floorsValid = Object.values(floors).every(
     (value) => value === '' || (/^\d+$/.test(value) && Number(value) >= 1),
   )
-  const blocked = overlaps || backwards || !floorsValid || topN < 1 || create.isPending
+  const drawdownLimit = limitOf(maxDrawdownR)
+  const yearsLimit = limitOf(minYearsPercent)
+  const yearsValid = yearsLimit.ok && (yearsLimit.value === undefined || Number(yearsLimit.value) <= 100)
+  const limitsValid = drawdownLimit.ok && yearsValid
+  const blocked =
+    overlaps || backwards || !floorsValid || !limitsValid || topN < 1 || create.isPending
 
   function launch(): void {
     const minTrades: Record<string, number> = {}
@@ -61,6 +81,10 @@ export function HoldoutLauncher(props: { sweep: SweepOut }): React.JSX.Element {
         date_to: startOf(dateTo),
         top_n: topN,
         metric,
+        ...(drawdownLimit.value === undefined ? {} : { max_drawdown_r: drawdownLimit.value }),
+        ...(yearsLimit.value === undefined
+          ? {}
+          : { min_positive_year_share: String(Number(yearsLimit.value) / 100) }),
         min_trades: minTrades,
       },
       {
@@ -125,7 +149,7 @@ export function HoldoutLauncher(props: { sweep: SweepOut }): React.JSX.Element {
           <select
             value={metric}
             onChange={(event) => {
-              setMetric(event.target.value as SelectionMetric)
+              setMetric(event.target.value as HoldoutRank)
             }}
             className={input}
           >
@@ -159,6 +183,43 @@ export function HoldoutLauncher(props: { sweep: SweepOut }): React.JSX.Element {
           ))}
         </div>
       </fieldset>
+      <fieldset className="text-sm">
+        <legend className="mb-1 text-slate-400">
+          Limits on the risk in R — blank sets none. A run recorded before 25/09 has no risk in R
+          and never passes a limit.
+        </legend>
+        <div className="flex flex-wrap gap-4">
+          <label className="flex flex-col gap-1">
+            Deepest drawdown (R)
+            <input
+              inputMode="decimal"
+              placeholder="no limit"
+              value={maxDrawdownR}
+              onChange={(event) => {
+                setMaxDrawdownR(event.target.value)
+              }}
+              className={`${input} w-28`}
+            />
+          </label>
+          <label className="flex flex-col gap-1">
+            Years positive, at least (%)
+            <input
+              inputMode="decimal"
+              placeholder="no limit"
+              value={minYearsPercent}
+              onChange={(event) => {
+                setMinYearsPercent(event.target.value)
+              }}
+              className={`${input} w-28`}
+            />
+          </label>
+        </div>
+      </fieldset>
+      {!limitsValid && (
+        <p role="alert" className="text-sm text-amber-300">
+          A limit is a positive number, and a share of years at most 100%.
+        </p>
+      )}
       {overlaps && (
         <p role="alert" className="text-sm text-amber-300">
           This window shares bars with the one searched ({day(sweep.date_from)} →{' '}

@@ -1193,12 +1193,22 @@ export interface SweepEntryOut {
   targets: TargetRung[]
 }
 
+/**
+ * What "best" means when a reserved-window test picks its points: the walk-forward's four, and
+ * the run's risk in R (25/09). Its own type — the walk-forward keeps `SelectionMetric`.
+ */
+export type HoldoutRank = SelectionMetric | 'net_r' | 'recovery_r' | 'positive_years'
+
 /** How a reserved-window test chose the points it runs again. */
 export interface HoldoutRule {
-  metric: SelectionMetric
+  metric: HoldoutRank
   top_n: number
   /** The fewest trades a run needed to be ranked, per chart. */
   min_trades: Record<string, number>
+  /** Present only when the test set it: the deepest drawdown in R a chosen run could have. */
+  max_drawdown_r?: string
+  /** Present only when the test set it: the least share of positive years. */
+  min_positive_year_share?: string
 }
 
 /** Test a sweep's best points on a window none of them was chosen on. */
@@ -1206,7 +1216,11 @@ export interface CreateHoldoutRequest {
   date_from: string
   date_to: string
   top_n: number
-  metric: SelectionMetric
+  metric: HoldoutRank
+  /** Only runs no deeper than this in R. A run recorded before 25/09 never passes. */
+  max_drawdown_r?: string
+  /** Only runs with at least this share of years positive, as a decimal string. */
+  min_positive_year_share?: string
   /** Per chart, over the sweep's own floor; a chart left out keeps that floor. */
   min_trades: Record<string, number>
 }

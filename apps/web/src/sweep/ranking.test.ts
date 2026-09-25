@@ -56,6 +56,26 @@ describe('the measures a run is ranked by', () => {
     )
   })
 
+  it('reads the risk in R, and a run recorded before it as nothing to rank by (25/09)', () => {
+    expect(score('net_r', { net_r: '12' })).toBe(12)
+    expect(score('net_r', {})).toBeNull()
+    expect(score('positive_years', { positive_year_share: '0.75' })).toBe(0.75)
+    expect(score('positive_years', { positive_year_share: null })).toBeNull()
+    expect(score('drawdown_r', { max_drawdown_r: '4' })).toBeGreaterThan(
+      score('drawdown_r', { max_drawdown_r: '25' }) ?? 0,
+    )
+    expect(score('drawdown_r', {})).toBeNull()
+  })
+
+  it('scores recovery as net R over drawdown R, with the no-drawdown cases the server uses', () => {
+    // The steadier run wins: +12 R through 4 R of drawdown against +20 R through 25 R.
+    expect(score('recovery_r', { net_r: '12', max_drawdown_r: '4' })).toBe(3)
+    expect(score('recovery_r', { net_r: '20', max_drawdown_r: '25' })).toBe(0.8)
+    expect(score('recovery_r', { net_r: '3', max_drawdown_r: '0' })).toBe(Number.POSITIVE_INFINITY)
+    expect(score('recovery_r', { net_r: '0', max_drawdown_r: '0' })).toBeNull()
+    expect(score('recovery_r', {})).toBeNull()
+  })
+
   it('offers every measure it can rank by, each once', () => {
     expect(RANKINGS.map((one) => one.label)).toEqual([
       'Return',
@@ -63,6 +83,10 @@ describe('the measures a run is ranked by', () => {
       'Win rate',
       'Expectancy',
       'Smallest drawdown',
+      'Net R',
+      'Net R per R of drawdown',
+      'Share of years positive',
+      'Smallest drawdown in R',
     ])
   })
 

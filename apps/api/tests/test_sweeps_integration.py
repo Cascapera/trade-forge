@@ -1968,6 +1968,57 @@ def trade_in(
         session.commit()
 
 
+class TestChoosingByRiskInR:
+    """25/09: a reserved-window test can rank by the risk in R and set limits on it."""
+
+    def test_the_limits_decide_what_can_be_chosen_and_are_kept_in_the_rule(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        window = TestTheReservedWindow()
+        sweep_id, runs = window.swept(client, session_factory)
+        by_period = {row["values"]["setup.params.period"]: row["run"]["id"] for row in runs}
+        # Period 13 made the most money but fell 30 R deep; 11 and 9 stayed within 10 R.
+        with session_factory() as session:
+            for period, (net_r, drawdown_r, years) in {
+                13: ("40", "30", "0.8"),
+                11: ("15", "5", "0.75"),
+                9: ("12", "3", "0.5"),
+            }.items():
+                run = session.get(Backtest, uuid.UUID(by_period[period]))
+                assert run is not None
+                assert run.metrics is not None
+                run.metrics.net_r = Decimal(net_r)
+                run.metrics.max_drawdown_r = Decimal(drawdown_r)
+                run.metrics.positive_year_share = Decimal(years)
+            session.commit()
+
+        created = client.post(
+            f"/sweeps/{sweep_id}/holdout",
+            json=window.after(
+                top_n=1, metric="recovery_r", max_drawdown_r="10", min_positive_year_share="0.6"
+            ),
+        )
+
+        assert created.status_code == 202, created.text
+        test = client.get(f"/sweeps/{created.json()['id']}").json()
+        # 13 is too deep and 9 too unsteady; 7 and 5 were recorded without R and never pass.
+        assert [row["values"]["setup.params.period"] for row in test["runs"]] == [11]
+        assert test["holdout_rule"]["metric"] == "recovery_r"
+        assert test["holdout_rule"]["max_drawdown_r"] == "10"
+        assert test["holdout_rule"]["min_positive_year_share"] == "0.6"
+
+    def test_limits_nothing_passes_are_refused_with_the_reason(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        window = TestTheReservedWindow()
+        sweep_id, _runs = window.swept(client, session_factory)
+
+        refused = client.post(f"/sweeps/{sweep_id}/holdout", json=window.after(max_drawdown_r="5"))
+
+        assert refused.status_code == 422
+        assert "before 25/09 has no risk in R" in refused.json()["detail"]
+
+
 class TestJudgingATestInPieces:
     """His ask (25/09): cut a finished reserved-window test by year or into blocks of trades, by
     hand, and keep the answer."""
@@ -2144,6 +2195,43 @@ class TestTheScreenReadsAPage:
         assert ranked("drawdown") == [n5, n11, n9, n7, queued]
         # Period 11 won with no loss (its net is positive): the best profit factor there is.
         assert ranked("profit_factor") == [n11, n9, n7, n5, queued]
+
+    def test_the_measures_in_r_rank_with_their_edge_cases_and_old_runs_last(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        """25/09. Four finished runs with their risk in R, and the queued one with none — which
+        stands for every run recorded before these measures existed."""
+        sweep_id, best_first = self.five(client, session_factory)
+        n7, n11, n9, n5, queued = best_first
+        # (net R, drawdown R, positive-year share)
+        risk = {
+            n7: ("20", "25", "0.4"),  # recovery 0.8
+            n11: ("12", "4", "0.8"),  # recovery 3
+            n9: ("3", "0", None),  # gained with no drawdown: best recovery; one year, no share
+            n5: ("-2", "6", "0.5"),  # recovery below zero
+        }
+        with session_factory() as session:
+            for run_id, (net_r, drawdown_r, years) in risk.items():
+                run = session.get(Backtest, uuid.UUID(run_id))
+                assert run is not None
+                assert run.metrics is not None
+                run.metrics.net_r = Decimal(net_r)
+                run.metrics.max_drawdown_r = Decimal(drawdown_r)
+                run.metrics.positive_year_share = None if years is None else Decimal(years)
+            session.commit()
+
+        def ranked(by: str) -> list[str]:
+            page = client.get(f"/sweeps/{sweep_id}/runs", params={"rank_by": by}).json()
+            return [row["run"]["id"] for row in page["items"]]
+
+        assert ranked("net_r") == [n7, n11, n9, n5, queued]
+        assert ranked("recovery_r") == [n9, n11, n7, n5, queued]
+        assert ranked("drawdown_r") == [n9, n11, n5, n7, queued]
+        # n9 has no share (one year) and ranks with the run that has no R at all: last. The two tie,
+        # and a tie falls to the strategy's name (runs launched together share `created_at`).
+        by_years = ranked("positive_years")
+        assert by_years[:3] == [n11, n5, n7]
+        assert set(by_years[3:]) == {n9, queued}
 
     def test_a_page_of_one_entry_holds_only_its_runs(
         self, client: Any, session_factory: Callable[[], Session]

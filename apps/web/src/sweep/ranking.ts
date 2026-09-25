@@ -7,7 +7,16 @@
 
 import type { Metrics } from '../api/types'
 
-export type RankKey = 'return' | 'profit_factor' | 'win_rate' | 'expectancy' | 'drawdown'
+export type RankKey =
+  | 'return'
+  | 'profit_factor'
+  | 'win_rate'
+  | 'expectancy'
+  | 'drawdown'
+  | 'net_r'
+  | 'recovery_r'
+  | 'positive_years'
+  | 'drawdown_r'
 
 export interface Ranking {
   key: RankKey
@@ -29,6 +38,25 @@ function profitFactor(metrics: Metrics): number | null {
   return Number(metrics.gross_profit) > 0 ? Number.POSITIVE_INFINITY : null
 }
 
+/** A measure in R, or null for a run recorded before those existed (25/09). */
+function inR(value: string | null | undefined): number | null {
+  return value === null || value === undefined ? null : Number(value)
+}
+
+/**
+ * Net R over the deepest drawdown in R — what the run made per unit of the worst it went through.
+ *
+ * ⚠️ The profit factor's no-loss case, again: a gain with no drawdown at all is the best there
+ * is (+∞), and no drawdown with nothing gained has nothing to say.
+ */
+function recoveryR(metrics: Metrics): number | null {
+  const net = inR(metrics.net_r)
+  const drawdown = inR(metrics.max_drawdown_r)
+  if (net === null || drawdown === null) return null
+  if (drawdown > 0) return net / drawdown
+  return net > 0 ? Number.POSITIVE_INFINITY : null
+}
+
 export const RANKINGS: readonly Ranking[] = [
   { key: 'return', label: 'Return', score: (m) => Number(m.net_profit) },
   { key: 'profit_factor', label: 'Profit factor', score: profitFactor },
@@ -45,6 +73,18 @@ export const RANKINGS: readonly Ranking[] = [
   },
   // Smaller is better, so the score is the drawdown negated.
   { key: 'drawdown', label: 'Smallest drawdown', score: (m) => -Number(m.max_drawdown_pct) },
+  // In R (25/09). A run recorded before them has none, and ranks last.
+  { key: 'net_r', label: 'Net R', score: (m) => inR(m.net_r) },
+  { key: 'recovery_r', label: 'Net R per R of drawdown', score: recoveryR },
+  { key: 'positive_years', label: 'Share of years positive', score: (m) => inR(m.positive_year_share) },
+  {
+    key: 'drawdown_r',
+    label: 'Smallest drawdown in R',
+    score: (m) => {
+      const drawdown = inR(m.max_drawdown_r)
+      return drawdown === null ? null : -drawdown
+    },
+  },
 ]
 
 export function rankingOf(key: RankKey): Ranking {

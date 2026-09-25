@@ -33,6 +33,7 @@ from pydantic import (
     model_validator,
 )
 
+from tradeforge_api.holdout import HoldoutRank
 from tradeforge_api.sweep_dataset import Role
 from tradeforge_api.walkforward import MAX_FOLDS, MIN_FOLDS
 from tradeforge_collector.classify import asset_class_from_path
@@ -2036,8 +2037,14 @@ class CreateHoldout(BaseModel):
     date_to: AwareInstant
     top_n: int = Field(default=3, ge=1, le=100)
     """How many points to test per (entry, chart, market)."""
-    metric: SelectionMetric = SelectionMetric.NET_PROFIT
+    metric: HoldoutRank = HoldoutRank.NET_PROFIT
     """What "best" means. A run with no value for it is not ranked, never ranked as zero."""
+    max_drawdown_r: Decimal | None = Field(default=None, gt=0)
+    """Only runs whose deepest drawdown in R is at most this (25/09). A run recorded before its
+    risk in R existed never passes."""
+    min_positive_year_share: Decimal | None = Field(default=None, gt=0, le=1)
+    """Only runs with at least this share of their years positive (25/09). A run with fewer
+    than two years that traded has no share, and never passes."""
     min_trades: dict[Timeframe, Annotated[int, Field(ge=1, le=1_000_000)]] = Field(
         default_factory=dict
     )

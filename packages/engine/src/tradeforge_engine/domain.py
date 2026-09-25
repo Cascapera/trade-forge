@@ -1045,6 +1045,10 @@ class ClosedTrade:
     mae_r: Money | None = None
     """How far against, in the same unit. A trade stopped out at its initial stop reads 1 here,
     or more if the bar gapped through it."""
+    swap: Money = ZERO
+    """What holding the position overnight came to — **signed**: negative was charged, positive
+    was paid (`tradeforge_engine.swap`). Part of `net_pnl`, which is `gross_pnl - costs + swap`;
+    kept apart from `costs` because a cost is a magnitude and a swap can be a credit."""
 
 
 @dataclass(frozen=True, slots=True)

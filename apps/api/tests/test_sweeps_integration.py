@@ -2131,3 +2131,47 @@ class TestEachMarketPaysItsOwnCosts:
 
         assert refused.status_code == 422
         assert refused.json()["detail"] == "no costs given for: GBPUSD"
+
+    def test_a_swap_typed_per_side_is_written_on_every_run_signed(self, client: Any) -> None:
+        """His GBPUSD (24/09): 5 points of spread, and -5 USD per lot per night on both sides —
+        signed as the broker quotes it, since a swap can be a credit."""
+        entry = an_entry(client, name=f"swapped {uuid.uuid4()}")
+        body = {
+            **a_sweep_body([entry], ["GBPUSD"], ["H1"]),
+            "cost_model": {
+                "type": "per_market",
+                "markets": {
+                    "GBPUSD": {
+                        "spread_points": "5",
+                        "swap_long_per_lot": "-5",
+                        "swap_short_per_lot": "-5",
+                    }
+                },
+            },
+        }
+
+        launched = client.post("/sweeps", json=body)
+
+        assert launched.status_code == 202, launched.text
+        (row,) = client.get(f"/sweeps/{launched.json()['id']}").json()["runs"]
+        assert row["run"]["cost_model"] == {
+            "type": "spread_commission",
+            "spread_points": "5",
+            "commission_per_unit": "0",
+            "swap": {"long_per_lot": "-5", "short_per_lot": "-5"},
+        }
+
+    def test_a_swap_that_is_not_a_number_is_refused(self, client: Any) -> None:
+        entry = an_entry(client, name=f"bad swap {uuid.uuid4()}")
+        body = {
+            **a_sweep_body([entry], ["GBPUSD"], ["H1"]),
+            "cost_model": {
+                "type": "per_market",
+                "markets": {"GBPUSD": {"spread_points": "5", "swap_long_per_lot": "a lot"}},
+            },
+        }
+
+        refused = client.post("/sweeps", json=body)
+
+        assert refused.status_code == 422
+        assert "cost model cannot be charged" in refused.json()["detail"]

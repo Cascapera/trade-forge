@@ -19,6 +19,9 @@ trade's own result as a price ratio too (`gross_r`), never with `r_multiple`, wh
 costs. Mixing the two would make every derived target look better than the trade it replaced by
 exactly the costs.
 
+**Net of the trade's own costs and swap** (`_costs_in_r`): what the trade actually paid, in R of
+its risk, is taken off every rung.
+
 `mfe_r` can only err low (`Position.best_price`), so a derived hit is a hit the bars prove; a target
 reached inside the same bar as the stop counts as missed, which is also what the broker does.
 """
@@ -149,12 +152,20 @@ def _summed(results: Sequence[Money], hits: int) -> TargetOutcome:
 
 
 def _costs_in_r(trade: ClosedTrade, instrument: InstrumentSpec) -> Money | None:
+    """What the trade paid besides the price move, in R of its own risk: its costs, less its swap.
+
+    ⚠️ **The swap is the trade's actual one, like the costs** (24/09, engine-guardian). A target
+    reached would have closed the trade earlier and held it for at most as many nights — so with a
+    charged swap every rung reads conservatively, and with a credit slightly optimistically.
+    Leaving the swap out made every rung of a position held overnight read better than the trade
+    itself, by exactly its swap, in every sweep with swap rates.
+    """
     if trade.stop_loss is None:
         return None
     risk = instrument.money_for(abs(trade.entry_price - trade.stop_loss), trade.volume)
     if risk <= ZERO:
         return None
-    return trade.costs / risk
+    return (trade.costs - trade.swap) / risk
 
 
 __all__ = ["LADDER", "TargetOutcome", "gross_r", "target_ladder", "with_target"]

@@ -60,6 +60,7 @@ from tradeforge_engine.protocols import (
 )
 from tradeforge_engine.risk import PercentRiskManager
 from tradeforge_engine.strategy import CompiledStrategy, compile_strategy
+from tradeforge_engine.swap import SwapRates
 from tradeforge_engine.warmup import HandOver, hand_over, unwarmed_indicators
 
 __all__ = [
@@ -102,6 +103,7 @@ __all__ = [
     "SignalKind",
     "SpreadCostModel",
     "Strategy",
+    "SwapRates",
     "Volume",
     "__version__",
     "build_indicator",

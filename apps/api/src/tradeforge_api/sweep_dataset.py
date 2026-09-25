@@ -447,11 +447,15 @@ def _rung_field(key: str, field: str) -> Callable[[DatasetRun], object]:
 _RUNG_FIELDS: tuple[tuple[str, str, str], ...] = (
     (
         "net_r",
-        "R, net of costs",
+        "R, net of costs and swap",
         "What the run's trades would have made with this target instead of their own exit, "
-        "summed: each trade scored alone, in R of its own risk, less its own costs in R.",
+        "summed: each trade scored alone, in R of its own risk, less its own costs and swap in R.",
     ),
-    ("expectancy_r", "R, net of costs", "net_r over trades: what one trade was worth on average."),
+    (
+        "expectancy_r",
+        "R, net of costs and swap",
+        "net_r over trades: what one trade was worth on average.",
+    ),
     ("hits", "count", "How many of the trades this target would have closed."),
     (
         "trades",

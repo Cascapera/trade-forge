@@ -35,6 +35,7 @@ from tradeforge_engine.domain import (
     SignalKind,
 )
 from tradeforge_engine.errors import EngineError
+from tradeforge_engine.swap import SwapRates
 
 
 class Portfolio:
@@ -46,6 +47,7 @@ class Portfolio:
         initial_capital: Money,
         instrument: InstrumentSpec,
         currency: str = "USD",
+        swap: SwapRates | None = None,
     ) -> None:
         if initial_capital <= ZERO:
             raise ValueError(f"initial capital must be positive, got {initial_capital}")
@@ -57,6 +59,7 @@ class Portfolio:
         self._equity = initial_capital
         self._position: Position | None = None
         self._trades: list[ClosedTrade] = []
+        self._swap = swap if swap is not None else SwapRates()
 
     @property
     def initial_capital(self) -> Money:
@@ -221,15 +224,18 @@ class Portfolio:
             )
 
         gross = self._pnl(position, position.entry_price, fill.price)
+        # Settled with the trade rather than night by night: the result and the balance are
+        # exact, and the curve does not show it accruing while the position is open (`swap`).
+        swap = self._swap.on(position.side, position.volume, position.entry_time, fill.time)
 
         # The balance only moves by what has not moved yet: the entry's cost was already
         # taken at `_open`. The *trade*, however, reports both legs.
-        self._balance += gross - fill.costs
+        self._balance += gross - fill.costs + swap
         self._equity = self._balance
         self._position = None
 
         costs = position.entry_costs + fill.costs
-        net = gross - costs
+        net = gross - costs + swap
         trade = ClosedTrade(
             symbol=position.symbol,
             side=position.side,
@@ -255,6 +261,7 @@ class Portfolio:
             mae_price=position.worst_price,
             mfe_r=_in_r(position, position.best_price),
             mae_r=_in_r(position, position.worst_price),
+            swap=swap,
         )
         self._trades.append(trade)
         return trade

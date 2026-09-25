@@ -631,6 +631,8 @@ class TradeOut(_Out):
     take_profit: Money | None
     gross_pnl: Money | None
     costs: Money | None
+    swap: Money = Decimal(0)
+    """Signed: negative was charged for holding it overnight, positive was paid (24/09)."""
     net_pnl: Money | None
     r_multiple: Money | None
     mfe_r: Money | None = None

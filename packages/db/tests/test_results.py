@@ -625,6 +625,8 @@ def test_closing_sets_the_exit_and_leaves_the_entry_alone() -> None:
         "take_profit",
         "gross_pnl",
         "costs",
+        # Held overnight or not is only known when it ends, like the rest of the exit (24/09).
+        "swap",
         "net_pnl",
         "r_multiple",
         # How far the trade went is only known when it ends, so it arrives with the exit.

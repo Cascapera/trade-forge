@@ -30,6 +30,11 @@ function anEntry(id: string, points: number): CatalogEntry {
 
 const ENTRIES = [anEntry('a', 1)]
 
+/** One market's typed costs; the swap blank unless a test gives it. */
+function costs(spread: string, commission: string, swapLong = '', swapShort = '') {
+  return { spread, commission, swapLong, swapShort }
+}
+
 /** A form that `whyNotLaunchable` approves, so each test can break exactly one thing. */
 function aForm(patch: Partial<SweepForm> = {}): SweepForm {
   return {
@@ -160,7 +165,7 @@ describe('toSweepRequest', () => {
     // statements. The engine reads the type, and `{type: 'none'}` is the honest one.
     expect(toSweepRequest(aForm()).cost_model).toEqual({ type: 'none' })
     expect(
-      toSweepRequest(aForm({ costs: { EURUSD: { spread: '  ', commission: '' } } })).cost_model,
+      toSweepRequest(aForm({ costs: { EURUSD: costs('  ', '') } })).cost_model,
     ).toEqual({ type: 'none' })
   })
 
@@ -168,8 +173,8 @@ describe('toSweepRequest', () => {
     const form = aForm({
       symbols: ['EURUSD', 'GBPUSD'],
       costs: {
-        EURUSD: { spread: ' 8 ', commission: '3.5' },
-        GBPUSD: { spread: '5', commission: '' },
+        EURUSD: costs(' 8 ', '3.5'),
+        GBPUSD: costs('5', ''),
       },
     })
 
@@ -213,23 +218,23 @@ describe('costs per market', () => {
 
     expect(aapl.symbols).toEqual(['GBPUSD', 'AAPL'])
     expect(aapl.costs).toEqual({
-      GBPUSD: { spread: '9', commission: '' },
-      AAPL: { spread: '', commission: '' },
+      GBPUSD: costs('9', ''),
+      AAPL: costs('', ''),
     })
   })
 
   it('keeps what was typed when a market is unticked and ticked again', () => {
-    const typed = aForm({ symbols: ['GBPUSD'], costs: { GBPUSD: { spread: '5', commission: '1' } } })
+    const typed = aForm({ symbols: ['GBPUSD'], costs: { GBPUSD: costs('5', '1') } })
 
     const again = toggleMarket(toggleMarket(typed, 'GBPUSD', instruments), 'GBPUSD', instruments)
 
-    expect(again.costs.GBPUSD).toEqual({ spread: '5', commission: '1' })
+    expect(again.costs.GBPUSD).toEqual(costs('5', '1'))
   })
 
   it('refuses some markets costed and others not, naming the one left blank', () => {
     const form = aForm({
       symbols: ['EURUSD', 'GBPUSD'],
-      costs: { EURUSD: { spread: '8', commission: '' }, GBPUSD: { spread: '', commission: '' } },
+      costs: { EURUSD: costs('8', ''), GBPUSD: costs('', '') },
     })
 
     expect(whyNotLaunchable(form, ENTRIES)).toMatch(/Type the spread for GBPUSD/)
@@ -237,8 +242,50 @@ describe('costs per market', () => {
   })
 
   it('refuses a cost that is not a number of zero or more', () => {
-    const form = aForm({ costs: { EURUSD: { spread: '8', commission: '-1' } } })
+    const form = aForm({ costs: { EURUSD: costs('8', '-1') } })
 
     expect(whyNotLaunchable(form, ENTRIES)).toMatch(/numbers of zero or more/)
+  })
+})
+
+
+describe('swap per market', () => {
+  it('sends the buy and the sell swap signed, and a side left blank as zero', () => {
+    const form = aForm({ symbols: ['GBPUSD'], costs: { GBPUSD: costs('5', '', '-5', '') } })
+
+    expect(toSweepRequest(form).cost_model).toEqual({
+      type: 'per_market',
+      markets: {
+        GBPUSD: {
+          spread_points: '5',
+          commission_per_unit: '0',
+          swap_long_per_lot: '-5',
+          swap_short_per_lot: '0',
+        },
+      },
+    })
+  })
+
+  it('sends no swap at all when neither side was typed', () => {
+    const form = aForm({ symbols: ['GBPUSD'], costs: { GBPUSD: costs('5', '') } })
+
+    expect(toSweepRequest(form).cost_model).toEqual({
+      type: 'per_market',
+      markets: { GBPUSD: { spread_points: '5', commission_per_unit: '0' } },
+    })
+  })
+
+  it('takes a positive swap as a credit and refuses one that is not a number', () => {
+    expect(whyNotLaunchable(aForm({ costs: { EURUSD: costs('8', '', '1.2', '-3') } }), ENTRIES)).toBeNull()
+    expect(whyNotLaunchable(aForm({ costs: { EURUSD: costs('8', '', 'lots', '') } }), ENTRIES)).toMatch(
+      /swap of EURUSD must be a number/,
+    )
+  })
+
+  it('counts a market with only a swap as costed, so its spread must be typed', () => {
+    const form = aForm({ costs: { EURUSD: costs('', '', '-5', '-5') } })
+
+    expect(isCostless(form)).toBe(false)
+    expect(whyNotLaunchable(form, ENTRIES)).toMatch(/Type the spread for EURUSD/)
   })
 })

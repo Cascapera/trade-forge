@@ -216,7 +216,13 @@ export function LaunchSweep(): React.JSX.Element {
             <legend className="text-sm text-slate-300">Costs per market</legend>
             <div className="space-y-1">
               {form.symbols.map((symbol) => {
-                const costs = form.costs[symbol] ?? { spread: '', commission: '' }
+                const costs = {
+                  spread: '',
+                  commission: '',
+                  swapLong: '',
+                  swapShort: '',
+                  ...form.costs[symbol],
+                }
                 const change = (patch: Partial<typeof costs>) => {
                   set({ costs: { ...form.costs, [symbol]: { ...costs, ...patch } } })
                 }
@@ -246,6 +252,30 @@ export function LaunchSweep(): React.JSX.Element {
                         value={costs.commission}
                         onChange={(event) => {
                           change({ commission: event.target.value })
+                        }}
+                      />
+                    </label>
+                    {/* Signed as the broker quotes it: negative is charged, positive paid. */}
+                    <label className="flex items-center gap-1 text-slate-400">
+                      Swap buy / sell per lot per night
+                      <input
+                        aria-label={`buy swap of ${symbol}`}
+                        inputMode="decimal"
+                        placeholder="0"
+                        className={`${inputClass} w-20`}
+                        value={costs.swapLong}
+                        onChange={(event) => {
+                          change({ swapLong: event.target.value })
+                        }}
+                      />
+                      <input
+                        aria-label={`sell swap of ${symbol}`}
+                        inputMode="decimal"
+                        placeholder="0"
+                        className={`${inputClass} w-20`}
+                        value={costs.swapShort}
+                        onChange={(event) => {
+                          change({ swapShort: event.target.value })
                         }}
                       />
                     </label>

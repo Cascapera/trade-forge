@@ -24,6 +24,9 @@ vi.mock('../api/hooks', async (importOriginal) => ({
 vi.mock('../components/HoldoutLauncher', () => ({
   HoldoutLauncher: () => <div data-testid="holdout-launcher" />,
 }))
+vi.mock('../components/SweepWalkForwardLauncher', () => ({
+  SweepWalkForwardLauncher: () => <div data-testid="walk-forward-launcher" />,
+}))
 vi.mock('../components/HoldoutComparison', () => ({
   HoldoutComparison: ({ sweepId }: { sweepId: string }) => (
     <div data-testid="holdout-comparison">{sweepId}</div>
@@ -612,6 +615,8 @@ describe('SweepResult — the reserved-window test', () => {
     renderWithProviders(<SweepResult />, '/sweeps/sweep-1')
 
     expect(screen.getByTestId('holdout-launcher')).toBeInTheDocument()
+    // The walk-forward is offered beside it, on the same finished sweep (25/09).
+    expect(screen.getByTestId('walk-forward-launcher')).toBeInTheDocument()
     expect(screen.queryByTestId('holdout-comparison')).not.toBeInTheDocument()
   })
 

@@ -16,6 +16,7 @@ import { ComparisonChart } from '../components/ComparisonChart'
 import { FailedDownloads } from '../components/FailedDownloads'
 import { HoldoutComparison } from '../components/HoldoutComparison'
 import { HoldoutLauncher } from '../components/HoldoutLauncher'
+import { SweepWalkForwardLauncher } from '../components/SweepWalkForwardLauncher'
 import { RunTable } from '../components/RunTable'
 import { StudyDispersion } from '../components/StudyDispersion'
 import { SweepTargets } from '../components/TargetLadder'
@@ -254,7 +255,12 @@ export function SweepResult(): React.JSX.Element {
       {data.holdout_rule !== undefined && data.holdout_rule !== null ? (
         <HoldoutComparison sweepId={data.id} />
       ) : (
-        isSweepSettled(data) && <HoldoutLauncher sweep={data} />
+        isSweepSettled(data) && (
+          <>
+            <HoldoutLauncher sweep={data} />
+            <SweepWalkForwardLauncher sweep={data} />
+          </>
+        )
       )}
 
       {/* ⚠️ **Always on screen, and waiting kept apart from executing.** The line this replaced

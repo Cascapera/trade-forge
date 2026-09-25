@@ -21,6 +21,9 @@ import type {
   ClusterOut,
   CreateClusterRequest,
   CreateHoldoutRequest,
+  CreateSweepWalkForwardRequest,
+  CreatedSweepWalkForward,
+  SweepWalkForwardOut,
   CreateMonteCarloRequest,
   CreateSlicingRequest,
   CreateSweepRequest,
@@ -214,6 +217,15 @@ export const api = {
   createSlicing: (id: string, payload: CreateSlicingRequest): Promise<SlicingOut> =>
     request('POST', `/sweeps/${id}/slicings`, payload),
   listSlicings: (id: string): Promise<SlicingOut[]> => request('GET', `/sweeps/${id}/slicings`),
+  // A sweep walked forward fold by fold (25/09): trainings queued at once, tests as they end.
+  createSweepWalkForward: (
+    sweepId: string,
+    payload: CreateSweepWalkForwardRequest,
+  ): Promise<CreatedSweepWalkForward> => request('POST', `/sweeps/${sweepId}/walkforward`, payload),
+  listSweepWalkForwards: (sweepId: string): Promise<SweepWalkForwardOut[]> =>
+    request('GET', `/sweeps/${sweepId}/walkforwards`),
+  getSweepWalkForward: (id: string): Promise<SweepWalkForwardOut> =>
+    request('GET', `/sweep-walkforwards/${id}`),
   // Several finished runs replayed on one shared account (25/09). Replayed by the worker.
   createCluster: (payload: CreateClusterRequest): Promise<ClusterOut> =>
     request('POST', '/clusters', payload),

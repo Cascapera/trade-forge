@@ -472,19 +472,32 @@ def aggregate_points(runs: list[tuple[Backtest, str]], initial_capital: Decimal)
     spectacular corner drags it upward, which is precisely the corner a reader most needs to
     see reported as an outlier rather than baked into the summary.
     """
-    finished = [(run, label) for run, label in runs if run.metrics is not None]
-    failed = sum(1 for run, _ in runs if run.status == BacktestStatus.FAILED)
+    return aggregate_scored(
+        [
+            (run.status, None if run.metrics is None else run.metrics.net_profit, label)
+            for run, label in runs
+        ],
+        initial_capital,
+    )
+
+
+def aggregate_scored(
+    points: Sequence[tuple[BacktestStatus, Decimal | None, str]], initial_capital: Decimal
+) -> StudyAggregate:
+    """`aggregate_points` over plain values: each run's status, its net profit — `None` while it
+    has no metrics — and its label. What a reader that never loads the runs whole can hand over
+    (a sweep's summary, 25/09: 51 thousand runs read as four columns, not as ORM rows)."""
+    failed = sum(1 for status, _net, _label in points if status == BacktestStatus.FAILED)
 
     # Fractions of the capital every point starts with — fixed by the study, so these are
     # comparable by construction rather than by the reader remembering to check.
     returns = sorted(
-        (run.metrics.net_profit / initial_capital, label)  # type: ignore[union-attr]
-        for run, label in finished
+        (net / initial_capital, label) for _status, net, label in points if net is not None
     )
 
     if not returns:
         return StudyAggregate(
-            points_total=len(runs),
+            points_total=len(points),
             points_finished=0,
             points_failed=failed,
             points_profitable=0,
@@ -499,7 +512,7 @@ def aggregate_points(runs: list[tuple[Backtest, str]], initial_capital: Decimal)
     median = returns[middle][0] if odd else (returns[middle - 1][0] + returns[middle][0]) / 2
 
     return StudyAggregate(
-        points_total=len(runs),
+        points_total=len(points),
         points_finished=len(returns),
         points_failed=failed,
         points_profitable=sum(1 for value, _ in returns if value > 0),

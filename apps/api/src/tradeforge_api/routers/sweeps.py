@@ -24,7 +24,7 @@ did — which is why a hole is always written down, never merely left.
 import json
 import secrets
 import uuid
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from decimal import Decimal
 from typing import Annotated, Any, Literal
 
@@ -52,7 +52,7 @@ from tradeforge_api.queue import COLLECT_QUEUE, COLLECT_RANGE, RUN_BACKTEST
 from tradeforge_api.retention import MIN_TRADES
 from tradeforge_api.routers.backtests import failed_collections, list_item
 from tradeforge_api.routers.strategies import refusal_of
-from tradeforge_api.routers.studies import aggregate_points, strategies_for
+from tradeforge_api.routers.studies import aggregate_scored, strategies_for
 from tradeforge_api.runner import ENGINE_VERSION, build_cost_model, swap_rates
 from tradeforge_api.schemas import (
     CreatedSweep,
@@ -102,7 +102,7 @@ from tradeforge_api.sweep import (
     size_refusal,
 )
 from tradeforge_api.sweep_dataset import CAVEATS, OMITTED, ROW, DatasetRun, columns_for, to_csv
-from tradeforge_api.targets import rungs_across
+from tradeforge_api.targets import rungs_of
 from tradeforge_collector.collect import year_slices
 from tradeforge_db.collections import create_collection
 from tradeforge_db.models import (
@@ -1426,33 +1426,19 @@ def get_sweep(
     entry's name is a prefix of another's or a value contains the separator. The first draft of
     this endpoint did exactly that; the column exists because of it.
     """
-    sweep, entries, coordinates, followers, rows = _read_sweep(session, sweep_id)
+    sweep = session.get(Sweep, sweep_id)
+    if sweep is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="sweep not found")
+    counts, summaries = _summary(session, sweep)
 
     out: list[SweepRunOut] = []
-    scored: dict[str, list[tuple[Backtest, str]]] = {one: [] for one in sweep.entry_ids}
-    for run, strategy, instrument in rows:
-        point = coordinates.get(str(run.strategy_id), {})
-        entry_id = str(point.get("entry_id", ""))
-        label = str(point.get("label", ""))
-        if runs == "all":
+    if runs == "all":
+        _sweep, entries, coordinates, followers, rows = _read_sweep(session, sweep_id)
+        for run, strategy, instrument in rows:
+            point = coordinates.get(str(run.strategy_id), {})
             out.append(
                 _run_out((run, strategy, instrument), point, entries=entries, followers=followers)
             )
-        if entry_id in scored:
-            # The symbol leads because the point label repeats once per market: `M15 · period=9`
-            # over three symbols is three runs, and a best that named only the point would name
-            # all three of them.
-            scored[entry_id].append((run, f"{instrument.symbol} · {label}"))
-
-    summaries = [
-        SweepEntryOut(
-            entry_id=uuid.UUID(entry_id),
-            entry_name=shelved.name if (shelved := entries.get(entry_id)) is not None else None,
-            aggregate=aggregate_points(scored[entry_id], sweep.initial_capital),
-            targets=rungs_across(scored[entry_id]),
-        )
-        for entry_id in sweep.entry_ids
-    ]
 
     return SweepOut(
         id=sweep.id,
@@ -1465,12 +1451,101 @@ def get_sweep(
         created_at=sweep.created_at,
         holdout_of=sweep.holdout_of,
         holdout_rule=sweep.holdout_rule,
-        counts=_counts(run for run, _strategy, _instrument in rows),
+        counts=counts,
         entries=summaries,
         runs=out,
         skipped=[UncoveredMarket.model_validate(one) for one in sweep.skipped],
         failed_collections=failed_collections(session, Backtest.sweep_id == sweep.id),
     )
+
+
+def _count_runs(session: Session, sweep_id: uuid.UUID) -> SweepRunCounts:
+    """The runs per status, counted by Postgres — 14 ms on 51 840 runs (25/09)."""
+    counted = dict.fromkeys(BacktestStatus, 0)
+    for state, many in session.execute(
+        select(Backtest.status, func.count())
+        .where(Backtest.sweep_id == sweep_id)
+        .group_by(Backtest.status)
+    ):
+        counted[state] = many
+    return SweepRunCounts(
+        total=sum(counted.values()),
+        done=counted[BacktestStatus.DONE],
+        running=counted[BacktestStatus.RUNNING],
+        queued=counted[BacktestStatus.QUEUED],
+        failed=counted[BacktestStatus.FAILED],
+    )
+
+
+def _summary(session: Session, sweep: Sweep) -> tuple[SweepRunCounts, list[SweepEntryOut]]:
+    """The run counts and each entry's summary — kept once every run has ended (25/09).
+
+    ⚠️ **Served from `sweeps.summary` only while the counts still match** the ones it was computed
+    at, and only once nothing is queued or running. A run retried or deleted changes the counts,
+    and the summary is computed again and kept again. Measured 25/09 on 51 840 runs: 6.5 s a poll
+    computed, a single count query kept.
+
+    ⚠️ **Computed from four columns, not from the runs whole.** Each run's status, strategy, market
+    and the two stored results the summary reads — not the strategy's document nor any ORM row,
+    which were most of those 6.5 s. The entry's name is read live: a shelf label can be renamed,
+    and a kept summary must not freeze it.
+    """
+    counts = _count_runs(session, sweep.id)
+    settled = counts.queued == 0 and counts.running == 0
+    names = _entry_names(session, sweep)
+    kept = sweep.summary
+    if settled and kept is not None and kept.get("counts") == counts.model_dump(mode="json"):
+        return counts, [
+            SweepEntryOut.model_validate({**one, "entry_name": names.get(str(one["entry_id"]))})
+            for one in kept["entries"]
+        ]
+
+    coordinates, _followers = _points_of(sweep)
+    points: dict[str, list[tuple[BacktestStatus, Decimal | None, str]]] = {
+        one: [] for one in sweep.entry_ids
+    }
+    ladders: dict[str, list[tuple[dict[str, Any] | None, str]]] = {
+        one: [] for one in sweep.entry_ids
+    }
+    for state, strategy_id, symbol, net, targets in session.execute(
+        select(
+            Backtest.status,
+            Backtest.strategy_id,
+            Instrument.symbol,
+            BacktestMetrics.net_profit,
+            BacktestMetrics.targets,
+        )
+        .join(Instrument, Instrument.id == Backtest.instrument_id)
+        .outerjoin(BacktestMetrics, BacktestMetrics.backtest_id == Backtest.id)
+        .where(Backtest.sweep_id == sweep.id)
+    ):
+        point = coordinates.get(str(strategy_id), {})
+        entry_id = str(point.get("entry_id", ""))
+        if entry_id not in points:
+            continue
+        # The symbol leads because the point label repeats once per market: `M15 · period=9`
+        # over three symbols is three runs, and a best that named only the point would name all
+        # three of them.
+        label = f"{symbol} · {point.get('label', '')}"
+        points[entry_id].append((state, net, label))
+        ladders[entry_id].append((targets, label))
+
+    summaries = [
+        SweepEntryOut(
+            entry_id=uuid.UUID(entry_id),
+            entry_name=names.get(entry_id),
+            aggregate=aggregate_scored(points[entry_id], sweep.initial_capital),
+            targets=rungs_of(ladders[entry_id]),
+        )
+        for entry_id in sweep.entry_ids
+    ]
+    if settled:
+        sweep.summary = {
+            "counts": counts.model_dump(mode="json"),
+            "entries": [one.model_dump(mode="json") for one in summaries],
+        }
+        session.commit()
+    return counts, summaries
 
 
 _SweepRows = list[tuple[Backtest, Strategy, Instrument]]
@@ -1501,19 +1576,6 @@ def _run_out(
             SweepPoint(label=str(one["label"]), values=dict(one["values"]))
             for one in followers.get(str(run.strategy_id), [])
         ],
-    )
-
-
-def _counts(runs: Iterable[Backtest]) -> SweepRunCounts:
-    counted = dict.fromkeys(BacktestStatus, 0)
-    for run in runs:
-        counted[run.status] += 1
-    return SweepRunCounts(
-        total=sum(counted.values()),
-        done=counted[BacktestStatus.DONE],
-        running=counted[BacktestStatus.RUNNING],
-        queued=counted[BacktestStatus.QUEUED],
-        failed=counted[BacktestStatus.FAILED],
     )
 
 

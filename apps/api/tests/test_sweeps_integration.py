@@ -40,6 +40,7 @@ from tradeforge_db.models import (
     BacktestCollection,
     BacktestMetrics,
     BacktestStatus,
+    CatalogEntry,
     Collection,
     Dataset,
     ExitReason,
@@ -1966,6 +1967,108 @@ def trade_in(
                 )
             )
         session.commit()
+
+
+class TestTheSummaryIsKept:
+    """25/09: once every run has ended, the per-entry summary is computed once and kept. Measured
+    on 51 840 runs: 6.5 s a poll computed."""
+
+    def settled(self, client: Any, session_factory: Callable[[], Session]) -> tuple[str, list[str]]:
+        entry = an_entry(
+            client, name=f"kept {uuid.uuid4()}", grid={"setup.params.period": [5, 7, 9]}
+        )
+        sweep_id = client.post("/sweeps", json=a_sweep_body([entry], ["EURUSD"], ["H1"])).json()[
+            "id"
+        ]
+        runs = [row["run"]["id"] for row in client.get(f"/sweeps/{sweep_id}").json()["runs"]]
+        for run_id, net in zip(runs, (100, 300, 200), strict=True):
+            finish(session_factory, run_id, net)
+        return sweep_id, runs
+
+    def kept(self, session_factory: Callable[[], Session], sweep_id: str) -> Any:
+        with session_factory() as session:
+            sweep = session.get(Sweep, uuid.UUID(sweep_id))
+            assert sweep is not None
+            return sweep.summary
+
+    def test_nothing_is_kept_while_a_run_is_still_to_come(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        entry = an_entry(client, name=f"open {uuid.uuid4()}", grid={"setup.params.period": [5, 7]})
+        sweep_id = client.post("/sweeps", json=a_sweep_body([entry], ["EURUSD"], ["H1"])).json()[
+            "id"
+        ]
+        first = client.get(f"/sweeps/{sweep_id}").json()["runs"][0]["run"]["id"]
+        finish(session_factory, first, 100)
+
+        body = client.get(f"/sweeps/{sweep_id}", params={"runs": "none"}).json()
+
+        assert body["counts"]["queued"] == 1
+        assert body["entries"][0]["aggregate"]["points_finished"] == 1
+        assert self.kept(session_factory, sweep_id) is None
+
+    def test_a_settled_sweep_keeps_its_summary_and_serves_it(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        sweep_id, _runs = self.settled(client, session_factory)
+
+        first = client.get(f"/sweeps/{sweep_id}", params={"runs": "none"}).json()
+        kept = self.kept(session_factory, sweep_id)
+
+        assert kept is not None
+        assert kept["counts"] == first["counts"]
+        assert Decimal(first["entries"][0]["aggregate"]["median_return"]) == Decimal("0.02")
+        # ⚠️ Proof that the kept copy is what is served: change it in the database, and the
+        # next read says what the database says — nothing was computed again.
+        with session_factory() as session:
+            sweep = session.get(Sweep, uuid.UUID(sweep_id))
+            assert sweep is not None
+            summary = dict(sweep.summary or {})
+            entries = [dict(one) for one in summary["entries"]]
+            entries[0] = {
+                **entries[0],
+                "aggregate": {**entries[0]["aggregate"], "median_return": "9"},
+            }
+            sweep.summary = {**summary, "entries": entries}
+            session.commit()
+        again = client.get(f"/sweeps/{sweep_id}", params={"runs": "none"}).json()
+        assert again["entries"][0]["aggregate"]["median_return"] == "9"
+
+    def test_a_run_that_changes_makes_it_be_computed_again(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        sweep_id, runs = self.settled(client, session_factory)
+        client.get(f"/sweeps/{sweep_id}", params={"runs": "none"})
+        # A run that failed on its retry: the counts move, and nothing kept may answer.
+        with session_factory() as session:
+            run = session.get(Backtest, uuid.UUID(runs[1]))
+            assert run is not None
+            run.status = BacktestStatus.FAILED
+            run.error = "failed on its retry"
+            session.commit()
+
+        body = client.get(f"/sweeps/{sweep_id}", params={"runs": "none"}).json()
+
+        assert body["counts"]["failed"] == 1
+        assert body["entries"][0]["aggregate"]["points_failed"] == 1
+        assert self.kept(session_factory, sweep_id)["counts"] == body["counts"]
+
+    def test_the_entry_name_is_read_live_even_from_a_kept_summary(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        sweep_id, _runs = self.settled(client, session_factory)
+        client.get(f"/sweeps/{sweep_id}", params={"runs": "none"})
+        with session_factory() as session:
+            sweep = session.get(Sweep, uuid.UUID(sweep_id))
+            assert sweep is not None
+            entry = session.get(CatalogEntry, uuid.UUID(sweep.entry_ids[0]))
+            assert entry is not None
+            entry.name = "renamed on the shelf"
+            session.commit()
+
+        body = client.get(f"/sweeps/{sweep_id}", params={"runs": "none"}).json()
+
+        assert body["entries"][0]["entry_name"] == "renamed on the shelf"
 
 
 class TestChoosingByRiskInR:

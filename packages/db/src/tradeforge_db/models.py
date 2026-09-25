@@ -1815,6 +1815,14 @@ class Sweep(Base):
     for an ordinary sweep (`rev_0024`). Null too once that sweep is deleted: the test's runs are
     measurements of their own, and what the deletion costs is the comparison."""
 
+    summary: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    """The per-entry summary as last computed once every run had ended, and the run counts it was
+    computed at (`rev_0029`): `{"counts": {...}, "entries": [...]}`. Null until then.
+
+    ⚠️ **A cache the counts keep honest, never a record.** It is served only while the sweep's
+    counts still equal the stored ones; a run retried or deleted changes them, and the summary is
+    computed again. Measured 25/09: computing it for 51 840 runs took 6.5 s a poll."""
+
     holdout_rule: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     """How the tested points were chosen — `metric`, `top_n` per (entry, chart, market), and the
     trade floor per chart. "The best" means nothing without "by what"."""
@@ -1836,6 +1844,9 @@ class Sweep(Base):
         CheckConstraint(
             "holdout_rule IS NULL OR jsonb_typeof(holdout_rule) = 'object'",
             name="a_holdout_rule_is_an_object",
+        ),
+        CheckConstraint(
+            "summary IS NULL OR jsonb_typeof(summary) = 'object'", name="a_summary_is_an_object"
         ),
         Index("ix_sweeps_created_at", "created_at"),
         Index("ix_sweeps_holdout_of", "holdout_of"),

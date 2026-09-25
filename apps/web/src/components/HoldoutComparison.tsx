@@ -76,6 +76,8 @@ export function HoldoutComparison(props: { sweepId: string }): React.JSX.Element
       (left.entry_name ?? '').localeCompare(right.entry_name ?? '') ||
       byChart(left.timeframe, right.timeframe),
   )
+  // The points a cluster can be built from: finished on the reserved window.
+  const finished = data.rows.filter((row) => row.out_of_sample.status === 'done')
   const floors = Object.entries(data.rule.min_trades)
     .sort(([left], [right]) => byChart(left, right))
     .map(([chart, floor]) => `${chart} ${String(floor)}`)
@@ -106,6 +108,24 @@ export function HoldoutComparison(props: { sweepId: string }): React.JSX.Element
             ` · at least ${percent(data.rule.min_positive_year_share, 0)} of years positive`}
         </p>
       </div>
+
+      {finished.length > 0 && (
+        <p className="text-sm">
+          <Link
+            to="/clusters"
+            state={{
+              name: `All ${String(finished.length)} points of a reserved-window test`,
+              members: finished.map((row) => ({
+                backtest_id: row.out_of_sample.run_id,
+                label: `${row.symbol} ${row.timeframe} · ${row.label}`,
+              })),
+            }}
+            className="text-sky-400 hover:text-sky-300"
+          >
+            Replay all {String(finished.length)} points on one account (cluster)
+          </Link>
+        </p>
+      )}
 
       <table className="w-full border-collapse text-left text-sm">
         <caption className="mb-2 text-left font-semibold">By entry and chart</caption>

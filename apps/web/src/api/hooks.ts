@@ -26,6 +26,9 @@ import type {
   CreateBasketRequest,
   CreateCollection,
   CreateStudyRequest,
+  ClusterListItem,
+  ClusterOut,
+  CreateClusterRequest,
   CreateHoldoutRequest,
   CreateMonteCarloRequest,
   CreateSlicingRequest,
@@ -665,6 +668,31 @@ export function useCreateSlicing(id: string) {
     mutationFn: (payload) => api.createSlicing(id, payload),
     onSuccess: () => {
       void client.invalidateQueries({ queryKey: ['slicings', id] })
+    },
+  })
+}
+
+/** The latest clusters first. */
+export function useClusters() {
+  return useQuery<ClusterListItem[]>({ queryKey: ['clusters'], queryFn: api.listClusters })
+}
+
+/** One cluster, polled until its replay has ended. */
+export function useCluster(id: string | undefined) {
+  return useQuery<ClusterOut>({
+    queryKey: ['cluster', id],
+    queryFn: id === undefined ? skipToken : () => api.getCluster(id),
+    refetchInterval: (query) => (isTerminal(query.state.data?.status) ? false : STUDY_POLL_MS),
+  })
+}
+
+/** Keep a cluster and queue its replay. */
+export function useCreateCluster() {
+  const client = useQueryClient()
+  return useMutation<ClusterOut, Error, CreateClusterRequest>({
+    mutationFn: (payload) => api.createCluster(payload),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: ['clusters'] })
     },
   })
 }

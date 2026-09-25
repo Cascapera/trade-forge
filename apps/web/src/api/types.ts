@@ -1383,6 +1383,75 @@ export interface MonteCarloOut {
   points: MonteCarloPoint[]
 }
 
+/** One finished run in a cluster (25/09). Blank risk takes the member's own document's. */
+export interface ClusterMemberIn {
+  backtest_id: string
+  /** Percent of the shared balance each trade risks, as a decimal string: "1" is 1%. */
+  risk_percent?: string
+}
+
+export interface CreateClusterRequest {
+  name: string
+  members: ClusterMemberIn[]
+  initial_capital?: string
+  max_open_positions?: number
+  /** Percent, like a member's risk: "5" is 5% of the balance at risk across what is open. */
+  max_open_risk_percent?: string
+}
+
+/** Why a member's trades were not taken on the shared account. */
+export type ClusterSkip = 'positions' | 'risk' | 'no_stop' | 'empty'
+
+export interface ClusterMember {
+  backtest_id: string
+  risk_percent: string
+  label: string
+  symbol: string
+  timeframe: string
+  /** Null until the replay has run. */
+  offered: number | null
+  taken: number | null
+  skipped: Partial<Record<ClusterSkip, number>> | null
+  net_pnl: string | null
+}
+
+export interface ClusterPoint {
+  time: string
+  balance: string
+  equity: string
+}
+
+export interface ClusterOut {
+  id: string
+  name: string
+  status: BacktestStatus
+  error: string | null
+  initial_capital: string
+  max_open_positions: number
+  max_open_risk_percent: string
+  created_at: string
+  finished_at: string | null
+  members: ClusterMember[]
+  final_balance: string | null
+  net_return: string | null
+  max_drawdown_pct: string | null
+  max_drawdown_abs: string | null
+  most_open: number | null
+  yearly_return: Record<string, string> | null
+  /** The marked equity at the end of each day; the drawdown was measured on every point. */
+  curve: ClusterPoint[] | null
+}
+
+export interface ClusterListItem {
+  id: string
+  name: string
+  status: BacktestStatus
+  members: number
+  created_at: string
+  net_return: string | null
+  max_drawdown_pct: string | null
+}
+
 export interface SweepOut {
   id: string
   entry_ids: string[]

@@ -6,6 +6,8 @@ import { LaunchBacktest } from './screens/LaunchBacktest'
 import { LaunchBasket } from './screens/LaunchBasket'
 import { Results } from './screens/Results'
 import { LaunchStudy } from './screens/LaunchStudy'
+import { ClusterResult } from './screens/ClusterResult'
+import { Clusters } from './screens/Clusters'
 import { LaunchSweep } from './screens/LaunchSweep'
 import { LiveSessions } from './screens/LiveSessions'
 import { RunLog } from './screens/RunLog'
@@ -95,6 +97,11 @@ export function App(): React.JSX.Element {
             <NavLink to="/sweeps/dashboard" className={navClass}>
               Sweep dashboard
             </NavLink>
+            {/* Finished runs on one shared account — built from a reserved-window test's
+                points, or by hand. `end`: `/clusters/:id` is one cluster being read. */}
+            <NavLink to="/clusters" end className={navClass}>
+              Clusters
+            </NavLink>
             <NavLink to="/runs" className={navClass}>
               Run log
             </NavLink>
@@ -154,6 +161,8 @@ export function App(): React.JSX.Element {
             <Route path="/sweeps/dashboard" element={<SweepDashboard />} />
             <Route path="/sweeps/:id" element={<SweepResult />} />
             <Route path="/walkforwards/:id" element={<WalkForwardResult />} />
+            <Route path="/clusters" element={<Clusters />} />
+            <Route path="/clusters/:id" element={<ClusterResult />} />
             <Route path="/collect" element={<CollectSymbol />} />
             <Route path="/runs" element={<RunLog />} />
             <Route path="/live" element={<LiveSessions />} />

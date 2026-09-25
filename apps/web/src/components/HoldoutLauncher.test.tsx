@@ -82,6 +82,41 @@ describe('HoldoutLauncher', () => {
     })
   })
 
+  it('sends the limits on the risk in R only when they are set, the years as a share', async () => {
+    createHoldout.mockResolvedValue({ id: 'test-9', runs: 6, skipped: [] })
+    render()
+
+    fireEvent.change(field('To'), { target: { value: '2026-09-19' } })
+    fireEvent.change(screen.getByLabelText('Ranked by'), { target: { value: 'recovery_r' } })
+    fireEvent.change(field('Deepest drawdown (R)'), { target: { value: '10' } })
+    fireEvent.change(field('Years positive, at least (%)'), { target: { value: '60' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Run the test' }))
+
+    await waitFor(() => {
+      expect(createHoldout).toHaveBeenCalledWith('sweep-1', {
+        date_from: '2026-01-01T00:00:00Z',
+        date_to: '2026-09-19T00:00:00Z',
+        top_n: 3,
+        metric: 'recovery_r',
+        max_drawdown_r: '10',
+        min_positive_year_share: '0.6',
+        min_trades: {},
+      })
+    })
+  })
+
+  it('refuses a limit that is not a positive number, or a share above 100%', () => {
+    render()
+
+    fireEvent.change(field('Deepest drawdown (R)'), { target: { value: '-3' } })
+    expect(screen.getByText(/a limit is a positive number/i)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Run the test' })).toBeDisabled()
+
+    fireEvent.change(field('Deepest drawdown (R)'), { target: { value: '' } })
+    fireEvent.change(field('Years positive, at least (%)'), { target: { value: '120' } })
+    expect(screen.getByRole('button', { name: 'Run the test' })).toBeDisabled()
+  })
+
   it('refuses a window that shares bars with the one searched', () => {
     render()
 

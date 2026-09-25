@@ -1,15 +1,18 @@
 import { Link } from 'react-router-dom'
 
 import { isHoldoutSettled, useHoldout } from '../api/hooks'
-import type { HoldoutRow, HoldoutSide, SelectionMetric } from '../api/types'
+import type { HoldoutRank, HoldoutRow, HoldoutSide } from '../api/types'
 import { percent } from '../format'
 import { HoldoutSlicings } from './HoldoutSlicings'
 
-const METRIC_LABEL: Record<SelectionMetric, string> = {
+const METRIC_LABEL: Record<HoldoutRank, string> = {
   net_profit: 'net profit',
   profit_factor: 'profit factor',
   sharpe: 'Sharpe',
   expectancy: 'expectancy',
+  net_r: 'net R',
+  recovery_r: 'net R per R of drawdown',
+  positive_years: 'share of years positive',
 }
 
 const CHART_ORDER = ['M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1', 'W1']
@@ -96,6 +99,10 @@ export function HoldoutComparison(props: { sweepId: string }): React.JSX.Element
           {data.searched_to === null ? '—' : day(data.searched_to)} · tested on{' '}
           {day(data.date_from)} → {day(data.date_to)} · best {String(data.rule.top_n)} per entry,
           chart and market by {METRIC_LABEL[data.rule.metric]} · fewest trades: {floors}
+          {data.rule.max_drawdown_r !== undefined &&
+            ` · drawdown at most ${data.rule.max_drawdown_r} R`}
+          {data.rule.min_positive_year_share !== undefined &&
+            ` · at least ${percent(data.rule.min_positive_year_share, 0)} of years positive`}
         </p>
       </div>
 

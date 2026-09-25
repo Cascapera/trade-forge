@@ -16,17 +16,80 @@ import datetime as dt
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
+from enum import StrEnum
 from statistics import median
 
-from tradeforge_db.models import BacktestMetrics, SelectionMetric
+from tradeforge_db.models import BacktestMetrics
 
-_METRIC_OF: Mapping[SelectionMetric, Callable[[BacktestMetrics], Decimal | None]] = {
-    SelectionMetric.NET_PROFIT: lambda metrics: metrics.net_profit,
-    SelectionMetric.PROFIT_FACTOR: lambda metrics: metrics.profit_factor,
-    SelectionMetric.SHARPE: lambda metrics: metrics.sharpe,
-    SelectionMetric.EXPECTANCY: lambda metrics: metrics.expectancy,
+_INFINITY = Decimal("Infinity")
+
+
+class HoldoutRank(StrEnum):
+    """What "best" means when a test picks its points.
+
+    The first four are the walk-forward's (`SelectionMetric`); the rest read the run's risk in R
+    (25/09, `r_metrics`). Its own enum rather than more members on `SelectionMetric`, which is a
+    column type of `walk_forwards` — adding to it would change that table for a choice it never
+    makes. A test's rule is stored as JSON, so its values need no column at all.
+    """
+
+    NET_PROFIT = "net_profit"
+    PROFIT_FACTOR = "profit_factor"
+    SHARPE = "sharpe"
+    EXPECTANCY = "expectancy"
+    NET_R = "net_r"
+    RECOVERY_R = "recovery_r"
+    """Net R over the deepest drawdown in R: what the run made per unit of the worst it went
+    through."""
+    POSITIVE_YEARS = "positive_years"
+
+
+def recovery_r(metrics: BacktestMetrics) -> Decimal | None:
+    """Net R over the deepest drawdown in R.
+
+    ⚠️ **No drawdown is not "no score".** A run that gained and never fell from a peak made
+    something for nothing, and is the best there is by this measure (+∞) — the profit factor's
+    no-loss case, the same way. A run with no drawdown that made nothing has nothing to say.
+    """
+    if metrics.net_r is None or metrics.max_drawdown_r is None:
+        return None
+    if metrics.max_drawdown_r > 0:
+        return metrics.net_r / metrics.max_drawdown_r
+    return _INFINITY if metrics.net_r > 0 else None
+
+
+_METRIC_OF: Mapping[HoldoutRank, Callable[[BacktestMetrics], Decimal | None]] = {
+    HoldoutRank.NET_PROFIT: lambda metrics: metrics.net_profit,
+    HoldoutRank.PROFIT_FACTOR: lambda metrics: metrics.profit_factor,
+    HoldoutRank.SHARPE: lambda metrics: metrics.sharpe,
+    HoldoutRank.EXPECTANCY: lambda metrics: metrics.expectancy,
+    HoldoutRank.NET_R: lambda metrics: metrics.net_r,
+    HoldoutRank.RECOVERY_R: recovery_r,
+    HoldoutRank.POSITIVE_YEARS: lambda metrics: metrics.positive_year_share,
 }
 """Which column each ranking reads — spelled out, as the walk-forward spells its own."""
+
+
+@dataclass(frozen=True, slots=True)
+class Bounds:
+    """Filters a run must pass to be ranked at all (25/09). `None` is "no filter".
+
+    ⚠️ **A run without the measure never passes a filter on it.** A run recorded before 25/09
+    has no risk in R, and "unknown" is not "within the limit".
+    """
+
+    max_drawdown_r: Decimal | None = None
+    min_positive_year_share: Decimal | None = None
+
+    def admit(self, metrics: BacktestMetrics) -> bool:
+        if self.max_drawdown_r is not None and (
+            metrics.max_drawdown_r is None or metrics.max_drawdown_r > self.max_drawdown_r
+        ):
+            return False
+        return self.min_positive_year_share is None or (
+            metrics.positive_year_share is not None
+            and metrics.positive_year_share >= self.min_positive_year_share
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,9 +117,10 @@ def floor_of(timeframe: str, floors: Mapping[str, int]) -> int:
 def choose(
     candidates: Sequence[Candidate],
     *,
-    metric: SelectionMetric,
+    metric: HoldoutRank,
     top_n: int,
     floors: Mapping[str, int],
+    bounds: Bounds | None = None,
 ) -> list[Candidate]:
     """The `top_n` best of each group by `metric`, among the runs that can be ranked at all.
 
@@ -69,6 +133,8 @@ def choose(
     for one in candidates:
         value = _METRIC_OF[metric](one.metrics)
         if value is None or one.metrics.total_trades < floor_of(one.group[1], floors):
+            continue
+        if bounds is not None and not bounds.admit(one.metrics):
             continue
         by_group.setdefault(one.group, []).append((value, one))
     chosen: list[Candidate] = []
@@ -107,10 +173,13 @@ def positive_share(values: Sequence[Decimal]) -> Decimal | None:
 
 
 __all__ = [
+    "Bounds",
     "Candidate",
+    "HoldoutRank",
     "choose",
     "floor_of",
     "median_of",
     "overlaps",
     "positive_share",
+    "recovery_r",
 ]

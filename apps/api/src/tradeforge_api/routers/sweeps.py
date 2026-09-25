@@ -23,22 +23,29 @@ did — which is why a hole is always written down, never merely left.
 
 import json
 import uuid
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from decimal import Decimal
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query, Response, status
 from pydantic import AwareDatetime
-from sqlalchemy import ColumnElement, and_, case, func, select
+from sqlalchemy import ColumnElement, and_, case, func, or_, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session, defer, selectinload
+from sqlalchemy.orm import InstrumentedAttribute, Session, defer, selectinload
 
 from tradeforge_api import sweep_dashboard as dashboard
 from tradeforge_api.coverage import describe, to_collect, uncovered_markets
 from tradeforge_api.deps import QueueDep, SessionDep, SettingsDep
 from tradeforge_api.estimates import backtests_time
 from tradeforge_api.grid import GridPoint
-from tradeforge_api.holdout import Candidate, choose, median_of, overlaps, positive_share
+from tradeforge_api.holdout import (
+    Bounds,
+    Candidate,
+    choose,
+    median_of,
+    overlaps,
+    positive_share,
+)
 from tradeforge_api.queue import COLLECT_QUEUE, COLLECT_RANGE, RUN_BACKTEST
 from tradeforge_api.retention import MIN_TRADES
 from tradeforge_api.routers.backtests import failed_collections, list_item
@@ -906,12 +913,24 @@ async def create_holdout(
             )
         )
     floors = {**MIN_TRADES, **request.min_trades}
-    chosen = choose(candidates, metric=request.metric, top_n=request.top_n, floors=floors)
+    bounds = Bounds(
+        max_drawdown_r=request.max_drawdown_r,
+        min_positive_year_share=request.min_positive_year_share,
+    )
+    chosen = choose(
+        candidates, metric=request.metric, top_n=request.top_n, floors=floors, bounds=bounds
+    )
     if not chosen:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="no finished run of this sweep can be ranked: none passed its chart's trade "
-            f"floor with a {request.metric.value} to rank by",
+            f"floor with a {request.metric.value} to rank by"
+            + (
+                ""
+                if bounds == Bounds()
+                else " within the drawdown and positive-year limits (a run recorded before "
+                "25/09 has no risk in R and never passes them)"
+            ),
         )
 
     picked = [runs_of[one.order] for one in chosen]
@@ -949,6 +968,17 @@ async def create_holdout(
             "metric": request.metric.value,
             "top_n": request.top_n,
             "min_trades": {one: max(floors.get(one, 0), 1) for one in timeframes},
+            # Only when asked: a rule that lists no limit is a test that set none.
+            **(
+                {}
+                if request.max_drawdown_r is None
+                else {"max_drawdown_r": str(request.max_drawdown_r)}
+            ),
+            **(
+                {}
+                if request.min_positive_year_share is None
+                else {"min_positive_year_share": str(request.min_positive_year_share)}
+            ),
         },
     )
     session.add(holdout)
@@ -1360,7 +1390,67 @@ def _counts(runs: Iterable[Backtest]) -> SweepRunCounts:
     )
 
 
-RankBy = Literal["return", "profit_factor", "win_rate", "expectancy", "drawdown"]
+RankBy = Literal[
+    "return",
+    "profit_factor",
+    "win_rate",
+    "expectancy",
+    "drawdown",
+    "net_r",
+    "recovery_r",
+    "positive_years",
+    "drawdown_r",
+]
+
+
+def _recovery_r() -> tuple[ColumnElement[Any], ...]:
+    """`holdout.recovery_r` in SQL: a gain with no drawdown is the best there is, no drawdown and
+    no gain says nothing, and a run recorded before R existed has no score."""
+    metrics = BacktestMetrics
+    tier = case(
+        (or_(metrics.net_r.is_(None), metrics.max_drawdown_r.is_(None)), 2),
+        (and_(metrics.max_drawdown_r == 0, metrics.net_r > 0), 0),
+        (metrics.max_drawdown_r == 0, 2),
+        else_=1,
+    )
+    return (tier, (metrics.net_r / func.nullif(metrics.max_drawdown_r, 0)).desc())
+
+
+def _unless_null(
+    column: InstrumentedAttribute[Any], *, smallest_first: bool = False
+) -> tuple[ColumnElement[Any], ...]:
+    """A column best first — the smallest, when that is better — with its nulls last."""
+    tier = case((column.is_(None), 2), else_=1)
+    return (tier, column.asc() if smallest_first else column.desc())
+
+
+_RANKINGS: dict[str, Callable[[], tuple[ColumnElement[Any], ...]]] = {
+    "return": lambda: _unless_null(BacktestMetrics.net_profit),
+    "profit_factor": lambda: (
+        case(
+            (and_(BacktestMetrics.profit_factor.is_(None), BacktestMetrics.gross_profit > 0), 0),
+            (BacktestMetrics.profit_factor.is_not(None), 1),
+            else_=2,
+        ),
+        BacktestMetrics.profit_factor.desc(),
+    ),
+    "win_rate": lambda: (
+        case(
+            (
+                and_(BacktestMetrics.total_trades.is_not(None), BacktestMetrics.total_trades > 0),
+                1,
+            ),
+            else_=2,
+        ),
+        BacktestMetrics.win_rate.desc(),
+    ),
+    "expectancy": lambda: _unless_null(BacktestMetrics.expectancy),
+    "drawdown": lambda: _unless_null(BacktestMetrics.max_drawdown_pct, smallest_first=True),
+    "net_r": lambda: _unless_null(BacktestMetrics.net_r),
+    "recovery_r": _recovery_r,
+    "positive_years": lambda: _unless_null(BacktestMetrics.positive_year_share),
+    "drawdown_r": lambda: _unless_null(BacktestMetrics.max_drawdown_r, smallest_first=True),
+}
 
 
 def _ranked(rank_by: RankBy) -> tuple[ColumnElement[Any], ...]:
@@ -1368,27 +1458,10 @@ def _ranked(rank_by: RankBy) -> tuple[ColumnElement[Any], ...]:
 
     The screen's own rule (`sweep/ranking.ts`), moved to where the runs are: a profit factor with
     gains and no loss is the best there is, not a blank; a win rate over no trade is not a
-    measurement; the smallest drawdown ranks first; an unfinished run has no score at all.
+    measurement; the smallest drawdown ranks first; an unfinished run has no score at all. The
+    measures in R (25/09) are null for a run recorded before them, and rank it last.
     """
-    metrics = BacktestMetrics
-    if rank_by == "return":
-        tier = case((metrics.net_profit.is_(None), 2), else_=1)
-        return (tier, metrics.net_profit.desc())
-    if rank_by == "profit_factor":
-        tier = case(
-            (and_(metrics.profit_factor.is_(None), metrics.gross_profit > 0), 0),
-            (metrics.profit_factor.is_not(None), 1),
-            else_=2,
-        )
-        return (tier, metrics.profit_factor.desc())
-    if rank_by == "win_rate":
-        tier = case((and_(metrics.total_trades.is_not(None), metrics.total_trades > 0), 1), else_=2)
-        return (tier, metrics.win_rate.desc())
-    if rank_by == "expectancy":
-        tier = case((metrics.expectancy.is_(None), 2), else_=1)
-        return (tier, metrics.expectancy.desc())
-    tier = case((metrics.max_drawdown_pct.is_(None), 2), else_=1)
-    return (tier, metrics.max_drawdown_pct.asc())
+    return _RANKINGS[rank_by]()
 
 
 @router.get("/sweeps/{sweep_id}/runs", response_model=SweepRunsPage, responses=_NOT_FOUND)

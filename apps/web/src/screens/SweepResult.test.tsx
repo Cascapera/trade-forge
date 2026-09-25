@@ -546,6 +546,10 @@ describe('SweepResult', () => {
       'Win rate',
       'Expectancy',
       'Smallest drawdown',
+      'Net R',
+      'Net R per R of drawdown',
+      'Share of years positive',
+      'Smallest drawdown in R',
     ])
   })
 

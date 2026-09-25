@@ -4,6 +4,7 @@ import { useNavigate } from 'react-router-dom'
 import { useCatalog, useCreateSweep, useInstruments } from '../api/hooks'
 import type { CatalogEntry } from '../api/types'
 import { useMissingDataGate } from '../collect/gate'
+import { neverCollected, neverCollectedReason } from '../basket/settings'
 import { anythingToRun, pairsOf } from '../collect/missing'
 import { MissingDataPrompt } from '../components/MissingDataPrompt'
 import { SymbolPicker } from '../components/SymbolPicker'
@@ -55,7 +56,10 @@ export function LaunchSweep(): React.JSX.Element {
 
   const rehearsal = useSweepRehearsal(form)
   const total = runCount(form, entries)
-  const local = whyNotLaunchable(form, entries)
+  // ⚠️ A market never collected first: the API refuses it outright ("unknown symbols"), and no
+  // cost typed for it or grid edited around it can change that — only the collect screen can.
+  const uncollected = neverCollectedReason(neverCollected(form.symbols, instruments.data))
+  const local = (uncollected === null ? null : `${uncollected}.`) ?? whyNotLaunchable(form, entries)
 
   // ⚠️ **Three refusals, kept apart, because they have three different fixes.** The local one is
   // about this form — a blank field, an entry that left the shelf — and the screen can decide it

@@ -59,6 +59,9 @@ vi.mock('../api/hooks', () => ({
   // The strategy picker asks the server what exists. Empty here: these tests are about the
   // basket's own rules, and the picker has its own test.
   useStrategies: () => ({ data: { total: 0, limit: 200, offset: 0, items: [] }, isPending: false }),
+  // The market search over the broker's list (PR-306). Empty: these tests tick the grid.
+  useSymbolSearch: () => ({ data: { symbols: [], snapshot: null } }),
+  useSyncSymbols: () => ({ mutate: vi.fn(), isPending: false }),
 }))
 
 import { LaunchBasket } from './LaunchBasket'

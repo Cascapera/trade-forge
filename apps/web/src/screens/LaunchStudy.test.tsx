@@ -189,11 +189,8 @@ describe('LaunchStudy', () => {
     // ⚠️ His decision (18/09): no cap. 520 combinations used to be refused here, at 500.
     renderWithProviders(<LaunchStudy />)
 
-    // ⚠️ The option, not the label. `findByLabelText('Market')` resolves the moment the select
-    // exists — with only the placeholder in it — and firing a change for a value that has no
-    // option is a no-op that leaves the field empty and says nothing. Waiting for the option is
-    // waiting for the instruments query.
-    await screen.findByRole('option', { name: 'AAPL' })
+    // The market is a search box now (PR-306): typing a ticker sets it, so there is no option
+    // to wait for — AAPL is catalogued, so nothing refuses it once the instruments arrive.
     // ⚠️ **Each** query needs its own wait. The parameter dropdown is built from the chosen
     // strategy's setup, so it fills from the *strategies* request — waiting for the market's
     // option says nothing about it, and setting a parameter before it arrives is the same
@@ -231,11 +228,8 @@ describe('LaunchStudy', () => {
     createStudy.mockResolvedValue({ id: 'study-1', points: [] })
     renderWithProviders(<LaunchStudy />)
 
-    // ⚠️ The option, not the label. `findByLabelText('Market')` resolves the moment the select
-    // exists — with only the placeholder in it — and firing a change for a value that has no
-    // option is a no-op that leaves the field empty and says nothing. Waiting for the option is
-    // waiting for the instruments query.
-    await screen.findByRole('option', { name: 'AAPL' })
+    // The market is a search box now (PR-306): typing a ticker sets it, so there is no option
+    // to wait for — AAPL is catalogued, so nothing refuses it once the instruments arrive.
     // ⚠️ **Each** query needs its own wait. The parameter dropdown is built from the chosen
     // strategy's setup, so it fills from the *strategies* request — waiting for the market's
     // option says nothing about it, and setting a parameter before it arrives is the same
@@ -292,7 +286,6 @@ describe('LaunchStudy', () => {
     renderWithProviders(<LaunchStudy />)
 
     return (async () => {
-      await screen.findByRole('option', { name: 'AAPL' })
       // ⚠️ **Each** query needs its own wait. The parameter dropdown is built from the chosen
       // strategy's setup, so it fills from the *strategies* request — waiting for the market's
       // option says nothing about it, and setting a parameter before it arrives is the same
@@ -325,7 +318,6 @@ describe('LaunchStudy', () => {
     )
     renderWithProviders(<LaunchStudy />)
 
-    await screen.findByRole('option', { name: 'AAPL' })
     // ⚠️ **Each** query needs its own wait. The parameter dropdown is built from the chosen
     // strategy's setup, so it fills from the *strategies* request — waiting for the market's
     // option says nothing about it, and setting a parameter before it arrives is the same
@@ -596,7 +588,6 @@ describe('LaunchStudy', () => {
   describe('the data has to be there (PR-272)', () => {
     /** Market, window and one axis of two values: a study that could launch. */
     async function fillIn(): Promise<void> {
-      await screen.findByRole('option', { name: 'AAPL' })
       await screen.findByRole('option', { name: 'period' })
       fireEvent.change(screen.getByLabelText('Market'), { target: { value: 'AAPL' } })
       fireEvent.change(screen.getByLabelText('From'), { target: { value: '2024-01-01' } })

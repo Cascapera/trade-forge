@@ -9,6 +9,8 @@ import {
   newlyComparable,
   toBasketRequest,
   toggleSymbol,
+  neverCollected,
+  neverCollectedReason,
   uncostedAmong,
   whyNotLaunchable,
 } from './settings'
@@ -103,12 +105,42 @@ describe('uncostedAmong', () => {
     expect(uncostedAmong(['EURUSD', 'US500'], catalogue)).toEqual(['US500'])
   })
 
-  it('treats a symbol the catalogue has never heard of as uncosted', () => {
-    expect(uncostedAmong(['NOPE'], [instrument('EURUSD', '8')])).toEqual(['NOPE'])
+  it('leaves a symbol the catalogue has never heard of to neverCollected', () => {
+    // ⚠️ It used to be listed here, when the picker could only offer catalogued markets and the
+    // case never arose. Now it can be picked from the broker's list, and it is not a market with
+    // an unknown cost: it is a market with no candles, which is a different refusal.
+    expect(uncostedAmong(['NOPE'], [instrument('EURUSD', '8')])).toEqual([])
   })
 
   it('says nothing while the catalogue is still loading', () => {
-    expect(uncostedAmong(['EURUSD'], undefined)).toEqual(['EURUSD'])
+    expect(uncostedAmong(['EURUSD'], undefined)).toEqual([])
+  })
+})
+
+describe('neverCollected', () => {
+  it('names the chosen markets that have no instrument, and only those', () => {
+    const catalogue = [instrument('EURUSD', '8'), instrument('US500', null)]
+
+    expect(neverCollected(['AUDUSD', 'EURUSD', 'US500', 'USDCHF'], catalogue)).toEqual([
+      'AUDUSD',
+      'USDCHF',
+    ])
+  })
+
+  it('says nothing while the catalogue is still loading', () => {
+    // A refusal flashed on every market for the moment the list takes to arrive is a refusal
+    // the reader learns to ignore.
+    expect(neverCollected(['EURUSD'], undefined)).toEqual([])
+  })
+
+  it('is said as a sentence with its fix, singular or plural', () => {
+    expect(neverCollectedReason([])).toBeNull()
+    expect(neverCollectedReason(['AUDUSD'])).toBe(
+      'AUDUSD has never been collected, so there are no candles to run on — collect it first',
+    )
+    expect(neverCollectedReason(['AUDUSD', 'USDCHF'])).toBe(
+      'AUDUSD, USDCHF have never been collected, so there are no candles to run on — collect them first',
+    )
   })
 })
 

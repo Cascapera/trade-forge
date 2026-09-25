@@ -2,11 +2,13 @@ import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 
 import { useCreateStudy, useInstruments, useStrategies } from '../api/hooks'
+import { neverCollected, neverCollectedReason } from '../basket/settings'
 import { useMissingDataGate } from '../collect/gate'
 import { anythingToRun } from '../collect/missing'
 import { MissingDataPrompt } from '../components/MissingDataPrompt'
 import { GridEditor } from '../components/GridEditor'
 import { StrategyPicker } from '../components/StrategyPicker'
+import { SymbolCombobox } from '../components/SymbolCombobox'
 import { useSession } from '../store'
 import { TIMEFRAMES } from '../strategy/builder'
 import { useGridPreview } from '../study/preview'
@@ -58,7 +60,13 @@ export function LaunchStudy(): React.JSX.Element {
   // size of the grid: there is no cap (18/09). The preview knows what only the DSL's semantics can say, and it is a round
   // trip away. Neither can be folded into the other without moving a rule to the wrong side.
   const preview = useGridPreview(strategyId, form)
-  const local = strategyId === null ? 'Choose a strategy.' : whyNotLaunchable(form)
+  const uncollected = neverCollectedReason(
+    form.symbol === '' ? [] : neverCollected([form.symbol], instruments.data),
+  )
+  const local =
+    strategyId === null
+      ? 'Choose a strategy.'
+      : (whyNotLaunchable(form) ?? (uncollected === null ? null : `${uncollected}.`))
   const total = combinationCount(form)
   // ⚠️ **A point that cannot run is left out, not a reason to refuse the grid** (his request,
   // 18/09) — the sweep's rule, now the study's: a higher timeframe no coarser than the chart is
@@ -145,23 +153,17 @@ export function LaunchStudy(): React.JSX.Element {
               set({ axes: [{ path: '', raw: '' }] })
             }}
           />
-          <label className="flex flex-col gap-1 text-sm text-slate-300">
-            Market
-            <select
-              className={inputClass}
+          {/* Any market the broker offers, not only the catalogued ones — a "no data" badge
+              marks the ones never collected, and the launch says to collect them first. */}
+          <div className="text-slate-300">
+            <SymbolCombobox
+              label="Market"
               value={form.symbol}
-              onChange={(event) => {
-                set({ symbol: event.target.value })
+              onChange={(symbol) => {
+                set({ symbol })
               }}
-            >
-              <option value="">Choose…</option>
-              {(instruments.data ?? []).map((instrument) => (
-                <option key={instrument.id} value={instrument.symbol}>
-                  {instrument.symbol}
-                </option>
-              ))}
-            </select>
-          </label>
+            />
+          </div>
 
           <label className="flex flex-col gap-1 text-sm text-slate-300">
             Timeframe

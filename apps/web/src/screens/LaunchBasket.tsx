@@ -8,6 +8,8 @@ import {
   launchFailure,
   toBasketRequest,
   toggleSymbol,
+  neverCollected,
+  neverCollectedReason,
   uncostedAmong,
   whyNotLaunchable,
   type BasketForm,
@@ -51,7 +53,11 @@ export function LaunchBasket(): React.JSX.Element {
   // ⚠️ This screen used to refuse to open unless a strategy had been created since the last
   // reload, because there was no way to ask the server what existed — for a database holding
   // forty-five of them. The picker is what `GET /strategies` was missing for.
-  const blocked = strategyId === null ? 'choose a strategy' : whyNotLaunchable(form)
+  const blocked =
+    strategyId === null
+      ? 'choose a strategy'
+      : (neverCollectedReason(neverCollected(form.symbols, instruments.data)) ??
+        whyNotLaunchable(form))
   const uncosted = uncostedAmong(form.symbols, instruments.data)
 
   const launch = (collectMissing = false): void => {

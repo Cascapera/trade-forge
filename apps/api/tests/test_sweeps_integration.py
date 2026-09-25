@@ -2114,6 +2114,9 @@ class TestClusterMembersRunAgain:
                 original.date_to,
                 original.cost_model,
             )
+            # The original kept no instrument here (recorded before 25/09), and neither does the
+            # twin: it will keep the one it first executes with.
+            assert twin.instrument_spec == original.instrument_spec
 
     def test_the_cluster_waits_for_its_twin_then_replays(
         self, client: Any, session_factory: Callable[[], Session], queue: _CapturingQueue
@@ -2139,6 +2142,26 @@ class TestClusterMembersRunAgain:
         read = client.get(f"/clusters/{body['id']}").json()
         assert read["status"] == "done", read["error"]
         assert read["members"][1]["taken"] == 2
+
+    def test_a_twin_inherits_the_instrument_the_original_executed_with(
+        self, client: Any, session_factory: Callable[[], Session], queue: _CapturingQueue
+    ) -> None:
+        runs = TestClusters().members(client, session_factory)
+        kept = {"symbol": "EURUSD", "tick_value": "1.1", "planted": True}
+        with session_factory() as session:
+            original = session.get(Backtest, uuid.UUID(runs[9]))
+            assert original is not None
+            original.instrument_spec = kept
+            session.commit()
+
+        body = client.post(
+            "/clusters", json={"name": "inherits", "members": [{"backtest_id": runs[9]}]}
+        ).json()
+
+        with session_factory() as session:
+            twin = session.get(Backtest, uuid.UUID(body["members"][0]["backtest_id"]))
+            assert twin is not None
+            assert twin.instrument_spec == kept
 
     def test_a_twin_already_run_is_reused(
         self, client: Any, session_factory: Callable[[], Session], queue: _CapturingQueue

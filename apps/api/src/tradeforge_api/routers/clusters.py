@@ -131,6 +131,9 @@ def _twin_of(session: SessionDep, run: Backtest) -> tuple[Backtest, bool]:
         Backtest.engine_version == ENGINE_VERSION,
         Backtest.recorded != Recorded.METRICS,
         Backtest.status.in_([BacktestStatus.DONE, BacktestStatus.QUEUED, BacktestStatus.RUNNING]),
+        # The same instrument as the original ran with, when it kept one (25/09): a twin run on
+        # a rewritten tick value would make the same trades for different money.
+        *([] if run.instrument_spec is None else [Backtest.instrument_spec == run.instrument_spec]),
     )
     found = session.scalars(
         select(Backtest).where(*same).order_by(Backtest.created_at.desc()).limit(1)
@@ -145,6 +148,10 @@ def _twin_of(session: SessionDep, run: Backtest) -> tuple[Backtest, bool]:
         date_to=run.date_to,
         initial_capital=run.initial_capital,
         cost_model=dict(run.cost_model),
+        # Inherited, so the twin executes on the instrument the original did (`runner.spec_for`).
+        # ⚠️ Left out, not passed as `None`, when the original kept none: `None` on a JSONB column
+        # is written as JSON `null`, not SQL NULL, and the CHECK refuses it.
+        **({} if run.instrument_spec is None else {"instrument_spec": dict(run.instrument_spec)}),
         status=BacktestStatus.QUEUED,
         engine_version=ENGINE_VERSION,
     )

@@ -898,6 +898,15 @@ class Backtest(Base):
     )
     error: Mapped[str | None] = mapped_column(Text)
     engine_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    instrument_spec: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    """The instrument as this run first executed it — tick size, tick value, contract, digits —
+    written by the worker and read back on every later execution of the row (`rev_0031`).
+
+    ⚠️ **Why it is kept (25/09).** A pair quoted outside USD has a tick value that is the exchange
+    rate on the day the collector last read the symbol, and a later collection rewrites it: the
+    same run executed again then gave the same trades and another amount of money. Null for a
+    run executed before this; a run that never started has none yet."""
+
     recorded: Mapped[Recorded] = mapped_column(
         _enum(Recorded, "backtest_recorded"),
         nullable=False,
@@ -976,6 +985,10 @@ class Backtest(Base):
             name="candle_provenance_complete",
         ),
         # The worker polls for work by status; without this it seq-scans the table.
+        CheckConstraint(
+            "instrument_spec IS NULL OR jsonb_typeof(instrument_spec) = 'object'",
+            name="an_instrument_spec_is_an_object",
+        ),
         Index("ix_backtests_status_created_at", "status", "created_at"),
     )
 

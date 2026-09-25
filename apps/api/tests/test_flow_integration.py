@@ -26,7 +26,7 @@ from tradeforge_api import retention
 from tradeforge_api.config import Settings
 from tradeforge_api.main import create_app
 from tradeforge_api.worker import process_backtest
-from tradeforge_db.models import Backtest, BacktestMetrics, Instrument, Sweep
+from tradeforge_db.models import Backtest, BacktestMetrics, BacktestStatus, Instrument, Sweep
 from tradeforge_engine.domain import AssetClass, Candle
 from tradeforge_engine.testing import bar
 
@@ -894,6 +894,64 @@ def test_a_single_run_keeps_everything(
         assert ladder["1"]["trades"] == run["metrics"]["total_trades"]
         assert ladder["2"] is not None
         assert ladder["3"] is None
+
+
+def test_a_run_keeps_the_instrument_it_executed_with_and_never_rewrites_it(
+    session_factory: Callable[[], Session],
+    settings: Settings,
+    tmp_path: Path,
+    collected: Callable[..., None],
+) -> None:
+    """25/09: a later collection rewrites a non-USD pair's tick value with that day's exchange
+    rate, and a run executed again made the same trades for different money. The first
+    execution keeps the specification; one already kept is read, never replaced."""
+    with _app(session_factory, settings, tmp_path, collected) as client:
+        first = _launch(client)
+        _work(session_factory, tmp_path, first)
+        again = client.get(f"/backtests/{first}").json()
+        second = client.post(
+            "/backtests",
+            json={
+                "strategy_id": again["strategy_id"],
+                "symbol": "EURUSD",
+                "timeframe": "H1",
+                "date_from": START.isoformat(),
+                "date_to": (START + 100 * HOUR).isoformat(),
+                "initial_capital": "10000",
+                "cost_model": {"type": "none"},
+            },
+        ).json()["id"]
+        planted = {
+            "symbol": "EURUSD",
+            "name": "planted",
+            "asset_class": "forex",
+            "currency_quote": "USD",
+            "currency_base": "EUR",
+            "tick_size": "0.00001",
+            "tick_value": "3",
+            "contract_size": "100000",
+            "digits": 5,
+            "exchange": None,
+        }
+        with session_factory() as session:
+            run = session.get(Backtest, uuid.UUID(second))
+            assert run is not None
+            run.instrument_spec = planted
+            session.commit()
+        _work(session_factory, tmp_path, second)
+
+        with session_factory() as session:
+            kept = session.get(Backtest, uuid.UUID(first))
+            again = session.get(Backtest, uuid.UUID(second))
+            instrument = session.scalars(
+                select(Instrument).where(Instrument.symbol == "EURUSD")
+            ).one()
+            assert kept is not None
+            assert again is not None
+            assert kept.instrument_spec is not None
+            assert Decimal(kept.instrument_spec["tick_value"]) == instrument.tick_value
+            assert again.instrument_spec == planted
+            assert again.status == BacktestStatus.DONE
 
 
 def test_a_sweeps_run_below_the_floor_keeps_only_its_metrics(

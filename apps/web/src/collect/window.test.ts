@@ -87,13 +87,27 @@ describe('the window the form opens on', () => {
   it('the quarter day is in the year, and it moves the answer by a fortnight', () => {
     /**
      * ⚠️ The assertion that separates 365.25 from 365, and it needs a *long* window to do it.
-     * An H1 budget is sixty years, so the quarter day compounds into fifteen — 18 September
-     * against 3 October. A one-year M1 window cannot tell them apart at all, which is why this
-     * one is written against H1 with the exact date rather than a rounded span.
+     * An M15 budget is fifteen years, so the quarter day compounds into almost four — 23 August
+     * against 27 August. A one-year M1 window cannot tell them apart at all, which is why this
+     * one is written against M15 with the exact date rather than a rounded span. (H1 used to
+     * carry this test with sixty years; that window now stops at 1970, below.)
      */
-    const found = suggestedWindow('H1', undefined, NOW)
+    const found = suggestedWindow('M15', undefined, NOW)
 
-    expect(asDateInput(found.from)).toBe('1966-09-18')
+    expect(asDateInput(found.from)).toBe('2011-08-23')
+  })
+
+  it('never opens before 1970, however far the budget reaches', () => {
+    /**
+     * ⚠️ Measured 24/09/2026: AUDUSD and USDCHF H1 were submitted from 1966, before their probe
+     * answered, and both collections died on the first year — MetaTrader counts in Unix seconds
+     * and its library raises for anything earlier. H1 and up all reach past it on budget alone.
+     */
+    for (const timeframe of ['H1', 'H4', 'D1', 'W1']) {
+      const found = suggestedWindow(timeframe, undefined, NOW)
+      expect(asDateInput(found.from)).toBe('1970-01-02')
+      expect(found.bound).toBe('budget')
+    }
   })
 
   it('an unknown timeframe falls back rather than producing a NaN date', () => {
@@ -114,7 +128,9 @@ describe('the window the form opens on', () => {
      * the union generated from the DSL). What is left to prove at runtime is that the rates are
      * *distinct*, which is what makes them rates rather than one number copied eight times.
      */
-    const spans = ['M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1', 'W1'].map((timeframe) =>
+    // H4 and up all stop at 1970 (the test above), so the rates are told apart where the
+    // budget still decides.
+    const spans = ['M1', 'M5', 'M15', 'M30', 'H1'].map((timeframe) =>
       suggestedWindow(timeframe, undefined, NOW).from.getTime(),
     )
 

@@ -470,3 +470,24 @@ def test_a_source_that_breaks_midway_does_not_catalogue_a_partial_series(tmp_pat
 
     assert "catalogued EURUSD" not in spy.entries
     assert spy.finished_candles is None
+
+
+def test_a_source_that_breaks_closes_the_row_as_failed_with_the_reason(tmp_path: Path) -> None:
+    """⚠️ Measured 24/09/2026: two collections sat at "running, 0 of 61 years" for good,
+    because an exception that was not a `LookupError` went past the journal to the queue. The
+    row must end, and end saying why — and the exception still reaches the queue."""
+    spy = SpyJournal()
+
+    with pytest.raises(ConnectionError):
+        run_collection(
+            Breaks(after=1),
+            spy,
+            root=tmp_path,
+            symbol="EURUSD",
+            timeframe="H1",
+            date_from=utc(2020),
+            date_to=utc(2021, 12, 31),
+        )
+
+    assert spy.entries == ["started", "year 1", "failed"]
+    assert spy.failure == "the collection of EURUSD H1 stopped: the terminal went away"

@@ -55,6 +55,13 @@ export const BARS_PER_YEAR: Record<Timeframe, number> = {
  */
 export const BAR_BUDGET = 368500
 
+/**
+ * The first day a window may open on. MetaTrader counts in Unix seconds, so nothing precedes
+ * 1970; the collector refuses to ask for it too, because its library raises rather than
+ * answering. The second of January, matching the collector, so no host timezone tips it back.
+ */
+export const EARLIEST_COLLECTABLE = new Date('1970-01-02T00:00:00Z')
+
 export interface SuggestedWindow {
   from: Date
   to: Date
@@ -88,7 +95,12 @@ export function suggestedWindow(
   // years the probe just finished arguing are worthless — and a window is only as trustworthy
   // as its weaker half.
   const takeProbe = probeFrom !== null && probeFrom > budgetFrom
-  const from = takeProbe ? probeFrom : budgetFrom
+  // ⚠️ Never before `EARLIEST_COLLECTABLE`. The budget alone reaches sixty years back on H1 and
+  // centuries on W1, and MetaTrader holds nothing before 1970 — measured 24/09/2026, a window
+  // from 1966 was submitted before the probe answered and its collection died on the first year.
+  const from = takeProbe
+    ? probeFrom
+    : new Date(Math.max(budgetFrom.getTime(), EARLIEST_COLLECTABLE.getTime()))
 
   const years = (now.getTime() - from.getTime()) / MS_PER_YEAR
   return {

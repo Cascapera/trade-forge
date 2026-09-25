@@ -416,6 +416,51 @@ def test_a_range_the_terminal_has_no_data_for_is_a_clear_error() -> None:
         source.candles("EURUSD", "H1", UTC_NOON, UTC_NOON + dt.timedelta(days=1))
 
 
+class _RecordsTheRange(_FakeTerminal):
+    def __init__(self) -> None:
+        super().__init__()
+        self.asked: list[tuple[dt.datetime, dt.datetime]] = []
+
+    def copy_rates_range(
+        self, _symbol: str, _timeframe: int, start: dt.datetime, end: dt.datetime
+    ) -> list[dict[str, Any]] | None:
+        self.asked.append((start, end))
+        return []
+
+
+def test_a_year_before_1970_is_an_empty_year_and_never_reaches_the_terminal() -> None:
+    """⚠️ Measured 25/09/2026: asked for 1966, the Windows library raises `OSError` instead of
+    answering. The terminal is never asked, and the answer is the one an empty year gives."""
+    terminal = _RecordsTheRange()
+
+    with MT5Source(terminal=terminal) as source, pytest.raises(LookupError, match="before 1970"):
+        source.candles(
+            "EURUSD",
+            "H1",
+            dt.datetime(1966, 1, 1, tzinfo=dt.UTC),
+            dt.datetime(1966, 12, 31, 23, tzinfo=dt.UTC),
+        )
+
+    assert terminal.asked == []
+
+
+def test_a_slice_across_1970_is_asked_from_1970() -> None:
+    terminal = _RecordsTheRange()
+
+    with MT5Source(terminal=terminal) as source:
+        source.candles(
+            "EURUSD",
+            "H1",
+            dt.datetime(1969, 6, 1, tzinfo=dt.UTC),
+            dt.datetime(1970, 12, 31, 23, tzinfo=dt.UTC),
+        )
+
+    # MT5 is handed naive server-clock instants; the start is the floor, the end is untouched.
+    start = dt.datetime(1970, 1, 2, tzinfo=dt.UTC)
+    end = dt.datetime(1970, 12, 31, 23, tzinfo=dt.UTC) + SERVER_OFFSET
+    assert terminal.asked == [(start.replace(tzinfo=None), end.replace(tzinfo=None))]
+
+
 def test_a_terminal_that_refuses_the_connection_says_so() -> None:
     class _Refusing(_FakeTerminal):
         def initialize(self) -> bool:

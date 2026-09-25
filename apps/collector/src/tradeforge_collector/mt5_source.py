@@ -381,10 +381,18 @@ class MT5Source:
         # The range is asked for in the server's own clock, because that is the only
         # clock MT5 speaks — so shift our UTC bounds *into* server time on the way in,
         # and shift every returned bar back *out* of it on the way home.
+        # ⚠️ Nothing is asked before `EARLIEST_ASKABLE`. The library converts the naive bounds
+        # through the host's local clock, and on Windows that raises `OSError` for any instant
+        # before 1970 — not "no data", an exception. A slice wholly before it is an empty year;
+        # one that straddles it starts there.
+        if end + self._offset < EARLIEST_ASKABLE:
+            raise LookupError(
+                f"MT5 holds nothing for {symbol} {timeframe} before {EARLIEST_ASKABLE.year}"
+            )
         rates = mt5.copy_rates_range(
             symbol,
             self._timeframe_constant(mt5, timeframe),
-            _naive(start + self._offset),
+            _naive(max(start + self._offset, EARLIEST_ASKABLE)),
             _naive(end + self._offset),
         )
         if rates is None:
@@ -719,6 +727,17 @@ _ONLY_THE_FORMING_BAR = 1
 # refusing those would trade a wrong number for a missing one. What this is aimed at is the
 # closed market, where the gap is tens of minutes and the quote is the widened closing print.
 _STALE_QUOTE = dt.timedelta(minutes=5)
+
+
+EARLIEST_ASKABLE = dt.datetime(1970, 1, 2, tzinfo=dt.UTC)
+"""The first instant a range may be asked from, in the server's clock.
+
+MetaTrader counts in Unix seconds, so it holds nothing before 1970 — and its Python library,
+handed a naive datetime, converts it through the host's local time, which on Windows refuses
+every instant before the epoch with `OSError: [Errno 22]` (measured 25/09/2026 on AUDUSD H1 from
+1966). The second of January rather than the first leaves room for any host timezone: a machine
+up to a day ahead of UTC still converts it to a positive number.
+"""
 
 
 def _naive(moment: dt.datetime) -> dt.datetime:

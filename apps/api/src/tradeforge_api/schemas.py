@@ -37,7 +37,7 @@ from tradeforge_api.sweep_dataset import Role
 from tradeforge_api.walkforward import MAX_FOLDS, MIN_FOLDS
 from tradeforge_collector.classify import asset_class_from_path
 from tradeforge_db.live_sessions import is_stale, silence
-from tradeforge_db.models import LiveSession, SelectionMetric
+from tradeforge_db.models import LiveSession, SelectionMetric, SliceMode
 from tradeforge_engine.domain import AssetClass
 from tradeforge_schema.models import TIMEFRAMES
 
@@ -2092,6 +2092,84 @@ class HoldoutOut(BaseModel):
     searched_to: dt.datetime | None
     groups: list[HoldoutGroup]
     rows: list[HoldoutRow]
+
+
+class CreateSlicing(BaseModel):
+    """Judge a finished reserved-window test in pieces (25/09): by calendar year, or by blocks of
+    `block_trades` trades — and the bar a point must clear, set before the result is seen."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: SliceMode
+    block_trades: int | None = Field(default=None, ge=5, le=10_000)
+    """Trades per block. Required when cutting by trades, refused by calendar."""
+    pass_share: Decimal = Field(default=Decimal("0.7"), gt=0, le=1)
+    """The share of counted slices that must end above zero R for a point to pass."""
+
+    @model_validator(mode="after")
+    def _blocks_only_by_trades(self) -> CreateSlicing:
+        if (self.mode is SliceMode.TRADES) != (self.block_trades is not None):
+            raise ValueError(
+                "block_trades is how big a block is: give it when cutting by trades, and only then"
+            )
+        return self
+
+
+class SliceOut(BaseModel):
+    """One piece of a point's out-of-sample run."""
+
+    label: str
+    date_from: dt.datetime
+    date_to: dt.datetime
+    trades: int
+    net_r: Money
+    counted: bool
+
+
+class SlicedPoint(BaseModel):
+    """One tested point cut into pieces, with its verdict."""
+
+    run_id: uuid.UUID
+    entry_id: str
+    entry_name: str | None
+    symbol: str
+    timeframe: str
+    label: str
+    trades_kept: bool
+    """False for a run that kept no trades — a test run before 25/09 that lost. Not sliced, and
+    never counted as failing: nobody looked."""
+    unscored: int
+    """Trades with no stop, hence no R: left out of every slice."""
+    net_r: Money
+    slices: list[SliceOut]
+    counted: int
+    positive: int
+    share: Money | None
+    passed: bool
+
+
+class SlicedGroup(BaseModel):
+    """How many of one (entry, chart)'s tested points passed."""
+
+    entry_id: str
+    entry_name: str | None
+    timeframe: str
+    points: int
+    judged: int
+    passed: int
+
+
+class SlicingOut(BaseModel):
+    """A slicing as it was asked and as it came out."""
+
+    id: uuid.UUID
+    sweep_id: uuid.UUID
+    mode: SliceMode
+    block_trades: int | None
+    pass_share: Money
+    created_at: dt.datetime
+    groups: list[SlicedGroup]
+    points: list[SlicedPoint]
 
 
 class SweepOut(BaseModel):

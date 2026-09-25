@@ -1,8 +1,9 @@
 import { Link } from 'react-router-dom'
 
-import { useHoldout } from '../api/hooks'
+import { isHoldoutSettled, useHoldout } from '../api/hooks'
 import type { HoldoutRow, HoldoutSide, SelectionMetric } from '../api/types'
 import { percent } from '../format'
+import { HoldoutSlicings } from './HoldoutSlicings'
 
 const METRIC_LABEL: Record<SelectionMetric, string> = {
   net_profit: 'net profit',
@@ -184,6 +185,8 @@ export function HoldoutComparison(props: { sweepId: string }): React.JSX.Element
           ))}
         </tbody>
       </table>
+
+      <HoldoutSlicings sweepId={data.id} settled={isHoldoutSettled(data)} />
     </section>
   )
 }

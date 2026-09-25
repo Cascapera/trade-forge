@@ -121,3 +121,19 @@ def test_a_winning_rung_still_needs_the_charts_floor_of_trades() -> None:
         )
         is Recorded.METRICS
     )
+
+
+@pytest.mark.parametrize("net_profit", [Decimal(-50), Decimal(0), Decimal(50)])
+def test_a_reserved_window_test_keeps_its_trades_win_or_lose(net_profit: Decimal) -> None:
+    """His ask (25/09): a point that failed out of sample is the one to cut into years and blocks
+    — and a losing sweep run keeps no trades, so the test's runs must be the exception."""
+    assert (
+        recorded_for(
+            in_sweep=True,
+            timeframe="M15",
+            net_profit=net_profit,
+            total_trades=3,
+            reserved_test=True,
+        )
+        is Recorded.TRADES
+    )

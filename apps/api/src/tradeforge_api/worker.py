@@ -167,6 +167,7 @@ async def process_backtest(  # noqa: PLR0913 — keyword-only; each names one th
             net_profit=metrics.net_profit,
             total_trades=metrics.total_trades,
             target_net_r=[None if rung is None else rung.net_r for rung in ladder.values()],
+            reserved_test=backtest.sweep is not None and backtest.sweep.holdout_rule is not None,
         )
         metrics_row, trade_rows = to_rows(
             trades=trades,

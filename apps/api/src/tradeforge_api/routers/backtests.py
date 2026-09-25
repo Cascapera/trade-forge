@@ -21,7 +21,7 @@ from tradeforge_api.coverage import describe, to_collect, uncovered_markets
 from tradeforge_api.deps import QueueDep, SessionDep, SettingsDep
 from tradeforge_api.queue import COLLECT_QUEUE, COLLECT_RANGE, RUN_BACKTEST
 from tradeforge_api.routers.strategies import assert_runnable_at
-from tradeforge_api.runner import ENGINE_VERSION, instrument_spec
+from tradeforge_api.runner import ENGINE_VERSION, spec_for
 from tradeforge_api.schemas import (
     BacktestListItem,
     BacktestOut,
@@ -662,7 +662,7 @@ def _zones_of(read: _Window) -> list[ZoneOut]:
     if marking is None:
         return []
 
-    spec = instrument_spec(read.instrument)
+    spec = spec_for(read.backtest, read.instrument)
     account = AccountState(
         equity=read.backtest.initial_capital,
         balance=read.backtest.initial_capital,

@@ -23,7 +23,7 @@ from typing import Any, NamedTuple
 from pydantic import ValidationError
 
 from tradeforge_collector import step
-from tradeforge_db.models import Instrument
+from tradeforge_db.models import Backtest, Instrument
 from tradeforge_engine import (
     BacktestBroker,
     Candle,
@@ -41,6 +41,7 @@ from tradeforge_engine import (
 )
 from tradeforge_engine import BacktestMetrics as EngineMetrics
 from tradeforge_engine import __version__ as ENGINE_VERSION  # noqa: N812 — public constant
+from tradeforge_engine.domain import AssetClass
 from tradeforge_engine.protocols import CostModel
 from tradeforge_schema import SemanticValidationError, assert_executable
 from tradeforge_schema import Strategy as StrategyDSL
@@ -65,6 +66,48 @@ def instrument_spec(instrument: Instrument) -> InstrumentSpec:
         contract_size=instrument.contract_size,
         digits=instrument.digits,
         exchange=instrument.exchange,
+    )
+
+
+def spec_document(spec: InstrumentSpec) -> dict[str, Any]:
+    """The specification as a run keeps it (`Backtest.instrument_spec`): decimals as strings, so
+    reading it back gives the very digits that were used."""
+    return {
+        "symbol": spec.symbol,
+        "name": spec.name,
+        "asset_class": spec.asset_class.value,
+        "currency_quote": spec.currency_quote,
+        "currency_base": spec.currency_base,
+        "tick_size": str(spec.tick_size),
+        "tick_value": str(spec.tick_value),
+        "contract_size": str(spec.contract_size),
+        "digits": spec.digits,
+        "exchange": spec.exchange,
+    }
+
+
+def spec_for(run: Backtest, instrument: Instrument) -> InstrumentSpec:
+    """The instrument a run is executed with: the one it kept (25/09), or — the first time — the
+    catalogue's current row, which the caller then keeps on the run.
+
+    ⚠️ **Never the current row once the run has one.** A later collection rewrites a non-USD
+    pair's tick value with that day's exchange rate, and a run executed again would then make the
+    same trades for a different amount of money.
+    """
+    kept = run.instrument_spec
+    if kept is None:
+        return instrument_spec(instrument)
+    return InstrumentSpec(
+        symbol=kept["symbol"],
+        name=kept["name"],
+        asset_class=AssetClass(kept["asset_class"]),
+        currency_quote=kept["currency_quote"],
+        currency_base=kept["currency_base"],
+        tick_size=Decimal(kept["tick_size"]),
+        tick_value=Decimal(kept["tick_value"]),
+        contract_size=Decimal(kept["contract_size"]),
+        digits=int(kept["digits"]),
+        exchange=kept["exchange"],
     )
 
 
@@ -271,7 +314,7 @@ class CandleWindow(NamedTuple):
 def execute_backtest(  # noqa: PLR0913 — keyword-only; each names one axis of a backtest run
     *,
     definition: Mapping[str, Any],
-    instrument: Instrument,
+    instrument: InstrumentSpec,
     timeframe: str,
     date_from: dt.datetime,
     date_to: dt.datetime,
@@ -291,7 +334,7 @@ def execute_backtest(  # noqa: PLR0913 — keyword-only; each names one axis of 
     """
     windowed = _candles_to_run(candles, instrument.symbol, timeframe, date_from, date_to)
 
-    spec = instrument_spec(instrument)
+    spec = instrument
     broker = BacktestBroker(
         instrument=spec,
         initial_capital=initial_capital,

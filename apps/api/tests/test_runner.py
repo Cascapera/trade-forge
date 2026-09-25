@@ -12,8 +12,15 @@ from decimal import Decimal
 
 import pytest
 
-from tradeforge_api.runner import CandleWindow, execute_backtest, swap_rates
-from tradeforge_db.models import Instrument
+from tradeforge_api.runner import (
+    CandleWindow,
+    execute_backtest,
+    instrument_spec,
+    spec_document,
+    spec_for,
+    swap_rates,
+)
+from tradeforge_db.models import Backtest, Instrument
 from tradeforge_engine import BacktestMetrics as EngineMetrics
 from tradeforge_engine.domain import AssetClass, Candle, ClosedTrade
 from tradeforge_engine.errors import EngineError
@@ -86,7 +93,7 @@ def ma_cross() -> dict[str, object]:
 def run_it(**overrides: object) -> tuple[list[ClosedTrade], EngineMetrics, CandleWindow]:
     kwargs: dict[str, object] = {
         "definition": ma_cross(),
-        "instrument": an_instrument(),
+        "instrument": instrument_spec(an_instrument()),
         "timeframe": "H1",
         "date_from": START,
         "date_to": START + 100 * HOUR,
@@ -297,7 +304,7 @@ def test_a_setup_document_reproduces_the_engine_s_own_golden() -> None:
     """
     trades, metrics, _ = run_it(
         definition=ponto_continuo(),
-        instrument=a_stock(),
+        instrument=instrument_spec(a_stock()),
         candles=pullback_to_the_average(),
         date_from=_GOLDEN_FROM,
         initial_capital=Decimal("100000"),
@@ -324,7 +331,7 @@ def test_a_setup_document_needs_no_indicators_entry_or_stop_block() -> None:
 
     trades, _, _ = run_it(
         definition=document,
-        instrument=a_stock(),
+        instrument=instrument_spec(a_stock()),
         candles=pullback_to_the_average(),
         date_from=_GOLDEN_FROM,
     )
@@ -336,13 +343,13 @@ def test_switching_the_breakeven_rule_off_reaches_the_setup() -> None:
     the trade it changes rather than by reading an attribute back."""
     with_rule, _, _ = run_it(
         definition=ponto_continuo(),
-        instrument=a_stock(),
+        instrument=instrument_spec(a_stock()),
         candles=pullback_to_the_average(),
         date_from=_GOLDEN_FROM,
     )
     without_rule, _, _ = run_it(
         definition=ponto_continuo(breakeven_at_r=None),
-        instrument=a_stock(),
+        instrument=instrument_spec(a_stock()),
         candles=pullback_to_the_average(),
         date_from=_GOLDEN_FROM,
     )
@@ -359,7 +366,7 @@ def test_an_unknown_setup_type_fails_loudly_at_compile_time() -> None:
     with pytest.raises(EngineError, match="unknown setup type"):
         run_it(
             definition=document,
-            instrument=a_stock(),
+            instrument=instrument_spec(a_stock()),
             candles=pullback_to_the_average(),
             date_from=_GOLDEN_FROM,
         )
@@ -405,3 +412,36 @@ def test_swap_rates_are_read_signed_and_refused_when_not_an_object() -> None:
     assert (rates.long_per_lot, rates.short_per_lot) == (Decimal(-5), Decimal("1.5"))
     with pytest.raises(ValueError, match="swap must be an object"):
         swap_rates({"swap": "-5"})
+
+
+class TestTheKeptInstrument:
+    """25/09: a run keeps the instrument it first executed with (`Backtest.instrument_spec`)."""
+
+    def row(self, tick_value: str = "1.20646181") -> Instrument:
+        return Instrument(
+            symbol="USDCHF",
+            name="US Dollar vs Swiss Franc",
+            asset_class=AssetClass.FOREX,
+            currency_quote="CHF",
+            currency_base="USD",
+            tick_size=Decimal("0.00001"),
+            tick_value=Decimal(tick_value),
+            contract_size=Decimal(100000),
+            digits=5,
+        )
+
+    def test_the_document_reads_back_as_the_same_specification(self) -> None:
+        spec = instrument_spec(self.row())
+
+        assert spec_for(Backtest(instrument_spec=spec_document(spec)), self.row("9")) == spec
+
+    def test_a_run_that_kept_one_ignores_the_catalogue_rewritten_since(self) -> None:
+        """The catalogue's tick value is today's exchange rate; the run's is the one it used."""
+        kept = spec_document(instrument_spec(self.row("1.10")))
+
+        spec = spec_for(Backtest(instrument_spec=kept), self.row("1.25"))
+
+        assert spec.tick_value == Decimal("1.10")
+
+    def test_a_run_that_kept_none_takes_the_catalogue(self) -> None:
+        assert spec_for(Backtest(), self.row("1.25")).tick_value == Decimal("1.25")

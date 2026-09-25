@@ -44,7 +44,7 @@ from tradeforge_api.grid import coordinates, label_for, read_point
 from tradeforge_api.queue import RUN_BACKTEST, RUN_CLUSTER, progress_channel, redis_settings
 from tradeforge_api.r_metrics import r_metrics
 from tradeforge_api.retention import recorded_for
-from tradeforge_api.runner import ENGINE_VERSION, execute_backtest, instrument_spec
+from tradeforge_api.runner import ENGINE_VERSION, execute_backtest, spec_document, spec_for
 from tradeforge_api.walkforward import Candidate, choose
 from tradeforge_collector import read_candles
 from tradeforge_db.models import (
@@ -60,6 +60,7 @@ from tradeforge_db.models import (
 )
 from tradeforge_db.results import ladder_row, to_rows
 from tradeforge_db.session import create_db_engine, create_session_factory
+from tradeforge_engine.domain import InstrumentSpec
 from tradeforge_engine.excursion import target_ladder
 
 
@@ -96,6 +97,15 @@ def database_unreachable(exc: BaseException) -> bool:
     if sqlstate is None:
         return isinstance(exc, OperationalError)
     return sqlstate.startswith("08") or sqlstate in _UNREACHABLE_STATES
+
+
+def _kept_spec(backtest: Backtest, instrument: Instrument) -> InstrumentSpec:
+    """The instrument as this run first executed it, kept on the row the first time
+    (`runner.spec_for`, 25/09)."""
+    spec = spec_for(backtest, instrument)
+    if backtest.instrument_spec is None:
+        backtest.instrument_spec = spec_document(spec)
+    return spec
 
 
 async def process_backtest(  # noqa: PLR0913 — keyword-only; each names one thing the run needs
@@ -146,9 +156,10 @@ async def process_backtest(  # noqa: PLR0913 — keyword-only; each names one th
         candles = read(parquet_root, instrument.symbol, backtest.timeframe)
         # A sweep's run keeps no pictures, so it does not build them either (`retention`).
         in_sweep = backtest.sweep_id is not None
+        spec = _kept_spec(backtest, instrument)
         trades, metrics, window = execute_backtest(
             definition=strategy.definition,
-            instrument=instrument,
+            instrument=spec,
             timeframe=backtest.timeframe,
             date_from=backtest.date_from,
             date_to=backtest.date_to,
@@ -161,7 +172,7 @@ async def process_backtest(  # noqa: PLR0913 — keyword-only; each names one th
 
         # Every rung of the target ladder, scored now: a sweep's losing run keeps no trades, and
         # without them this cannot be computed later (`backtest_metrics.targets`).
-        ladder = target_ladder(trades, instrument_spec(instrument))
+        ladder = target_ladder(trades, spec)
         # Decided here and stamped on the run, never re-derived later: see `Recorded`.
         recorded = recorded_for(
             in_sweep=in_sweep,

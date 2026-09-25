@@ -21,6 +21,10 @@ import type {
   ClusterOut,
   CreateClusterRequest,
   CreateHoldoutRequest,
+  CreateSweepTemplateRequest,
+  QueueMarket,
+  SweepTemplateListItem,
+  SweepTemplateOut,
   CreateSweepWalkForwardRequest,
   CreatedSweepWalkForward,
   SweepWalkForwardOut,
@@ -217,6 +221,23 @@ export const api = {
   createSlicing: (id: string, payload: CreateSlicingRequest): Promise<SlicingOut> =>
     request('POST', `/sweeps/${id}/slicings`, payload),
   listSlicings: (id: string): Promise<SlicingOut[]> => request('GET', `/sweeps/${id}/slicings`),
+  // Templates (26/09): a sweep without its markets, and its queue of markets run one at a time.
+  createSweepTemplate: (payload: CreateSweepTemplateRequest): Promise<SweepTemplateOut> =>
+    request('POST', '/sweep-templates', payload),
+  listSweepTemplates: (): Promise<SweepTemplateListItem[]> => request('GET', '/sweep-templates'),
+  getSweepTemplate: (id: string): Promise<SweepTemplateOut> =>
+    request('GET', `/sweep-templates/${id}`),
+  queueMarkets: (id: string, markets: QueueMarket[]): Promise<SweepTemplateOut> =>
+    request('POST', `/sweep-templates/${id}/queue`, { markets }),
+  pauseTemplate: (id: string): Promise<SweepTemplateOut> =>
+    request('POST', `/sweep-templates/${id}/pause`),
+  resumeTemplate: (id: string): Promise<SweepTemplateOut> =>
+    request('POST', `/sweep-templates/${id}/resume`),
+  removeTemplateItem: (id: string, itemId: string): Promise<SweepTemplateOut> =>
+    request('DELETE', `/sweep-templates/${id}/items/${itemId}`),
+  // Finished sweeps of one template read together as one (26/09). Runs nothing.
+  combineSweeps: (sweepIds: string[]): Promise<CreatedSweep> =>
+    request('POST', '/sweeps/combine', { sweep_ids: sweepIds }),
   // A sweep walked forward fold by fold (25/09): trainings queued at once, tests as they end.
   createSweepWalkForward: (
     sweepId: string,

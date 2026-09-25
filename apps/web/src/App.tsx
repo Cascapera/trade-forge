@@ -8,6 +8,8 @@ import { Results } from './screens/Results'
 import { LaunchStudy } from './screens/LaunchStudy'
 import { ClusterResult } from './screens/ClusterResult'
 import { Clusters } from './screens/Clusters'
+import { TemplateQueue } from './screens/TemplateQueue'
+import { Templates } from './screens/Templates'
 import { SweepWalkForwardResult } from './screens/SweepWalkForwardResult'
 import { LaunchSweep } from './screens/LaunchSweep'
 import { LiveSessions } from './screens/LiveSessions'
@@ -88,6 +90,11 @@ export function App(): React.JSX.Element {
             <NavLink to="/study" className={navClass}>
               Study
             </NavLink>
+            {/* A sweep without its markets, run market by market from a queue and read
+                together afterwards (26/09). `end`: `/templates/:id` is one template's queue. */}
+            <NavLink to="/templates" end className={navClass}>
+              Templates
+            </NavLink>
             <NavLink to="/sweep" className={navClass}>
               Sweep
             </NavLink>
@@ -163,6 +170,8 @@ export function App(): React.JSX.Element {
             <Route path="/sweeps/:id" element={<SweepResult />} />
             <Route path="/walkforwards/:id" element={<WalkForwardResult />} />
             <Route path="/clusters" element={<Clusters />} />
+            <Route path="/templates" element={<Templates />} />
+            <Route path="/templates/:id" element={<TemplateQueue />} />
             <Route path="/sweep-walkforwards/:id" element={<SweepWalkForwardResult />} />
             <Route path="/clusters/:id" element={<ClusterResult />} />
             <Route path="/collect" element={<CollectSymbol />} />

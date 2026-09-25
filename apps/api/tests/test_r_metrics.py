@@ -29,7 +29,7 @@ def day(n: int, year: int = 2020) -> dt.datetime:
     return dt.datetime(year, 1, 1, tzinfo=dt.UTC) + dt.timedelta(days=n)
 
 
-def run(*rs: str) -> list[ClosedTrade]:
+def run(*rs: str | None) -> list[ClosedTrade]:
     return [trade(day(n), r) for n, r in enumerate(rs)]
 
 

@@ -921,7 +921,7 @@ def test_a_sweeps_run_below_the_floor_keeps_only_its_metrics(
         metrics = run["metrics"]
         assert Decimal(metrics["net_r"]) > 0
         assert Decimal(metrics["max_drawdown_r"]) == 0
-        assert (metrics["losing_streak"], Decimal(metrics["losing_streak_r"])) == (0, 0)
+        assert (metrics["losing_streak"], Decimal(metrics["losing_streak_r"])) == (0, Decimal(0))
         assert metrics["positive_year_share"] is None
         (only,) = metrics["yearly_r"].values()
         assert Decimal(only) == Decimal(metrics["net_r"])

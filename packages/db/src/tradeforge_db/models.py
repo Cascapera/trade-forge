@@ -2003,3 +2003,79 @@ class Cluster(Base):
         ),
         Index("ix_clusters_created_at", "created_at"),
     )
+
+
+class SweepWalkForward(Base):
+    """A sweep's walk-forward (25/09, path B — `sweep_walkforward`): at each fold the whole sweep
+    runs again on a training window, its best points are chosen by `rule` — a reserved-window
+    test's own — and run on the window after. Started by hand from a finished sweep."""
+
+    __tablename__ = "sweep_walk_forwards"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    parent_sweep_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("sweeps.id", ondelete="SET NULL"), nullable=True
+    )
+    """The sweep whose entries, markets, charts and points each fold runs again. Null once
+    deleted: the folds' sweeps are measurements of their own."""
+
+    start_year: Mapped[int] = mapped_column(Integer, nullable=False)
+    train_years: Mapped[int] = mapped_column(Integer, nullable=False)
+    test_years: Mapped[int] = mapped_column(Integer, nullable=False)
+    anchored: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    rule: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    """How each fold chooses: a `CreateHoldout` without its window — metric, top N, floors,
+    limits in R."""
+
+    status: Mapped[BacktestStatus] = mapped_column(
+        _enum(BacktestStatus, "sweep_walk_forward_status"), nullable=False
+    )
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[dt.datetime] = _created_at()
+    finished_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    folds: Mapped[list[SweepWalkForwardFold]] = relationship(
+        back_populates="walk_forward",
+        order_by="SweepWalkForwardFold.index",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+    __table_args__ = (
+        CheckConstraint("train_years >= 1 AND test_years >= 1", name="windows_are_whole_years"),
+        CheckConstraint("jsonb_typeof(rule) = 'object'", name="a_walk_forward_rule_is_an_object"),
+        Index("ix_sweep_walk_forwards_parent_sweep_id", "parent_sweep_id"),
+    )
+
+
+class SweepWalkForwardFold(Base):
+    """One fold: its windows, the training sweep run on the first, the test run on the second."""
+
+    __tablename__ = "sweep_walk_forward_folds"
+
+    walk_forward_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("sweep_walk_forwards.id", ondelete="CASCADE"), primary_key=True
+    )
+    index: Mapped[int] = mapped_column(Integer, primary_key=True)
+    train_from: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    train_to: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    test_from: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    test_to: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    train_sweep_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("sweeps.id", ondelete="SET NULL"), nullable=True
+    )
+    test_sweep_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("sweeps.id", ondelete="SET NULL"), nullable=True
+    )
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    """Why this fold has no test — nothing in its training could be ranked, say — while the
+    others go on."""
+
+    walk_forward: Mapped[SweepWalkForward] = relationship(back_populates="folds")
+
+    __table_args__ = (
+        CheckConstraint("train_to = test_from", name="test_starts_at_training_end"),
+        CheckConstraint(
+            "train_from < train_to AND test_from < test_to", name="windows_run_forwards"
+        ),
+    )

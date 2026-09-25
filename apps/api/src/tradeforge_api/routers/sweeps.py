@@ -21,6 +21,7 @@ would draw a map of a space it never searched, and it would look exactly like a 
 did — which is why a hole is always written down, never merely left.
 """
 
+import datetime as dt
 import secrets
 import uuid
 from collections.abc import Callable
@@ -904,6 +905,76 @@ async def create_holdout(
     ⚠️ **Refused, not warned:** a window that shares a bar with the one searched, and a test of a
     test — its points would be chosen on the reserved window itself.
     """
+    holdout, runs, uncovered = launch_holdout(session, sweep_id, request)
+    # After the commit, and with the run's own id as the job id — the sweep launch's reasons.
+    for one in runs:
+        await queue.enqueue_job(RUN_BACKTEST, str(one.id), _job_id=str(one.id))
+    return CreatedSweep(id=holdout.id, runs=len(runs), skipped=uncovered)
+
+
+def launch_window(
+    session: Session, parent: Sweep, date_from: dt.datetime, date_to: dt.datetime
+) -> tuple[Sweep, list[Backtest]]:
+    """`parent` again over another window — every run it made, the same strategy, market, chart,
+    capital and costs — kept and committed; the caller queues the runs (a walk-forward's
+    training, 25/09).
+
+    ⚠️ **Its runs, not its grid again.** The parent's runs are what its launch made of the grid
+    after refusals and de-duplication (`same_as`), so copying them reproduces the sweep exactly —
+    expanding the grid anew would re-decide both, possibly differently. A (market, chart) with no
+    candles in the new window is left out and recorded in `skipped`, as a launch does.
+    """
+    parents = session.execute(
+        select(Backtest, Instrument.symbol)
+        .join(Instrument, Instrument.id == Backtest.instrument_id)
+        .where(Backtest.sweep_id == parent.id)
+        .order_by(Backtest.created_at, Backtest.id)
+    ).all()
+    uncovered = uncovered_markets(
+        session, list(parent.symbols), list(parent.timeframes), date_from, date_to
+    )
+    empty = {(market.symbol, market.timeframe) for market in uncovered}
+    sweep = Sweep(
+        entry_ids=list(parent.entry_ids),
+        symbols=list(parent.symbols),
+        timeframes=list(parent.timeframes),
+        date_from=date_from,
+        date_to=date_to,
+        initial_capital=parent.initial_capital,
+        skipped=[market.model_dump(mode="json") for market in uncovered],
+        points=list(parent.points),
+    )
+    session.add(sweep)
+    runs = [
+        Backtest(
+            sweep=sweep,
+            strategy_id=run.strategy_id,
+            instrument_id=run.instrument_id,
+            timeframe=run.timeframe,
+            date_from=date_from,
+            date_to=date_to,
+            initial_capital=run.initial_capital,
+            cost_model=dict(run.cost_model),
+            status=BacktestStatus.QUEUED,
+            engine_version=ENGINE_VERSION,
+        )
+        for run, symbol in parents
+        if (symbol, run.timeframe) not in empty
+    ]
+    session.add_all(runs)
+    session.commit()
+    return sweep, runs
+
+
+def launch_holdout(
+    session: Session, sweep_id: uuid.UUID, request: CreateHoldout
+) -> tuple[Sweep, list[Backtest], list[UncoveredMarket]]:
+    """Choose, keep and commit a reserved-window test of `sweep_id`; the caller queues its runs.
+
+    Shared by the endpoint above and a sweep's walk-forward (`sweep_walkforward_job`), which
+    tests each fold's training sweep the same way. Refusals are `HTTPException`s with the
+    sentence a person reads, which the walk-forward records on the fold.
+    """
     parent = session.get(Sweep, sweep_id)
     if parent is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="sweep not found")
@@ -1030,10 +1101,7 @@ async def create_holdout(
     ]
     session.add_all(runs)
     session.commit()
-    # After the commit, and with the run's own id as the job id — the sweep launch's reasons.
-    for one in runs:
-        await queue.enqueue_job(RUN_BACKTEST, str(one.id), _job_id=str(one.id))
-    return CreatedSweep(id=holdout.id, runs=len(runs), skipped=uncovered)
+    return holdout, runs, uncovered
 
 
 def _runs_of(

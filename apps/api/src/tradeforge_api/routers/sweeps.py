@@ -55,6 +55,7 @@ from tradeforge_api.routers.strategies import refusal_of
 from tradeforge_api.routers.studies import aggregate_scored, strategies_for
 from tradeforge_api.runner import ENGINE_VERSION, build_cost_model, swap_rates
 from tradeforge_api.schemas import (
+    CombineSweeps,
     CreatedSweep,
     CreateHoldout,
     CreateMonteCarlo,
@@ -699,12 +700,20 @@ def list_sweeps(
     counts: dict[uuid.UUID, dict[BacktestStatus, int]] = {
         sweep.id: dict.fromkeys(BacktestStatus, 0) for sweep in sweeps
     }
-    for sweep_id, run_status, how_many in session.execute(
+    # A combination has no runs of its own: its members' are counted for it (26/09).
+    owner: dict[uuid.UUID, list[uuid.UUID]] = {}
+    for sweep in sweeps:
+        for member in scope_of(sweep):
+            owner.setdefault(member, []).append(sweep.id)
+    for member_id, run_status, how_many in session.execute(
         select(Backtest.sweep_id, Backtest.status, func.count())
-        .where(Backtest.sweep_id.in_(list(counts)))
+        .where(Backtest.sweep_id.in_(list(owner)))
         .group_by(Backtest.sweep_id, Backtest.status)
     ).all():
-        counts[sweep_id][run_status] = how_many
+        if member_id is None:  # pragma: no cover — the filter selects by sweep
+            continue
+        for sweep_id in owner[member_id]:
+            counts[sweep_id][run_status] += how_many
 
     asked = {uuid.UUID(one) for sweep in sweeps for one in sweep.entry_ids}
     names = {
@@ -727,6 +736,8 @@ def list_sweeps(
                 timeframes=list(sweep.timeframes),
                 date_from=sweep.date_from,
                 date_to=sweep.date_to,
+                combines=None if sweep.combines is None else len(sweep.combines),
+                template_id=sweep.template_id,
                 runs=SweepRunCounts(
                     total=sum(tally.values()),
                     done=tally[BacktestStatus.DONE],
@@ -775,7 +786,8 @@ def get_sweep_dashboard(
             detail="launched_to must come after launched_from",
         )
 
-    window = []
+    # A combination has no runs of its own and would name its members' twice (26/09).
+    window: list[ColumnElement[bool]] = [Sweep.combines.is_(None)]
     if launched_from is not None:
         window.append(Sweep.created_at >= launched_from)
     if launched_to is not None:
@@ -1001,7 +1013,7 @@ def launch_window(
     parents = session.execute(
         select(Backtest, Instrument.symbol)
         .join(Instrument, Instrument.id == Backtest.instrument_id)
-        .where(Backtest.sweep_id == parent.id)
+        .where(Backtest.sweep_id.in_(scope_of(parent)))
         .order_by(Backtest.created_at, Backtest.id)
     ).all()
     uncovered = uncovered_markets(
@@ -1040,6 +1052,99 @@ def launch_window(
     return sweep, runs
 
 
+@router.post(
+    "/sweeps/combine",
+    response_model=CreatedSweep,
+    status_code=status.HTTP_201_CREATED,
+    responses={**_NOT_FOUND, **_BAD_BODY},
+)
+def combine_sweeps(request: CombineSweeps, session: SessionDep) -> CreatedSweep:
+    """Keep a sweep that reads several finished sweeps as one — a template's markets, run one at a
+    time over days, brought together for the second phase (26/09). Nothing runs.
+
+    ⚠️ **Only sweeps that asked the same question.** The same entries, charts, window and capital
+    — what a template fixes — or the medians, the choice of the best and the comparison would
+    mix answers to different questions. Refused, with the reason, for a reserved-window test or
+    another combination (its runs are chosen or borrowed), and for a sweep still running (the
+    second phase reads finished work).
+    """
+    ids = list(dict.fromkeys(request.sweep_ids))
+    if len(ids) < 2:  # noqa: PLR2004 — a combination of one is that sweep
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="combine at least two different sweeps",
+        )
+    found = {one.id: one for one in session.scalars(select(Sweep).where(Sweep.id.in_(ids)))}
+    missing = [str(one) for one in ids if one not in found]
+    if missing:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=f"no such sweep: {', '.join(missing)}"
+        )
+    members = [found[one] for one in ids]
+    for one in members:
+        if one.holdout_rule is not None or one.combines is not None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=f"{one.id} is a reserved-window test or a combination; combine the sweeps "
+                "that ran",
+            )
+
+    def question(sweep: Sweep) -> tuple[Any, ...]:
+        return (
+            tuple(sorted(sweep.entry_ids)),
+            tuple(sorted(sweep.timeframes)),
+            sweep.date_from,
+            sweep.date_to,
+            sweep.initial_capital,
+        )
+
+    if len({question(one) for one in members}) != 1:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="these sweeps asked different questions — entries, charts, window or capital "
+            "differ; combine sweeps of one template",
+        )
+    counted = {one.id: _count_runs(session, one) for one in members}
+    still = [str(key) for key, one in counted.items() if one.queued + one.running > 0]
+    if still:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"still running: {', '.join(still)} — combine them once they have finished",
+        )
+
+    first = members[0]
+    symbols = list(dict.fromkeys(symbol for one in members for symbol in one.symbols))
+    points: list[Any] = []
+    seen: set[tuple[str, str, str | None]] = set()
+    for one in members:
+        for point in one.points:
+            key = (str(point["strategy_id"]), str(point["label"]), point.get("same_as"))
+            if key not in seen:
+                seen.add(key)
+                points.append(point)
+    templates = {one.template_id for one in members}
+    combined = Sweep(
+        entry_ids=list(first.entry_ids),
+        symbols=symbols,
+        timeframes=list(first.timeframes),
+        date_from=first.date_from,
+        date_to=first.date_to,
+        initial_capital=first.initial_capital,
+        skipped=[market for one in members for market in one.skipped],
+        points=points,
+        template_id=templates.pop() if len(templates) == 1 else None,
+        combines=[str(one.id) for one in members],
+    )
+    session.add(combined)
+    session.commit()
+    counts = _count_runs(session, combined)
+    return CreatedSweep(
+        id=combined.id,
+        runs=counts.total,
+        skipped=[UncoveredMarket.model_validate(one) for one in combined.skipped],
+    )
+
+
 def launch_holdout(
     session: Session, sweep_id: uuid.UUID, request: CreateHoldout
 ) -> tuple[Sweep, list[Backtest], list[UncoveredMarket]]:
@@ -1074,7 +1179,7 @@ def launch_holdout(
     own, _followers = _points_of(parent)
     runs_of: dict[int, tuple[Backtest, str]] = {}
     candidates: list[Candidate] = []
-    for order, (run, symbol) in enumerate(_runs_of(session, parent.id, done_only=True)):
+    for order, (run, symbol) in enumerate(_runs_of(session, parent, done_only=True)):
         point = own.get(str(run.strategy_id))
         if point is None or run.metrics is None:
             continue
@@ -1179,14 +1284,14 @@ def launch_holdout(
 
 
 def _runs_of(
-    session: Session, sweep_id: uuid.UUID, *, done_only: bool = False
+    session: Session, sweep: Sweep, *, done_only: bool = False
 ) -> list[tuple[Backtest, str]]:
     """A sweep's runs with their market, in launch order, metrics loaded without the heavy
     columns — the curve and the ladder, which neither a choice nor a comparison reads."""
     query = (
         select(Backtest, Instrument.symbol)
         .join(Instrument, Instrument.id == Backtest.instrument_id)
-        .where(Backtest.sweep_id == sweep_id)
+        .where(Backtest.sweep_id.in_(scope_of(sweep)))
         .order_by(Backtest.created_at, Backtest.id)
         .options(
             selectinload(Backtest.metrics).options(
@@ -1224,7 +1329,7 @@ def get_holdout(sweep_id: uuid.UUID, session: SessionDep) -> HoldoutOut:
         if parent is None
         else {
             (run.strategy_id, symbol, run.timeframe): run
-            for run, symbol in _runs_of(session, parent.id)
+            for run, symbol in _runs_of(session, parent)
         }
     )
     own, _followers = _points_of(holdout)
@@ -1238,7 +1343,7 @@ def get_holdout(sweep_id: uuid.UUID, session: SessionDep) -> HoldoutOut:
     }
 
     rows: list[HoldoutRow] = []
-    for run, symbol in _runs_of(session, holdout.id):
+    for run, symbol in _runs_of(session, holdout):
         point = own.get(str(run.strategy_id), {})
         entry_id = str(point.get("entry_id", ""))
         before = chosen_by.get((run.strategy_id, symbol, run.timeframe))
@@ -1338,7 +1443,7 @@ def _finished_test(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=f"only a reserved-window test can be {doing}; test this sweep first",
         )
-    runs = _runs_of(session, test.id)
+    runs = _runs_of(session, test)
     if any(run.status in (BacktestStatus.QUEUED, BacktestStatus.RUNNING) for run, _ in runs):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -1614,20 +1719,24 @@ def get_sweep(
         created_at=sweep.created_at,
         holdout_of=sweep.holdout_of,
         holdout_rule=sweep.holdout_rule,
+        combines=None
+        if sweep.combines is None
+        else [uuid.UUID(str(one)) for one in sweep.combines],
+        template_id=sweep.template_id,
         counts=counts,
         entries=summaries,
         runs=out,
         skipped=[UncoveredMarket.model_validate(one) for one in sweep.skipped],
-        failed_collections=failed_collections(session, Backtest.sweep_id == sweep.id),
+        failed_collections=failed_collections(session, Backtest.sweep_id.in_(scope_of(sweep))),
     )
 
 
-def _count_runs(session: Session, sweep_id: uuid.UUID) -> SweepRunCounts:
+def _count_runs(session: Session, sweep: Sweep) -> SweepRunCounts:
     """The runs per status, counted by Postgres — 14 ms on 51 840 runs (25/09)."""
     counted = dict.fromkeys(BacktestStatus, 0)
     for state, many in session.execute(
         select(Backtest.status, func.count())
-        .where(Backtest.sweep_id == sweep_id)
+        .where(Backtest.sweep_id.in_(scope_of(sweep)))
         .group_by(Backtest.status)
     ):
         counted[state] = many
@@ -1653,7 +1762,7 @@ def _summary(session: Session, sweep: Sweep) -> tuple[SweepRunCounts, list[Sweep
     which were most of those 6.5 s. The entry's name is read live: a shelf label can be renamed,
     and a kept summary must not freeze it.
     """
-    counts = _count_runs(session, sweep.id)
+    counts = _count_runs(session, sweep)
     settled = counts.queued == 0 and counts.running == 0
     names = _entry_names(session, sweep)
     kept = sweep.summary
@@ -1680,7 +1789,7 @@ def _summary(session: Session, sweep: Sweep) -> tuple[SweepRunCounts, list[Sweep
         )
         .join(Instrument, Instrument.id == Backtest.instrument_id)
         .outerjoin(BacktestMetrics, BacktestMetrics.backtest_id == Backtest.id)
-        .where(Backtest.sweep_id == sweep.id)
+        .where(Backtest.sweep_id.in_(scope_of(sweep)))
     ):
         point = coordinates.get(str(strategy_id), {})
         entry_id = str(point.get("entry_id", ""))
@@ -1840,7 +1949,7 @@ def get_sweep_runs(  # noqa: PLR0913 — one query parameter per thing a page is
         for key, point in own.items()
         if entry_id is None or str(point.get("entry_id")) == str(entry_id)
     ]
-    where = (Backtest.sweep_id == sweep.id, Backtest.strategy_id.in_(strategies))
+    where = (Backtest.sweep_id.in_(scope_of(sweep)), Backtest.strategy_id.in_(strategies))
     total = session.scalar(select(func.count()).select_from(Backtest).where(*where)) or 0
     rows = session.execute(
         select(Backtest, Strategy, Instrument)
@@ -1878,6 +1987,14 @@ def get_sweep_runs(  # noqa: PLR0913 — one query parameter per thing a page is
             for run, strategy, instrument in rows
         ],
     )
+
+
+def scope_of(sweep: Sweep) -> list[uuid.UUID]:
+    """The sweeps whose runs are this sweep's: itself, or — for a combination (26/09) — the
+    sweeps it reads together. Every read of a sweep's runs filters on this, never on the id."""
+    if sweep.combines:
+        return [uuid.UUID(str(one)) for one in sweep.combines]
+    return [sweep.id]
 
 
 def _points_of(sweep: Sweep) -> tuple[dict[str, _Point], dict[str, list[_Point]]]:
@@ -1925,7 +2042,7 @@ def _read_sweep(
         select(Backtest, Strategy, Instrument)
         .join(Strategy, Strategy.id == Backtest.strategy_id)
         .join(Instrument, Instrument.id == Backtest.instrument_id)
-        .where(Backtest.sweep_id == sweep.id)
+        .where(Backtest.sweep_id.in_(scope_of(sweep)))
         .order_by(Backtest.created_at, Strategy.name, Instrument.symbol)
         # ⚠️ **The curve is deferred, and on this endpoint that is not an optimisation.** The
         # screen polls it every few seconds while the runs land, and each response carries every

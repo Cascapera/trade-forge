@@ -2469,6 +2469,114 @@ class TestTemplatesRunMarketByMarket:
         assert template["id"] in [one["id"] for one in listed]
 
 
+class TestSweepsReadTogether:
+    """26/09: a template's markets, run one at a time, read together as one sweep."""
+
+    def two_markets(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> tuple[str, str, str]:
+        """One entry of three points, run once over EURUSD and once over GBPUSD, both finished;
+        nets 100..300 by period on EURUSD and 1000..3000 on GBPUSD."""
+        entry = an_entry(
+            client, name=f"together {uuid.uuid4()}", grid={"setup.params.period": [5, 7, 9]}
+        )
+        ids = []
+        for symbol, scale in (("EURUSD", 1), ("GBPUSD", 10)):
+            made = client.post("/sweeps", json=a_sweep_body([entry], [symbol], ["H1"]))
+            assert made.status_code == 202, made.text
+            sweep_id = made.json()["id"]
+            for row in client.get(f"/sweeps/{sweep_id}").json()["runs"]:
+                period = row["values"]["setup.params.period"]
+                finish_trading(
+                    session_factory, row["run"]["id"], net=period * 20 * scale, trades=40
+                )
+            ids.append(sweep_id)
+        return entry, ids[0], ids[1]
+
+    def test_a_combination_reads_its_members_runs_as_its_own(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        _entry, eur, gbp = self.two_markets(client, session_factory)
+
+        made = client.post("/sweeps/combine", json={"sweep_ids": [eur, gbp]})
+
+        assert made.status_code == 201, made.text
+        assert made.json()["runs"] == 6
+        combined = made.json()["id"]
+        body = client.get(f"/sweeps/{combined}", params={"runs": "none"}).json()
+        assert body["combines"] == [eur, gbp]
+        assert body["symbols"] == ["EURUSD", "GBPUSD"]
+        assert body["counts"]["done"] == 6
+        (entry,) = body["entries"]
+        assert entry["aggregate"]["points_finished"] == 6
+        page = client.get(f"/sweeps/{combined}/runs", params={"limit": 10}).json()
+        assert page["total"] == 6
+        assert {row["run"]["symbol"] for row in page["items"]} == {"EURUSD", "GBPUSD"}
+        listed = {one["id"]: one for one in client.get("/sweeps").json()["items"]}
+        assert (listed[combined]["combines"], listed[combined]["runs"]["done"]) == (2, 6)
+
+    def test_the_second_phase_chooses_across_every_member(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        _entry, eur, gbp = self.two_markets(client, session_factory)
+        combined = client.post("/sweeps/combine", json={"sweep_ids": [eur, gbp]}).json()["id"]
+        window = TestTheReservedWindow()
+
+        test = client.post(f"/sweeps/{combined}/holdout", json=window.after(top_n=1))
+
+        assert test.status_code == 202, test.text
+        runs = client.get(f"/sweeps/{test.json()['id']}").json()["runs"]
+        # The best of each (entry, chart, market): period 9 on both markets.
+        assert sorted(
+            (row["run"]["symbol"], row["values"]["setup.params.period"]) for row in runs
+        ) == [("EURUSD", 9), ("GBPUSD", 9)]
+        compared = client.get(f"/sweeps/{test.json()['id']}/holdout").json()
+        assert all(row["in_sample"] is not None for row in compared["rows"])
+
+    def test_the_dashboard_does_not_count_a_combination_again(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        sweeps_router._DASHBOARD.clear()
+        _entry, eur, gbp = self.two_markets(client, session_factory)
+        before = client.get("/sweeps/dashboard").json()["totals"]
+
+        client.post("/sweeps/combine", json={"sweep_ids": [eur, gbp]})
+        after = client.get("/sweeps/dashboard").json()["totals"]
+
+        assert before == after
+
+    def test_only_finished_sweeps_that_asked_the_same_question_combine(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        entry, eur, gbp = self.two_markets(client, session_factory)
+        other_window = client.post(
+            "/sweeps",
+            json={
+                **a_sweep_body([entry], ["USDJPY"], ["H1"]),
+                "date_to": (START + 50 * HOUR).isoformat(),
+            },
+        ).json()["id"]
+        running = client.post("/sweeps", json=a_sweep_body([entry], ["USDJPY"], ["H1"])).json()[
+            "id"
+        ]
+        window = TestTheReservedWindow()
+        test = client.post(f"/sweeps/{eur}/holdout", json=window.after()).json()["id"]
+
+        different = client.post("/sweeps/combine", json={"sweep_ids": [eur, other_window]})
+        unfinished = client.post("/sweeps/combine", json={"sweep_ids": [eur, running]})
+        of_a_test = client.post("/sweeps/combine", json={"sweep_ids": [eur, test]})
+        alone = client.post("/sweeps/combine", json={"sweep_ids": [eur, eur]})
+        ghost = client.post("/sweeps/combine", json={"sweep_ids": [eur, str(uuid.uuid4())]})
+
+        assert different.status_code == 422
+        assert "different questions" in different.json()["detail"]
+        assert unfinished.status_code == 409
+        assert of_a_test.status_code == 422
+        assert alone.status_code == 422
+        assert ghost.status_code == 404
+        assert client.post("/sweeps/combine", json={"sweep_ids": [eur, gbp]}).status_code == 201
+
+
 class TestTheDashboardIsKept:
     """26/09: the dashboard is computed once per state of what it reads, and read back after."""
 

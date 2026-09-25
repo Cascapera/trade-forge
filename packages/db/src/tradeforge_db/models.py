@@ -1835,6 +1835,11 @@ class Sweep(Base):
     launched on its own. Null too once the template is deleted: the sweep is a measurement of its
     own."""
 
+    combines: Mapped[list[Any] | None] = mapped_column(JSONB, nullable=True)
+    """The sweeps this one reads together, when it is a combination (26/09) — of one template's
+    markets, run one at a time. A combination has no runs of its own: every read of its runs
+    reads theirs (`routers.sweeps.scope_of`). Null for a sweep that ran."""
+
     summary: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     """The per-entry summary as last computed once every run had ended, and the run counts it was
     computed at (`rev_0029`): `{"counts": {...}, "entries": [...]}`. Null until then.
@@ -1867,6 +1872,10 @@ class Sweep(Base):
         ),
         CheckConstraint(
             "summary IS NULL OR jsonb_typeof(summary) = 'object'", name="a_summary_is_an_object"
+        ),
+        CheckConstraint(
+            "combines IS NULL OR jsonb_typeof(combines) = 'array'",
+            name="a_combination_is_a_list",
         ),
         Index("ix_sweeps_created_at", "created_at"),
         Index("ix_sweeps_holdout_of", "holdout_of"),

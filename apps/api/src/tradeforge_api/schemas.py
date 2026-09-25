@@ -2282,6 +2282,8 @@ class ClusterMemberOut(BaseModel):
     """A member as the cluster used it, and what the shared account did with its trades."""
 
     backtest_id: uuid.UUID
+    rerun_of: uuid.UUID | None = None
+    """The run asked for, when it kept no trades and this is its twin run again to keep them."""
     risk_percent: Money
     label: str
     symbol: str

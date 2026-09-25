@@ -59,7 +59,11 @@ export function ClusterResult(): React.JSX.Element {
         </p>
       )}
       {!done && data.status !== 'failed' && (
-        <p className="text-slate-400">Replaying on one account… ({data.status})</p>
+        <p className="text-slate-400">
+          Replaying on one account… ({data.status})
+          {data.members.some((member) => member.rerun_of != null) &&
+            ' — members that kept no trades are being run again first.'}
+        </p>
       )}
 
       {done && (
@@ -121,7 +125,17 @@ export function ClusterResult(): React.JSX.Element {
             const skipped = Object.entries(member.skipped ?? {}).filter(([, many]) => many > 0)
             return (
               <tr key={member.backtest_id} className="border-b border-slate-900">
-                <td className="px-3 py-2">{member.label}</td>
+                <td className="px-3 py-2">
+                  {member.label}
+                  {member.rerun_of != null && (
+                    <span
+                      className="ml-2 rounded bg-slate-800 px-1 text-[10px] text-slate-300"
+                      title={`The run asked for (${member.rerun_of}) kept no trades; this is the same run again, keeping them.`}
+                    >
+                      run again
+                    </span>
+                  )}
+                </td>
                 <td className="px-3 py-2">
                   {member.symbol} {member.timeframe}
                 </td>

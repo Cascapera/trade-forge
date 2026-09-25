@@ -254,7 +254,8 @@ export function Clusters(): React.JSX.Element {
             Add
           </button>
           <span className="text-xs text-slate-500">
-            Or open a reserved-window test and build one from its points.
+            Or open a reserved-window test and build one from its points. A run that kept no trades
+            is run again first, and the cluster waits for it.
           </span>
         </div>
 

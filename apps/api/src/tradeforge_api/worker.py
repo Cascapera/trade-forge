@@ -41,7 +41,7 @@ from tradeforge_api.candle_cache import CandleCache, CandleReader
 from tradeforge_api.cluster_job import process_cluster
 from tradeforge_api.config import RedisConfig, Settings
 from tradeforge_api.grid import coordinates, label_for, read_point
-from tradeforge_api.queue import RUN_BACKTEST, progress_channel, redis_settings
+from tradeforge_api.queue import RUN_BACKTEST, RUN_CLUSTER, progress_channel, redis_settings
 from tradeforge_api.r_metrics import r_metrics
 from tradeforge_api.retention import recorded_for
 from tradeforge_api.runner import ENGINE_VERSION, execute_backtest, instrument_spec
@@ -460,6 +460,9 @@ def _reason(exc: Exception) -> str:
 
 
 WAIT_POLL_SECONDS = 30
+
+CLUSTER_WAIT_SECONDS = 5
+"""How long a cluster waits between looks at its members still running again."""
 """How long a run waiting for its collection sleeps before asking again.
 
 A collection advances one calendar year at a time and a cold year takes minutes on this broker,
@@ -658,11 +661,15 @@ async def run_walk_forward(ctx: dict[str, Any], walk_forward_id: str) -> None:
 
 
 async def run_cluster(ctx: dict[str, Any], cluster_id: str) -> None:
-    """Replay one cluster's members on a shared account (`cluster_job`). Runs no engine."""
+    """Replay one cluster's members on a shared account (`cluster_job`). Runs no engine.
+
+    A member run again to keep its trades may not have finished: the job then asks again a few
+    seconds later — a new job id each time, since arq will not requeue one it is still holding.
+    """
     session: Session = ctx["session_factory"]()
     settings: Settings = ctx["settings"]
     try:
-        process_cluster(
+        waiting = process_cluster(
             session=session,
             parquet_root=settings.parquet_root,
             cluster_id=uuid.UUID(cluster_id),
@@ -670,6 +677,10 @@ async def run_cluster(ctx: dict[str, Any], cluster_id: str) -> None:
         )
     finally:
         session.close()
+    if waiting:
+        await ctx["redis"].enqueue_job(
+            RUN_CLUSTER, cluster_id, _defer_by=dt.timedelta(seconds=CLUSTER_WAIT_SECONDS)
+        )
 
 
 async def startup(ctx: dict[str, Any]) -> None:

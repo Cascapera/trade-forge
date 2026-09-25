@@ -12,7 +12,12 @@ vi.mock('../api/client', async () => {
   // The judgements below the comparison have their own test (`HoldoutSlicings.test`).
   return {
     ...actual,
-    api: { ...actual.api, getHoldout: vi.fn(), listSlicings: vi.fn().mockResolvedValue([]) },
+    api: {
+      ...actual.api,
+      getHoldout: vi.fn(),
+      listSlicings: vi.fn().mockResolvedValue([]),
+      listMonteCarlos: vi.fn().mockResolvedValue([]),
+    },
   }
 })
 

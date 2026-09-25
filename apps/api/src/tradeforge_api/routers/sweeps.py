@@ -22,6 +22,7 @@ did — which is why a hole is always written down, never merely left.
 """
 
 import json
+import secrets
 import uuid
 from collections.abc import Callable, Iterable
 from decimal import Decimal
@@ -46,6 +47,7 @@ from tradeforge_api.holdout import (
     overlaps,
     positive_share,
 )
+from tradeforge_api.montecarlo import Spread, observed, simulate
 from tradeforge_api.queue import COLLECT_QUEUE, COLLECT_RANGE, RUN_BACKTEST
 from tradeforge_api.retention import MIN_TRADES
 from tradeforge_api.routers.backtests import failed_collections, list_item
@@ -55,6 +57,7 @@ from tradeforge_api.runner import ENGINE_VERSION, build_cost_model, swap_rates
 from tradeforge_api.schemas import (
     CreatedSweep,
     CreateHoldout,
+    CreateMonteCarlo,
     CreateSlicing,
     CreateSweep,
     DatasetColumnOut,
@@ -65,12 +68,16 @@ from tradeforge_api.schemas import (
     HoldoutOut,
     HoldoutRow,
     HoldoutSide,
+    MonteCarloOut,
+    MonteCarloPoint,
     PlannedCollection,
     PreviewSweepRequest,
+    SimulatedOut,
     SlicedGroup,
     SlicedPoint,
     SliceOut,
     SlicingOut,
+    SpreadOut,
     SweepDashboardOut,
     SweepEntryOut,
     SweepEntryPreview,
@@ -110,6 +117,7 @@ from tradeforge_db.models import (
     SliceMode,
     Strategy,
     Sweep,
+    SweepMonteCarlo,
     SweepSlicing,
     Trade,
 )
@@ -1150,6 +1158,50 @@ def _slicing_out(row: SweepSlicing) -> SlicingOut:
     )
 
 
+def _finished_test(
+    session: Session, sweep_id: uuid.UUID, *, doing: str
+) -> tuple[Sweep, list[tuple[Backtest, str]]]:
+    """A reserved-window test whose every run has finished, and its finished runs.
+
+    ⚠️ **Refused for a sweep that is not such a test** — its runs were not chosen on other data,
+    and analysing them would dress an in-sample result as a second opinion — **and for a test
+    still running**, whose answer would silently leave out the runs not yet finished.
+    """
+    test = session.get(Sweep, sweep_id)
+    if test is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="sweep not found")
+    if test.holdout_rule is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=f"only a reserved-window test can be {doing}; test this sweep first",
+        )
+    runs = _runs_of(session, test.id)
+    if any(run.status in (BacktestStatus.QUEUED, BacktestStatus.RUNNING) for run, _ in runs):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="the test is still running: wait until every run has finished",
+        )
+    return test, [(run, symbol) for run, symbol in runs if run.status == BacktestStatus.DONE]
+
+
+def _trades_of(
+    session: Session, runs: list[tuple[Backtest, str]]
+) -> dict[uuid.UUID, list[ClosedTrade]]:
+    """Every closed trade of `runs` in one query, in entry order, with only what slicing and
+    resampling read: when it was entered and its R."""
+    found: dict[uuid.UUID, list[ClosedTrade]] = {}
+    for backtest_id, entry_time, r in session.execute(
+        select(Trade.backtest_id, Trade.entry_time, Trade.r_multiple)
+        .where(
+            Trade.backtest_id.in_([run.id for run, _ in runs]),
+            Trade.exit_time.is_not(None),
+        )
+        .order_by(Trade.backtest_id, Trade.entry_time, Trade.id)
+    ):
+        found.setdefault(backtest_id, []).append(ClosedTrade(entry_time=entry_time, r=r))
+    return found
+
+
 @router.post(
     "/sweeps/{sweep_id}/slicings",
     response_model=SlicingOut,
@@ -1165,31 +1217,8 @@ def create_slicing(sweep_id: uuid.UUID, request: CreateSlicing, session: Session
     would dress an in-sample result as a second opinion — and for a test still running, whose
     verdict would silently leave out the runs not yet finished.
     """
-    test = session.get(Sweep, sweep_id)
-    if test is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="sweep not found")
-    if test.holdout_rule is None:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="only a reserved-window test can be judged in pieces; test this sweep first",
-        )
-    runs = _runs_of(session, test.id)
-    if any(run.status in (BacktestStatus.QUEUED, BacktestStatus.RUNNING) for run, _ in runs):
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="the test is still running: judge it once every run has finished",
-        )
-    done = [(run, symbol) for run, symbol in runs if run.status == BacktestStatus.DONE]
-
-    # One query for every trade of every run, only the two columns a slice reads.
-    trades_of: dict[uuid.UUID, list[ClosedTrade]] = {}
-    for backtest_id, entry_time, r in session.execute(
-        select(Trade.backtest_id, Trade.entry_time, Trade.r_multiple).where(
-            Trade.backtest_id.in_([run.id for run, _ in done]),
-            Trade.exit_time.is_not(None),
-        )
-    ):
-        trades_of.setdefault(backtest_id, []).append(ClosedTrade(entry_time=entry_time, r=r))
+    test, done = _finished_test(session, sweep_id, doing="judged in pieces")
+    trades_of = _trades_of(session, done)
 
     own, _followers = _points_of(test)
     names = _entry_names(session, test)
@@ -1278,6 +1307,104 @@ def list_slicings(sweep_id: uuid.UUID, session: SessionDep) -> list[SlicingOut]:
         .order_by(SweepSlicing.created_at.desc(), SweepSlicing.id)
     )
     return [_slicing_out(row) for row in rows]
+
+
+def _montecarlo_out(row: SweepMonteCarlo) -> MonteCarloOut:
+    return MonteCarloOut(
+        id=row.id,
+        sweep_id=row.sweep_id,
+        paths=row.paths,
+        seed=row.seed,
+        created_at=row.created_at,
+        points=[MonteCarloPoint.model_validate(one) for one in row.result["points"]],
+    )
+
+
+def _spread_out(spread: Spread) -> SpreadOut:
+    return SpreadOut(p5=spread.p5, p50=spread.p50, p95=spread.p95, p99=spread.p99)
+
+
+@router.post(
+    "/sweeps/{sweep_id}/montecarlos",
+    response_model=MonteCarloOut,
+    status_code=status.HTTP_201_CREATED,
+    responses={**_NOT_FOUND, **_BAD_BODY},
+)
+def create_montecarlo(
+    sweep_id: uuid.UUID, request: CreateMonteCarlo, session: SessionDep
+) -> MonteCarloOut:
+    """Resample every point of a finished reserved-window test and keep the answer (25/09).
+
+    Each point's trades are drawn with replacement into `paths` paths (`montecarlo.simulate`),
+    from a generator seeded by the request's seed and the run's id: repeatable, and no point's
+    draws depend on another's. Runs nothing — the test keeps its trades — but takes seconds on a
+    large test, which is why it is started by hand and kept.
+    """
+    test, done = _finished_test(session, sweep_id, doing="resampled")
+    trades_of = _trades_of(session, done)
+    seed = request.seed or secrets.token_hex(8)
+    own, _followers = _points_of(test)
+    names = _entry_names(session, test)
+
+    points: list[MonteCarloPoint] = []
+    for run, symbol in done:
+        point = own.get(str(run.strategy_id), {})
+        entry_id = str(point.get("entry_id", ""))
+        kept = run.recorded is not Recorded.METRICS
+        rs = [one.r for one in trades_of.get(run.id, []) if one.r is not None]
+        seen = observed(rs)
+        simulated = simulate(rs, paths=request.paths, seed=f"{seed}:{run.id}") if kept else None
+        points.append(
+            MonteCarloPoint(
+                run_id=run.id,
+                entry_id=entry_id,
+                entry_name=names.get(entry_id),
+                symbol=symbol,
+                timeframe=run.timeframe,
+                label=str(point.get("label", "")),
+                trades_kept=kept,
+                trades=len(rs),
+                observed_net_r=seen.net_r,
+                observed_drawdown_r=seen.drawdown_r,
+                observed_losing_streak=seen.losing_streak,
+                simulated=None
+                if simulated is None
+                else SimulatedOut(
+                    paths=simulated.paths,
+                    trades=simulated.trades,
+                    drawdown_r=_spread_out(simulated.drawdown_r),
+                    losing_streak=_spread_out(simulated.losing_streak),
+                    net_r=_spread_out(simulated.net_r),
+                    negative_share=simulated.negative_share,
+                ),
+            )
+        )
+
+    row = SweepMonteCarlo(
+        sweep_id=test.id,
+        paths=request.paths,
+        seed=seed,
+        result={"points": [one.model_dump(mode="json") for one in points]},
+    )
+    session.add(row)
+    session.commit()
+    session.refresh(row)
+    return _montecarlo_out(row)
+
+
+@router.get(
+    "/sweeps/{sweep_id}/montecarlos", response_model=list[MonteCarloOut], responses=_NOT_FOUND
+)
+def list_montecarlos(sweep_id: uuid.UUID, session: SessionDep) -> list[MonteCarloOut]:
+    """Every resampling kept for this test, newest first."""
+    if session.get(Sweep, sweep_id) is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="sweep not found")
+    rows = session.scalars(
+        select(SweepMonteCarlo)
+        .where(SweepMonteCarlo.sweep_id == sweep_id)
+        .order_by(SweepMonteCarlo.created_at.desc(), SweepMonteCarlo.id)
+    )
+    return [_montecarlo_out(row) for row in rows]
 
 
 @router.get("/sweeps/{sweep_id}", response_model=SweepOut, responses=_NOT_FOUND)

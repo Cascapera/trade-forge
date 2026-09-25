@@ -2019,6 +2019,87 @@ class TestChoosingByRiskInR:
         assert "before 25/09 has no risk in R" in refused.json()["detail"]
 
 
+class TestResamplingATest:
+    """25/09: a finished reserved-window test's points resampled by hand, and the answer kept."""
+
+    def a_finished_test(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> tuple[str, dict[int, str]]:
+        """Period 13 kept 25 trades (+1, +1, -1 repeating, then +1); 11 lost and kept none."""
+        window = TestTheReservedWindow()
+        sweep_id, _runs = window.swept(client, session_factory)
+        test_id = client.post(f"/sweeps/{sweep_id}/holdout", json=window.after()).json()["id"]
+        runs = {
+            row["values"]["setup.params.period"]: row["run"]["id"]
+            for row in client.get(f"/sweeps/{test_id}").json()["runs"]
+        }
+        finish_trading(session_factory, runs[13], net=900, trades=25)
+        trade_in(session_factory, runs[13], ["1", "1", "-1"] * 8 + ["1"], first=START + 210 * HOUR)
+        finish_trading(session_factory, runs[11], net=-80, trades=4)
+        with session_factory() as session:
+            lost = session.get(Backtest, uuid.UUID(runs[11]))
+            assert lost is not None
+            lost.recorded = Recorded.METRICS
+            session.commit()
+        return test_id, runs
+
+    def test_each_point_is_resampled_beside_what_happened_and_the_answer_is_kept(
+        self, client: Any, session_factory: Callable[[], Session], queue: _CapturingQueue
+    ) -> None:
+        test_id, runs = self.a_finished_test(client, session_factory)
+        queued = len(queue.jobs)
+
+        made = client.post(f"/sweeps/{test_id}/montecarlos", json={"paths": 200, "seed": "x"})
+
+        assert made.status_code == 201, made.text
+        assert len(queue.jobs) == queued, "resampling reads stored trades; it queues nothing"
+        body = made.json()
+        assert (body["paths"], body["seed"]) == (200, "x")
+        points = {one["run_id"]: one for one in body["points"]}
+        good = points[runs[13]]
+        # What happened: +9 R; the one-loss dips never go deeper than 1 R; streaks of one.
+        assert (good["trades"], Decimal(good["observed_net_r"])) == (25, Decimal(9))
+        assert Decimal(good["observed_drawdown_r"]) == Decimal(1)
+        assert good["observed_losing_streak"] == 1
+        simulated = good["simulated"]
+        assert (simulated["paths"], simulated["trades"]) == (200, 25)
+        # Drawn with replacement, some path meets losses back to back that never happened.
+        assert Decimal(simulated["losing_streak"]["p99"]) >= 2
+        assert Decimal(simulated["drawdown_r"]["p99"]) >= Decimal(simulated["drawdown_r"]["p50"])
+        lost = points[runs[11]]
+        assert (lost["trades_kept"], lost["simulated"]) == (False, None)
+
+        kept = client.get(f"/sweeps/{test_id}/montecarlos").json()
+        assert [one["id"] for one in kept] == [body["id"]]
+
+    def test_the_same_seed_gives_the_same_answer_and_a_blank_one_is_drawn_and_kept(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        test_id, runs = self.a_finished_test(client, session_factory)
+
+        first = client.post(f"/sweeps/{test_id}/montecarlos", json={"paths": 150, "seed": "s"})
+        again = client.post(f"/sweeps/{test_id}/montecarlos", json={"paths": 150, "seed": "s"})
+        drawn = client.post(f"/sweeps/{test_id}/montecarlos", json={"paths": 150})
+
+        def simulated(response: Any) -> Any:
+            return {one["run_id"]: one for one in response.json()["points"]}[runs[13]]["simulated"]
+
+        assert simulated(first) == simulated(again)
+        assert drawn.json()["seed"] not in ("", None)
+
+    def test_only_a_finished_reserved_window_test_is_resampled(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        window = TestTheReservedWindow()
+        sweep_id, _runs = window.swept(client, session_factory)
+
+        assert client.post(f"/sweeps/{sweep_id}/montecarlos", json={}).status_code == 422
+        test_id = client.post(f"/sweeps/{sweep_id}/holdout", json=window.after()).json()["id"]
+        assert client.post(f"/sweeps/{test_id}/montecarlos", json={}).status_code == 409
+        assert client.post(f"/sweeps/{test_id}/montecarlos", json={"paths": 50}).status_code == 422
+        assert client.get(f"/sweeps/{uuid.uuid4()}/montecarlos").status_code == 404
+
+
 class TestJudgingATestInPieces:
     """His ask (25/09): cut a finished reserved-window test by year or into blocks of trades, by
     hand, and keep the answer."""

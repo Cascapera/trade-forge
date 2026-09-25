@@ -8,6 +8,7 @@ import { Results } from './screens/Results'
 import { LaunchStudy } from './screens/LaunchStudy'
 import { ClusterResult } from './screens/ClusterResult'
 import { Clusters } from './screens/Clusters'
+import { SweepWalkForwardResult } from './screens/SweepWalkForwardResult'
 import { LaunchSweep } from './screens/LaunchSweep'
 import { LiveSessions } from './screens/LiveSessions'
 import { RunLog } from './screens/RunLog'
@@ -162,6 +163,7 @@ export function App(): React.JSX.Element {
             <Route path="/sweeps/:id" element={<SweepResult />} />
             <Route path="/walkforwards/:id" element={<WalkForwardResult />} />
             <Route path="/clusters" element={<Clusters />} />
+            <Route path="/sweep-walkforwards/:id" element={<SweepWalkForwardResult />} />
             <Route path="/clusters/:id" element={<ClusterResult />} />
             <Route path="/collect" element={<CollectSymbol />} />
             <Route path="/runs" element={<RunLog />} />

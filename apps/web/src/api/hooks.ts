@@ -30,6 +30,9 @@ import type {
   ClusterOut,
   CreateClusterRequest,
   CreateHoldoutRequest,
+  CreateSweepWalkForwardRequest,
+  CreatedSweepWalkForward,
+  SweepWalkForwardOut,
   CreateMonteCarloRequest,
   CreateSlicingRequest,
   CreateSweepRequest,
@@ -668,6 +671,34 @@ export function useCreateSlicing(id: string) {
     mutationFn: (payload) => api.createSlicing(id, payload),
     onSuccess: () => {
       void client.invalidateQueries({ queryKey: ['slicings', id] })
+    },
+  })
+}
+
+/** Every walk-forward of a sweep, newest first. */
+export function useSweepWalkForwards(sweepId: string) {
+  return useQuery<SweepWalkForwardOut[]>({
+    queryKey: ['sweep-walkforwards', sweepId],
+    queryFn: () => api.listSweepWalkForwards(sweepId),
+  })
+}
+
+/** One walk-forward, polled until every fold has ended. */
+export function useSweepWalkForward(id: string | undefined) {
+  return useQuery<SweepWalkForwardOut>({
+    queryKey: ['sweep-walkforward', id],
+    queryFn: id === undefined ? skipToken : () => api.getSweepWalkForward(id),
+    refetchInterval: (query) => (isTerminal(query.state.data?.status) ? false : STUDY_POLL_MS * 5),
+  })
+}
+
+/** Launch a sweep's walk-forward. */
+export function useCreateSweepWalkForward(sweepId: string) {
+  const client = useQueryClient()
+  return useMutation<CreatedSweepWalkForward, Error, CreateSweepWalkForwardRequest>({
+    mutationFn: (payload) => api.createSweepWalkForward(sweepId, payload),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: ['sweep-walkforwards', sweepId] })
     },
   })
 }

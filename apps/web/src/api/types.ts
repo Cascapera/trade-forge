@@ -1454,6 +1454,69 @@ export interface ClusterListItem {
   max_drawdown_pct: string | null
 }
 
+/** Walk a finished sweep forward (25/09): whole-year windows and each fold's choice rule. */
+export interface CreateSweepWalkForwardRequest {
+  start_year: number
+  train_years: number
+  test_years: number
+  folds: number
+  anchored: boolean
+  top_n: number
+  metric: HoldoutRank
+  min_trades?: Record<string, number>
+  max_drawdown_r?: string
+  min_positive_year_share?: string
+}
+
+export interface CreatedSweepWalkForward {
+  id: string
+  folds: number
+  /** Training runs queued now; each fold's test runs are queued when its training ends. */
+  runs: number
+}
+
+export type WalkForwardStage = 'training' | 'testing' | 'done' | 'failed'
+
+export interface SweepWalkForwardFold {
+  index: number
+  train_from: string
+  train_to: string
+  test_from: string
+  test_to: string
+  train_sweep_id: string | null
+  test_sweep_id: string | null
+  stage: WalkForwardStage
+  error: string | null
+}
+
+export interface SweepWalkForwardGroup {
+  entry_id: string
+  entry_name: string | null
+  timeframe: string
+  /** Per fold, in order: the out-of-sample median return; null where there is no test. */
+  medians: (string | null)[]
+  folds: number
+  positive_folds: number
+  most_chosen: string | null
+  most_chosen_folds: number
+}
+
+export interface SweepWalkForwardOut {
+  id: string
+  parent_sweep_id: string | null
+  start_year: number
+  train_years: number
+  test_years: number
+  anchored: boolean
+  rule: Record<string, unknown>
+  status: BacktestStatus
+  error: string | null
+  created_at: string
+  finished_at: string | null
+  folds: SweepWalkForwardFold[]
+  groups: SweepWalkForwardGroup[]
+}
+
 export interface SweepOut {
   id: string
   entry_ids: string[]

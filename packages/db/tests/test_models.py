@@ -58,6 +58,8 @@ EXPECTED_TABLES = {
     "sweep_slicings",
     # A test's points resampled, kept with the seed that makes it repeatable (rev_0028).
     "sweep_montecarlos",
+    # Several finished runs replayed on one shared account (rev_0030).
+    "clusters",
     "walk_forwards",
     "walk_forward_folds",
     "backtests",

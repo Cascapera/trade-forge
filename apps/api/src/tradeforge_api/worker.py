@@ -38,6 +38,7 @@ from sqlalchemy.exc import DBAPIError, OperationalError
 from sqlalchemy.orm import Session
 
 from tradeforge_api.candle_cache import CandleCache, CandleReader
+from tradeforge_api.cluster_job import process_cluster
 from tradeforge_api.config import RedisConfig, Settings
 from tradeforge_api.grid import coordinates, label_for, read_point
 from tradeforge_api.queue import RUN_BACKTEST, progress_channel, redis_settings
@@ -656,6 +657,21 @@ async def run_walk_forward(ctx: dict[str, Any], walk_forward_id: str) -> None:
         session.close()
 
 
+async def run_cluster(ctx: dict[str, Any], cluster_id: str) -> None:
+    """Replay one cluster's members on a shared account (`cluster_job`). Runs no engine."""
+    session: Session = ctx["session_factory"]()
+    settings: Settings = ctx["settings"]
+    try:
+        process_cluster(
+            session=session,
+            parquet_root=settings.parquet_root,
+            cluster_id=uuid.UUID(cluster_id),
+            read=ctx["candles"].read,
+        )
+    finally:
+        session.close()
+
+
 async def startup(ctx: dict[str, Any]) -> None:
     settings = Settings()
     engine = create_db_engine(settings.sqlalchemy_dsn)
@@ -675,7 +691,7 @@ class WorkerSettings:
 
     # `run_backtest` spends the last try itself, so arq must be told the same number — stated on
     # that function alone. The walk-forward keeps arq's default: it does not raise `Retry`.
-    functions = (func(run_backtest, max_tries=MAX_TRIES), run_walk_forward)
+    functions = (func(run_backtest, max_tries=MAX_TRIES), run_walk_forward, run_cluster)
     # Built from RedisConfig, not Settings: this line runs at import, and importing the worker
     # must not require the Postgres password. The DB config is read later, in `startup`.
     redis_settings = redis_settings(RedisConfig())

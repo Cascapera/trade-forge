@@ -2247,6 +2247,89 @@ class MonteCarloOut(BaseModel):
     points: list[MonteCarloPoint]
 
 
+class ClusterMemberIn(BaseModel):
+    """One finished run in a cluster, and the risk its trades are sized by."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    backtest_id: uuid.UUID
+    risk_percent: Decimal | None = Field(default=None, gt=0, le=100)
+    """Percent of the shared balance each trade risks. Blank takes the member's own document's
+    (`risk.sizing.params.percent`)."""
+
+
+class CreateCluster(BaseModel):
+    """Replay several finished runs on one shared account (25/09)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=200)
+    members: list[ClusterMemberIn] = Field(min_length=1, max_length=200)
+    initial_capital: Decimal = Field(default=Decimal(10000), gt=0)
+    max_open_positions: int = Field(default=5, ge=1, le=1000)
+    max_open_risk_percent: Decimal = Field(default=Decimal(5), gt=0, le=100)
+
+    @field_validator("members")
+    @classmethod
+    def _each_run_once(cls, members: list[ClusterMemberIn]) -> list[ClusterMemberIn]:
+        seen = [one.backtest_id for one in members]
+        if len(set(seen)) != len(seen):
+            raise ValueError("a run can be a member once: its trades would be replayed twice")
+        return members
+
+
+class ClusterMemberOut(BaseModel):
+    """A member as the cluster used it, and what the shared account did with its trades."""
+
+    backtest_id: uuid.UUID
+    risk_percent: Money
+    label: str
+    symbol: str
+    timeframe: str
+    offered: int | None = None
+    taken: int | None = None
+    skipped: dict[str, int] | None = None
+    """Why trades were not taken: `positions`, `risk`, `no_stop`, `empty`."""
+    net_pnl: Money | None = None
+
+
+class ClusterPointOut(BaseModel):
+    time: dt.datetime
+    balance: Money
+    equity: Money
+
+
+class ClusterOut(BaseModel):
+    id: uuid.UUID
+    name: str
+    status: str
+    error: str | None
+    initial_capital: Money
+    max_open_positions: int
+    max_open_risk_percent: Money
+    created_at: dt.datetime
+    finished_at: dt.datetime | None
+    members: list[ClusterMemberOut]
+    final_balance: Money | None = None
+    net_return: Money | None = None
+    max_drawdown_pct: Money | None = None
+    max_drawdown_abs: Money | None = None
+    most_open: int | None = None
+    yearly_return: dict[str, Money] | None = None
+    curve: list[ClusterPointOut] | None = None
+    """The marked equity at the end of each day. The drawdown was measured on every point."""
+
+
+class ClusterListItem(BaseModel):
+    id: uuid.UUID
+    name: str
+    status: str
+    members: int
+    created_at: dt.datetime
+    net_return: Money | None = None
+    max_drawdown_pct: Money | None = None
+
+
 class SweepOut(BaseModel):
     """A sweep read back: the question that was asked, and every run it became."""
 

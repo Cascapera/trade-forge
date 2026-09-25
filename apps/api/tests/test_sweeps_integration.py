@@ -31,6 +31,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import Engine, event, select
 from sqlalchemy.orm import Session
 
+from tradeforge_api.cluster_job import process_cluster
 from tradeforge_api.config import Settings
 from tradeforge_api.main import create_app
 from tradeforge_api.queue import COLLECT_QUEUE, COLLECT_RANGE, RUN_BACKTEST
@@ -1967,6 +1968,101 @@ def trade_in(
                 )
             )
         session.commit()
+
+
+class TestClusters:
+    """25/09: several finished runs replayed on one shared account (`cluster`)."""
+
+    def members(self, client: Any, session_factory: Callable[[], Session]) -> dict[int, str]:
+        """Three finished runs of periods 5, 7, 9. Period 5 and 7 kept their trades — +1 R, then
+        -1 R a day apart, overlapping each other; 9 kept only its metrics."""
+        entry = an_entry(
+            client, name=f"clustered {uuid.uuid4()}", grid={"setup.params.period": [5, 7, 9]}
+        )
+        sweep_id = client.post("/sweeps", json=a_sweep_body([entry], ["EURUSD"], ["H1"])).json()[
+            "id"
+        ]
+        runs = {
+            row["values"]["setup.params.period"]: row["run"]["id"]
+            for row in client.get(f"/sweeps/{sweep_id}").json()["runs"]
+        }
+        for period in (5, 7, 9):
+            finish_trading(session_factory, runs[period], net=100, trades=2)
+        trade_in(session_factory, runs[5], ["1", "-1"], first=START)
+        trade_in(session_factory, runs[7], ["1", "-1"], first=START + 12 * HOUR)
+        with session_factory() as session:
+            thin = session.get(Backtest, uuid.UUID(runs[9]))
+            assert thin is not None
+            thin.recorded = Recorded.METRICS
+            session.commit()
+        return runs
+
+    def test_a_cluster_is_kept_queued_and_replayed_on_one_account(
+        self, client: Any, session_factory: Callable[[], Session], queue: _CapturingQueue
+    ) -> None:
+        runs = self.members(client, session_factory)
+
+        made = client.post(
+            "/clusters",
+            json={
+                "name": "two on one",
+                "members": [
+                    {"backtest_id": runs[5], "risk_percent": "1"},
+                    {"backtest_id": runs[7], "risk_percent": "2"},
+                ],
+            },
+        )
+
+        assert made.status_code == 202, made.text
+        body = made.json()
+        assert (body["status"], body["max_open_positions"]) == ("queued", 5)
+        assert [one["risk_percent"] for one in body["members"]] == ["1", "2"]
+        assert queue.jobs[-1][0] == "run_cluster"
+
+        # The worker's side, with no bars: nothing to mark, so the curve is the booked balance.
+        # By hand, one trade an hour long each, 00:00 for member 0 and 12:00 for member 1, a day
+        # apart: +100 (1% of 10 000) → 10 100; +202 (2% of 10 100) → 10 302; -103.02 (1% of
+        # 10 302) → 10 198.98; -203.9796 (2% of 10 198.98) → 9 995.0004. Never two open at once.
+        with session_factory() as session:
+            process_cluster(
+                session=session,
+                parquet_root=Path("unused"),
+                cluster_id=uuid.UUID(body["id"]),
+                read=lambda _root, _symbol, _timeframe: [],
+            )
+        read = client.get(f"/clusters/{body['id']}").json()
+
+        assert read["status"] == "done", read["error"]
+        assert [(one["offered"], one["taken"]) for one in read["members"]] == [(2, 2), (2, 2)]
+        assert Decimal(read["final_balance"]) == Decimal("9995.0004")
+        assert [Decimal(one["net_pnl"]) for one in read["members"]] == [
+            Decimal("-3.02"),
+            Decimal("-1.9796"),
+        ]
+        assert read["most_open"] == 1
+        assert read["curve"], "a replay with trades has a curve"
+        assert client.get("/clusters").json()[0]["id"] == body["id"]
+
+    def test_members_that_cannot_be_replayed_are_refused_by_name(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        runs = self.members(client, session_factory)
+        ghost = str(uuid.uuid4())
+
+        refused = client.post(
+            "/clusters",
+            json={"name": "x", "members": [{"backtest_id": runs[9]}, {"backtest_id": ghost}]},
+        )
+        twice = client.post(
+            "/clusters",
+            json={"name": "x", "members": [{"backtest_id": runs[5]}, {"backtest_id": runs[5]}]},
+        )
+
+        assert refused.status_code == 422
+        assert "kept no trades" in refused.json()["detail"]
+        assert f"{ghost}: no such run" in refused.json()["detail"]
+        assert twice.status_code == 422
+        assert client.get(f"/clusters/{uuid.uuid4()}").status_code == 404
 
 
 class TestTheSummaryIsKept:

@@ -1941,3 +1941,52 @@ class SweepMonteCarlo(Base):
         CheckConstraint("jsonb_typeof(result) = 'object'", name="a_montecarlo_result_is_an_object"),
         Index("ix_sweep_montecarlos_sweep_id", "sweep_id"),
     )
+
+
+class Cluster(Base):
+    """Several finished runs replayed on ONE account (25/09, option A — `cluster`).
+
+    The engine runs one strategy on one market with one position at a time (ADR-0019), so a
+    portfolio of setups is not run again: each member's kept trades are replayed in time on a
+    shared balance, sized by the member's risk %, under the portfolio's limits, with open
+    positions marked on the member's own bars. What the replay found is kept in `result`.
+
+    ⚠️ **Members by run, and their risk % kept here.** The member's own document gives the default
+    (`risk.sizing.params.percent`); what was used is stored, because a cluster re-read later must
+    say what it sized by, not what the documents say today.
+    """
+
+    __tablename__ = "clusters"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    initial_capital: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    max_open_positions: Mapped[int] = mapped_column(Integer, nullable=False)
+    max_open_risk_percent: Mapped[Decimal] = mapped_column(RATIO, nullable=False)
+    """In percent, like a strategy's own risk: 5 is 5% of the balance at risk across the open."""
+
+    members: Mapped[list[Any]] = mapped_column(JSONB, nullable=False)
+    """`[{"backtest_id": "...", "risk_percent": "1"}, ...]` in the order they tie-break in."""
+
+    status: Mapped[BacktestStatus] = mapped_column(
+        _enum(BacktestStatus, "cluster_status"), nullable=False
+    )
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    result: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+
+    created_at: Mapped[dt.datetime] = _created_at()
+    finished_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint("initial_capital > 0", name="cluster_capital_positive"),
+        CheckConstraint("max_open_positions >= 1", name="at_least_one_open_position"),
+        CheckConstraint(
+            "max_open_risk_percent > 0 AND max_open_risk_percent <= 100",
+            name="open_risk_is_a_percent",
+        ),
+        CheckConstraint("jsonb_typeof(members) = 'array'", name="members_are_a_list"),
+        CheckConstraint(
+            "result IS NULL OR jsonb_typeof(result) = 'object'", name="cluster_result_is_an_object"
+        ),
+        Index("ix_clusters_created_at", "created_at"),
+    )

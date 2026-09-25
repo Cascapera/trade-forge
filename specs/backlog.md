@@ -2755,3 +2755,31 @@ Pendências:
   para depois de o fatiamento mostrar se vale o custo.
 - O ano reservado é outro teste fora da amostra da mesma varredura. Nada impede, ainda, que ele
   seja lançado antes da hora; hoje isso depende da disciplina.
+
+## Operar contra setups consistentemente ruins (25/09) — PENDENTE, para o FINAL, com tudo pronto
+
+Pergunta dele: se vários setups perdem muito (80–90%), dá para inverter a entrada e operar contra
+eles? Combinado: fica para o fim do projeto, depois de seleção, walk-forward e cluster prontos.
+
+Por que quase nunca funciona (registrar para não repetir a discussão):
+
+1. **Os custos não se invertem.** Um sinal sem vantagem perde o spread, a comissão e o swap a
+   cada trade, e o espelho paga os mesmos custos. Os dois perdem.
+2. **Os piores de milhares de combinações são sorte, como os melhores.** Fora da amostra, os dois
+   extremos voltam para o meio.
+3. **O setup não é simétrico.** O espelho de 15% de acerto com 3R:1R é 85% de acerto com 1R:3R,
+   que não é o oposto em resultado. A entrada limite na zona (SMC), invertida, vira outro tipo de
+   ordem. O stop estrutural e a condução do trade também não se espelham.
+
+Quando pode funcionar: **R bruto (antes de custos) negativo de forma consistente**, em muitos
+trades, anos e ativos. Há um sinal, só que ao contrário.
+
+Plano, na ordem:
+
+1. **Triagem sem rodar nada**: grupos (entrada, gráfico) com **mediana** negativa numa varredura,
+   não os piores runs isolados.
+2. **Separar custo de sinal**: R bruto vs. líquido. Bruto perto de zero significa que a perda é
+   custo, e a ideia morre aqui.
+3. **Só se o bruto for claramente negativo**: construir a opção "inverter direção" no motor (não
+   existe hoje; passa pelo `engine-guardian`) e testar o espelho **fora da amostra**, com o mesmo
+   rigor dos vencedores (teste reservado + fatiamento por ano/blocos).

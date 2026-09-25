@@ -39,9 +39,6 @@ data/
 # --- Teaching notes: generated for the author, not part of the public repo ---
 docs/aulas/
 
-# --- His own working notes: measurements and decisions in progress, not the repo's docs ---
-docs/localdocs/
-
 # --- The author's own copyrighted books (SMC method source material) — never publish ---
 docs/livros/
 

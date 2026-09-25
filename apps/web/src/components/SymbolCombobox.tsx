@@ -34,8 +34,9 @@ import { SnapshotFooter, SymbolOptions } from './SymbolOptions'
 export function SymbolCombobox(props: {
   value: string
   onChange: (symbol: string, chosen: BrokerSymbol | undefined) => void
+  label?: string
 }): React.JSX.Element {
-  const { value, onChange } = props
+  const { value, onChange, label = 'Symbol' } = props
   const [text, setText] = useState(value)
   const [open, setOpen] = useState(false)
   const listId = useId()
@@ -70,7 +71,7 @@ export function SymbolCombobox(props: {
   return (
     <div className="relative flex flex-col gap-1 text-sm">
       <label className="flex flex-col gap-1" htmlFor={`${listId}-input`}>
-        Symbol
+        {label}
         <input
           id={`${listId}-input`}
           role="combobox"

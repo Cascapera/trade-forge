@@ -19,6 +19,7 @@ vi.mock('../api/client', async () => {
       createSweep: vi.fn(),
       previewSweep: vi.fn(),
       planCollections: vi.fn(),
+      searchSymbols: vi.fn(),
     },
   }
 })
@@ -28,6 +29,7 @@ const listCatalog = vi.mocked(api.listCatalog)
 const createSweep = vi.mocked(api.createSweep)
 const previewSweep = vi.mocked(api.previewSweep)
 const planCollections = vi.mocked(api.planCollections)
+const searchSymbols = vi.mocked(api.searchSymbols)
 
 function instrument(symbol: string) {
   return {
@@ -116,6 +118,68 @@ beforeEach(() => {
   // Nothing missing unless a test says otherwise: the click then launches as it always did.
   planCollections.mockResolvedValue([])
   createSweep.mockResolvedValue({ id: 'sweep-1', runs: 2, skipped: [] })
+  // The broker offers one market nobody has collected, which is what the search is for.
+  searchSymbols.mockResolvedValue({
+    symbols: [
+      {
+        symbol: 'AUDUSD',
+        description: 'Australian Dollar vs US Dollar',
+        path: 'Forex/Majors/AUDUSD',
+        digits: 5,
+        visible: true,
+        asset_class_from_path: 'forex',
+        catalogued: false,
+      },
+    ],
+    snapshot: null,
+  })
+})
+
+describe('a market found in the broker list (PR-306)', () => {
+  async function pickAudusd(): Promise<void> {
+    fireEvent.change(screen.getByRole('combobox', { name: /find any market/i }), {
+      target: { value: 'aud' },
+    })
+    fireEvent.mouseDown(await screen.findByRole('option', { name: /AUDUSD/ }))
+  }
+
+  it('can be chosen, and the launch says to collect it first rather than failing with a 422', async () => {
+    /**
+     * ⚠️ His ask of 24/09: the pickers showed only the catalogued four. Now any market the broker
+     * offers can be found — and one never collected has no instrument, which the API refuses
+     * outright, so the screen says what fixes it before the click, with the way there.
+     */
+    renderWithProviders(<LaunchSweep />)
+    await fillIn()
+    await pickAudusd()
+
+    expect(
+      await screen.findByRole('button', { name: 'Remove AUDUSD, never collected' }),
+    ).toBeInTheDocument()
+    expect(
+      screen.getByText(
+        'AUDUSD has never been collected, so there are no candles to run on — collect it first.',
+      ),
+    ).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: /collect it first/i })).toHaveAttribute(
+      'href',
+      '/collect',
+    )
+    expect(screen.getByRole('button', { name: /run the sweep/i })).toBeDisabled()
+  })
+
+  it('stops refusing once the market is taken off again', async () => {
+    renderWithProviders(<LaunchSweep />)
+    await fillIn()
+    await pickAudusd()
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Remove AUDUSD, never collected' }))
+
+    expect(screen.queryByText(/never been collected/)).not.toBeInTheDocument()
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /run the sweep/i })).toBeEnabled()
+    })
+  })
 })
 
 describe('the count on screen', () => {

@@ -2723,3 +2723,19 @@ barras (60 anos no H1, agora limitado a 1970), e o botão já envia. Medido em 2
 medição daria. Opções: segurar o envio até a medição responder (ou falhar), ou mostrar que a janela
 ainda não foi medida. Junto: um erro ao **conectar** ao MT5 (antes do `run_collection`) ainda
 deixaria a linha em `queued`.
+
+**FEITO no PR-306 (a parte da tela):** varredura, basket e estudo passam a buscar em **todos** os
+símbolos da corretora, com a mesma busca que o backtest já tinha. Um ativo nunca coletado pode ser
+escolhido; ele aparece como "never collected" e trava o lançamento com um link para a tela de
+coleta. A API o recusa com 422, e nenhum "coletar e rodar" resolve: tick, contrato e tick value só
+o terminal sabe, então o instrumento nasce na coleta.
+
+**Continua em aberto:**
+
+1. Lançar direto um ativo nunca coletado, enfileirando antes dos runs a coleta que cria o
+   instrumento. Para isso o `POST /sweeps` precisa aceitar símbolo sem `Instrument` e esperar a
+   coleta terminar.
+2. A grade de catalogados continua embaixo da busca. Com centenas de instrumentos (plano do ML) ela
+   deixa de ser escaneável; trocar por "catalogados filtrados pela busca" ou por grupos.
+3. O `POST /sweeps/preview` pula símbolo desconhecido em silêncio (`coverage.py`, `continue`), e a
+   prévia não o menciona.

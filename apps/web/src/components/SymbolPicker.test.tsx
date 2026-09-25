@@ -1,9 +1,33 @@
 import { fireEvent, screen } from '@testing-library/react'
 
+import { api } from '../api/client'
 import type { Instrument } from '../api/types'
 import { MAX_SYMBOLS } from '../basket/settings'
 import { renderWithProviders } from '../test-utils'
 import { SymbolPicker } from './SymbolPicker'
+
+vi.mock('../api/client', async () => {
+  const actual = await vi.importActual<typeof import('../api/client')>('../api/client')
+  return { ...actual, api: { ...actual.api, searchSymbols: vi.fn() } }
+})
+
+beforeEach(() => {
+  // The broker offers one market nobody has collected — the case the search exists for.
+  vi.mocked(api.searchSymbols).mockResolvedValue({
+    symbols: [
+      {
+        symbol: 'AUDUSD',
+        description: 'Australian Dollar vs US Dollar',
+        path: 'Forex/Majors/AUDUSD',
+        digits: 5,
+        visible: true,
+        asset_class_from_path: 'forex',
+        catalogued: false,
+      },
+    ],
+    snapshot: null,
+  })
+})
 
 function instrument(symbol: string, spread: string | null): Instrument {
   return {
@@ -96,5 +120,55 @@ describe('SymbolPicker', () => {
 
     renderWithProviders(<SymbolPicker instruments={[]} chosen={[]} onToggle={vi.fn()} />)
     expect(screen.getByText(/no instruments catalogued/i)).toBeInTheDocument()
+  })
+
+  it('finds a market outside the catalogue and hands its name to the caller', async () => {
+    const onToggle = vi.fn()
+    renderWithProviders(<SymbolPicker instruments={catalogue} chosen={[]} onToggle={onToggle} />)
+
+    fireEvent.change(screen.getByRole('combobox', { name: /find any market/i }), {
+      target: { value: 'aud' },
+    })
+    fireEvent.mouseDown(await screen.findByRole('option', { name: /AUDUSD/ }))
+
+    expect(onToggle).toHaveBeenCalledWith('AUDUSD')
+  })
+
+  it('shows a chosen market never collected as a chip that says so, with the way to fix it', () => {
+    // ⚠️ "no spread measured" would be the wrong sentence: the market has no candles at all, and
+    // the fix is the collect screen, not a cost typed in.
+    const onToggle = vi.fn()
+    renderWithProviders(
+      <SymbolPicker instruments={catalogue} chosen={['EURUSD', 'AUDUSD']} onToggle={onToggle} />,
+    )
+
+    expect(screen.getByRole('link', { name: /collect it first/i })).toHaveAttribute(
+      'href',
+      '/collect',
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Remove AUDUSD, never collected' }))
+    expect(onToggle).toHaveBeenCalledWith('AUDUSD')
+    // A catalogued pick stays a ticked row of the grid, not a chip.
+    expect(screen.queryByRole('button', { name: /Remove EURUSD/ })).not.toBeInTheDocument()
+  })
+
+  it('refuses to add past the ceiling from the search too', async () => {
+    const full = Array.from({ length: MAX_SYMBOLS }, (_, i) => `SYM${String(i)}`)
+    const onToggle = vi.fn()
+    renderWithProviders(
+      <SymbolPicker
+        instruments={[...catalogue, ...full.map((s) => instrument(s, '1'))]}
+        chosen={full}
+        onToggle={onToggle}
+      />,
+    )
+
+    fireEvent.change(screen.getByRole('combobox', { name: /find any market/i }), {
+      target: { value: 'aud' },
+    })
+    fireEvent.mouseDown(await screen.findByRole('option', { name: /AUDUSD/ }))
+
+    expect(onToggle).not.toHaveBeenCalled()
+    expect(screen.getByText(/remove one to add another/i)).toBeInTheDocument()
   })
 })

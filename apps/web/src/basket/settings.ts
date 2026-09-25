@@ -80,7 +80,41 @@ export function uncostedAmong(
   instruments: readonly Instrument[] | undefined,
 ): string[] {
   const byName = new Map((instruments ?? []).map((one) => [one.symbol, one]))
-  return symbols.filter((symbol) => measuredSpread(byName.get(symbol)) === null)
+  // ⚠️ Only catalogued markets. One never collected has no spread *and* no candles, and the
+  // second is the refusal that matters — `neverCollected` says it, and listing it here too would
+  // tell the reader to measure a cost for a market that cannot run at all.
+  return symbols.filter((symbol) => {
+    const found = byName.get(symbol)
+    return found !== undefined && measuredSpread(found) === null
+  })
+}
+
+/**
+ * The chosen markets with no instrument at all — picked from the broker's list, never collected.
+ *
+ * ⚠️ The launch refuses them (the API answers 422 "unknown symbol"), and no "collect and run"
+ * can rescue them: the instrument — tick, contract, tick value — is written by the collector,
+ * because only the terminal knows those numbers. So the fix is the collect screen, and the
+ * screen says so before the click rather than after it.
+ *
+ * Empty while the catalogue is still loading: "not in a list that has not arrived" is not
+ * "never collected", and saying it would flash a refusal on every market for a moment.
+ */
+export function neverCollected(
+  symbols: readonly string[],
+  instruments: readonly Instrument[] | undefined,
+): string[] {
+  if (instruments === undefined) return []
+  const known = new Set(instruments.map((one) => one.symbol))
+  return symbols.filter((symbol) => !known.has(symbol))
+}
+
+/** The launch refusal for markets `neverCollected` found, or `null` when there are none. */
+export function neverCollectedReason(missing: readonly string[]): string | null {
+  if (missing.length === 0) return null
+  const verb = missing.length === 1 ? 'has' : 'have'
+  const them = missing.length === 1 ? 'it' : 'them'
+  return `${missing.join(', ')} ${verb} never been collected, so there are no candles to run on — collect ${them} first`
 }
 
 /** Why the basket cannot be launched yet, or `null` if it can. */

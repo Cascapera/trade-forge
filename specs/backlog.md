@@ -2797,3 +2797,30 @@ para calcular medianas. O conserto segue o mesmo molde:
 
 ⚠️ O painel remove medições duplicadas entre varreduras (`distinct`), então o resumo por varredura
 não pode ser somado direto. É preciso ver o que dá para reaproveitar.
+
+## O tick value é uma foto do câmbio, e o run não guarda a foto que usou (25/09) — PENDENTE
+
+Medido em 25/09, testando os gêmeos do cluster (PR-317). Três runs de USDCHF H4 da varredura MM9,
+rodados de novo com a mesma estratégia, janela, candles (7 764), custo e versão do motor, deram os
+**mesmos trades** (992, 992, 944) e **outro resultado em dinheiro** (−9 039,83 no original contra
+−9 027,16 no gêmeo). O motor é determinístico: rodando local três vezes, com e sem imagens, deu
+−9 027,16 todas as vezes. O que mudou foi o **instrumento**. A coleta das 17:15 UTC regravou o
+USDCHF com `tick_value = 1,2065`, o câmbio daquele momento, e o backtest lê o `tick_value` atual
+na hora em que roda.
+
+Dois problemas, de tamanhos diferentes:
+
+1. **Reprodutibilidade (pequeno, conserto claro).** O run não guarda a especificação do
+   instrumento que usou (tick_size, tick_value, contract_size, dígitos). Uma coleta posterior muda
+   o resultado de qualquer run refeito. Conserto: gravar a especificação no run, na hora de
+   lançar (coluna JSONB em `backtests`), e o worker usar essa em vez da atual.
+2. **Modelo (maior).** Para pares cotados fora de USD (USDCHF, USDJPY, EURGBP, CADJPY, XAUUSD…), o
+   `tick_value` é **um câmbio fixo, do dia da coleta**, aplicado a 17 anos de histórico. O valor do
+   ponto em USD variou muito nesse período, então o resultado em dinheiro é aproximado. Em R não
+   muda, porque R divide pelo mesmo `tick_value` em cima e embaixo, exceto pelo arredondamento do
+   lote. Conserto possível: converter pelo câmbio da época (candle do par de conversão,
+   p. ex. USDCHF para CHF → USD) no momento de cada trade. Mexe no motor (`costs`, `portfolio`),
+   então passa pelo guardian.
+
+⚠️ Até lá: **compare estratégias em R**, não em dinheiro, quando houver pares não-USD. As métricas
+de seleção (PR-309/310), o fatiamento e o cluster já trabalham em R.

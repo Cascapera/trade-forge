@@ -2706,3 +2706,20 @@ corretora, criando o instrumento (tick, contrato, spread) quando ainda não exis
 A investigar junto: houve coletas de AUDUSD e USDCHF que não viraram `instruments` nem `datasets`
 — a coleta de um símbolo novo talvez não registre o instrumento, o que também o esconderia dos
 seletores.
+
+**Investigado em 25/09 (PR-305):** as coletas de AUDUSD e USDCHF não sumiram, **travaram**. Foram
+pedidas em H1 desde 1966 (a sugestão pelo orçamento de barras, porque o formulário foi enviado antes
+de a medição do símbolo responder), a biblioteca do MT5 levanta `OSError` para data anterior a 1970
+no Windows, e o `run_collection` só tratava `LookupError` — as duas linhas ficaram em `running, 0 de
+61 anos` para sempre, sem instrumento nem dataset. O PR-305 fecha a linha como `failed` em qualquer
+erro, o coletor não pede nada antes de 1970 e a tela não sugere antes de 1970. O pedido dos
+seletores continua de pé.
+
+## A coleta pode ser enviada antes de a medição do símbolo responder (25/09) — PENDENTE
+
+Origem: PR-305. Enquanto o `probe` do símbolo não volta, a janela sugerida é só o orçamento de
+barras (60 anos no H1, agora limitado a 1970), e o botão já envia. Medido em 24/09: AUDUSD pedido
+às 01:13, medição gravada às 01:16 — o pedido saiu com a janela do orçamento, não com a de 2010 que a
+medição daria. Opções: segurar o envio até a medição responder (ou falhar), ou mostrar que a janela
+ainda não foi medida. Junto: um erro ao **conectar** ao MT5 (antes do `run_collection`) ainda
+deixaria a linha em `queued`.

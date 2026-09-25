@@ -167,10 +167,47 @@ def run_collection(  # noqa: PLR0913 — keyword-only; each names a real axis of
     date_from: dt.datetime,
     date_to: dt.datetime,
 ) -> CollectionOutcome:
-    """Download a range year by year and record what ended up on disk."""
+    """Download a range year by year and record what ended up on disk.
+
+    ⚠️ **Whatever stops it, the row stops saying `running`.** An empty year is a `LookupError`
+    and handled below; anything else — the terminal gone, the disk full, MetaTrader's own library
+    raising on a date it cannot convert — used to leave the journal at `started` for ever, because
+    the exception went straight past it to the queue. Measured on 24/09/2026: AUDUSD and USDCHF H1
+    asked from 1966 died on their first year (`copy_rates_range` raises `OSError` for a date
+    before 1970 on Windows) and sat at "running, 0 of 61 years" with no sentence to act on. The
+    failure is recorded, then re-raised: the queue still sees a failed job, and the agent's log
+    still gets the traceback that the screen has no room for.
+    """
     slices = year_slices(date_from, date_to)
     journal.started()
 
+    try:
+        return _collect(
+            source,
+            journal,
+            root=root,
+            symbol=symbol,
+            timeframe=timeframe,
+            slices=slices,
+            date_from=date_from,
+            date_to=date_to,
+        )
+    except Exception as exc:
+        journal.failed(f"the collection of {symbol} {timeframe} stopped: {exc}")
+        raise
+
+
+def _collect(  # noqa: PLR0913 — keyword-only; the same axes as `run_collection`
+    source: MarketDataSource,
+    journal: CollectionJournal,
+    *,
+    root: Path,
+    symbol: str,
+    timeframe: str,
+    slices: list[tuple[dt.datetime, dt.datetime]],
+    date_from: dt.datetime,
+    date_to: dt.datetime,
+) -> CollectionOutcome:
     # ⚠️ **One list rather than four accumulators, because the four were one fact under four
     # names.** A running candle count, a slice count, and a remembered instrument all changed in
     # the same branch, so "some slice came back with data" could be asked of any of them — and
@@ -301,6 +338,10 @@ class DatabaseJournal:
         self._session.commit()
 
     def failed(self, reason: str) -> None:
+        # ⚠️ Rolled back first: this is also the entry an unexpected exception reaches, and one
+        # raised inside `catalogued` leaves the session holding a transaction that can only be
+        # thrown away. Everything earlier was committed entry by entry, so nothing is lost.
+        self._session.rollback()
         finish_collection(self._session, self._id, at=_now(), error=reason)
         self._session.commit()
 

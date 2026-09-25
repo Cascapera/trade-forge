@@ -18,6 +18,7 @@ import type {
   CreateCollection,
   CreateStudyRequest,
   CreateHoldoutRequest,
+  CreateMonteCarloRequest,
   CreateSlicingRequest,
   CreateSweepRequest,
   CreateWalkForwardRequest,
@@ -44,6 +45,7 @@ import type {
   StudyOut,
   StudyPreview,
   HoldoutOut,
+  MonteCarloOut,
   SlicingOut,
   SweepOut,
   SweepPreview,
@@ -209,6 +211,11 @@ export const api = {
   createSlicing: (id: string, payload: CreateSlicingRequest): Promise<SlicingOut> =>
     request('POST', `/sweeps/${id}/slicings`, payload),
   listSlicings: (id: string): Promise<SlicingOut[]> => request('GET', `/sweeps/${id}/slicings`),
+  // A finished test's points resampled, and kept (25/09). Runs nothing; takes seconds.
+  createMonteCarlo: (id: string, payload: CreateMonteCarloRequest): Promise<MonteCarloOut> =>
+    request('POST', `/sweeps/${id}/montecarlos`, payload),
+  listMonteCarlos: (id: string): Promise<MonteCarloOut[]> =>
+    request('GET', `/sweeps/${id}/montecarlos`),
   listSweeps: (page: { limit: number; offset: number }): Promise<SweepsPage> =>
     request('GET', `/sweeps${query(page)}`),
   getSweepDashboard: (launched: LaunchWindow): Promise<SweepDashboard> =>

@@ -2189,6 +2189,64 @@ class SlicingOut(BaseModel):
     points: list[SlicedPoint]
 
 
+class CreateMonteCarlo(BaseModel):
+    """Resample a finished reserved-window test's points (25/09, `montecarlo`)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    paths: int = Field(default=1000, ge=100, le=5000)
+    """How many paths each point's trades are drawn into."""
+    seed: str | None = Field(default=None, min_length=1, max_length=64)
+    """Any string; blank draws one, which is stored — the answer is repeatable either way."""
+
+
+class SpreadOut(BaseModel):
+    """Percentiles of one measure across the simulated paths."""
+
+    p5: Money
+    p50: Money
+    p95: Money
+    p99: Money
+
+
+class SimulatedOut(BaseModel):
+    paths: int
+    trades: int
+    drawdown_r: SpreadOut
+    losing_streak: SpreadOut
+    net_r: SpreadOut
+    negative_share: Money
+    """The share of paths that ended below zero R."""
+
+
+class MonteCarloPoint(BaseModel):
+    """One tested point: what happened, and the spread of what could have."""
+
+    run_id: uuid.UUID
+    entry_id: str
+    entry_name: str | None
+    symbol: str
+    timeframe: str
+    label: str
+    trades_kept: bool
+    """False for a test run from before 25/09 that lost: it kept no trades to resample."""
+    trades: int
+    observed_net_r: Money
+    observed_drawdown_r: Money
+    observed_losing_streak: int
+    simulated: SimulatedOut | None
+    """`None` below `montecarlo.MIN_TRADES` trades, or with none kept."""
+
+
+class MonteCarloOut(BaseModel):
+    id: uuid.UUID
+    sweep_id: uuid.UUID
+    paths: int
+    seed: str
+    created_at: dt.datetime
+    points: list[MonteCarloPoint]
+
+
 class SweepOut(BaseModel):
     """A sweep read back: the question that was asked, and every run it became."""
 

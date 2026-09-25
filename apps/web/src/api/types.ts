@@ -1332,6 +1332,57 @@ export interface SlicingOut {
   points: SlicedPoint[]
 }
 
+/** Resample a finished reserved-window test's points (25/09). */
+export interface CreateMonteCarloRequest {
+  paths: number
+  /** Blank draws one on the server, which is kept — the answer is repeatable either way. */
+  seed?: string
+}
+
+/** Percentiles of one measure across the simulated paths, as decimal strings. */
+export interface Spread {
+  p5: string
+  p50: string
+  p95: string
+  p99: string
+}
+
+export interface Simulated {
+  paths: number
+  trades: number
+  drawdown_r: Spread
+  losing_streak: Spread
+  net_r: Spread
+  /** The share of paths that ended below zero R. */
+  negative_share: string
+}
+
+export interface MonteCarloPoint {
+  run_id: string
+  entry_id: string
+  entry_name: string | null
+  symbol: string
+  timeframe: string
+  label: string
+  /** False for a test run from before 25/09 that lost: no trades were kept to resample. */
+  trades_kept: boolean
+  trades: number
+  observed_net_r: string
+  observed_drawdown_r: string
+  observed_losing_streak: number
+  /** Null below 20 trades, or with none kept. */
+  simulated: Simulated | null
+}
+
+export interface MonteCarloOut {
+  id: string
+  sweep_id: string
+  paths: number
+  seed: string
+  created_at: string
+  points: MonteCarloPoint[]
+}
+
 export interface SweepOut {
   id: string
   entry_ids: string[]

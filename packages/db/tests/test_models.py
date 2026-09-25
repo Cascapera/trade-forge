@@ -56,6 +56,8 @@ EXPECTED_TABLES = {
     # A reserved-window test judged in pieces, kept with the rule it was judged by (rev_0026).
     # Beside `sweeps` rather than a column on it, because one test can be cut several ways.
     "sweep_slicings",
+    # A test's points resampled, kept with the seed that makes it repeatable (rev_0028).
+    "sweep_montecarlos",
     "walk_forwards",
     "walk_forward_folds",
     "backtests",

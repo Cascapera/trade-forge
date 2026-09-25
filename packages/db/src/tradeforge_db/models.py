@@ -1894,3 +1894,39 @@ class SweepSlicing(Base):
         CheckConstraint("jsonb_typeof(result) = 'object'", name="a_result_is_an_object"),
         Index("ix_sweep_slicings_sweep_id", "sweep_id"),
     )
+
+
+class SweepMonteCarlo(Base):
+    """A reserved-window test's points resampled (25/09, `montecarlo`), and the answer kept.
+
+    Each point's out-of-sample trades are drawn with replacement into many paths: the drawdown and
+    losing streak to expect, and how often the whole run ends below zero. Started by hand, like a
+    slicing, and computed from the trades a test keeps win or lose — nothing is run again.
+
+    ⚠️ **The seed is stored**, and each point's draws come from it and the run's id: the same
+    request always gives the same answer, which is the engine's invariant carried over to what
+    judges the engine's output.
+    """
+
+    __tablename__ = "sweep_montecarlos"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+
+    sweep_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("sweeps.id", ondelete="CASCADE"), nullable=False
+    )
+    """The reserved-window test that was resampled; its answer goes with it."""
+
+    paths: Mapped[int] = mapped_column(Integer, nullable=False)
+    seed: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    result: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    """Per point: the simulated spreads beside what actually happened."""
+
+    created_at: Mapped[dt.datetime] = _created_at()
+
+    __table_args__ = (
+        CheckConstraint("paths BETWEEN 100 AND 5000", name="paths_within_bounds"),
+        CheckConstraint("jsonb_typeof(result) = 'object'", name="a_montecarlo_result_is_an_object"),
+        Index("ix_sweep_montecarlos_sweep_id", "sweep_id"),
+    )

@@ -27,6 +27,7 @@ import type {
   CreateCollection,
   CreateStudyRequest,
   CreateHoldoutRequest,
+  CreateMonteCarloRequest,
   CreateSlicingRequest,
   CreateSweepRequest,
   CreateWalkForwardRequest,
@@ -54,6 +55,7 @@ import type {
   StudyPreview,
   PreviewSweepRequest,
   HoldoutOut,
+  MonteCarloOut,
   SlicingOut,
   SweepOut,
   SweepPreview,
@@ -663,6 +665,25 @@ export function useCreateSlicing(id: string) {
     mutationFn: (payload) => api.createSlicing(id, payload),
     onSuccess: () => {
       void client.invalidateQueries({ queryKey: ['slicings', id] })
+    },
+  })
+}
+
+/** Every resampling kept for a reserved-window test, newest first. */
+export function useMonteCarlos(id: string) {
+  return useQuery<MonteCarloOut[]>({
+    queryKey: ['montecarlos', id],
+    queryFn: () => api.listMonteCarlos(id),
+  })
+}
+
+/** Resample a finished test; the new answer joins the list on success. */
+export function useCreateMonteCarlo(id: string) {
+  const client = useQueryClient()
+  return useMutation<MonteCarloOut, Error, CreateMonteCarloRequest>({
+    mutationFn: (payload) => api.createMonteCarlo(id, payload),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: ['montecarlos', id] })
     },
   })
 }

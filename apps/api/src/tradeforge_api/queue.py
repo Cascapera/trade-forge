@@ -22,6 +22,7 @@ RUN_BACKTEST = "run_backtest"
 RUN_WALK_FORWARD = "run_walk_forward"
 RUN_CLUSTER = "run_cluster"
 RUN_SWEEP_WALK_FORWARD = "run_sweep_walk_forward"
+RUN_TEMPLATE_QUEUE = "run_template_queue"
 """The orchestrating job: one per walk-forward, not one per run.
 
 ⚠️ **A walk-forward's training runs are deliberately never enqueued.** They are written as

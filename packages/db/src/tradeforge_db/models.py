@@ -1828,6 +1828,13 @@ class Sweep(Base):
     for an ordinary sweep (`rev_0024`). Null too once that sweep is deleted: the test's runs are
     measurements of their own, and what the deletion costs is the comparison."""
 
+    template_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("sweep_templates.id", ondelete="SET NULL"), nullable=True
+    )
+    """The template this sweep ran one market of (`SweepTemplate`, 26/09), or null for a sweep
+    launched on its own. Null too once the template is deleted: the sweep is a measurement of its
+    own."""
+
     summary: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     """The per-entry summary as last computed once every run had ended, and the run counts it was
     computed at (`rev_0029`): `{"counts": {...}, "entries": [...]}`. Null until then.
@@ -1863,6 +1870,7 @@ class Sweep(Base):
         ),
         Index("ix_sweeps_created_at", "created_at"),
         Index("ix_sweeps_holdout_of", "holdout_of"),
+        Index("ix_sweeps_template_id", "template_id"),
     )
 
 
@@ -2078,4 +2086,85 @@ class SweepWalkForwardFold(Base):
         CheckConstraint(
             "train_from < train_to AND test_from < test_to", name="windows_run_forwards"
         ),
+    )
+
+
+class TemplateItemStatus(StrEnum):
+    """Where one market stands in a template's queue."""
+
+    WAITING = "waiting"
+    LAUNCHED = "launched"
+    """Its sweep exists; whether it has finished is the sweep's own runs' to say."""
+    FAILED = "failed"
+    """Its launch was refused — the reason is on the item."""
+    REMOVED = "removed"
+    """Taken out of the queue before it launched."""
+
+
+class SweepTemplate(Base):
+    """A sweep without its markets, kept to be run one market at a time (26/09).
+
+    His ask: a sweep over thirteen markets was a day and a half of queue and one poll too heavy
+    for the screen. A template fixes what makes sweeps comparable — the entries, the charts, the
+    window, the capital — and each market becomes a sweep of its own, launched from a queue one
+    after the other, today or on another day. Sweeps of one template can then be read together
+    (`Sweep.combines`) as if they were one.
+    """
+
+    __tablename__ = "sweep_templates"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    name: Mapped[str] = mapped_column(String(200), nullable=False, unique=True)
+    entry_ids: Mapped[list[Any]] = mapped_column(JSONB, nullable=False)
+    timeframes: Mapped[list[Any]] = mapped_column(JSONB, nullable=False)
+    date_from: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    date_to: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    initial_capital: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    paused: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    """While paused, the queue launches nothing new; the market already running goes on."""
+    created_at: Mapped[dt.datetime] = _created_at()
+
+    items: Mapped[list[SweepTemplateItem]] = relationship(
+        back_populates="template",
+        order_by="SweepTemplateItem.position",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+    __table_args__ = (
+        CheckConstraint("jsonb_typeof(entry_ids) = 'array'", name="template_entries_are_a_list"),
+        CheckConstraint("jsonb_typeof(timeframes) = 'array'", name="template_charts_are_a_list"),
+        CheckConstraint("date_to > date_from", name="a_template_window_runs_forwards"),
+        CheckConstraint("initial_capital > 0", name="template_capital_positive"),
+    )
+
+
+class SweepTemplateItem(Base):
+    """One market in a template's queue: its costs as typed, its place, and the sweep it became."""
+
+    __tablename__ = "sweep_template_items"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    template_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("sweep_templates.id", ondelete="CASCADE"), nullable=False
+    )
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False)
+    cost_model: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    """The sweep's cost model for this one market, as typed at queueing — prefilled from its
+    measured spread, and his to correct."""
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[TemplateItemStatus] = mapped_column(
+        _enum(TemplateItemStatus, "template_item_status"), nullable=False
+    )
+    sweep_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("sweeps.id", ondelete="SET NULL"), nullable=True
+    )
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[dt.datetime] = _created_at()
+
+    template: Mapped[SweepTemplate] = relationship(back_populates="items")
+
+    __table_args__ = (
+        CheckConstraint("jsonb_typeof(cost_model) = 'object'", name="item_costs_are_an_object"),
+        Index("ix_sweep_template_items_template_id", "template_id", "position"),
     )

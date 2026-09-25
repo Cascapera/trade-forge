@@ -42,9 +42,12 @@ from tradeforge_api.cluster_job import process_cluster
 from tradeforge_api.config import RedisConfig, Settings
 from tradeforge_api.grid import coordinates, label_for, read_point
 from tradeforge_api.queue import (
+    COLLECT_QUEUE,
+    COLLECT_RANGE,
     RUN_BACKTEST,
     RUN_CLUSTER,
     RUN_SWEEP_WALK_FORWARD,
+    RUN_TEMPLATE_QUEUE,
     progress_channel,
     redis_settings,
 )
@@ -52,6 +55,7 @@ from tradeforge_api.r_metrics import r_metrics
 from tradeforge_api.retention import recorded_for
 from tradeforge_api.runner import ENGINE_VERSION, execute_backtest, spec_document, spec_for
 from tradeforge_api.sweep_walkforward_job import advance
+from tradeforge_api.template_queue_job import advance_queue
 from tradeforge_api.walkforward import Candidate, choose
 from tradeforge_collector import read_candles
 from tradeforge_db.models import (
@@ -718,6 +722,26 @@ async def run_sweep_walk_forward(ctx: dict[str, Any], walk_forward_id: str) -> N
         )
 
 
+async def run_template_queue(ctx: dict[str, Any], template_id: str) -> None:
+    """A template's queue (`template_queue_job.advance_queue`): launch the next market when the
+    last has ended, queue its runs, and look again every minute while one is running or waiting."""
+    session: Session = ctx["session_factory"]()
+    try:
+        runs, collections, pending = advance_queue(session, uuid.UUID(template_id))
+        run_ids = [str(one.id) for one in runs]
+        collection_ids = [str(one.id) for one in collections]
+    finally:
+        session.close()
+    for collection_id in collection_ids:
+        await ctx["redis"].enqueue_job(COLLECT_RANGE, collection_id, _queue_name=COLLECT_QUEUE)
+    for run_id in run_ids:
+        await ctx["redis"].enqueue_job(RUN_BACKTEST, run_id, _job_id=run_id)
+    if pending:
+        await ctx["redis"].enqueue_job(
+            RUN_TEMPLATE_QUEUE, template_id, _defer_by=dt.timedelta(seconds=60)
+        )
+
+
 async def startup(ctx: dict[str, Any]) -> None:
     settings = Settings()
     engine = create_db_engine(settings.sqlalchemy_dsn)
@@ -742,6 +766,7 @@ class WorkerSettings:
         run_walk_forward,
         run_cluster,
         run_sweep_walk_forward,
+        run_template_queue,
     )
     # Built from RedisConfig, not Settings: this line runs at import, and importing the worker
     # must not require the Postgres password. The DB config is read later, in `startup`.

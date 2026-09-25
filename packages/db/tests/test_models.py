@@ -63,6 +63,9 @@ EXPECTED_TABLES = {
     # A sweep run again fold by fold, its choices tested after each (rev_0032).
     "sweep_walk_forwards",
     "sweep_walk_forward_folds",
+    # A sweep without its markets, and its queue of markets run one at a time (rev_0033).
+    "sweep_templates",
+    "sweep_template_items",
     "walk_forwards",
     "walk_forward_folds",
     "backtests",

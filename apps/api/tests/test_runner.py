@@ -7,11 +7,12 @@ up in milliseconds without Postgres or arq.
 """
 
 import datetime as dt
+from dataclasses import replace
 from decimal import Decimal
 
 import pytest
 
-from tradeforge_api.runner import CandleWindow, execute_backtest
+from tradeforge_api.runner import CandleWindow, execute_backtest, swap_rates
 from tradeforge_db.models import Instrument
 from tradeforge_engine import BacktestMetrics as EngineMetrics
 from tradeforge_engine.domain import AssetClass, Candle, ClosedTrade
@@ -362,3 +363,45 @@ def test_an_unknown_setup_type_fails_loudly_at_compile_time() -> None:
             candles=pullback_to_the_average(),
             date_from=_GOLDEN_FROM,
         )
+
+
+def test_a_swap_beside_the_costs_lands_on_every_trade_it_held_overnight() -> None:
+    """His account (24/09): -5 USD per lot per night on both sides, beside whatever the spread
+    charges. Each trade's net is its gross less its costs plus its swap, and the run nets the
+    swaps less than the same run without them."""
+    # Down, then a slow grind up: the cross fires early and the 2R target is hours away.
+    levels = [Decimal("1.10500") - Decimal("0.00100") * step for step in range(4)]
+    levels += [levels[-1] + Decimal("0.00012") * step for step in range(1, 80)]
+    # Started at 16:00 UTC, so the trade opens at 21:00 and closes at midnight — across January's
+    # rollover at 22:00 UTC (17:00 in New York).
+    slow = [
+        replace(
+            bar(index, open_=str(levels[index]), close=str(levels[index + 1])),
+            time=START + (index + 16) * HOUR,
+        )
+        for index in range(len(levels) - 1)
+    ]
+    window = {"candles": slow, "date_from": START, "date_to": START + 200 * HOUR}
+    plain, without, _ = run_it(cost_model={"type": "spread", "spread_points": 20}, **window)
+    trades, with_swap, _ = run_it(
+        cost_model={
+            "type": "spread",
+            "spread_points": 20,
+            "swap": {"long_per_lot": "-5", "short_per_lot": "-5"},
+        },
+        **window,
+    )
+
+    assert [trade.swap for trade in plain] == [0] * len(plain)
+    assert any(trade.swap < 0 for trade in trades)
+    assert all(trade.net_pnl == trade.gross_pnl - trade.costs + trade.swap for trade in trades)
+    assert with_swap.net_profit == without.net_profit + sum(trade.swap for trade in trades)
+
+
+def test_swap_rates_are_read_signed_and_refused_when_not_an_object() -> None:
+    assert swap_rates({"type": "none"}) is None
+    rates = swap_rates({"swap": {"long_per_lot": "-5", "short_per_lot": "1.5"}})
+    assert rates is not None
+    assert (rates.long_per_lot, rates.short_per_lot) == (Decimal(-5), Decimal("1.5"))
+    with pytest.raises(ValueError, match="swap must be an object"):
+        swap_rates({"swap": "-5"})

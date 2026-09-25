@@ -34,6 +34,7 @@ from tradeforge_engine import (
     NoCostModel,
     PercentRiskManager,
     SpreadCostModel,
+    SwapRates,
     compile_strategy,
     compute_metrics,
     run,
@@ -92,6 +93,22 @@ def build_cost_model(spec: Mapping[str, Any]) -> CostModel:
     raise ValueError(
         f"unknown cost model type {kind!r}; "
         "expected 'none', 'spread', 'commission' or 'spread_commission'"
+    )
+
+
+def swap_rates(spec: Mapping[str, Any]) -> SwapRates | None:
+    """The swap a cost document charges, or None — `{"swap": {"long_per_lot": "-5",
+    "short_per_lot": "-5"}}` beside any cost model, per standard lot per night and signed as the
+    broker quotes it (24/09). Kept beside the costs rather than inside them: a cost is a magnitude
+    and a swap can be a credit (`tradeforge_engine.swap`)."""
+    swap = spec.get("swap")
+    if swap is None:
+        return None
+    if not isinstance(swap, Mapping):
+        raise ValueError(f"swap must be an object of per-lot rates, got {swap!r}")
+    return SwapRates(
+        long_per_lot=_decimal(swap.get("long_per_lot", 0)),
+        short_per_lot=_decimal(swap.get("short_per_lot", 0)),
     )
 
 
@@ -279,6 +296,7 @@ def execute_backtest(  # noqa: PLR0913 — keyword-only; each names one axis of 
         instrument=spec,
         initial_capital=initial_capital,
         cost_model=build_cost_model(cost_model),
+        swap=swap_rates(cost_model),
         slippage_ticks=slippage_ticks,
         take_profit_rr=take_profit_rr(definition),
     )
@@ -307,6 +325,7 @@ __all__ = [
     "execute_backtest",
     "instrument_spec",
     "risk_percent",
+    "swap_rates",
     "take_profit_rr",
     "timeframe_refusal",
 ]

@@ -60,6 +60,7 @@ from tradeforge_engine.domain import (
 from tradeforge_engine.errors import EngineError
 from tradeforge_engine.portfolio import Portfolio
 from tradeforge_engine.protocols import CostModel
+from tradeforge_engine.swap import SwapRates
 
 logger = logging.getLogger(__name__)
 
@@ -222,6 +223,7 @@ class BacktestBroker:
         slippage_ticks: Decimal = ZERO,
         take_profit_rr: Decimal | None = None,
         currency: str = "USD",
+        swap: SwapRates | None = None,
     ) -> None:
         if slippage_ticks < ZERO:
             raise ValueError(f"slippage is a magnitude, got {slippage_ticks}")
@@ -230,7 +232,7 @@ class BacktestBroker:
 
         self._instrument = instrument
         self._portfolio = Portfolio(
-            initial_capital=initial_capital, instrument=instrument, currency=currency
+            initial_capital=initial_capital, instrument=instrument, currency=currency, swap=swap
         )
         self._cost_model: CostModel = cost_model if cost_model is not None else NoCostModel()
         # Kept in ticks, converted to a price at fill time. `slippage_ticks * tick_size` in

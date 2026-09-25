@@ -185,6 +185,8 @@ export interface Trade {
   take_profit: string | null
   gross_pnl: string | null
   costs: string | null
+  /** Signed: negative was charged for holding it overnight, positive was paid (24/09). */
+  swap?: string
   net_pnl: string | null
   r_multiple: string | null
   context: Record<string, string | null>

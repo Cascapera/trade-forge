@@ -607,3 +607,36 @@ describe('LaunchSweep — costs per market', () => {
     expect(screen.getByText(/every result is an upper bound/)).toBeInTheDocument()
   })
 })
+
+describe('LaunchSweep — swap per market', () => {
+  it('sends the buy and sell swap typed for a market, signed', async () => {
+    renderWithProviders(<LaunchSweep />)
+    await fillIn()
+
+    fireEvent.change(await screen.findByLabelText('spread of EURUSD'), { target: { value: '5' } })
+    fireEvent.change(screen.getByLabelText('buy swap of EURUSD'), { target: { value: '-5' } })
+    fireEvent.change(screen.getByLabelText('sell swap of EURUSD'), { target: { value: '-5' } })
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /run the sweep/i })).toBeEnabled()
+    })
+    fireEvent.click(screen.getByRole('button', { name: /run the sweep/i }))
+
+    await waitFor(() => {
+      expect(createSweep).toHaveBeenCalledWith(
+        expect.objectContaining({
+          cost_model: {
+            type: 'per_market',
+            markets: {
+              EURUSD: {
+                spread_points: '5',
+                commission_per_unit: '0',
+                swap_long_per_lot: '-5',
+                swap_short_per_lot: '-5',
+              },
+            },
+          },
+        }),
+      )
+    })
+  })
+})

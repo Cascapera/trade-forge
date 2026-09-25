@@ -160,6 +160,7 @@ def _trade_row(
     # satisfies `net_pnl_balances` by construction. See `_money`.
     gross_pnl = _money(trade.gross_pnl)
     costs = _money(trade.costs)
+    swap = _money(trade.swap)
     return Trade(
         backtest_id=backtest_id,
         live_session_id=live_session_id,
@@ -175,7 +176,8 @@ def _trade_row(
         take_profit=trade.take_profit,
         gross_pnl=gross_pnl,
         costs=costs,
-        net_pnl=gross_pnl - costs,
+        swap=swap,
+        net_pnl=gross_pnl - costs + swap,
         r_multiple=trade.r_multiple,
         mfe_price=trade.mfe_price,
         mae_price=trade.mae_price,
@@ -371,6 +373,7 @@ def close_trade_values(trade: ClosedTrade) -> dict[str, Any]:
     """
     gross_pnl = _money(trade.gross_pnl)
     costs = _money(trade.costs)
+    swap = _money(trade.swap)
     return {
         "exit_time": trade.exit_time,
         "exit_price": trade.exit_price,
@@ -378,7 +381,8 @@ def close_trade_values(trade: ClosedTrade) -> dict[str, Any]:
         "take_profit": trade.take_profit,
         "gross_pnl": gross_pnl,
         "costs": costs,
-        "net_pnl": gross_pnl - costs,
+        "swap": swap,
+        "net_pnl": gross_pnl - costs + swap,
         "r_multiple": trade.r_multiple,
         "mfe_price": trade.mfe_price,
         "mae_price": trade.mae_price,

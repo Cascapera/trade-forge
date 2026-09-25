@@ -43,7 +43,7 @@ from tradeforge_api.retention import MIN_TRADES
 from tradeforge_api.routers.backtests import failed_collections, list_item
 from tradeforge_api.routers.strategies import refusal_of
 from tradeforge_api.routers.studies import aggregate_points, strategies_for
-from tradeforge_api.runner import ENGINE_VERSION, build_cost_model
+from tradeforge_api.runner import ENGINE_VERSION, build_cost_model, swap_rates
 from tradeforge_api.schemas import (
     CreatedSweep,
     CreateHoldout,
@@ -525,15 +525,7 @@ def _costs_for(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="no costs given for: " + ", ".join(missing),
             )
-        resolved = {
-            symbol: _spread_and_commission(
-                markets[symbol].get("spread_points") if isinstance(markets[symbol], dict) else None,
-                markets[symbol].get("commission_per_unit", "0")
-                if isinstance(markets[symbol], dict)
-                else None,
-            )
-            for symbol in instruments
-        }
+        resolved = {symbol: _typed(markets[symbol]) for symbol in instruments}
     elif kind == "instrument":
         unmeasured = sorted(
             symbol for symbol, one in instruments.items() if one.default_spread_points is None
@@ -555,12 +547,29 @@ def _costs_for(
     for model in resolved.values():
         try:
             build_cost_model(model)
+            swap_rates(model)
         except (KeyError, TypeError, ValueError, ArithmeticError) as exc:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=f"cost model cannot be charged: {exc}",
             ) from exc
     return resolved
+
+
+def _typed(market: object) -> dict[str, Any]:
+    """One market's typed costs as the document its runs are charged by: the spread and the
+    commission, and the swap per side when either was given — signed, as the broker quotes it."""
+    given: dict[str, Any] = market if isinstance(market, dict) else {}
+    model = _spread_and_commission(
+        given.get("spread_points"), given.get("commission_per_unit", "0")
+    )
+    long_rate, short_rate = given.get("swap_long_per_lot"), given.get("swap_short_per_lot")
+    if long_rate is not None or short_rate is not None:
+        model["swap"] = {
+            "long_per_lot": str(long_rate if long_rate is not None else "0"),
+            "short_per_lot": str(short_rate if short_rate is not None else "0"),
+        }
+    return model
 
 
 def _spread_and_commission(spread: object, commission: object) -> dict[str, Any]:

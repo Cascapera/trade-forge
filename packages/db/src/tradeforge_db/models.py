@@ -1112,6 +1112,9 @@ class Trade(Base):
     gross_pnl: Mapped[Decimal | None] = mapped_column(MONEY)
     costs: Mapped[Decimal | None] = mapped_column(MONEY)
     net_pnl: Mapped[Decimal | None] = mapped_column(MONEY)
+    swap: Mapped[Decimal] = mapped_column(MONEY, nullable=False, server_default="0")
+    """What holding it overnight came to, **signed** — negative charged, positive paid
+    (`rev_0025`). Part of `net_pnl`; apart from `costs`, which is a magnitude."""
     r_multiple: Mapped[Decimal | None] = mapped_column(RATIO)
 
     # How far the trade went, both ways (2026-09-23): the most and least favourable prices it
@@ -1160,7 +1163,9 @@ class Trade(Base):
         # Costs are a magnitude, and net is gross minus them. Stating it here means no
         # two call sites can disagree about the sign — the same trap as gross_loss above.
         CheckConstraint("costs IS NULL OR costs >= 0", name="costs_non_negative"),
-        CheckConstraint("net_pnl IS NULL OR net_pnl = gross_pnl - costs", name="net_pnl_balances"),
+        CheckConstraint(
+            "net_pnl IS NULL OR net_pnl = gross_pnl - costs + swap", name="net_pnl_balances"
+        ),
         # Distances, not signed moves: which way is the column's name. A negative one is a sign
         # error upstream, and a derived target would read it as a trade that never moved.
         CheckConstraint("mfe_r IS NULL OR mfe_r >= 0", name="mfe_r_non_negative"),

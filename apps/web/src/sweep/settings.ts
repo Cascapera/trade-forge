@@ -33,11 +33,18 @@ export interface SweepForm {
   costs: Record<string, MarketCosts>
 }
 
-/** One market's costs as typed: the spread in points and the commission per lot, per leg. */
+/**
+ * One market's costs as typed: the spread in points, the commission per lot per leg, and the swap
+ * per lot per night on each side — signed as the broker quotes it, since a swap can be a credit.
+ */
 export interface MarketCosts {
   spread: string
   commission: string
+  swapLong: string
+  swapShort: string
 }
+
+const NO_COSTS: MarketCosts = { spread: '', commission: '', swapLong: '', swapShort: '' }
 
 export const emptySweepForm: SweepForm = {
   entryIds: [],
@@ -68,20 +75,22 @@ export function toggleMarket(
       ? form.costs
       : {
           ...form.costs,
-          [symbol]: { spread: quoted == null ? '' : String(Number(quoted)), commission: '' },
+          [symbol]: { ...NO_COSTS, spread: quoted == null ? '' : String(Number(quoted)) },
         }
   return { ...form, symbols: [...form.symbols, symbol], costs }
 }
 
 function costsOf(form: SweepForm, symbol: string): MarketCosts {
-  return form.costs[symbol] ?? { spread: '', commission: '' }
+  return { ...NO_COSTS, ...form.costs[symbol] }
 }
 
 /** Whether the form charges nothing at all: every field of every ticked market blank. */
 export function isCostless(form: SweepForm): boolean {
   return form.symbols.every((symbol) => {
     const costs = costsOf(form, symbol)
-    return costs.spread.trim() === '' && costs.commission.trim() === ''
+    return [costs.spread, costs.commission, costs.swapLong, costs.swapShort].every(
+      (value) => value.trim() === '',
+    )
   })
 }
 
@@ -92,13 +101,19 @@ export function isCostless(form: SweepForm): boolean {
 function costsProblem(form: SweepForm): string | null {
   if (isCostless(form)) return null
   for (const symbol of form.symbols) {
-    const { spread, commission } = costsOf(form, symbol)
+    const { spread, commission, swapLong, swapShort } = costsOf(form, symbol)
     if (spread.trim() === '') {
       return `Type the spread for ${symbol}, or leave every market blank to run without costs.`
     }
     for (const value of [spread, commission]) {
       if (value.trim() !== '' && !(Number(value) >= 0)) {
         return `The costs of ${symbol} must be numbers of zero or more.`
+      }
+    }
+    // A swap is signed — negative is charged, positive paid — so it only has to be a number.
+    for (const value of [swapLong, swapShort]) {
+      if (value.trim() !== '' && !Number.isFinite(Number(value))) {
+        return `The swap of ${symbol} must be a number, negative when it is charged.`
       }
     }
   }
@@ -210,12 +225,19 @@ export function toSweepRequest(form: SweepForm, collectMissing = false): CreateS
           type: 'per_market',
           markets: Object.fromEntries(
             form.symbols.map((symbol) => {
-              const { spread, commission } = costsOf(form, symbol)
+              const { spread, commission, swapLong, swapShort } = costsOf(form, symbol)
+              const swapped = swapLong.trim() !== '' || swapShort.trim() !== ''
               return [
                 symbol,
                 {
                   spread_points: spread.trim(),
                   commission_per_unit: commission.trim() === '' ? '0' : commission.trim(),
+                  ...(swapped
+                    ? {
+                        swap_long_per_lot: swapLong.trim() === '' ? '0' : swapLong.trim(),
+                        swap_short_per_lot: swapShort.trim() === '' ? '0' : swapShort.trim(),
+                      }
+                    : {}),
                 },
               ]
             }),

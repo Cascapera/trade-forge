@@ -444,6 +444,28 @@ def test_a_short_trades_costs_are_taken_off_in_r_of_its_own_risk() -> None:
     assert (two.hits, two.net_r) == (0, Decimal("-0.8"))
 
 
+def test_a_trade_held_overnight_pays_its_swap_on_every_rung() -> None:
+    """The swap is taken off like the costs (24/09, engine-guardian): a trade that reached 0.8 R
+    and left at 95 (-1 R gross), charged $2 of costs and $4 of swap on two shares with $10 of risk
+    — 0.2 R and 0.4 R. Unreached, the rung reads what the trade made: -1.6 R. Without the swap it
+    read -1.2, better than the trade itself by exactly its swap."""
+    trade = dataclasses.replace(_costed(mfe_r="0.8", exit_price="95", costs="2"), swap=Decimal(-4))
+
+    [rung] = target_ladder([trade], AAPL, (Decimal(2),)).values()
+
+    assert rung is not None
+    assert rung.net_r == Decimal("-1.6")
+
+
+def test_a_swap_paid_to_the_account_is_added_back() -> None:
+    trade = dataclasses.replace(_costed(mfe_r="2", exit_price="97", costs="2"), swap=Decimal(1))
+
+    [rung] = target_ladder([trade], AAPL, (Decimal(2),)).values()
+
+    assert rung is not None
+    assert rung.net_r == Decimal("1.9")  # +2 R, less 0.2 R of costs, plus 0.1 R of swap
+
+
 def test_reaching_the_target_exactly_is_a_hit() -> None:
     [rung] = target_ladder([_costed(mfe_r="2", exit_price="97")], AAPL, (Decimal(2),)).values()
     assert rung is not None

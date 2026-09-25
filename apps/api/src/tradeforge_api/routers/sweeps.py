@@ -43,7 +43,7 @@ from tradeforge_api.retention import MIN_TRADES
 from tradeforge_api.routers.backtests import failed_collections, list_item
 from tradeforge_api.routers.strategies import refusal_of
 from tradeforge_api.routers.studies import aggregate_points, strategies_for
-from tradeforge_api.runner import ENGINE_VERSION
+from tradeforge_api.runner import ENGINE_VERSION, build_cost_model
 from tradeforge_api.schemas import (
     CreatedSweep,
     CreateHoldout,
@@ -332,6 +332,7 @@ async def create_sweep(request: CreateSweep, session: SessionDep, queue: QueueDe
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=f"unknown symbols: {', '.join(unknown)}",
         )
+    costs = _costs_for(request.cost_model, found)
 
     planned = (
         to_collect(
@@ -457,7 +458,7 @@ async def create_sweep(request: CreateSweep, session: SessionDep, queue: QueueDe
                 date_from=request.date_from,
                 date_to=request.date_to,
                 initial_capital=request.initial_capital,
-                cost_model=request.cost_model,
+                cost_model=costs[symbol],
                 status=BacktestStatus.QUEUED,
                 engine_version=ENGINE_VERSION,
             )
@@ -492,6 +493,84 @@ async def create_sweep(request: CreateSweep, session: SessionDep, queue: QueueDe
         await queue.enqueue_job(RUN_BACKTEST, str(run.id), _job_id=str(run.id))
 
     return CreatedSweep(id=sweep.id, runs=len(runs), shared=len(followers), skipped=skipped)
+
+
+def _costs_for(
+    cost_model: dict[str, Any], instruments: dict[str, Instrument]
+) -> dict[str, dict[str, Any]]:
+    """What each market's runs are charged — resolved here, written concretely on every run.
+
+    Two ways to charge each market **its own** costs (24/09): one figure across markets would
+    charge EURUSD's ticks to a symbol counted in ticks a thousand times larger.
+
+    * `{"type": "per_market", "markets": {"GBPUSD": {"spread_points": "5", "commission_per_unit":
+      "0"}}}` — typed at launch, because they are the broker's and change with it (his ask). Every
+      market of the sweep must be named.
+    * `{"type": "instrument", "commission_per_unit": "7"}` — each market's measured spread
+      (`instruments.default_spread_points`) and one commission per lot.
+
+    Any other model is the same for every market.
+
+    ⚠️ **Refused before anything is written, and the reason named:** a market with no costs to
+    charge — a sweep mixing costed and costless runs would rank the costless ones first — and a
+    model the engine cannot build, which used to fail inside every one of the sweep's runs.
+    """
+    kind = cost_model.get("type")
+    if kind == "per_market":
+        given = cost_model.get("markets")
+        markets: dict[str, Any] = given if isinstance(given, dict) else {}
+        missing = sorted(symbol for symbol in instruments if symbol not in markets)
+        if missing:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="no costs given for: " + ", ".join(missing),
+            )
+        resolved = {
+            symbol: _spread_and_commission(
+                markets[symbol].get("spread_points") if isinstance(markets[symbol], dict) else None,
+                markets[symbol].get("commission_per_unit", "0")
+                if isinstance(markets[symbol], dict)
+                else None,
+            )
+            for symbol in instruments
+        }
+    elif kind == "instrument":
+        unmeasured = sorted(
+            symbol for symbol, one in instruments.items() if one.default_spread_points is None
+        )
+        if unmeasured:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="no measured spread for: "
+                + ", ".join(unmeasured)
+                + " — sync the symbols from the broker, or type each market's costs",
+            )
+        commission = cost_model.get("commission_per_unit", "0")
+        resolved = {
+            symbol: _spread_and_commission(one.default_spread_points, commission)
+            for symbol, one in instruments.items()
+        }
+    else:
+        resolved = {symbol: dict(cost_model) for symbol in instruments}
+    for model in resolved.values():
+        try:
+            build_cost_model(model)
+        except (KeyError, TypeError, ValueError, ArithmeticError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=f"cost model cannot be charged: {exc}",
+            ) from exc
+    return resolved
+
+
+def _spread_and_commission(spread: object, commission: object) -> dict[str, Any]:
+    """The concrete document a run is charged by. Strings, as every stored cost is: JSON has only
+    doubles, and a spread is an exact tick count."""
+    return {
+        "type": "spread_commission",
+        "spread_points": None if spread is None else str(spread),
+        "commission_per_unit": None if commission is None else str(commission),
+    }
 
 
 def _collections_for(

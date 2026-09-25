@@ -13,6 +13,7 @@ import pytest
 
 from tradeforge_engine.costs import (
     BarSpreadCostModel,
+    CombinedCostModel,
     CommissionCostModel,
     NoCostModel,
     SpreadCostModel,
@@ -138,3 +139,50 @@ def test_a_bar_with_no_spread_is_free_only_when_that_is_asserted() -> None:
     model = BarSpreadCostModel(require_spread=False)
     assert model.entry_cost(an_order(), EURUSD, Decimal("1.1"), silent) == Decimal(0)
     assert model.exit_cost(an_order(), EURUSD, Decimal("1.1"), silent) == Decimal(0)
+
+
+def test_a_combined_model_charges_every_part_on_each_leg() -> None:
+    """A raw-spread account (24/09): 8 points of spread and $3.50 a lot, half a lot. Each leg
+    pays half the spread (0.5 x 4 = $2) and the commission (0.5 x 3.50 = $1.75): $3.75, twice."""
+    model = CombinedCostModel(
+        SpreadCostModel(spread_points=Decimal(8)),
+        CommissionCostModel(commission_per_unit=Decimal("3.50")),
+    )
+    order = an_order("0.5")
+    assert model.entry_cost(order, EURUSD, Decimal("1.10000"), A_BAR) == Decimal("3.75")
+    assert model.exit_cost(order, EURUSD, Decimal("1.10500"), A_BAR) == Decimal("3.75")
+
+
+def test_a_combined_model_of_one_part_is_that_part() -> None:
+    alone = SpreadCostModel(spread_points=Decimal(10))
+    model = CombinedCostModel(alone)
+    assert model.entry_cost(an_order(), EURUSD, Decimal("1.1"), A_BAR) == alone.entry_cost(
+        an_order(), EURUSD, Decimal("1.1"), A_BAR
+    )
+
+
+def test_a_combined_model_of_nothing_is_refused() -> None:
+    """No parts is a costless run that looks costed — the one thing a cost model must not be."""
+    with pytest.raises(ValueError, match="at least one part"):
+        CombinedCostModel()
+
+
+class _Uneven:
+    """A part that charges differently on each leg, as no model does yet — so a combined model
+    that asked the wrong leg of its parts would be caught the day one does (engine-guardian)."""
+
+    def entry_cost(
+        self, order: OrderRequest, instrument: object, price: Decimal, candle: object
+    ) -> Decimal:
+        return Decimal(1)
+
+    def exit_cost(
+        self, order: OrderRequest, instrument: object, price: Decimal, candle: object
+    ) -> Decimal:
+        return Decimal(2)
+
+
+def test_a_combined_model_asks_each_part_for_the_same_leg() -> None:
+    model = CombinedCostModel(_Uneven(), SpreadCostModel(spread_points=Decimal(10)))
+    assert model.entry_cost(an_order(), EURUSD, Decimal("1.1"), A_BAR) == Decimal(6)
+    assert model.exit_cost(an_order(), EURUSD, Decimal("1.1"), A_BAR) == Decimal(7)

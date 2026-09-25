@@ -2694,3 +2694,15 @@ cobre só os setups de estrutura (`structure_choch`, `structure_continuation`), 
 - o estudo (`/studies`) expande grades pelo mesmo caminho e ainda roda cada ponto;
 - a chave de equivalência compara o JSON do documento: `0` e `0.0` no mesmo eixo contam como
   diferentes (só custa um run a mais, nunca junta o que difere).
+
+## Seletores de ativo mostram só os instrumentos cadastrados (24/09) — PENDENTE, pedido dele
+
+"Mesmo que eu colete no coletor vários ativos sempre aparece somente os mesmos 4." As telas de
+varredura, backtest, estudo e basket listam `GET /instruments` (a tabela `instruments`: 4 linhas —
+AAPL, US500, EURUSD, GBPUSD), enquanto a corretora tem 84 símbolos em `broker_symbols`. Pedido:
+**digitar, buscar e adicionar** o ativo na hora de lançar qualquer teste, a partir dos símbolos da
+corretora, criando o instrumento (tick, contrato, spread) quando ainda não existe.
+
+A investigar junto: houve coletas de AUDUSD e USDCHF que não viraram `instruments` nem `datasets`
+— a coleta de um símbolo novo talvez não registre o instrumento, o que também o esconderia dos
+seletores.

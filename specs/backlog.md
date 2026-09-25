@@ -2739,3 +2739,19 @@ o terminal sabe, então o instrumento nasce na coleta.
    deixa de ser escaneável; trocar por "catalogados filtrados pela busca" ou por grupos.
 3. O `POST /sweeps/preview` pula símbolo desconhecido em silêncio (`coverage.py`, `continue`), e a
    prévia não o menciona.
+
+## Teste fora da amostra julgado em pedaços (25/09) — FEITO no PR-307, com pendências
+
+A pedido dele, um teste fora da amostra terminado pode ser fatiado **à mão** por ano calendário ou
+em blocos de N trades. Cada ponto passa se ≥ X% das fatias fecharem acima de zero R, com pelo menos
+2 fatias contadas. A análise é gravada (`sweep_slicings`, migração 0026) junto com a regra, e não
+roda nada: os runs de teste passam a guardar os trades mesmo quando perdem (`retention`).
+
+Pendências:
+
+- **Testes lançados antes de 25/09** não têm os trades dos perdedores (`recorded = metrics`). A
+  análise mostra "no trades kept" em vez de julgar; para julgá-los, é preciso lançar o teste de novo.
+- **Walk-forward de verdade** (caminho B: reotimizar a cada janela, uma varredura por janela) fica
+  para depois de o fatiamento mostrar se vale o custo.
+- O ano reservado é outro teste fora da amostra da mesma varredura. Nada impede, ainda, que ele
+  seja lançado antes da hora; hoje isso depende da disciplina.

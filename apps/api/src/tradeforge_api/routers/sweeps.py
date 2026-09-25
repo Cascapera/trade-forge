@@ -24,6 +24,7 @@ did — which is why a hole is always written down, never merely left.
 import json
 import uuid
 from collections.abc import Iterable
+from decimal import Decimal
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query, Response, status
@@ -47,6 +48,7 @@ from tradeforge_api.runner import ENGINE_VERSION, build_cost_model, swap_rates
 from tradeforge_api.schemas import (
     CreatedSweep,
     CreateHoldout,
+    CreateSlicing,
     CreateSweep,
     DatasetColumnOut,
     DatasetDictionaryOut,
@@ -58,6 +60,10 @@ from tradeforge_api.schemas import (
     HoldoutSide,
     PlannedCollection,
     PreviewSweepRequest,
+    SlicedGroup,
+    SlicedPoint,
+    SliceOut,
+    SlicingOut,
     SweepDashboardOut,
     SweepEntryOut,
     SweepEntryPreview,
@@ -72,6 +78,7 @@ from tradeforge_api.schemas import (
     SweepsPage,
     UncoveredMarket,
 )
+from tradeforge_api.slices import ClosedTrade, by_blocks, by_year, verdict
 from tradeforge_api.sweep import (
     SweepDocument,
     SweepError,
@@ -92,8 +99,12 @@ from tradeforge_db.models import (
     CatalogEntry,
     Collection,
     Instrument,
+    Recorded,
+    SliceMode,
     Strategy,
     Sweep,
+    SweepSlicing,
+    Trade,
 )
 from tradeforge_engine.setup_factory import unread_params
 
@@ -1083,6 +1094,160 @@ def get_holdout(sweep_id: uuid.UUID, session: SessionDep) -> HoldoutOut:
         groups=groups,
         rows=rows,
     )
+
+
+def _entry_names(session: Session, sweep: Sweep) -> dict[str, str]:
+    return {
+        str(entry.id): entry.name
+        for entry in session.scalars(
+            select(CatalogEntry).where(
+                CatalogEntry.id.in_([uuid.UUID(one) for one in sweep.entry_ids])
+            )
+        )
+    }
+
+
+def _slicing_out(row: SweepSlicing) -> SlicingOut:
+    return SlicingOut(
+        id=row.id,
+        sweep_id=row.sweep_id,
+        mode=row.mode,
+        block_trades=row.block_trades,
+        pass_share=row.pass_share,
+        created_at=row.created_at,
+        groups=[SlicedGroup.model_validate(one) for one in row.result["groups"]],
+        points=[SlicedPoint.model_validate(one) for one in row.result["points"]],
+    )
+
+
+@router.post(
+    "/sweeps/{sweep_id}/slicings",
+    response_model=SlicingOut,
+    status_code=status.HTTP_201_CREATED,
+    responses={**_NOT_FOUND, **_BAD_BODY},
+)
+def create_slicing(sweep_id: uuid.UUID, request: CreateSlicing, session: SessionDep) -> SlicingOut:
+    """Cut a finished reserved-window test's runs by year or into blocks of trades, judge each
+    point by the share of pieces that made money, and keep the answer (25/09, `slices`).
+
+    Runs nothing: the test's runs keep their trades win or lose (`retention`). Refused for a
+    sweep that is not such a test — its runs were not chosen on other data, and slicing them
+    would dress an in-sample result as a second opinion — and for a test still running, whose
+    verdict would silently leave out the runs not yet finished.
+    """
+    test = session.get(Sweep, sweep_id)
+    if test is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="sweep not found")
+    if test.holdout_rule is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="only a reserved-window test can be judged in pieces; test this sweep first",
+        )
+    runs = _runs_of(session, test.id)
+    if any(run.status in (BacktestStatus.QUEUED, BacktestStatus.RUNNING) for run, _ in runs):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="the test is still running: judge it once every run has finished",
+        )
+    done = [(run, symbol) for run, symbol in runs if run.status == BacktestStatus.DONE]
+
+    # One query for every trade of every run, only the two columns a slice reads.
+    trades_of: dict[uuid.UUID, list[ClosedTrade]] = {}
+    for backtest_id, entry_time, r in session.execute(
+        select(Trade.backtest_id, Trade.entry_time, Trade.r_multiple).where(
+            Trade.backtest_id.in_([run.id for run, _ in done]),
+            Trade.exit_time.is_not(None),
+        )
+    ):
+        trades_of.setdefault(backtest_id, []).append(ClosedTrade(entry_time=entry_time, r=r))
+
+    own, _followers = _points_of(test)
+    names = _entry_names(session, test)
+    points: list[SlicedPoint] = []
+    for run, symbol in done:
+        point = own.get(str(run.strategy_id), {})
+        entry_id = str(point.get("entry_id", ""))
+        kept = run.recorded is not Recorded.METRICS
+        trades = trades_of.get(run.id, [])
+        pieces = (
+            []
+            if not kept
+            else by_year(trades, test.date_from, test.date_to)
+            if request.mode is SliceMode.CALENDAR
+            else by_blocks(trades, request.block_trades or 0)
+        )
+        judged = verdict(pieces, request.pass_share)
+        points.append(
+            SlicedPoint(
+                run_id=run.id,
+                entry_id=entry_id,
+                entry_name=names.get(entry_id),
+                symbol=symbol,
+                timeframe=run.timeframe,
+                label=str(point.get("label", "")),
+                trades_kept=kept,
+                unscored=sum(1 for one in trades if one.r is None),
+                net_r=sum((one.r for one in trades if one.r is not None), Decimal(0)),
+                slices=[
+                    SliceOut(
+                        label=one.label,
+                        date_from=one.date_from,
+                        date_to=one.date_to,
+                        trades=one.trades,
+                        net_r=one.net_r,
+                        counted=one.counted,
+                    )
+                    for one in pieces
+                ],
+                counted=judged.counted,
+                positive=judged.positive,
+                share=judged.share,
+                passed=judged.passed,
+            )
+        )
+
+    grouped: dict[tuple[str, str], list[SlicedPoint]] = {}
+    for one in points:
+        grouped.setdefault((one.entry_id, one.timeframe), []).append(one)
+    groups = [
+        SlicedGroup(
+            entry_id=entry_id,
+            entry_name=names.get(entry_id),
+            timeframe=timeframe,
+            points=len(members),
+            judged=sum(1 for one in members if one.trades_kept),
+            passed=sum(1 for one in members if one.passed),
+        )
+        for (entry_id, timeframe), members in grouped.items()
+    ]
+
+    row = SweepSlicing(
+        sweep_id=test.id,
+        mode=request.mode,
+        block_trades=request.block_trades,
+        pass_share=request.pass_share,
+        result={
+            "groups": [one.model_dump(mode="json") for one in groups],
+            "points": [one.model_dump(mode="json") for one in points],
+        },
+    )
+    session.add(row)
+    session.commit()
+    session.refresh(row)
+    return _slicing_out(row)
+
+
+@router.get("/sweeps/{sweep_id}/slicings", response_model=list[SlicingOut], responses=_NOT_FOUND)
+def list_slicings(sweep_id: uuid.UUID, session: SessionDep) -> list[SlicingOut]:
+    """Every slicing kept for this test, newest first."""
+    if session.get(Sweep, sweep_id) is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="sweep not found")
+    rows = session.scalars(
+        select(SweepSlicing)
+        .where(SweepSlicing.sweep_id == sweep_id)
+        .order_by(SweepSlicing.created_at.desc(), SweepSlicing.id)
+    )
+    return [_slicing_out(row) for row in rows]
 
 
 @router.get("/sweeps/{sweep_id}", response_model=SweepOut, responses=_NOT_FOUND)

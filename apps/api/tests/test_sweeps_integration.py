@@ -42,11 +42,14 @@ from tradeforge_db.models import (
     BacktestStatus,
     Collection,
     Dataset,
+    ExitReason,
     Instrument,
+    Recorded,
     Sweep,
     SymbolHistory,
+    Trade,
 )
-from tradeforge_engine.domain import AssetClass
+from tradeforge_engine.domain import AssetClass, Side
 
 pytestmark = pytest.mark.integration
 
@@ -1932,6 +1935,143 @@ class TestTheReservedWindow:
         for floors in ({"H1": 0}, {"H7": 5}):
             refused = client.post(f"/sweeps/{sweep_id}/holdout", json=self.after(min_trades=floors))
             assert refused.status_code == 422, floors
+
+
+def trade_in(
+    session_factory: Callable[[], Session], run_id: str, rs: list[str], *, first: dt.datetime
+) -> None:
+    """Closed trades on a run, one a day from `first`, each making the R given."""
+    with session_factory() as session:
+        run = session.get(Backtest, uuid.UUID(run_id))
+        assert run is not None
+        run.recorded = Recorded.TRADES
+        for day, r in enumerate(rs):
+            entered = first + dt.timedelta(days=day)
+            session.add(
+                Trade(
+                    backtest_id=run.id,
+                    instrument_id=run.instrument_id,
+                    direction=Side.LONG,
+                    entry_time=entered,
+                    entry_price=Decimal("1.10000"),
+                    volume=Decimal("0.10"),
+                    stop_loss=Decimal("1.09000"),
+                    exit_time=entered + HOUR,
+                    exit_price=Decimal("1.10500"),
+                    exit_reason=ExitReason.TAKE_PROFIT,
+                    gross_pnl=Decimal(r) * 100,
+                    costs=Decimal("0"),
+                    net_pnl=Decimal(r) * 100,
+                    r_multiple=Decimal(r),
+                )
+            )
+        session.commit()
+
+
+class TestJudgingATestInPieces:
+    """His ask (25/09): cut a finished reserved-window test by year or into blocks of trades, by
+    hand, and keep the answer."""
+
+    def a_finished_test(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> tuple[str, dict[int, str]]:
+        """A finished test of periods 13 and 11: 13 kept six trades, 11 lost and kept none."""
+        window = TestTheReservedWindow()
+        sweep_id, _runs = window.swept(client, session_factory)
+        test_id = client.post(f"/sweeps/{sweep_id}/holdout", json=window.after()).json()["id"]
+        runs = {
+            row["values"]["setup.params.period"]: row["run"]["id"]
+            for row in client.get(f"/sweeps/{test_id}").json()["runs"]
+        }
+        finish_trading(session_factory, runs[13], net=300, trades=6)
+        # Blocks of three: [1, 1, -1] = +1 and [1, 1, 1] = +3 → both positive.
+        trade_in(
+            session_factory, runs[13], ["1", "1", "-1", "1", "1", "1"], first=START + 210 * HOUR
+        )
+        finish_trading(session_factory, runs[11], net=-80, trades=4)
+        with session_factory() as session:
+            lost = session.get(Backtest, uuid.UUID(runs[11]))
+            assert lost is not None
+            lost.recorded = Recorded.METRICS  # a test run from before 25/09 that lost
+            session.commit()
+        return test_id, runs
+
+    def test_blocks_of_trades_are_judged_and_the_answer_is_kept(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        test_id, runs = self.a_finished_test(client, session_factory)
+
+        made = client.post(
+            f"/sweeps/{test_id}/slicings",
+            json={"mode": "trades", "block_trades": 4, "pass_share": "0.5"},
+        )
+        assert made.status_code == 422, "a block of fewer than five is refused"
+        made = client.post(
+            f"/sweeps/{test_id}/slicings", json={"mode": "calendar", "block_trades": 5}
+        )
+        assert made.status_code == 422, "a block size by calendar means nothing"
+
+        made = client.post(
+            f"/sweeps/{test_id}/slicings",
+            json={"mode": "trades", "block_trades": 5, "pass_share": "0.7"},
+        )
+        assert made.status_code == 201, made.text
+        body = made.json()
+        points = {one["run_id"]: one for one in body["points"]}
+        good = points[runs[13]]
+        assert [
+            (one["label"], one["trades"], Decimal(one["net_r"]), one["counted"])
+            for one in good["slices"]
+        ] == [
+            ("1-5", 5, Decimal("3"), True),
+            ("6-6", 1, Decimal("1"), False),
+        ]
+        # One counted block is one draw: never a pass, however good.
+        assert (good["counted"], good["positive"], good["passed"]) == (1, 1, False)
+        assert Decimal(good["net_r"]) == Decimal("4")
+        lost = points[runs[11]]
+        assert (lost["trades_kept"], lost["slices"], lost["passed"]) == (False, [], False)
+        (group,) = body["groups"]
+        assert (group["points"], group["judged"], group["passed"]) == (2, 1, 0)
+
+        kept = client.get(f"/sweeps/{test_id}/slicings")
+        assert kept.status_code == 200
+        assert [one["id"] for one in kept.json()] == [body["id"]]
+
+    def test_a_second_cut_of_the_same_test_runs_nothing_and_is_kept_beside_the_first(
+        self, client: Any, session_factory: Callable[[], Session], queue: _CapturingQueue
+    ) -> None:
+        test_id, runs = self.a_finished_test(client, session_factory)
+        first = client.post(
+            f"/sweeps/{test_id}/slicings", json={"mode": "calendar", "pass_share": "0.7"}
+        ).json()
+        queued = len(queue.jobs)
+
+        second = client.post(
+            f"/sweeps/{test_id}/slicings",
+            json={"mode": "trades", "block_trades": 5, "pass_share": "0.7"},
+        )
+
+        assert second.status_code == 201
+        assert len(queue.jobs) == queued, "a slicing reads stored trades; it queues nothing"
+        good = {one["run_id"]: one for one in first["points"]}[runs[13]]
+        assert [one["label"] for one in good["slices"]] == ["2024"]
+        listed = client.get(f"/sweeps/{test_id}/slicings").json()
+        assert [one["mode"] for one in listed] == ["trades", "calendar"]
+
+    def test_only_a_finished_reserved_window_test_can_be_judged(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        window = TestTheReservedWindow()
+        sweep_id, _runs = window.swept(client, session_factory)
+        body = {"mode": "calendar"}
+
+        assert client.post(f"/sweeps/{sweep_id}/slicings", json=body).status_code == 422
+        test_id = client.post(f"/sweeps/{sweep_id}/holdout", json=window.after()).json()["id"]
+        still = client.post(f"/sweeps/{test_id}/slicings", json=body)
+        assert still.status_code == 409, still.text
+        assert client.post(f"/sweeps/{uuid.uuid4()}/slicings", json=body).status_code == 404
+        assert client.get(f"/sweeps/{uuid.uuid4()}/slicings").status_code == 404
 
 
 class TestTheScreenReadsAPage:

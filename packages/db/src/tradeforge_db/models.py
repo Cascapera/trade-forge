@@ -94,6 +94,16 @@ class Recorded(StrEnum):
     the denominator every winner is judged against."""
 
 
+class SliceMode(StrEnum):
+    """How a reserved-window test's run is cut when it is judged in pieces (`SweepSlicing`)."""
+
+    CALENDAR = "calendar"
+    """One slice per calendar year: the regime question."""
+
+    TRADES = "trades"
+    """Blocks of the same number of trades: every slice the same strength of evidence."""
+
+
 class SelectionMetric(StrEnum):
     """What a walk-forward fold maximises when it picks a winner from its training grid.
 
@@ -1801,4 +1811,58 @@ class Sweep(Base):
         ),
         Index("ix_sweeps_created_at", "created_at"),
         Index("ix_sweeps_holdout_of", "holdout_of"),
+    )
+
+
+class SweepSlicing(Base):
+    """A reserved-window test judged in pieces — by year or by blocks of trades — and kept.
+
+    His ask (25/09): after a test (`Sweep.holdout_rule`), decide whether it deserves a second
+    look, and if so cut each tested point's out-of-sample run into slices and see how many made
+    money. Nothing starts it but him: a sweep that was bad needs no second analysis.
+
+    ⚠️ **Computed once and stored, not recomputed on read.** `result` is what the slicing found
+    when it was asked, under the rule written beside it (`mode`, `block_trades`, `pass_share`).
+    The rule is set *before* the result is seen, which is the point: with two ways to cut, the
+    temptation is to keep whichever looks better, and a stored rule is the record of which one
+    was decided on first.
+
+    ⚠️ **Runs nothing.** The test's runs keep their trades win or lose (`retention`), so any
+    number of slicings of one test cost queries, not engine time.
+    """
+
+    __tablename__ = "sweep_slicings"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+
+    sweep_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("sweeps.id", ondelete="CASCADE"), nullable=False
+    )
+    """The reserved-window test that was cut. `CASCADE`: a slicing of a test that no longer
+    exists describes nothing anybody can open."""
+
+    mode: Mapped[SliceMode] = mapped_column(_enum(SliceMode, "slice_mode"), nullable=False)
+
+    block_trades: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    """Trades per block when cutting by trades; null — and only null — by calendar."""
+
+    pass_share: Mapped[Decimal] = mapped_column(RATIO, nullable=False)
+    """The share of counted slices that must be positive for a point to pass, as a fraction."""
+
+    result: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    """Per point: its slices and its verdict; per (entry, chart): how many points passed."""
+
+    created_at: Mapped[dt.datetime] = _created_at()
+
+    __table_args__ = (
+        CheckConstraint(
+            "(mode = 'trades') = (block_trades IS NOT NULL)",
+            name="blocks_are_sized_only_when_cutting_by_trades",
+        ),
+        CheckConstraint(
+            "block_trades IS NULL OR block_trades >= 5", name="a_block_holds_five_trades_or_more"
+        ),
+        CheckConstraint("pass_share > 0 AND pass_share <= 1", name="the_bar_is_a_share_above_zero"),
+        CheckConstraint("jsonb_typeof(result) = 'object'", name="a_result_is_an_object"),
+        Index("ix_sweep_slicings_sweep_id", "sweep_id"),
     )

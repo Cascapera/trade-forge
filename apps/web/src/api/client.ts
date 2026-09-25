@@ -18,6 +18,7 @@ import type {
   CreateCollection,
   CreateStudyRequest,
   CreateHoldoutRequest,
+  CreateSlicingRequest,
   CreateSweepRequest,
   CreateWalkForwardRequest,
   CreatedBacktest,
@@ -43,6 +44,7 @@ import type {
   StudyOut,
   StudyPreview,
   HoldoutOut,
+  SlicingOut,
   SweepOut,
   SweepPreview,
   SweepDashboard,
@@ -203,6 +205,10 @@ export const api = {
   createHoldout: (sweepId: string, payload: CreateHoldoutRequest): Promise<CreatedSweep> =>
     request('POST', `/sweeps/${sweepId}/holdout`, payload),
   getHoldout: (id: string): Promise<HoldoutOut> => request('GET', `/sweeps/${id}/holdout`),
+  // A finished test cut by year or into blocks of trades, and kept (25/09). Runs nothing.
+  createSlicing: (id: string, payload: CreateSlicingRequest): Promise<SlicingOut> =>
+    request('POST', `/sweeps/${id}/slicings`, payload),
+  listSlicings: (id: string): Promise<SlicingOut[]> => request('GET', `/sweeps/${id}/slicings`),
   listSweeps: (page: { limit: number; offset: number }): Promise<SweepsPage> =>
     request('GET', `/sweeps${query(page)}`),
   getSweepDashboard: (launched: LaunchWindow): Promise<SweepDashboard> =>

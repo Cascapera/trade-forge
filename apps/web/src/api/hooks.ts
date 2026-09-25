@@ -27,6 +27,7 @@ import type {
   CreateCollection,
   CreateStudyRequest,
   CreateHoldoutRequest,
+  CreateSlicingRequest,
   CreateSweepRequest,
   CreateWalkForwardRequest,
   CreatedBacktest,
@@ -53,6 +54,7 @@ import type {
   StudyPreview,
   PreviewSweepRequest,
   HoldoutOut,
+  SlicingOut,
   SweepOut,
   SweepPreview,
   SweepRunsPage,
@@ -643,6 +645,25 @@ export function useHoldout(id: string | undefined) {
     queryKey: ['holdout', id],
     queryFn: id === undefined ? skipToken : () => api.getHoldout(id),
     refetchInterval: (query) => (isHoldoutSettled(query.state.data) ? false : STUDY_POLL_MS),
+  })
+}
+
+/** Every slicing kept for a reserved-window test, newest first. */
+export function useSlicings(id: string) {
+  return useQuery<SlicingOut[]>({
+    queryKey: ['slicings', id],
+    queryFn: () => api.listSlicings(id),
+  })
+}
+
+/** Judge a finished test in pieces; the new slicing joins the list on success. */
+export function useCreateSlicing(id: string) {
+  const client = useQueryClient()
+  return useMutation<SlicingOut, Error, CreateSlicingRequest>({
+    mutationFn: (payload) => api.createSlicing(id, payload),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: ['slicings', id] })
+    },
   })
 }
 

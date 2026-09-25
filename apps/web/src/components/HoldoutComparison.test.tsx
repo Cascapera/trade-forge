@@ -9,7 +9,11 @@ import { HoldoutComparison } from './HoldoutComparison'
 
 vi.mock('../api/client', async () => {
   const actual = await vi.importActual<typeof import('../api/client')>('../api/client')
-  return { ...actual, api: { ...actual.api, getHoldout: vi.fn() } }
+  // The judgements below the comparison have their own test (`HoldoutSlicings.test`).
+  return {
+    ...actual,
+    api: { ...actual.api, getHoldout: vi.fn(), listSlicings: vi.fn().mockResolvedValue([]) },
+  }
 })
 
 const getHoldout = vi.mocked(api.getHoldout)

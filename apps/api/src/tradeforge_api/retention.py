@@ -12,6 +12,10 @@ of it pictures and an equity curve that nobody opens one run at a time. So a swe
 * **never** the entry pictures or the equity curve. The engine is deterministic: running the same
   point again rebuilds both, exactly.
 
+A **reserved-window test** is a sweep too (`Sweep.holdout_rule`), and its runs keep their trades
+**win or lose** (25/09): a point that failed out of sample is exactly the one to cut into years and
+blocks to see *where* it failed (`slices`), and a test holds only the few chosen points.
+
 Anything that is not a sweep's run — a single backtest, a study, a basket, a walk-forward — keeps
 everything, as before: those are read run by run.
 
@@ -39,13 +43,14 @@ MIN_TRADES: Final[Mapping[str, int]] = {
 DSL names has a line here, and a test fails the day one is added without one."""
 
 
-def recorded_for(
+def recorded_for(  # noqa: PLR0913 — keyword-only; each is a fact about the run
     *,
     in_sweep: bool,
     timeframe: str,
     net_profit: Decimal,
     total_trades: int,
     target_net_r: Iterable[Decimal | None] = (),
+    reserved_test: bool = False,
 ) -> Recorded:
     """What a finished run keeps. See the module docstring for why.
 
@@ -64,6 +69,8 @@ def recorded_for(
     """
     if not in_sweep:
         return Recorded.FULL
+    if reserved_test:
+        return Recorded.TRADES
     floor = MIN_TRADES[timeframe]
     profitable = net_profit > 0 or any(r is not None and r > 0 for r in target_net_r)
     if profitable and total_trades >= floor:

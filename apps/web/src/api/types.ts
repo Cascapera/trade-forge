@@ -1251,6 +1251,64 @@ export interface HoldoutOut {
   rows: HoldoutRow[]
 }
 
+/** How a reserved-window test is cut when it is judged in pieces (25/09). */
+export type SliceMode = 'calendar' | 'trades'
+
+export interface CreateSlicingRequest {
+  mode: SliceMode
+  /** Trades per block — given when cutting by trades, and only then. */
+  block_trades?: number
+  /** The share of counted slices that must end above zero R, as a decimal string. */
+  pass_share: string
+}
+
+export interface SliceOut {
+  label: string
+  date_from: string
+  date_to: string
+  trades: number
+  net_r: string
+  counted: boolean
+}
+
+export interface SlicedPoint {
+  run_id: string
+  entry_id: string
+  entry_name: string | null
+  symbol: string
+  timeframe: string
+  label: string
+  /** False for a test run from before 25/09 that lost: it kept no trades and was not cut. */
+  trades_kept: boolean
+  unscored: number
+  net_r: string
+  slices: SliceOut[]
+  counted: number
+  positive: number
+  share: string | null
+  passed: boolean
+}
+
+export interface SlicedGroup {
+  entry_id: string
+  entry_name: string | null
+  timeframe: string
+  points: number
+  judged: number
+  passed: number
+}
+
+export interface SlicingOut {
+  id: string
+  sweep_id: string
+  mode: SliceMode
+  block_trades: number | null
+  pass_share: string
+  created_at: string
+  groups: SlicedGroup[]
+  points: SlicedPoint[]
+}
+
 export interface SweepOut {
   id: string
   entry_ids: string[]

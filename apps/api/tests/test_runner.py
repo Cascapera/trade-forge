@@ -162,6 +162,23 @@ def test_a_spread_cost_model_eats_into_the_result() -> None:
     assert spread.net_profit < costless.net_profit
 
 
+def test_a_spread_and_commission_model_charges_exactly_both() -> None:
+    """A raw-spread account pays the spread and a commission per lot (24/09). Charged together, each
+    trade costs exactly what the spread alone and the commission alone cost it — so a model that
+    read one figure for the other, 7 points of spread and $20 a lot, is caught (engine-guardian)."""
+    spread_trades, _, _ = run_it(cost_model={"type": "spread", "spread_points": 20})
+    commission_trades, _, _ = run_it(cost_model={"type": "commission", "commission_per_unit": 7})
+    both_trades, _, _ = run_it(
+        cost_model={"type": "spread_commission", "spread_points": 20, "commission_per_unit": 7}
+    )
+
+    assert both_trades
+    assert [trade.costs for trade in both_trades] == [
+        spread.costs + commission.costs
+        for spread, commission in zip(spread_trades, commission_trades, strict=True)
+    ]
+
+
 def test_an_unknown_cost_model_raises() -> None:
     with pytest.raises(ValueError, match="unknown cost model type"):
         run_it(cost_model={"type": "teleport"})

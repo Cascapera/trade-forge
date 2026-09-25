@@ -12,9 +12,11 @@ import { TIMEFRAMES } from '../strategy/builder'
 import { useSweepRehearsal } from '../sweep/preview'
 import {
   emptySweepForm,
+  isCostless,
   launchFailure,
   runCount,
   toSweepRequest,
+  toggleMarket,
   whyNotLaunchable,
   type SweepForm,
 } from '../sweep/settings'
@@ -200,9 +202,64 @@ export function LaunchSweep(): React.JSX.Element {
           instruments={instruments.data}
           chosen={form.symbols}
           onToggle={(symbol) => {
-            set({ symbols: toggle(form.symbols, symbol) })
+            const next = toggleMarket(form, symbol, instruments.data)
+            set({ symbols: next.symbols, costs: next.costs })
           }}
         />
+
+        {/* ⚠️ **Typed here, per market, because the costs are the broker's** (his ask, 24/09):
+            they change with the account, and one spread across markets would charge EURUSD's
+            ticks to a symbol counted in ticks a thousand times larger. Each starts from the spread
+            the broker quoted at the last sync, for the reader to correct. */}
+        {form.symbols.length > 0 && (
+          <fieldset className="space-y-2">
+            <legend className="text-sm text-slate-300">Costs per market</legend>
+            <div className="space-y-1">
+              {form.symbols.map((symbol) => {
+                const costs = form.costs[symbol] ?? { spread: '', commission: '' }
+                const change = (patch: Partial<typeof costs>) => {
+                  set({ costs: { ...form.costs, [symbol]: { ...costs, ...patch } } })
+                }
+                return (
+                  <div key={symbol} className="flex flex-wrap items-center gap-3 text-sm">
+                    <span className="w-24 font-medium text-slate-200">{symbol}</span>
+                    <label className="flex items-center gap-1 text-slate-400">
+                      Spread (points)
+                      <input
+                        aria-label={`spread of ${symbol}`}
+                        inputMode="decimal"
+                        placeholder="none"
+                        className={`${inputClass} w-24`}
+                        value={costs.spread}
+                        onChange={(event) => {
+                          change({ spread: event.target.value })
+                        }}
+                      />
+                    </label>
+                    <label className="flex items-center gap-1 text-slate-400">
+                      Commission per lot, each leg
+                      <input
+                        aria-label={`commission of ${symbol}`}
+                        inputMode="decimal"
+                        placeholder="0"
+                        className={`${inputClass} w-24`}
+                        value={costs.commission}
+                        onChange={(event) => {
+                          change({ commission: event.target.value })
+                        }}
+                      />
+                    </label>
+                  </div>
+                )
+              })}
+            </div>
+            {isCostless(form) && (
+              <p role="status" className="text-xs text-amber-300">
+                No costs on any market: every result is an upper bound, not a P&amp;L.
+              </p>
+            )}
+          </fieldset>
+        )}
 
         <fieldset className="space-y-2">
           <legend className="text-sm text-slate-300">
@@ -266,19 +323,6 @@ export function LaunchSweep(): React.JSX.Element {
               value={form.initialCapital}
               onChange={(event) => {
                 set({ initialCapital: event.target.value })
-              }}
-            />
-          </label>
-          <label className="flex flex-col gap-1 text-sm text-slate-300">
-            Spread (points)
-            <input
-              type="text"
-              inputMode="decimal"
-              placeholder="none"
-              className={inputClass}
-              value={form.spreadTicks}
-              onChange={(event) => {
-                set({ spreadTicks: event.target.value })
               }}
             />
           </label>

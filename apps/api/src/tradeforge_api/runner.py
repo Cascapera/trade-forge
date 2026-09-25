@@ -28,6 +28,7 @@ from tradeforge_engine import (
     BacktestBroker,
     Candle,
     ClosedTrade,
+    CombinedCostModel,
     CommissionCostModel,
     InstrumentSpec,
     NoCostModel,
@@ -81,7 +82,17 @@ def build_cost_model(spec: Mapping[str, Any]) -> CostModel:
         return SpreadCostModel(spread_points=_decimal(spec["spread_points"]))
     if kind == "commission":
         return CommissionCostModel(commission_per_unit=_decimal(spec["commission_per_unit"]))
-    raise ValueError(f"unknown cost model type {kind!r}; expected 'none', 'spread' or 'commission'")
+    if kind == "spread_commission":
+        # A raw-spread account (24/09): the spread crossed on each leg and a commission per lot on
+        # each leg, both charged — the engine's two models, summed.
+        return CombinedCostModel(
+            SpreadCostModel(spread_points=_decimal(spec["spread_points"])),
+            CommissionCostModel(commission_per_unit=_decimal(spec["commission_per_unit"])),
+        )
+    raise ValueError(
+        f"unknown cost model type {kind!r}; "
+        "expected 'none', 'spread', 'commission' or 'spread_commission'"
+    )
 
 
 def take_profit_rr(definition: Mapping[str, Any]) -> Decimal | None:

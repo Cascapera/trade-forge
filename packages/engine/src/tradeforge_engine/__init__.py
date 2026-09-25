@@ -21,6 +21,7 @@ Three invariants hold here and are enforced by tests (AGENTS.md §5):
 from tradeforge_engine.backtest_broker import BacktestBroker
 from tradeforge_engine.costs import (
     BarSpreadCostModel,
+    CombinedCostModel,
     CommissionCostModel,
     NoCostModel,
     SpreadCostModel,
@@ -73,6 +74,7 @@ __all__ = [
     "Broker",
     "Candle",
     "ClosedTrade",
+    "CombinedCostModel",
     "CommissionCostModel",
     "CompiledStrategy",
     "Condition",

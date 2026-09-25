@@ -1,12 +1,14 @@
 import { describe, expect, it } from 'vitest'
 
-import type { CatalogEntry } from '../api/types'
+import type { CatalogEntry, Instrument } from '../api/types'
 
 import {
   emptySweepForm,
+  isCostless,
   runCount,
   toPreviewRequest,
   toSweepRequest,
+  toggleMarket,
   whyNotLaunchable,
   type SweepForm,
 } from './settings'
@@ -25,6 +27,8 @@ function anEntry(id: string, points: number): CatalogEntry {
     created_at: '2026-09-01T00:00:00Z',
   }
 }
+
+const ENTRIES = [anEntry('a', 1)]
 
 /** A form that `whyNotLaunchable` approves, so each test can break exactly one thing. */
 function aForm(patch: Partial<SweepForm> = {}): SweepForm {
@@ -151,17 +155,30 @@ describe('toPreviewRequest', () => {
 })
 
 describe('toSweepRequest', () => {
-  it('sends no cost model rather than a spread of zero when the field is blank', () => {
+  it('sends no cost model rather than a spread of zero when every market is blank', () => {
     // ⚠️ "Charge nothing" and "charge a spread of zero" are the same number and different
     // statements. The engine reads the type, and `{type: 'none'}` is the honest one.
-    expect(toSweepRequest(aForm({ spreadTicks: '' })).cost_model).toEqual({ type: 'none' })
-    expect(toSweepRequest(aForm({ spreadTicks: '  ' })).cost_model).toEqual({ type: 'none' })
+    expect(toSweepRequest(aForm()).cost_model).toEqual({ type: 'none' })
+    expect(
+      toSweepRequest(aForm({ costs: { EURUSD: { spread: '  ', commission: '' } } })).cost_model,
+    ).toEqual({ type: 'none' })
   })
 
-  it('sends the spread it was given, trimmed', () => {
-    expect(toSweepRequest(aForm({ spreadTicks: ' 8 ' })).cost_model).toEqual({
-      type: 'spread',
-      spread_points: '8',
+  it('sends each market the costs typed for it, trimmed, with a blank commission as zero', () => {
+    const form = aForm({
+      symbols: ['EURUSD', 'GBPUSD'],
+      costs: {
+        EURUSD: { spread: ' 8 ', commission: '3.5' },
+        GBPUSD: { spread: '5', commission: '' },
+      },
+    })
+
+    expect(toSweepRequest(form).cost_model).toEqual({
+      type: 'per_market',
+      markets: {
+        EURUSD: { spread_points: '8', commission_per_unit: '3.5' },
+        GBPUSD: { spread_points: '5', commission_per_unit: '0' },
+      },
     })
   })
 
@@ -180,5 +197,48 @@ describe('toSweepRequest', () => {
     form.symbols.push('GBPUSD')
 
     expect(body.symbols).toEqual(['EURUSD'])
+  })
+})
+
+
+describe('costs per market', () => {
+  const instruments = [
+    { symbol: 'GBPUSD', default_spread_points: '9.0000000000' },
+    { symbol: 'AAPL', default_spread_points: null },
+  ] as unknown as Instrument[]
+
+  it('starts a ticked market from the spread the broker quoted, and blank where none was', () => {
+    const gbp = toggleMarket(aForm({ symbols: [] }), 'GBPUSD', instruments)
+    const aapl = toggleMarket(gbp, 'AAPL', instruments)
+
+    expect(aapl.symbols).toEqual(['GBPUSD', 'AAPL'])
+    expect(aapl.costs).toEqual({
+      GBPUSD: { spread: '9', commission: '' },
+      AAPL: { spread: '', commission: '' },
+    })
+  })
+
+  it('keeps what was typed when a market is unticked and ticked again', () => {
+    const typed = aForm({ symbols: ['GBPUSD'], costs: { GBPUSD: { spread: '5', commission: '1' } } })
+
+    const again = toggleMarket(toggleMarket(typed, 'GBPUSD', instruments), 'GBPUSD', instruments)
+
+    expect(again.costs.GBPUSD).toEqual({ spread: '5', commission: '1' })
+  })
+
+  it('refuses some markets costed and others not, naming the one left blank', () => {
+    const form = aForm({
+      symbols: ['EURUSD', 'GBPUSD'],
+      costs: { EURUSD: { spread: '8', commission: '' }, GBPUSD: { spread: '', commission: '' } },
+    })
+
+    expect(whyNotLaunchable(form, ENTRIES)).toMatch(/Type the spread for GBPUSD/)
+    expect(isCostless(form)).toBe(false)
+  })
+
+  it('refuses a cost that is not a number of zero or more', () => {
+    const form = aForm({ costs: { EURUSD: { spread: '8', commission: '-1' } } })
+
+    expect(whyNotLaunchable(form, ENTRIES)).toMatch(/numbers of zero or more/)
   })
 })

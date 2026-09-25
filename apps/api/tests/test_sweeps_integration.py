@@ -2019,3 +2019,115 @@ class TestTheScreenReadsAPage:
         assert page["total"] == 2
         assert {row["entry_id"] for row in page["items"]} == {mine}
         assert client.get(f"/sweeps/{uuid.uuid4()}/runs").status_code == 404
+
+
+class TestEachMarketPaysItsOwnCosts:
+    """His account pays a spread and a commission per lot (24/09), and a sweep over several
+    markets used to charge one spread to them all."""
+
+    def test_each_run_is_charged_its_markets_spread_and_the_commission(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        with session_factory() as session:
+            gbp = session.scalars(select(Instrument).where(Instrument.symbol == "GBPUSD")).one()
+            gbp.default_spread_points = Decimal(12)
+            session.commit()
+        entry = an_entry(client, name=f"costed {uuid.uuid4()}")
+        body = {
+            **a_sweep_body([entry], ["EURUSD", "GBPUSD"], ["H1"]),
+            "cost_model": {"type": "instrument", "commission_per_unit": "3.5"},
+        }
+
+        launched = client.post("/sweeps", json=body)
+
+        assert launched.status_code == 202, launched.text
+        runs = client.get(f"/sweeps/{launched.json()['id']}").json()["runs"]
+        charged = {row["run"]["symbol"]: row["run"]["cost_model"] for row in runs}
+        assert charged == {
+            "EURUSD": {
+                "type": "spread_commission",
+                "spread_points": "8.0000000000",
+                "commission_per_unit": "3.5",
+            },
+            "GBPUSD": {
+                "type": "spread_commission",
+                "spread_points": "12.0000000000",
+                "commission_per_unit": "3.5",
+            },
+        }
+
+    def test_a_market_nobody_measured_is_refused_by_name(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        with session_factory() as session:
+            gbp = session.scalars(select(Instrument).where(Instrument.symbol == "GBPUSD")).one()
+            gbp.default_spread_points = None
+            session.commit()
+        entry = an_entry(client, name=f"unmeasured {uuid.uuid4()}")
+        body = {
+            **a_sweep_body([entry], ["EURUSD", "GBPUSD"], ["H1"]),
+            "cost_model": {"type": "instrument"},
+        }
+
+        refused = client.post("/sweeps", json=body)
+
+        assert refused.status_code == 422
+        assert "no measured spread for: GBPUSD" in refused.json()["detail"]
+
+    @pytest.mark.parametrize(
+        "model",
+        [
+            {"type": "teleport"},
+            {"type": "spread", "spread_points": "-1"},
+            {"type": "instrument", "commission_per_unit": "lots"},
+        ],
+    )
+    def test_a_cost_the_engine_cannot_charge_is_refused_before_any_run(
+        self, client: Any, model: dict[str, Any]
+    ) -> None:
+        entry = an_entry(client, name=f"bad cost {uuid.uuid4()}")
+        body = {**a_sweep_body([entry], ["EURUSD"], ["H1"]), "cost_model": model}
+
+        refused = client.post("/sweeps", json=body)
+
+        assert refused.status_code == 422, refused.text
+        assert "cost model cannot be charged" in refused.json()["detail"]
+
+    def test_costs_typed_at_launch_are_charged_market_by_market(self, client: Any) -> None:
+        """His ask (24/09): the costs are the broker's and change with it, so they are typed with
+        the sweep — GBPUSD's 5 points on his account, with no commission."""
+        entry = an_entry(client, name=f"typed {uuid.uuid4()}")
+        body = {
+            **a_sweep_body([entry], ["EURUSD", "GBPUSD"], ["H1"]),
+            "cost_model": {
+                "type": "per_market",
+                "markets": {
+                    "EURUSD": {"spread_points": "8", "commission_per_unit": "3.5"},
+                    "GBPUSD": {"spread_points": "5"},
+                },
+            },
+        }
+
+        launched = client.post("/sweeps", json=body)
+
+        assert launched.status_code == 202, launched.text
+        runs = client.get(f"/sweeps/{launched.json()['id']}").json()["runs"]
+        charged = {row["run"]["symbol"]: row["run"]["cost_model"] for row in runs}
+        assert charged["GBPUSD"] == {
+            "type": "spread_commission",
+            "spread_points": "5",
+            "commission_per_unit": "0",
+        }
+        assert charged["EURUSD"]["commission_per_unit"] == "3.5"
+
+    def test_a_market_left_out_of_the_typed_costs_is_refused_by_name(self, client: Any) -> None:
+        entry = an_entry(client, name=f"half typed {uuid.uuid4()}")
+        body = {
+            **a_sweep_body([entry], ["EURUSD", "GBPUSD"], ["H1"]),
+            "cost_model": {"type": "per_market", "markets": {"EURUSD": {"spread_points": "8"}}},
+        }
+
+        refused = client.post("/sweeps", json=body)
+
+        assert refused.status_code == 422
+        assert refused.json()["detail"] == "no costs given for: GBPUSD"

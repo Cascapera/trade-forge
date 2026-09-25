@@ -9,7 +9,12 @@
 // they live in Python once (`/sweeps/preview`). This file knows only what the form can see: an
 // empty field, a window that runs backwards, an entry that has left the shelf.
 
-import type { CatalogEntry, CreateSweepRequest, PreviewSweepRequest } from '../api/types'
+import type {
+  CatalogEntry,
+  CreateSweepRequest,
+  Instrument,
+  PreviewSweepRequest,
+} from '../api/types'
 import { apiFailure } from '../api/failure'
 
 export interface SweepForm {
@@ -20,8 +25,18 @@ export interface SweepForm {
   dateFrom: string
   dateTo: string
   initialCapital: string
-  /** Blank means charge nothing, which is `{"type": "none"}` and never a spread of zero. */
-  spreadTicks: string
+  /**
+   * What each market is charged, typed at launch because it is the broker's and changes with it
+   * (his ask, 24/09). Every field blank on every market means charge nothing — `{"type": "none"}`,
+   * never a spread of zero.
+   */
+  costs: Record<string, MarketCosts>
+}
+
+/** One market's costs as typed: the spread in points and the commission per lot, per leg. */
+export interface MarketCosts {
+  spread: string
+  commission: string
 }
 
 export const emptySweepForm: SweepForm = {
@@ -31,7 +46,63 @@ export const emptySweepForm: SweepForm = {
   dateFrom: '',
   dateTo: '',
   initialCapital: '10000',
-  spreadTicks: '',
+  costs: {},
+}
+
+/**
+ * The form with this market ticked or unticked — and, when ticked, its costs started from the
+ * spread the broker quoted when the symbols were synced, for the reader to correct. A market
+ * already carrying typed costs keeps them.
+ */
+export function toggleMarket(
+  form: SweepForm,
+  symbol: string,
+  instruments: readonly Instrument[] | undefined,
+): SweepForm {
+  if (form.symbols.includes(symbol)) {
+    return { ...form, symbols: form.symbols.filter((one) => one !== symbol) }
+  }
+  const quoted = instruments?.find((one) => one.symbol === symbol)?.default_spread_points
+  const costs =
+    symbol in form.costs
+      ? form.costs
+      : {
+          ...form.costs,
+          [symbol]: { spread: quoted == null ? '' : String(Number(quoted)), commission: '' },
+        }
+  return { ...form, symbols: [...form.symbols, symbol], costs }
+}
+
+function costsOf(form: SweepForm, symbol: string): MarketCosts {
+  return form.costs[symbol] ?? { spread: '', commission: '' }
+}
+
+/** Whether the form charges nothing at all: every field of every ticked market blank. */
+export function isCostless(form: SweepForm): boolean {
+  return form.symbols.every((symbol) => {
+    const costs = costsOf(form, symbol)
+    return costs.spread.trim() === '' && costs.commission.trim() === ''
+  })
+}
+
+/**
+ * Why these costs cannot be sent, or null. Some markets costed and others not is refused rather
+ * than sent: a sweep mixing costed and costless runs ranks the costless ones first.
+ */
+function costsProblem(form: SweepForm): string | null {
+  if (isCostless(form)) return null
+  for (const symbol of form.symbols) {
+    const { spread, commission } = costsOf(form, symbol)
+    if (spread.trim() === '') {
+      return `Type the spread for ${symbol}, or leave every market blank to run without costs.`
+    }
+    for (const value of [spread, commission]) {
+      if (value.trim() !== '' && !(Number(value) >= 0)) {
+        return `The costs of ${symbol} must be numbers of zero or more.`
+      }
+    }
+  }
+  return null
 }
 
 /**
@@ -83,6 +154,8 @@ export function whyNotLaunchable(form: SweepForm, entries: readonly CatalogEntry
   // that allowed it would trade a readable refusal here for a 422 after the click.
   if (form.dateTo <= form.dateFrom) return 'The end of the period must be after its start.'
   if (Number(form.initialCapital) <= 0) return 'Initial capital must be positive.'
+  const costs = costsProblem(form)
+  if (costs !== null) return costs
 
   // ⚠️ Refused rather than waved through: the entry is gone from the shelf, so the launch would
   // come back as a 404 after the click. Said here, where the reader can see which tick to undo.
@@ -131,10 +204,23 @@ export function toSweepRequest(form: SweepForm, collectMissing = false): CreateS
     date_from: new Date(form.dateFrom).toISOString(),
     date_to: new Date(form.dateTo).toISOString(),
     initial_capital: form.initialCapital,
-    cost_model:
-      form.spreadTicks.trim() === ''
-        ? { type: 'none' }
-        : { type: 'spread', spread_points: form.spreadTicks.trim() },
+    cost_model: isCostless(form)
+      ? { type: 'none' }
+      : {
+          type: 'per_market',
+          markets: Object.fromEntries(
+            form.symbols.map((symbol) => {
+              const { spread, commission } = costsOf(form, symbol)
+              return [
+                symbol,
+                {
+                  spread_points: spread.trim(),
+                  commission_per_unit: commission.trim() === '' ? '0' : commission.trim(),
+                },
+              ]
+            }),
+          ),
+        },
     collect_missing: collectMissing,
   }
 }

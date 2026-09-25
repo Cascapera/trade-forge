@@ -453,7 +453,11 @@ describe('launching', () => {
           timeframes: ['M15'],
           date_from: '2025-01-01T00:00:00.000Z',
           date_to: '2025-06-01T00:00:00.000Z',
-          cost_model: { type: 'none' },
+          // The market's own spread, started from the one the broker quoted (24/09).
+          cost_model: {
+            type: 'per_market',
+            markets: { EURUSD: { spread_points: '8', commission_per_unit: '0' } },
+          },
         }),
       )
     })
@@ -564,5 +568,42 @@ describe('launching', () => {
       expect(screen.getByRole('status')).toHaveTextContent('1 backtest.')
     })
     expect(previewSweep).not.toHaveBeenCalled()
+  })
+})
+
+
+describe('LaunchSweep — costs per market', () => {
+  it('starts each ticked market from its quoted spread and lets the reader correct it', async () => {
+    renderWithProviders(<LaunchSweep />)
+    await fillIn()
+
+    const spread = await screen.findByLabelText('spread of EURUSD')
+    expect(spread).toHaveValue('8')
+    fireEvent.change(spread, { target: { value: '5' } })
+    fireEvent.change(screen.getByLabelText('commission of EURUSD'), { target: { value: '3.5' } })
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /run the sweep/i })).toBeEnabled()
+    })
+    fireEvent.click(screen.getByRole('button', { name: /run the sweep/i }))
+
+    await waitFor(() => {
+      expect(createSweep).toHaveBeenCalledWith(
+        expect.objectContaining({
+          cost_model: {
+            type: 'per_market',
+            markets: { EURUSD: { spread_points: '5', commission_per_unit: '3.5' } },
+          },
+        }),
+      )
+    })
+  })
+
+  it('warns that every result is an upper bound when no market is charged', async () => {
+    renderWithProviders(<LaunchSweep />)
+    await fillIn()
+
+    fireEvent.change(await screen.findByLabelText('spread of EURUSD'), { target: { value: '' } })
+
+    expect(screen.getByText(/every result is an upper bound/)).toBeInTheDocument()
   })
 })

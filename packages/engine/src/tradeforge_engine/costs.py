@@ -15,9 +15,11 @@ account, always ≥ 0. The `Fill` refuses a negative cost precisely so a sign bu
 at construction instead of as a strategy that mysteriously prints money.
 """
 
+from collections.abc import Sequence
 from decimal import Decimal
 
 from tradeforge_engine.domain import ZERO, Candle, InstrumentSpec, Money, OrderRequest, Volume
+from tradeforge_engine.protocols import CostModel
 
 
 class SpreadCostModel:
@@ -178,4 +180,37 @@ class BarSpreadCostModel:
         return self._half_spread(instrument, order.volume, candle)
 
 
-__all__ = ["BarSpreadCostModel", "CommissionCostModel", "NoCostModel", "SpreadCostModel"]
+class CombinedCostModel:
+    """Several ways of charging at once — a raw-spread forex account pays a spread **and** a
+    commission per lot (24/09), an index future the same.
+
+    Each leg costs the sum of what every part charges for it. A new class rather than a spread
+    model that also takes a commission: the two charges are already one class each, and a fused
+    one would be a third copy of arithmetic that exists twice (ADR-07, AGENTS.md §5.6).
+    """
+
+    def __init__(self, *parts: CostModel) -> None:
+        if not parts:
+            raise ValueError("a combined cost model needs at least one part")
+        self._parts: Sequence[CostModel] = parts
+
+    def entry_cost(
+        self, order: OrderRequest, instrument: InstrumentSpec, price: Money, candle: Candle
+    ) -> Money:
+        return sum(
+            (part.entry_cost(order, instrument, price, candle) for part in self._parts), ZERO
+        )
+
+    def exit_cost(
+        self, order: OrderRequest, instrument: InstrumentSpec, price: Money, candle: Candle
+    ) -> Money:
+        return sum((part.exit_cost(order, instrument, price, candle) for part in self._parts), ZERO)
+
+
+__all__ = [
+    "BarSpreadCostModel",
+    "CombinedCostModel",
+    "CommissionCostModel",
+    "NoCostModel",
+    "SpreadCostModel",
+]

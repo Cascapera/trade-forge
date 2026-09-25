@@ -679,6 +679,14 @@ export function useCreateSlicing(id: string) {
   })
 }
 
+/** Whether nothing in a template's queue is waiting or running — when its poll can stop. */
+export function isTemplateSettled(template: SweepTemplateOut | undefined): boolean {
+  if (template === undefined) return false
+  return !template.items.some(
+    (one) => one.status === 'waiting' || (one.status === 'launched' && !one.finished),
+  )
+}
+
 /** Every template, newest first. */
 export function useSweepTemplates() {
   return useQuery<SweepTemplateListItem[]>({
@@ -692,13 +700,7 @@ export function useSweepTemplate(id: string | undefined) {
   return useQuery<SweepTemplateOut>({
     queryKey: ['sweep-template', id],
     queryFn: id === undefined ? skipToken : () => api.getSweepTemplate(id),
-    refetchInterval: (query) => {
-      const items = query.state.data?.items ?? []
-      const open = items.some(
-        (one) => one.status === 'waiting' || (one.status === 'launched' && !one.finished),
-      )
-      return open ? STUDY_POLL_MS * 5 : false
-    },
+    refetchInterval: (query) => (isTemplateSettled(query.state.data) ? false : STUDY_POLL_MS * 5),
   })
 }
 

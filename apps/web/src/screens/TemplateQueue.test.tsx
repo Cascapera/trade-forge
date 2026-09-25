@@ -2,7 +2,7 @@ import { fireEvent, screen, waitFor } from '@testing-library/react'
 import { Route, Routes } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { api } from '../api/client'
+import { ApiError, api } from '../api/client'
 import type { Instrument, SweepTemplateOut, TemplateItem } from '../api/types'
 import { renderWithProviders } from '../test-utils'
 
@@ -143,6 +143,80 @@ describe('TemplateQueue', () => {
       expect(mocked.combineSweeps).toHaveBeenCalledWith(['s1', 's2'])
     })
     expect(navigate).toHaveBeenCalledWith('/sweeps/c1')
+  })
+
+  it('shows a paused queue, what failed and why, and the costs that were typed', async () => {
+    mocked.getSweepTemplate.mockResolvedValue({
+      ...template,
+      paused: true,
+      items: [
+        item({
+          cost_model: {
+            spread_points: '9',
+            commission_per_unit: '7',
+            swap_long_per_lot: '-4.5',
+            swap_short_per_lot: '1.2',
+          },
+          done: 350,
+          failed: 10,
+        }),
+        item({
+          id: 'i9',
+          symbol: 'XAUUSD',
+          status: 'failed',
+          sweep_id: null,
+          error: 'no candles in this window',
+          runs: 0,
+          finished: false,
+        }),
+      ],
+    })
+    mocked.resumeTemplate.mockResolvedValue(template)
+    show()
+
+    expect(await screen.findByText(/nothing new starts/)).toBeInTheDocument()
+    expect(screen.getByText(/commission 7 · swap -4.5 \/ 1.2/)).toBeInTheDocument()
+    expect(screen.getByText('350 of 360 · 10 failed')).toBeInTheDocument()
+    expect(screen.getByText('not launched')).toBeInTheDocument()
+    expect(screen.getByText('no candles in this window')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Resume the queue' }))
+    await waitFor(() => {
+      expect(mocked.resumeTemplate).toHaveBeenCalledWith('t1')
+    })
+  })
+
+  it('says a queue is empty, and a refused queueing in the server words', async () => {
+    mocked.getSweepTemplate.mockResolvedValue({ ...template, items: [] })
+    mocked.queueMarkets.mockRejectedValue(new ApiError(422, 'cannot queue: NOPE: never collected'))
+    show()
+
+    expect(await screen.findByText(/Nothing queued yet/)).toBeInTheDocument()
+    fireEvent.click(await screen.findByLabelText('AUDUSD'))
+    fireEvent.click(screen.getByLabelText('AUDUSD'))
+    expect(screen.queryByLabelText('spread of AUDUSD')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByLabelText('AUDUSD'))
+    fireEvent.change(screen.getByLabelText('commission of AUDUSD'), { target: { value: '7' } })
+    fireEvent.change(screen.getByLabelText('swap short of AUDUSD'), { target: { value: '2' } })
+    fireEvent.change(screen.getByLabelText('spread of AUDUSD'), { target: { value: '' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Queue 1 markets' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('never collected')
+    expect(mocked.queueMarkets).toHaveBeenCalledWith('t1', [
+      { symbol: 'AUDUSD', commission_per_unit: '7', swap_short_per_lot: '2' },
+    ])
+  })
+
+  it('says a refused reading together in the server words, and a template that cannot load', async () => {
+    mocked.combineSweeps.mockRejectedValue(new ApiError(409, 'still running: s2'))
+    show()
+
+    fireEvent.click(await screen.findByLabelText('read EURUSD together'))
+    fireEvent.click(screen.getByLabelText('read GBPUSD together'))
+    fireEvent.click(screen.getByLabelText('read GBPUSD together'))
+    fireEvent.click(screen.getByLabelText('read GBPUSD together'))
+    fireEvent.click(screen.getByRole('button', { name: 'Read 2 together' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('still running')
   })
 
   it('offers no reading together for a market still running', async () => {

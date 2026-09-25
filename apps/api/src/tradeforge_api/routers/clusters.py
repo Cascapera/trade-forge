@@ -12,8 +12,8 @@ from fastapi import APIRouter, HTTPException, Query, status
 from sqlalchemy import select
 
 from tradeforge_api.deps import QueueDep, SessionDep
-from tradeforge_api.queue import RUN_CLUSTER
-from tradeforge_api.runner import risk_percent
+from tradeforge_api.queue import RUN_BACKTEST, RUN_CLUSTER
+from tradeforge_api.runner import ENGINE_VERSION, risk_percent
 from tradeforge_api.schemas import (
     ClusterListItem,
     ClusterMemberOut,
@@ -43,9 +43,15 @@ async def create_cluster(
 ) -> ClusterOut:
     """Check every member, fix each one's risk %, keep the cluster and queue its replay.
 
-    ⚠️ **Refused, with the members named**, for a run that does not exist, has not finished, or
-    kept no trades — never replayed with those left out, which would present a smaller portfolio
-    as the one asked for.
+    ⚠️ **A member that kept no trades is run again, not refused** (25/09). A sweep's losing run
+    keeps only its metrics, and those are exactly the runs a portfolio may want. Its twin — the
+    same strategy, market, chart, window, capital and costs, outside any sweep, so it keeps its
+    trades — is queued, or reused if one already finished under this engine; the engine is
+    deterministic, so the twin's trades are the ones the original made. The cluster waits for it.
+
+    ⚠️ **Refused, with the members named**, for a run that does not exist or has not finished —
+    never replayed with those left out, which would present a smaller portfolio as the one asked
+    for.
     """
     ids = [one.backtest_id for one in request.members]
     found = {
@@ -58,6 +64,7 @@ async def create_cluster(
     }
     problems: list[str] = []
     members: list[dict[str, str]] = []
+    twins: list[Backtest] = []
     for member in request.members:
         pair = found.get(member.backtest_id)
         if pair is None:
@@ -67,12 +74,6 @@ async def create_cluster(
         if run.status is not BacktestStatus.DONE:
             problems.append(f"{member.backtest_id}: not finished ({run.status.value})")
             continue
-        if run.recorded is Recorded.METRICS:
-            problems.append(
-                f"{member.backtest_id}: kept no trades (a sweep's run below its bar) — run it "
-                "again as a single backtest to keep them"
-            )
-            continue
         if member.risk_percent is not None:
             percent = member.risk_percent
         else:
@@ -81,7 +82,17 @@ async def create_cluster(
             except ValueError:
                 problems.append(f"{member.backtest_id}: its strategy sizes by no percent; give one")
                 continue
-        members.append({"backtest_id": str(run.id), "risk_percent": str(percent)})
+        if run.recorded is not Recorded.METRICS:
+            members.append({"backtest_id": str(run.id), "risk_percent": str(percent)})
+            continue
+        twin, new = _twin_of(session, run)
+        if new:
+            twins.append(twin)
+            session.add(twin)
+            session.flush()
+        members.append(
+            {"backtest_id": str(twin.id), "rerun_of": str(run.id), "risk_percent": str(percent)}
+        )
     if problems:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -99,8 +110,45 @@ async def create_cluster(
     session.add(cluster)
     session.commit()
     session.refresh(cluster)
+    # The twins first: the cluster's job finds them queued and waits for them (`cluster_job`).
+    for twin in twins:
+        await queue.enqueue_job(RUN_BACKTEST, str(twin.id), _job_id=str(twin.id))
     await queue.enqueue_job(RUN_CLUSTER, str(cluster.id), _job_id=f"cluster-{cluster.id}")
     return cluster_out(session, cluster)
+
+
+def _twin_of(session: SessionDep, run: Backtest) -> tuple[Backtest, bool]:
+    """A run of the same measurement that keeps its trades: one already finished under this
+    engine if there is one (`False`), or a new one to queue (`True`)."""
+    same = (
+        Backtest.strategy_id == run.strategy_id,
+        Backtest.instrument_id == run.instrument_id,
+        Backtest.timeframe == run.timeframe,
+        Backtest.date_from == run.date_from,
+        Backtest.date_to == run.date_to,
+        Backtest.initial_capital == run.initial_capital,
+        Backtest.cost_model == run.cost_model,
+        Backtest.engine_version == ENGINE_VERSION,
+        Backtest.recorded != Recorded.METRICS,
+        Backtest.status.in_([BacktestStatus.DONE, BacktestStatus.QUEUED, BacktestStatus.RUNNING]),
+    )
+    found = session.scalars(
+        select(Backtest).where(*same).order_by(Backtest.created_at.desc()).limit(1)
+    ).first()
+    if found is not None:
+        return found, False
+    twin = Backtest(
+        strategy_id=run.strategy_id,
+        instrument_id=run.instrument_id,
+        timeframe=run.timeframe,
+        date_from=run.date_from,
+        date_to=run.date_to,
+        initial_capital=run.initial_capital,
+        cost_model=dict(run.cost_model),
+        status=BacktestStatus.QUEUED,
+        engine_version=ENGINE_VERSION,
+    )
+    return twin, True
 
 
 @router.get("/clusters", response_model=list[ClusterListItem])
@@ -153,6 +201,7 @@ def cluster_out(session: SessionDep, cluster: Cluster) -> ClusterOut:
         members.append(
             ClusterMemberOut(
                 backtest_id=run_id,
+                rerun_of=member.get("rerun_of"),
                 risk_percent=member["risk_percent"],
                 label=name,
                 symbol=symbol,

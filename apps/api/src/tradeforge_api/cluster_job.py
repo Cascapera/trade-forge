@@ -61,11 +61,34 @@ def _marks(
 
 def process_cluster(
     *, session: Session, parquet_root: Path, cluster_id: uuid.UUID, read: CandleReader
-) -> None:
-    """Replay one cluster and record the answer, or the reason there is none."""
+) -> bool:
+    """Replay one cluster and record the answer, or the reason there is none.
+
+    Returns `True` when it did not start because a member — a twin run again to keep its trades
+    — has not finished yet: the caller asks again later, and the cluster stays `queued`.
+    """
     cluster = session.get(Cluster, cluster_id)
     if cluster is None or cluster.status is not BacktestStatus.QUEUED:
-        return
+        return False
+    ids = [uuid.UUID(one["backtest_id"]) for one in cluster.members]
+    # `.all()` first: a result has `keys()`, so `dict(result)` would read it as a mapping of
+    # column names; a list of rows is a list of pairs.
+    states = dict(
+        session.execute(select(Backtest.id, Backtest.status).where(Backtest.id.in_(ids)))
+        .tuples()
+        .all()
+    )
+    failed = [run_id for run_id in ids if states.get(run_id) is BacktestStatus.FAILED]
+    if failed:
+        cluster.status = BacktestStatus.FAILED
+        cluster.error = "a member run again to keep its trades failed: " + ", ".join(
+            str(one) for one in failed
+        )
+        cluster.finished_at = _now()
+        session.commit()
+        return False
+    if any(states.get(run_id) is not BacktestStatus.DONE for run_id in ids):
+        return True
     cluster.status = BacktestStatus.RUNNING
     session.commit()
     try:
@@ -79,6 +102,7 @@ def process_cluster(
         cluster.error = f"{type(exc).__name__}: {exc}"
     cluster.finished_at = _now()
     session.commit()
+    return False
 
 
 def _replay_into(

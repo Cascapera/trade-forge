@@ -91,6 +91,37 @@ describe('ClusterResult', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('The replay failed: KeyError: gone')
   })
 
+  it('marks a member that was run again to keep its trades, and says the cluster waits for it', async () => {
+    getCluster.mockResolvedValue(
+      cluster({
+        status: 'queued',
+        final_balance: null,
+        curve: null,
+        members: [
+          {
+            backtest_id: 'twin-1',
+            rerun_of: 'orig-1',
+            risk_percent: '1',
+            label: 'MM9 [H4 · rr=2]',
+            symbol: 'EURUSD',
+            timeframe: 'H4',
+            offered: null,
+            taken: null,
+            skipped: null,
+            net_pnl: null,
+          },
+        ],
+      }),
+    )
+    show()
+
+    expect(await screen.findByText('run again')).toHaveAttribute(
+      'title',
+      expect.stringContaining('orig-1'),
+    )
+    expect(screen.getByText(/being run again first/)).toBeInTheDocument()
+  })
+
   it('says it is still replaying rather than showing empty numbers', async () => {
     getCluster.mockResolvedValue(cluster({ status: 'running', final_balance: null, curve: null }))
     show()

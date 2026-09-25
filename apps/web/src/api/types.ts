@@ -1404,6 +1404,8 @@ export type ClusterSkip = 'positions' | 'risk' | 'no_stop' | 'empty'
 
 export interface ClusterMember {
   backtest_id: string
+  /** The run asked for, when it kept no trades and this is its twin run again to keep them. */
+  rerun_of?: string | null
   risk_percent: string
   label: string
   symbol: string

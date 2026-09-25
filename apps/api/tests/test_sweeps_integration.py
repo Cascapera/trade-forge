@@ -2053,7 +2053,7 @@ class TestClusters:
 
         refused = client.post(
             "/clusters",
-            json={"name": "x", "members": [{"backtest_id": runs[9]}, {"backtest_id": ghost}]},
+            json={"name": "x", "members": [{"backtest_id": runs[5]}, {"backtest_id": ghost}]},
         )
         twice = client.post(
             "/clusters",
@@ -2061,10 +2061,120 @@ class TestClusters:
         )
 
         assert refused.status_code == 422
-        assert "kept no trades" in refused.json()["detail"]
         assert f"{ghost}: no such run" in refused.json()["detail"]
         assert twice.status_code == 422
         assert client.get(f"/clusters/{uuid.uuid4()}").status_code == 404
+
+
+class TestClusterMembersRunAgain:
+    """25/09: a member that kept no trades is run again as its twin, and the cluster waits."""
+
+    def twin_of_nine(
+        self, client: Any, session_factory: Callable[[], Session], queue: _CapturingQueue
+    ) -> tuple[dict[int, str], dict[str, Any]]:
+        runs = TestClusters().members(client, session_factory)
+        made = client.post(
+            "/clusters",
+            json={
+                "name": "with a loser",
+                "members": [
+                    {"backtest_id": runs[5]},
+                    {"backtest_id": runs[9], "risk_percent": "1"},
+                ],
+            },
+        )
+        assert made.status_code == 202, made.text
+        return runs, made.json()
+
+    def test_it_is_queued_as_a_twin_that_keeps_its_trades(
+        self, client: Any, session_factory: Callable[[], Session], queue: _CapturingQueue
+    ) -> None:
+        runs, body = self.twin_of_nine(client, session_factory, queue)
+
+        member = body["members"][1]
+        assert member["rerun_of"] == runs[9]
+        assert member["backtest_id"] != runs[9]
+        assert body["members"][0]["rerun_of"] is None
+        twin_id = member["backtest_id"]
+        assert [job[0] for job in queue.jobs[-2:]] == ["run_backtest", "run_cluster"]
+        with session_factory() as session:
+            twin = session.get(Backtest, uuid.UUID(twin_id))
+            original = session.get(Backtest, uuid.UUID(runs[9]))
+            assert twin is not None
+            assert original is not None
+            # The same measurement, outside any sweep — which is what makes it keep its trades.
+            assert twin.sweep_id is None
+            assert (twin.strategy_id, twin.instrument_id, twin.timeframe) == (
+                original.strategy_id,
+                original.instrument_id,
+                original.timeframe,
+            )
+            assert (twin.date_from, twin.date_to, twin.cost_model) == (
+                original.date_from,
+                original.date_to,
+                original.cost_model,
+            )
+
+    def test_the_cluster_waits_for_its_twin_then_replays(
+        self, client: Any, session_factory: Callable[[], Session], queue: _CapturingQueue
+    ) -> None:
+        _runs, body = self.twin_of_nine(client, session_factory, queue)
+        twin_id = body["members"][1]["backtest_id"]
+
+        def work() -> bool:
+            with session_factory() as session:
+                return process_cluster(
+                    session=session,
+                    parquet_root=Path("unused"),
+                    cluster_id=uuid.UUID(body["id"]),
+                    read=lambda _root, _symbol, _timeframe: [],
+                )
+
+        assert work() is True
+        assert client.get(f"/clusters/{body['id']}").json()["status"] == "queued"
+
+        finish_trading(session_factory, twin_id, net=100, trades=2)
+        trade_in(session_factory, twin_id, ["1", "1"], first=START + 3 * HOUR)
+        assert work() is False
+        read = client.get(f"/clusters/{body['id']}").json()
+        assert read["status"] == "done", read["error"]
+        assert read["members"][1]["taken"] == 2
+
+    def test_a_twin_already_run_is_reused(
+        self, client: Any, session_factory: Callable[[], Session], queue: _CapturingQueue
+    ) -> None:
+        runs, first = self.twin_of_nine(client, session_factory, queue)
+        queued = len(queue.jobs)
+
+        again = client.post(
+            "/clusters", json={"name": "again", "members": [{"backtest_id": runs[9]}]}
+        ).json()
+
+        assert again["members"][0]["backtest_id"] == first["members"][1]["backtest_id"]
+        assert [job[0] for job in queue.jobs[queued:]] == ["run_cluster"]
+
+    def test_a_twin_that_fails_fails_the_cluster_with_the_reason(
+        self, client: Any, session_factory: Callable[[], Session], queue: _CapturingQueue
+    ) -> None:
+        _runs, body = self.twin_of_nine(client, session_factory, queue)
+        twin_id = body["members"][1]["backtest_id"]
+        with session_factory() as session:
+            twin = session.get(Backtest, uuid.UUID(twin_id))
+            assert twin is not None
+            twin.status = BacktestStatus.FAILED
+            twin.error = "no candles in this window"
+            session.commit()
+            waiting = process_cluster(
+                session=session,
+                parquet_root=Path("unused"),
+                cluster_id=uuid.UUID(body["id"]),
+                read=lambda _root, _symbol, _timeframe: [],
+            )
+
+        read = client.get(f"/clusters/{body['id']}").json()
+        assert waiting is False
+        assert read["status"] == "failed"
+        assert twin_id in read["error"]
 
 
 class TestTheSummaryIsKept:

@@ -27,6 +27,7 @@ from tradeforge_api.routers import (
     backtests,
     baskets,
     catalog,
+    clusters,
     collections,
     executor,
     instruments,
@@ -126,6 +127,7 @@ def create_app(
     app.include_router(studies.router)
     app.include_router(sweeps.router)
     app.include_router(walkforwards.router)
+    app.include_router(clusters.router)
     app.include_router(ws.router)
 
     @app.get("/health", tags=["health"])

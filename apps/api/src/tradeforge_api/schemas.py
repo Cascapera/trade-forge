@@ -2491,6 +2491,9 @@ class SweepOut(BaseModel):
     """Set on a sweep that tests another's best points on a reserved window: the sweep they were
     chosen from. Its comparison is `GET /sweeps/{id}/holdout`."""
     holdout_rule: dict[str, Any] | None = None
+    combines: list[uuid.UUID] | None = None
+    """The sweeps this one reads together (26/09); null for a sweep that ran."""
+    template_id: uuid.UUID | None = None
     """How those points were chosen — `metric`, `top_n`, `min_trades` per chart."""
     counts: SweepRunCounts | None = None
     """How many runs sit in each status — what a screen polls on, without the runs themselves."""
@@ -2560,6 +2563,17 @@ class SweepListItem(BaseModel):
     date_from: dt.datetime
     date_to: dt.datetime
     runs: SweepRunCounts
+    combines: int | None = None
+    """How many sweeps a combination reads together; null for a sweep that ran."""
+    template_id: uuid.UUID | None = None
+
+
+class CombineSweeps(BaseModel):
+    """Read several finished sweeps of one template as one (26/09)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    sweep_ids: list[uuid.UUID] = Field(min_length=2, max_length=500)
 
 
 class SweepsPage(BaseModel):

@@ -37,6 +37,7 @@ from tradeforge_api.main import create_app
 from tradeforge_api.queue import COLLECT_QUEUE, COLLECT_RANGE, RUN_BACKTEST
 from tradeforge_api.routers import sweeps as sweeps_router
 from tradeforge_api.sweep_walkforward_job import advance
+from tradeforge_api.template_queue_job import advance_queue
 from tradeforge_db.broker_symbols import BrokerSymbolEntry, replace_snapshot
 from tradeforge_db.models import (
     Backtest,
@@ -2319,6 +2320,153 @@ class TestTheSweepWalksForward:
         assert of_a_test.status_code == 422
         assert client.post(f"/sweeps/{uuid.uuid4()}/walkforward", json=self.BODY).status_code == 404
         assert client.get(f"/sweep-walkforwards/{uuid.uuid4()}").status_code == 404
+
+
+class TestTemplatesRunMarketByMarket:
+    """26/09: a sweep without its markets, kept; a queue that runs one market's sweep at a time."""
+
+    def template(self, client: Any, **over: Any) -> dict[str, Any]:
+        entry = an_entry(client, name=f"templated {uuid.uuid4()}")
+        made = client.post(
+            "/sweep-templates",
+            json={
+                "name": f"H1 majors {uuid.uuid4()}",
+                "entry_ids": [entry],
+                "timeframes": ["H1"],
+                "date_from": START.isoformat(),
+                "date_to": (START + 100 * HOUR).isoformat(),
+                **over,
+            },
+        )
+        assert made.status_code == 201, made.text
+        return dict(made.json())
+
+    def step(self, session_factory: Callable[[], Session], template_id: str) -> bool:
+        with session_factory() as session:
+            _runs, _collections, pending = advance_queue(session, uuid.UUID(template_id))
+        return pending
+
+    def finish_all(
+        self, client: Any, session_factory: Callable[[], Session], sweep_id: str
+    ) -> None:
+        for run_id in run_ids(client, sweep_id):
+            finish(session_factory, run_id, 100)
+
+    def test_markets_run_one_after_the_other_each_as_its_own_sweep(
+        self, client: Any, session_factory: Callable[[], Session], queue: _CapturingQueue
+    ) -> None:
+        template = self.template(client)
+        queued = client.post(
+            f"/sweep-templates/{template['id']}/queue",
+            json={"markets": [{"symbol": "EURUSD"}, {"symbol": "GBPUSD", "spread_points": "5"}]},
+        )
+        assert queued.status_code == 200, queued.text
+        assert queue.jobs[-1][0] == "run_template_queue"
+        items = queued.json()["items"]
+        # A blank spread is the measured one, written down; a typed one is kept as typed.
+        assert [(one["symbol"], one["cost_model"]["spread_points"]) for one in items] == [
+            ("EURUSD", "8"),
+            ("GBPUSD", "5"),
+        ]
+
+        assert self.step(session_factory, template["id"]) is True
+        read = client.get(f"/sweep-templates/{template['id']}").json()
+        first, second = read["items"]
+        assert (first["status"], second["status"]) == ("launched", "waiting")
+        sweep = client.get(f"/sweeps/{first['sweep_id']}").json()
+        assert sweep["symbols"] == ["EURUSD"]
+        assert sweep["runs"][0]["run"]["cost_model"]["spread_points"] == "8"
+
+        # The first still running: nothing new starts.
+        assert self.step(session_factory, template["id"]) is True
+        assert client.get(f"/sweep-templates/{template['id']}").json()["items"][1]["status"] == (
+            "waiting"
+        )
+
+        self.finish_all(client, session_factory, first["sweep_id"])
+        assert self.step(session_factory, template["id"]) is True
+        read = client.get(f"/sweep-templates/{template['id']}").json()
+        first, second = read["items"]
+        assert first["finished"] is True
+        assert second["status"] == "launched"
+        self.finish_all(client, session_factory, second["sweep_id"])
+        assert self.step(session_factory, template["id"]) is False
+
+    def test_a_paused_queue_launches_nothing_until_resumed(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        template = self.template(client)
+        client.post(f"/sweep-templates/{template['id']}/pause")
+        client.post(
+            f"/sweep-templates/{template['id']}/queue", json={"markets": [{"symbol": "EURUSD"}]}
+        )
+
+        assert self.step(session_factory, template["id"]) is False
+        assert client.get(f"/sweep-templates/{template['id']}").json()["items"][0]["status"] == (
+            "waiting"
+        )
+
+        resumed = client.post(f"/sweep-templates/{template['id']}/resume")
+        assert resumed.json()["paused"] is False
+        assert self.step(session_factory, template["id"]) is True
+        assert client.get(f"/sweep-templates/{template['id']}").json()["items"][0]["status"] == (
+            "launched"
+        )
+
+    def test_a_waiting_market_can_be_removed_and_a_launched_one_cannot(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        template = self.template(client)
+        items = client.post(
+            f"/sweep-templates/{template['id']}/queue",
+            json={"markets": [{"symbol": "EURUSD"}, {"symbol": "GBPUSD"}]},
+        ).json()["items"]
+        self.step(session_factory, template["id"])
+
+        launched = client.delete(f"/sweep-templates/{template['id']}/items/{items[0]['id']}")
+        removed = client.delete(f"/sweep-templates/{template['id']}/items/{items[1]['id']}")
+
+        assert launched.status_code == 409
+        assert [one["status"] for one in removed.json()["items"]] == ["launched", "removed"]
+
+    def test_a_market_that_cannot_launch_fails_and_the_queue_goes_on(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        """No W1 candles in the fixture: that market's sweep has nothing to read."""
+        template = self.template(client, timeframes=["W1"])
+        client.post(
+            f"/sweep-templates/{template['id']}/queue",
+            json={"markets": [{"symbol": "EURUSD"}, {"symbol": "GBPUSD"}]},
+        )
+
+        assert self.step(session_factory, template["id"]) is False
+        items = client.get(f"/sweep-templates/{template['id']}").json()["items"]
+        assert [one["status"] for one in items] == ["failed", "failed"]
+        assert all(one["error"] for one in items)
+
+    def test_what_cannot_be_kept_or_queued_is_refused(self, client: Any) -> None:
+        template = self.template(client)
+
+        twice = client.post(
+            "/sweep-templates",
+            json={
+                "name": template["name"],
+                "entry_ids": [str(template["entry_ids"][0])],
+                "timeframes": ["H1"],
+                "date_from": START.isoformat(),
+                "date_to": (START + HOUR).isoformat(),
+            },
+        )
+        ghost = client.post(
+            f"/sweep-templates/{template['id']}/queue", json={"markets": [{"symbol": "NOPE"}]}
+        )
+
+        assert twice.status_code == 409
+        assert ghost.status_code == 422
+        assert "NOPE: never collected" in ghost.json()["detail"]
+        assert client.get(f"/sweep-templates/{uuid.uuid4()}").status_code == 404
+        listed = client.get("/sweep-templates").json()
+        assert template["id"] in [one["id"] for one in listed]
 
 
 class TestTheDashboardIsKept:

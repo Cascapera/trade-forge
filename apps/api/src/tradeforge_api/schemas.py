@@ -2402,6 +2402,80 @@ class SweepWalkForwardOut(BaseModel):
     groups: list[SweepWalkForwardGroupOut]
 
 
+class CreateSweepTemplate(BaseModel):
+    """A sweep without its markets, kept to run one market at a time (26/09)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=200)
+    entry_ids: list[uuid.UUID] = Field(min_length=1, max_length=50)
+    timeframes: list[Timeframe] = Field(min_length=1, max_length=8)
+    date_from: AwareInstant
+    date_to: AwareInstant
+    initial_capital: Decimal = Field(default=Decimal(10000), gt=0)
+
+
+class QueueMarket(BaseModel):
+    """One market to queue, with its costs. A blank spread is the market's measured one."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    symbol: Symbol
+    spread_points: Decimal | None = Field(default=None, ge=0)
+    commission_per_unit: Decimal = Field(default=Decimal(0), ge=0)
+    swap_long_per_lot: Decimal | None = None
+    swap_short_per_lot: Decimal | None = None
+
+
+class QueueMarkets(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    markets: list[QueueMarket] = Field(min_length=1, max_length=200)
+
+
+class TemplateItemOut(BaseModel):
+    id: uuid.UUID
+    symbol: str
+    cost_model: dict[str, Any]
+    position: int
+    status: str
+    """`waiting`, `launched`, `failed` or `removed`."""
+    sweep_id: uuid.UUID | None
+    error: str | None
+    runs: int
+    done: int
+    failed: int
+    finished: bool
+    """Its sweep exists and nothing of it is still queued or running."""
+
+
+class SweepTemplateOut(BaseModel):
+    id: uuid.UUID
+    name: str
+    entry_ids: list[uuid.UUID]
+    entry_names: list[str | None]
+    timeframes: list[str]
+    date_from: dt.datetime
+    date_to: dt.datetime
+    initial_capital: Money
+    paused: bool
+    created_at: dt.datetime
+    items: list[TemplateItemOut]
+
+
+class SweepTemplateListItem(BaseModel):
+    id: uuid.UUID
+    name: str
+    timeframes: list[str]
+    date_from: dt.datetime
+    date_to: dt.datetime
+    paused: bool
+    waiting: int
+    launched: int
+    failed: int
+    created_at: dt.datetime
+
+
 class SweepOut(BaseModel):
     """A sweep read back: the question that was asked, and every run it became."""
 

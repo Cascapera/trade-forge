@@ -336,6 +336,30 @@ async def create_sweep(request: CreateSweep, session: SessionDep, queue: QueueDe
     run disappearing without a name — and since 18/09 no point is left out for the size of the
     sweep either: there is no cap.
     """
+    sweep, runs, collections, shared_count, skipped = launch_sweep(session, request)
+
+    # ⚠️ After the commit, and with the run's own id as the job id. A worker is fast enough to
+    # claim a job before an uncommitted row is visible; and the derived job id makes the enqueue
+    # idempotent, so a crash halfway through this loop is recovered by re-sending rather than by
+    # working out which of two thousand runs were reached.
+    # ⚠️ **That claim is the runs' alone.** The downloads carry no job id, as the basket's do not:
+    # re-sending them queues each window again, and a crash before one is sent leaves it
+    # `queued` with its runs deferring until the queue has been silent for `WAIT_LIMIT`.
+    for collection in collections:
+        await queue.enqueue_job(COLLECT_RANGE, str(collection.id), _queue_name=COLLECT_QUEUE)
+    for run in runs:
+        await queue.enqueue_job(RUN_BACKTEST, str(run.id), _job_id=str(run.id))
+
+    return CreatedSweep(id=sweep.id, runs=len(runs), shared=shared_count, skipped=skipped)
+
+
+def launch_sweep(
+    session: Session, request: CreateSweep, *, template_id: uuid.UUID | None = None
+) -> tuple[Sweep, list[Backtest], list[Collection], int, list[UncoveredMarket]]:
+    """Decide, write and commit a sweep — the endpoint's body, shared with a template's queue
+    (`sweep_templates`, 26/09), which launches one market at a time. The caller queues the
+    collections and the runs; refusals are `HTTPException`s with the sentence a person reads.
+    """
     pairs = _entries(session, request.entry_ids)
     timeframes = list(request.timeframes)
 
@@ -427,6 +451,7 @@ async def create_sweep(request: CreateSweep, session: SessionDep, queue: QueueDe
         date_to=request.date_to,
         initial_capital=request.initial_capital,
         skipped=[market.model_dump() for market in skipped],
+        template_id=template_id,
     )
     session.add(sweep)
 
@@ -506,19 +531,7 @@ async def create_sweep(request: CreateSweep, session: SessionDep, queue: QueueDe
             detail="another sweep created these strategies at the same time; try again",
         ) from exc
 
-    # ⚠️ After the commit, and with the run's own id as the job id. A worker is fast enough to
-    # claim a job before an uncommitted row is visible; and the derived job id makes the enqueue
-    # idempotent, so a crash halfway through this loop is recovered by re-sending rather than by
-    # working out which of two thousand runs were reached.
-    # ⚠️ **That claim is the runs' alone.** The downloads carry no job id, as the basket's do not:
-    # re-sending them queues each window again, and a crash before one is sent leaves it
-    # `queued` with its runs deferring until the queue has been silent for `WAIT_LIMIT`.
-    for collection in collections:
-        await queue.enqueue_job(COLLECT_RANGE, str(collection.id), _queue_name=COLLECT_QUEUE)
-    for run in runs:
-        await queue.enqueue_job(RUN_BACKTEST, str(run.id), _job_id=str(run.id))
-
-    return CreatedSweep(id=sweep.id, runs=len(runs), shared=len(followers), skipped=skipped)
+    return sweep, runs, collections, len(followers), skipped
 
 
 def _costs_for(

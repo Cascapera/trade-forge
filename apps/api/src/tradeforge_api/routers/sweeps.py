@@ -21,20 +21,23 @@ would draw a map of a space it never searched, and it would look exactly like a 
 did — which is why a hole is always written down, never merely left.
 """
 
+import asyncio
 import datetime as dt
 import secrets
+import threading
 import uuid
 from collections.abc import Callable, Iterator
 from decimal import Decimal
 from typing import Annotated, Any, Literal
 
-from fastapi import APIRouter, HTTPException, Query, Response, status
+from fastapi import APIRouter, HTTPException, Query, Request, Response, status
 from pydantic import AwareDatetime
 from sqlalchemy import ColumnElement, Text, and_, case, cast, func, insert, literal, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import InstrumentedAttribute, Session, defer, selectinload
 
 from tradeforge_api import sweep_dashboard as dashboard
+from tradeforge_api.config import Settings
 from tradeforge_api.coverage import describe, to_collect, uncovered_markets
 from tradeforge_api.deps import QueueDep, SessionDep, SettingsDep
 from tradeforge_api.estimates import backtests_time
@@ -229,9 +232,55 @@ REFUSAL_EXAMPLES = 3
 """How many labels a preview names under each reason a combination was refused for."""
 
 
-@router.post("/sweeps/preview", response_model=SweepPreview, responses={**_NOT_FOUND, **_BAD_BODY})
-def preview_sweep(
-    request: PreviewSweepRequest, session: SessionDep, settings: SettingsDep
+class PreviewAbandoned(Exception):  # noqa: N818 — an outcome, not an error anyone handles
+    """The caller of a preview went away before it was answered."""
+
+
+ABANDON_CHECK = 1000
+"""Documents a preview reads between two looks at whether its caller is still there."""
+
+
+@router.post(
+    "/sweeps/preview",
+    response_model=SweepPreview,
+    responses={**_NOT_FOUND, **_BAD_BODY, 499: {"description": "the caller went away"}},
+)
+async def preview_sweep(
+    request: PreviewSweepRequest, session: SessionDep, settings: SettingsDep, http: Request
+) -> SweepPreview | Response:
+    """What this sweep would enqueue — `_preview`, in a thread, given up when its caller leaves.
+
+    ⚠️ **Given up, because nobody else will give it up** (26/09). The screen asks again on every
+    edit, and ticking six charts one after another asked six times; each question over a grid of
+    435 thousand points per chart is two minutes of CPU, the browser kept only the last answer,
+    and the server went on computing all six until the API fell over. The screen now cancels the
+    question it no longer wants, and this notices the connection closing and stops.
+    """
+    abandoned = threading.Event()
+
+    async def watch() -> None:
+        while not abandoned.is_set():
+            if await http.is_disconnected():
+                abandoned.set()
+                return
+            await asyncio.sleep(0.5)
+
+    watcher = asyncio.create_task(watch())
+    try:
+        return await asyncio.to_thread(_preview, request, session, settings, abandoned)
+    except PreviewAbandoned:
+        # Nobody is there to read it; the status is for the log.
+        return Response(status_code=499)
+    finally:
+        abandoned.set()
+        watcher.cancel()
+
+
+def _preview(
+    request: PreviewSweepRequest,
+    session: Session,
+    settings: Settings,
+    abandoned: threading.Event | None = None,
 ) -> SweepPreview:
     """What this sweep would enqueue, without enqueuing any of it.
 
@@ -284,6 +333,8 @@ def preview_sweep(
         groups: dict[str, RefusalGroup] = {}
         for doc in stream:
             documents += 1
+            if abandoned is not None and documents % ABANDON_CHECK == 0 and abandoned.is_set():
+                raise PreviewAbandoned
             reason = refusal_of(dict(doc.document))
             if reason is not None:
                 group = groups.setdefault(reason, RefusalGroup(reason=reason, count=0, examples=[]))
@@ -360,7 +411,12 @@ async def create_sweep(request: CreateSweep, session: SessionDep, queue: QueueDe
     run disappearing without a name — and since 18/09 no point is left out for the size of the
     sweep either: there is no cap.
     """
-    sweep, run_ids, collections, shared_count, skipped = launch_sweep(session, request)
+    # ⚠️ **In a thread, never on the event loop** (26/09). A launch of a large grid is minutes of
+    # CPU; run here it held the loop — every other request and the health check with it — and the
+    # two crashes of the API measured on the loop's own thread happened during launches.
+    sweep, run_ids, collections, shared_count, skipped = await asyncio.to_thread(
+        launch_sweep, session, request
+    )
 
     # ⚠️ After the commit, and with the run's own id as the job id. A worker is fast enough to
     # claim a job before an uncommitted row is visible; and the derived job id makes the enqueue

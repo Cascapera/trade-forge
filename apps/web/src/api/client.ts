@@ -81,7 +81,12 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
+async function request<T>(
+  method: string,
+  path: string,
+  body?: unknown,
+  signal?: AbortSignal,
+): Promise<T> {
   // Built up rather than spread with `undefined` values: under exactOptionalPropertyTypes a
   // present-but-undefined `body` is not the same as an absent one, and `fetch` wants it absent.
   const init: RequestInit = { method }
@@ -89,15 +94,35 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
     init.headers = { 'Content-Type': 'application/json' }
     init.body = JSON.stringify(body)
   }
+  if (signal !== undefined) init.signal = signal
   const response = await fetch(`${BASE_URL}${path}`, init)
   const text = await response.text()
-  const payload: unknown = text ? JSON.parse(text) : null
+  const payload = parsed(text)
+  if (payload === NOT_JSON) {
+    // ⚠️ **The proxy's own page, not the API's answer** (26/09): nginx answers 502 with HTML when
+    // the API is down or restarting, and parsing that surfaced as "Unexpected token '<'".
+    throw new ApiError(
+      response.status,
+      `the server did not answer (HTTP ${String(response.status)}); try again in a moment`,
+    )
+  }
   if (!response.ok) {
     const detail =
       payload && typeof payload === 'object' && 'detail' in payload ? payload.detail : payload
     throw new ApiError(response.status, detail)
   }
   return payload as T
+}
+
+const NOT_JSON = Symbol('not JSON')
+
+function parsed(text: string): unknown {
+  if (!text) return null
+  try {
+    return JSON.parse(text) as unknown
+  } catch {
+    return NOT_JSON
+  }
 }
 
 /**
@@ -265,8 +290,10 @@ export const api = {
   // the form is still being filled in. ⚠️ It answers three different noes — a combination the
   // DSL refuses, a market with no candles in the window, and a sweep with nothing to run — and the
   // screen has to keep them apart, because the fixes are to edit, to collect, and to shrink.
-  previewSweep: (payload: PreviewSweepRequest): Promise<SweepPreview> =>
-    request('POST', '/sweeps/preview', payload),
+  // ⚠️ Cancellable: a preview of a large grid is minutes of server CPU, and the server stops
+  // when the question it was asked is withdrawn (26/09).
+  previewSweep: (payload: PreviewSweepRequest, signal?: AbortSignal): Promise<SweepPreview> =>
+    request('POST', '/sweeps/preview', payload, signal),
   // Takes a study, not a grid: the comparison a walk-forward exists to support only holds if
   // both halves searched the same parameter space over the same market, and a grid retyped
   // here could differ by one value while still looking like the same experiment.

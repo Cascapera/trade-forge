@@ -104,7 +104,11 @@ services:
       - '0.0.0.0'
       - --port
       - '8000'
-    environment: *backend-env
+    environment:
+      <<: *backend-env
+      # A native crash (segfault) prints every thread's Python stack to the log instead of
+      # dying silently — the API segfaulted six times on 26/09 with nothing in its log.
+      PYTHONFAULTHANDLER: '1'
     ports:
       - '8000:8000'
     volumes:

@@ -411,7 +411,12 @@ async def create_sweep(request: CreateSweep, session: SessionDep, queue: QueueDe
     run disappearing without a name — and since 18/09 no point is left out for the size of the
     sweep either: there is no cap.
     """
-    sweep, run_ids, collections, shared_count, skipped = launch_sweep(session, request)
+    # ⚠️ **In a thread, never on the event loop** (26/09). A launch of a large grid is minutes of
+    # CPU; run here it held the loop — every other request and the health check with it — and the
+    # two crashes of the API measured on the loop's own thread happened during launches.
+    sweep, run_ids, collections, shared_count, skipped = await asyncio.to_thread(
+        launch_sweep, session, request
+    )
 
     # ⚠️ After the commit, and with the run's own id as the job id. A worker is fast enough to
     # claim a job before an uncommitted row is visible; and the derived job id makes the enqueue

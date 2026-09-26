@@ -574,10 +574,20 @@ export function useCreateStudy() {
 export function useSweepPreview(request: PreviewSweepRequest | null) {
   return useQuery<{ asked: PreviewSweepRequest; preview: SweepPreview }>({
     queryKey: ['sweep-preview', request],
+    // ⚠️ **The signal is consumed, so a superseded preview is cancelled** (26/09). Ticking six
+    // charts asks six questions; unconsumed, all six ran to the end on the server — two minutes
+    // of CPU each over a large grid — and took the API down. Consumed, React Query aborts the
+    // request the moment its key is no longer observed, and the server stops with it.
     queryFn:
       request !== null
-        ? async () => ({ asked: request, preview: await api.previewSweep(request) })
+        ? async ({ signal }) => ({
+            asked: request,
+            preview: await api.previewSweep(request, signal),
+          })
         : skipToken,
+    // Not asked again on failure: a preview that failed under load, asked three more times, is
+    // the load.
+    retry: false,
   })
 }
 

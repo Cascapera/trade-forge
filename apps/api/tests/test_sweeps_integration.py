@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from fastapi import Request
 from fastapi.testclient import TestClient
 from sqlalchemy import Engine, event, select
 from sqlalchemy.orm import Session
@@ -224,6 +225,10 @@ def finish(session_factory: Callable[[], Session], run_id: str, net: int) -> Non
         session.close()
 
 
+async def _always_gone(_self: Request) -> bool:
+    return True
+
+
 def a_sweep_body(entries: list[str], symbols: list[str], timeframes: list[str]) -> dict[str, Any]:
     return {
         "entry_ids": entries,
@@ -347,6 +352,36 @@ class TestTheTimeframeIsRealHere:
 
         launched = client.post("/sweeps", json=body)
         assert launched.json()["runs"] == 2
+
+    def test_a_preview_whose_caller_left_stops_and_says_so(
+        self, client: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """⚠️ **Given up, not finished** (26/09). Six abandoned previews of a grid of 435 thousand
+        points per chart kept computing after the screen had moved on, and took the API down."""
+        monkeypatch.setattr(sweeps_router, "ABANDON_CHECK", 1)
+        monkeypatch.setattr(Request, "is_disconnected", _always_gone)
+        seen: list[int] = []
+        judged = sweeps_router.refusal_of
+
+        def counting(document: dict[str, Any]) -> str | None:
+            seen.append(1)
+            return judged(document)
+
+        monkeypatch.setattr(sweeps_router, "refusal_of", counting)
+        entry = an_entry(
+            client, name=f"swept {uuid.uuid4()}", grid={"setup.params.period": list(range(5, 45))}
+        )
+        body = a_sweep_body([entry], ["EURUSD"], ["M15", "H1"])
+
+        answered = client.post(
+            "/sweeps/preview",
+            json={
+                k: body[k] for k in ("entry_ids", "symbols", "timeframes", "date_from", "date_to")
+            },
+        )
+
+        assert answered.status_code == 499
+        assert len(seen) < 80
 
     def test_the_preview_groups_refusals_by_reason_and_names_a_few(
         self, client: Any, monkeypatch: pytest.MonkeyPatch

@@ -58,6 +58,47 @@ describe('api client', () => {
     expect((error as ApiError).detail).toEqual(['weird'])
   })
 
+  it('says the server did not answer when the proxy sends its own HTML page', async () => {
+    // ⚠️ nginx answers 502 with HTML while the API restarts; parsing it used to surface as
+    // "Unexpected token '<'", which says nothing a reader can act on (26/09).
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 502,
+        text: () => Promise.resolve('<html> <head><title>502 Bad Gateway</title></head></html>'),
+      }),
+    )
+
+    const failure = await api.listInstruments().catch((error: unknown) => error)
+
+    expect(failure).toBeInstanceOf(ApiError)
+    expect((failure as ApiError).status).toBe(502)
+    expect((failure as ApiError).detail).toMatch(/did not answer \(HTTP 502\)/)
+  })
+
+  it('hands a preview its abort signal, so a superseded one can be withdrawn', async () => {
+    const fetchMock = mockFetch(200, { runs: 0 })
+    vi.stubGlobal('fetch', fetchMock)
+    const controller = new AbortController()
+
+    await api.previewSweep(
+      {
+        entry_ids: [],
+        symbols: [],
+        timeframes: [],
+        date_from: '2024-01-01T00:00:00Z',
+        date_to: '2024-02-01T00:00:00Z',
+      },
+      controller.signal,
+    )
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/sweeps/preview',
+      expect.objectContaining({ signal: controller.signal }),
+    )
+  })
+
   it('treats an empty body as null', async () => {
     vi.stubGlobal('fetch', mockFetch(200, undefined))
     await expect(api.getEquity('x')).resolves.toBeNull()

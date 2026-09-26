@@ -76,7 +76,7 @@ def test_the_digest_is_the_same_one_a_later_process_will_compute() -> None:
     """
     name = fit_name(BASE, LONG_LABEL, values())
 
-    assert name.endswith("… #cddd7e]")
+    assert name.endswith("… #cddd7ee2bed81f50]")
     assert len(name) == NAME_MAX_LENGTH
     assert name.startswith(f"{BASE} [H4 · side='long'")
 

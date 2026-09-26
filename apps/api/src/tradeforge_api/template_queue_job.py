@@ -15,7 +15,6 @@ from tradeforge_api.routers.sweeps import launch_sweep
 from tradeforge_api.schemas import CreateSweep
 from tradeforge_api.sweep_walkforward_job import settled
 from tradeforge_db.models import (
-    Backtest,
     Collection,
     SweepTemplate,
     SweepTemplateItem,
@@ -25,7 +24,7 @@ from tradeforge_db.models import (
 
 def advance_queue(
     session: Session, template_id: uuid.UUID
-) -> tuple[list[Backtest], list[Collection], bool]:
+) -> tuple[list[uuid.UUID], list[Collection], bool]:
     """Launch the next market if nothing of this template is running; what to queue, and whether
     to look again.
 

@@ -22,8 +22,9 @@ same window returns the identical number and is not a second opinion. Only data 
 **not chosen on** is: a walk-forward, another market, a reserved window.
 """
 
+import hashlib
 import json
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -31,8 +32,8 @@ from tradeforge_api.grid import (
     TAKE_PROFIT_RR,
     GridError,
     GridPoint,
-    expand,
     fit_name,
+    iter_expand,
     size_of,
 )
 
@@ -65,19 +66,23 @@ class SweepDocument:
     """The document itself, with the point's values substituted and the timeframe written in."""
 
 
-def documents_for(
+def iter_documents_for(
     *,
     entry_id: str,
     entry_name: str,
     definition: Mapping[str, Any],
     grid: Mapping[str, Sequence[Any]],
     timeframes: Sequence[str],
-) -> list[SweepDocument]:
-    """Every document one catalogue entry becomes across the timeframes asked for.
+) -> Iterator[SweepDocument]:
+    """Every document one catalogue entry becomes across the timeframes asked for, one at a time.
 
-    The grid is expanded once and reused at each timeframe rather than expanded per timeframe:
-    the axes are the same and `expand` is the component that owns what a grid means, so asking
-    it repeatedly would be asking one question several times and hoping for one answer.
+    ⚠️ **Lazy, because a grid can be too large to hold** (26/09): 435 thousand points per chart,
+    each a whole strategy document, took the API past 18 GB before it was stopped. A refusal of
+    the grid itself (`GridError`, `SweepError`) is still raised by the call, before any document.
+
+    The grid is expanded again for each timeframe rather than held between them — holding it is
+    the memory this exists not to spend — and `expand`'s order is kept, so the documents come in
+    the order `documents_for` always gave: timeframe by timeframe, the grid's own order within.
 
     ⚠️ **An entry with no grid is one document per timeframe, not zero.** `expand` over an empty
     grid returns the base document unchanged, which is the empty product spelled as an object —
@@ -94,14 +99,24 @@ def documents_for(
     if TAKE_PROFIT_RR not in grid:
         definition = _without_target(definition)
 
+    def points_of() -> Iterator[GridPoint]:
+        return iter_expand(definition, grid) if grid else iter([_whole(definition)])
+
     try:
-        points = expand(definition, grid) if grid else [_whole(definition)]
+        points_of()  # the axes are checked by the call, before any document is built
     except GridError as exc:
         raise SweepError(f"{entry_name}: {exc}") from exc
+    return _documents(entry_id, entry_name, points_of, timeframes)
 
-    out: list[SweepDocument] = []
+
+def _documents(
+    entry_id: str,
+    entry_name: str,
+    points_of: Callable[[], Iterator[GridPoint]],
+    timeframes: Sequence[str],
+) -> Iterator[SweepDocument]:
     for timeframe in timeframes:
-        for point in points:
+        for point in points_of():
             # ⚠️ The timeframe goes **into** the document, and the name carries it. Without the
             # name the two timeframes produce documents that differ in content but share a name,
             # and (name, version) is unique — the second one would collide rather than insert.
@@ -113,16 +128,33 @@ def documents_for(
             # zero runs. The full label is kept on the point either way, which is what the sweep's
             # screen and its dataset read.
             document["name"] = fit_name(entry_name, label, values)
-            out.append(
-                SweepDocument(
-                    entry_id=entry_id,
-                    timeframe=timeframe,
-                    label=label,
-                    values=values,
-                    document=document,
-                )
+            yield SweepDocument(
+                entry_id=entry_id,
+                timeframe=timeframe,
+                label=label,
+                values=values,
+                document=document,
             )
-    return out
+
+
+def documents_for(
+    *,
+    entry_id: str,
+    entry_name: str,
+    definition: Mapping[str, Any],
+    grid: Mapping[str, Sequence[Any]],
+    timeframes: Sequence[str],
+) -> list[SweepDocument]:
+    """`iter_documents_for`, held — for a caller whose grid is known to be small."""
+    return list(
+        iter_documents_for(
+            entry_id=entry_id,
+            entry_name=entry_name,
+            definition=definition,
+            grid=grid,
+            timeframes=timeframes,
+        )
+    )
 
 
 def _without_target(definition: Mapping[str, Any]) -> dict[str, Any]:
@@ -170,13 +202,24 @@ def shared(documents: Sequence[SweepDocument], unread: UnreadParams) -> dict[int
     The first document of a group, in the order given, answers for the rest: launch order, so
     which point owns the run does not change between a preview and the launch.
     """
-    owners: dict[str, SweepDocument] = {}
+    owners: dict[bytes, SweepDocument] = {}
     answered: dict[int, SweepDocument] = {}
     for doc in documents:
-        owner = owners.setdefault(_behaviour(doc, unread), doc)
+        owner = owners.setdefault(behaviour_key(doc, unread), doc)
         if owner is not doc:
             answered[id(doc)] = owner
     return answered
+
+
+def behaviour_key(doc: SweepDocument, unread: UnreadParams) -> bytes:
+    """`_behaviour` as 16 bytes — what a launch of a large grid keeps per distinct behaviour.
+
+    ⚠️ **A digest rather than the text**, because the text is the whole document less its name
+    (hundreds of bytes) and a grid of hundreds of thousands of points keeps one per behaviour
+    for the length of the launch. 128 bits: a collision would merge two behaviours, and at a
+    million keys its odds are around 10^-27.
+    """
+    return hashlib.blake2b(_behaviour(doc, unread).encode(), digest_size=16).digest()
 
 
 def _behaviour(doc: SweepDocument, unread: UnreadParams) -> str:

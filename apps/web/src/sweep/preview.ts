@@ -10,7 +10,7 @@ import { useEffect, useState } from 'react'
 
 import { apiFailure } from '../api/failure'
 import { useSweepPreview } from '../api/hooks'
-import type { GridRefusal, SweepEntryPreview, TimeEstimate, UncoveredMarket } from '../api/types'
+import type { RefusalGroup, SweepEntryPreview, TimeEstimate, UncoveredMarket } from '../api/types'
 
 import { toPreviewRequest, type SweepForm } from './settings'
 
@@ -30,8 +30,9 @@ export interface SweepRehearsal {
   runs: number
   /** Per entry, so a refusal can be shown under the label that caused it. */
   entries: SweepEntryPreview[]
-  /** Every combination the DSL refuses, pooled for the count but each carrying its own entry. */
-  refusals: (GridRefusal & { entryName: string })[]
+  /** Every reason the DSL refuses combinations for, pooled for the count but each carrying its
+   *  own entry. */
+  refusals: (RefusalGroup & { entryName: string })[]
   /** (symbol, timeframe) pairs with no candles in this window. ⚠️ Not a refusal to fix by
    *  editing: the fix is a backfill, or a different window. */
   uncovered: UncoveredMarket[]

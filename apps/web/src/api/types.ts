@@ -1104,8 +1104,17 @@ export interface SweepEntryPreview {
   /** Its grid's own size — before the timeframes and the markets multiply it. */
   points: number
   /** ⚠️ Per entry rather than pooled: a sweep holds several, and `htf must be coarser than H4`
-   *  says nothing about which shelf label caused it. */
-  refusals: GridRefusal[]
+   *  says nothing about which shelf label caused it. Grouped by reason, never one per point: one
+   *  per point made a preview of 435 thousand points per chart answer 1.09 GB (26/09). */
+  refusals: RefusalGroup[]
+}
+
+/** Every combination of one entry refused for one reason: how many, and the first few. */
+export interface RefusalGroup {
+  reason: string
+  count: number
+  /** Labels of the first few refused for it, in launch order. */
+  examples: string[]
 }
 
 /**

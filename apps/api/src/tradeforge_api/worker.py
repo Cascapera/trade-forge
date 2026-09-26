@@ -728,7 +728,7 @@ async def run_template_queue(ctx: dict[str, Any], template_id: str) -> None:
     session: Session = ctx["session_factory"]()
     try:
         runs, collections, pending = advance_queue(session, uuid.UUID(template_id))
-        run_ids = [str(one.id) for one in runs]
+        run_ids = [str(one) for one in runs]
         collection_ids = [str(one.id) for one in collections]
     finally:
         session.close()

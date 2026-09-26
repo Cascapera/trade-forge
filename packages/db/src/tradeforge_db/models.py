@@ -1796,19 +1796,6 @@ class Sweep(Base):
     timeframes: Mapped[list[Any]] = mapped_column(JSONB, nullable=False)
     """The charts. One is the ordinary case and is not a special case — a list of one."""
 
-    points: Mapped[list[Any]] = mapped_column(JSONB, nullable=False, server_default="[]")
-    """Where each written document sits on the axes: `strategy_id`, `entry_id`, `label`, `values`.
-
-    ⚠️ **Stored, because the alternative is parsing a caption.** A point's document is written
-    under `{entry name} [{label}]` — that name is what a run log row shows, and it is the reason
-    the points are separate lineages at all. Recovering the *coordinates* from it would mean
-    splitting text on brackets and separators, which works until an entry is named so that
-    another's name is a prefix of it, or until a value contains a separator. Both are things a
-    person will do.
-
-    A JSONB list rather than a table, on the same terms as `entry_ids` above: the runs point at
-    immutable documents, and this column records the question, not a set of live references."""
-
     skipped: Mapped[list[Any]] = mapped_column(JSONB, nullable=False, server_default="[]")
     """The (market, chart) pairs asked for and left out for having no candles in the window
     (`rev_0020`): `symbol`, `timeframe`, and `covers` — what the index held then, or null.
@@ -1863,7 +1850,6 @@ class Sweep(Base):
         CheckConstraint("jsonb_typeof(entry_ids) = 'array'", name="entries_are_a_list"),
         CheckConstraint("jsonb_typeof(symbols) = 'array'", name="symbols_are_a_list"),
         CheckConstraint("jsonb_typeof(timeframes) = 'array'", name="timeframes_are_a_list"),
-        CheckConstraint("jsonb_typeof(points) = 'array'", name="points_are_a_list"),
         CheckConstraint("jsonb_typeof(skipped) = 'array'", name="skipped_is_a_list"),
         CheckConstraint("date_to > date_from", name="a_window_runs_forwards"),
         CheckConstraint(
@@ -1880,6 +1866,51 @@ class Sweep(Base):
         Index("ix_sweeps_created_at", "created_at"),
         Index("ix_sweeps_holdout_of", "holdout_of"),
         Index("ix_sweeps_template_id", "template_id"),
+    )
+
+
+class SweepPoint(Base):
+    """Where one written document of a sweep sits on the axes (`rev_0035`).
+
+    ⚠️ **Stored, because the alternative is parsing a caption.** A point's document is written
+    under `{entry name} [{label}]` — that name is what a run log row shows, and it is the reason
+    the points are separate lineages at all. Recovering the *coordinates* from it would mean
+    splitting text on brackets and separators, which works until an entry is named so that
+    another's name is a prefix of it, or until a value contains a separator.
+
+    ⚠️ **A table, not the JSONB list it was until 26/09.** A grid of 435 thousand points per chart
+    made that list hundreds of megabytes in one value — past Postgres's 255 MB ceiling for a
+    whole-chart sweep — and every reader loaded all of it to find a handful of strategies. Rows
+    are written in blocks as the launch expands the grid, and read by the strategies asked for.
+
+    No foreign key to `strategies`, on the terms `Sweep.entry_ids` gives: the column records the
+    question, and the runs are what point at the immutable documents.
+    """
+
+    __tablename__ = "sweep_points"
+
+    sweep_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("sweeps.id", ondelete="CASCADE"), primary_key=True
+    )
+    position: Mapped[int] = mapped_column(Integer, primary_key=True)
+    """The order the launch wrote it in — launch order, which is the grid's own."""
+
+    strategy_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    """The strategy whose run answers this point: its own, or — with `same_as` — another's."""
+
+    entry_id: Mapped[str] = mapped_column(Text, nullable=False)
+    label: Mapped[str] = mapped_column(Text, nullable=False)
+    coordinates: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    """The point's values, keyed by the grid's dotted paths, with the chart under `timeframe` —
+    what the API calls a point's `values` (a column cannot be named that in SQL)."""
+
+    same_as: Mapped[str | None] = mapped_column(Text, nullable=True)
+    """The label of the point whose run answers this one (24/09), or null for a point that is
+    its own run."""
+
+    __table_args__ = (
+        CheckConstraint("jsonb_typeof(coordinates) = 'object'", name="coordinates_are_an_object"),
+        Index("ix_sweep_points_sweep_id_strategy_id", "sweep_id", "strategy_id"),
     )
 
 

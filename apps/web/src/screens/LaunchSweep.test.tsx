@@ -311,7 +311,7 @@ describe('the three refusals stay apart', () => {
             entry_id: 'a',
             name: 'nine one plain',
             points: 3001,
-            refusals: [{ label: 'M15 · period=5', values: {}, reason: 'nope' }],
+            refusals: [{ reason: 'nope', count: 1, examples: ['M15 · period=5'] }],
           },
         ],
       }),
@@ -347,7 +347,11 @@ describe('the three refusals stay apart', () => {
             name: 'nine one swept',
             points: 3,
             refusals: [
-              { label: 'M15 · period=5', values: {}, reason: 'htf must be coarser than M15' },
+              {
+                reason: 'htf must be coarser than M15',
+                count: 4,
+                examples: ['M15 · period=5', 'M15 · period=9'],
+              },
             ],
           },
         ],
@@ -358,7 +362,9 @@ describe('the three refusals stay apart', () => {
 
     const refusal = await screen.findByText(/htf must be coarser than M15/i)
     expect(refusal).toHaveTextContent('nine one swept')
-    expect(refusal).toHaveTextContent('M15 · period=5')
+    expect(refusal).toHaveTextContent('M15 · period=5, M15 · period=9, …')
+    // ⚠️ Counted by the group, not by the items: one reason can stand for thousands of points.
+    expect(screen.getByText('4 combinations cannot run and will be left out.')).toBeInTheDocument()
   })
 
   it('leaves refused combinations out instead of blocking the launch', async () => {
@@ -372,7 +378,7 @@ describe('the three refusals stay apart', () => {
             entry_id: 'b',
             name: 'nine one swept',
             points: 3,
-            refusals: [{ label: 'M15 · period=5', values: {}, reason: 'nope' }],
+            refusals: [{ reason: 'nope', count: 1, examples: ['M15 · period=5'] }],
           },
         ],
       }),

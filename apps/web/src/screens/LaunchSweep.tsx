@@ -69,10 +69,11 @@ export function LaunchSweep(): React.JSX.Element {
   // different window. Pooling them into one "cannot run" would send somebody to edit a grid when
   // what they need is to collect candles.
   const stale = !rehearsal.settled
+  const refused = rehearsal.refusals.reduce((total, group) => total + group.count, 0)
   const refusedByDsl =
-    stale || rehearsal.refusals.length === 0
+    stale || refused === 0
       ? null
-      : `${String(rehearsal.refusals.length)} combination${rehearsal.refusals.length === 1 ? '' : 's'} cannot run and will be left out.`
+      : `${refused.toLocaleString()} combination${refused === 1 ? '' : 's'} cannot run and will be left out.`
   const uncovered = stale ? [] : rehearsal.uncovered
   const serverError = stale ? null : rehearsal.error
 
@@ -456,10 +457,15 @@ export function LaunchSweep(): React.JSX.Element {
           <div className="space-y-1">
             <p className="text-sm text-amber-300">{refusedByDsl}</p>
             <ul className="space-y-1 text-xs text-amber-300/80">
-              {rehearsal.refusals.map((refusal) => (
-                <li key={`${refusal.entryName}-${refusal.label}`}>
-                  <span className="font-medium">{refusal.entryName}</span>{' '}
-                  <span className="font-mono">{refusal.label}</span> — {refusal.reason}
+              {rehearsal.refusals.map((group) => (
+                <li key={`${group.entryName}-${group.reason}`}>
+                  <span className="font-medium">{group.entryName}</span>{' '}
+                  {group.count.toLocaleString()} × {group.reason}
+                  {/* A few of them by name, so the reason can be read against a point. */}
+                  <span className="block font-mono text-amber-300/60">
+                    e.g. {group.examples.join(', ')}
+                    {group.count > group.examples.length ? ', …' : ''}
+                  </span>
                 </li>
               ))}
             </ul>

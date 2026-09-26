@@ -17,7 +17,7 @@ answers, joined by merge logic that could drift, and nothing would raise when it
 
 import hashlib
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from itertools import product
 from typing import Any
@@ -256,14 +256,23 @@ def expand(document: Mapping[str, Any], grid: Mapping[str, Sequence[Any]]) -> li
     from a nested loop. It matters because that order becomes the order of the runs in the
     study, and a heatmap laid out row by row is reading it.
     """
-    _check_axes(document, grid)
+    return list(iter_expand(document, grid))
 
-    return [
+
+def iter_expand(
+    document: Mapping[str, Any], grid: Mapping[str, Sequence[Any]]
+) -> Iterator[GridPoint]:
+    """`expand`, one point at a time — for a grid too large to hold (26/09: 435 thousand points
+    per chart, each a whole document). Same checks, raised before the first point; same order."""
+    # Checked here, not inside the generator: a generator's body runs at the first `next`, and the
+    # refusal belongs to the call.
+    _check_axes(document, grid)
+    return (
         GridPoint(
             values=dict(zip(grid, chosen, strict=True)), document=_apply(document, grid, chosen)
         )
         for chosen in product(*grid.values())
-    ]
+    )
 
 
 def _apply(
@@ -373,14 +382,20 @@ def named(base_name: str, point: GridPoint) -> str:
 
 
 def _digest(values: Mapping[str, Any]) -> str:
-    """Six hex characters that stand for this point's coordinates.
+    """Sixteen hex characters that stand for this point's coordinates.
 
     ⚠️ **sha256, not `hash()`.** The built-in is salted per process, so a name built today and the
     same name rebuilt tomorrow would differ — and a stored strategy would be written twice instead
     of being found and reused.
+
+    ⚠️ **Sixteen, not the six it was until 26/09.** Six is 24 bits, and the trimmed names of one
+    entry share every visible character: a grid of 54 thousand distinct points expects about 87
+    pairs of them to collide, and the first pair in a launch is an integrity error on
+    `(name, version)` — measured on a real grid. 64 bits put a collision among a million points
+    near 3 in 100 million.
     """
     canonical = json.dumps(dict(sorted(values.items())), sort_keys=True, default=str)
-    return hashlib.sha256(canonical.encode()).hexdigest()[:6]
+    return hashlib.sha256(canonical.encode()).hexdigest()[:16]
 
 
 def fit_name(base_name: str, label: str, values: Mapping[str, Any]) -> str:

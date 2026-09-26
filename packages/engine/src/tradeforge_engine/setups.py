@@ -2137,17 +2137,11 @@ class StructureStrategy:
         # better than guessing the base from the spacing of the first two candles.
         if htf is not None and timeframe is None:
             raise ValueError("a higher-timeframe filter needs the setup's own timeframe")
-        # ⚠️ **The broker's clock is demanded, never assumed** — his rule of 2026-09-09, and the
-        # doctrine the collector's `catalogue` command already applies to `--server-offset` (its
-        # `backfill` measures instead, so the precedent is that one command's). A default of UTC
-        # would be a claim about a real terminal, and the one it makes is wrong for most: the
-        # regions would come out displaced by the broker's offset and every number would still
-        # look reasonable. Refusing costs one field on the document.
-        if htf is not None and htf_offset is None:
-            raise ValueError(
-                "a higher-timeframe filter needs the broker's clock: pass htf_offset, the hours "
-                "its server runs ahead of UTC"
-            )
+        # ⚠️ **No broker clock means UTC** — his decision of 2026-09-26 (*"nao vamos fazer o
+        # ajuste"*), reversing the rule of 2026-09-09 that demanded it. The stored candles are
+        # UTC, so an absent offset cuts the higher bars where they already are; a MetaTrader
+        # chart cuts them on the server's clock, and the regions above then sit displaced from
+        # his by the broker's offset. Known and accepted, and a stated offset still moves the cut.
         # ⚠️ **A timeframe with no name is refused here rather than at the chart.** `zones()`
         # labels the regions above with the bar's own name, and a duration outside the table has
         # none — built by hand, such a setup ran a whole backtest and then raised a bare
@@ -2158,15 +2152,18 @@ class StructureStrategy:
                 f"a higher timeframe has to be a bar this engine can name, got {htf}; "
                 f"this engine knows {sorted(TIMEFRAME_DELTAS)}"
             )
-        # ⚠️ **The last two clauses are unreachable at runtime and are not dead code.** The two
-        # refusals above already guarantee that a filter has both, so no test can distinguish this
-        # from `if htf is None`; what needs them is `mypy --strict`, which narrows `timeframe` and
-        # `htf_offset` to non-`None` only where it can see the check. Deleting them is a type
-        # error, not a green suite — which is the one form of "untested" that cannot rot.
+        # ⚠️ **The `timeframe` clause is unreachable at runtime and is not dead code.** The refusal
+        # above already guarantees a filter has one, so no test can tell this from `if htf is
+        # None`; what needs it is `mypy --strict`, which narrows `timeframe` to non-`None` only
+        # where it can see the check.
         self._gate = (
             None
-            if htf is None or timeframe is None or htf_offset is None
-            else HigherTimeframeGate(base=timeframe, target=htf, offset=htf_offset)
+            if htf is None or timeframe is None
+            else HigherTimeframeGate(
+                base=timeframe,
+                target=htf,
+                offset=dt.timedelta(0) if htf_offset is None else htf_offset,
+            )
         )
 
         self._qualifier = qualifier

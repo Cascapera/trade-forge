@@ -567,15 +567,11 @@ function ConditionRows(props: {
  *  otherwise, and it is the difference between two different experiments. */
 function emptyHint(param: SchemaParam): string | null {
   if (param.kind === 'boolean' || !('nullable' in param) || !param.nullable) return null
-  // ⚠️ A parameter the schema marks `requiredWith` is nullable and its empty box is **not** off:
-  // `htf_offset` blank is legal only while `htf` is blank too. This said `empty = off` since the
-  // filter shipped, which is the screen promising a document the API refuses.
-  //
-  // Phrased as a condition on the blank rather than as "required with htf", which is the sentence
-  // this caption first carried and is false in half the states of this screen: with `htf` empty
-  // the clock is not required at all. The neighbours all say what an empty box means, and so does
-  // this one.
+  // A parameter the schema marks `requiredWith` is nullable and its empty box is **not** off: it
+  // is legal only while its companion is blank too. No parameter carries the key today.
   if (param.requiredWith !== undefined) return `empty only if ${param.requiredWith} is`
+  // `htf_offset` empty is the higher bars cut on UTC, with no broker clock applied (26/09).
+  if (param.name === 'htf_offset') return 'empty = UTC'
   return param.name === 'max_bos' ? 'empty = uncapped' : 'empty = off'
 }
 

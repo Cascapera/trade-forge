@@ -387,6 +387,17 @@ def test_a_higher_timeframe_that_is_not_higher_is_refused_by_the_class() -> None
         )
 
 
+@pytest.mark.parametrize("params", [{"htf": "H4"}, {"htf": "H4", "htf_offset": None}])
+def test_a_higher_timeframe_with_no_clock_is_cut_on_utc(params: dict[str, object]) -> None:
+    """Absent and `null` alike are UTC since 2026-09-26 (*"nao vamos fazer o ajuste"*)."""
+    setup = build_setup(
+        {"type": "structure_choch", "params": params}, timeframe=dt.timedelta(minutes=15)
+    )
+    assert isinstance(setup, StructureStrategy)
+    assert setup._gate is not None
+    assert setup._gate.offset == dt.timedelta(0)
+
+
 def test_the_broker_s_clock_reaches_the_engine_as_a_duration_half_hours_included() -> None:
     """The document says hours ahead of UTC; the engine reasons in durations. Half hours are real
     timezones, so the probe is one — and it is not zero, or the assertion would hold for a factory

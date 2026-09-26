@@ -2824,3 +2824,18 @@ Dois problemas, de tamanhos diferentes:
 
 ⚠️ Até lá: **compare estratégias em R**, não em dinheiro, quando houver pares não-USD. As métricas
 de seleção (PR-309/310), o fatiamento e o cluster já trabalham em R.
+
+## Editar uma estratégia já catalogada (26/09) — PENDENTE
+
+Pedido dele: *"não tem opção de alterar uma estratégia já catalogada, seria bom"*. Hoje uma entrada
+da prateleira (`catalog_entries`) não tem edição de grade nem de documento pela tela; para mudar um
+eixo é preciso catalogar outra. Cuidado ao fazer: varreduras e runs antigos apontam para a entrada,
+então editar não pode reescrever o que já rodou (versionar, ou copiar ao editar).
+
+## A prévia da varredura lista cada ponto recusado, e passou de 1 GB (26/09) — PENDENTE
+
+Com a grade do "CONTINUATION FULL OTIMIZATION" (~435 mil pontos por tempo gráfico), a resposta de
+`POST /sweeps/preview` chegou a 1,09 GB e uma vez derrubou a API (`stack smashing detected`, nginx
+devolvendo 502). Mesmo com o `htf_offset` opcional (PR-326), os `htf` menores ou iguais ao gráfico
+continuam recusados ponto a ponto. Agrupar `GridRefusal` por motivo, com a contagem e alguns
+exemplos, em vez de um item por ponto.

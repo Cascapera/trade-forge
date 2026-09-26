@@ -44,16 +44,17 @@ one candle, and that is the anti-lookahead rule made structural). So the higher 
 close of the H4 bar that revealed it — the moment his chart would draw it, and never earlier.
 ADR-0026 has the alternatives.
 
-⚠️ **The bars close on the broker's clock, and it has to be stated.** *"Sempre levar em
+⚠️ **The bars close on the broker's clock, and stating it is optional.** *"Sempre levar em
 consideração o horário do MT5"* (2026-09-09). A MetaTrader chart closes its H4 at 00:00, 04:00 and
 08:00 **server** time, and the collector converts everything to UTC before storing it — so an
 aggregator anchored on UTC cuts the bars somewhere else entirely, and with a broker three hours
 ahead every region comes out three hours displaced from the one he is looking at. Plausible, and
 wrong. `offset` is how far the broker's clock runs ahead of UTC, the same number and the same
-vocabulary the collector takes as `--server-offset`, and it is required rather than guessed for
-exactly the reason its `catalogue` command gives for demanding it: a measured clock is a
-nondeterministic one. (Its `backfill` measures instead, and guards the measurement with
-`offset_is_plausible` — the two commands differ, and the doctrine quoted here is `catalogue`'s.)
+vocabulary the collector takes as `--server-offset`. A document that does not state it is cut on
+UTC (his decision of 2026-09-26, *"nao vamos fazer o ajuste"*, reversing the rule above): the
+regions then sit displaced from his chart by the broker's offset, known and accepted. The gate
+itself still takes the offset as a number, never measured — a measured clock is a
+nondeterministic one.
 """
 
 import datetime as dt

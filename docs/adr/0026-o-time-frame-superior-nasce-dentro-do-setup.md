@@ -110,3 +110,25 @@ O que se perde: um eixo de estudo sobre `htf_offset` num documento com `htf: nul
 aceito e produz N backtests idênticos — um mapa de calor chapado, que é o modo de falha que a
 própria API classifica como o único totalmente silencioso. Está em `specs/backlog.md`, junto com
 o resto da validação semântica que o navegador ainda não faz.
+
+## Revisão — 2026-09-26 (PR-326): sem relógio é UTC
+
+⚠️ **A regra de 09/09 foi revertida por ele**: *"altere o padrão para usar sempre null, não vamos
+fazer o ajuste"*. `htf` sem `htf_offset` deixou de ser recusado; o `null` agora quer dizer
+**UTC**, onde as velas guardadas já estão.
+
+O motivo foi uma varredura real: a grade do "CONTINUATION FULL OTIMIZATION" variava `htf` em sete
+valores sem relógio ao lado, e **todos** os ~435 mil pontos por tempo gráfico eram recusados — o
+botão devolvia 422 ("no combination in this sweep can run"). Nenhuma estratégia salva tinha
+`htf_offset`.
+
+| Documento | O que acontece | Veredito |
+|-----------|----------------|----------|
+| `htf` sem `htf_offset` | Barras de cima cortadas em UTC; regiões deslocadas do gráfico do MT5 pelo offset da corretora | **aceito** (antes: recusado) |
+| `htf` com `htf_offset` | Barras cortadas no relógio do servidor, como antes | aceito |
+
+O que se aceita perder: as regiões do H4/D1 não batem com as do gráfico do MT5 enquanto a
+corretora não estiver em UTC. É uma diferença conhecida e escolhida, não silenciosa: está aqui, no
+docstring de `StructureParams` e na legenda da tela (`empty = UTC`). A palavra-chave
+`requiredWith` do schema ficou sem nenhum campo que a use; o leitor dela no front continua, testado
+por `params.test.ts`.

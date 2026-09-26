@@ -472,11 +472,15 @@ def test_the_furthest_real_clock_is_accepted(offset: dt.timedelta) -> None:
     assert dt.timedelta(hours=14) == MAX_SERVER_OFFSET
 
 
-def test_the_filter_demands_the_broker_s_clock() -> None:
-    """A default of UTC would be a claim about a real terminal — and the wrong one for most of
-    them. The document has to say it, exactly as the collector demands `--server-offset`."""
-    with pytest.raises(ValueError, match="needs the broker's clock"):
-        StructureStrategy(qualifier=_Marked(), htf=H4, timeframe=HOUR)
+def test_a_filter_with_no_clock_is_cut_on_utc() -> None:
+    """His decision of 2026-09-26 (*"nao vamos fazer o ajuste"*), reversing 2026-09-09: no
+    offset is UTC, where the stored candles are — the same entries as a UTC broker stated."""
+    silent = StructureStrategy(qualifier=_Marked(), htf=H4, timeframe=HOUR)
+    stated = StructureStrategy(qualifier=_Marked(), htf=H4, htf_offset=_UTC_BROKER, timeframe=HOUR)
+
+    assert silent._gate is not None
+    assert silent._gate.offset == _UTC_BROKER
+    assert _entries(_drive(silent, STREAM)) == _entries(_drive(stated, STREAM))
 
 
 @pytest.mark.parametrize(

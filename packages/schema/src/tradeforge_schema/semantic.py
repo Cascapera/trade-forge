@@ -258,7 +258,6 @@ def _validate_setup_document(strategy: Strategy) -> list[SemanticError]:
     htf_error = _higher_timeframe_error(strategy)
     if htf_error is not None:
         errors.append(htf_error)
-    errors.extend(_broker_clock_errors(strategy))
     return errors
 
 
@@ -275,42 +274,6 @@ _TIMEFRAME_MINUTES: dict[str, int] = {
     "D1": 1440,
     "W1": 10080,
 }
-
-
-def _broker_clock_errors(strategy: Strategy) -> list[SemanticError]:
-    """A higher-timeframe filter has to say which clock its bars close on, and only then.
-
-    The engine assembles those bars from the document's own, and the stored candles are UTC while
-    a MetaTrader chart closes its H4 on the *server's* clock — so without the offset every region
-    would come out displaced by it, and nothing would look wrong (2026-09-09, his rule). Demanded
-    rather than defaulted, the same way the collector demands `--server-offset`.
-
-    ⚠️ **The rule is asymmetric, and it stopped being symmetric on 2026-09-09.** `htf` without a
-    clock is refused because it produces a *wrong* backtest: every region displaced by the
-    broker's offset, and nothing looking odd. A clock without `htf` produces nothing at all — the
-    setup builds no gate and never reads the number.
-
-    It was refused too, on the argument that a key configuring nothing is one somebody later
-    reads as if it did. That argument lost to a concrete use: a **study grid** varying `htf` over
-    `[off, H4]` is the experiment the filter exists to justify — does the region above earn its
-    keep? — and a grid is a cross product, so the clock has to sit still at one value while the
-    filter moves. Refusing the unfiltered point made the comparison impossible to ask for; the
-    tidiness it bought was worth less.
-    """
-    setup = strategy.setup
-    if setup is None:
-        return []
-    htf = getattr(setup.params, "htf", None)
-    offset = getattr(setup.params, "htf_offset", None)
-    if htf is not None and offset is None:
-        return [
-            SemanticError(
-                "setup.params.htf_offset",
-                "a higher timeframe needs the broker's clock: give htf_offset, the hours its "
-                "server runs ahead of UTC (the collector's --server-offset)",
-            )
-        ]
-    return []
 
 
 def _higher_timeframe_error(strategy: Strategy) -> SemanticError | None:

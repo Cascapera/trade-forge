@@ -891,16 +891,16 @@ export interface StructureChochSetup {
  * heights past the region or closes through it. The zone traded may sit outside the region
  * above; the break that qualifies it must confirm after the touch. Serves the change of
  * character and the continuation alike. The value must be coarser than the document's own
- * `timeframe` and a whole number of its bars, and it needs `htf_offset` beside it — `semantic.py`
- * refuses the rest.
+ * `timeframe` and a whole number of its bars — `semantic.py` refuses the rest.
  *
  * `htf_offset` is how far the broker's clock runs ahead of UTC, in hours (`3`, `-5.5`) — the
- * same number the collector takes as `--server-offset`, and **required whenever `htf` is named**
- * (2026-09-09: *"sempre levar em consideração o horário do mt5"*). A MetaTrader chart closes its
- * H4 at 00:00, 04:00 and 08:00 *server* time while the stored candles are UTC, so an engine that
- * assumed UTC would mark every region displaced by the broker's offset and every number would
- * still look reasonable. Demanded rather than defaulted, for the reason the collector already
- * gives: a clock that is measured instead of stated is a nondeterministic one.
+ * same number the collector takes as `--server-offset`. **Optional since 2026-09-26** (his
+ * decision: *"nao vamos fazer o ajuste"*): `null`, the default, assembles the higher bars on
+ * UTC, where the stored candles already are. A MetaTrader chart closes its H4 at 00:00, 04:00
+ * and 08:00 *server* time, so without the offset the regions above sit displaced from his chart
+ * by the broker's offset — a known, accepted difference, not a silent one. Stating the number
+ * still moves the cut onto the server's clock. It was required from 2026-09-09 until then, and
+ * that refused every point of a grid varying `htf` without a clock beside it.
  */
 export interface StructureParams {
   allow_secondary?: AllowSecondary;

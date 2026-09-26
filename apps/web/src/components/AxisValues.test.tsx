@@ -212,14 +212,10 @@ describe('an axis over a number', () => {
     expect(screen.queryByLabelText(`${LABEL} off`)).toBeNull()
   })
 
-  it('leaves off out of a nullable number the schema marks as required with another', () => {
-    // ⚠️ **The difference `nullable` alone cannot see.** `htf_offset` takes `null`, and its
-    // `null` is not a setting: the semantics refuse it wherever `htf` is named, so this button
-    // was one click from a 422 that takes a whole study with it. Both parameters are checked in
-    // one test because they are the two halves of the distinction — a rule applied to every
-    // nullable, and a rule applied to none, each pass one of these assertions alone.
+  it('offers off on a nullable number, the broker clock included', () => {
+    // `htf_offset: null` is UTC since 26/09, a value a grid may hold like any other.
     show(option('structure_choch', 'htf_offset'))
-    expect(screen.queryByLabelText(`${LABEL} off`)).toBeNull()
+    expect(screen.getByLabelText(`${LABEL} off`)).toBeInTheDocument()
 
     cleanup()
     show(option('structure_choch', 'breakeven_at_r'))

@@ -1,12 +1,12 @@
 """Semantic rules, one at a time."""
 
-from typing import Any, get_args
+from typing import Any
 
 import pytest
-from pydantic import BaseModel, ValidationError
+from pydantic import ValidationError
 
 from tradeforge_schema.generate import main
-from tradeforge_schema.models import Setup, Strategy, Timeframe
+from tradeforge_schema.models import Strategy
 from tradeforge_schema.semantic import (
     SemanticValidationError,
     assert_executable,
@@ -434,23 +434,19 @@ def test_the_continuation_setup_is_held_to_the_same_rule() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_a_higher_timeframe_needs_the_broker_s_clock() -> None:
-    """His rule: *"sempre levar em consideração o horário do MT5"*. The stored candles are UTC and
-    a MetaTrader chart cuts its H4 on the server's clock, so a filter that did not say which clock
-    would mark every region displaced by the broker's offset — and look entirely reasonable."""
-    model = setup_strategy(
-        timeframe="M15", setup={"type": "structure_choch", "params": {"htf": "H4"}}
-    )
-    errors = validate_semantics(model)
+@pytest.mark.parametrize("setup_type", ["structure_choch", "structure_continuation"])
+def test_a_higher_timeframe_without_a_clock_is_sound_and_runs_on_utc(setup_type: str) -> None:
+    """His decision of 2026-09-26 (*"nao vamos fazer o ajuste"*), reversing 2026-09-09: an `htf`
+    with no `htf_offset` is cut on UTC, where the stored candles are. Refusing it had refused every
+    point of a sweep grid varying `htf` without a clock beside it."""
+    model = setup_strategy(timeframe="M15", setup={"type": setup_type, "params": {"htf": "H4"}})
 
-    assert [error.path for error in errors] == ["setup.params.htf_offset"]
-    assert "hours its server runs ahead of UTC" in messages(model)
+    assert validate_semantics(model) == []
 
 
 def test_a_clock_with_no_higher_timeframe_is_sound_because_a_grid_needs_it() -> None:
-    """⚠️ **The asymmetry, and it is deliberate.** `htf` without a clock is refused above,
-    because it produces a wrong backtest with nothing looking odd. A clock without `htf` produces
-    nothing at all: no gate is built and the number is never read.
+    """A clock without `htf` produces nothing at all: no gate is built and the number is never
+    read.
 
     It *was* refused too, until a study grid needed it. Varying `htf` over `[off, H4]` is the
     experiment the whole filter exists to justify, and a grid is a cross product — so the clock
@@ -488,104 +484,3 @@ def test_the_pair_together_is_sound_and_a_half_hour_clock_is_a_clock() -> None:
             setup={"type": "structure_choch", "params": {"htf": "H4", "htf_offset": offset}},
         )
         assert validate_semantics(model) == []
-
-
-def test_the_continuation_setup_is_held_to_the_clock_rule_too() -> None:
-    model = setup_strategy(
-        timeframe="M15", setup={"type": "structure_continuation", "params": {"htf": "H4"}}
-    )
-    assert "hours its server runs ahead of UTC" in messages(model)
-
-
-def _required_with() -> list[tuple[str, str, str]]:
-    """Every `(setup type, field, companion)` the models publish as `requiredWith`.
-
-    Read out of the **models**, not out of a list beside them, and walked through the setup union
-    so the pair arrives with a setup that can actually carry it — a document is the only place a
-    semantic rule is observable.
-    """
-    found: list[tuple[str, str, str]] = []
-    # ⚠️ `Setup` is a PEP-695 alias, so `get_args` on it yields nothing at all rather than
-    # failing — `__value__` is the annotation it stands for. An empty walk here would have made
-    # every parametrize below vacuous, which is what the test above exists to catch.
-    for member in get_args(get_args(Setup.__value__)[0]):
-        setup_type = get_args(member.model_fields["type"].annotation)[0]
-        params = member.model_fields["params"].annotation
-        assert params is not None
-        for name, field in params.model_fields.items():
-            extra = field.json_schema_extra
-            if not isinstance(extra, dict):
-                continue
-            companion = extra.get("requiredWith")
-            if companion is not None:
-                assert isinstance(companion, str)
-                found.append((setup_type, name, companion))
-    return found
-
-
-def _params_model(setup_type: str) -> type[BaseModel]:
-    """The params model a setup type carries, found the same way `_required_with` walks."""
-    for member in get_args(get_args(Setup.__value__)[0]):
-        if get_args(member.model_fields["type"].annotation)[0] == setup_type:
-            params = member.model_fields["params"].annotation
-            assert params is not None
-            return params  # type: ignore[no-any-return]
-    raise AssertionError(f"no setup named {setup_type}")
-
-
-def test_the_models_publish_at_least_one_required_with() -> None:
-    """⚠️ Otherwise the two tests below are vacuous: an empty parametrize passes, silently, and
-    would keep passing on the day somebody deleted the key they are here to hold."""
-    assert _required_with() != []
-
-
-@pytest.mark.parametrize(("setup_type", "field", "companion"), _required_with())
-def test_every_required_with_pair_is_one_these_fixtures_can_fill(
-    setup_type: str, field: str, companion: str
-) -> None:
-    """The companion is named with `"H4"` in the two tests below, which is all there is to name
-    today. Checked in a test of its own rather than inside the helper: the helper runs while
-    pytest is *collecting*, so an assertion there would not fail a case — it would fail the
-    collection of this whole module, and 46 unrelated tests would vanish with it."""
-    params = _params_model(setup_type)
-    # Widened to `object` for the comparison: `annotation` is `type[Any] | None` to mypy, and a
-    # PEP-695 alias union is not a `type`, so the check reads as non-overlapping and is refused.
-    annotation: object = params.model_fields[companion].annotation
-
-    assert annotation == Timeframe | None
-
-
-@pytest.mark.parametrize(("setup_type", "field", "companion"), _required_with())
-def test_a_required_with_field_is_refused_when_its_companion_is_named(
-    setup_type: str, field: str, companion: str
-) -> None:
-    """⚠️ **The schema keyword is held to the rule it describes.** `requiredWith` exists so a
-    screen with no Python runtime knows that this `null` is not a setting somebody may choose —
-    unlike `breakeven_at_r: null`, which is one. A keyword that said so while the semantics
-    allowed it would be worse than no keyword: every form would hide a legal value, and the only
-    symptom would be a control quietly missing.
-
-    Read the other way round, this is also what stops the semantics from relaxing under a keyword
-    nobody updated — which is the exact failure the PR-213 review found in an ADR.
-    """
-    model = setup_strategy(
-        timeframe="M15",
-        setup={"type": setup_type, "params": {companion: "H4", field: None}},
-    )
-
-    assert [error.path for error in validate_semantics(model)] == [f"setup.params.{field}"]
-
-
-@pytest.mark.parametrize(("setup_type", "field", "companion"), _required_with())
-def test_a_required_with_field_is_free_when_its_companion_is_absent(
-    setup_type: str, field: str, companion: str
-) -> None:
-    """The other half, and it is what makes the keyword mean "required *with*" rather than
-    "required". Without this, a screen could reasonably read the key as "never nullable" and
-    take away a control that is legal whenever the companion is off."""
-    model = setup_strategy(
-        timeframe="M15",
-        setup={"type": setup_type, "params": {companion: None, field: None}},
-    )
-
-    assert validate_semantics(model) == []

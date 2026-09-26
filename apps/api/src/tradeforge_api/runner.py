@@ -207,7 +207,7 @@ def timeframe_refusal(definition: Mapping[str, Any], timeframe: str) -> str | No
     are not hypothetical: `htf_offset` accepts them, and the ADR says so in as many words.
 
     **Neither rule is restated here.** The semantic one is the DSL's own — a filter has to be
-    coarser than the chart and a whole number of its bars, with the broker's clock beside it —
+    coarser than the chart and a whole number of its bars —
     so this substitutes the run's timeframe into the document and asks `assert_executable`, the
     authority that answered when the strategy was saved. The equality is this function's, and it
     is about the *wiring* rather than the grammar: no DSL rule can see two timeframes at once,

@@ -13,18 +13,14 @@ describe('axesFor', () => {
     expect(side?.hint).not.toMatch(/off/)
   })
 
-  it('says nothing about off on a nullable the schema marks as required with another', () => {
-    // ⚠️ **Nullable is not the question.** `htf_offset` accepts `null` and its `null` is not a
-    // setting: the semantics refuse it wherever `htf` is named, so an axis carrying `off` here
-    // is a study that 422s whole. The pair is asserted together because a rule applied to
-    // everything, and a rule applied to nothing, each pass half of this on their own.
-    const axes = axesFor('structure_choch')
-    const offset = axes.find((axis) => axis.path === 'setup.params.htf_offset')
-    const breakeven = axes.find((axis) => axis.path === 'setup.params.breakeven_at_r')
+  it('offers off on the broker clock, whose null is UTC', () => {
+    // `htf_offset: null` became a setting on 26/09 — the higher bars cut on UTC.
+    const offset = axesFor('structure_choch').find(
+      (axis) => axis.path === 'setup.params.htf_offset',
+    )
 
     expect(offset?.param.kind).toBe('number')
-    expect(offset?.hint).not.toMatch(/off/)
-    expect(breakeven?.hint).toMatch(/or off for none/)
+    expect(offset?.hint).toMatch(/or off for none/)
   })
 
   it('offers the parameters the chosen setup actually has', () => {

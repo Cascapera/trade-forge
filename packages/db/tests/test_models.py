@@ -53,6 +53,7 @@ EXPECTED_TABLES = {
     # study and a basket each refuse to take. Beside them rather than folded into either,
     # because a run can belong to a sweep and to nothing else.
     "sweeps",
+    "sweep_points",
     # A reserved-window test judged in pieces, kept with the rule it was judged by (rev_0026).
     # Beside `sweeps` rather than a column on it, because one test can be cut several ways.
     "sweep_slicings",

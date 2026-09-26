@@ -51,6 +51,7 @@ from tradeforge_db.models import (
     Instrument,
     Recorded,
     Sweep,
+    SweepPoint,
     SymbolHistory,
     Trade,
 )
@@ -341,11 +342,37 @@ class TestTheTimeframeIsRealHere:
 
         assert preview["runs"] == 2
         (refusal,) = preview["entries"][0]["refusals"]
-        assert refusal["values"]["timeframe"] == "H4"
+        assert (refusal["count"], refusal["examples"]) == (1, ["H4"])
         assert "htf" in refusal["reason"]
 
         launched = client.post("/sweeps", json=body)
         assert launched.json()["runs"] == 2
+
+    def test_the_preview_groups_refusals_by_reason_and_names_a_few(
+        self, client: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """⚠️ **One item per reason, not per point** (26/09). One per point made a preview of a
+        grid of 435 thousand points per chart answer 1.09 GB, and it took the API down."""
+        monkeypatch.setattr(sweeps_router, "REFUSAL_EXAMPLES", 2)
+        entry = an_entry(
+            client,
+            name=f"filtered {uuid.uuid4()}",
+            grid={"setup.params.htf_offset": [0, 1, 3]},
+            document=a_filtered_document(f"choch {uuid.uuid4()}"),
+        )
+        body = a_sweep_body([entry], ["EURUSD"], ["M15", "H4"])
+
+        preview = client.post(
+            "/sweeps/preview",
+            json={
+                k: body[k] for k in ("entry_ids", "symbols", "timeframes", "date_from", "date_to")
+            },
+        ).json()
+
+        (refusal,) = preview["entries"][0]["refusals"]
+        assert refusal["count"] == 3
+        assert refusal["examples"] == ["H4 · htf_offset=0", "H4 · htf_offset=1"]
+        assert (preview["documents"], preview["runs"]) == (6, 3)
 
     def test_the_two_timeframes_do_not_collide_on_a_name(self, client: Any) -> None:
         # Two documents that differ only in timeframe share every other byte. Without the
@@ -566,6 +593,17 @@ class TestPointsThatRunTheSameShareOneRun:
         "setup.params.entry_point": ["edge", "martelo"],
         "setup.params.stop_buffer": [0, 0.1, 0.2],
     }
+
+    @pytest.fixture(
+        autouse=True, params=[None, 1, 5], ids=["one-block", "block-of-1", "block-of-5"]
+    )
+    def _blocks(self, request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+        """⚠️ **The same answers whatever the block** (26/09). The launch writes a block at a
+        time, and a point answered by another must find it whether that one was written in an
+        earlier block (1: every point its own) or in the same block (5: `martelo` at 0 and 0.1
+        together, 0.2 in the next)."""
+        if request.param is not None:
+            monkeypatch.setattr(sweeps_router, "LAUNCH_BLOCK", request.param)
 
     def launched(self, client: Any) -> tuple[dict[str, Any], dict[str, Any]]:
         entry = an_entry(
@@ -884,7 +922,10 @@ class TestTheDataHasToBeThere:
         session.expire_all()
         sweep = session.get(Sweep, uuid.UUID(launched.json()["id"]))
         assert sweep is not None
-        assert {point["values"]["timeframe"] for point in sweep.points} == {"M15"}
+        written = session.scalars(
+            select(SweepPoint.coordinates).where(SweepPoint.sweep_id == sweep.id)
+        )
+        assert {point["timeframe"] for point in written} == {"M15"}
         assert {(one["symbol"], one["timeframe"]) for one in sweep.skipped} == {
             ("EURUSD", "H4"),
             ("GBPUSD", "H4"),
@@ -917,7 +958,7 @@ class TestTheDataHasToBeThere:
         assert preview["uncovered"] == []
         # Where it belongs instead: a refusal, in the DSL's words.
         (refusal,) = preview["entries"][0]["refusals"]
-        assert refusal["values"]["timeframe"] == "H4"
+        assert refusal["examples"][0].startswith("H4")
         assert launched.status_code == 202, launched.text
         assert launched.json()["skipped"] == []
 
@@ -1530,7 +1571,7 @@ class TestTheHistory:
         assert one == three, f"one sweep took {one} queries and three took {three}"
         reading_sweeps = [text for text in statements if "FROM sweeps" in text]
         assert reading_sweeps, "no statement read the sweeps table, so the check below is vacuous"
-        assert not any("sweeps.points" in text for text in reading_sweeps)
+        assert not any("sweep_points" in text for text in reading_sweeps)
 
 
 class TestTheDashboard:

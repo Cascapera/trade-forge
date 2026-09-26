@@ -1887,6 +1887,16 @@ class PreviewSweepRequest(BaseModel):
         return _distinct_axis(values, info)
 
 
+class RefusalGroup(BaseModel):
+    """Every combination of one entry refused for one reason: how many, and a few of them."""
+
+    reason: str
+    """One sentence, from the same validator `POST /studies` refuses with."""
+    count: int
+    examples: list[str]
+    """The labels of the first few refused for it (`REFUSAL_EXAMPLES`), in launch order."""
+
+
 class SweepEntryPreview(BaseModel):
     """What one entry contributes, and why some of it may not run."""
 
@@ -1894,11 +1904,14 @@ class SweepEntryPreview(BaseModel):
     name: str
     points: int
     """Its grid's own size — before the timeframes and the markets multiply it."""
-    refusals: list[GridRefusal]
-    """Combinations this entry cannot run, each with the reason in the DSL's own words.
+    refusals: list[RefusalGroup]
+    """Combinations this entry cannot run, grouped by the reason in the DSL's own words.
 
     ⚠️ Reported per entry rather than pooled, because a sweep holds several and `htf must be
-    coarser than H4` says nothing about which shelf label caused it."""
+    coarser than H4` says nothing about which shelf label caused it.
+
+    ⚠️ **Grouped, not one per point** (26/09). One item per refused point made a preview of a
+    grid with 435 thousand points per chart answer 1.09 GB, and it once took the API down."""
 
 
 class TimeEstimate(BaseModel):

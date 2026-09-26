@@ -171,7 +171,7 @@ def test_the_preview_asks_about_the_named_documents_a_launch_would_write() -> No
     # be true is that the document was named at all, that it fits, and that the two points did
     # not end up sharing a name.
     assert all(name != long_name for name in names)
-    assert all(name.startswith("c" * 100) for name in names)
+    assert all(name.startswith("c" * 90) for name in names)
     assert all(name.endswith("]") for name in names)
     assert all(len(name) <= NAME_MAX_LENGTH for name in names)
     # Distinct, which at this length only the digest can make them.

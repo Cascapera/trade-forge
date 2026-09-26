@@ -2832,10 +2832,26 @@ da prateleira (`catalog_entries`) não tem edição de grade nem de documento pe
 eixo é preciso catalogar outra. Cuidado ao fazer: varreduras e runs antigos apontam para a entrada,
 então editar não pode reescrever o que já rodou (versionar, ou copiar ao editar).
 
-## A prévia da varredura lista cada ponto recusado, e passou de 1 GB (26/09) — PENDENTE
+## ~~A prévia da varredura lista cada ponto recusado, e passou de 1 GB (26/09)~~ — FECHADO (PR-327)
 
 Com a grade do "CONTINUATION FULL OTIMIZATION" (~435 mil pontos por tempo gráfico), a resposta de
 `POST /sweeps/preview` chegou a 1,09 GB e uma vez derrubou a API (`stack smashing detected`, nginx
 devolvendo 502). Mesmo com o `htf_offset` opcional (PR-326), os `htf` menores ou iguais ao gráfico
 continuam recusados ponto a ponto. Agrupar `GridRefusal` por motivo, com a contagem e alguns
 exemplos, em vez de um item por ponto.
+
+## Aproveitar o backtest de uma varredura anterior (26/09) — PENDENTE
+
+Pergunta dele: *"hoje nós já aproveitamos uma corrida que já foi feita antes?"*. Dentro de uma
+varredura, sim (pontos equivalentes compartilham um run — no CONTINUATION, só 18% dos pontos
+válidos rodam). Entre varreduras, não: o documento da estratégia é reaproveitado
+(`strategies_for`), mas o backtest roda de novo. Quando estratégia, ativo, tempo gráfico, janela,
+capital, custos e `engine_version` forem iguais a um run terminado, o lançamento poderia apontar
+para ele em vez de enfileirar outro. Cuidado: retenção (`retention`) apaga trades de runs ruins, e
+um run apagado não pode ser a resposta de outro.
+
+## A prévia de uma grade enorme leva meio minuto (26/09) — PENDENTE
+
+Em fluxo (PR-327) a prévia do CONTINUATION em H1+H4 lê 870 mil documentos em ~35 s com 126 MB. A
+tela pergunta de novo a cada edição (400 ms de espera). A maior parte é montar cada documento
+(`grid._copy` + `fit_name`); dá para cortar sem mudar a resposta.

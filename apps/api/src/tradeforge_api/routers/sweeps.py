@@ -24,13 +24,13 @@ did — which is why a hole is always written down, never merely left.
 import datetime as dt
 import secrets
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from decimal import Decimal
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query, Response, status
 from pydantic import AwareDatetime
-from sqlalchemy import ColumnElement, Text, and_, case, cast, func, or_, select
+from sqlalchemy import ColumnElement, Text, and_, case, cast, func, insert, literal, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import InstrumentedAttribute, Session, defer, selectinload
 
@@ -64,7 +64,6 @@ from tradeforge_api.schemas import (
     DatasetColumnOut,
     DatasetDictionaryOut,
     DatasetOmissionOut,
-    GridRefusal,
     HoldoutGroup,
     HoldoutOut,
     HoldoutRow,
@@ -73,6 +72,7 @@ from tradeforge_api.schemas import (
     MonteCarloPoint,
     PlannedCollection,
     PreviewSweepRequest,
+    RefusalGroup,
     SimulatedOut,
     SlicedGroup,
     SlicedPoint,
@@ -97,14 +97,15 @@ from tradeforge_api.slices import ClosedTrade, by_blocks, by_year, verdict
 from tradeforge_api.sweep import (
     SweepDocument,
     SweepError,
-    documents_for,
+    behaviour_key,
+    iter_documents_for,
     points_in,
-    shared,
     size_refusal,
 )
 from tradeforge_api.sweep_dataset import CAVEATS, OMITTED, ROW, DatasetRun, columns_for, to_csv
 from tradeforge_api.targets import rungs_of
 from tradeforge_collector.collect import year_slices
+from tradeforge_db.base import Base
 from tradeforge_db.collections import create_collection
 from tradeforge_db.models import (
     Backtest,
@@ -122,6 +123,7 @@ from tradeforge_db.models import (
     SweepSlicing,
     Trade,
 )
+from tradeforge_db.models import SweepPoint as PointRow
 from tradeforge_engine.setup_factory import unread_params
 
 router = APIRouter(tags=["sweeps"])
@@ -157,15 +159,20 @@ def _entries(session: SessionDep, ids: list[uuid.UUID]) -> list[tuple[CatalogEnt
     return [found[one] for one in ids]
 
 
-def _expand(
+def _streams(
     pairs: list[tuple[CatalogEntry, Strategy]], timeframes: list[str]
-) -> list[SweepDocument]:
-    """Every document the sweep would write, or a 422 naming the entry that cannot expand."""
-    out: list[SweepDocument] = []
+) -> list[Iterator[SweepDocument]]:
+    """Every entry's documents, one stream each — or a 422 naming the entry that cannot expand.
+
+    ⚠️ **Every grid is checked here, before any document is built** (`iter_documents_for` raises
+    at the call). A launch writes in blocks as it reads the streams, and an entry refused halfway
+    through them would leave the checks of the ones after it to a transaction already writing.
+    """
+    out: list[Iterator[SweepDocument]] = []
     for entry, strategy in pairs:
         try:
-            out.extend(
-                documents_for(
+            out.append(
+                iter_documents_for(
                     entry_id=str(entry.id),
                     entry_name=entry.name,
                     definition=strategy.definition,
@@ -180,26 +187,21 @@ def _expand(
     return out
 
 
-def _combinations(
-    documents: list[SweepDocument], symbols: list[str], skipped: list[UncoveredMarket]
-) -> list[tuple[SweepDocument, str]]:
-    """Every (document, market) the sweep runs: the product, less the pairs with nothing to read.
+def _markets_by_chart(
+    symbols: list[str], timeframes: list[str], empty: set[tuple[str, str]]
+) -> dict[str, list[str]]:
+    """The markets each chart runs on: all of them, less the pairs with nothing to read.
 
     ⚠️ **Skipped by pair, not by market.** A market can hold M15 and not H4, and dropping it from
     every chart for the want of one would leave out runs that could have read every bar.
     """
-    empty = {(market.symbol, market.timeframe) for market in skipped}
-    return [
-        (doc, symbol)
-        for doc in documents
-        for symbol in symbols
-        if (symbol, doc.timeframe) not in empty
-    ]
+    return {
+        timeframe: [symbol for symbol in symbols if (symbol, timeframe) not in empty]
+        for timeframe in timeframes
+    }
 
 
-def _worth_naming(
-    uncovered: list[UncoveredMarket], documents: list[SweepDocument]
-) -> list[UncoveredMarket]:
+def _worth_naming(uncovered: list[UncoveredMarket], charts: set[str]) -> list[UncoveredMarket]:
     """The uncovered pairs on a chart where some point can run — the ones that are a hole.
 
     ⚠️ **A chart the DSL refused everywhere is not missing data.** An H4 filter cannot run on H4,
@@ -207,15 +209,10 @@ def _worth_naming(
     that produces nothing, and would blur the two absences `Sweep.skipped` exists to keep apart.
     That chart is reported where it belongs, as the preview's refusals.
     """
-    charts = {doc.timeframe for doc in documents}
     return [market for market in uncovered if market.timeframe in charts]
 
 
-def _nothing_to_read(
-    documents: list[SweepDocument],
-    combinations: list[tuple[SweepDocument, str]],
-    skipped: list[UncoveredMarket],
-) -> str | None:
+def _nothing_to_read(runnable: int, runs: int, skipped: list[UncoveredMarket]) -> str | None:
     """Why a sweep whose every runnable point landed on a skipped pair cannot be launched.
 
     ⚠️ **Asked before the size rule, and only when there were points to run.** With every pair
@@ -223,9 +220,13 @@ def _nothing_to_read(
     blame the grid for what is missing data. With no runnable point at all, the grid *is* to
     blame, and the size rule says so.
     """
-    if documents and not combinations:
+    if runnable and not runs:
         return "no candles in this window for: " + ", ".join(map(describe, skipped))
     return None
+
+
+REFUSAL_EXAMPLES = 3
+"""How many labels a preview names under each reason a combination was refused for."""
 
 
 @router.post("/sweeps/preview", response_model=SweepPreview, responses={**_NOT_FOUND, **_BAD_BODY})
@@ -242,6 +243,11 @@ def preview_sweep(
     fixing one axis per round trip is the round trip this endpoint exists to remove. What would
     make the launch refuse — nothing runnable, every pair without data — is reported as an
     `error` instead, in the launch's own words. Never its size: there is no cap (18/09).
+
+    ⚠️ **Counted as the grid streams past, never held** (26/09). A grid of 435 thousand points per
+    chart took the API past 18 GB when every document was built first, and its refusals — one item
+    per point — made a 1.09 GB answer. Each document is built, judged and dropped; what is kept is
+    one 16-byte key per distinct behaviour and the refusals grouped by reason.
     """
     pairs = _entries(session, request.entry_ids)
 
@@ -249,66 +255,83 @@ def preview_sweep(
     # backwards window is not a window any dataset can overlap, so `uncovered_markets` can name
     # a market that is collected and the screen reads "no candles in this window; move the
     # window or collect them first" — blaming the data for a typo, and sending a person to run
-    # a backfill they do not need. Refused the
-    # same way and in the same words the launch refuses it, so one request cannot get two
-    # verdicts from the two endpoints.
+    # a backfill they do not need. Refused the same way and in the same words the launch refuses
+    # it, so one request cannot get two verdicts from the two endpoints.
     if request.date_to <= request.date_from:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="date_to precedes date_from"
         )
 
     timeframes = list(request.timeframes)
-    documents = _expand(pairs, timeframes)
+    symbols = list(request.symbols)
+    streams = _streams(pairs, timeframes)
+    uncovered_all = uncovered_markets(
+        session, symbols, timeframes, request.date_from, request.date_to
+    )
+    # ⚠️ Counted as the launch counts them when told not to collect: the pairs with no candles
+    # are skipped, not refused (his rule, 18/09), so they subtract rather than block.
+    markets = _markets_by_chart(
+        symbols, timeframes, {(market.symbol, market.timeframe) for market in uncovered_all}
+    )
 
+    documents = 0
+    answered = 0
+    owners: set[bytes] = set()
+    charts: set[str] = set()
+    runs_by_chart: dict[str, int] = dict.fromkeys(timeframes, 0)
     per_entry: list[SweepEntryPreview] = []
-    for entry, _strategy in pairs:
-        mine = [doc for doc in documents if doc.entry_id == str(entry.id)]
-        refusals = [
-            GridRefusal(label=doc.label, values=dict(doc.values), reason=reason)
-            for doc in mine
-            if (reason := refusal_of(dict(doc.document))) is not None
-        ]
+    for (entry, _strategy), stream in zip(pairs, streams, strict=True):
+        groups: dict[str, RefusalGroup] = {}
+        for doc in stream:
+            documents += 1
+            reason = refusal_of(dict(doc.document))
+            if reason is not None:
+                group = groups.setdefault(reason, RefusalGroup(reason=reason, count=0, examples=[]))
+                group.count += 1
+                if len(group.examples) < REFUSAL_EXAMPLES:
+                    group.examples.append(doc.label)
+                continue
+            charts.add(doc.timeframe)
+            # ⚠️ Counted as the launch counts them: a point another point answers runs nothing
+            # (24/09). The same key, in the same order, so the two agree on which one runs.
+            key = behaviour_key(doc, unread_params)
+            if key in owners:
+                answered += 1
+                continue
+            owners.add(key)
+            runs_by_chart[doc.timeframe] += len(markets[doc.timeframe])
         per_entry.append(
             SweepEntryPreview(
                 entry_id=entry.id,
                 name=entry.name,
                 points=points_in(entry.grid),
-                refusals=refusals,
+                refusals=list(groups.values()),
             )
         )
 
-    runnable = [doc for doc in documents if refusal_of(dict(doc.document)) is None]
-    # ⚠️ Counted as the launch counts them: a point another point answers runs nothing (24/09).
-    answered = shared(runnable, unread_params)
-    runnable_documents = [doc for doc in runnable if id(doc) not in answered]
-    uncovered = _worth_naming(
-        uncovered_markets(
-            session, list(request.symbols), timeframes, request.date_from, request.date_to
-        ),
-        runnable_documents,
-    )
-
-    # ⚠️ Counted as the launch counts them when told not to collect: the pairs with no candles
-    # are skipped, not refused (his rule, 18/09), so they subtract rather than block.
-    # ⚠️ The empty sweep and the all-skipped one are asked of the same functions the launch asks, so
-    # the two endpoints cannot answer this in different words. Reported as an `error` rather than
-    # raised, which is the one thing that *is* different: a preview that raised would have
+    uncovered = _worth_naming(uncovered_all, charts)
+    runs = sum(runs_by_chart.values())
+    # ⚠️ The empty sweep and the all-skipped one are asked of the same functions the launch asks,
+    # so the two endpoints cannot answer this in different words. Reported as an `error` rather
+    # than raised, which is the one thing that *is* different: a preview that raised would have
     # nothing to preview.
-    combinations = _combinations(runnable_documents, list(request.symbols), uncovered)
-    runs = len(combinations)
-    error = _nothing_to_read(runnable_documents, combinations, uncovered) or size_refusal(runs)
+    error = _nothing_to_read(len(owners), runs, uncovered) or size_refusal(runs)
 
     return SweepPreview(
         runs=runs,
-        documents=len(documents),
-        shared=len(answered),
+        documents=documents,
+        shared=answered,
         entries=per_entry,
         uncovered=uncovered,
         # Every run of a sweep reads the same window, so what varies from run to run is the
         # chart: the bars in the window depend on the document's timeframe, not on the market.
         backtest_time=backtests_time(
             session,
-            ((request.date_from, request.date_to, doc.timeframe) for doc, _symbol in combinations),
+            (
+                (request.date_from, request.date_to, timeframe)
+                for timeframe, count in runs_by_chart.items()
+                for _ in range(count)
+            ),
             workers=settings.tradeforge_workers,
         ),
         error=error,
@@ -324,8 +347,8 @@ def preview_sweep(
 async def create_sweep(request: CreateSweep, session: SessionDep, queue: QueueDep) -> CreatedSweep:
     """Write the sweep, its strategies and its runs in one transaction, then enqueue.
 
-    **All or nothing in the face of a refusal.** Every refusal is decided before anything is
-    written: a sweep that half-exists is worse than one that was refused, because the caller
+    **All or nothing in the face of a refusal.** Nothing is committed until every refusal has
+    been decided: a sweep that half-exists is worse than one that was refused, because the caller
     asked one question about a space, and four hundred runs plus an error answers a question
     nobody asked. The same doctrine as the study, one axis up.
 
@@ -337,7 +360,7 @@ async def create_sweep(request: CreateSweep, session: SessionDep, queue: QueueDe
     run disappearing without a name — and since 18/09 no point is left out for the size of the
     sweep either: there is no cap.
     """
-    sweep, runs, collections, shared_count, skipped = launch_sweep(session, request)
+    sweep, run_ids, collections, shared_count, skipped = launch_sweep(session, request)
 
     # ⚠️ After the commit, and with the run's own id as the job id. A worker is fast enough to
     # claim a job before an uncommitted row is visible; and the derived job id makes the enqueue
@@ -348,34 +371,46 @@ async def create_sweep(request: CreateSweep, session: SessionDep, queue: QueueDe
     # `queued` with its runs deferring until the queue has been silent for `WAIT_LIMIT`.
     for collection in collections:
         await queue.enqueue_job(COLLECT_RANGE, str(collection.id), _queue_name=COLLECT_QUEUE)
-    for run in runs:
-        await queue.enqueue_job(RUN_BACKTEST, str(run.id), _job_id=str(run.id))
+    for run_id in run_ids:
+        await queue.enqueue_job(RUN_BACKTEST, str(run_id), _job_id=str(run_id))
 
-    return CreatedSweep(id=sweep.id, runs=len(runs), shared=shared_count, skipped=skipped)
+    return CreatedSweep(id=sweep.id, runs=len(run_ids), shared=shared_count, skipped=skipped)
+
+
+LAUNCH_BLOCK = 2000
+"""Runnable points a launch writes at a time — their strategies, their points and their runs.
+
+The memory a launch holds is this block plus one 16-byte key and one id per distinct behaviour,
+whatever the grid's size (26/09)."""
 
 
 def launch_sweep(
     session: Session, request: CreateSweep, *, template_id: uuid.UUID | None = None
-) -> tuple[Sweep, list[Backtest], list[Collection], int, list[UncoveredMarket]]:
+) -> tuple[Sweep, list[uuid.UUID], list[Collection], int, list[UncoveredMarket]]:
     """Decide, write and commit a sweep — the endpoint's body, shared with a template's queue
-    (`sweep_templates`, 26/09), which launches one market at a time. The caller queues the
-    collections and the runs; refusals are `HTTPException`s with the sentence a person reads.
+    (`sweep_templates`, 26/09), which launches one market at a time. Returns the ids of the runs
+    to queue; the caller queues them and the collections. Refusals are `HTTPException`s with the
+    sentence a person reads, raised before the commit — nothing of a refused sweep is kept.
+
+    ⚠️ **Written in blocks as the grid streams past, committed once** (26/09). A grid of 435
+    thousand points per chart built whole took the API past 18 GB; here each block of
+    `LAUNCH_BLOCK` points is flushed and dropped. Postgres holds the flushed rows inside the one
+    transaction, so a refusal found at the end — every point skipped, say — still leaves nothing.
     """
-    pairs = _entries(session, request.entry_ids)
     timeframes = list(request.timeframes)
+    symbols = list(request.symbols)
 
     if request.date_to <= request.date_from:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="date_to precedes date_from"
         )
+    pairs = _entries(session, request.entry_ids)
 
     found = {
         instrument.symbol: instrument
-        for instrument in session.scalars(
-            select(Instrument).where(Instrument.symbol.in_(request.symbols))
-        )
+        for instrument in session.scalars(select(Instrument).where(Instrument.symbol.in_(symbols)))
     }
-    unknown = [symbol for symbol in request.symbols if symbol not in found]
+    unknown = [symbol for symbol in symbols if symbol not in found]
     if unknown:
         # Every bad symbol at once. A caller fixing a typo list one round trip at a time is a
         # caller the API is failing — the same answer `/baskets` gives.
@@ -384,11 +419,12 @@ def launch_sweep(
             detail=f"unknown symbols: {', '.join(unknown)}",
         )
     costs = _costs_for(request.cost_model, found)
+    streams = _streams(pairs, timeframes)
 
     planned = (
         to_collect(
             session,
-            symbols=list(request.symbols),
+            symbols=symbols,
             timeframes=timeframes,
             date_from=request.date_from,
             date_to=request.date_to,
@@ -406,119 +442,57 @@ def launch_sweep(
     # ⚠️ A pair with something to fetch is not skipped when told to collect; an empty plan is not
     # "covered", though. A window wholly in the future, or older than the broker's first bar, has
     # nothing to download and nothing to read, and is skipped like any other.
-    runnable = [doc for doc in _expand(pairs, timeframes) if refusal_of(dict(doc.document)) is None]
-    # ⚠️ **One run for points that run the same** (his answer, 24/09): a point that differs from
-    # an earlier one only in a parameter its entry point never reads is answered by that one's
-    # run. It is still a point of the sweep — written in `points` below, pointing at the run that
-    # answers it — and never a run of its own. The same call the preview makes, so the two agree.
-    answered = shared(runnable, unread_params)
-    documents = [doc for doc in runnable if id(doc) not in answered]
-    skipped = [
+    uncovered = [
         market
-        for market in _worth_naming(
-            uncovered_markets(
-                session, list(request.symbols), timeframes, request.date_from, request.date_to
-            ),
-            documents,
+        for market in uncovered_markets(
+            session, symbols, timeframes, request.date_from, request.date_to
         )
         if (market.symbol, market.timeframe) not in collectable
     ]
-    combinations = _combinations(documents, list(request.symbols), skipped)
-    # The same questions the preview asked, of the same functions, so the words a person read on
-    # the screen are the words they get back from the button.
-    refusal = _nothing_to_read(documents, combinations, skipped) or size_refusal(len(combinations))
-    if refusal is not None:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=refusal)
-    # ⚠️ Only after the refusals, which need every runnable document to tell "all skipped" from
-    # "nothing runnable". A chart skipped on every market leaves documents no run reads; writing
-    # them would put points on the map with nothing measured under them.
-    # ⚠️ Read from `combinations`, never re-derived: the rule for which pairs run has one owner,
-    # and a second copy would let the preview's count and the runs written drift apart. Keyed by
-    # `id()`, which holds because every document stays alive in `documents` until the runs exist.
-    markets_of: dict[int, list[str]] = {}
-    for doc, symbol in combinations:
-        markets_of.setdefault(id(doc), []).append(symbol)
-    documents = [doc for doc in documents if id(doc) in markets_of]
-    # A point is kept only if the point answering it runs: the same chart, so the same pairs.
-    followers = [
-        doc for doc in runnable if id(doc) in answered and id(answered[id(doc)]) in markets_of
-    ]
+    markets = _markets_by_chart(
+        symbols, timeframes, {(market.symbol, market.timeframe) for market in uncovered}
+    )
 
     sweep = Sweep(
         entry_ids=[str(one) for one in request.entry_ids],
-        symbols=list(request.symbols),
+        symbols=symbols,
         timeframes=timeframes,
         date_from=request.date_from,
         date_to=request.date_to,
         initial_capital=request.initial_capital,
-        skipped=[market.model_dump() for market in skipped],
+        skipped=[],
         template_id=template_id,
     )
     session.add(sweep)
-
-    # ⚠️ **Reused, never reimplemented.** `strategies_for` is where the reuse-or-version decision
-    # lives — a point's document is written once and a later sweep finds it rather than colliding
-    # on `(name, version)`. Copying that logic here would be a second answer to a question the
-    # study already answers subtly and correctly.
-    points = [GridPoint(values=dict(doc.values), document=dict(doc.document)) for doc in documents]
-    strategies = strategies_for(session, points)
-    session.add_all(strategies)
     session.flush()
 
-    # ⚠️ **The coordinates are written down now, keyed by the strategy they produced.** The
-    # alternative is recovering them later from the document's name — and a name is a caption:
-    # `{entry} [{label}]` splits cleanly until one entry's name is a prefix of another's, or a
-    # value contains the separator. Both are things a person will do, and neither would raise.
-    # ⚠️ **A point answered by another carries that point's strategy and says so** (`same_as`).
-    # The strategy id is the join every read already makes from a run to its coordinates, so a
-    # read that knows nothing of this still finds the run's own point — the one without
-    # `same_as` — and a read that does (`_points_of`) finds the others beside it.
-    strategy_of = {id(doc): strategy for doc, strategy in zip(documents, strategies, strict=True)}
-    sweep.points = [
-        *(
-            {
-                "strategy_id": str(strategy_of[id(doc)].id),
-                "entry_id": doc.entry_id,
-                "label": doc.label,
-                "values": dict(doc.values),
-            }
-            for doc in documents
-        ),
-        *(
-            {
-                "strategy_id": str(strategy_of[id(answered[id(doc)])].id),
-                "entry_id": doc.entry_id,
-                "label": doc.label,
-                "values": dict(doc.values),
-                "same_as": answered[id(doc)].label,
-            }
-            for doc in followers
-        ),
-    ]
+    writer = _SweepWriter(
+        session,
+        sweep=sweep,
+        request=request,
+        markets=markets,
+        found=found,
+        costs=costs,
+        collectable=collectable,
+    )
+    for stream in streams:
+        for doc in stream:
+            # ⚠️ Refused points are not part of the space: the preview names them, and none is
+            # enqueued to fail (18/09).
+            if refusal_of(dict(doc.document)) is None:
+                writer.add(doc)
+    writer.close()
 
-    runs: list[Backtest] = []
-    paired: list[tuple[SweepDocument, str, Backtest]] = []
-    for doc, strategy in zip(documents, strategies, strict=True):
-        for symbol in markets_of[id(doc)]:
-            run = Backtest(
-                sweep=sweep,
-                strategy_id=strategy.id,
-                instrument_id=found[symbol].id,
-                # The document's timeframe and the run's are one value, read from one place —
-                # which is what makes PR-238's equality rule unreachable here.
-                timeframe=doc.timeframe,
-                date_from=request.date_from,
-                date_to=request.date_to,
-                initial_capital=request.initial_capital,
-                cost_model=costs[symbol],
-                status=BacktestStatus.QUEUED,
-                engine_version=ENGINE_VERSION,
-            )
-            runs.append(run)
-            paired.append((doc, symbol, run))
-    session.add_all(runs)
-
-    collections = _collections_for(session, paired, collectable, found)
+    skipped = _worth_naming(uncovered, writer.charts)
+    # The same questions the preview asked, of the same functions, so the words a person read on
+    # the screen are the words they get back from the button.
+    refusal = _nothing_to_read(writer.runnable, len(writer.run_ids), skipped) or size_refusal(
+        len(writer.run_ids)
+    )
+    if refusal is not None:
+        session.rollback()
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=refusal)
+    sweep.skipped = [market.model_dump() for market in skipped]
 
     try:
         session.commit()
@@ -532,7 +506,205 @@ def launch_sweep(
             detail="another sweep created these strategies at the same time; try again",
         ) from exc
 
-    return sweep, runs, collections, len(followers), skipped
+    return sweep, writer.run_ids, writer.collections, writer.followers, skipped
+
+
+INSERT_ROWS = 500
+"""Rows a single `INSERT ... VALUES` of a launch carries — under Postgres's 65 535 parameters
+for the widest row written (`backtests`, thirteen columns)."""
+
+
+def _insert(session: Session, model: type[Base], rows: list[dict[str, Any]]) -> None:
+    """`rows` into `model`'s table, `INSERT_ROWS` a statement.
+
+    ⚠️ **Many rows a statement, spelled out** (26/09). Handed to `execute` as an executemany,
+    the points of a 41 thousand-point launch went as 1 407 statements and took 62 of its 72
+    seconds. Dicts, never objects the session would keep for the length of the transaction.
+    """
+    for start in range(0, len(rows), INSERT_ROWS):
+        session.execute(insert(model).values(rows[start : start + INSERT_ROWS]))
+
+
+class _SweepWriter:
+    """A launch's runnable points, written a block at a time: strategies, points, runs, links.
+
+    ⚠️ **One run for points that run the same** (his answer, 24/09): a point that differs from an
+    earlier one only in a parameter its entry point never reads is answered by that one's run. It
+    is still a point of the sweep — a row of `sweep_points` carrying the answering strategy and
+    `same_as` — and never a run of its own. The first point of each behaviour, in launch order,
+    runs: the order the preview counts in, so the two agree on which one.
+
+    ⚠️ **A point whose chart runs on no market is not written**, and nor is a point it answers: a
+    chart skipped on every market leaves documents no run reads, and writing them would put
+    points on the map with nothing measured under them.
+    """
+
+    def __init__(  # noqa: PLR0913 — the launch's decided context, passed once
+        self,
+        session: Session,
+        *,
+        sweep: Sweep,
+        request: CreateSweep,
+        markets: dict[str, list[str]],
+        found: dict[str, Instrument],
+        costs: dict[str, dict[str, Any]],
+        collectable: dict[tuple[str, str], PlannedCollection],
+    ) -> None:
+        self._session = session
+        self._sweep = sweep
+        self._request = request
+        self._markets = markets
+        self._found = found
+        self._costs = costs
+        self._collectable = collectable
+        # Per behaviour: the strategy and label of the point that runs it, or `None` when that
+        # point runs on no market. Only keys and ids — never a document.
+        self._owners: dict[bytes, tuple[uuid.UUID, str] | None] = {}
+        self._block: list[tuple[SweepDocument, bytes, bool]] = []
+        self._position = 0
+        self._downloads: dict[tuple[str, str], list[Collection]] = {}
+        self.run_ids: list[uuid.UUID] = []
+        self.collections: list[Collection] = []
+        self.charts: set[str] = set()
+        self.runnable = 0
+        """Points that run themselves, on a market or not — `_nothing_to_read`'s question."""
+        self.followers = 0
+        """Points written that another point's run answers."""
+        self._pending: set[bytes] = set()
+
+    def add(self, doc: SweepDocument) -> None:
+        """One runnable point, in launch order."""
+        self.charts.add(doc.timeframe)
+        key = behaviour_key(doc, unread_params)
+        runs_itself = key not in self._owners and key not in self._pending
+        if runs_itself:
+            self.runnable += 1
+            self._pending.add(key)
+        self._block.append((doc, key, runs_itself))
+        if len(self._block) >= LAUNCH_BLOCK:
+            self._write()
+
+    def close(self) -> None:
+        """Write what is left of the last block."""
+        if self._block:
+            self._write()
+
+    def _write(self) -> None:
+        block, self._block = self._block, []
+        running = [
+            doc for doc, _key, runs_itself in block if runs_itself and self._markets[doc.timeframe]
+        ]
+        # ⚠️ **Reused, never reimplemented.** `strategies_for` is where the reuse-or-version
+        # decision lives — a point's document is written once and a later sweep finds it rather
+        # than colliding on `(name, version)`.
+        strategies = strategies_for(
+            self._session,
+            [GridPoint(values=dict(doc.values), document=dict(doc.document)) for doc in running],
+        )
+        self._session.add_all(strategies)
+        self._session.flush()
+        strategy_of = {
+            id(doc): strategy.id for doc, strategy in zip(running, strategies, strict=True)
+        }
+
+        points: list[dict[str, Any]] = []
+        runs: list[dict[str, Any]] = []
+        links: list[dict[str, Any]] = []
+        for doc, key, runs_itself in block:
+            if runs_itself:
+                self._pending.discard(key)
+                strategy_id = strategy_of.get(id(doc))
+                self._owners[key] = None if strategy_id is None else (strategy_id, doc.label)
+                if strategy_id is None:
+                    continue
+                points.append(self._point(doc, strategy_id, None))
+                for symbol in self._markets[doc.timeframe]:
+                    run_id = uuid.uuid4()
+                    runs.append(self._run(run_id, doc, strategy_id, symbol))
+                    links += self._links(run_id, symbol, doc.timeframe)
+                continue
+            owner = self._owners[key]
+            if owner is None:
+                continue
+            owner_strategy, owner_label = owner
+            points.append(self._point(doc, owner_strategy, owner_label))
+            self.followers += 1
+
+        _insert(self._session, PointRow, points)
+        _insert(self._session, Backtest, runs)
+        self.run_ids += [run["id"] for run in runs]
+        _insert(self._session, BacktestCollection, links)
+
+    def _point(
+        self, doc: SweepDocument, strategy_id: uuid.UUID, same_as: str | None
+    ) -> dict[str, Any]:
+        # ⚠️ **The coordinates are written down now, keyed by the strategy they produced.** The
+        # alternative is recovering them later from the document's name — and a name is a
+        # caption: `{entry} [{label}]` splits cleanly until one entry's name is a prefix of
+        # another's, or a value contains the separator.
+        row = {
+            "sweep_id": self._sweep.id,
+            "position": self._position,
+            "strategy_id": strategy_id,
+            "entry_id": doc.entry_id,
+            "label": doc.label,
+            "coordinates": dict(doc.values),
+            "same_as": same_as,
+        }
+        self._position += 1
+        return row
+
+    def _run(
+        self, run_id: uuid.UUID, doc: SweepDocument, strategy_id: uuid.UUID, symbol: str
+    ) -> dict[str, Any]:
+        return {
+            "id": run_id,
+            "sweep_id": self._sweep.id,
+            "strategy_id": strategy_id,
+            "instrument_id": self._found[symbol].id,
+            # The document's timeframe and the run's are one value, read from one place — which
+            # is what makes PR-238's equality rule unreachable here.
+            "timeframe": doc.timeframe,
+            "date_from": self._request.date_from,
+            "date_to": self._request.date_to,
+            "initial_capital": self._request.initial_capital,
+            "cost_model": self._costs[symbol],
+            "status": BacktestStatus.QUEUED,
+            "engine_version": ENGINE_VERSION,
+        }
+
+    def _links(self, run_id: uuid.UUID, symbol: str, timeframe: str) -> list[dict[str, Any]]:
+        """The run's downloads, when its pair is being collected.
+
+        ⚠️ **One collection per window of each pair, linked to every run over it** — never one
+        per run, which would download the same window once per point. Written the first time
+        the pair is met; the worker needs no change: each run asks whether *its* collections
+        have landed.
+        """
+        pair = (symbol, timeframe)
+        plan = self._collectable.get(pair)
+        if plan is None:
+            return []
+        downloads = self._downloads.get(pair)
+        if downloads is None:
+            downloads = [
+                create_collection(
+                    self._session,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    date_from=window.date_from,
+                    date_to=window.date_to,
+                    # The class the catalogue already decided, as the basket does it: the
+                    # broker's tree path must not refuse a collection the launch itself asked for.
+                    asset_class=self._found[symbol].asset_class,
+                    years_total=len(year_slices(window.date_from, window.date_to)),
+                )
+                for window in plan.windows
+            ]
+            self._session.flush()
+            self._downloads[pair] = downloads
+            self.collections += downloads
+        return [{"backtest_id": run_id, "collection_id": collection.id} for collection in downloads]
 
 
 def _costs_for(
@@ -622,50 +794,6 @@ def _spread_and_commission(spread: object, commission: object) -> dict[str, Any]
     }
 
 
-def _collections_for(
-    session: Session,
-    paired: list[tuple[SweepDocument, str, Backtest]],
-    collectable: dict[tuple[str, str], PlannedCollection],
-    found: dict[str, Instrument],
-) -> list[Collection]:
-    """Write one collection per window of each pair to collect, linked to every run over it.
-
-    ⚠️ **Grouped by pair before anything is written — this is what the basket's loop cannot be
-    copied for.** A basket has one run per market, so a collection per run is a collection per
-    market. A sweep has every point of every entry over the same pair, and a collection per run
-    would download the same window once per point. The link table's key is the pair of ids, so
-    many runs waiting on one collection is a row each, and the worker needs no change: each run
-    asks whether *its* collections have landed.
-    """
-    waiting: dict[tuple[str, str], list[Backtest]] = {}
-    for doc, symbol, run in paired:
-        if (symbol, doc.timeframe) in collectable:
-            waiting.setdefault((symbol, doc.timeframe), []).append(run)
-    if not waiting:
-        return []
-
-    session.flush()  # the runs' ids, for the links
-    collections: list[Collection] = []
-    for (symbol, timeframe), runs in waiting.items():
-        for window in collectable[symbol, timeframe].windows:
-            collection = create_collection(
-                session,
-                symbol=symbol,
-                timeframe=timeframe,
-                date_from=window.date_from,
-                date_to=window.date_to,
-                # The class the catalogue already decided, as the basket does it: the broker's
-                # tree path must not refuse a collection the launch itself asked for.
-                asset_class=found[symbol].asset_class,
-                years_total=len(year_slices(window.date_from, window.date_to)),
-            )
-            collections.append(collection)
-            session.add_all(
-                BacktestCollection(backtest_id=run.id, collection_id=collection.id) for run in runs
-            )
-    return collections
-
-
 @router.get("/sweeps", response_model=SweepsPage)
 def list_sweeps(
     session: SessionDep,
@@ -682,14 +810,13 @@ def list_sweeps(
     ⚠️ **The same queries for a page of one sweep as for a page of many**: the total, the sweeps,
     one grouped count
     of their runs, and the shelf names of their entries. Reading each sweep back in full would
-    work, and would ship every run of every sweep on the page to say "480 of 500 done". `points`
-    is deferred for the same reason: it is one element per grid point, and no field of this
-    response reaches it. Held by `test_listing_sweeps_costs_the_same_however_many_there_are`.
+    work, and would ship every run of every sweep on the page to say "480 of 500 done". The points
+    live in `sweep_points` and are not read at all. Held by
+    `test_listing_sweeps_costs_the_same_however_many_there_are`.
     """
     total = session.scalar(select(func.count()).select_from(Sweep)) or 0
     sweeps = session.scalars(
         select(Sweep)
-        .options(defer(Sweep.points))
         # `created_at` is the launch transaction's start, so it only ties between sweeps launched
         # in the same instant; the id breaks that tie so a page boundary cannot move between reads.
         .order_by(Sweep.created_at.desc(), Sweep.id)
@@ -776,9 +903,9 @@ def get_sweep_dashboard(
     Half-open, so two adjacent windows never count the same sweep twice. Either end may be
     left out.
 
-    ⚠️ **`points` is read here, unlike the history list.** It is the only record of which entry a
-    run belongs to — the strategy's name is a caption, and recovering the entry from it breaks
-    the day one entry's name is a prefix of another's. The equity curve stays deferred.
+    ⚠️ **The points are read here, unlike the history list.** They are the only record of which
+    entry a run belongs to — the strategy's name is a caption, and recovering the entry from it
+    breaks the day one entry's name is a prefix of another's. The equity curve stays deferred.
     """
     if launched_from is not None and launched_to is not None and launched_to <= launched_from:
         raise HTTPException(
@@ -809,10 +936,13 @@ def get_sweep_dashboard(
     # Per sweep: each run is looked up in the points of the sweep that launched it. A document
     # is reused by every later sweep of the same entry, so the sweep is the only key that says,
     # without a second lookup, which record wrote this run's coordinates.
-    entry_of = {
-        sweep.id: {str(point["strategy_id"]): str(point["entry_id"]) for point in sweep.points}
-        for sweep in sweeps
-    }
+    entry_of: dict[uuid.UUID, dict[str, str]] = {sweep.id: {} for sweep in sweeps}
+    for sweep_id, strategy_id, entry_id in session.execute(
+        select(PointRow.sweep_id, PointRow.strategy_id, PointRow.entry_id).where(
+            PointRow.sweep_id.in_(list(entry_of)), PointRow.same_as.is_(None)
+        )
+    ):
+        entry_of[sweep_id][str(strategy_id)] = entry_id
 
     # ⚠️ **Columns, not rows** (25/09). Every run of every sweep read as an ORM object with its
     # metrics loaded beside it took 10.3 s on 80 thousand runs; the dashboard reads eleven of their
@@ -1028,9 +1158,10 @@ def launch_window(
         date_to=date_to,
         initial_capital=parent.initial_capital,
         skipped=[market.model_dump(mode="json") for market in uncovered],
-        points=list(parent.points),
     )
     session.add(sweep)
+    session.flush()
+    _copy_points(session, parent, sweep)
     runs = [
         Backtest(
             sweep=sweep,
@@ -1114,14 +1245,6 @@ def combine_sweeps(request: CombineSweeps, session: SessionDep) -> CreatedSweep:
 
     first = members[0]
     symbols = list(dict.fromkeys(symbol for one in members for symbol in one.symbols))
-    points: list[Any] = []
-    seen: set[tuple[str, str, str | None]] = set()
-    for one in members:
-        for point in one.points:
-            key = (str(point["strategy_id"]), str(point["label"]), point.get("same_as"))
-            if key not in seen:
-                seen.add(key)
-                points.append(point)
     templates = {one.template_id for one in members}
     combined = Sweep(
         entry_ids=list(first.entry_ids),
@@ -1131,11 +1254,47 @@ def combine_sweeps(request: CombineSweeps, session: SessionDep) -> CreatedSweep:
         date_to=first.date_to,
         initial_capital=first.initial_capital,
         skipped=[market for one in members for market in one.skipped],
-        points=points,
         template_id=templates.pop() if len(templates) == 1 else None,
         combines=[str(one.id) for one in members],
     )
     session.add(combined)
+    session.flush()
+    # Each member's points, a point shared by two members (the same strategy, label and answer)
+    # kept once, in the members' order.
+    member = case({one.id: index for index, one in enumerate(members)}, value=PointRow.sweep_id)
+    ranked = (
+        select(
+            PointRow.strategy_id,
+            PointRow.entry_id,
+            PointRow.label,
+            PointRow.coordinates,
+            PointRow.same_as,
+            member.label("member"),
+            PointRow.position,
+            func.row_number()
+            .over(
+                partition_by=(PointRow.strategy_id, PointRow.label, PointRow.same_as),
+                order_by=(member, PointRow.position),
+            )
+            .label("copy"),
+        )
+        .where(PointRow.sweep_id.in_([one.id for one in members]))
+        .subquery()
+    )
+    session.execute(
+        insert(PointRow).from_select(
+            ["sweep_id", "position", "strategy_id", "entry_id", "label", "coordinates", "same_as"],
+            select(
+                literal(combined.id),
+                func.row_number().over(order_by=(ranked.c.member, ranked.c.position)) - 1,
+                ranked.c.strategy_id,
+                ranked.c.entry_id,
+                ranked.c.label,
+                ranked.c.coordinates,
+                ranked.c.same_as,
+            ).where(ranked.c.copy == 1),
+        )
+    )
     session.commit()
     counts = _count_runs(session, combined)
     return CreatedSweep(
@@ -1176,7 +1335,7 @@ def launch_holdout(
             ),
         )
 
-    own, _followers = _points_of(parent)
+    own, _followers = _points_of(session, parent)
     runs_of: dict[int, tuple[Backtest, str]] = {}
     candidates: list[Candidate] = []
     for order, (run, symbol) in enumerate(_runs_of(session, parent, done_only=True)):
@@ -1239,9 +1398,6 @@ def launch_holdout(
         date_to=request.date_to,
         initial_capital=parent.initial_capital,
         skipped=[market.model_dump() for market in uncovered],
-        # The parent's own point records, copied: the same strategies at the same coordinates —
-        # the one thing this sweep changes is the window.
-        points=[point for key, point in own.items() if key in tested],
         holdout_of=parent.id,
         holdout_rule={
             "metric": request.metric.value,
@@ -1261,6 +1417,10 @@ def launch_holdout(
         },
     )
     session.add(holdout)
+    session.flush()
+    # The parent's own point records, copied: the same strategies at the same coordinates — the
+    # one thing this sweep changes is the window.
+    _copy_points(session, parent, holdout, strategy_ids=tested)
     runs = [
         Backtest(
             sweep=holdout,
@@ -1332,7 +1492,7 @@ def get_holdout(sweep_id: uuid.UUID, session: SessionDep) -> HoldoutOut:
             for run, symbol in _runs_of(session, parent)
         }
     )
-    own, _followers = _points_of(holdout)
+    own, _followers = _points_of(session, holdout)
     names = {
         str(entry.id): entry.name
         for entry in session.scalars(
@@ -1488,7 +1648,7 @@ def create_slicing(sweep_id: uuid.UUID, request: CreateSlicing, session: Session
     test, done = _finished_test(session, sweep_id, doing="judged in pieces")
     trades_of = _trades_of(session, done)
 
-    own, _followers = _points_of(test)
+    own, _followers = _points_of(session, test)
     names = _entry_names(session, test)
     points: list[SlicedPoint] = []
     for run, symbol in done:
@@ -1611,7 +1771,7 @@ def create_montecarlo(
     test, done = _finished_test(session, sweep_id, doing="resampled")
     trades_of = _trades_of(session, done)
     seed = request.seed or secrets.token_hex(8)
-    own, _followers = _points_of(test)
+    own, _followers = _points_of(session, test)
     names = _entry_names(session, test)
 
     points: list[MonteCarloPoint] = []
@@ -1688,7 +1848,7 @@ def get_sweep(
     runs the body carries the header, each entry's summary and `counts`; a screen reads the runs a
     page at a time from `GET /sweeps/{id}/runs`. `all` stays the default for every other reader.
 
-    ⚠️ **The coordinates come from `sweeps.points`, never from the strategy's name.** The name
+    ⚠️ **The coordinates come from `sweep_points`, never from the strategy's name.** The name
     carries the label (`9.1 sem filtro [M15 · period=5]`) because that is what a run log row
     shows — but it is a caption, and recovering axis values by splitting one works until an
     entry's name is a prefix of another's or a value contains the separator. The first draft of
@@ -1772,7 +1932,7 @@ def _summary(session: Session, sweep: Sweep) -> tuple[SweepRunCounts, list[Sweep
             for one in kept["entries"]
         ]
 
-    coordinates, _followers = _points_of(sweep)
+    coordinates, _followers = _points_of(session, sweep)
     points: dict[str, list[tuple[BacktestStatus, Decimal | None, str]]] = {
         one: [] for one in sweep.entry_ids
     }
@@ -1943,12 +2103,14 @@ def get_sweep_runs(  # noqa: PLR0913 — one query parameter per thing a page is
     sweep = session.get(Sweep, sweep_id)
     if sweep is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="sweep not found")
-    own, followers = _points_of(sweep)
-    strategies = [
-        uuid.UUID(key)
-        for key, point in own.items()
-        if entry_id is None or str(point.get("entry_id")) == str(entry_id)
-    ]
+    # ⚠️ **The entry's strategies as a subquery, not a list read first** (26/09): a sweep can hold
+    # hundreds of thousands of points, and this page is polled. Only the page's own points are
+    # read, below.
+    strategies = select(PointRow.strategy_id).where(
+        PointRow.sweep_id == sweep.id, PointRow.same_as.is_(None)
+    )
+    if entry_id is not None:
+        strategies = strategies.where(PointRow.entry_id == str(entry_id))
     where = (Backtest.sweep_id.in_(scope_of(sweep)), Backtest.strategy_id.in_(strategies))
     total = session.scalar(select(func.count()).select_from(Backtest).where(*where)) or 0
     rows = session.execute(
@@ -1967,6 +2129,9 @@ def get_sweep_runs(  # noqa: PLR0913 — one query parameter per thing a page is
             )
         )
     ).all()
+    own, followers = _points_of(
+        session, sweep, strategy_ids={run.strategy_id for run, _, _ in rows}
+    )
     entries = {
         str(entry.id): entry
         for entry in session.scalars(
@@ -1997,22 +2162,75 @@ def scope_of(sweep: Sweep) -> list[uuid.UUID]:
     return [sweep.id]
 
 
-def _points_of(sweep: Sweep) -> tuple[dict[str, _Point], dict[str, list[_Point]]]:
-    """A sweep's points by strategy: the one each run is, and the ones it answers besides.
+def _points_of(
+    session: Session, sweep: Sweep, *, strategy_ids: set[uuid.UUID] | None = None
+) -> tuple[dict[str, _Point], dict[str, list[_Point]]]:
+    """A sweep's points by strategy: the one each run is, and the ones it answers besides — of
+    `strategy_ids` only, when given (a page of runs reads its own points, not the sweep's).
 
     ⚠️ **Split on `same_as`, never on order.** A point answered by another's run carries that
-    run's strategy id (`create_sweep`), so a plain `{strategy_id: point}` would keep whichever came
-    last — and a run would be shown at a follower's coordinates rather than its own.
+    run's strategy id (`_SweepWriter`), so a plain `{strategy_id: point}` would keep whichever
+    came last — and a run would be shown at a follower's coordinates rather than its own.
     """
     own: dict[str, _Point] = {}
     followers: dict[str, list[_Point]] = {}
-    for point in sweep.points:
-        key = str(point["strategy_id"])
-        if point.get("same_as") is None:
+    query = (
+        select(
+            PointRow.strategy_id,
+            PointRow.entry_id,
+            PointRow.label,
+            PointRow.coordinates,
+            PointRow.same_as,
+        )
+        .where(PointRow.sweep_id == sweep.id)
+        .order_by(PointRow.position)
+    )
+    if strategy_ids is not None:
+        query = query.where(PointRow.strategy_id.in_(list(strategy_ids)))
+    for strategy_id, entry_id, label, coordinates, same_as in session.execute(query):
+        key = str(strategy_id)
+        point: _Point = {
+            "strategy_id": key,
+            "entry_id": entry_id,
+            "label": label,
+            "values": coordinates,
+        }
+        if same_as is None:
             own[key] = point
         else:
-            followers.setdefault(key, []).append(point)
+            followers.setdefault(key, []).append({**point, "same_as": same_as})
     return own, followers
+
+
+def _copy_points(
+    session: Session, source: Sweep, target: Sweep, *, strategy_ids: set[str] | None = None
+) -> None:
+    """`source`'s points written again as `target`'s, in their order — in Postgres, never
+    through Python: a sweep's points can number hundreds of thousands (26/09).
+
+    With `strategy_ids`, only the points that are those strategies' own runs (a reserved-window
+    test copies the points it chose, and none of the points they answered).
+    """
+    query = select(
+        literal(target.id),
+        func.row_number().over(order_by=PointRow.position) - 1,
+        PointRow.strategy_id,
+        PointRow.entry_id,
+        PointRow.label,
+        PointRow.coordinates,
+        PointRow.same_as,
+    ).where(PointRow.sweep_id == source.id)
+    if strategy_ids is not None:
+        query = query.where(
+            PointRow.same_as.is_(None),
+            PointRow.strategy_id.in_([uuid.UUID(one) for one in strategy_ids]),
+        )
+    session.execute(
+        insert(PointRow).from_select(
+            ["sweep_id", "position", "strategy_id", "entry_id", "label", "coordinates", "same_as"],
+            query,
+        )
+    )
 
 
 def _read_sweep(
@@ -2036,7 +2254,7 @@ def _read_sweep(
         )
     }
     # Keyed by the strategy each point produced, which is the join the runs already carry.
-    coordinates, followers = _points_of(sweep)
+    coordinates, followers = _points_of(session, sweep)
 
     rows = session.execute(
         select(Backtest, Strategy, Instrument)

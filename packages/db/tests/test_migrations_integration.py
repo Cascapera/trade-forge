@@ -7,7 +7,9 @@ been run. In particular, `downgrade` is the half nobody exercises until the nigh
 they need it — so it is exercised here, on every push.
 """
 
+import json
 import re
+import uuid
 from collections.abc import Iterator
 
 import pytest
@@ -240,3 +242,63 @@ def test_the_database_and_the_models_agree_on_every_check_name(migrated_engine: 
     # declared; the models holding a name the database does not is the failure.
     missing = in_models - in_database
     assert missing == set(), f"the models name checks the database does not have: {sorted(missing)}"
+
+
+@pytest.mark.usefixtures("_restore_head")
+def test_a_sweep_s_points_move_to_rows_and_back_in_order(dsn: str) -> None:
+    """`rev_0035`: the JSONB list becomes rows in the order it held them, and a downgrade puts the
+    same list back — `same_as` only where a point had one."""
+    points = [
+        {
+            "strategy_id": str(uuid.uuid4()),
+            "entry_id": "e",
+            "label": "M15 · a=1",
+            "values": {"timeframe": "M15", "a": 1},
+        },
+        {
+            "strategy_id": str(uuid.uuid4()),
+            "entry_id": "e",
+            "label": "M15 · a=2",
+            "values": {"timeframe": "M15", "a": 2},
+            "same_as": "M15 · a=1",
+        },
+    ]
+    points[1]["strategy_id"] = points[0]["strategy_id"]
+    sweep_id = uuid.uuid4()
+    engine = create_engine(dsn)
+    try:
+        downgrade("0034", dsn=dsn)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO sweeps (id, entry_ids, symbols, timeframes, points, date_from, "
+                    "date_to, initial_capital) VALUES (:id, '[]', '[]', '[\"M15\"]', "
+                    "CAST(:points AS jsonb), '2024-01-01', '2025-01-01', 10000)"
+                ),
+                {"id": sweep_id, "points": json.dumps(points)},
+            )
+
+        upgrade("0035", dsn=dsn)
+        with engine.connect() as connection:
+            rows = connection.execute(
+                text(
+                    "SELECT position, strategy_id::text, label, coordinates, same_as "
+                    "FROM sweep_points WHERE sweep_id = :id ORDER BY position"
+                ),
+                {"id": sweep_id},
+            ).all()
+        assert [tuple(row) for row in rows] == [
+            (0, points[0]["strategy_id"], "M15 · a=1", {"timeframe": "M15", "a": 1}, None),
+            (1, points[0]["strategy_id"], "M15 · a=2", {"timeframe": "M15", "a": 2}, "M15 · a=1"),
+        ]
+
+        downgrade("0034", dsn=dsn)
+        with engine.connect() as connection:
+            back = connection.execute(
+                text("SELECT points FROM sweeps WHERE id = :id"), {"id": sweep_id}
+            ).scalar_one()
+        assert back == points
+    finally:
+        with engine.begin() as connection:
+            connection.execute(text("DELETE FROM sweeps WHERE id = :id"), {"id": sweep_id})
+        engine.dispose()

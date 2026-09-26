@@ -37,6 +37,7 @@ from tradeforge_api.config import Settings
 from tradeforge_api.main import create_app
 from tradeforge_api.queue import COLLECT_QUEUE, COLLECT_RANGE, RUN_BACKTEST
 from tradeforge_api.routers import sweeps as sweeps_router
+from tradeforge_api.routers.strategies import refusal_of
 from tradeforge_api.sweep_walkforward_job import advance
 from tradeforge_api.template_queue_job import advance_queue
 from tradeforge_db.broker_symbols import BrokerSymbolEntry, replace_snapshot
@@ -361,7 +362,7 @@ class TestTheTimeframeIsRealHere:
         monkeypatch.setattr(sweeps_router, "ABANDON_CHECK", 1)
         monkeypatch.setattr(Request, "is_disconnected", _always_gone)
         seen: list[int] = []
-        judged = sweeps_router.refusal_of
+        judged = refusal_of
 
         def counting(document: dict[str, Any]) -> str | None:
             seen.append(1)

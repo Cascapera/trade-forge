@@ -50,7 +50,13 @@ from tradeforge_engine.higher_timeframe import (
 )
 from tradeforge_engine.loop import ENGINE_CONTEXT
 from tradeforge_engine.setups import SetupContext, StructureStrategy
-from tradeforge_engine.structure import OrderBlock, OrderBlockDetector, StructureKind, ZoneKind
+from tradeforge_engine.structure import (
+    MarketStructure,
+    OrderBlock,
+    OrderBlockDetector,
+    StructureKind,
+    ZoneKind,
+)
 from tradeforge_engine.testing import (
     AAPL,
     BULLISH_START,
@@ -990,6 +996,16 @@ class _EveryHigherBar(HigherTimeframeGate):
     """The gate as it was before 27/09: the untouched regions rebuilt on every higher bar that
     closes, whether or not the detector's list changed. Slow and plainly right — the reference."""
 
+    def __init__(self, *, base: dt.timedelta, target: dt.timedelta, offset: dt.timedelta) -> None:
+        # ⚠️ The whole of the old gate's state in one object, as before the split into
+        # `RegionTracker` and releases (27/09): the oracle is the unsplit gate, not the new one.
+        self._bars = BarAggregator(base=base, target=target, offset=offset)
+        self._structure = MarketStructure()
+        self._blocks = OrderBlockDetector()
+        self._touched: set[OrderBlock] = set()
+        self._untouched: list[OrderBlock] = []
+        self._releases: dict[Side, Release] = {}
+
     def observe(self, candle: Candle) -> None:
         closed = False
         for higher in self._bars.update(candle):
@@ -1054,9 +1070,9 @@ def test_rebuilding_only_when_a_region_is_offered_changes_nothing(
             fast.observe(candle)
             plain.observe(candle)
             assert fast._releases == plain._releases, (seed, hour)
-            assert fast._untouched == plain._untouched, (seed, hour)
+            assert fast._regions._untouched == plain._untouched, (seed, hour)
             # Pruned as before: the record of touches never outgrows the regions the detector holds.
-            assert len(fast._touched) <= kept
+            assert len(fast._regions._touched) <= kept
             released += len(fast._releases)
             if rng.random() < 0.05:
                 side = rng.choice([Side.LONG, Side.SHORT])

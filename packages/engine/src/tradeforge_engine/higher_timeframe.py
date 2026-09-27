@@ -278,7 +278,7 @@ class HigherTimeframeGate:
         # already in `_touched` would be skipped anyway; asking the set about each of them on every
         # base bar re-hashed a frozen dataclass two hundred times a bar — 6.6 million hashes in one
         # CHOCH run with an H4 gate (24/09). The detector's list only changes when a higher bar
-        # closes, so this is rebuilt there, and shrinks on the bar a region is reached.
+        # offers a region, so this is rebuilt there, and shrinks on the bar a region is reached.
         self._untouched: list[OrderBlock] = []
         self._releases: dict[Side, Release] = {}
 
@@ -312,16 +312,21 @@ class HigherTimeframeGate:
         then the endings: a bar that reaches a new region and runs two heights past it in one go
         releases and ends on the same call, which is what his rule says about that bar.
         """
-        closed = False
+        changed = False
         for bar in self._bars.update(candle):
-            self._blocks.update(bar, self._structure.update(bar))
-            # The detector keeps a bounded history; so does this record, and only membership is
-            # ever asked of it. Pruned only when a higher bar closed, which is the only time the
-            # detector's list can change.
-            held = {tracked.block for tracked in self._blocks.zones}
-            self._touched.intersection_update(held)
-            closed = True
-        if closed:
+            # ⚠️ **Only a bar that offered a region can change the detector's list** — it extends
+            # the list and trims it back to its bound in that same branch, and nowhere else. On
+            # every other higher bar the list is the one already read: `_touched` holds nothing
+            # outside it (it only ever gains regions of `_untouched`), and `_untouched` has been
+            # kept equal to the list minus `_touched` bar by bar. Rebuilding both there anyway was
+            # half of a CHOCH run with an M15 gate over M5 — 52 million hashes of a frozen
+            # dataclass in 372 thousand bars (27/09). Still pruned bar by bar when it does change,
+            # which is what keeps `_touched` no larger than the detector's bounded list.
+            if self._blocks.update(bar, self._structure.update(bar)):
+                held = {tracked.block for tracked in self._blocks.zones}
+                self._touched.intersection_update(held)
+                changed = True
+        if changed:
             self._untouched = [
                 tracked.block
                 for tracked in self._blocks.zones

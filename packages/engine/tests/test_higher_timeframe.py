@@ -21,6 +21,7 @@ answer, and the tests assert those bars.
 """
 
 import datetime as dt
+import random
 from dataclasses import dataclass, field
 from decimal import Decimal, localcontext
 
@@ -42,10 +43,14 @@ from tradeforge_engine.higher_timeframe import (
     MAX_SERVER_OFFSET,
     BarAggregator,
     HigherTimeframeGate,
+    Release,
+    _innermost,
+    _reaches,
+    _search_over,
 )
 from tradeforge_engine.loop import ENGINE_CONTEXT
 from tradeforge_engine.setups import SetupContext, StructureStrategy
-from tradeforge_engine.structure import OrderBlock, StructureKind, ZoneKind
+from tradeforge_engine.structure import OrderBlock, OrderBlockDetector, StructureKind, ZoneKind
 from tradeforge_engine.testing import (
     AAPL,
     BULLISH_START,
@@ -979,3 +984,84 @@ def test_a_higher_timeframe_the_engine_cannot_name_is_refused_at_construction() 
 def test_a_timeframe_alone_builds_no_gate() -> None:
     strategy = StructureStrategy(qualifier=_Marked(), timeframe=HOUR)
     assert strategy._gate is None
+
+
+class _EveryHigherBar(HigherTimeframeGate):
+    """The gate as it was before 27/09: the untouched regions rebuilt on every higher bar that
+    closes, whether or not the detector's list changed. Slow and plainly right — the reference."""
+
+    def observe(self, candle: Candle) -> None:
+        closed = False
+        for higher in self._bars.update(candle):
+            self._blocks.update(higher, self._structure.update(higher))
+            held = {tracked.block for tracked in self._blocks.zones}
+            self._touched.intersection_update(held)
+            closed = True
+        if closed:
+            self._untouched = [
+                tracked.block
+                for tracked in self._blocks.zones
+                if tracked.block not in self._touched
+            ]
+        reached: dict[Side, list[OrderBlock]] = {}
+        for block in self._untouched:
+            if not _reaches(block, candle) or block in self._touched:
+                continue
+            self._touched.add(block)
+            reached.setdefault(block.side, []).append(block)
+        if reached:
+            self._untouched = [block for block in self._untouched if block not in self._touched]
+        for side, blocks in reached.items():
+            standing = self._releases.get(side)
+            opened_at = candle.time if standing is None else standing.opened_at
+            self._releases[side] = Release(block=_innermost(blocks), opened_at=opened_at)
+        for side in (Side.LONG, Side.SHORT):
+            release = self._releases.get(side)
+            if release is not None and _search_over(release.block, candle):
+                del self._releases[side]
+
+
+@pytest.mark.parametrize("kept", [1, 3, 200])
+def test_rebuilding_only_when_a_region_is_offered_changes_nothing(
+    kept: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """⚠️ **The gate rebuilds its untouched regions only when the detector offered one** (27/09):
+    the rebuild on every higher bar was half of a CHOCH run over M5. Held against the gate that
+    rebuilds every time, bar by bar, over random walks with holes in the history — a hole of two
+    or three hours closes two higher bars in one call, the first offering a region and the second
+    not (the refactor that keeps only the last bar's answer loses that region) — with the
+    detector's list trimmed hard, so regions leave while touched, and sides spent at random."""
+    monkeypatch.setattr(OrderBlockDetector, "_MAX_ZONES", kept)
+    two_at_once = released = 0
+    for seed in range(100):
+        rng = random.Random(seed)  # noqa: S311 — a reproducible walk, not a secret
+        fast = HigherTimeframeGate(base=HOUR, target=3 * HOUR, offset=_UTC_BROKER)
+        plain = _EveryHigherBar(base=HOUR, target=3 * HOUR, offset=_UTC_BROKER)
+        price, hour = 100, 0
+        for _ in range(600):
+            step = rng.choice([1] * 8 + [2, 3, 4])
+            two_at_once += step > 1
+            hour += step
+            open_ = price
+            price = max(5, open_ + rng.randint(-3, 3))
+            candle = Candle(
+                time=START + hour * HOUR,
+                open=Decimal(open_),
+                high=Decimal(max(open_, price) + rng.randint(0, 2)),
+                low=Decimal(max(1, min(open_, price) - rng.randint(0, 2))),
+                close=Decimal(price),
+            )
+            fast.observe(candle)
+            plain.observe(candle)
+            assert fast._releases == plain._releases, (seed, hour)
+            assert fast._untouched == plain._untouched, (seed, hour)
+            # Pruned as before: the record of touches never outgrows the regions the detector holds.
+            assert len(fast._touched) <= kept
+            released += len(fast._releases)
+            if rng.random() < 0.05:
+                side = rng.choice([Side.LONG, Side.SHORT])
+                fast.spend(side)
+                plain.spend(side)
+    # The walk has to have reached the cases it exists for, or it proves nothing.
+    assert two_at_once > 0
+    assert released > 0

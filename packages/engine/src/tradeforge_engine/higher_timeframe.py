@@ -58,8 +58,10 @@ nondeterministic one.
 """
 
 import datetime as dt
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
+from types import MappingProxyType
 from typing import Final
 
 from tradeforge_engine.domain import Candle, Money, Side
@@ -261,7 +263,7 @@ class RegionTracker:
         # CHOCH run with an H4 gate (24/09). The detector's list only changes when a higher bar
         # offers a region, so this is rebuilt there, and shrinks on the bar a region is reached.
         self._untouched: list[OrderBlock] = []
-        self._reached: dict[Side, list[OrderBlock]] = {}
+        self._reached: dict[Side, tuple[OrderBlock, ...]] = {}
 
     @property
     def timeframe(self) -> dt.timedelta:
@@ -284,14 +286,16 @@ class RegionTracker:
         return self._blocks.zones
 
     @property
-    def reached(self) -> dict[Side, list[OrderBlock]]:
+    def reached(self) -> Mapping[Side, tuple[OrderBlock, ...]]:
         """The regions the last observed base bar reached for the first time, per side, oldest
         offered first. Empty on a bar that reached none.
 
-        ⚠️ Read, never written: the gate builds its releases from it, and a tracker read by several
-        runs hands each of them this same mapping.
+        ⚠️ **Read-only by type, not by promise** (27/09): a tracker read by a whole batch of runs
+        hands every one of them this same mapping, and a run that popped a region from it would
+        take it from the others without an error anywhere. A frozen mapping of tuples makes that
+        write a type error, and a `TypeError` if anyone tries anyway.
         """
-        return self._reached
+        return MappingProxyType(self._reached)
 
     def observe(self, candle: Candle) -> None:
         """Fold in one closed base bar: assemble the bar above, then record what this bar reached.
@@ -333,7 +337,7 @@ class RegionTracker:
             reached.setdefault(block.side, []).append(block)
         if reached:
             self._untouched = [block for block in self._untouched if block not in self._touched]
-        self._reached = reached
+        self._reached = {side: tuple(blocks) for side, blocks in reached.items()}
 
 
 class HigherTimeframeGate:
@@ -371,8 +375,27 @@ class HigherTimeframeGate:
     (*"1 - correto / 2 - correto"*).
     """
 
-    def __init__(self, *, base: dt.timedelta, target: dt.timedelta, offset: dt.timedelta) -> None:
-        self._regions = RegionTracker(base=base, target=target, offset=offset)
+    def __init__(
+        self,
+        *,
+        base: dt.timedelta,
+        target: dt.timedelta,
+        offset: dt.timedelta,
+        regions: RegionTracker | None = None,
+    ) -> None:
+        # ⚠️ **A tracker handed in is advanced by whoever handed it in**, never here (ADR-0029): a
+        # `MarketReading` owns it — the setup's own, or a batch's leader shared by many runs. The
+        # gate then only reads what the bar reached. Without one the gate builds and advances its
+        # own, which is every use of the gate on its own.
+        if regions is not None and (regions.timeframe, regions.offset) != (target, offset):
+            raise ValueError(
+                f"the tracker reads {regions.timeframe} cut at {regions.offset}, "
+                f"not {target} cut at {offset}"
+            )
+        self._owns_regions = regions is None
+        self._regions = (
+            RegionTracker(base=base, target=target, offset=offset) if regions is None else regions
+        )
         self._releases: dict[Side, Release] = {}
 
     @property
@@ -398,7 +421,8 @@ class HigherTimeframeGate:
         heights past it in one go releases and ends on the same call, which is what his rule says
         about that bar.
         """
-        self._regions.observe(candle)
+        if self._owns_regions:
+            self._regions.observe(candle)
         for side, blocks in self._regions.reached.items():
             # A side already released keeps the bar that released it: *from that bar on* is
             # counted from the first region price came to, and only the reference moves. A region
@@ -470,7 +494,7 @@ class HigherTimeframeGate:
         self._releases[side] = release
 
 
-def _innermost(blocks: list[OrderBlock]) -> OrderBlock:
+def _innermost(blocks: Sequence[OrderBlock]) -> OrderBlock:
     """Of several regions one side reached on one bar, the one price went deepest into.
 
     The lowest top among demand regions, the highest bottom among supply ones. `min`/`max` keep

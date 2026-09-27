@@ -176,7 +176,7 @@ class TestTheIndexAnswersWhatTheWalkAnswered:
         assert ZoneView().holding(block) == ()
 
 
-class _WalkingGate(HigherTimeframeGate):
+class _WalkingGate:
     """The gate's `observe` as it was before 24/09, kept as the oracle: every region the detector
     holds is asked about on every base bar."""
 
@@ -189,6 +189,10 @@ class _WalkingGate(HigherTimeframeGate):
         self._touched: set[OrderBlock] = set()
         self._untouched: list[OrderBlock] = []
         self._releases: dict[Side, Release] = {}
+
+    def spend(self, side: Side) -> None:
+        # `HigherTimeframeGate.spend`, as it has always been.
+        self._releases.pop(side, None)
 
     def observe(self, candle: Candle) -> None:
         for higher in self._bars.update(candle):

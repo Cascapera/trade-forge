@@ -992,7 +992,7 @@ def test_a_timeframe_alone_builds_no_gate() -> None:
     assert strategy._gate is None
 
 
-class _EveryHigherBar(HigherTimeframeGate):
+class _EveryHigherBar:
     """The gate as it was before 27/09: the untouched regions rebuilt on every higher bar that
     closes, whether or not the detector's list changed. Slow and plainly right — the reference."""
 
@@ -1005,6 +1005,10 @@ class _EveryHigherBar(HigherTimeframeGate):
         self._touched: set[OrderBlock] = set()
         self._untouched: list[OrderBlock] = []
         self._releases: dict[Side, Release] = {}
+
+    def spend(self, side: Side) -> None:
+        # `HigherTimeframeGate.spend`, as it has always been.
+        self._releases.pop(side, None)
 
     def observe(self, candle: Candle) -> None:
         closed = False

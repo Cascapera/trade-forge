@@ -2480,8 +2480,7 @@ class TestTemplatesRunMarketByMarket:
     def test_a_market_collects_what_it_is_missing_while_the_agent_runs(
         self, client: Any, session_factory: Callable[[], Session]
     ) -> None:
-        """His rule of 26/09, on the queue too: a chart never collected is downloaded first, and
-        with the agent off the same market is launched over what is on disk — here, nothing."""
+        """His rule of 26/09, on the queue too: a chart never collected is downloaded first."""
         template = self.template(client, timeframes=["H1", "W1"])
         client.post(
             f"/sweep-templates/{template['id']}/queue", json={"markets": [{"symbol": "EURUSD"}]}
@@ -2495,8 +2494,52 @@ class TestTemplatesRunMarketByMarket:
 
         assert pending is True
         assert downloads == [("EURUSD", "W1")]
-        [item] = client.get(f"/sweep-templates/{template['id']}").json()["items"]
-        assert client.get(f"/sweeps/{item['sweep_id']}").json()["skipped"] == []
+        first, _second = client.get(f"/sweep-templates/{template['id']}").json()["items"]
+        assert client.get(f"/sweeps/{first['sweep_id']}").json()["skipped"] == []
+
+    def test_each_market_is_queued_chart_by_chart_lightest_first(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        """His ask (26/09): one chart of one market at a time, so no launch prepares every chart
+        at once; W1 before M15 so the quick ones are read while the slow ones run."""
+        template = self.template(client, timeframes=["M15", "H4", "H1"])
+        queued = client.post(
+            f"/sweep-templates/{template['id']}/queue",
+            json={"markets": [{"symbol": "EURUSD"}, {"symbol": "GBPUSD"}]},
+        ).json()
+
+        assert [(one["symbol"], one["timeframe"]) for one in queued["items"]] == [
+            ("EURUSD", "H4"),
+            ("EURUSD", "H1"),
+            ("EURUSD", "M15"),
+            ("GBPUSD", "H4"),
+            ("GBPUSD", "H1"),
+            ("GBPUSD", "M15"),
+        ]
+        assert self.step(session_factory, template["id"]) is True
+        first = client.get(f"/sweep-templates/{template['id']}").json()["items"][0]
+        sweep = client.get(f"/sweeps/{first['sweep_id']}").json()
+        assert (sweep["symbols"], sweep["timeframes"]) == (["EURUSD"], ["H4"])
+
+    def test_a_chart_where_nothing_runs_is_failed_when_queued_with_the_reason(
+        self, client: Any
+    ) -> None:
+        """An H4 filter cannot run on the H4 chart: said at once, not an item later."""
+        entry = an_entry(
+            client,
+            name=f"filtered {uuid.uuid4()}",
+            document=a_filtered_document(f"choch {uuid.uuid4()}"),
+        )
+        template = self.template(client, timeframes=["H1", "H4"], entry_ids=[entry])
+        queued = client.post(
+            f"/sweep-templates/{template['id']}/queue", json={"markets": [{"symbol": "EURUSD"}]}
+        ).json()
+
+        at_h4, at_h1 = queued["items"]
+        assert (at_h4["timeframe"], at_h4["status"]) == ("H4", "failed")
+        assert "nothing runs at H4" in at_h4["error"]
+        assert "htf" in at_h4["error"]
+        assert (at_h1["timeframe"], at_h1["status"]) == ("H1", "waiting")
 
     def test_a_paused_queue_launches_nothing_until_resumed(
         self, client: Any, session_factory: Callable[[], Session]
@@ -2681,6 +2724,45 @@ class TestSweepsReadTogether:
         assert alone.status_code == 422
         assert ghost.status_code == 404
         assert client.post("/sweeps/combine", json={"sweep_ids": [eur, gbp]}).status_code == 201
+
+    def test_the_charts_of_one_template_combine_and_others_do_not(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        """26/09: the queue runs one chart at a time, so H4 and H1 of one template are two sweeps
+        of one question. Two sweeps outside a template still have to share their charts."""
+        queue_of = TestTemplatesRunMarketByMarket()
+        template = queue_of.template(client, timeframes=["H1", "H4"])
+        client.post(
+            f"/sweep-templates/{template['id']}/queue", json={"markets": [{"symbol": "EURUSD"}]}
+        )
+        for _chart in ("H4", "H1"):
+            assert queue_of.step(session_factory, template["id"]) is True
+            launched = [
+                one["sweep_id"]
+                for one in client.get(f"/sweep-templates/{template['id']}").json()["items"]
+                if one["sweep_id"] is not None
+            ]
+            queue_of.finish_all(client, session_factory, launched[-1])
+        at_h4, at_h1 = launched
+
+        made = client.post("/sweeps/combine", json={"sweep_ids": [at_h4, at_h1]})
+
+        assert made.status_code == 201, made.text
+        body = client.get(f"/sweeps/{made.json()['id']}", params={"runs": "none"}).json()
+        assert body["timeframes"] == ["H4", "H1"]
+
+        entry = an_entry(client, name=f"loose {uuid.uuid4()}")
+        loose = []
+        for chart in ("H1", "H4"):
+            sweep_id = client.post(
+                "/sweeps", json=a_sweep_body([entry], ["EURUSD"], [chart])
+            ).json()["id"]
+            for run_id in run_ids(client, sweep_id):
+                finish(session_factory, run_id, 100)
+            loose.append(sweep_id)
+        refused = client.post("/sweeps/combine", json={"sweep_ids": loose})
+        assert refused.status_code == 422
+        assert "different questions" in refused.json()["detail"]
 
 
 class TestTheDashboardIsKept:

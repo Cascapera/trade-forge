@@ -140,7 +140,7 @@ _BAD_BODY: _Responses = {status.HTTP_400_BAD_REQUEST: {"description": "malformed
 _MAX_OFFSET = 9_223_372_036_854_775_807  # 2**63 - 1, Postgres bigint
 
 
-def _entries(session: SessionDep, ids: list[uuid.UUID]) -> list[tuple[CatalogEntry, Strategy]]:
+def entries_of(session: SessionDep, ids: list[uuid.UUID]) -> list[tuple[CatalogEntry, Strategy]]:
     """The chosen entries with their strategies, **in the order they were asked for**.
 
     ⚠️ The order is restored rather than left to the database. `IN (...)` returns rows in
@@ -162,7 +162,7 @@ def _entries(session: SessionDep, ids: list[uuid.UUID]) -> list[tuple[CatalogEnt
     return [found[one] for one in ids]
 
 
-def _streams(
+def streams_of(
     pairs: list[tuple[CatalogEntry, Strategy]], timeframes: list[str]
 ) -> list[Iterator[SweepDocument]]:
     """Every entry's documents, one stream each — or a 422 naming the entry that cannot expand.
@@ -298,7 +298,7 @@ def _preview(
     per point — made a 1.09 GB answer. Each document is built, judged and dropped; what is kept is
     one 16-byte key per distinct behaviour and the refusals grouped by reason.
     """
-    pairs = _entries(session, request.entry_ids)
+    pairs = entries_of(session, request.entry_ids)
 
     # ⚠️ **The same guard the launch has, and the preview needs it more.** Without it a
     # backwards window is not a window any dataset can overlap, so `uncovered_markets` can name
@@ -313,7 +313,7 @@ def _preview(
 
     timeframes = list(request.timeframes)
     symbols = list(request.symbols)
-    streams = _streams(pairs, timeframes)
+    streams = streams_of(pairs, timeframes)
     uncovered_all = uncovered_markets(
         session, symbols, timeframes, request.date_from, request.date_to
     )
@@ -465,7 +465,7 @@ def launch_sweep(
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="date_to precedes date_from"
         )
-    pairs = _entries(session, request.entry_ids)
+    pairs = entries_of(session, request.entry_ids)
 
     found = {
         instrument.symbol: instrument
@@ -480,7 +480,7 @@ def launch_sweep(
             detail=f"unknown symbols: {', '.join(unknown)}",
         )
     costs = _costs_for(request.cost_model, found)
-    streams = _streams(pairs, timeframes)
+    streams = streams_of(pairs, timeframes)
 
     planned = (
         to_collect(
@@ -1255,7 +1255,8 @@ def combine_sweeps(request: CombineSweeps, session: SessionDep) -> CreatedSweep:
     time over days, brought together for the second phase (26/09). Nothing runs.
 
     ⚠️ **Only sweeps that asked the same question.** The same entries, charts, window and capital
-    — what a template fixes — or the medians, the choice of the best and the comparison would
+    — what a template fixes; the charts may differ between sweeps of one template, whose queue
+    runs chart by chart — or the medians, the choice of the best and the comparison would
     mix answers to different questions. Refused, with the reason, for a reserved-window test or
     another combination (its runs are chosen or borrowed), and for a sweep still running (the
     second phase reads finished work).
@@ -1281,10 +1282,15 @@ def combine_sweeps(request: CombineSweeps, session: SessionDep) -> CreatedSweep:
                 "that ran",
             )
 
+    # ⚠️ **The charts may differ inside one template** (26/09): its queue runs one chart of one
+    # market at a time, so H4 and M15 of the same template are two sweeps of one question, split
+    # by chart as by market. Outside a template the charts still have to match.
+    one_template = len({one.template_id for one in members}) == 1 and members[0].template_id
+
     def question(sweep: Sweep) -> tuple[Any, ...]:
         return (
             tuple(sorted(sweep.entry_ids)),
-            tuple(sorted(sweep.timeframes)),
+            () if one_template else tuple(sorted(sweep.timeframes)),
             sweep.date_from,
             sweep.date_to,
             sweep.initial_capital,
@@ -1310,7 +1316,7 @@ def combine_sweeps(request: CombineSweeps, session: SessionDep) -> CreatedSweep:
     combined = Sweep(
         entry_ids=list(first.entry_ids),
         symbols=symbols,
-        timeframes=list(first.timeframes),
+        timeframes=list(dict.fromkeys(chart for one in members for chart in one.timeframes)),
         date_from=first.date_from,
         date_to=first.date_to,
         initial_capital=first.initial_capital,

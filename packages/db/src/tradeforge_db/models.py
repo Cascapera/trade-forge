@@ -2189,6 +2189,9 @@ class SweepTemplateItem(Base):
         ForeignKey("sweep_templates.id", ondelete="CASCADE"), nullable=False
     )
     symbol: Mapped[str] = mapped_column(String(32), nullable=False)
+    timeframe: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    """The one chart this item runs (26/09) — or `None` on an item queued before, which runs
+    every chart of the template in one sweep."""
     cost_model: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     """The sweep's cost model for this one market, as typed at queueing — prefilled from its
     measured spread, and his to correct."""

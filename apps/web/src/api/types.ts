@@ -1550,6 +1550,8 @@ export type TemplateItemStatus = 'waiting' | 'launched' | 'failed' | 'removed'
 export interface TemplateItem {
   id: string
   symbol: string
+  /** The one chart this item runs (26/09); `null` on an item queued before: every chart. */
+  timeframe: string | null
   cost_model: Record<string, string>
   position: number
   status: TemplateItemStatus

@@ -2451,6 +2451,8 @@ class QueueMarkets(BaseModel):
 class TemplateItemOut(BaseModel):
     id: uuid.UUID
     symbol: str
+    timeframe: str | None
+    """The one chart this item runs, or `None` for an item queued before 26/09 (every chart)."""
     cost_model: dict[str, Any]
     position: int
     status: str

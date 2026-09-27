@@ -37,6 +37,7 @@ function item(over: Partial<TemplateItem>): TemplateItem {
   return {
     id: 'i1',
     symbol: 'EURUSD',
+    timeframe: null,
     cost_model: { spread_points: '9', commission_per_unit: '0' },
     position: 0,
     status: 'launched',
@@ -100,6 +101,35 @@ describe('TemplateQueue', () => {
     expect(screen.getAllByText('finished')).toHaveLength(2)
     expect(screen.getByText('waiting')).toBeInTheDocument()
     expect(screen.getAllByText('360 of 360')).toHaveLength(2)
+  })
+
+  it('names each chart of a market on its own line (26/09)', async () => {
+    mocked.getSweepTemplate.mockResolvedValue({
+      ...template,
+      items: [
+        item({ timeframe: 'H4' }),
+        item({
+          id: 'i2',
+          timeframe: 'H1',
+          sweep_id: null,
+          status: 'waiting',
+          runs: 0,
+          done: 0,
+          finished: false,
+          position: 1,
+        }),
+      ],
+    })
+    show()
+
+    expect(await screen.findByRole('link', { name: 'EURUSD H4' })).toHaveAttribute(
+      'href',
+      '/sweeps/s1',
+    )
+    expect(screen.getByText('EURUSD H1')).toBeInTheDocument()
+    expect(
+      screen.getByRole('button', { name: 'Remove EURUSD H1 from the queue' }),
+    ).toBeInTheDocument()
   })
 
   it('prefills the measured spread and sends only what was typed', async () => {

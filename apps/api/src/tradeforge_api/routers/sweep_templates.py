@@ -1,4 +1,5 @@
-"""Sweep templates (26/09): a sweep without its markets, and a queue that runs one market at a time.
+"""Sweep templates (26/09): a sweep without its markets, and a queue that runs one chart of one
+market at a time.
 
 His ask: run some markets today and others tomorrow, then read them together. A template keeps
 entries, charts, window and capital; each market queued becomes a sweep of its own
@@ -6,6 +7,7 @@ entries, charts, window and capital; each market queued becomes a sweep of its o
 ended.
 """
 
+import asyncio
 import uuid
 from decimal import Decimal
 from typing import Any
@@ -16,6 +18,8 @@ from sqlalchemy.exc import IntegrityError
 
 from tradeforge_api.deps import QueueDep, SessionDep
 from tradeforge_api.queue import RUN_TEMPLATE_QUEUE
+from tradeforge_api.routers.strategies import refusal_of
+from tradeforge_api.routers.sweeps import entries_of, streams_of
 from tradeforge_api.schemas import (
     CreateSweepTemplate,
     QueueMarkets,
@@ -23,6 +27,7 @@ from tradeforge_api.schemas import (
     SweepTemplateOut,
     TemplateItemOut,
 )
+from tradeforge_collector import step
 from tradeforge_db.models import (
     Backtest,
     BacktestStatus,
@@ -127,7 +132,16 @@ def get_template(template_id: uuid.UUID, session: SessionDep) -> SweepTemplateOu
 async def queue_markets(
     template_id: uuid.UUID, request: QueueMarkets, session: SessionDep, queue: QueueDep
 ) -> SweepTemplateOut:
-    """Add markets to the end of the queue, each with its costs, and wake the conductor.
+    """Add markets to the end of the queue — one item per chart, lightest chart first — each with
+    its costs, and wake the conductor.
+
+    ⚠️ **One chart per item** (26/09). A market over every chart was one sweep whose preparation
+    grew with the charts: minutes of one process at full boost, where this machine's CPU fails.
+    Lightest first (W1 before M5) so the quick ones are read while the slow ones run.
+
+    ⚠️ **A chart where nothing can run is failed here, with the reason** — every point refused at
+    that chart, as a higher timeframe no higher than the chart is. Found by looking for the first
+    point that runs, which is usually the first point: quick unless the answer is "none".
 
     ⚠️ **A blank spread is the market's measured one, written now** — what the screen prefilled
     and he left as it was. Refused, with the markets named, for a symbol that has never been
@@ -167,6 +181,15 @@ async def queue_markets(
             detail="cannot queue: " + "; ".join(problems),
         )
 
+    charts = sorted(template.timeframes, key=step, reverse=True)
+    pairs = entries_of(session, [uuid.UUID(one) for one in template.entry_ids])
+    # In a thread: a chart where nothing runs is a walk through its whole grid (`nothing_runs_at`).
+    blocked = {
+        chart: reason
+        for chart in charts
+        if (reason := await asyncio.to_thread(nothing_runs_at, pairs, chart)) is not None
+    }
+
     last = session.scalar(
         select(func.max(SweepTemplateItem.position)).where(
             SweepTemplateItem.template_id == template.id
@@ -177,11 +200,17 @@ async def queue_markets(
         SweepTemplateItem(
             template_id=template.id,
             symbol=market.symbol,
+            timeframe=chart,
             cost_model=cost,
             position=start + index,
-            status=TemplateItemStatus.WAITING,
+            status=TemplateItemStatus.FAILED if chart in blocked else TemplateItemStatus.WAITING,
+            error=blocked.get(chart),
         )
-        for index, (market, cost) in enumerate(zip(request.markets, costs, strict=True))
+        for index, (market, cost, chart) in enumerate(
+            (market, cost, chart)
+            for market, cost in zip(request.markets, costs, strict=True)
+            for chart in charts
+        )
     )
     session.commit()
     await queue.enqueue_job(RUN_TEMPLATE_QUEUE, str(template.id))
@@ -230,11 +259,30 @@ def remove_item(
     if item.status is not TemplateItemStatus.WAITING:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=f"{item.symbol} is {item.status.value}; only a waiting market can be removed",
+            detail=(
+                f"{item.symbol} {item.timeframe or ''} is {item.status.value}; "
+                "only a waiting item can be removed"
+            ),
         )
     item.status = TemplateItemStatus.REMOVED
     session.commit()
     return template_out(session, template)
+
+
+def nothing_runs_at(pairs: list[Any], chart: str) -> str | None:
+    """`None` when some point of some entry runs at this chart; otherwise why none does.
+
+    ⚠️ **The launch's own judgement** (`refusal_of`), never a second reading of the DSL: a copy of
+    its rules here would agree the day it was written and not after.
+    """
+    first: str | None = None
+    for stream in streams_of(pairs, [chart]):
+        for doc in stream:
+            reason = refusal_of(dict(doc.document))
+            if reason is None:
+                return None
+            first = first or reason
+    return f"nothing runs at {chart}: {first or 'no point'}"
 
 
 def template_out(session: SessionDep, template: SweepTemplate) -> SweepTemplateOut:
@@ -265,6 +313,7 @@ def template_out(session: SessionDep, template: SweepTemplate) -> SweepTemplateO
             TemplateItemOut(
                 id=item.id,
                 symbol=item.symbol,
+                timeframe=item.timeframe,
                 cost_model=dict(item.cost_model),
                 position=item.position,
                 status=item.status.value,

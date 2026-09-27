@@ -170,7 +170,7 @@ export function TemplateQueue(): React.JSX.Element {
                   {item.finished && item.sweep_id !== null && (
                     <input
                       type="checkbox"
-                      aria-label={`read ${item.symbol} together`}
+                      aria-label={`read ${named(item)} together`}
                       checked={chosen.includes(item.sweep_id)}
                       onChange={() => {
                         const sweepId = item.sweep_id ?? ''
@@ -185,10 +185,10 @@ export function TemplateQueue(): React.JSX.Element {
                 </td>
                 <td className="px-3 py-2">
                   {item.sweep_id === null ? (
-                    item.symbol
+                    named(item)
                   ) : (
                     <Link to={`/sweeps/${item.sweep_id}`} className="text-sky-400 hover:text-sky-300">
-                      {item.symbol}
+                      {named(item)}
                     </Link>
                   )}
                 </td>
@@ -215,7 +215,7 @@ export function TemplateQueue(): React.JSX.Element {
                   {item.status === 'waiting' && (
                     <button
                       type="button"
-                      aria-label={`Remove ${item.symbol} from the queue`}
+                      aria-label={`Remove ${named(item)} from the queue`}
                       onClick={() => {
                         queue.remove.mutate(item.id)
                       }}
@@ -325,4 +325,9 @@ export function TemplateQueue(): React.JSX.Element {
       </div>
     </section>
   )
+}
+
+/** `EURUSD H4` — one chart of one market (26/09); an item queued before names the market alone. */
+function named(item: TemplateItem): string {
+  return item.timeframe === null ? item.symbol : `${item.symbol} ${item.timeframe}`
 }

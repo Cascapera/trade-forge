@@ -25,7 +25,8 @@ from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from decimal import ROUND_HALF_EVEN, localcontext
 from decimal import Context as DecimalContext
-from typing import cast
+from enum import StrEnum
+from typing import Protocol, cast
 
 from tradeforge_engine.domain import (
     SNAPSHOT_BARS_BEFORE,
@@ -85,11 +86,26 @@ __all__ = [
     "ENGINE_PRECISION",
     "SNAPSHOT_BARS_BEFORE",
     "BarOutcome",
+    "QuietBars",
     "RunRecorder",
     "RunResult",
     "iter_run",
     "run",
 ]
+
+
+class QuietBars(StrEnum):
+    """What the loop does with a bar a setup calls quiet (ADR-0029, `StructureStrategy.quiet`).
+
+    `OFF` — every bar through `_step`, as a run on its own, paper and live always go. `SKIP` — a
+    quiet bar through `_quiet_step`: the broker's bar and the account as always, the setup's
+    `pass_quiet` instead of its decision. `SHADOW` — every bar through `_step`, and on a bar that
+    would have been quiet, a refusal if anything came of it: the claim, checked on real runs.
+    """
+
+    OFF = "off"
+    SKIP = "skip"
+    SHADOW = "shadow"
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,6 +175,7 @@ def iter_run(  # noqa: PLR0913 — keyword-only; see run()
     risk: RiskManager,
     refusals: tuple[Refusal, ...] = (),
     record_snapshots: bool = True,
+    quiet: QuietBars = QuietBars.OFF,
 ) -> Iterator[BarOutcome]:
     """The loop itself, one `BarOutcome` at a time, for as long as candles keep arriving.
 
@@ -206,6 +223,7 @@ def iter_run(  # noqa: PLR0913 — keyword-only; see run()
     # happened to start iterating — a bad timeframe would surface from inside a live session's
     # first bar rather than from the line that configured it.
     return _iter_run(
+        quiet=quiet,
         candles=candles,
         timeframe=timeframe,
         instrument=instrument,
@@ -313,6 +331,7 @@ def _iter_run(  # noqa: PLR0913 — see run()
     risk: RiskManager,
     refusals: tuple[Refusal, ...] = (),
     record_snapshots: bool = True,
+    quiet: QuietBars = QuietBars.OFF,
 ) -> Iterator[BarOutcome]:
     previous: Candle | None = None
     # Refusals born on the bar before the one about to run, waiting to be shown to the strategy.
@@ -352,19 +371,30 @@ def _iter_run(  # noqa: PLR0913 — see run()
             if window is not None:
                 window.append(candle)
 
-            outcome, gates = _step(
-                index=index,
-                candle=candle,
-                window=window,
-                timeframe=timeframe,
-                instrument=instrument,
-                strategy=strategy,
-                broker=broker,
-                risk=risk,
-                refusals=pending,
-                recorded=carried,
-            )
-
+            still = quiet is not QuietBars.OFF and not pending and _quiet(strategy, broker, candle)
+            if still and quiet is QuietBars.SKIP:
+                outcome, gates = _quiet_step(
+                    index=index, candle=candle, strategy=strategy, broker=broker, recorded=carried
+                )
+            else:
+                outcome, gates = _step(
+                    index=index,
+                    candle=candle,
+                    window=window,
+                    timeframe=timeframe,
+                    instrument=instrument,
+                    strategy=strategy,
+                    broker=broker,
+                    risk=risk,
+                    refusals=pending,
+                    recorded=carried,
+                )
+                if still and (fills_or_gates := (outcome.fills, gates)) != ((), ()):
+                    raise EngineError(
+                        f"a bar called quiet was not: {fills_or_gates} at {candle.time}"
+                    )
+                if still and not _idle(broker):
+                    raise EngineError(f"a bar called quiet placed an order at {candle.time}")
         yield outcome
 
         previous = candle
@@ -400,6 +430,54 @@ def _iter_run(  # noqa: PLR0913 — see run()
         # make, with the wider window as its prize; this PR restores the delivery it found.
         carried = tuple(broker.refusals())
         pending = (*gates, *carried)
+
+
+def _quiet(strategy: Strategy, broker: Broker, candle: Candle) -> bool:
+    """Can this bar change nothing and produce nothing? Only a setup that says so on its own terms
+    (`quiet`), over an account that can fill nothing (`idle`) — anything else is never quiet."""
+    asks = getattr(strategy, "quiet", None)
+    return asks is not None and _idle(broker) and bool(asks(candle))
+
+
+def _idle(broker: Broker) -> bool:
+    idle = getattr(broker, "idle", None)
+    return idle is not None and bool(idle())
+
+
+def _quiet_step(
+    *,
+    index: int,
+    candle: Candle,
+    strategy: Strategy,
+    broker: Broker,
+    recorded: tuple[Refusal, ...],
+) -> tuple[BarOutcome, tuple[Refusal, ...]]:
+    """A quiet bar (ADR-0029): `_step` less the setup's decision, which would have been none.
+
+    The broker's bar and the account are the same calls in the same order as `_step`'s — an idle
+    broker fills nothing, and a fill here would be a broken promise, refused loudly. The setup's
+    `on_bar` is replaced by `pass_quiet`, the part of it that must happen on every bar. What the
+    broker turned away on the bar before is recorded on this one, as `_step` records it.
+    """
+    fills = broker.on_bar(candle)
+    if fills:
+        raise EngineError(f"an idle broker filled on a quiet bar at {candle.time}")
+    account = broker.account()
+    cast(_Quiet, strategy).pass_quiet(candle)
+    return (
+        BarOutcome(
+            index=index,
+            candle=candle,
+            fills=(),
+            equity=EquityPoint(time=candle.time, equity=account.equity),
+            refusals=recorded,
+        ),
+        (),
+    )
+
+
+class _Quiet(Protocol):
+    def pass_quiet(self, candle: Candle) -> None: ...
 
 
 def _step(  # noqa: PLR0913 — one bar of the loop; every argument is a seam or the bar itself

@@ -437,6 +437,13 @@ class HigherTimeframeGate:
             if release is not None and _search_over(release.block, candle):
                 del self._releases[side]
 
+    def shut_on_this_bar(self) -> bool:
+        """No side released now, and the base bar just read released none — asked before
+        `observe` on that bar, with the tracker already at it. Such a bar can end a search but
+        cannot open one, so `allows` answers no to every zone on it (`StructureStrategy.quiet`).
+        """
+        return not self._releases and not self._regions.reached
+
     def allows(self, block: OrderBlock) -> bool:
         """May this zone of the base timeframe be armed now?
 

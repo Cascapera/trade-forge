@@ -22,7 +22,14 @@ from dataclasses import dataclass
 from decimal import localcontext
 
 from tradeforge_engine.domain import Candle, InstrumentSpec
-from tradeforge_engine.loop import ENGINE_CONTEXT, BarOutcome, RunRecorder, RunResult, iter_run
+from tradeforge_engine.loop import (
+    ENGINE_CONTEXT,
+    BarOutcome,
+    QuietBars,
+    RunRecorder,
+    RunResult,
+    iter_run,
+)
 from tradeforge_engine.protocols import Broker, RiskManager, Strategy
 from tradeforge_engine.reading import MarketReading
 
@@ -77,8 +84,13 @@ def run_batch(  # noqa: PLR0913 — keyword-only; each one names a real axis of 
     reading: MarketReading,
     members: Sequence[BatchMember],
     record_snapshots: bool = True,
+    quiet: QuietBars = QuietBars.SKIP,
 ) -> list[BatchOutcome]:
     """Run every member over `candles`, the reading advanced once per bar ahead of all of them.
+
+    ⚠️ **Quiet bars are skipped by default** (`QuietBars.SKIP`): a member whose setup says nothing
+    can happen on a bar, over an account that can fill nothing, takes the bar through
+    `loop._quiet_step`. `SHADOW` runs every bar in full and refuses one called quiet that was not.
 
     Returns one outcome per member, in the members' order. Each member's strategy has to have
     been built on `reading` — one built on its own would read its own market and ignore this one,
@@ -95,6 +107,7 @@ def run_batch(  # noqa: PLR0913 — keyword-only; each one names a real axis of 
             broker=member.broker,
             risk=member.risk,
             record_snapshots=record_snapshots,
+            quiet=quiet,
         )
         running.append(_Running(member, bars, feed))
 

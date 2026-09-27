@@ -26,7 +26,7 @@ import contextlib
 import datetime as dt
 import json
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -37,6 +37,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import DBAPIError, OperationalError
 from sqlalchemy.orm import Session
 
+from tradeforge_api.batching import enqueue_runs
 from tradeforge_api.candle_cache import CandleCache, CandleReader
 from tradeforge_api.cluster_job import process_cluster
 from tradeforge_api.collector import running as collector_running
@@ -54,11 +55,20 @@ from tradeforge_api.queue import (
 )
 from tradeforge_api.r_metrics import r_metrics
 from tradeforge_api.retention import recorded_for
-from tradeforge_api.runner import ENGINE_VERSION, execute_backtest, spec_document, spec_for
+from tradeforge_api.runner import (
+    ENGINE_VERSION,
+    BatchRun,
+    CandleWindow,
+    Measured,
+    execute_backtest,
+    execute_batch,
+    spec_document,
+    spec_for,
+)
 from tradeforge_api.sweep_walkforward_job import advance
 from tradeforge_api.template_queue_job import advance_queue
 from tradeforge_api.walkforward import Candidate, choose
-from tradeforge_collector import read_candles
+from tradeforge_collector import read_candles, step
 from tradeforge_db.collections import finish_collection
 from tradeforge_db.models import (
     Backtest,
@@ -73,8 +83,11 @@ from tradeforge_db.models import (
 )
 from tradeforge_db.results import ladder_row, to_rows
 from tradeforge_db.session import create_db_engine, create_session_factory
+from tradeforge_engine import BacktestMetrics as EngineMetrics
+from tradeforge_engine import ClosedTrade
 from tradeforge_engine.domain import InstrumentSpec
 from tradeforge_engine.excursion import target_ladder
+from tradeforge_engine.setup_factory import shared_reading
 
 
 def _now() -> dt.datetime:
@@ -119,6 +132,62 @@ def _kept_spec(backtest: Backtest, instrument: Instrument) -> InstrumentSpec:
     if backtest.instrument_spec is None:
         backtest.instrument_spec = spec_document(spec)
     return spec
+
+
+def _record_done(  # noqa: PLR0913 — one finished run and what it came to
+    session: Session,
+    backtest: Backtest,
+    *,
+    instrument: Instrument,
+    spec: InstrumentSpec,
+    trades: list[ClosedTrade],
+    metrics: EngineMetrics,
+    window: CandleWindow,
+) -> None:
+    """Write one finished run: what it keeps, its metrics in money and in R, what it read.
+
+    The one place a result is written — a run on its own (`process_backtest`) and each run of a
+    batch (`process_batch`) — so a batch cannot keep a run differently from how it keeps itself.
+    The caller commits.
+    """
+    # Every rung of the target ladder, scored now: a sweep's losing run keeps no trades, and
+    # without them this cannot be computed later (`backtest_metrics.targets`).
+    ladder = target_ladder(trades, spec)
+    # Decided here and stamped on the run, never re-derived later: see `Recorded`.
+    recorded = recorded_for(
+        in_sweep=backtest.sweep_id is not None,
+        timeframe=backtest.timeframe,
+        net_profit=metrics.net_profit,
+        total_trades=metrics.total_trades,
+        target_net_r=[None if rung is None else rung.net_r for rung in ladder.values()],
+        reserved_test=backtest.sweep is not None and backtest.sweep.holdout_rule is not None,
+    )
+    metrics_row, trade_rows = to_rows(
+        trades=trades,
+        metrics=metrics,
+        backtest_id=backtest.id,
+        instrument_id=instrument.id,
+        recorded=recorded,
+    )
+    metrics_row.targets = ladder_row(ladder)
+    # The run's risk in R, for every run — its trades may not be kept (`r_metrics`).
+    in_r = r_metrics(trades)
+    metrics_row.net_r = in_r.net_r
+    metrics_row.max_drawdown_r = in_r.max_drawdown_r
+    metrics_row.losing_streak = in_r.losing_streak
+    metrics_row.losing_streak_r = in_r.losing_streak_r
+    metrics_row.positive_year_share = in_r.positive_year_share
+    metrics_row.yearly_r = {str(year): str(r) for year, r in sorted(in_r.yearly_r.items())}
+    backtest.recorded = recorded
+    session.add(metrics_row)
+    session.add_all(trade_rows)
+    # Recorded on the run, not derived later: the Parquet underneath can be re-collected
+    # or extended, and then "what this run read" stops being answerable from the dataset.
+    backtest.candles_seen = window.candles
+    backtest.first_candle = window.first
+    backtest.last_candle = window.last
+    backtest.status = BacktestStatus.DONE
+    backtest.finished_at = _now()
 
 
 async def process_backtest(  # noqa: PLR0913 — keyword-only; each names one thing the run needs
@@ -183,44 +252,15 @@ async def process_backtest(  # noqa: PLR0913 — keyword-only; each names one th
             record_snapshots=not in_sweep,
         )
 
-        # Every rung of the target ladder, scored now: a sweep's losing run keeps no trades, and
-        # without them this cannot be computed later (`backtest_metrics.targets`).
-        ladder = target_ladder(trades, spec)
-        # Decided here and stamped on the run, never re-derived later: see `Recorded`.
-        recorded = recorded_for(
-            in_sweep=in_sweep,
-            timeframe=backtest.timeframe,
-            net_profit=metrics.net_profit,
-            total_trades=metrics.total_trades,
-            target_net_r=[None if rung is None else rung.net_r for rung in ladder.values()],
-            reserved_test=backtest.sweep is not None and backtest.sweep.holdout_rule is not None,
-        )
-        metrics_row, trade_rows = to_rows(
+        _record_done(
+            session,
+            backtest,
+            instrument=instrument,
+            spec=spec,
             trades=trades,
             metrics=metrics,
-            backtest_id=backtest.id,
-            instrument_id=instrument.id,
-            recorded=recorded,
+            window=window,
         )
-        metrics_row.targets = ladder_row(ladder)
-        # The run's risk in R, for every run — its trades may not be kept (`r_metrics`).
-        in_r = r_metrics(trades)
-        metrics_row.net_r = in_r.net_r
-        metrics_row.max_drawdown_r = in_r.max_drawdown_r
-        metrics_row.losing_streak = in_r.losing_streak
-        metrics_row.losing_streak_r = in_r.losing_streak_r
-        metrics_row.positive_year_share = in_r.positive_year_share
-        metrics_row.yearly_r = {str(year): str(r) for year, r in sorted(in_r.yearly_r.items())}
-        backtest.recorded = recorded
-        session.add(metrics_row)
-        session.add_all(trade_rows)
-        # Recorded on the run, not derived later: the Parquet underneath can be re-collected
-        # or extended, and then "what this run read" stops being answerable from the dataset.
-        backtest.candles_seen = window.candles
-        backtest.first_candle = window.first
-        backtest.last_candle = window.last
-        backtest.status = BacktestStatus.DONE
-        backtest.finished_at = _now()
         session.commit()
         await _announce(redis, backtest_id, {"status": "done", "progress": 1.0})
 
@@ -236,6 +276,197 @@ async def process_backtest(  # noqa: PLR0913 — keyword-only; each names one th
         session.rollback()
         _record_failure(session, backtest_id, exc)
         await _announce(redis, backtest_id, {"status": "failed", "error": _reason(exc)})
+
+
+async def process_batch(  # noqa: PLR0913 — keyword-only; each names one thing the batch needs
+    *,
+    session: Session,
+    redis: Redis,
+    parquet_root: Path,
+    run_ids: Sequence[uuid.UUID],
+    retry_unreachable: bool = True,
+    read: CandleReader = read_candles,
+) -> None:
+    """Run a batch of runs over one market together, the market read once per bar (ADR-0029).
+
+    ⚠️ **A batch refuses to guess.** Its runs are meant to share a symbol, a chart, a window, an
+    instrument and a reading of the market (`batching.batch_key`); if they do not — a hand-made
+    job, a row changed since the launch — each runs on its own through `process_backtest`,
+    which is slower and always right. Runs already finished are skipped, so a batch handed back
+    after a worker died picks up where it was.
+
+    ⚠️ **Each run's result is its own.** A run whose document will not compile, or that raised,
+    fails alone with its reason; the others are written as they finish (`_record_done`).
+    """
+    runs = [
+        run
+        for run in (session.get(Backtest, run_id) for run_id in run_ids)
+        if run is not None and run.status not in (BacktestStatus.DONE, BacktestStatus.FAILED)
+    ]
+    if not runs:
+        return
+    first = runs[0]
+    instrument = session.get(Instrument, first.instrument_id)
+    strategies = [session.get(Strategy, run.strategy_id) for run in runs]
+    keys = {
+        None if strategy is None else shared_reading_of(strategy.definition, first.timeframe)
+        for strategy in strategies
+    }
+    one_market = (
+        instrument is not None
+        and len(keys) == 1
+        and None not in keys
+        and all(
+            (run.instrument_id, run.timeframe, run.date_from, run.date_to)
+            == (first.instrument_id, first.timeframe, first.date_from, first.date_to)
+            for run in runs
+        )
+    )
+    specs = [_kept_spec(run, instrument) for run in runs] if instrument is not None else []
+    if not one_market or len(set(specs)) != 1:
+        session.rollback()
+        for run in runs:
+            await process_backtest(
+                session=session,
+                redis=redis,
+                parquet_root=parquet_root,
+                backtest_id=run.id,
+                retry_unreachable=retry_unreachable,
+                read=read,
+            )
+        return
+    assert instrument is not None  # noqa: S101 — `one_market` says so
+    (key,) = keys
+    assert key is not None  # noqa: S101 — `one_market` says so
+
+    ids = [run.id for run in runs]
+    try:
+        started = _now()
+        for run in runs:
+            run.status = BacktestStatus.RUNNING
+            run.started_at = started
+        session.commit()
+        for run_id in ids:
+            await _announce(redis, run_id, {"status": "running", "progress": 0.0})
+
+        candles = read(parquet_root, instrument.symbol, first.timeframe)
+        outcomes = execute_batch(
+            key=key,
+            runs=[
+                BatchRun(
+                    definition=strategy.definition,
+                    initial_capital=run.initial_capital,
+                    cost_model=run.cost_model,
+                )
+                for run, strategy in zip(runs, strategies, strict=True)
+                if strategy is not None
+            ],
+            instrument=specs[0],
+            timeframe=first.timeframe,
+            date_from=first.date_from,
+            date_to=first.date_to,
+            candles=candles,
+        )
+        for run, spec, outcome in zip(runs, specs, outcomes, strict=True):
+            await _write_one(
+                session,
+                redis,
+                run,
+                instrument=instrument,
+                spec=spec,
+                outcome=outcome,
+                retry_unreachable=retry_unreachable,
+            )
+    except DBAPIError as exc:
+        if retry_unreachable and database_unreachable(exc):
+            raise
+        session.rollback()
+        await _fail_open(session, redis, ids, exc)
+    except Exception as exc:  # noqa: BLE001 — a failed batch is recorded on its runs, not a crash
+        session.rollback()
+        await _fail_open(session, redis, ids, exc)
+    except BaseException as exc:
+        # ⚠️ **Cancelled by arq's timeout, or the worker told to stop** (27/09). The batch is
+        # synchronous CPU, so arq's `wait_for` only lands on the first `await` after it — in the
+        # middle of writing the runs. Left alone, the runs not yet written would stay `running`
+        # for good, with nothing to close them; they are failed with the reason, and the
+        # cancellation goes on up.
+        session.rollback()
+        await _fail_open(session, redis, ids, RuntimeError(f"the batch was stopped: {exc!r}"))
+        raise
+
+
+async def _write_one(  # noqa: PLR0913 — one run of a batch and what it came to
+    session: Session,
+    redis: Redis,
+    run: Backtest,
+    *,
+    instrument: Instrument,
+    spec: InstrumentSpec,
+    outcome: Measured | Exception,
+    retry_unreachable: bool,
+) -> None:
+    """Write one run of a batch: its failure, or its result — its own, whatever the others did.
+
+    ⚠️ **One run's write failing is that run's failure only**: rolled back and recorded on it, and
+    the next run is written as if nothing happened. An unreachable database is not a run's
+    failure, and goes up to be retried.
+    """
+    if isinstance(outcome, Exception):
+        _record_failure(session, run.id, outcome)
+        await _announce(redis, run.id, {"status": "failed", "error": _reason(outcome)})
+        return
+    trades, metrics, window = outcome
+    try:
+        _record_done(
+            session,
+            run,
+            instrument=instrument,
+            spec=spec,
+            trades=trades,
+            metrics=metrics,
+            window=window,
+        )
+        session.commit()
+    except DBAPIError as exc:
+        if retry_unreachable and database_unreachable(exc):
+            raise
+        session.rollback()
+        _record_failure(session, run.id, exc)
+        await _announce(redis, run.id, {"status": "failed", "error": _reason(exc)})
+        return
+    except Exception as exc:  # noqa: BLE001 — this run's failure, not the batch's
+        session.rollback()
+        _record_failure(session, run.id, exc)
+        await _announce(redis, run.id, {"status": "failed", "error": _reason(exc)})
+        return
+    await _announce(redis, run.id, {"status": "done", "progress": 1.0})
+
+
+async def _fail_open(
+    session: Session, redis: Redis, ids: Sequence[uuid.UUID], exc: BaseException
+) -> None:
+    """Fail every run of the batch not yet finished, and say so to whoever is watching it."""
+    reason = _reason(exc) if isinstance(exc, Exception) else repr(exc)
+    for run_id in ids:
+        run = session.get(Backtest, run_id)
+        if run is None or run.status in (BacktestStatus.DONE, BacktestStatus.FAILED):
+            continue
+        _record_failure(
+            session, run_id, exc if isinstance(exc, Exception) else RuntimeError(reason)
+        )
+        with contextlib.suppress(Exception):
+            await _announce(redis, run_id, {"status": "failed", "error": reason})
+
+
+def shared_reading_of(
+    definition: Mapping[str, Any], timeframe: str
+) -> tuple[dt.timedelta | None, dt.timedelta] | None:
+    """The reading of the market a stored document's setup shares (`shared_reading`), if any."""
+    setup = definition.get("setup")
+    if not isinstance(setup, Mapping):
+        return None
+    return shared_reading(setup, timeframe=step(timeframe))
 
 
 # --------------------------------------------------------------------------- #
@@ -485,6 +716,13 @@ def _reason(exc: Exception) -> str:
 
 WAIT_POLL_SECONDS = 30
 
+BATCH_TIMEOUT_SECONDS = 2 * 60 * 60
+"""How long one batch may run before arq ends it — a ceiling for a batch stuck, not an estimate.
+
+⚠️ **Well above any batch, on purpose.** arq also keeps a job "in progress" for this long plus ten
+seconds; a batch still computing past it would be handed to a second worker and run twice. The
+batches are sized so none comes near it (`batching.batch_size`): a batch of M5 is minutes."""
+
 OFF_GRACE = dt.timedelta(minutes=2)
 """How long a run waits for a download before an agent that is not running gives it up.
 
@@ -680,6 +918,35 @@ def _discard(session: Session) -> None:
     session.close()
 
 
+async def run_backtest_batch(ctx: dict[str, Any], run_ids: list[str]) -> None:
+    """The batch job (`batching`, ADR-0029). An unreachable database is handed back to arq, as a
+    single run's is; on the last try it is recorded on every run still open."""
+    session: Session = ctx["session_factory"]()
+    settings: Settings = ctx["settings"]
+    ids = [uuid.UUID(one) for one in run_ids]
+    try:
+        await process_batch(
+            session=session,
+            redis=ctx["redis"],
+            parquet_root=settings.parquet_root,
+            run_ids=ids,
+            retry_unreachable=ctx.get("job_try", 1) < MAX_TRIES,
+            read=ctx["candles"].read,
+        )
+    except DBAPIError as exc:
+        job_try: int = ctx.get("job_try", 1)
+        if database_unreachable(exc) and job_try < MAX_TRIES:
+            raise Retry(defer=retry_delay(job_try)) from exc
+        _discard(session)
+        last = ctx["session_factory"]()
+        try:
+            await _fail_open(last, ctx["redis"], ids, exc)
+        finally:
+            _discard(last)
+    finally:
+        _discard(session)
+
+
 async def run_walk_forward(ctx: dict[str, Any], walk_forward_id: str) -> None:
     """The registered orchestrating job — one per walk-forward, never one per run.
 
@@ -751,15 +1018,18 @@ async def run_template_queue(ctx: dict[str, Any], template_id: str) -> None:
         # Collected by itself unless the host agent is off (26/09) — then the market runs on what
         # is on disk, as any launch does.
         collect = await collector_running(ctx["redis"])
-        runs, collections, pending = advance_queue(session, uuid.UUID(template_id), collect=collect)
-        run_ids = [str(one) for one in runs]
+        jobs, collections, pending = advance_queue(
+            session,
+            uuid.UUID(template_id),
+            collect=collect,
+            batch=ctx["settings"].tradeforge_batch,
+        )
         collection_ids = [str(one.id) for one in collections]
     finally:
         session.close()
     for collection_id in collection_ids:
         await ctx["redis"].enqueue_job(COLLECT_RANGE, collection_id, _queue_name=COLLECT_QUEUE)
-    for run_id in run_ids:
-        await ctx["redis"].enqueue_job(RUN_BACKTEST, run_id, _job_id=run_id)
+    await enqueue_runs(ctx["redis"], jobs)
     if pending:
         await ctx["redis"].enqueue_job(
             RUN_TEMPLATE_QUEUE, template_id, _defer_by=dt.timedelta(seconds=60)
@@ -787,6 +1057,9 @@ class WorkerSettings:
     # that function alone. The walk-forward keeps arq's default: it does not raise `Retry`.
     functions = (
         func(run_backtest, max_tries=MAX_TRIES),
+        # ⚠️ **Its own timeout** (ADR-0029): arq's default is five minutes, and twenty-four M5 runs
+        # take about a minute and a half here — three times that on the Xeon's slower cores.
+        func(run_backtest_batch, max_tries=MAX_TRIES, timeout=BATCH_TIMEOUT_SECONDS),
         run_walk_forward,
         run_cluster,
         run_sweep_walk_forward,
@@ -816,8 +1089,10 @@ __all__ = [
     "WorkerSettings",
     "database_unreachable",
     "process_backtest",
+    "process_batch",
     "process_walk_forward",
     "retry_delay",
     "run_backtest",
+    "run_backtest_batch",
     "run_walk_forward",
 ]

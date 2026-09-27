@@ -23,6 +23,7 @@ did — which is why a hole is always written down, never merely left.
 
 import asyncio
 import datetime as dt
+import functools
 import secrets
 import threading
 import uuid
@@ -37,6 +38,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import InstrumentedAttribute, Session, defer, selectinload
 
 from tradeforge_api import sweep_dashboard as dashboard
+from tradeforge_api.batching import Batcher, batch_key, enqueue_runs, runs_in
 from tradeforge_api.config import Settings
 from tradeforge_api.coverage import describe, to_collect, uncovered_markets
 from tradeforge_api.deps import CollectorDep, QueueDep, SessionDep, SettingsDep
@@ -396,7 +398,11 @@ def _preview(
     responses={**_NOT_FOUND, **_BAD_BODY},
 )
 async def create_sweep(
-    request: CreateSweep, session: SessionDep, queue: QueueDep, collector: CollectorDep
+    request: CreateSweep,
+    session: SessionDep,
+    queue: QueueDep,
+    collector: CollectorDep,
+    settings: SettingsDep,
 ) -> CreatedSweep:
     """Write the sweep, its strategies and its runs in one transaction, then enqueue.
 
@@ -419,8 +425,8 @@ async def create_sweep(
     # Nothing is planned while the host agent is off: the runs read what is on disk (26/09).
     if request.collect_missing and not collector.alive():
         request = request.model_copy(update={"collect_missing": False})
-    sweep, run_ids, collections, shared_count, skipped = await asyncio.to_thread(
-        launch_sweep, session, request
+    sweep, jobs, collections, shared_count, skipped = await asyncio.to_thread(
+        functools.partial(launch_sweep, session, request, batch=settings.tradeforge_batch)
     )
 
     # ⚠️ After the commit, and with the run's own id as the job id. A worker is fast enough to
@@ -432,10 +438,9 @@ async def create_sweep(
     # `queued` with its runs deferring until the queue has been silent for `WAIT_LIMIT`.
     for collection in collections:
         await queue.enqueue_job(COLLECT_RANGE, str(collection.id), _queue_name=COLLECT_QUEUE)
-    for run_id in run_ids:
-        await queue.enqueue_job(RUN_BACKTEST, str(run_id), _job_id=str(run_id))
+    await enqueue_runs(queue, jobs)
 
-    return CreatedSweep(id=sweep.id, runs=len(run_ids), shared=shared_count, skipped=skipped)
+    return CreatedSweep(id=sweep.id, runs=runs_in(jobs), shared=shared_count, skipped=skipped)
 
 
 LAUNCH_BLOCK = 2000
@@ -446,11 +451,16 @@ whatever the grid's size (26/09)."""
 
 
 def launch_sweep(
-    session: Session, request: CreateSweep, *, template_id: uuid.UUID | None = None
-) -> tuple[Sweep, list[uuid.UUID], list[Collection], int, list[UncoveredMarket]]:
+    session: Session,
+    request: CreateSweep,
+    *,
+    template_id: uuid.UUID | None = None,
+    batch: bool = True,
+) -> tuple[Sweep, list[list[uuid.UUID]], list[Collection], int, list[UncoveredMarket]]:
     """Decide, write and commit a sweep — the endpoint's body, shared with a template's queue
-    (`sweep_templates`, 26/09), which launches one market at a time. Returns the ids of the runs
-    to queue; the caller queues them and the collections. Refusals are `HTTPException`s with the
+    (`sweep_templates`, 26/09), which launches one market at a time. Returns the runs to queue as
+    jobs — a batch of runs over one market, or a run alone (`batching`, ADR-0029); the caller
+    queues them (`enqueue_runs`) and the collections. Refusals are `HTTPException`s with the
     sentence a person reads, raised before the commit — nothing of a refused sweep is kept.
 
     ⚠️ **Written in blocks as the grid streams past, committed once** (26/09). A grid of 435
@@ -535,6 +545,7 @@ def launch_sweep(
         found=found,
         costs=costs,
         collectable=collectable,
+        batch=batch,
     )
     for stream in streams:
         for doc in stream:
@@ -567,7 +578,7 @@ def launch_sweep(
             detail="another sweep created these strategies at the same time; try again",
         ) from exc
 
-    return sweep, writer.run_ids, writer.collections, writer.followers, skipped
+    return sweep, writer.batches.jobs(), writer.collections, writer.followers, skipped
 
 
 INSERT_ROWS = 500
@@ -610,6 +621,7 @@ class _SweepWriter:
         found: dict[str, Instrument],
         costs: dict[str, dict[str, Any]],
         collectable: dict[tuple[str, str], PlannedCollection],
+        batch: bool = True,
     ) -> None:
         self._session = session
         self._sweep = sweep
@@ -625,6 +637,9 @@ class _SweepWriter:
         self._position = 0
         self._downloads: dict[tuple[str, str], list[Collection]] = {}
         self.run_ids: list[uuid.UUID] = []
+        # ⚠️ **The jobs, cut as the runs are written** (ADR-0029): runs over one market go to a
+        # worker together. A run waiting for a download goes alone — its wait is per run.
+        self.batches = Batcher(enabled=batch)
         self.collections: list[Collection] = []
         self.charts: set[str] = set()
         self.runnable = 0
@@ -682,7 +697,12 @@ class _SweepWriter:
                 for symbol in self._markets[doc.timeframe]:
                     run_id = uuid.uuid4()
                     runs.append(self._run(run_id, doc, strategy_id, symbol))
-                    links += self._links(run_id, symbol, doc.timeframe)
+                    waits = self._links(run_id, symbol, doc.timeframe)
+                    links += waits
+                    self.batches.add(
+                        run_id,
+                        None if waits else batch_key(doc.document, symbol, doc.timeframe),
+                    )
                 continue
             owner = self._owners[key]
             if owner is None:

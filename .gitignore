@@ -2,6 +2,8 @@
 .env
 .env.*
 !.env.example
+# The remote workers' settings (docker-compose.worker.yml): the database password.
+worker.env
 
 # --- Python ---
 __pycache__/

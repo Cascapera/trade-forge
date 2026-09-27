@@ -1,0 +1,47 @@
+# Backtest workers on another machine (26/09) — nothing else. They drain the same Redis queue and
+# write to the same Postgres as the main stack, which stays on the machine that runs it.
+#
+#   docker compose -f docker-compose.worker.yml --env-file worker.env up -d --build
+#
+# Copy worker.env.example to worker.env and fill it in. The step by step, in Portuguese, is
+# docs/referencia/worker-remoto.md.
+#
+# ⚠️ **The same commit as the main stack's workers.** A run records `ENGINE_VERSION`, and two
+# engines answering the same queue would put two answers under one sweep. Check out the commit the
+# main machine's Docker was built from before building here.
+#
+# ⚠️ **The candles are read from this machine's disk**, into each worker's memory once per series
+# (`candle_cache`), then reused for every run after it. Copy `data/ohlcv` over and point
+# TRADEFORGE_CANDLES at it; copy again after a collection on the main machine — a worker notices
+# the files changed and reads them again.
+
+name: tradeforge-remote
+
+services:
+  worker:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    # ⚠️ Not `tradeforge-api`: run here by mistake on the main machine, a build under that name
+    # would replace the image its own workers are recreated from.
+    image: tradeforge-worker-remote
+    command: ['arq', 'tradeforge_api.worker.WorkerSettings']
+    environment:
+      # The main machine, where Postgres and Redis are published (docker-compose.yml `ports:`).
+      POSTGRES_HOST: ${TRADEFORGE_HOST:?set TRADEFORGE_HOST in worker.env — the main machine's IP}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5433}
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in worker.env}
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in worker.env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in worker.env}
+      REDIS_HOST: ${TRADEFORGE_HOST}
+      REDIS_PORT: ${REDIS_PORT:-6379}
+      PARQUET_ROOT: /data/ohlcv
+    # One core per worker, as on the main machine: a backtest is synchronous CPU, one at a time.
+    deploy:
+      replicas: ${TRADEFORGE_WORKERS:-1}
+      resources:
+        limits:
+          cpus: '1'
+    volumes:
+      - ${TRADEFORGE_CANDLES:-./data/ohlcv}:/data/ohlcv:ro
+    restart: unless-stopped

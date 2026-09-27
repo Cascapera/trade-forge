@@ -17,6 +17,7 @@ from hypothesis import strategies as st
 
 from tradeforge_engine.domain import Candle, Side
 from tradeforge_engine.higher_timeframe import (
+    BarAggregator,
     HigherTimeframeGate,
     Release,
     _innermost,
@@ -179,6 +180,16 @@ class _WalkingGate(HigherTimeframeGate):
     """The gate's `observe` as it was before 24/09, kept as the oracle: every region the detector
     holds is asked about on every base bar."""
 
+    def __init__(self, *, base: dt.timedelta, target: dt.timedelta, offset: dt.timedelta) -> None:
+        # ⚠️ The whole of the old gate's state in one object, as before the split into
+        # `RegionTracker` and releases (27/09): the oracle is the unsplit gate, not the new one.
+        self._bars = BarAggregator(base=base, target=target, offset=offset)
+        self._structure = MarketStructure()
+        self._blocks = OrderBlockDetector()
+        self._touched: set[OrderBlock] = set()
+        self._untouched: list[OrderBlock] = []
+        self._releases: dict[Side, Release] = {}
+
     def observe(self, candle: Candle) -> None:
         for higher in self._bars.update(candle):
             self._blocks.update(higher, self._structure.update(higher))
@@ -226,4 +237,4 @@ class TestTheGateReleasesWhatTheWalkReleased:
                     side = Side.LONG if index % 2 else Side.SHORT
                     gate.spend(side)
                     walking.spend(side)
-                assert gate._touched == walking._touched
+                assert gate._regions._touched == walking._touched

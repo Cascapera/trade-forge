@@ -233,40 +233,21 @@ class Release:
     opened_at: dt.datetime
 
 
-class HigherTimeframeGate:
-    """His filter: may a zone of the base timeframe be armed, given the regions above it?
+class RegionTracker:
+    """The higher timeframe's regions and which of them the base bars have reached — nothing more.
 
-    Fed every base bar through `observe`, **before** anything asks it a question on that bar. It
-    assembles the higher-timeframe bars, runs his structure and region detectors on them — the
-    same two objects the setup runs on its own bars — and keeps, per side, whether the search is
-    open and which region opened it.
+    ⚠️ **Pure: a function of the base bars, the higher timeframe and the broker's clock alone**
+    (ADR-0029). Nothing a setup does — arming, spending a side, a refusal — reaches it; those
+    live in `HigherTimeframeGate`, which reads this. That is what lets one tracker be read by
+    many runs of a sweep over the same market, and why it was split out of the gate (27/09).
 
-    **The touch is read on the base bar, not on the higher one.** The detector above marks a
-    region mitigated when the H4 bar that reached it closes, up to sixteen M15 bars after the
-    wick that did it. Releasing the M15 on that schedule would release it late; so this class
-    keeps its own record of which regions have been reached, at the base bar's resolution, and
-    reads the detector only for which regions exist. The two agree on *whether* a region was
-    taken, and disagree only about *when* — which is the whole reason for the second record.
+    Fed every base bar through `observe`, which assembles the bars above, runs his structure and
+    region detectors on them, and records the regions this bar reached (`reached`) at the base
+    bar's resolution — the gate says why the touch is read there and not on the higher bar.
 
-    **One release per region, ever.** A region enters `_touched` on the bar that reaches it and
-    never leaves, so the same region cannot release the base timeframe twice — his answer 1, and
-    a set that is only ever asked about membership, so nothing about its order can reach a result
-    (`AGENTS.md §5.2`).
-
-    **The reference is the region price is at; the release keeps its first bar.** Released by
-    region A and, still without an entry, price reaches region B below it: the search stays open,
-    B is now the region the two heights and the break are measured from, and *from that bar on*
-    still means from the touch of A — the side has been released since then, and a break that
-    confirmed between the two touches was a reaction to a region price had come to. Price is
-    working B, not A; ending the search at A's far edge plus two heights while price sits in B
-    would be ending it on a region price has already left. Several regions reached on one bar —
-    his impulse leaves a primary and a secondary, and one bar can fall through both — spend all
-    of them and leave the **innermost** as the reference, the one the bar's extreme is in.
-    Measured, not reasoned: with the newer region as the reference the very first scenario probed
-    released and ended on the same bar, because that bar had closed through the secondary on its
-    way down to the primary. A region reached and closed through on the same bar spends itself
-    and releases nothing. Both were readings of ours, and both are his answers since 2026-09-09
-    (*"1 - correto / 2 - correto"*).
+    **One touch per region, ever.** A region enters `_touched` on the bar that reaches it and never
+    leaves, so the same region is reported as reached once — his answer 1, and a set that is only
+    ever asked about membership, so nothing about its order can reach a result (`AGENTS.md §5.2`).
     """
 
     def __init__(self, *, base: dt.timedelta, target: dt.timedelta, offset: dt.timedelta) -> None:
@@ -280,7 +261,7 @@ class HigherTimeframeGate:
         # CHOCH run with an H4 gate (24/09). The detector's list only changes when a higher bar
         # offers a region, so this is rebuilt there, and shrinks on the bar a region is reached.
         self._untouched: list[OrderBlock] = []
-        self._releases: dict[Side, Release] = {}
+        self._reached: dict[Side, list[OrderBlock]] = {}
 
     @property
     def timeframe(self) -> dt.timedelta:
@@ -296,21 +277,29 @@ class HigherTimeframeGate:
     def zones(self) -> tuple[TrackedZone, ...]:
         """Every region the higher timeframe has offered, oldest first — the detector's own view.
 
-        ⚠️ `mitigated` here is on the higher timeframe's schedule; whether a region has *released*
-        the base timeframe is this class's own record, and a region can be released here and still
-        read as standing there until its H4 bar closes.
+        ⚠️ `mitigated` here is on the higher timeframe's schedule; whether a region has been
+        *reached* at the base bar's resolution is this class's own record, and a region can be
+        reached here and still read as standing there until its H4 bar closes.
         """
         return self._blocks.zones
 
-    def observe(self, candle: Candle) -> None:
-        """Fold in one closed base bar: assemble the bar above, then read this bar against it.
+    @property
+    def reached(self) -> dict[Side, list[OrderBlock]]:
+        """The regions the last observed base bar reached for the first time, per side, oldest
+        offered first. Empty on a bar that reached none.
 
-        Order matters and is deliberate. The higher bar is completed first, so a region revealed
-        by the H4 that closed on this very base bar is already known when this bar is read against
-        it — that is the earliest his chart would show it, and this bar's own low is part of that
-        H4's low, so the detector will not offer a region this bar already took. Then the touches,
-        then the endings: a bar that reaches a new region and runs two heights past it in one go
-        releases and ends on the same call, which is what his rule says about that bar.
+        ⚠️ Read, never written: the gate builds its releases from it, and a tracker read by several
+        runs hands each of them this same mapping.
+        """
+        return self._reached
+
+    def observe(self, candle: Candle) -> None:
+        """Fold in one closed base bar: assemble the bar above, then record what this bar reached.
+
+        The higher bar is completed first, so a region revealed by the H4 that closed on this very
+        base bar is already known when this bar is read against it — that is the earliest his
+        chart would show it, and this bar's own low is part of that H4's low, so the detector will
+        not offer a region this bar already took.
         """
         changed = False
         for bar in self._bars.update(candle):
@@ -344,7 +333,73 @@ class HigherTimeframeGate:
             reached.setdefault(block.side, []).append(block)
         if reached:
             self._untouched = [block for block in self._untouched if block not in self._touched]
-        for side, blocks in reached.items():
+        self._reached = reached
+
+
+class HigherTimeframeGate:
+    """His filter: may a zone of the base timeframe be armed, given the regions above it?
+
+    Fed every base bar through `observe`, **before** anything asks it a question on that bar. It
+    reads the regions above and what each base bar reached from its `RegionTracker` — the same
+    two detectors the setup runs on its own bars, on the higher bars — and keeps, per side,
+    whether the search is open and which region opened it. The tracker is pure; what this class
+    keeps is not: a side is spent by the setup's arming and handed back by a refusal (ADR-0029).
+
+    **The touch is read on the base bar, not on the higher one.** The detector above marks a
+    region mitigated when the H4 bar that reached it closes, up to sixteen M15 bars after the
+    wick that did it. Releasing the M15 on that schedule would release it late; so this class
+    keeps its own record of which regions have been reached, at the base bar's resolution, and
+    reads the detector only for which regions exist. The two agree on *whether* a region was
+    taken, and disagree only about *when* — which is the whole reason for the second record.
+
+    **One release per region, ever.** The tracker reports a region as reached once, on the bar
+    that first reaches it — his answer 1.
+
+    **The reference is the region price is at; the release keeps its first bar.** Released by
+    region A and, still without an entry, price reaches region B below it: the search stays open,
+    B is now the region the two heights and the break are measured from, and *from that bar on*
+    still means from the touch of A — the side has been released since then, and a break that
+    confirmed between the two touches was a reaction to a region price had come to. Price is
+    working B, not A; ending the search at A's far edge plus two heights while price sits in B
+    would be ending it on a region price has already left. Several regions reached on one bar —
+    his impulse leaves a primary and a secondary, and one bar can fall through both — spend all
+    of them and leave the **innermost** as the reference, the one the bar's extreme is in.
+    Measured, not reasoned: with the newer region as the reference the very first scenario probed
+    released and ended on the same bar, because that bar had closed through the secondary on its
+    way down to the primary. A region reached and closed through on the same bar spends itself
+    and releases nothing. Both were readings of ours, and both are his answers since 2026-09-09
+    (*"1 - correto / 2 - correto"*).
+    """
+
+    def __init__(self, *, base: dt.timedelta, target: dt.timedelta, offset: dt.timedelta) -> None:
+        self._regions = RegionTracker(base=base, target=target, offset=offset)
+        self._releases: dict[Side, Release] = {}
+
+    @property
+    def timeframe(self) -> dt.timedelta:
+        """How long one bar of the higher timeframe lasts."""
+        return self._regions.timeframe
+
+    @property
+    def offset(self) -> dt.timedelta:
+        """How far the broker's clock runs ahead of UTC — where its bars are cut."""
+        return self._regions.offset
+
+    @property
+    def zones(self) -> tuple[TrackedZone, ...]:
+        """Every region the higher timeframe has offered, oldest first (`RegionTracker.zones`)."""
+        return self._regions.zones
+
+    def observe(self, candle: Candle) -> None:
+        """Fold in one closed base bar: the tracker reads it, then the releases follow.
+
+        Order matters and is deliberate: the regions first (`RegionTracker.observe`), then the
+        touches become releases, then the endings — a bar that reaches a new region and runs two
+        heights past it in one go releases and ends on the same call, which is what his rule says
+        about that bar.
+        """
+        self._regions.observe(candle)
+        for side, blocks in self._regions.reached.items():
             # A side already released keeps the bar that released it: *from that bar on* is
             # counted from the first region price came to, and only the reference moves. A region
             # reached and closed through on this same bar opens a release here and loses it in
@@ -454,5 +509,6 @@ __all__ = [
     "MAX_SERVER_OFFSET",
     "BarAggregator",
     "HigherTimeframeGate",
+    "RegionTracker",
     "Release",
 ]

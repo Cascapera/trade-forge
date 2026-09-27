@@ -77,10 +77,9 @@ from tradeforge_engine.domain import (
 )
 from tradeforge_engine.errors import EngineError
 from tradeforge_engine.higher_timeframe import HigherTimeframeGate, Release
+from tradeforge_engine.reading import MarketReading
 from tradeforge_engine.structure import (
-    MarketStructure,
     OrderBlock,
-    OrderBlockDetector,
     StructureBreak,
     StructureKind,
     TrackedZone,
@@ -2126,6 +2125,7 @@ class StructureStrategy:
         htf_offset: dt.timedelta | None = None,
         timeframe: dt.timedelta | None = None,
         side: Side | None = None,
+        reading: MarketReading | None = None,
     ) -> None:
         if stop_buffer < ZERO:
             raise ValueError(f"stop buffer is a fraction of the zone width, got {stop_buffer}")
@@ -2156,13 +2156,28 @@ class StructureStrategy:
         # above already guarantees a filter has one, so no test can tell this from `if htf is
         # None`; what needs it is `mypy --strict`, which narrows `timeframe` to non-`None` only
         # where it can see the check.
+        # ⚠️ **The market is read by a `MarketReading`: this setup's own, or one handed in**
+        # (ADR-0029). Handed in, it is a batch's — advanced once per bar by the batch's leader and
+        # read by every run of it — and this setup only reads it; its own it advances itself, the
+        # same objects in the same order as before 27/09. Either way what it reads is pure, so a
+        # run reads the same market whichever reading it was given.
+        offset = dt.timedelta(0) if htf_offset is None else htf_offset
+        self._owns_reading = reading is None
+        if reading is None:
+            reading = MarketReading(timeframe=timeframe, htf=htf, htf_offset=offset)
+        elif (reading.regions is None) != (htf is None) or (
+            reading.regions is not None
+            and (reading.regions.timeframe, reading.regions.offset) != (htf, offset)
+        ):
+            raise ValueError(
+                "a shared market reading has to read the timeframe this setup filters by"
+            )
+        self._reading = reading
         self._gate = (
             None
             if htf is None or timeframe is None
             else HigherTimeframeGate(
-                base=timeframe,
-                target=htf,
-                offset=dt.timedelta(0) if htf_offset is None else htf_offset,
+                base=timeframe, target=htf, offset=offset, regions=reading.regions
             )
         )
 
@@ -2193,8 +2208,10 @@ class StructureStrategy:
         self._entry_point = entry_point
         self._breakeven_at_r = breakeven_at_r
 
-        self._structure = MarketStructure()
-        self._blocks = OrderBlockDetector()
+        # The reading's own objects under the names the setup always used: read, never advanced
+        # here except through `self._reading.advance`.
+        self._structure = reading.structure
+        self._blocks = reading.blocks
         self._armed: _Armed | None = None
         self._armed_count = 0
         # Zones whose order became a trade. Membership only — never iterated — so it cannot
@@ -2255,16 +2272,24 @@ class StructureStrategy:
         )
         return above + tuple(_zone_mark(tracked) for tracked in self._blocks.zones)
 
+    def _read(self, candle: Candle) -> None:
+        """Advance this setup's own reading, or check that a shared one is at this bar."""
+        if self._owns_reading:
+            self._reading.advance(candle)
+        else:
+            self._reading.read_at(candle)
+
     def on_bar(self, context: Context) -> tuple[Signal, ...]:
         candle = context.candle
-        # The timeframe above reads this bar first, and on every bar. It answers `_may_arm`
-        # later on this same call, and a region above reached while a position is open has to
-        # be a release by the time the trade ends — so this runs ahead of the position branch
-        # below, which returns before anything else is asked.
+        # The market — and the timeframe above — reads this bar first, and on every bar. It
+        # answers `_may_arm` later on this same call, and a region above reached while a position
+        # is open has to be a release by the time the trade ends — so this runs ahead of the
+        # position branch below, which returns before anything else is asked.
+        self._read(candle)
         if self._gate is not None:
             self._gate.observe(candle)
-        break_ = self._structure.update(candle)
-        marked = self._blocks.update(candle, break_)
+        break_ = self._reading.break_
+        marked = self._reading.marked
 
         # ⚠️ **The refusal is read first, and one state makes it matter.** `_observe_fill`
         # falls back to "a position is open" as a sign that the armed order became a trade —

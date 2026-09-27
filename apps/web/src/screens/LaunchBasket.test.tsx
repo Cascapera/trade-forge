@@ -217,7 +217,7 @@ describe('LaunchBasket when data is missing', () => {
     )
   })
 
-  it('waits for an answer when something is missing, and runs with what there is on request', () => {
+  it('waits for an answer when nothing missing can be collected, and runs with what there is on request', () => {
     gate.plan.answer = [
       {
         symbol: 'GBPUSD',
@@ -226,13 +226,14 @@ describe('LaunchBasket when data is missing', () => {
         in_window: false,
         windows: [{ date_from: '2024-01-01T00:00:00Z', date_to: '2024-12-31T23:59:59.999999Z' }],
         time: null,
+        at_broker: false,
       },
     ]
     chosen()
     fireEvent.click(screen.getByRole('button', { name: /run 2 markets/i }))
 
     expect(screen.getByRole('region', { name: 'missing data' })).toHaveTextContent(
-      'GBPUSD H4 — never collected; would fetch 2024',
+      'GBPUSD H4 — never collected; not listed by the broker, cannot be collected',
     )
     expect(mutate).not.toHaveBeenCalled()
 
@@ -268,6 +269,7 @@ describe('LaunchBasket when data is missing', () => {
         in_window: false,
         windows: [{ date_from: '2024-01-01T00:00:00Z', date_to: '2024-12-31T23:59:59.999999Z' }],
         time: null,
+        at_broker: false,
       },
     ]
     chosen()
@@ -276,9 +278,9 @@ describe('LaunchBasket when data is missing', () => {
     expect(screen.getByRole('button', { name: 'Run with what there is' })).toBeInTheDocument()
   })
 
-  it('collects and runs in one press, letting the server plan every market', () => {
-    // ⚠️ One flag for the whole basket, and the server decides per market: the covered ones
-    // start at once, and only the others wait for their own downloads.
+  it('collects without asking, letting the server plan every market', () => {
+    // His rule of 26/09. ⚠️ One flag for the whole basket, and the server decides per market:
+    // the covered ones start at once, and only the others wait for their own downloads.
     gate.plan.answer = [
       {
         symbol: 'GBPUSD',
@@ -291,8 +293,8 @@ describe('LaunchBasket when data is missing', () => {
     ]
     chosen()
     fireEvent.click(screen.getByRole('button', { name: /run 2 markets/i }))
-    fireEvent.click(screen.getByRole('button', { name: 'Collect and run' }))
 
+    expect(screen.queryByRole('region', { name: 'missing data' })).not.toBeInTheDocument()
     expect(mutate).toHaveBeenCalledTimes(1)
     const payload = mutate.mock.calls[0]?.[0] as { collect_missing: boolean; symbols: string[] }
     expect(payload.collect_missing).toBe(true)
@@ -308,6 +310,7 @@ describe('LaunchBasket when data is missing', () => {
         in_window: false,
         windows: [{ date_from: '2024-01-01T00:00:00Z', date_to: '2024-12-31T23:59:59.999999Z' }],
         time: null,
+        at_broker: false,
       },
     ]
     chosen()

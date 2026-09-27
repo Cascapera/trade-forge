@@ -46,6 +46,8 @@ from tradeforge_db.models import (
 )
 from tradeforge_engine.domain import AssetClass
 
+from .collector_fakes import running
+
 pytestmark = pytest.mark.integration
 
 START = dt.datetime(2024, 1, 1, tzinfo=dt.UTC)
@@ -118,6 +120,7 @@ def _app(settings: Settings, session_factory: Callable[[], Session], tmp_path: P
         settings=settings.model_copy(update={"parquet_root": tmp_path}),
         session_factory=session_factory,
         arq_pool=_CapturingQueue(),
+        collector=running(),
     )
 
 
@@ -132,6 +135,9 @@ def _body(strategy_id: str, **overrides: Any) -> dict[str, Any]:
         "date_to": (START + 100 * HOUR).isoformat(),
         "initial_capital": "10000",
         "cost_model": {"type": "none"},
+        # Launches collect by themselves since 26/09; these tests name the answer "no", and
+        # the ones about collecting say "yes" out loud.
+        "collect_missing": False,
         "grid": {
             "setup.params.period": [5, 9, 20],
             "setup.params.breakeven_at_r": [1.0, 2.0],

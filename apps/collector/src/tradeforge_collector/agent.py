@@ -39,12 +39,15 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+import redis
 from arq.connections import RedisSettings
 
+from tradeforge_collector.alive import Heartbeat
 from tradeforge_collector.collect import DatabaseJournal, run_collection
 from tradeforge_collector.source import SymbolInfo
 from tradeforge_db.broker_symbols import BrokerSymbolEntry, replace_snapshot
-from tradeforge_db.collections import read_collection
+from tradeforge_db.collections import finish_collection, read_collection
+from tradeforge_db.models import BacktestStatus
 from tradeforge_db.session import create_db_engine, create_session_factory, session_scope
 from tradeforge_db.symbol_history import HistoryProbe, upsert_history
 
@@ -208,14 +211,37 @@ async def collect_range(_context: dict[str, Any], collection_id: str) -> int:
                 # the row that would have held the error is the row that is gone.
                 logger.warning("collection %s no longer exists", collection_id)
                 return 0
+            if request.status in _ENDED:
+                # ⚠️ Given up on while it waited (26/09): the agent was off, the backtest worker
+                # stopped waiting and ran on what was on disk, and wrote the reason here.
+                # Downloading it now would turn that `failed` into `done` under runs that never
+                # read it — the warning they carry would vanish while their window stayed short.
+                logger.info("collection %s already ended as %s", collection_id, request.status)
+                return 0
 
             # ⚠️ The class the requester supplied, or None to let the path decide. It reaches
             # the source rather than the database because `instrument()` is what needs it: 24
             # of this broker's 84 symbols file under roots `classify` refuses to guess at, and
             # without an override those symbols cannot be catalogued at all.
-            source = MT5Source(
-                server_offset=_stated_offset(), asset_class=request.asset_class
-            ).connect()
+            try:
+                source = MT5Source(
+                    server_offset=_stated_offset(), asset_class=request.asset_class
+                ).connect()
+            except ConnectionError as refused:
+                # ⚠️ **Written on the row, not only raised** (26/09). Raised alone, the row
+                # stayed `queued` for good — the connect is before `run_collection`, whose
+                # journal is what records a failure — and every run waiting on it sat two hours
+                # before failing. Failed here, the runs go ahead at once on what is on disk:
+                # his rule of 22/09 for a download that does not land.
+                finish_collection(
+                    session,
+                    request.id,
+                    at=dt.datetime.now(tz=dt.UTC),
+                    error=f"MetaTrader 5 is not reachable: {refused}",
+                )
+                session.commit()
+                logger.warning("collection %s failed: %s", collection_id, refused)
+                return 0
             try:
                 outcome = run_collection(
                     source,
@@ -247,6 +273,29 @@ async def collect_range(_context: dict[str, Any], collection_id: str) -> int:
             session.close()
     finally:
         engine.dispose()
+
+
+_ENDED = frozenset({BacktestStatus.DONE, BacktestStatus.FAILED})
+
+
+async def start_heartbeat(context: dict[str, Any]) -> None:
+    """arq's `on_startup`: say the agent is running, for as long as it is (`alive`)."""
+    # The same environment `redis_settings_from_env` reads; arq's type allows a host list (for
+    # Sentinel), which a plain client does not take.
+    client = redis.Redis(
+        host=os.environ.get("REDIS_HOST", "localhost"),
+        port=int(os.environ.get("REDIS_PORT", "6379")),
+    )
+    heartbeat = Heartbeat(client)
+    heartbeat.start()
+    context["heartbeat"] = heartbeat
+
+
+async def stop_heartbeat(context: dict[str, Any]) -> None:
+    """arq's `on_shutdown`: a clean stop is seen at once, not when the key expires."""
+    heartbeat = context.get("heartbeat")
+    if isinstance(heartbeat, Heartbeat):
+        heartbeat.stop()
 
 
 def data_root_from_env() -> Path:
@@ -312,3 +361,6 @@ class WorkerSettings:
     # while `arq` blew up on `'staticmethod' object has no attribute 'host'` the moment the
     # worker actually started. Evaluated at import, exactly like the API's worker does it.
     redis_settings = redis_settings_from_env()
+
+    on_startup = start_heartbeat
+    on_shutdown = stop_heartbeat

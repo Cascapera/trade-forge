@@ -39,6 +39,7 @@ from sqlalchemy.orm import Session
 
 from tradeforge_api.candle_cache import CandleCache, CandleReader
 from tradeforge_api.cluster_job import process_cluster
+from tradeforge_api.collector import running as collector_running
 from tradeforge_api.config import RedisConfig, Settings
 from tradeforge_api.grid import coordinates, label_for, read_point
 from tradeforge_api.queue import (
@@ -58,6 +59,7 @@ from tradeforge_api.sweep_walkforward_job import advance
 from tradeforge_api.template_queue_job import advance_queue
 from tradeforge_api.walkforward import Candidate, choose
 from tradeforge_collector import read_candles
+from tradeforge_db.collections import finish_collection
 from tradeforge_db.models import (
     Backtest,
     BacktestMetrics,
@@ -483,6 +485,13 @@ def _reason(exc: Exception) -> str:
 
 WAIT_POLL_SECONDS = 30
 
+OFF_GRACE = dt.timedelta(minutes=2)
+"""How long a run waits for a download before an agent that is not running gives it up.
+
+Four polls: longer than a restart of the agent, which deletes its key on the way down and writes
+it again on the way up; far shorter than `WAIT_LIMIT`, which is for an agent that runs and says
+nothing."""
+
 CLUSTER_WAIT_SECONDS = 5
 """How long a cluster waits between looks at its members still running again."""
 """How long a run waiting for its collection sleeps before asking again.
@@ -572,15 +581,27 @@ async def _still_collecting(ctx: dict[str, Any], session: Session, run_id: uuid.
         .limit(1)
     )
     silent_since = max(run.created_at, last_delivery) if last_delivery else run.created_at
-    if _now() - silent_since > WAIT_LIMIT:
-        names = ", ".join(f"{one.symbol} {one.timeframe}" for one in unfinished)
-        _fail(
-            session,
-            run,
-            f"nothing has been collected for {WAIT_LIMIT} while waiting for {names}; gave up",
+    silent = _now() - silent_since > WAIT_LIMIT
+    # ⚠️ Asked only once the run has waited `OFF_GRACE`: the agent deletes its key on a clean
+    # stop, and a restart would otherwise read as "off" to every run polling in between.
+    off = (
+        not silent
+        and _now() - run.created_at > OFF_GRACE
+        and not await collector_running(ctx["redis"])
+    )
+    if silent or off:
+        # ⚠️ **The downloads are given up, not the run** (26/09). It used to fail here, with years
+        # on disk it could have read; failed downloads are what his rule of 22/09 already answers
+        # — the run goes ahead on what is there and says which download failed and why.
+        reason = (
+            "the collector is not running" if off else f"nothing was collected for {WAIT_LIMIT}"
         )
-        await _announce(ctx["redis"], run_id, {"status": "failed", "error": run.error})
-        return True
+        for one in unfinished:
+            finish_collection(
+                session, one.id, at=_now(), error=f"{reason}; runs went ahead on what is on disk"
+            )
+        session.commit()
+        return False
 
     await ctx["redis"].enqueue_job(
         RUN_BACKTEST, str(run_id), _defer_by=dt.timedelta(seconds=WAIT_POLL_SECONDS)
@@ -727,7 +748,10 @@ async def run_template_queue(ctx: dict[str, Any], template_id: str) -> None:
     last has ended, queue its runs, and look again every minute while one is running or waiting."""
     session: Session = ctx["session_factory"]()
     try:
-        runs, collections, pending = advance_queue(session, uuid.UUID(template_id))
+        # Collected by itself unless the host agent is off (26/09) — then the market runs on what
+        # is on disk, as any launch does.
+        collect = await collector_running(ctx["redis"])
+        runs, collections, pending = advance_queue(session, uuid.UUID(template_id), collect=collect)
         run_ids = [str(one) for one in runs]
         collection_ids = [str(one.id) for one in collections]
     finally:

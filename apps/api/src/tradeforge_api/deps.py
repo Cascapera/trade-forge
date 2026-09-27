@@ -12,6 +12,7 @@ from typing import Annotated
 from fastapi import Depends, Request
 from sqlalchemy.orm import Session
 
+from tradeforge_api.collector import Collector
 from tradeforge_api.config import Settings
 from tradeforge_api.kill_switch import KillSwitch
 from tradeforge_api.live.stop import StopStore
@@ -37,6 +38,11 @@ def get_queue(request: Request) -> JobQueue:
     return pool
 
 
+def get_collector(request: Request) -> Collector:
+    collector: Collector = request.app.state.collector
+    return collector
+
+
 def get_kill_switch(request: Request) -> KillSwitch:
     switch: KillSwitch = request.app.state.kill_switch
     return switch
@@ -50,5 +56,6 @@ def get_stop_store(request: Request) -> StopStore:
 SettingsDep = Annotated[Settings, Depends(get_settings)]
 SessionDep = Annotated[Session, Depends(get_session)]
 QueueDep = Annotated[JobQueue, Depends(get_queue)]
+CollectorDep = Annotated[Collector, Depends(get_collector)]
 KillSwitchDep = Annotated[KillSwitch, Depends(get_kill_switch)]
 StopStoreDep = Annotated[StopStore, Depends(get_stop_store)]

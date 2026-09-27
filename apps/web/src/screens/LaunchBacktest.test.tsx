@@ -193,6 +193,10 @@ describe('LaunchBacktest when data is missing', () => {
     },
   ]
 
+  // ⚠️ The only kind of gap that still asks (26/09): nothing of it can be collected — the broker
+  // does not list the symbol — so there is something to read before running.
+  const UNLISTED = MISSING.map((market) => ({ ...market, at_broker: false }))
+
   function ready(): void {
     useSession.getState().setStrategy('s1', 'MME9 breakout')
     renderWithProviders(<LaunchBacktest />)
@@ -213,31 +217,41 @@ describe('LaunchBacktest when data is missing', () => {
     expect(mutate).toHaveBeenCalledTimes(1)
   })
 
-  it('says what is missing and waits instead of launching', () => {
+  it('collects what is missing without asking, letting the server plan the windows', () => {
+    // His rule of 26/09. ⚠️ The screen sends no windows of its own: a client-chosen window could
+    // be part of a year, and the collector replaces whole year partitions.
     gate.plan.answer = MISSING
     ready()
     fireEvent.click(runButton())
 
+    expect(screen.queryByRole('region', { name: 'missing data' })).not.toBeInTheDocument()
+    expect(mutate).toHaveBeenCalledTimes(1)
+    expect((mutate.mock.calls[0]?.[0] as { collect_missing: boolean }).collect_missing).toBe(true)
+  })
+
+  it('says what is missing and waits when none of it can be collected', () => {
+    gate.plan.answer = UNLISTED
+    ready()
+    fireEvent.click(runButton())
+
     const prompt = screen.getByRole('region', { name: 'missing data' })
-    expect(prompt).toHaveTextContent(
-      'EURUSD H4 — on disk 2023-03-01 to 2026-09-10; would fetch 2023',
-    )
+    expect(prompt).toHaveTextContent('EURUSD H4 — on disk 2023-03-01 to 2026-09-10')
     expect(mutate).not.toHaveBeenCalled()
   })
 
-  it('runs with what there is when told to', () => {
-    gate.plan.answer = MISSING
+  it('runs with what there is when told to, asking for no collection', () => {
+    gate.plan.answer = UNLISTED
     ready()
     fireEvent.click(runButton())
     fireEvent.click(screen.getByRole('button', { name: 'Run with what there is' }))
 
     expect(mutate).toHaveBeenCalledTimes(1)
     expect((mutate.mock.calls[0]?.[0] as { symbol: string }).symbol).toBe('EURUSD')
+    expect((mutate.mock.calls[0]?.[0] as { collect_missing: boolean }).collect_missing).toBe(false)
   })
 
-
   it('closes the prompt when the form changes, since it answered the old form', () => {
-    gate.plan.answer = MISSING
+    gate.plan.answer = UNLISTED
     ready()
     fireEvent.click(runButton())
     fireEvent.change(screen.getByLabelText('to'), { target: { value: '2023-09-01' } })
@@ -268,7 +282,7 @@ describe('LaunchBacktest when data is missing', () => {
   })
 
 
-  it('does not offer to run a market that was never collected', () => {
+  it('does not offer to run a market that was never collected and cannot be', () => {
     // ⚠️ His case on 17/09: an H1 strategy over a pair collected only at M15 and H4. The launch
     // answered "no candles in this window for EURUSD H1 (never collected)" — a refusal the screen
     // already knew about and should not have invited.
@@ -280,35 +294,17 @@ describe('LaunchBacktest when data is missing', () => {
         in_window: false,
         windows: [{ date_from: '2024-01-01T00:00:00Z', date_to: '2024-12-31T23:59:59.999999Z' }],
         time: null,
+        at_broker: false,
       },
     ]
     ready()
     fireEvent.click(runButton())
 
     expect(screen.queryByRole('button', { name: 'Run with what there is' })).not.toBeInTheDocument()
-    expect(screen.getByText('Nothing would run until this is collected.')).toBeInTheDocument()
+    expect(
+      screen.getByText('Nothing here can be collected or run. Choose other markets or another window.'),
+    ).toBeInTheDocument()
     expect(mutate).not.toHaveBeenCalled()
-  })
-
-  it('collects and runs in one press, letting the server plan the windows', () => {
-    // ⚠️ The screen sends no windows of its own: a client-chosen window could be part of a year,
-    // and the collector replaces whole year partitions.
-    gate.plan.answer = MISSING
-    ready()
-    fireEvent.click(runButton())
-    fireEvent.click(screen.getByRole('button', { name: 'Collect and run' }))
-
-    expect(mutate).toHaveBeenCalledTimes(1)
-    expect((mutate.mock.calls[0]?.[0] as { collect_missing: boolean }).collect_missing).toBe(true)
-  })
-
-  it('runs with what there is without asking for a collection', () => {
-    gate.plan.answer = MISSING
-    ready()
-    fireEvent.click(runButton())
-    fireEvent.click(screen.getByRole('button', { name: 'Run with what there is' }))
-
-    expect((mutate.mock.calls[0]?.[0] as { collect_missing: boolean }).collect_missing).toBe(false)
   })
 
   it('an ordinary launch asks for no collection either', () => {

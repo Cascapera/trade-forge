@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session, defer, selectinload
 
 from tradeforge_api.config import Settings
 from tradeforge_api.coverage import describe, to_collect, uncovered_markets
-from tradeforge_api.deps import QueueDep, SessionDep, SettingsDep
+from tradeforge_api.deps import CollectorDep, QueueDep, SessionDep, SettingsDep
 from tradeforge_api.queue import COLLECT_QUEUE, COLLECT_RANGE, RUN_BACKTEST
 from tradeforge_api.routers.strategies import assert_runnable_at
 from tradeforge_api.runner import ENGINE_VERSION, spec_for
@@ -232,7 +232,10 @@ def _read_the_window(session: SessionDep, settings: Settings, backtest: Backtest
     responses={**_NOT_FOUND, **_BAD_BODY},
 )
 async def create_backtest(
-    request: CreateBacktestRequest, session: SessionDep, queue: QueueDep
+    request: CreateBacktestRequest,
+    session: SessionDep,
+    queue: QueueDep,
+    collector: CollectorDep,
 ) -> Backtest:
     """Validate against the current data, persist a queued run, and enqueue it.
 
@@ -282,7 +285,8 @@ async def create_backtest(
             date_from=request.date_from,
             date_to=request.date_to,
         )
-        if request.collect_missing
+        # Nothing is planned while the host agent is off: the run reads what is on disk (26/09).
+        if request.collect_missing and collector.alive()
         else []
     )
 

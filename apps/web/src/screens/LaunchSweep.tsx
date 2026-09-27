@@ -106,7 +106,11 @@ export function LaunchSweep(): React.JSX.Element {
   // ⚠️ **Asked on the click, not read off the rehearsal.** `uncovered` lists only pairs with *no*
   // candle in the window; a pair covered in part is absent from it, and would run over half the
   // window without anybody being asked. The plan sees the gap — the same one the launch collects.
-  const gate = useMissingDataGate(() => {
+  const gate = useMissingDataGate((collectMissing) => {
+    if (collectMissing) {
+      launch(true)
+      return
+    }
     if (dataGap) {
       setNothingToFetch(true)
       return

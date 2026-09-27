@@ -24,7 +24,7 @@ from tradeforge_api.candle_cache import CandleCache
 from tradeforge_api.config import Settings
 from tradeforge_api.main import create_app
 from tradeforge_api.queue import COLLECT_QUEUE, COLLECT_RANGE, RUN_BACKTEST
-from tradeforge_api.worker import WAIT_POLL_SECONDS, run_backtest
+from tradeforge_api.worker import OFF_GRACE, WAIT_POLL_SECONDS, run_backtest
 from tradeforge_db.broker_symbols import BrokerSymbolEntry, replace_snapshot
 from tradeforge_db.models import (
     Backtest,
@@ -36,6 +36,8 @@ from tradeforge_db.models import (
 )
 from tradeforge_engine.domain import AssetClass
 from tradeforge_engine.testing import bar
+
+from .collector_fakes import running, stopped
 
 pytestmark = pytest.mark.integration
 
@@ -50,6 +52,11 @@ class _Queue:
 
     def __init__(self) -> None:
         self.jobs: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
+        # The host agent's key, as the worker reads it on this same client (`collector.running`).
+        self.agent_running = True
+
+    async def exists(self, *names: str) -> int:
+        return len(names) if self.agent_running else 0
 
     async def enqueue_job(self, function: str, *args: Any, **options: Any) -> None:
         self.jobs.append((function, args, options))
@@ -67,7 +74,15 @@ def queue() -> _Queue:
 
 
 @pytest.fixture
-def client(session_factory: Callable[[], Session], queue: _Queue, tmp_path: Any) -> Iterator[Any]:
+def agent_running() -> bool:
+    """Whether the host agent's key is there when the app asks — a test parametrizes it off."""
+    return True
+
+
+@pytest.fixture
+def client(
+    session_factory: Callable[[], Session], queue: _Queue, tmp_path: Any, agent_running: bool
+) -> Iterator[Any]:
     seeding = session_factory()
     seeding.add(
         Instrument(
@@ -88,6 +103,7 @@ def client(session_factory: Callable[[], Session], queue: _Queue, tmp_path: Any)
         settings=Settings().model_copy(update={"parquet_root": tmp_path}),
         session_factory=session_factory,
         arq_pool=queue,
+        collector=running() if agent_running else stopped(),
     )
     with TestClient(app) as opened:
         yield opened
@@ -181,7 +197,7 @@ def broker_lists(session_factory: Callable[[], Session], *symbols: str) -> None:
 class TestTheLaunch:
     def test_without_the_flag_a_window_with_no_candles_is_still_refused(self, client: Any) -> None:
         """The answer "no" keeps PR-262's behaviour: nothing is collected, nothing is queued."""
-        refused = launch(client)
+        refused = launch(client, collect_missing=False)
         assert refused.status_code == 422
         assert "never collected" in refused.json()["detail"]
 
@@ -336,6 +352,42 @@ class TestTheLaunch:
             date_to=CANDLES[-1].time.isoformat(),
         )
         assert client.get(f"/backtests/{created.json()['id']}").json()["waiting_for"] == []
+
+    @pytest.mark.parametrize("agent_running", [False])
+    def test_with_the_agent_off_nothing_is_planned_and_the_run_reads_the_disk(
+        self,
+        client: Any,
+        session_factory: Callable[[], Session],
+        queue: _Queue,
+        collected: Any,
+        tmp_path: Any,
+    ) -> None:
+        """His rule of 26/09: a download nobody will pick up is not queued. The part of the window
+        on disk runs at once, with nothing to wait for."""
+        collected(tmp_path, "EURUSD", "H1", CANDLES)
+        created = launch(client, collect_missing=True)
+
+        assert created.status_code == 202, created.text
+        assert waits_of(session_factory, created.json()["id"]) == []
+        assert queue.of(COLLECT_RANGE) == []
+        assert len(queue.of(RUN_BACKTEST)) == 1
+
+    @pytest.mark.parametrize("agent_running", [False])
+    def test_with_the_agent_off_and_nothing_on_disk_the_launch_is_refused(
+        self, client: Any
+    ) -> None:
+        refused = launch(client, collect_missing=True)
+        assert refused.status_code == 422
+        assert "never collected" in refused.json()["detail"]
+
+    def test_collecting_is_what_a_launch_does_unless_told_otherwise(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        """His rule of 26/09: every launch collects by itself; the flag is there to say "no"."""
+        created = launch(client)
+
+        assert created.status_code == 202, created.text
+        assert len(waits_of(session_factory, created.json()["id"])) == 1
 
     def test_the_waits_are_served_oldest_window_first(
         self, client: Any, session_factory: Callable[[], Session]
@@ -570,11 +622,18 @@ class TestTheWait:
         assert queue.of(RUN_BACKTEST) == [{"_defer_by": dt.timedelta(seconds=30)}]
         assert self.run_status(session_factory, waiting).status is BacktestStatus.QUEUED
 
-    def test_a_wait_that_outlives_the_limit_fails_rather_than_waiting_for_ever(
-        self, waiting: str, session_factory: Callable[[], Session], queue: _Queue, tmp_path: Any
+    def test_a_wait_that_outlives_the_limit_gives_up_the_download_not_the_run(
+        self,
+        waiting: str,
+        session_factory: Callable[[], Session],
+        queue: _Queue,
+        collected: Any,
+        tmp_path: Any,
     ) -> None:
-        # ⚠️ Nothing has landed anywhere since: the queue itself is dead, which is the case
-        # this limit exists for — an agent that stopped, a terminal nobody logged in to.
+        """⚠️ Nothing has landed anywhere since: the queue itself is dead. The run used to fail
+        here with bars on disk it could have read; his rule of 26/09 gives up the download
+        instead, and the run goes ahead as it does after any failed download (22/09)."""
+        collected(tmp_path, "EURUSD", "H1", CANDLES)
         with session_factory() as session:
             run = session.get(Backtest, uuid.UUID(waiting))
             assert run is not None
@@ -583,8 +642,47 @@ class TestTheWait:
         queue.jobs.clear()
         work(session_factory, queue, waiting, tmp_path)
 
-        run_row = self.run_status(session_factory, waiting)
-        assert run_row.status is BacktestStatus.FAILED
-        assert run_row.error is not None
-        assert "nothing has been collected" in run_row.error
+        assert self.run_status(session_factory, waiting).status is BacktestStatus.DONE
+        [wait] = waits_of(session_factory, waiting)
+        assert wait.status is BacktestStatus.FAILED
+        assert wait.error is not None
+        assert "nothing was collected" in wait.error
         assert queue.of(RUN_BACKTEST) == []
+
+    def test_an_agent_that_is_not_running_is_given_up_on_after_the_grace(
+        self,
+        waiting: str,
+        session_factory: Callable[[], Session],
+        queue: _Queue,
+        collected: Any,
+        tmp_path: Any,
+    ) -> None:
+        """Nothing will ever pick the download up: the run does not wait two hours to learn it."""
+        collected(tmp_path, "EURUSD", "H1", CANDLES)
+        with session_factory() as session:
+            run = session.get(Backtest, uuid.UUID(waiting))
+            assert run is not None
+            run.created_at = dt.datetime.now(tz=dt.UTC) - OFF_GRACE - dt.timedelta(seconds=1)
+            session.commit()
+        queue.agent_running = False
+        queue.jobs.clear()
+        work(session_factory, queue, waiting, tmp_path)
+
+        assert self.run_status(session_factory, waiting).status is BacktestStatus.DONE
+        [wait] = waits_of(session_factory, waiting)
+        assert wait.status is BacktestStatus.FAILED
+        assert wait.error is not None
+        assert "the collector is not running" in wait.error
+
+    def test_an_agent_that_is_off_for_a_moment_is_still_waited_for(
+        self, waiting: str, session_factory: Callable[[], Session], queue: _Queue, tmp_path: Any
+    ) -> None:
+        """⚠️ A restart deletes the key and writes it again; a run that has barely waited reads
+        that gap as nothing and asks again later."""
+        queue.agent_running = False
+        queue.jobs.clear()
+        work(session_factory, queue, waiting, tmp_path)
+
+        assert queue.of(RUN_BACKTEST) == [{"_defer_by": dt.timedelta(seconds=30)}]
+        [wait] = waits_of(session_factory, waiting)
+        assert wait.status is BacktestStatus.QUEUED

@@ -2735,13 +2735,15 @@ class TestSweepsReadTogether:
         client.post(
             f"/sweep-templates/{template['id']}/queue", json={"markets": [{"symbol": "EURUSD"}]}
         )
-        for _chart in ("H4", "H1"):
+        for chart in ("H4", "H1"):
             assert queue_of.step(session_factory, template["id"]) is True
             launched = [
                 one["sweep_id"]
                 for one in client.get(f"/sweep-templates/{template['id']}").json()["items"]
                 if one["sweep_id"] is not None
             ]
+            ran = client.get(f"/sweeps/{launched[-1]}", params={"runs": "none"}).json()
+            assert ran["timeframes"] == [chart]
             queue_of.finish_all(client, session_factory, launched[-1])
         at_h4, at_h1 = launched
 

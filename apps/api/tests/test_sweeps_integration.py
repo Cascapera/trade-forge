@@ -59,6 +59,8 @@ from tradeforge_db.models import (
 )
 from tradeforge_engine.domain import AssetClass, Side
 
+from .collector_fakes import running
+
 pytestmark = pytest.mark.integration
 
 START = dt.datetime(2024, 1, 1, tzinfo=dt.UTC)
@@ -143,6 +145,7 @@ def client(
         settings=settings.model_copy(update={"parquet_root": tmp_path, "tradeforge_workers": 1}),
         session_factory=session_factory,
         arq_pool=queue,
+        collector=running(),
     )
     with TestClient(app) as opened:
         yield opened
@@ -239,6 +242,9 @@ def a_sweep_body(entries: list[str], symbols: list[str], timeframes: list[str]) 
         "date_to": (START + 100 * HOUR).isoformat(),
         "initial_capital": CAPITAL,
         "cost_model": {"type": "none"},
+        # Launches collect by themselves since 26/09; these tests name the answer "no", and
+        # the ones about collecting say "yes" out loud.
+        "collect_missing": False,
     }
 
 
@@ -2420,7 +2426,9 @@ class TestTemplatesRunMarketByMarket:
 
     def step(self, session_factory: Callable[[], Session], template_id: str) -> bool:
         with session_factory() as session:
-            _runs, _collections, pending = advance_queue(session, uuid.UUID(template_id))
+            _runs, _collections, pending = advance_queue(
+                session, uuid.UUID(template_id), collect=False
+            )
         return pending
 
     def finish_all(
@@ -2468,6 +2476,27 @@ class TestTemplatesRunMarketByMarket:
         assert second["status"] == "launched"
         self.finish_all(client, session_factory, second["sweep_id"])
         assert self.step(session_factory, template["id"]) is False
+
+    def test_a_market_collects_what_it_is_missing_while_the_agent_runs(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        """His rule of 26/09, on the queue too: a chart never collected is downloaded first, and
+        with the agent off the same market is launched over what is on disk — here, nothing."""
+        template = self.template(client, timeframes=["H1", "W1"])
+        client.post(
+            f"/sweep-templates/{template['id']}/queue", json={"markets": [{"symbol": "EURUSD"}]}
+        )
+
+        with session_factory() as session:
+            _runs, collections, pending = advance_queue(
+                session, uuid.UUID(template["id"]), collect=True
+            )
+            downloads = [(one.symbol, one.timeframe) for one in collections]
+
+        assert pending is True
+        assert downloads == [("EURUSD", "W1")]
+        [item] = client.get(f"/sweep-templates/{template['id']}").json()["items"]
+        assert client.get(f"/sweeps/{item['sweep_id']}").json()["skipped"] == []
 
     def test_a_paused_queue_launches_nothing_until_resumed(
         self, client: Any, session_factory: Callable[[], Session]

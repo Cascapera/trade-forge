@@ -379,13 +379,15 @@ class CreateBacktestRequest(BaseModel):
     date_to: AwareInstant
     initial_capital: Decimal = Field(gt=0)
     cost_model: dict[str, Any] = Field(default_factory=lambda: {"type": "none"})
-    collect_missing: bool = False
+    collect_missing: bool = True
     """Collect what this window is missing, and run once it has landed.
 
-    ⚠️ **False is the answer "no", not a default nobody chose.** Left false, a window the index
-    holds no candle of is refused at once (PR-262). Set true, the same window is planned
-    (`coverage.plan_for`), the collections are queued, and the run waits for them — which is his
-    rule of 17/09: say what is missing and ask, then do what the answer says.
+    ⚠️ **True unless said otherwise — his rule of 26/09**, which replaced "say what is missing
+    and ask" (17/09): every launch collects what it is missing by itself. The window is planned
+    (`coverage.plan_for`), the collections are queued, and the run waits for them. **With the host
+    agent off nothing is planned** (`collector.Collector`) and the run reads what is on disk, as
+    it does when a download fails. False — or nothing on disk at all — refuses a window the index
+    holds no candle of at once (PR-262).
 
     ⚠️ The windows are the **server's** plan, not the caller's: a client that sent its own could
     queue a partial year, and a partial year erases the rest of that year's partition.
@@ -851,7 +853,7 @@ class CreateBasketRequest(BaseModel):
     date_from: AwareInstant
     date_to: AwareInstant
     initial_capital: Decimal = Field(gt=0)
-    collect_missing: bool = False
+    collect_missing: bool = True
     """Collect what each market is missing, and run it once its own downloads have landed.
 
     ⚠️ **Per market, not per basket.** A basket mixes markets that are covered with markets
@@ -983,7 +985,7 @@ class CreateStudyRequest(BaseModel):
     date_to: AwareInstant
     initial_capital: Decimal = Field(gt=0)
     cost_model: dict[str, Any] = Field(default_factory=lambda: {"type": "none"})
-    collect_missing: bool = False
+    collect_missing: bool = True
     """Collect what the market is missing, and run every point once the downloads have landed.
 
     ⚠️ **One download for the whole grid.** Every point reads the same (symbol, timeframe) over
@@ -1826,7 +1828,7 @@ class CreateSweep(BaseModel):
     date_to: AwareInstant
     initial_capital: Decimal = Field(gt=0)
     cost_model: dict[str, Any]
-    collect_missing: bool = False
+    collect_missing: bool = True
     """Collect what each (market, chart) is missing, and run once those downloads have landed.
 
     ⚠️ **One collection per pair, not per run.** A pair here is shared by every point of every

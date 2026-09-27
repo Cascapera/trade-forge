@@ -23,7 +23,7 @@ from tradeforge_db.models import (
 
 
 def advance_queue(
-    session: Session, template_id: uuid.UUID
+    session: Session, template_id: uuid.UUID, *, collect: bool
 ) -> tuple[list[uuid.UUID], list[Collection], bool]:
     """Launch the next market if nothing of this template is running; what to queue, and whether
     to look again.
@@ -32,6 +32,9 @@ def advance_queue(
     while the conductor was already due — cannot both launch. The item is marked launched in the
     same transaction the sweep is written in (`launch_sweep` commits both), so no reader ever sees
     a sweep without its item or an item launched without its sweep.
+
+    ⚠️ **`collect` is whether the host agent is running** (26/09): a market collects what it is
+    missing by itself, like any launch, and runs on what is on disk while the agent is off.
 
     ⚠️ **A refused launch fails that market and the queue goes on** — an unknown symbol, a window
     with no candles for it — with the reason on the item.
@@ -65,6 +68,7 @@ def advance_queue(
             date_to=template.date_to,
             initial_capital=template.initial_capital,
             cost_model={"type": "per_market", "markets": {item.symbol: dict(item.cost_model)}},
+            collect_missing=collect,
         )
         item.status = TemplateItemStatus.LAUNCHED
         try:
@@ -78,7 +82,7 @@ def advance_queue(
             failed.status = TemplateItemStatus.FAILED
             failed.error = str(refused.detail)
             session.commit()
-            return advance_queue(session, template_id)
+            return advance_queue(session, template_id, collect=collect)
         launched = session.get(SweepTemplateItem, item_id)
         assert launched is not None  # noqa: S101 — committed with the sweep just now
         launched.sweep_id = sweep.id

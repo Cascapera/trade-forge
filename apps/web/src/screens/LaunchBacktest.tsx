@@ -83,9 +83,9 @@ export function LaunchBacktest(): React.JSX.Element {
       },
     )
   }
-  // ⚠️ The plan is asked with the flag off: nothing missing means launch as an ordinary run.
-  const gate = useMissingDataGate(() => {
-    launch()
+  // Nothing missing launches as an ordinary run; anything collectable is collected first.
+  const gate = useMissingDataGate((collectMissing) => {
+    launch(collectMissing)
   })
 
   // Asked first, launched only if nothing is missing — otherwise the prompt below decides.

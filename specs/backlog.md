@@ -811,6 +811,18 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
 
   Não é regressão do upgrade: o default sempre foi 3600. Só ninguém tinha olhado.
 
+  **Atualização 26/09 (PR #329):** o "está vivo?" foi resolvido **fora** do arq — uma chave própria
+  (`collector:alive`, TTL 90 s) renovada por uma thread, que bate mesmo com o laço bloqueado; a API
+  e o worker a leem para não pedir coleta a um agente desligado. **Continua aberto:** (a) o
+  `to_thread` em `collect_range`, (b) o `job_timeout` escolhido, e distinguir "vivo mas travado"
+  (a thread bate mesmo com a coleta presa).
+
+- [origem: PR #329, 26/09/2026] A fila do modelo ainda **recusa** um ativo que nunca foi
+  catalogado (`POST /sweep-templates/{id}/queue` → 422 "never collected", sem linha em
+  `instruments`). A coleta automática não alcança esse caso: sem instrumento não há classe de
+  ativo nem custo medido para preencher. Conserto provável: sincronizar/catalogar o símbolo no
+  enfileiramento, com o agente vivo.
+
 ---
 
 ## `ix_live_sessions_heartbeat_at` não é usado por consulta nenhuma

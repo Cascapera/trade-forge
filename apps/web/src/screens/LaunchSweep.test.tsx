@@ -556,9 +556,10 @@ describe('launching', () => {
     )
   })
 
-  it('asks before launching when a pair is missing, and collects on request', async () => {
-    // ⚠️ A pair covered **in part** — the case the rehearsal's `uncovered` cannot see, and the
-    // reason the click asks the plan. `in_window: true`: it has candles, just not all of them.
+  it('collects a pair that is missing without asking', async () => {
+    // His rule of 26/09. ⚠️ A pair covered **in part** — the case the rehearsal's `uncovered`
+    // cannot see, and the reason the click asks the plan. `in_window: true`: it has candles, just
+    // not all of them.
     planCollections.mockResolvedValue([
       { ...planned('EURUSD', 'M15'), covers: '2025-03-01 to 2025-12-31', in_window: true },
     ])
@@ -570,22 +571,17 @@ describe('launching', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /run the sweep/i }))
 
-    expect(await screen.findByRole('region', { name: 'missing data' })).toHaveTextContent(
-      'EURUSD M15 — on disk 2025-03-01 to 2025-12-31; would fetch 2025',
-    )
-    expect(createSweep).not.toHaveBeenCalled()
-
-    fireEvent.click(screen.getByRole('button', { name: 'Collect and run' }))
-
     await waitFor(() => {
       expect(createSweep).toHaveBeenCalledWith(expect.objectContaining({ collect_missing: true }))
     })
+    expect(screen.queryByRole('region', { name: 'missing data' })).not.toBeInTheDocument()
   })
 
   it('offers running with what there is when one chart of a market has data', async () => {
     // ⚠️ By pair. EURUSD has no H4, and its M15 is not in the plan at all: keyed by symbol, the
-    // empty H4 would read as EURUSD being empty and the run would be withdrawn.
-    planCollections.mockResolvedValue([planned('EURUSD', 'H4')])
+    // empty H4 would read as EURUSD being empty and the run would be withdrawn. The broker does
+    // not list it, so there is nothing to collect and the question is asked.
+    planCollections.mockResolvedValue([{ ...planned('EURUSD', 'H4'), at_broker: false }])
     renderWithProviders(<LaunchSweep />)
     await fillIn()
     fireEvent.click(screen.getByLabelText('H4'))
@@ -601,10 +597,9 @@ describe('launching', () => {
     })
   })
 
-  it('withdraws running with what there is when every pair with a runnable point is empty', async () => {
-    // ⚠️ The rehearsal's answer, not the plan's. The plan here mentions only H4, so by the plan
-    // alone M15 would run — but the rehearsal says nothing runs (the DSL refuses M15 for this
-    // entry, say), and "run" would be a button that 422s.
+  it('collects even when nothing would run until it lands', async () => {
+    // ⚠️ The rehearsal says nothing runs — every pair with a runnable point is empty — and the
+    // download is exactly what changes that.
     previewSweep.mockResolvedValue(
       preview({
         runs: 0,
@@ -620,9 +615,37 @@ describe('launching', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /run the sweep/i }))
 
-    expect(await screen.findByText('Nothing would run until this is collected.')).toBeInTheDocument()
+    await waitFor(() => {
+      expect(createSweep).toHaveBeenCalledWith(expect.objectContaining({ collect_missing: true }))
+    })
+  })
+
+  it('withdraws running when every pair with a runnable point is empty and cannot be collected', async () => {
+    // ⚠️ The rehearsal's answer, not the plan's. The plan here mentions only H4, so by the plan
+    // alone M15 would run — but the rehearsal says nothing runs (the DSL refuses M15 for this
+    // entry, say), and "run" would be a button that 422s.
+    previewSweep.mockResolvedValue(
+      preview({
+        runs: 0,
+        uncovered: [{ symbol: 'EURUSD', timeframe: 'H4', covers: null }],
+        error: 'no candles in this window for: EURUSD H4 (never collected)',
+      }),
+    )
+    planCollections.mockResolvedValue([{ ...planned('EURUSD', 'H4'), at_broker: false }])
+    renderWithProviders(<LaunchSweep />)
+    await fillIn()
+    fireEvent.click(screen.getByLabelText('H4'))
+    await screen.findByText(/never collected/i)
+
+    fireEvent.click(screen.getByRole('button', { name: /run the sweep/i }))
+
+    expect(
+      await screen.findByText(
+        'Nothing here can be collected or run. Choose other markets or another window.',
+      ),
+    ).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Run with what there is' })).not.toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Collect and run' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Collect and run' })).not.toBeInTheDocument()
   })
 
   it('does not ask the server about a sweep with no window yet', async () => {

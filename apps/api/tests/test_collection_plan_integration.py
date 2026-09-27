@@ -22,6 +22,8 @@ from tradeforge_db.models import Collection, Dataset, Instrument
 from tradeforge_db.symbol_history import HistoryProbe, upsert_history
 from tradeforge_engine.domain import AssetClass
 
+from .collector_fakes import running
+
 pytestmark = pytest.mark.integration
 
 
@@ -53,7 +55,9 @@ def queue() -> _CapturingQueue:
 
 @pytest.fixture
 def client(session_factory: Callable[[], Session], queue: _CapturingQueue) -> Iterator[TestClient]:
-    app: Any = create_app(settings=Settings(), session_factory=session_factory, arq_pool=queue)
+    app: Any = create_app(
+        settings=Settings(), session_factory=session_factory, arq_pool=queue, collector=running()
+    )
     with TestClient(app) as opened:
         yield opened
 

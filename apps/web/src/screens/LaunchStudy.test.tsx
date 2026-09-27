@@ -628,8 +628,9 @@ describe('LaunchStudy', () => {
       )
     })
 
-    it('asks before launching when the window is missing, and collects on request', async () => {
-      // ⚠️ What the study used to do instead: queue every point, and let each fail in a worker.
+    it('collects what the window is missing without asking', async () => {
+      // His rule of 26/09. ⚠️ What the study used to do before PR-272: queue every point, and
+      // let each fail in a worker.
       planCollections.mockResolvedValue([missingAapl])
       createStudy.mockResolvedValue({ id: 'study-1', points: [] })
       renderWithProviders(<LaunchStudy />)
@@ -637,22 +638,29 @@ describe('LaunchStudy', () => {
 
       fireEvent.click(screen.getByRole('button', { name: 'Run the study' }))
 
-      expect(await screen.findByRole('region', { name: 'missing data' })).toHaveTextContent(
-        'AAPL H1 — never collected; would fetch 2024–2025',
-      )
-      expect(createStudy).not.toHaveBeenCalled()
-      // Nothing in the window: running without collecting would be refused, so it is not offered.
-      expect(screen.queryByRole('button', { name: 'Run with what there is' })).not.toBeInTheDocument()
-
-      fireEvent.click(screen.getByRole('button', { name: 'Collect and run' }))
-
       await waitFor(() => {
         expect(createStudy).toHaveBeenCalledWith(expect.objectContaining({ collect_missing: true }))
       })
+      expect(screen.queryByRole('region', { name: 'missing data' })).not.toBeInTheDocument()
+    })
+
+    it('says why nothing would run when the window cannot be collected either', async () => {
+      planCollections.mockResolvedValue([{ ...missingAapl, at_broker: false }])
+      renderWithProviders(<LaunchStudy />)
+      await fillIn()
+
+      fireEvent.click(screen.getByRole('button', { name: 'Run the study' }))
+
+      expect(await screen.findByRole('region', { name: 'missing data' })).toHaveTextContent(
+        'AAPL H1 — never collected; not listed by the broker, cannot be collected',
+      )
+      expect(createStudy).not.toHaveBeenCalled()
+      // Nothing in the window: running would be refused, so it is not offered.
+      expect(screen.queryByRole('button', { name: 'Run with what there is' })).not.toBeInTheDocument()
     })
 
     it('closes the question when the form changes', async () => {
-      planCollections.mockResolvedValue([missingAapl])
+      planCollections.mockResolvedValue([{ ...missingAapl, at_broker: false }])
       renderWithProviders(<LaunchStudy />)
       await fillIn()
       fireEvent.click(screen.getByRole('button', { name: 'Run the study' }))

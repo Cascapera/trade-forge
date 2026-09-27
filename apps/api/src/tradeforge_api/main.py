@@ -17,6 +17,7 @@ from redis import Redis
 from sqlalchemy.orm import Session
 
 from tradeforge_api import __version__, ws
+from tradeforge_api.collector import Collector
 from tradeforge_api.config import Settings
 from tradeforge_api.deps import SettingsDep
 from tradeforge_api.health import check_postgres, check_redis
@@ -59,7 +60,11 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.arq_pool = await create_pool(redis_settings(settings))
         app.state._owns_pool = True
 
-    if not (hasattr(app.state, "kill_switch") and hasattr(app.state, "stop_store")):
+    if not (
+        hasattr(app.state, "kill_switch")
+        and hasattr(app.state, "stop_store")
+        and hasattr(app.state, "collector")
+    ):
         # ⚠️ A client of its own rather than the arq pool, and the reason is not tidiness. The
         # pool is async and arq's; these are read and written by plain handlers, and an emergency
         # path that borrows the job queue's connection is an emergency path that stops working
@@ -75,6 +80,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.kill_switch = KillSwitch(app.state._redis_client)
     if not hasattr(app.state, "stop_store"):
         app.state.stop_store = app.state._redis_client
+    if not hasattr(app.state, "collector"):
+        app.state.collector = Collector(app.state._redis_client)
 
     try:
         yield
@@ -87,13 +94,14 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             app.state._engine.dispose()
 
 
-def create_app(
+def create_app(  # noqa: PLR0913 — keyword-only seams, one per connection a test replaces
     *,
     settings: Settings | None = None,
     session_factory: Callable[[], Session] | None = None,
     arq_pool: JobQueue | None = None,
     kill_switch: KillSwitch | None = None,
     stop_store: StopStore | None = None,
+    collector: Collector | None = None,
 ) -> FastAPI:
     """Build the app. Pass `session_factory`/`arq_pool`/`kill_switch` to bypass the real
     connections.
@@ -116,6 +124,8 @@ def create_app(
         app.state.kill_switch = kill_switch
     if stop_store is not None:
         app.state.stop_store = stop_store
+    if collector is not None:
+        app.state.collector = collector
 
     app.include_router(instruments.router)
     app.include_router(symbols.router)

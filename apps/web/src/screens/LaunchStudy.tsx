@@ -104,8 +104,8 @@ export function LaunchStudy(): React.JSX.Element {
   // ⚠️ Asked before launching, as the single backtest, the basket and the sweep ask (PR-272). The
   // study used to queue every point straight away, and each one then learnt in a worker what the
   // `datasets` index already knew. An empty plan launches with `collect_missing` off.
-  const gate = useMissingDataGate(() => {
-    launch()
+  const gate = useMissingDataGate((collectMissing) => {
+    launch(collectMissing)
   })
 
   // A prompt answers the form it was asked about; any edit closes it.

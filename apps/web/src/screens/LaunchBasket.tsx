@@ -72,8 +72,8 @@ export function LaunchBasket(): React.JSX.Element {
     })
   }
   // ⚠️ The plan is asked with the flag off: nothing missing means an ordinary launch.
-  const gate = useMissingDataGate(() => {
-    launch()
+  const gate = useMissingDataGate((collectMissing) => {
+    launch(collectMissing)
   })
 
   // Asked first, launched only if nothing is missing — otherwise the prompt below decides.

@@ -39,6 +39,8 @@ from tradeforge_db.models import (
 from tradeforge_engine.domain import AssetClass, Candle
 from tradeforge_engine.testing import bar
 
+from .collector_fakes import running
+
 pytestmark = pytest.mark.integration
 
 START = dt.datetime(2024, 1, 1, tzinfo=dt.UTC)
@@ -163,6 +165,9 @@ def _basket_body(strategy_id: str, symbols: list[str], **overrides: Any) -> dict
         "date_from": START.isoformat(),
         "date_to": (START + 100 * HOUR).isoformat(),
         "initial_capital": CAPITAL,
+        # Launches collect by themselves since 26/09; these tests name the answer "no", and
+        # the ones about collecting say "yes" out loud.
+        "collect_missing": False,
         **overrides,
     }
 
@@ -174,6 +179,7 @@ def _app(
         settings=settings.model_copy(update={"parquet_root": tmp_path}),
         session_factory=session_factory,
         arq_pool=queue,
+        collector=running(),
     )
 
 

@@ -30,6 +30,8 @@ from tradeforge_db.models import Backtest, BacktestMetrics, BacktestStatus, Inst
 from tradeforge_engine.domain import AssetClass, Candle
 from tradeforge_engine.testing import bar
 
+from .collector_fakes import stopped
+
 pytestmark = pytest.mark.integration
 
 START = dt.datetime(2024, 1, 1, tzinfo=dt.UTC)
@@ -269,6 +271,9 @@ def _assert_listing_costs_the_same_whatever_the_page_holds(
     )
 
 
+# ⚠️ The host agent is off in every app here: these launches run on what is on disk, and one
+# over a window with nothing there is refused — the fallback of 26/09, where collecting is not
+# possible. Collecting itself is `test_wait_for_collection_integration`'s subject.
 def test_create_enqueue_run_and_read(
     session_factory: Callable[[], Session],
     settings: Settings,
@@ -286,6 +291,7 @@ def test_create_enqueue_run_and_read(
         settings=settings.model_copy(update={"parquet_root": tmp_path}),
         session_factory=session_factory,
         arq_pool=queue,
+        collector=stopped(),
     )
 
     with TestClient(app) as client:
@@ -374,6 +380,7 @@ def test_a_backtest_for_an_unknown_symbol_is_rejected(
         settings=settings.model_copy(update={"parquet_root": tmp_path}),
         session_factory=session_factory,
         arq_pool=_CapturingQueue(),
+        collector=stopped(),
     )
     with TestClient(app) as client:
         strategy_id = client.post("/strategies", json=strategy_row_source).json()["id"]
@@ -408,6 +415,7 @@ def test_a_timeframe_the_index_has_never_seen_is_refused_at_launch(
         settings=settings.model_copy(update={"parquet_root": tmp_path}),
         session_factory=session_factory,
         arq_pool=queue,
+        collector=stopped(),
     )
 
     with TestClient(app) as client:
@@ -446,6 +454,7 @@ def test_a_window_the_data_does_not_reach_is_refused_at_launch(
             settings=settings.model_copy(update={"parquet_root": tmp_path}),
             session_factory=session_factory,
             arq_pool=_CapturingQueue(),
+            collector=stopped(),
         )
     ) as client:
         strategy_id = client.post("/strategies", json=_strategy()).json()["id"]
@@ -487,6 +496,7 @@ def _launch_over(
             settings=settings.model_copy(update={"parquet_root": tmp_path}),
             session_factory=session_factory,
             arq_pool=_CapturingQueue(),
+            collector=stopped(),
         )
     ) as client:
         strategy_id = client.post("/strategies", json=_strategy()).json()["id"]
@@ -585,6 +595,7 @@ def test_a_timeframe_with_no_collected_candles_fails_instead_of_finishing_empty(
         settings=settings.model_copy(update={"parquet_root": tmp_path}),
         session_factory=session_factory,
         arq_pool=_CapturingQueue(),
+        collector=stopped(),
     )
 
     with TestClient(app) as client:
@@ -673,6 +684,7 @@ def _app(
             settings=settings.model_copy(update={"parquet_root": tmp_path}),
             session_factory=session_factory,
             arq_pool=_CapturingQueue(),
+            collector=stopped(),
         )
     )
 

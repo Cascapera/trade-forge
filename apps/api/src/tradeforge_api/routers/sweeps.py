@@ -39,7 +39,7 @@ from sqlalchemy.orm import InstrumentedAttribute, Session, defer, selectinload
 from tradeforge_api import sweep_dashboard as dashboard
 from tradeforge_api.config import Settings
 from tradeforge_api.coverage import describe, to_collect, uncovered_markets
-from tradeforge_api.deps import QueueDep, SessionDep, SettingsDep
+from tradeforge_api.deps import CollectorDep, QueueDep, SessionDep, SettingsDep
 from tradeforge_api.estimates import backtests_time
 from tradeforge_api.grid import GridPoint
 from tradeforge_api.holdout import (
@@ -395,7 +395,9 @@ def _preview(
     status_code=status.HTTP_202_ACCEPTED,
     responses={**_NOT_FOUND, **_BAD_BODY},
 )
-async def create_sweep(request: CreateSweep, session: SessionDep, queue: QueueDep) -> CreatedSweep:
+async def create_sweep(
+    request: CreateSweep, session: SessionDep, queue: QueueDep, collector: CollectorDep
+) -> CreatedSweep:
     """Write the sweep, its strategies and its runs in one transaction, then enqueue.
 
     **All or nothing in the face of a refusal.** Nothing is committed until every refusal has
@@ -414,6 +416,9 @@ async def create_sweep(request: CreateSweep, session: SessionDep, queue: QueueDe
     # ⚠️ **In a thread, never on the event loop** (26/09). A launch of a large grid is minutes of
     # CPU; run here it held the loop — every other request and the health check with it — and the
     # two crashes of the API measured on the loop's own thread happened during launches.
+    # Nothing is planned while the host agent is off: the runs read what is on disk (26/09).
+    if request.collect_missing and not collector.alive():
+        request = request.model_copy(update={"collect_missing": False})
     sweep, run_ids, collections, shared_count, skipped = await asyncio.to_thread(
         launch_sweep, session, request
     )

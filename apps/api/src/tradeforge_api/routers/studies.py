@@ -27,7 +27,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import defer, selectinload
 
 from tradeforge_api.coverage import describe, to_collect, uncovered_markets
-from tradeforge_api.deps import QueueDep, SessionDep
+from tradeforge_api.deps import CollectorDep, QueueDep, SessionDep
 from tradeforge_api.grid import (
     GridError,
     GridPoint,
@@ -272,7 +272,10 @@ def preview_of(base: Strategy, grid: Mapping[str, Sequence[Any]], timeframe: str
     responses={**_NOT_FOUND, **_BAD_BODY},
 )
 async def create_study(
-    request: CreateStudyRequest, session: SessionDep, queue: QueueDep
+    request: CreateStudyRequest,
+    session: SessionDep,
+    queue: QueueDep,
+    collector: CollectorDep,
 ) -> CreatedStudy:
     """Validate once, write the study, its strategies and its runs in one transaction, enqueue.
 
@@ -320,7 +323,8 @@ async def create_study(
             date_from=request.date_from,
             date_to=request.date_to,
         )
-        if request.collect_missing
+        # Nothing is planned while the host agent is off: the run reads what is on disk (26/09).
+        if request.collect_missing and collector.alive()
         else []
     )
     if not planned:

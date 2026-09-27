@@ -1,4 +1,5 @@
-"""A template's queue: one market's sweep at a time, the next when the last has ended (26/09).
+"""A template's queue: one sweep at a time — one chart of one market — the next when the last has
+ended (26/09).
 
 Called by the worker job `run_template_queue`, again every minute while a market is running or
 waiting. Never two markets at once: that is the point of the queue — a day's worth of markets run
@@ -63,7 +64,8 @@ def advance_queue(
         request = CreateSweep(
             entry_ids=[uuid.UUID(one) for one in template.entry_ids],
             symbols=[item.symbol],
-            timeframes=list(template.timeframes),
+            # One chart per item since 26/09; an item queued before runs them all, as it was.
+            timeframes=[item.timeframe] if item.timeframe else list(template.timeframes),
             date_from=template.date_from,
             date_to=template.date_to,
             initial_capital=template.initial_capital,

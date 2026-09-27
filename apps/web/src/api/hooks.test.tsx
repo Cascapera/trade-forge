@@ -113,6 +113,7 @@ describe('isTemplateSettled', () => {
   const item = (status: TemplateItem['status'], finished: boolean): TemplateItem => ({
     id: status,
     symbol: 'EURUSD',
+    timeframe: null,
     cost_model: {},
     position: 0,
     status,

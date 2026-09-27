@@ -19,6 +19,14 @@ from tradeforge_api.config import RedisConfig
 # and the router enqueues by it — a mismatch would enqueue jobs no worker ever claims.
 RUN_BACKTEST = "run_backtest"
 
+RUN_BACKTEST_BATCH = "run_backtest_batch"
+"""Many runs of a sweep over one market, the market read once per bar (ADR-0029, `batching`).
+
+⚠️ **A worker that does not know this name fails the job and drops it** — arq records "function
+not found" and takes it off the queue, and its runs stay `queued` for good. Every machine running
+workers — the Xeon's too — has to be on the code that registers it before a sweep is launched, or
+batching is switched off for the launches meanwhile (`TRADEFORGE_BATCH=false`)."""
+
 RUN_WALK_FORWARD = "run_walk_forward"
 RUN_CLUSTER = "run_cluster"
 RUN_SWEEP_WALK_FORWARD = "run_sweep_walk_forward"

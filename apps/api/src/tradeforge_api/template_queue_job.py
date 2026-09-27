@@ -24,8 +24,8 @@ from tradeforge_db.models import (
 
 
 def advance_queue(
-    session: Session, template_id: uuid.UUID, *, collect: bool
-) -> tuple[list[uuid.UUID], list[Collection], bool]:
+    session: Session, template_id: uuid.UUID, *, collect: bool, batch: bool = True
+) -> tuple[list[list[uuid.UUID]], list[Collection], bool]:
     """Launch the next market if nothing of this template is running; what to queue, and whether
     to look again.
 
@@ -74,8 +74,8 @@ def advance_queue(
         )
         item.status = TemplateItemStatus.LAUNCHED
         try:
-            sweep, runs, collections, _shared, _skipped = launch_sweep(
-                session, request, template_id=template.id
+            sweep, jobs, collections, _shared, _skipped = launch_sweep(
+                session, request, template_id=template.id, batch=batch
             )
         except HTTPException as refused:
             session.rollback()
@@ -84,12 +84,12 @@ def advance_queue(
             failed.status = TemplateItemStatus.FAILED
             failed.error = str(refused.detail)
             session.commit()
-            return advance_queue(session, template_id, collect=collect)
+            return advance_queue(session, template_id, collect=collect, batch=batch)
         launched = session.get(SweepTemplateItem, item_id)
         assert launched is not None  # noqa: S101 — committed with the sweep just now
         launched.sweep_id = sweep.id
         session.commit()
-        return runs, collections, True
+        return jobs, collections, True
 
     session.commit()
     return [], [], False

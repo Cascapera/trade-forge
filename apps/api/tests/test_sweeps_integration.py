@@ -35,7 +35,7 @@ from sqlalchemy.orm import Session
 from tradeforge_api.cluster_job import process_cluster
 from tradeforge_api.config import Settings
 from tradeforge_api.main import create_app
-from tradeforge_api.queue import COLLECT_QUEUE, COLLECT_RANGE, RUN_BACKTEST
+from tradeforge_api.queue import COLLECT_QUEUE, COLLECT_RANGE, RUN_BACKTEST, RUN_BACKTEST_BATCH
 from tradeforge_api.routers import sweeps as sweeps_router
 from tradeforge_api.routers.strategies import refusal_of
 from tradeforge_api.sweep_walkforward_job import advance
@@ -175,6 +175,15 @@ def a_filtered_document(name: str) -> dict[str, Any]:
         "setup": {"type": "structure_choch", "params": {"htf": "H4", "htf_offset": 3}},
         "risk": {"sizing": {"type": "percent_risk", "params": {"percent": 1.0}}},
     }
+
+
+def queued_runs(queue: Any) -> int:
+    """Runs queued, alone or in a batch (ADR-0029) — a batch job carries its runs' ids."""
+    return sum(
+        1 if name == RUN_BACKTEST else len(args[0])
+        for name, args in ((job[0], job[1]) for job in queue.jobs)
+        if name in {RUN_BACKTEST, RUN_BACKTEST_BATCH}
+    )
 
 
 def an_entry(
@@ -674,7 +683,7 @@ class TestPointsThatRunTheSameShareOneRun:
         # Three edge points, each reading its buffer; three martelo points, one run.
         assert (preview["documents"], preview["runs"], preview["shared"]) == (6, 4, 2)
         assert (created["runs"], created["shared"]) == (4, 2)
-        assert len([job for job in queue.jobs if job[0] == RUN_BACKTEST]) == 4
+        assert queued_runs(queue) == 4
 
     def test_the_run_names_the_points_it_answers(self, client: Any) -> None:
         _preview, created = self.launched(client)

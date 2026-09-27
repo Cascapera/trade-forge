@@ -58,6 +58,11 @@ class Settings(PostgresSettings, RedisConfig):
     # worker's replicas in docker-compose.yml, so the two cannot disagree.
     tradeforge_workers: int = Field(default=1, ge=1)
 
+    # Whether a sweep's launch cuts its runs into batches (ADR-0029, `batching`). ⚠️ Off while any
+    # machine's workers predate `run_backtest_batch`: such a worker fails a batch job it takes and
+    # drops it, leaving its runs queued for good. Read by the launch, never by the worker.
+    tradeforge_batch: bool = True
+
     # How many distinct days of paper trading a strategy must have on record before a live
     # session is allowed. **Policy, not invariant** — the database refuses a strategy that has
     # never completed a bar in paper at all (rev_0016), and that floor is not negotiable; this

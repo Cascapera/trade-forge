@@ -63,6 +63,12 @@ estiver no meio é perdido e volta a rodar quando alguém pegar de novo, como na
 
 ## Cuidados
 
+- ⚠️ **Lotes (ADR-0029): o Xeon tem de estar no mesmo código da principal antes de qualquer
+  varredura.** Uma varredura manda os runs em lotes (`run_backtest_batch`). Um worker de código
+  antigo que pegar um lote **não o devolve à fila**: o arq marca "function not found" e os runs do
+  lote ficam `queued` para sempre. Atualize o Xeon junto com a principal; se não der, lance com
+  `TRADEFORGE_BATCH=false` no `.env` da principal (tudo roda run a run, como antes).
+
 - **Conexões no Postgres:** o limite padrão é 100. 12 workers da principal + a API + 20–30 remotos
   cabem sem mudar nada.
 - **Coleta nova na principal:** repita o `robocopy`. Um worker percebe que os arquivos mudaram e lê

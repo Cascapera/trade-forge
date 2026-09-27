@@ -41,8 +41,11 @@ from tradeforge_engine import (
 )
 from tradeforge_engine import BacktestMetrics as EngineMetrics
 from tradeforge_engine import __version__ as ENGINE_VERSION  # noqa: N812 — public constant
+from tradeforge_engine.batch import BatchMember, run_batch
 from tradeforge_engine.domain import AssetClass
+from tradeforge_engine.loop import RunResult
 from tradeforge_engine.protocols import CostModel
+from tradeforge_engine.setup_factory import reading_for
 from tradeforge_schema import SemanticValidationError, assert_executable
 from tradeforge_schema import Strategy as StrategyDSL
 
@@ -333,25 +336,125 @@ def execute_backtest(  # noqa: PLR0913 — keyword-only; each names one axis of 
     (`retention`). The trades and metrics are the same either way (`loop.run`).
     """
     windowed = _candles_to_run(candles, instrument.symbol, timeframe, date_from, date_to)
+    result = run(
+        candles=windowed,
+        timeframe=step(timeframe),
+        instrument=instrument,
+        strategy=compile_strategy(definition),
+        broker=broker_for(
+            definition=definition,
+            instrument=instrument,
+            initial_capital=initial_capital,
+            cost_model=cost_model,
+            slippage_ticks=slippage_ticks,
+        ),
+        risk=risk_for(definition),
+        record_snapshots=record_snapshots,
+    )
+    return _measured(result, initial_capital, windowed)
 
-    spec = instrument
-    broker = BacktestBroker(
-        instrument=spec,
+
+class BatchRun(NamedTuple):
+    """One run of a batch, as `execute_batch` needs it: its document, its capital, its costs."""
+
+    definition: Mapping[str, Any]
+    initial_capital: Decimal
+    cost_model: Mapping[str, Any]
+
+
+Measured = tuple[list[ClosedTrade], EngineMetrics, CandleWindow]
+"""What `execute_backtest` returns, and what each run of `execute_batch` comes to."""
+
+
+def execute_batch(  # noqa: PLR0913 — keyword-only; each names one axis the batch shares
+    *,
+    key: tuple[dt.timedelta | None, dt.timedelta],
+    runs: Sequence[BatchRun],
+    instrument: InstrumentSpec,
+    timeframe: str,
+    date_from: dt.datetime,
+    date_to: dt.datetime,
+    candles: Sequence[Candle],
+) -> list[Measured | Exception]:
+    """`execute_backtest` for many runs over one market, the market read once per bar (ADR-0029).
+
+    Every run shares the window, the instrument and the reading `key` (`shared_reading`); each
+    keeps its own document, capital and costs, built into its broker and risk exactly as
+    `execute_backtest` builds them. One outcome per run, in order: what `execute_backtest` would
+    have returned, or the error that ended that run alone — a document that does not compile, a
+    run that raised. A sweep's run keeps no pictures, so none are built (`retention`).
+    """
+    windowed = _candles_to_run(candles, instrument.symbol, timeframe, date_from, date_to)
+    reading = reading_for(key, timeframe=step(timeframe))
+    outcomes: list[Measured | Exception | None] = []
+    members: list[BatchMember] = []
+    for batch_run in runs:
+        try:
+            members.append(
+                BatchMember(
+                    strategy=compile_strategy(batch_run.definition, reading=reading),
+                    broker=broker_for(
+                        definition=batch_run.definition,
+                        instrument=instrument,
+                        initial_capital=batch_run.initial_capital,
+                        cost_model=batch_run.cost_model,
+                        slippage_ticks=Decimal(0),
+                    ),
+                    risk=risk_for(batch_run.definition),
+                )
+            )
+            outcomes.append(None)
+        except Exception as exc:  # noqa: BLE001 — this run's refusal, not the batch's
+            outcomes.append(exc)
+    ran = iter(
+        run_batch(
+            candles=windowed,
+            timeframe=step(timeframe),
+            instrument=instrument,
+            reading=reading,
+            members=members,
+            record_snapshots=False,
+        )
+    )
+    measured: list[Measured | Exception] = []
+    for batch_run, refused in zip(runs, outcomes, strict=True):
+        if refused is not None:
+            measured.append(refused)
+            continue
+        outcome = next(ran)
+        if outcome.error is not None:
+            measured.append(outcome.error)
+        else:
+            assert outcome.result is not None  # noqa: S101 — `BatchOutcome` holds one or the other
+            measured.append(_measured(outcome.result, batch_run.initial_capital, windowed))
+    return measured
+
+
+def broker_for(
+    *,
+    definition: Mapping[str, Any],
+    instrument: InstrumentSpec,
+    initial_capital: Decimal,
+    cost_model: Mapping[str, Any],
+    slippage_ticks: Decimal,
+) -> BacktestBroker:
+    """The broker a run trades through — built once here for a run on its own and for a batch."""
+    return BacktestBroker(
+        instrument=instrument,
         initial_capital=initial_capital,
         cost_model=build_cost_model(cost_model),
         swap=swap_rates(cost_model),
         slippage_ticks=slippage_ticks,
         take_profit_rr=take_profit_rr(definition),
     )
-    result = run(
-        candles=windowed,
-        timeframe=step(timeframe),
-        instrument=spec,
-        strategy=compile_strategy(definition),
-        broker=broker,
-        risk=PercentRiskManager(percent=risk_percent(definition)),
-        record_snapshots=record_snapshots,
-    )
+
+
+def risk_for(definition: Mapping[str, Any]) -> PercentRiskManager:
+    """The sizing a run's document asks for — the same for a run on its own and for a batch."""
+    return PercentRiskManager(percent=risk_percent(definition))
+
+
+def _measured(result: RunResult, initial_capital: Decimal, windowed: Sequence[Candle]) -> Measured:
     metrics = compute_metrics(
         trades=result.trades,
         equity_curve=result.equity_curve,
@@ -363,10 +466,14 @@ def execute_backtest(  # noqa: PLR0913 — keyword-only; each names one axis of 
 
 __all__ = [
     "ENGINE_VERSION",
+    "BatchRun",
     "CandleWindow",
+    "broker_for",
     "build_cost_model",
     "execute_backtest",
+    "execute_batch",
     "instrument_spec",
+    "risk_for",
     "risk_percent",
     "swap_rates",
     "take_profit_rr",

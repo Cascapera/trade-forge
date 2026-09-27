@@ -46,6 +46,7 @@ from tradeforge_engine.expressions import (
 )
 from tradeforge_engine.indicators import ComponentView, build_indicator
 from tradeforge_engine.protocols import CompositeIndicator, Indicator, Strategy
+from tradeforge_engine.reading import MarketReading
 from tradeforge_engine.setup_factory import build_setup
 
 SUPPORTED_SCHEMA_VERSION: Final = "1.0"
@@ -295,7 +296,9 @@ def _compile_side(entry: Mapping[str, object], side: str) -> Condition | None:
     return compile_condition(_require_mapping(node, f"entry.{side}"))
 
 
-def compile_strategy(document: Mapping[str, object]) -> Strategy:
+def compile_strategy(
+    document: Mapping[str, object], *, reading: MarketReading | None = None
+) -> Strategy:
     """Compile a validated DSL document into a runnable strategy.
 
     Assumes `document` has already passed the schema package's shape and semantic checks.
@@ -329,7 +332,12 @@ def compile_strategy(document: Mapping[str, object]) -> Strategy:
         # and an engine that refuses to interpret one must refuse to interpret the other. The
         # timeframe is handed over because a setup may read a *higher* one, and it can only build
         # those bars knowing how long its own are.
-        return build_setup(_require_mapping(setup, "setup"), timeframe=timeframe)
+        return build_setup(_require_mapping(setup, "setup"), timeframe=timeframe, reading=reading)
+
+    # ⚠️ A shared market is read by a setup; a document of conditions reads none, and building
+    # it as if it did would leave a batch advancing a reading nobody reads.
+    if reading is not None:
+        raise EngineError("only a setup reads a shared market; this document names none")
 
     name = document.get("name")
     if not isinstance(name, str):

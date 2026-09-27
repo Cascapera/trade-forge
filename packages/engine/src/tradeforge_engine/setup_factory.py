@@ -30,6 +30,7 @@ from tradeforge_engine.bar_setups import GiftStop
 from tradeforge_engine.domain import TIMEFRAME_DELTAS, Side
 from tradeforge_engine.errors import EngineError
 from tradeforge_engine.protocols import Strategy
+from tradeforge_engine.reading import MarketReading
 from tradeforge_engine.setups import (
     DIALS_READ,
     ENTRY_DIALS,
@@ -317,25 +318,46 @@ def _structure_kwargs(
     return kwargs
 
 
-def _structure_choch(params: Mapping[str, object], timeframe: dt.timedelta | None) -> Strategy:
+def _structure_choch(
+    params: Mapping[str, object],
+    timeframe: dt.timedelta | None,
+    reading: MarketReading | None = None,
+) -> Strategy:
     return StructureStrategy(
-        qualifier=ChochQualifier(), name="choch", **_structure_kwargs(params, timeframe)
+        qualifier=ChochQualifier(),
+        name="choch",
+        reading=reading,
+        **_structure_kwargs(params, timeframe),
     )
 
 
 def _structure_continuation(
-    params: Mapping[str, object], timeframe: dt.timedelta | None
+    params: Mapping[str, object],
+    timeframe: dt.timedelta | None,
+    reading: MarketReading | None = None,
 ) -> Strategy:
     continuation: dict[str, Any] = {}
     _optional_int(params, "max_bos", continuation)
     return StructureStrategy(
         qualifier=ContinuationQualifier(**continuation),
         name="continuation",
+        reading=reading,
         **_structure_kwargs(params, timeframe),
     )
 
 
-_BUILDERS = {
+_ReadingBuilder = Callable[
+    [Mapping[str, object], dt.timedelta | None, MarketReading | None], Strategy
+]
+
+_READING_BUILDERS: dict[str, _ReadingBuilder] = {
+    "structure_choch": _structure_choch,
+    "structure_continuation": _structure_continuation,
+}
+"""The setups that read a `MarketReading` and so can share one (ADR-0029)."""
+
+
+_BUILDERS: dict[str, Callable[[Mapping[str, object], dt.timedelta | None], Strategy]] = {
     "mme9_breakout": _mme9,
     "mme9_failed_turn": _mme9_failed_turn,
     "mme9_pullback": _mme9_pullback,
@@ -346,7 +368,12 @@ _BUILDERS = {
 }
 
 
-def build_setup(node: Mapping[str, object], *, timeframe: dt.timedelta | None = None) -> Strategy:
+def build_setup(
+    node: Mapping[str, object],
+    *,
+    timeframe: dt.timedelta | None = None,
+    reading: MarketReading | None = None,
+) -> Strategy:
     """Build the named setup, or raise. `node` is the document's `setup` block.
 
     The name reaching here has already been through the schema's discriminated union, so an
@@ -358,12 +385,52 @@ def build_setup(node: Mapping[str, object], *, timeframe: dt.timedelta | None = 
     Only a setup reading a *higher* timeframe needs it — its bars are assembled from this one —
     and the class refuses such a filter without it, so a caller that builds a filtered setup by
     hand cannot get one that silently reads nothing.
+
+    `reading` is a batch's shared market (ADR-0029), `shared_reading`'s answer for this block —
+    refused for any setup that does not read one, rather than built without it and left to read
+    a market of its own that the batch cannot see.
     """
     kind = node.get("type")
+    if reading is not None:
+        reads = _READING_BUILDERS.get(kind) if isinstance(kind, str) else None
+        if reads is None:
+            raise EngineError(f"a {kind!r} setup does not read a shared market")
+        return reads(_params(node), timeframe, reading)
     build = _BUILDERS.get(kind) if isinstance(kind, str) else None
     if build is None:
         raise EngineError(f"unknown setup type {kind!r}; this engine builds {sorted(_BUILDERS)}")
     return build(_params(node), timeframe)
+
+
+def shared_reading(
+    node: Mapping[str, object], *, timeframe: dt.timedelta
+) -> tuple[dt.timedelta | None, dt.timedelta] | None:
+    """What of the market this setup block reads, as a key — or `None` if it cannot share one.
+
+    Two blocks with the same key, over the same bars, read the same market: the same structure and
+    regions on the chart, and the same regions above (the higher timeframe and the broker's clock
+    it is cut on). That is what a batch groups runs by (ADR-0029), and `MarketReading` is built from
+    it. `None` for a setup that builds no reading, and for a block too malformed to parse — running
+    it on its own is never wrong, only slower.
+    """
+    kind = node.get("type")
+    if not isinstance(kind, str) or kind not in _READING_BUILDERS:
+        return None
+    try:
+        kwargs = _structure_kwargs(_params(node), timeframe)
+    except (EngineError, ValueError):
+        return None
+    htf = kwargs.get("htf")
+    offset = kwargs.get("htf_offset")
+    return (htf, dt.timedelta(0) if offset is None else offset)
+
+
+def reading_for(
+    key: tuple[dt.timedelta | None, dt.timedelta], *, timeframe: dt.timedelta
+) -> MarketReading:
+    """The reading a batch whose members share `key` (`shared_reading`) advances once per bar."""
+    htf, offset = key
+    return MarketReading(timeframe=timeframe, htf=htf, htf_offset=offset)
 
 
 _ZONE_SETUPS = frozenset({"structure_choch", "structure_continuation"})
@@ -401,4 +468,4 @@ def unread_params(node: Mapping[str, object]) -> frozenset[str]:
     return frozenset()
 
 
-__all__ = ["build_setup", "unread_params"]
+__all__ = ["build_setup", "reading_for", "shared_reading", "unread_params"]

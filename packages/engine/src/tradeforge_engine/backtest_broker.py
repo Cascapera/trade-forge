@@ -497,6 +497,16 @@ class BacktestBroker:
         fills.sort(key=lambda fill: fill.order.intent is SignalKind.ENTRY)
         return fills
 
+    def idle(self) -> bool:
+        """No position, no order waiting to open, resting, or protecting one — a bar can fill
+        nothing here (ADR-0029, `loop._quiet`)."""
+        return (
+            self._portfolio.position is None
+            and not self._pending
+            and not self._resting
+            and self._protection is None
+        )
+
     def positions(self, symbol: str) -> Sequence[Position]:
         position = self._portfolio.position
         return (position,) if position is not None and position.symbol == symbol else ()

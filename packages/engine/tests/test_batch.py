@@ -8,19 +8,20 @@ alongside: one member failing, the reading failing, a document that cannot share
 """
 
 import datetime as dt
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from typing import Any
 
 import pytest
 
 from tradeforge_engine.backtest_broker import BacktestBroker
 from tradeforge_engine.batch import BatchMember, run_batch
-from tradeforge_engine.domain import Candle
+from tradeforge_engine.domain import Candle, Side
 from tradeforge_engine.errors import EngineError
-from tradeforge_engine.loop import run
+from tradeforge_engine.loop import ENGINE_CONTEXT, QuietBars, iter_run, run
 from tradeforge_engine.reading import MarketReading
 from tradeforge_engine.risk import PercentRiskManager
 from tradeforge_engine.setup_factory import build_setup, reading_for, shared_reading
+from tradeforge_engine.setups import ChochQualifier, ContinuationQualifier
 from tradeforge_engine.strategy import compile_strategy
 from tradeforge_engine.testing import EURUSD, HOUR
 
@@ -103,6 +104,8 @@ def _batched(
         reading=reading,
         members=members,
         record_snapshots=snapshots,
+        # Named, not left to the default: this equality is the proof the skip changes nothing.
+        quiet=QuietBars.SKIP,
     )
 
 
@@ -264,3 +267,136 @@ class TestSharedReading:
         }
         with pytest.raises(EngineError, match="only a setup reads a shared market"):
             compile_strategy(document, reading=MarketReading())
+
+
+class TestQuietBars:
+    """ADR-0029's second half: a batch skips the bars its setups call quiet, and it shows."""
+
+    def _batch(self, candles: list[Candle], quiet: QuietBars) -> tuple[list[Any], list[int]]:
+        documents = _grid(htf=True)
+        key = shared_reading(documents[0]["setup"], timeframe=HOUR)
+        assert key is not None
+        reading = reading_for(key, timeframe=HOUR)
+        calls: list[int] = []
+        strategies = []
+        for index, document in enumerate(documents):
+            strategy = compile_strategy(document, reading=reading)
+            calls.append(0)
+            inner = strategy.on_bar
+
+            def counted(context: Any, _inner: Any = inner, _at: int = index) -> Any:
+                calls[_at] += 1
+                return _inner(context)
+
+            strategy.on_bar = counted  # type: ignore[method-assign]
+            strategies.append(strategy)
+        outcomes = run_batch(
+            candles=candles,
+            timeframe=HOUR,
+            instrument=EURUSD,
+            reading=reading,
+            members=[
+                BatchMember(
+                    strategy=strategy,
+                    broker=_broker(),
+                    risk=PercentRiskManager(percent=Decimal(1)),
+                )
+                for strategy in strategies
+            ],
+            record_snapshots=False,
+            quiet=quiet,
+        )
+        return [outcome.result for outcome in outcomes], calls
+
+    def test_most_bars_are_skipped_and_nothing_changes(self) -> None:
+        candles = _walk(4)
+        skipped, calls = self._batch(candles, QuietBars.SKIP)
+        full, every = self._batch(candles, QuietBars.OFF)
+
+        assert skipped == full
+        assert every == [len(candles)] * len(every)
+        # Measured on this walk: the setups decide on a small share of the bars.
+        assert sum(calls) < sum(every) / 2
+        assert sum(len(result.trades) for result in full) > 0
+
+    def test_in_shadow_every_bar_runs_in_full_and_none_called_quiet_did_anything(self) -> None:
+        """The claim checked, not assumed: on each bar a setup calls quiet the full `on_bar` runs
+        anyway, and a fill, an order or a refusal on it would be refused by the loop."""
+        for seed in (0, 4, 10):
+            candles = _walk(seed)
+            shadowed, calls = self._batch(candles, QuietBars.SHADOW)
+            full, _ = self._batch(candles, QuietBars.OFF)
+            assert shadowed == full
+            assert calls == [len(candles)] * len(calls)
+
+    def test_a_setup_on_a_reading_of_its_own_is_never_quiet(self) -> None:
+        """Its reading is read inside `on_bar`: before it, the break it holds is the last bar's."""
+        candles = _walk(4)
+        document = _grid(htf=True)[0]
+        alone = run(
+            candles=candles,
+            timeframe=HOUR,
+            instrument=EURUSD,
+            strategy=compile_strategy(document),
+            broker=_broker(),
+            risk=PercentRiskManager(percent=Decimal(1)),
+        )
+        strategy = compile_strategy(document)
+        assert strategy.quiet(candles[0]) is False  # type: ignore[attr-defined]
+        broker = _broker()
+        bars = list(
+            iter_run(
+                candles=candles,
+                timeframe=HOUR,
+                instrument=EURUSD,
+                strategy=strategy,
+                broker=broker,
+                risk=PercentRiskManager(percent=Decimal(1)),
+                quiet=QuietBars.SKIP,
+            )
+        )
+        assert tuple(broker.trades()) == alone.trades
+        assert tuple(bar.equity for bar in bars) == alone.equity_curve
+
+    def test_an_account_with_an_order_or_a_position_is_not_idle(self) -> None:
+        broker = _broker()
+        assert broker.idle()
+        broker._pending.append(object())  # type: ignore[arg-type]
+        assert not broker.idle()
+
+    def test_a_waiting_rung_is_quiet_only_while_the_gate_above_is_shut(self) -> None:
+        """⚠️ The branch the walks never reach (the guardian's mutants M3, M8, M9): a rung still
+        standing, nothing armed, no break. Only a shut gate makes that bar quiet — without a gate
+        above, or with a side released, the full bar could arm the rung, and skipping it would
+        lose the trade from the batch alone."""
+        candles = _walk(0, count=3)
+        reading = reading_for((4 * HOUR, dt.timedelta(0)), timeframe=HOUR)
+        strategy: Any = compile_strategy(_grid(htf=True)[0], reading=reading)
+        with localcontext(ENGINE_CONTEXT):
+            reading.advance(candles[0])
+        assert reading.break_ is None
+
+        class _Rungs:
+            def __init__(self, holds: bool) -> None:
+                self.holds_rungs = holds
+
+        strategy._qualifier = _Rungs(holds=False)
+        assert strategy.quiet(candles[0]) is True
+
+        strategy._qualifier = _Rungs(holds=True)
+        assert strategy.quiet(candles[0]) is True  # the gate above is shut
+        strategy._gate._releases[Side.LONG] = object()
+        assert strategy.quiet(candles[0]) is False  # a side released: the rung could arm
+        strategy._gate = None
+        assert strategy.quiet(candles[0]) is False  # no gate above: nothing refuses the rung
+
+        strategy._qualifier = object()  # a qualifier that cannot say
+        assert strategy.quiet(candles[0]) is False
+
+    @pytest.mark.parametrize("qualifier", [ChochQualifier, ContinuationQualifier])
+    def test_a_qualifier_says_when_a_rung_is_waiting(self, qualifier: Any) -> None:
+        """What `quiet` asks of the real qualifiers — a stub above would let them lie."""
+        asked = qualifier()
+        assert asked.holds_rungs is False
+        asked._ladder = [object()]
+        assert asked.holds_rungs is True

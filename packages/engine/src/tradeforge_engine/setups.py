@@ -339,6 +339,11 @@ class ChochQualifier:
     def __init__(self) -> None:
         self._ladder: list[OrderBlock] = []
 
+    @property
+    def holds_rungs(self) -> bool:
+        """Whether a rung is waiting — what a quiet bar asks (`StructureStrategy.quiet`)."""
+        return bool(self._ladder)
+
     def qualify(self, context: SetupContext) -> OrderBlock | None:
         """Name the ladder's current rung, advancing on the outcome the machinery reported."""
         # The outcome belongs to the regime that produced the trade, so it is settled before a
@@ -423,6 +428,11 @@ class ContinuationQualifier:
         # Breaks armed since the last change of character; `None` until the first choch is seen,
         # which is the "not eligible yet" state — a bootstrap BOS has no reversal behind it.
         self._since_choch: int | None = None
+
+    @property
+    def holds_rungs(self) -> bool:
+        """Whether a rung is waiting — what a quiet bar asks (`StructureStrategy.quiet`)."""
+        return bool(self._ladder)
 
     def qualify(self, context: SetupContext) -> OrderBlock | None:
         """Name the ladder's current rung, arming on a favourable break once a choch has opened
@@ -2271,6 +2281,48 @@ class StructureStrategy:
             )
         )
         return above + tuple(_zone_mark(tracked) for tracked in self._blocks.zones)
+
+    def quiet(self, candle: Candle) -> bool:
+        """Can nothing this setup keeps change on this bar, and can it emit nothing? (ADR-0029)
+
+        Asked by a batch's loop before the bar, with the market already read for it, and only
+        when the account holds no position and no order and no refusal is waiting to be told
+        (`loop._quiet`). Then, on this setup's own terms:
+
+        * **Nothing armed and no trade just ended** — no activation to watch, no outcome to hand
+          the qualifier.
+        * **No break of structure on this bar** — no new ladder, no count, no zone offered.
+        * **No rung waiting — or the timeframe above shut** (no release standing, none opened on
+          this bar). A waiting rung can only become an order through `_may_arm`, which a shut
+          gate refuses; what `qualify` would do meanwhile is drop dead rungs, and a rung dead now
+          is dead on the next bar that asks — mitigation and trimming are permanent — so it is
+          dropped then, with the same ladder left.
+
+        On such a bar `on_bar` returns nothing, and `pass_quiet` does the only part of it that
+        must still happen every bar: the market read, and the gate's releases moved on.
+        """
+        # ⚠️ Only over a reading someone else advanced: a reading of the setup's own is read inside
+        # `on_bar`, so before it the break it holds is the last bar's.
+        if self._owns_reading:
+            return False
+        # The break read below has to be this bar's: a leader out of step fails here, loudly.
+        self._reading.read_at(candle)
+        if self._armed is not None or self._filled is not None or self._reading.break_ is not None:
+            return False
+        holds = getattr(self._qualifier, "holds_rungs", None)
+        if holds is None:
+            return False
+        if not holds:
+            return True
+        gate = self._gate
+        return gate is not None and gate.shut_on_this_bar()
+
+    def pass_quiet(self, candle: Candle) -> None:
+        """What `on_bar` does on a quiet bar that it must not skip: read the market at this bar,
+        and move the timeframe above's releases on (a region reached, a search ended)."""
+        self._read(candle)
+        if self._gate is not None:
+            self._gate.observe(candle)
 
     def _read(self, candle: Candle) -> None:
         """Advance this setup's own reading, or check that a shared one is at this bar."""

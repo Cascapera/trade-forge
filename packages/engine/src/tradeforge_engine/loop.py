@@ -85,6 +85,7 @@ __all__ = [
     "ENGINE_PRECISION",
     "SNAPSHOT_BARS_BEFORE",
     "BarOutcome",
+    "RunRecorder",
     "RunResult",
     "iter_run",
     "run",
@@ -250,11 +251,7 @@ def run(  # noqa: PLR0913 — keyword-only; each one names a real axis of a back
     (`test_snapshots_off_change_nothing_but_the_snapshots`). It is not built and dropped later
     because the copy is the cost — up to 51 bars per entry, over millions of runs.
     """
-    fills: list[Fill] = []
-    refusals: list[Refusal] = []
-    equity_curve: list[EquityPoint] = []
-    processed = 0
-
+    recorder = RunRecorder()
     for outcome in iter_run(
         candles=candles,
         timeframe=timeframe,
@@ -264,26 +261,46 @@ def run(  # noqa: PLR0913 — keyword-only; each one names a real axis of a back
         risk=risk,
         record_snapshots=record_snapshots,
     ):
-        fills.extend(outcome.fills)
-        refusals.extend(outcome.refusals)
-        equity_curve.append(outcome.equity)
-        processed = outcome.index + 1
+        recorder.add(outcome)
+    return recorder.result(broker)
 
-    # The closing reads are pinned like every bar's work was. ⚠️ With the brokers in this repo
-    # that is a no-op and provably so — `Portfolio.account()` reads fields already computed and
-    # `trades()` hands back objects already built, so a mutant deleting this block survives. It
-    # stays as a boundary, not as a fix: the arithmetic of totalling a ledger is a broker's to
-    # place, and one that computed equity on demand would need it. The comment says which of
-    # those is true today so nobody reads the block as proof of the other.
-    with localcontext(ENGINE_CONTEXT):
-        return RunResult(
-            fills=tuple(fills),
-            trades=tuple(broker.trades()),
-            equity_curve=tuple(equity_curve),
-            final_account=broker.account(),
-            candles_processed=processed,
-            refusals=tuple(refusals),
-        )
+
+class RunRecorder:
+    """What `run` keeps of each bar, and the `RunResult` it makes of them at the end.
+
+    A class of its own so a batch (`batch.run_batch`), which steps many runs a bar at a time
+    instead of draining one, keeps each run's record exactly the way `run` does — one place
+    that decides what a result is made of, not two that agree today (ADR-0029).
+    """
+
+    def __init__(self) -> None:
+        self._fills: list[Fill] = []
+        self._refusals: list[Refusal] = []
+        self._equity_curve: list[EquityPoint] = []
+        self._processed = 0
+
+    def add(self, outcome: BarOutcome) -> None:
+        self._fills.extend(outcome.fills)
+        self._refusals.extend(outcome.refusals)
+        self._equity_curve.append(outcome.equity)
+        self._processed = outcome.index + 1
+
+    def result(self, broker: Broker) -> RunResult:
+        # The closing reads are pinned like every bar's work was. ⚠️ With the brokers in this repo
+        # that is a no-op and provably so — `Portfolio.account()` reads fields already computed and
+        # `trades()` hands back objects already built, so a mutant deleting this block survives. It
+        # stays as a boundary, not as a fix: the arithmetic of totalling a ledger is a broker's to
+        # place, and one that computed equity on demand would need it. The comment says which of
+        # those is true today so nobody reads the block as proof of the other.
+        with localcontext(ENGINE_CONTEXT):
+            return RunResult(
+                fills=tuple(self._fills),
+                trades=tuple(broker.trades()),
+                equity_curve=tuple(self._equity_curve),
+                final_account=broker.account(),
+                candles_processed=self._processed,
+                refusals=tuple(self._refusals),
+            )
 
 
 def _iter_run(  # noqa: PLR0913 — see run()

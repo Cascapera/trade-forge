@@ -71,6 +71,13 @@ class DashboardRun:
     result: RunResult | None
     """Null until the run has metrics — which is what "finished" means here."""
 
+    count: int = 1
+    """How many runs this row stands for (28/09). One for a run read whole; more for a **tally** of
+    runs without a result — failed, cancelled, still queued — that Postgres counted by sweep,
+    entry, market, chart and status, because reading 1.3 million of them one by one was most of a
+    52-second dashboard. Only a row without a result may stand for more than one, and its
+    `measurement` must be its own: a tally is already one-per-measurement where it has to be."""
+
     @property
     def return_(self) -> Decimal | None:
         if self.result is None:
@@ -124,9 +131,9 @@ def summarise(key: str, label: str | None, runs: Sequence[DashboardRun]) -> Dash
     return DashboardSlice(
         key=key,
         label=label,
-        runs=len(runs),
+        runs=sum(run.count for run in runs),
         finished=len(returns),
-        failed=sum(1 for run in runs if run.status == BacktestStatus.FAILED),
+        failed=sum(run.count for run in runs if run.status == BacktestStatus.FAILED),
         winners=sum(1 for value in returns if value > 0),
         losers=sum(1 for value in returns if value < 0),
         flat=sum(1 for value in returns if value == 0),
@@ -211,12 +218,21 @@ def left_out(sweeps: Iterable[DashboardSweepRow]) -> list[DashboardLeftOut]:
     ]
 
 
-def totals(sweeps: Sequence[DashboardSweepRow], runs: Sequence[DashboardRun]) -> DashboardTotals:
-    """What was launched (every run) beside what was measured (each measurement once)."""
+def totals(
+    sweeps: Sequence[DashboardSweepRow],
+    runs: Sequence[DashboardRun],
+    measured: Sequence[DashboardRun] | None = None,
+) -> DashboardTotals:
+    """What was launched (every run) beside what was measured (each measurement once).
+
+    `measured` is `distinct(runs)` unless the caller already has it — the router does, when the
+    runs without a result come counted (`DashboardRun.count`) and their one-per-measurement tally
+    comes apart from their every-run one.
+    """
     counted = dict.fromkeys(BacktestStatus, 0)
     for run in runs:
-        counted[run.status] += 1
-    measured = distinct(runs)
+        counted[run.status] += run.count
+    measured = distinct(runs) if measured is None else measured
     finished = [run.result for run in measured if run.result is not None]
     return DashboardTotals(
         sweeps=len(sweeps),
@@ -224,13 +240,13 @@ def totals(sweeps: Sequence[DashboardSweepRow], runs: Sequence[DashboardRun]) ->
         symbols=sorted({run.symbol for run in runs}),
         timeframes=sorted({run.timeframe for run in runs}),
         runs=SweepRunCounts(
-            total=len(runs),
+            total=sum(run.count for run in runs),
             done=counted[BacktestStatus.DONE],
             running=counted[BacktestStatus.RUNNING],
             queued=counted[BacktestStatus.QUEUED],
             failed=counted[BacktestStatus.FAILED],
         ),
-        measurements=len(measured),
+        measurements=sum(run.count for run in measured),
         trades=sum(result.total_trades for result in finished),
         runs_without_trades=sum(1 for result in finished if result.total_trades == 0),
         left_out=left_out(sweeps),
@@ -257,7 +273,7 @@ def per_sweep(
                 id=sweep.sweep_id,
                 created_at=sweep.created_at,
                 entry_names=list(sweep.entry_names),
-                runs=len(members),
+                runs=sum(run.count for run in members),
                 finished=len(returns),
                 winners=sum(1 for value in returns if value > 0),
                 median_return=median(returns),

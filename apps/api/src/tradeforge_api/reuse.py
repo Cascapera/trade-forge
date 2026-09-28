@@ -40,6 +40,7 @@ from sqlalchemy.orm import Session
 
 from tradeforge_api.retention import recorded_for
 from tradeforge_api.runner import ENGINE_VERSION
+from tradeforge_api.warm_window import WarmUp, warm_start
 from tradeforge_db.models import Backtest, BacktestMetrics, BacktestStatus, Recorded, Trade
 from tradeforge_engine.domain import Candle
 
@@ -52,16 +53,18 @@ they differ only in what they kept; five is plenty to find one that kept enough.
 
 
 def window_of(
-    candles: Sequence[Candle], date_from: dt.datetime, date_to: dt.datetime
-) -> tuple[int, dt.datetime, dt.datetime] | None:
-    """The bars a run over this window reads — how many, the first and the last — or `None` for
-    none. The same bounds as the run's own clip (`runner._candles_to_run`: both ends included),
-    by binary search: the reader hands candles in time order, and a sweep asks this per run."""
+    candles: Sequence[Candle], date_from: dt.datetime, date_to: dt.datetime, warmup: WarmUp
+) -> tuple[int, dt.datetime, dt.datetime, int] | None:
+    """The bars a run over this window reads — how many, the first and the last, and how many
+    before it to warm up (ADR-0030) — or `None` for none. The same bounds as the run's own clip
+    (`runner._candles_to_run`: both ends included) and warm-up (`warm_window.warm_start`), by
+    binary search: the reader hands candles in time order, and a sweep asks this per run."""
     start = bisect_left(candles, date_from, key=lambda candle: candle.time)
     end = bisect_right(candles, date_to, key=lambda candle: candle.time)
     if end <= start:
         return None
-    return end - start, candles[start].time, candles[end - 1].time
+    warmed = start - warm_start(candles, warmup, date_from)
+    return end - start, candles[start].time, candles[end - 1].time, warmed
 
 
 def needs(run: Backtest, metrics: BacktestMetrics) -> Recorded:
@@ -84,7 +87,7 @@ def original_for(
     session: Session,
     run: Backtest,
     spec: Mapping[str, Any],
-    window: tuple[int, dt.datetime, dt.datetime],
+    window: tuple[int, dt.datetime, dt.datetime, int],
 ) -> tuple[Backtest, Recorded] | None:
     """A finished run of the very same measurement that kept enough to stand for `run`, and what
     `run` will keep — or `None`, and `run` runs.
@@ -93,7 +96,7 @@ def original_for(
     none ran before 25/09 — under 0.1.0, so it is never a candidate anyway. `window` is what the
     run would read from the disk now (`window_of`).
     """
-    candles, first, last = window
+    candles, first, last, warmed = window
     found = session.scalars(
         select(Backtest)
         .where(
@@ -110,6 +113,9 @@ def original_for(
             Backtest.candles_seen == candles,
             Backtest.first_candle == first,
             Backtest.last_candle == last,
+            # Warmed on as many bars (ADR-0030): a run that starts where the history starts
+            # warms on less, and its first trades may differ from one that warmed in full.
+            Backtest.warmup_bars == warmed,
             Backtest.id != run.id,
         )
         .order_by(Backtest.finished_at.desc())

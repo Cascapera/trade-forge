@@ -943,6 +943,9 @@ class Backtest(Base):
     candles_seen: Mapped[int | None] = mapped_column(Integer)
     first_candle: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
     last_candle: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    # The bars read before the window to warm the run up (ADR-0030, rev_0038): traded on, never
+    # booked. Null for a run recorded before; fewer than asked when the history is shorter.
+    warmup_bars: Mapped[int | None] = mapped_column(Integer)
 
     # `passive_deletes=True` pairs with ON DELETE CASCADE: Postgres removes the children
     # in one statement. Without it, SQLAlchemy would load every trade of the run into
@@ -1081,6 +1084,9 @@ class BacktestMetrics(Base):
     positive_year_share: Mapped[Decimal | None] = mapped_column(RATIO)
     # `{"2019": "3.25", ...}` — R per calendar year of entry, for the years that had a trade.
     yearly_r: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    # `{"2019": {"2019": "2.5", "2020": "-1"}, ...}` — R by year of entry, then year of exit
+    # (ADR-0030, rev_0038): what a longer run gives a window of whole years. Null before 28/09.
+    r_by_years: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
 
     backtest: Mapped[Backtest] = relationship(back_populates="metrics")
 
@@ -1109,6 +1115,10 @@ class BacktestMetrics(Base):
         ),
         CheckConstraint(
             "yearly_r IS NULL OR jsonb_typeof(yearly_r) = 'object'", name="yearly_r_is_an_object"
+        ),
+        CheckConstraint(
+            "r_by_years IS NULL OR jsonb_typeof(r_by_years) = 'object'",
+            name="r_by_years_is_an_object",
         ),
     )
 

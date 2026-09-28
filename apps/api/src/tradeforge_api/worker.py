@@ -70,6 +70,7 @@ from tradeforge_api.runner import (
 from tradeforge_api.sweep_walkforward_job import advance
 from tradeforge_api.template_queue_job import advance_queue
 from tradeforge_api.walkforward import Candidate, choose
+from tradeforge_api.warm_window import warmup_for
 from tradeforge_collector import read_candles, step
 from tradeforge_db.collections import finish_collection
 from tradeforge_db.models import (
@@ -146,10 +147,14 @@ def _original_of(
     must have seen the very bars on the disk now — a chart collected again since does not match.
     """
     instrument = session.get(Instrument, run.instrument_id)
-    if run.sweep_id is None or instrument is None:
+    strategy = session.get(Strategy, run.strategy_id)
+    if run.sweep_id is None or instrument is None or strategy is None:
         return None
     window = window_of(
-        read(parquet_root, instrument.symbol, run.timeframe), run.date_from, run.date_to
+        read(parquet_root, instrument.symbol, run.timeframe),
+        run.date_from,
+        run.date_to,
+        warmup_for(strategy.definition),
     )
     if window is None:
         return None  # nothing to read: the run records that itself
@@ -229,6 +234,10 @@ def _record_done(  # noqa: PLR0913 — one finished run and what it came to
     metrics_row.losing_streak_r = in_r.losing_streak_r
     metrics_row.positive_year_share = in_r.positive_year_share
     metrics_row.yearly_r = {str(year): str(r) for year, r in sorted(in_r.yearly_r.items())}
+    metrics_row.r_by_years = {
+        str(entered): {str(left): str(r) for left, r in sorted(exits.items())}
+        for entered, exits in sorted(in_r.by_years.items())
+    }
     backtest.recorded = recorded
     session.add(metrics_row)
     session.add_all(trade_rows)
@@ -237,6 +246,7 @@ def _record_done(  # noqa: PLR0913 — one finished run and what it came to
     backtest.candles_seen = window.candles
     backtest.first_candle = window.first
     backtest.last_candle = window.last
+    backtest.warmup_bars = window.warmed
     backtest.status = BacktestStatus.DONE
     backtest.finished_at = _now()
 
@@ -370,8 +380,12 @@ async def process_batch(  # noqa: PLR0913 — keyword-only; each names one thing
     first = runs[0]
     instrument = session.get(Instrument, first.instrument_id)
     strategies = [session.get(Strategy, run.strategy_id) for run in runs]
+    # The reading and the warm-up: a batch feeds its runs one stream of bars (ADR-0030).
     keys = {
-        None if strategy is None else shared_reading_of(strategy.definition, first.timeframe)
+        None
+        if strategy is None
+        or (reading := shared_reading_of(strategy.definition, first.timeframe)) is None
+        else (reading, warmup_for(strategy.definition))
         for strategy in strategies
     }
     one_market = (
@@ -399,8 +413,9 @@ async def process_batch(  # noqa: PLR0913 — keyword-only; each names one thing
             )
         return
     assert instrument is not None  # noqa: S101 — `one_market` says so
-    (key,) = keys
-    assert key is not None  # noqa: S101 — `one_market` says so
+    (shared,) = keys
+    assert shared is not None  # noqa: S101 — `one_market` says so
+    key = shared[0]
 
     ids = [run.id for run in runs]
     try:

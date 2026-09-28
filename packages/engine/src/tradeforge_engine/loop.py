@@ -113,6 +113,9 @@ class RunResult:
     """What a run produced. Frozen, so a caller cannot doctor the record."""
 
     fills: tuple[Fill, ...]
+    """Every fill from the first booked bar on. ⚠️ Under a warm-up (ADR-0030) the exit of a shadow
+    position that closes after `book_from` is here without its entry, and makes no trade: read the
+    trades for what the run did, never pair these."""
     trades: tuple[ClosedTrade, ...]
     equity_curve: tuple[EquityPoint, ...]
     final_account: AccountState

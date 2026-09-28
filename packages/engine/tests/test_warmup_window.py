@@ -21,6 +21,7 @@ from tradeforge_engine.portfolio import Portfolio
 from tradeforge_engine.risk import PercentRiskManager
 from tradeforge_engine.setup_factory import reading_for, shared_reading
 from tradeforge_engine.strategy import compile_strategy
+from tradeforge_engine.swap import SwapRates
 from tradeforge_engine.testing import EURUSD, HOUR
 
 from .test_batch import _grid
@@ -89,6 +90,29 @@ class TestTheLedger:
             portfolio.account().equity - CAPITAL
         )
 
+    def test_a_shadow_held_over_rollovers_leaks_no_swap(self) -> None:
+        """The engine-guardian's mutant (28/09): the swap is settled at the exit, after `book_from`
+        — a shadow opened on a Wednesday and closed on the Friday carries three nights of it
+        (the Wednesday rollover counts triple) and none may reach the account."""
+        wednesday = dt.datetime(2024, 1, 3, 10, tzinfo=dt.UTC)
+        thursday = dt.datetime(2024, 1, 4, tzinfo=dt.UTC)
+        friday = dt.datetime(2024, 1, 5, 10, tzinfo=dt.UTC)
+        portfolio = Portfolio(
+            initial_capital=CAPITAL,
+            instrument=EURUSD,
+            swap=SwapRates(long_per_lot=Decimal(-6)),
+            book_from=thursday,
+        )
+        portfolio.apply(fill(order(), price="1.10000", time=wednesday))
+
+        trade = portfolio.apply(fill(order(intent=SignalKind.EXIT), price="1.10000", time=friday))
+
+        assert trade is not None
+        assert trade.swap < 0, "the rates charge nothing here: the test proves nothing"
+        assert portfolio.trades == ()
+        assert portfolio.account().balance == CAPITAL
+        assert portfolio.account().equity == CAPITAL
+
     def test_without_book_from_nothing_is_shadow(self) -> None:
         portfolio = Portfolio(initial_capital=CAPITAL, instrument=EURUSD)
         portfolio.apply(fill(order(), price="1.10000", time=T0))
@@ -144,14 +168,19 @@ def test_a_warmed_run_takes_the_trades_a_longer_run_takes_from_book_from(
         )
         # The account opens at `book_from`, with its capital, and books only from there.
         assert warmed.equity_curve[0].time == book_from
-        assert warmed.equity_curve[0].equity == CAPITAL or warmed.trades
+        # The account opens with its capital: before any booked trade, the curve is flat at it.
+        first_booked = min((t.entry_time for t in warmed.trades), default=None)
+        assert all(
+            point.equity == CAPITAL
+            for point in warmed.equity_curve
+            if first_booked is None or point.time < first_booked
+        )
         assert warmed.warmed == sum(1 for candle in candles if candle.time < book_from)
         assert warmed.candles_processed == len(candles) - warmed.warmed
         assert all(fill.time >= book_from for fill in warmed.fills)
-        assert sum(t.net_pnl for t in warmed.trades) == warmed.final_account.equity - CAPITAL or (
-            # A booked position still open at the end is in the equity and not in the trades.
-            warmed.final_account.balance != warmed.final_account.equity
-        )
+        # The ledger's property over what was booked: the balance, which a position still open at
+        # the end does not move, is the capital plus every booked trade.
+        assert sum(t.net_pnl for t in warmed.trades) == warmed.final_account.balance - CAPITAL
         booked += len(warmed.trades)
     # The walks have to have traded after `book_from`, or the equality is between empty lists.
     assert booked > 0

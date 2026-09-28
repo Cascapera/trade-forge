@@ -16,12 +16,14 @@ via `str`, so `1.1` stays `1.1` and never inherits a float's binary dust.
 from __future__ import annotations
 
 import datetime as dt
+from bisect import bisect_left
 from collections.abc import Mapping, Sequence
 from decimal import Decimal
 from typing import Any, NamedTuple
 
 from pydantic import ValidationError
 
+from tradeforge_api.warm_window import WarmUp, warm_start, warmup_for
 from tradeforge_collector import step
 from tradeforge_db.models import Backtest, Instrument
 from tradeforge_engine import (
@@ -312,6 +314,9 @@ class CandleWindow(NamedTuple):
     candles: int
     first: dt.datetime
     last: dt.datetime
+    warmed: int = 0
+    """Bars read before the window to warm the run up (ADR-0030): traded on as shadow, never
+    booked. Fewer than asked when the history does not reach back that far."""
 
 
 def execute_backtest(  # noqa: PLR0913 — keyword-only; each names one axis of a backtest run
@@ -337,7 +342,7 @@ def execute_backtest(  # noqa: PLR0913 — keyword-only; each names one axis of 
     """
     windowed = _candles_to_run(candles, instrument.symbol, timeframe, date_from, date_to)
     result = run(
-        candles=windowed,
+        candles=[*_warm(candles, warmup_for(definition), date_from), *windowed],
         timeframe=step(timeframe),
         instrument=instrument,
         strategy=compile_strategy(definition),
@@ -347,6 +352,7 @@ def execute_backtest(  # noqa: PLR0913 — keyword-only; each names one axis of 
             initial_capital=initial_capital,
             cost_model=cost_model,
             slippage_ticks=slippage_ticks,
+            book_from=date_from,
         ),
         risk=risk_for(definition),
         record_snapshots=record_snapshots,
@@ -385,6 +391,12 @@ def execute_batch(  # noqa: PLR0913 — keyword-only; each names one axis the ba
     run that raised. A sweep's run keeps no pictures, so none are built (`retention`).
     """
     windowed = _candles_to_run(candles, instrument.symbol, timeframe, date_from, date_to)
+    # One stream of bars for every member, so one warm-up: a batch holds only runs that warm up
+    # alike (`batching.batch_key`), and one that does not is refused rather than fed another's.
+    warmups = {warmup_for(batch_run.definition) for batch_run in runs}
+    if len(warmups) != 1:
+        raise ValueError(f"a batch's runs warm up differently: {sorted(map(str, warmups))}")
+    (warmup,) = warmups
     reading = reading_for(key, timeframe=step(timeframe))
     outcomes: list[Measured | Exception | None] = []
     members: list[BatchMember] = []
@@ -399,6 +411,7 @@ def execute_batch(  # noqa: PLR0913 — keyword-only; each names one axis the ba
                         initial_capital=batch_run.initial_capital,
                         cost_model=batch_run.cost_model,
                         slippage_ticks=Decimal(0),
+                        book_from=date_from,
                     ),
                     risk=risk_for(batch_run.definition),
                 )
@@ -408,7 +421,7 @@ def execute_batch(  # noqa: PLR0913 — keyword-only; each names one axis the ba
             outcomes.append(exc)
     ran = iter(
         run_batch(
-            candles=windowed,
+            candles=[*_warm(candles, warmup, date_from), *windowed],
             timeframe=step(timeframe),
             instrument=instrument,
             reading=reading,
@@ -430,15 +443,19 @@ def execute_batch(  # noqa: PLR0913 — keyword-only; each names one axis the ba
     return measured
 
 
-def broker_for(
+def broker_for(  # noqa: PLR0913 — keyword-only; each names one part of the venue
     *,
     definition: Mapping[str, Any],
     instrument: InstrumentSpec,
     initial_capital: Decimal,
     cost_model: Mapping[str, Any],
     slippage_ticks: Decimal,
+    book_from: dt.datetime | None = None,
 ) -> BacktestBroker:
-    """The broker a run trades through — built once here for a run on its own and for a batch."""
+    """The broker a run trades through — built once here for a run on its own and for a batch.
+
+    `book_from` is where its account opens (ADR-0030): what fills before it is warm-up.
+    """
     return BacktestBroker(
         instrument=instrument,
         initial_capital=initial_capital,
@@ -446,7 +463,17 @@ def broker_for(
         swap=swap_rates(cost_model),
         slippage_ticks=slippage_ticks,
         take_profit_rr=take_profit_rr(definition),
+        book_from=book_from,
     )
+
+
+def _warm(candles: Sequence[Candle], warmup: WarmUp, date_from: dt.datetime) -> Sequence[Candle]:
+    """The bars before the window a run warms up on (ADR-0030, `warm_window`)."""
+    return candles[warm_start(candles, warmup, date_from) : _opens(candles, date_from)]
+
+
+def _opens(candles: Sequence[Candle], date_from: dt.datetime) -> int:
+    return bisect_left(candles, date_from, key=lambda candle: candle.time)
 
 
 def risk_for(definition: Mapping[str, Any]) -> PercentRiskManager:
@@ -460,7 +487,7 @@ def _measured(result: RunResult, initial_capital: Decimal, windowed: Sequence[Ca
         equity_curve=result.equity_curve,
         initial_capital=initial_capital,
     )
-    window = CandleWindow(len(windowed), windowed[0].time, windowed[-1].time)
+    window = CandleWindow(len(windowed), windowed[0].time, windowed[-1].time, result.warmed)
     return list(result.trades), metrics, window
 
 

@@ -18,6 +18,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from tradeforge_api.queue import RUN_BACKTEST, RUN_BACKTEST_BATCH, JobQueue
+from tradeforge_api.warm_window import WarmUp, warmup_for
 from tradeforge_collector import step
 from tradeforge_engine.setup_factory import shared_reading
 
@@ -32,8 +33,9 @@ def batch_size(timeframe: str) -> int:
     return _SMALLER.get(timeframe, BATCH_SIZE)
 
 
-BatchKey = tuple[str, str, tuple[dt.timedelta | None, dt.timedelta]]
-"""(symbol, chart, reading) — every run of one launch already shares its window."""
+BatchKey = tuple[str, str, tuple[dt.timedelta | None, dt.timedelta], WarmUp]
+"""(symbol, chart, reading, warm-up) — every run of one launch already shares its window. The
+warm-up because a batch feeds one stream of bars to all its runs (ADR-0030, `warm_window`)."""
 
 
 def batch_key(document: Mapping[str, Any], symbol: str, timeframe: str) -> BatchKey | None:
@@ -42,7 +44,7 @@ def batch_key(document: Mapping[str, Any], symbol: str, timeframe: str) -> Batch
     if not isinstance(setup, Mapping):
         return None
     reading = shared_reading(setup, timeframe=step(timeframe))
-    return None if reading is None else (symbol, timeframe, reading)
+    return None if reading is None else (symbol, timeframe, reading, warmup_for(document))
 
 
 class Batcher:
@@ -64,7 +66,7 @@ class Batcher:
         """Each job's runs: batches of up to `size` per key in the order the keys were met, then
         the runs that go alone, one each. A batch of one is a run alone."""
         jobs = []
-        for (_symbol, timeframe, _reading), runs in self._groups.items():
+        for (_symbol, timeframe, _reading, _warmup), runs in self._groups.items():
             size = self._size or batch_size(timeframe)
             jobs += [runs[start : start + size] for start in range(0, len(runs), size)]
         return jobs + [[run_id] for run_id in self._alone]

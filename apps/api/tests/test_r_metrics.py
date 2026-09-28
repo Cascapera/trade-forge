@@ -97,3 +97,25 @@ def test_no_trades_is_zero_risk_and_no_share() -> None:
     assert found.losing_streak_r == Decimal(0)
     assert found.yearly_r == {}
     assert found.positive_year_share is None
+
+
+def test_r_is_kept_by_year_of_entry_then_year_of_exit() -> None:
+    """ADR-0030: a longer run answers a window of whole years with the cells entered from its
+    first year and left by its last — a trade entered on New Year's Eve and left in January is
+    not the earlier year's alone."""
+    new_years_eve = dt.datetime(2020, 12, 31, 23, tzinfo=dt.UTC)
+    trades = [
+        trade(day(10, 2020), "2"),
+        trade(new_years_eve, "-1"),  # exits 2021-01-01 00:00
+        trade(day(10, 2021), "3"),
+    ]
+
+    found = r_metrics(trades)
+
+    assert found.by_years == {
+        2020: {2020: Decimal("2"), 2021: Decimal("-1")},
+        2021: {2021: Decimal("3")},
+    }
+    # By entry the year still counts the trade it opened, as before.
+    assert found.yearly_r == {2020: Decimal("1"), 2021: Decimal("3")}
+    assert sum(r for exits in found.by_years.values() for r in exits.values()) == found.net_r

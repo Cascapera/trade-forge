@@ -51,6 +51,10 @@ class RMetrics:
     """The deepest run of consecutive losing trades, summed — non-positive."""
     yearly_r: dict[int, Decimal]
     """R per calendar year of entry, for the years that had a trade."""
+    by_years: dict[int, dict[int, Decimal]]
+    """R by year of entry, then year of exit (ADR-0030): a longer run answers a window of whole
+    years `[a, b]` with the cells entered from `a` and left by `b` — the trades a run of that
+    window would have closed inside it."""
     positive_year_share: Decimal | None
     """Years ending above zero R over years with a trade; `None` below `MIN_YEARS_FOR_SHARE`."""
 
@@ -58,8 +62,12 @@ class RMetrics:
 def r_metrics(trades: Sequence[ClosedTrade]) -> RMetrics:
     """Fold a run's trades, in entry order, into its R metrics."""
     scored = sorted(
-        ((trade.entry_time, trade.r_multiple) for trade in trades if trade.r_multiple is not None),
-        key=lambda pair: pair[0],
+        (
+            (trade.entry_time, trade.r_multiple, trade.exit_time)
+            for trade in trades
+            if trade.r_multiple is not None
+        ),
+        key=lambda scored_trade: scored_trade[0],
     )
 
     total = _ZERO
@@ -70,8 +78,9 @@ def r_metrics(trades: Sequence[ClosedTrade]) -> RMetrics:
     streak_r = _ZERO
     worst_streak_r = _ZERO
     yearly: dict[int, Decimal] = {}
+    by_years: dict[int, dict[int, Decimal]] = {}
 
-    for entered, r in scored:
+    for entered, r, left in scored:
         total += r
         peak = max(peak, total)
         deepest = max(deepest, peak - total)
@@ -87,6 +96,8 @@ def r_metrics(trades: Sequence[ClosedTrade]) -> RMetrics:
             streak_r = _ZERO
 
         yearly[entered.year] = yearly.get(entered.year, _ZERO) + r
+        exits = by_years.setdefault(entered.year, {})
+        exits[left.year] = exits.get(left.year, _ZERO) + r
 
     share = (
         Decimal(sum(1 for value in yearly.values() if value > _ZERO)) / Decimal(len(yearly))
@@ -99,6 +110,7 @@ def r_metrics(trades: Sequence[ClosedTrade]) -> RMetrics:
         losing_streak=longest,
         losing_streak_r=worst_streak_r,
         yearly_r=yearly,
+        by_years=by_years,
         positive_year_share=share,
     )
 

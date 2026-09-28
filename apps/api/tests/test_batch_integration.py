@@ -26,6 +26,7 @@ from tradeforge_api.candle_cache import CandleCache
 from tradeforge_api.config import Settings
 from tradeforge_api.main import create_app
 from tradeforge_api.queue import RUN_BACKTEST, RUN_BACKTEST_BATCH
+from tradeforge_api.warm_window import WarmUp
 from tradeforge_api.worker import process_backtest, process_batch
 from tradeforge_collector import write_candles
 from tradeforge_db.models import (
@@ -45,6 +46,7 @@ pytestmark = pytest.mark.integration
 START = dt.datetime(2024, 1, 1, tzinfo=dt.UTC)
 HOUR = dt.timedelta(hours=1)
 BARS = 1400
+_NO_WARMUP = WarmUp(bars=0, span=None)
 
 
 class _Queue:
@@ -330,8 +332,8 @@ class TestTheLaunchCutsBatches:
     def test_runs_are_cut_by_market_in_batches_of_at_most_the_size(self) -> None:
         batcher = Batcher(size=2)
         eur, gbp = (
-            ("EURUSD", "H1", (None, dt.timedelta(0))),
-            ("GBPUSD", "H1", (None, dt.timedelta(0))),
+            ("EURUSD", "H1", (None, dt.timedelta(0)), _NO_WARMUP),
+            ("GBPUSD", "H1", (None, dt.timedelta(0)), _NO_WARMUP),
         )
         ids = [uuid.uuid4() for _ in range(6)]
         for run_id, key in zip(ids, [eur, gbp, eur, None, eur, gbp], strict=True):
@@ -348,7 +350,7 @@ class TestTheLaunchCutsBatches:
         batcher = Batcher()
         ids = [uuid.uuid4() for _ in range(13)]
         for run_id in ids:
-            batcher.add(run_id, ("EURUSD", "M1", (None, dt.timedelta(0))))
+            batcher.add(run_id, ("EURUSD", "M1", (None, dt.timedelta(0)), _NO_WARMUP))
         assert [len(job) for job in batcher.jobs()] == [6, 6, 1]
 
     def test_switched_off_every_run_goes_alone(self) -> None:
@@ -356,7 +358,7 @@ class TestTheLaunchCutsBatches:
         batcher = Batcher(enabled=False)
         ids = [uuid.uuid4() for _ in range(3)]
         for run_id in ids:
-            batcher.add(run_id, ("EURUSD", "H1", (None, dt.timedelta(0))))
+            batcher.add(run_id, ("EURUSD", "H1", (None, dt.timedelta(0)), _NO_WARMUP))
         assert batcher.jobs() == [[one] for one in ids]
 
 
@@ -463,6 +465,72 @@ def _recorded(session_factory: Callable[[], Session], sweep_id: str) -> dict[uui
                 select(Backtest).where(Backtest.sweep_id == uuid.UUID(sweep_id))
             )
         }
+
+
+class TestTheRunWarmsUpBeforeItsWindow:
+    """ADR-0030 through the API and the worker: a sweep whose window opens in the middle of the
+    data reads the bars before it to warm up, records how many, and books from `date_from`."""
+
+    OPENS = 700
+
+    def launch_later(self, client: Any, entry: str) -> str:
+        launched = client.post(
+            "/sweeps",
+            json={
+                "entry_ids": [entry],
+                "symbols": ["EURUSD"],
+                "timeframes": ["H1"],
+                "date_from": (START + self.OPENS * HOUR).isoformat(),
+                "date_to": (START + (BARS - 1) * HOUR).isoformat(),
+                "initial_capital": "10000",
+                "cost_model": {"type": "none"},
+                "collect_missing": False,
+            },
+        )
+        assert launched.status_code == 202, launched.text
+        return str(launched.json()["id"])
+
+    def test_a_batch_warms_up_and_books_as_each_run_alone(
+        self, client: Any, session_factory: Callable[[], Session], queue: _Queue, tmp_path: Path
+    ) -> None:
+        entry = _entry(client)
+        batched = self.launch_later(client, entry)
+        assert any(job[0] == RUN_BACKTEST_BATCH for job in queue.jobs)
+        _run_all(queue, session_factory, tmp_path, reuse=False)
+        alone = self.launch_later(client, entry)
+        cache = CandleCache()
+        for name, args, _options in queue.jobs:
+            ids = [args[0]] if name == RUN_BACKTEST else args[0]
+            for run_id in ids:
+                with session_factory() as session:
+                    asyncio.run(
+                        process_backtest(
+                            session=session,
+                            redis=queue,  # type: ignore[arg-type]
+                            parquet_root=tmp_path,
+                            backtest_id=uuid.UUID(run_id),
+                            read=cache.read,
+                            reuse=False,
+                        )
+                    )
+        queue.jobs.clear()
+
+        assert _written(session_factory, batched) == _written(session_factory, alone)
+        with session_factory() as session:
+            runs = list(
+                session.scalars(select(Backtest).where(Backtest.sweep_id == uuid.UUID(batched)))
+            )
+            # A structure setup warms a year; the history holds the 700 bars before the window.
+            assert {run.warmup_bars for run in runs} == {self.OPENS}
+            assert {run.first_candle for run in runs} == {START + self.OPENS * HOUR}
+            traded = 0
+            for run in runs:
+                assert run.metrics is not None
+                cells = run.metrics.r_by_years or {}
+                total = sum(Decimal(r) for exits in cells.values() for r in exits.values())
+                assert total == (run.metrics.net_r or 0)
+                traded += run.metrics.total_trades
+            assert traded > 0, "the warmed window has to trade, or the checks are vacuous"
 
 
 class TestTheSameMeasurementIsCopied:

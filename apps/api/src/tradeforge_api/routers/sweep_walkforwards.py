@@ -13,9 +13,10 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, status
 from sqlalchemy import select
 
-from tradeforge_api.deps import QueueDep, SessionDep
-from tradeforge_api.queue import RUN_BACKTEST, RUN_SWEEP_WALK_FORWARD
-from tradeforge_api.routers.sweeps import get_holdout, launch_window
+from tradeforge_api.batching import enqueue_runs
+from tradeforge_api.deps import QueueDep, SessionDep, SettingsDep
+from tradeforge_api.queue import RUN_SWEEP_WALK_FORWARD
+from tradeforge_api.routers.sweeps import get_holdout, jobs_for, launch_window
 from tradeforge_api.schemas import (
     CreatedSweepWalkForward,
     CreateSweepWalkForward,
@@ -51,7 +52,11 @@ FIRST_LOOK = dt.timedelta(seconds=30)
     responses=_NOT_FOUND,
 )
 async def create_sweep_walk_forward(
-    sweep_id: uuid.UUID, request: CreateSweepWalkForward, session: SessionDep, queue: QueueDep
+    sweep_id: uuid.UUID,
+    request: CreateSweepWalkForward,
+    session: SessionDep,
+    queue: QueueDep,
+    settings: SettingsDep,
 ) -> CreatedSweepWalkForward:
     """Keep the walk-forward, launch every fold's training at once, and start the conductor.
 
@@ -67,6 +72,17 @@ async def create_sweep_walk_forward(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="a reserved-window test cannot walk forward; walk the sweep it came from",
         )
+    charts = None
+    if request.timeframes is not None:
+        unknown = [one for one in request.timeframes if one not in parent.timeframes]
+        if unknown:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=f"the sweep has no {', '.join(unknown)} to walk; it ran "
+                + ", ".join(parent.timeframes),
+            )
+        # In the sweep's own order, whatever order they were asked in.
+        charts = [one for one in parent.timeframes if one in request.timeframes]
     try:
         planned = windows(
             start_year=request.start_year,
@@ -110,9 +126,13 @@ async def create_sweep_walk_forward(
     session.commit()
 
     queued: list[Backtest] = []
+    by_fold: list[list[Backtest]] = []
     for index, window in enumerate(planned):
-        training, runs = launch_window(session, parent, window.train_from, window.train_to)
+        training, runs = launch_window(
+            session, parent, window.train_from, window.train_to, timeframes=charts
+        )
         queued += runs
+        by_fold.append(runs)
         session.add(
             SweepWalkForwardFold(
                 walk_forward_id=walk.id,
@@ -126,8 +146,9 @@ async def create_sweep_walk_forward(
         )
         session.commit()
 
-    for run in queued:
-        await queue.enqueue_job(RUN_BACKTEST, str(run.id), _job_id=str(run.id))
+    # Cut per fold: a batch shares one window, and every fold trains on its own.
+    for fold_runs in by_fold:
+        await enqueue_runs(queue, jobs_for(session, fold_runs, batch=settings.tradeforge_batch))
     await queue.enqueue_job(RUN_SWEEP_WALK_FORWARD, str(walk.id), _defer_by=FIRST_LOOK)
     return CreatedSweepWalkForward(id=walk.id, folds=len(planned), runs=len(queued))
 

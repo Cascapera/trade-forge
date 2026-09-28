@@ -55,6 +55,7 @@ from tradeforge_api.queue import (
 )
 from tradeforge_api.r_metrics import r_metrics
 from tradeforge_api.retention import recorded_for
+from tradeforge_api.routers.sweeps import jobs_for
 from tradeforge_api.runner import (
     ENGINE_VERSION,
     BatchRun,
@@ -999,11 +1000,18 @@ async def run_sweep_walk_forward(ctx: dict[str, Any], walk_forward_id: str) -> N
     session: Session = ctx["session_factory"]()
     try:
         runs, pending = advance(session, uuid.UUID(walk_forward_id))
-        run_ids = [str(one.id) for one in runs]
+        # Each fold's test is its own window, and a batch shares one: cut per test sweep.
+        by_test: dict[uuid.UUID | None, list[Backtest]] = {}
+        for one in runs:
+            by_test.setdefault(one.sweep_id, []).append(one)
+        jobs = [
+            job
+            for fold_runs in by_test.values()
+            for job in jobs_for(session, fold_runs, batch=ctx["settings"].tradeforge_batch)
+        ]
     finally:
         session.close()
-    for run_id in run_ids:
-        await ctx["redis"].enqueue_job(RUN_BACKTEST, run_id, _job_id=run_id)
+    await enqueue_runs(ctx["redis"], jobs)
     if pending:
         await ctx["redis"].enqueue_job(
             RUN_SWEEP_WALK_FORWARD, walk_forward_id, _defer_by=dt.timedelta(seconds=30)

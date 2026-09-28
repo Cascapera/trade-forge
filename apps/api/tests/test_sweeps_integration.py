@@ -2394,6 +2394,58 @@ class TestTheSweepWalksForward:
         listed = client.get(f"/sweeps/{parent}/walkforwards").json()
         assert [one["id"] for one in listed] == [walk_id]
 
+    def zoned(self, client: Any) -> str:
+        """A structure sweep over M15 and H1: its runs share a reading of the market and batch."""
+        entry = an_entry(
+            client,
+            name=f"walked zones {uuid.uuid4()}",
+            grid={"setup.params.stop_buffer": [0, 0.1, 0.2]},
+            document=a_zone_document(f"doc {uuid.uuid4()}"),
+        )
+        launched = client.post("/sweeps", json=a_sweep_body([entry], ["EURUSD"], ["M15", "H1"]))
+        assert launched.status_code == 202, launched.text
+        assert launched.json()["runs"] == 6
+        return str(launched.json()["id"])
+
+    def test_only_the_charts_asked_are_trained_and_in_batches(
+        self, client: Any, queue: _CapturingQueue
+    ) -> None:
+        """28/09: a sweep over M5 and M15 walked on M5 alone re-ran M15 in every window, and run
+        by run — ~3.4x slower than the sweep had run, in batches (ADR-0029)."""
+        parent = self.zoned(client)
+        before = len(queue.jobs)
+
+        made = client.post(
+            f"/sweeps/{parent}/walkforward", json={**self.BODY, "timeframes": ["H1"]}
+        )
+
+        assert made.status_code == 202, made.text
+        assert (made.json()["folds"], made.json()["runs"]) == (2, 6)
+        new = queue.jobs[before:]
+        # Each fold's three H1 runs are one batch: a batch shares one window.
+        assert [job[0] for job in new] == [
+            "run_backtest_batch",
+            "run_backtest_batch",
+            "run_sweep_walk_forward",
+        ]
+        assert [len(job[1][0]) for job in new[:2]] == [3, 3]
+        walk = client.get(f"/sweep-walkforwards/{made.json()['id']}").json()
+        for fold in walk["folds"]:
+            training = client.get(f"/sweeps/{fold['train_sweep_id']}").json()
+            assert training["timeframes"] == ["H1"]
+            assert {row["run"]["timeframe"] for row in training["runs"]} == {"H1"}
+            assert {row["values"]["timeframe"] for row in training["runs"]} == {"H1"}
+
+    def test_a_chart_the_sweep_did_not_run_is_refused(self, client: Any) -> None:
+        parent = self.zoned(client)
+
+        refused = client.post(
+            f"/sweeps/{parent}/walkforward", json={**self.BODY, "timeframes": ["H1", "H4"]}
+        )
+
+        assert refused.status_code == 422
+        assert refused.json()["detail"] == "the sweep has no H4 to walk; it ran M15, H1"
+
     def test_what_cannot_walk_forward_is_refused(
         self, client: Any, session_factory: Callable[[], Session]
     ) -> None:

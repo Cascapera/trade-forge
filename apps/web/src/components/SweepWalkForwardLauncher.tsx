@@ -37,9 +37,13 @@ function planned(
  * Walk a finished sweep forward (25/09, path B): at each fold the whole sweep runs again on a
  * training window, its best points are chosen by the rule below, and they run on the window after.
  *
- * ⚠️ **Each fold is the whole sweep again.** The cost is said before the button — the sweep's
- * runs times the folds — because the button that starts it is one click and the queue it fills is
- * hours long.
+ * ⚠️ **Each fold is the whole sweep again** — on the charts ticked (28/09). The cost is said
+ * before the button — the sweep's runs times the folds — because the button that starts it is one
+ * click and the queue it fills is hours long. With some charts only, the runs are the sweep's
+ * share on those charts, estimated as an even split: the sweep does not count its runs per chart.
+ *
+ * The trade floor is per chart, as the reserved-window test's: blank keeps the sweep's own (60 on
+ * M1 and M5), which no run of a quiet setup may reach — and then every fold is refused.
  */
 export function SweepWalkForwardLauncher(props: { sweep: SweepOut }): React.JSX.Element {
   const { sweep } = props
@@ -55,9 +59,16 @@ export function SweepWalkForwardLauncher(props: { sweep: SweepOut }): React.JSX.
   const [topN, setTopN] = useState(3)
   const [metric, setMetric] = useState<HoldoutRank>('net_profit')
   const [understood, setUnderstood] = useState(false)
+  const [charts, setCharts] = useState<string[]>(sweep.timeframes)
+  const [floors, setFloors] = useState<Record<string, string>>({})
 
-  const runs = sweep.counts?.total ?? sweep.runs.length
+  const all = sweep.counts?.total ?? sweep.runs.length
+  const some = charts.length < sweep.timeframes.length
+  const runs = some ? Math.round((all * charts.length) / sweep.timeframes.length) : all
   const cost = runs * folds
+  const floorsValid = charts.every(
+    (chart) => (floors[chart] ?? '') === '' || /^[1-9]\d*$/.test(floors[chart] ?? ''),
+  )
   const windows = planned(startYear, trainYears, testYears, folds, anchored)
   const lastTest = startYear + trainYears + folds * testYears - 1
   const thisYear = new Date().getUTCFullYear()
@@ -68,11 +79,20 @@ export function SweepWalkForwardLauncher(props: { sweep: SweepOut }): React.JSX.
         ? 'Each window is at least a year.'
         : startYear + trainYears > thisYear
           ? 'The first test would start in the future.'
-          : !understood
-            ? 'Confirm the cost first.'
-            : null
+          : charts.length === 0
+            ? 'Tick at least one chart.'
+            : !floorsValid
+              ? 'A trade floor is a whole number of at least 1.'
+              : !understood
+                ? 'Confirm the cost first.'
+                : null
 
   const launch = (): void => {
+    const minTrades: Record<string, number> = {}
+    for (const chart of charts) {
+      const value = floors[chart] ?? ''
+      if (value !== '') minTrades[chart] = Number(value)
+    }
     create.mutate(
       {
         start_year: startYear,
@@ -82,6 +102,9 @@ export function SweepWalkForwardLauncher(props: { sweep: SweepOut }): React.JSX.
         anchored,
         top_n: topN,
         metric,
+        ...(Object.keys(minTrades).length > 0 ? { min_trades: minTrades } : {}),
+        // In the sweep's order; left out when every chart walks, as before 28/09.
+        ...(some ? { timeframes: sweep.timeframes.filter((one) => charts.includes(one)) } : {}),
       },
       {
         onSuccess: (made) => {
@@ -155,6 +178,44 @@ export function SweepWalkForwardLauncher(props: { sweep: SweepOut }): React.JSX.
         </label>
       </div>
 
+      <fieldset className="text-sm">
+        <legend className="mb-1 text-slate-400">
+          Charts to walk, and the fewest trades to be chosen on each — blank keeps the sweep&apos;s
+          floor
+        </legend>
+        <div className="flex flex-wrap gap-4">
+          {sweep.timeframes.map((chart) => (
+            <span key={chart} className="flex items-center gap-2">
+              <label className="flex items-center gap-1">
+                <input
+                  type="checkbox"
+                  checked={charts.includes(chart)}
+                  onChange={(event) => {
+                    const on = event.target.checked
+                    setCharts((current) =>
+                      on ? [...current, chart] : current.filter((one) => one !== chart),
+                    )
+                    setUnderstood(false)
+                  }}
+                />
+                {chart}
+              </label>
+              <input
+                aria-label={`fewest trades on ${chart}`}
+                inputMode="numeric"
+                placeholder="default"
+                disabled={!charts.includes(chart)}
+                value={floors[chart] ?? ''}
+                onChange={(event) => {
+                  setFloors((current) => ({ ...current, [chart]: event.target.value }))
+                }}
+                className={`${input} w-20 disabled:opacity-40`}
+              />
+            </span>
+          ))}
+        </div>
+      </fieldset>
+
       <p className="text-xs text-slate-400">
         {windows.map((one, k) => `fold ${String(k + 1)}: train ${one.train} → test ${one.test}`).join(' · ')}
         {lastTest > thisYear && ` · the last test reaches ${String(lastTest)} and stops at today`}
@@ -169,7 +230,8 @@ export function SweepWalkForwardLauncher(props: { sweep: SweepOut }): React.JSX.
           }}
         />
         Queues about {cost.toLocaleString('en-US')} training runs ({String(runs)} × {String(folds)}{' '}
-        folds), plus each fold&apos;s tests.
+        folds{some && `, on ${charts.join(', ')} only — an even share of the sweep's ${String(all)}`}
+        ), plus each fold&apos;s tests.
       </label>
 
       {why !== null && <p className="text-xs text-amber-300">{why}</p>}

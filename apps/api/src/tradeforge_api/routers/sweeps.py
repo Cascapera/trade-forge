@@ -27,7 +27,7 @@ import functools
 import secrets
 import threading
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from decimal import Decimal
 from typing import Annotated, Any, Literal
 
@@ -53,7 +53,7 @@ from tradeforge_api.holdout import (
     positive_share,
 )
 from tradeforge_api.montecarlo import Spread, observed, simulate
-from tradeforge_api.queue import COLLECT_QUEUE, COLLECT_RANGE, RUN_BACKTEST
+from tradeforge_api.queue import COLLECT_QUEUE, COLLECT_RANGE
 from tradeforge_api.retention import MIN_TRADES
 from tradeforge_api.routers.backtests import failed_collections, list_item
 from tradeforge_api.routers.strategies import refusal_of
@@ -1190,7 +1190,11 @@ def _dashboard_key(
     responses={**_NOT_FOUND, **_BAD_BODY},
 )
 async def create_holdout(
-    sweep_id: uuid.UUID, request: CreateHoldout, session: SessionDep, queue: QueueDep
+    sweep_id: uuid.UUID,
+    request: CreateHoldout,
+    session: SessionDep,
+    queue: QueueDep,
+    settings: SettingsDep,
 ) -> CreatedSweep:
     """Run a sweep's best points again, on a window none of them was chosen on (24/09).
 
@@ -1203,14 +1207,52 @@ async def create_holdout(
     test — its points would be chosen on the reserved window itself.
     """
     holdout, runs, uncovered = launch_holdout(session, sweep_id, request)
-    # After the commit, and with the run's own id as the job id — the sweep launch's reasons.
-    for one in runs:
-        await queue.enqueue_job(RUN_BACKTEST, str(one.id), _job_id=str(one.id))
+    # After the commit, and with job ids derived from the runs — the sweep launch's reasons.
+    await enqueue_runs(queue, jobs_for(session, runs, batch=settings.tradeforge_batch))
     return CreatedSweep(id=holdout.id, runs=len(runs), skipped=uncovered)
 
 
+def jobs_for(session: Session, runs: Sequence[Backtest], *, batch: bool) -> list[list[uuid.UUID]]:
+    """Runs already written, cut into jobs as a launch cuts its own (ADR-0029, 28/09).
+
+    A walk-forward's training copies a sweep's runs and a reserved-window test re-runs its chosen
+    ones; both were queued run by run, so a walk-forward over a sweep that ran in batches ran
+    ~3.4x slower than the sweep itself. Every run here shares one window, as a launch's do.
+    """
+    if not runs:
+        return []
+    documents = dict(
+        session.execute(
+            select(Strategy.id, Strategy.definition).where(
+                Strategy.id.in_({run.strategy_id for run in runs})
+            )
+        )
+        .tuples()
+        .all()
+    )
+    symbols = dict(
+        session.execute(
+            select(Instrument.id, Instrument.symbol).where(
+                Instrument.id.in_({run.instrument_id for run in runs})
+            )
+        )
+        .tuples()
+        .all()
+    )
+    batches = Batcher(enabled=batch)
+    for run in runs:
+        batches.add(
+            run.id, batch_key(documents[run.strategy_id], symbols[run.instrument_id], run.timeframe)
+        )
+    return batches.jobs()
+
+
 def launch_window(
-    session: Session, parent: Sweep, date_from: dt.datetime, date_to: dt.datetime
+    session: Session,
+    parent: Sweep,
+    date_from: dt.datetime,
+    date_to: dt.datetime,
+    timeframes: Sequence[str] | None = None,
 ) -> tuple[Sweep, list[Backtest]]:
     """`parent` again over another window — every run it made, the same strategy, market, chart,
     capital and costs — kept and committed; the caller queues the runs (a walk-forward's
@@ -1220,21 +1262,23 @@ def launch_window(
     after refusals and de-duplication (`same_as`), so copying them reproduces the sweep exactly —
     expanding the grid anew would re-decide both, possibly differently. A (market, chart) with no
     candles in the new window is left out and recorded in `skipped`, as a launch does.
+
+    `timeframes` keeps only the runs on those charts (28/09): a walk-forward of one chart of a
+    sweep over several need not train the others. `None` is every chart of the parent.
     """
+    charts = list(parent.timeframes) if timeframes is None else list(timeframes)
     parents = session.execute(
         select(Backtest, Instrument.symbol)
         .join(Instrument, Instrument.id == Backtest.instrument_id)
-        .where(Backtest.sweep_id.in_(scope_of(parent)))
+        .where(Backtest.sweep_id.in_(scope_of(parent)), Backtest.timeframe.in_(charts))
         .order_by(Backtest.created_at, Backtest.id)
     ).all()
-    uncovered = uncovered_markets(
-        session, list(parent.symbols), list(parent.timeframes), date_from, date_to
-    )
+    uncovered = uncovered_markets(session, list(parent.symbols), charts, date_from, date_to)
     empty = {(market.symbol, market.timeframe) for market in uncovered}
     sweep = Sweep(
         entry_ids=list(parent.entry_ids),
         symbols=list(parent.symbols),
-        timeframes=list(parent.timeframes),
+        timeframes=charts,
         date_from=date_from,
         date_to=date_to,
         initial_capital=parent.initial_capital,
@@ -1242,7 +1286,7 @@ def launch_window(
     )
     session.add(sweep)
     session.flush()
-    _copy_points(session, parent, sweep)
+    _copy_points(session, parent, sweep, timeframes=None if timeframes is None else charts)
     runs = [
         Backtest(
             sweep=sweep,
@@ -2296,13 +2340,19 @@ def _points_of(
 
 
 def _copy_points(
-    session: Session, source: Sweep, target: Sweep, *, strategy_ids: set[str] | None = None
+    session: Session,
+    source: Sweep,
+    target: Sweep,
+    *,
+    strategy_ids: set[str] | None = None,
+    timeframes: Sequence[str] | None = None,
 ) -> None:
     """`source`'s points written again as `target`'s, in their order — in Postgres, never
     through Python: a sweep's points can number hundreds of thousands (26/09).
 
     With `strategy_ids`, only the points that are those strategies' own runs (a reserved-window
-    test copies the points it chose, and none of the points they answered).
+    test copies the points it chose, and none of the points they answered). With `timeframes`,
+    only the points on those charts (a walk-forward of some charts of the sweep, 28/09).
     """
     query = select(
         literal(target.id),
@@ -2318,6 +2368,8 @@ def _copy_points(
             PointRow.same_as.is_(None),
             PointRow.strategy_id.in_([uuid.UUID(one) for one in strategy_ids]),
         )
+    if timeframes is not None:
+        query = query.where(PointRow.coordinates["timeframe"].astext.in_(list(timeframes)))
     session.execute(
         insert(PointRow).from_select(
             ["sweep_id", "position", "strategy_id", "entry_id", "label", "coordinates", "same_as"],

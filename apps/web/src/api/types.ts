@@ -1480,6 +1480,8 @@ export interface CreateSweepWalkForwardRequest {
   min_trades?: Record<string, number>
   max_drawdown_r?: string
   min_positive_year_share?: string
+  /** The charts to walk (28/09); left out, every chart of the sweep. */
+  timeframes?: string[]
 }
 
 export interface CreatedSweepWalkForward {

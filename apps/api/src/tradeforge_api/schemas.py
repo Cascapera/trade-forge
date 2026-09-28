@@ -2370,6 +2370,9 @@ class CreateSweepWalkForward(BaseModel):
     min_positive_year_share: Decimal | None = Field(default=None, gt=0, le=1)
     distinct: bool = True
     """Each fold skips clones, as a reserved-window test does (`CreateHoldout.distinct`)."""
+    timeframes: list[Timeframe] | None = Field(default=None, min_length=1)
+    """The charts to walk (28/09); blank is every chart of the sweep. Each fold trains only these —
+    a sweep over M5 and M15 walked on M5 alone does not re-run M15 in every window."""
 
 
 class CreatedSweepWalkForward(BaseModel):

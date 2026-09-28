@@ -2436,6 +2436,41 @@ class TestTheSweepWalksForward:
             assert {row["run"]["timeframe"] for row in training["runs"]} == {"H1"}
             assert {row["values"]["timeframe"] for row in training["runs"]} == {"H1"}
 
+    def test_a_fold_that_would_test_after_today_is_refused_with_how_many_fit(
+        self, client: Any
+    ) -> None:
+        """28/09: folds testing 2028, 2030 and 2032 trained on the same data as the first — cut at
+        today — and had nothing to test; 360 thousand runs queued for no answer."""
+        parent = self.parent(client)
+
+        refused = client.post(f"/sweeps/{parent}/walkforward", json={**self.BODY, "folds": 6})
+
+        assert refused.status_code == 422
+        # From 2023, one year each: folds test 2024, 2025, 2026 — and 2027 is after today.
+        assert refused.json()["detail"] == (
+            "fold 4 would test from 2027-01-01, in the future: "
+            "with these windows at most 3 folds fit"
+        )
+
+    def test_the_runs_the_sweep_failed_are_not_trained_again(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        """A run cancelled by hand is written `failed`; the sweep of 27/09 had 116 thousand."""
+        parent = self.parent(client)
+        with session_factory() as session:
+            run = session.scalars(
+                select(Backtest).where(Backtest.sweep_id == uuid.UUID(parent)).limit(1)
+            ).one()
+            run.status = BacktestStatus.FAILED
+            run.error = "cancelled by hand"
+            run.started_at = run.finished_at = START
+            session.commit()
+
+        made = client.post(f"/sweeps/{parent}/walkforward", json=self.BODY)
+
+        assert made.status_code == 202, made.text
+        assert made.json()["runs"] == 4  # two points of three, in each of the two folds
+
     def test_a_chart_the_sweep_did_not_run_is_refused(self, client: Any) -> None:
         parent = self.zoned(client)
 
@@ -2460,7 +2495,10 @@ class TestTheSweepWalksForward:
         of_a_test = client.post(f"/sweeps/{test_id}/walkforward", json=self.BODY)
 
         assert future.status_code == 422
-        assert "in the future" in future.json()["detail"]
+        assert future.json()["detail"] == (
+            "fold 1 would test from 2091-01-01, in the future: "
+            "these windows leave fewer than two folds to test"
+        )
         assert one_fold.status_code == 422
         assert of_a_test.status_code == 422
         assert client.post(f"/sweeps/{uuid.uuid4()}/walkforward", json=self.BODY).status_code == 404

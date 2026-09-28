@@ -116,11 +116,38 @@ describe('SweepWalkForwardLauncher', () => {
     expect(screen.getByText('Tick at least one chart.')).toBeInTheDocument()
   })
 
+  it('refuses a fold that would test after this year, and says how many fit', () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-09-28T12:00:00Z'))
+    try {
+      renderWithProviders(<SweepWalkForwardLauncher sweep={sweep} />)
+
+      // From 2009, six years of training and two of test: folds test 2015, 2017 … 2025, 2027.
+      fireEvent.change(field('Folds'), { target: { value: '7' } })
+
+      expect(
+        screen.getByText('Fold 7 would test from 2027, in the future — at most 6 folds fit.'),
+      ).toBeInTheDocument()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not count the runs the sweep failed in the cost', () => {
+    renderWithProviders(
+      <SweepWalkForwardLauncher
+        sweep={{ ...sweep, counts: { total: 1200, done: 1000, running: 0, queued: 0, failed: 200 } }}
+      />,
+    )
+
+    expect(screen.getByLabelText(/Queues about 4,000 training runs \(1000 × 4/)).toBeInTheDocument()
+  })
+
   it('takes the confirmation back when the windows change', () => {
     renderWithProviders(<SweepWalkForwardLauncher sweep={sweep} />)
     fireEvent.click(screen.getByLabelText(/Queues about/))
 
-    fireEvent.change(field('Folds'), { target: { value: '8' } })
+    fireEvent.change(field('Folds'), { target: { value: '5' } })
 
     expect(screen.getByText('Confirm the cost first.')).toBeInTheDocument()
   })

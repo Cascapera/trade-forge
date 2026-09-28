@@ -1263,14 +1263,23 @@ def launch_window(
     expanding the grid anew would re-decide both, possibly differently. A (market, chart) with no
     candles in the new window is left out and recorded in `skipped`, as a launch does.
 
-    `timeframes` keeps only the runs on those charts (28/09): a walk-forward of one chart of a
-    sweep over several need not train the others. `None` is every chart of the parent.
+    A run of the parent that failed is not copied (28/09): cancelled by hand, or failing for its
+    own reason, it has nothing to train on. `timeframes` keeps only the runs on those charts
+    (28/09): a walk-forward of one chart of a sweep over several need not train the others.
+    `None` is every chart of the parent.
     """
     charts = list(parent.timeframes) if timeframes is None else list(timeframes)
     parents = session.execute(
         select(Backtest, Instrument.symbol)
         .join(Instrument, Instrument.id == Backtest.instrument_id)
-        .where(Backtest.sweep_id.in_(scope_of(parent)), Backtest.timeframe.in_(charts))
+        .where(
+            Backtest.sweep_id.in_(scope_of(parent)),
+            Backtest.timeframe.in_(charts),
+            # ⚠️ Not the runs that failed (28/09): a run cancelled by hand is written `failed`,
+            # and the sweep of 27/09 had 116 thousand of them — each walk-forward fold queued
+            # them all again. A run that failed for its own reason would fail again anyway.
+            Backtest.status != BacktestStatus.FAILED,
+        )
         .order_by(Backtest.created_at, Backtest.id)
     ).all()
     uncovered = uncovered_markets(session, list(parent.symbols), charts, date_from, date_to)

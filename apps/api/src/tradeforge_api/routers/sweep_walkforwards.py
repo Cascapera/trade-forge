@@ -24,7 +24,7 @@ from tradeforge_api.schemas import (
     SweepWalkForwardGroupOut,
     SweepWalkForwardOut,
 )
-from tradeforge_api.sweep_walkforward import FoldGroup, stability, windows
+from tradeforge_api.sweep_walkforward import MIN_FOLDS, FoldGroup, stability, windows
 from tradeforge_api.sweep_walkforward_job import settled
 from tradeforge_db.models import (
     Backtest,
@@ -95,10 +95,23 @@ async def create_sweep_walk_forward(
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
         ) from exc
-    if planned[0].test_from >= dt.datetime.now(tz=dt.UTC):
+    # ⚠️ **Every fold, not the first** (28/09). A fold whose test starts after today trains on
+    # the same data as the last fold that can be tested — the training is cut at today — and has
+    # nothing to test: the walk-forward of that morning queued three such folds, 360 thousand
+    # runs for no answer. Refused, with how many fit.
+    now = dt.datetime.now(tz=dt.UTC)
+    future = [index for index, window in enumerate(planned) if window.test_from >= now]
+    if future:
+        fit = future[0]
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail=f"the first test starts {planned[0].test_from:%Y-%m-%d}, in the future",
+            detail=f"fold {future[0] + 1} would test from "
+            f"{planned[future[0]].test_from:%Y-%m-%d}, in the future: "
+            + (
+                f"with these windows at most {fit} folds fit"
+                if fit >= MIN_FOLDS
+                else "these windows leave fewer than two folds to test"
+            ),
         )
 
     rule = request.model_dump(

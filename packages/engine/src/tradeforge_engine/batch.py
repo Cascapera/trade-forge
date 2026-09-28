@@ -72,7 +72,8 @@ class _Running:
         self.member = member
         self.bars = bars
         self.feed = feed
-        self.recorder = RunRecorder()
+        # The broker says where its account opens (ADR-0030), as it does for `run`.
+        self.recorder = RunRecorder(book_from=getattr(member.broker, "book_from", None))
         self.error: Exception | None = None
 
 

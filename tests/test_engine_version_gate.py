@@ -73,7 +73,7 @@ class TestVersionIn:
     def test_reads_the_real_engine_version(self) -> None:
         source = (REPO_ROOT / gate.VERSION_FILE).read_text(encoding="utf-8")
 
-        assert gate.version_in(source) == "0.2.0"
+        assert gate.version_in(source) == "0.3.0"
 
     def test_none_when_there_is_none(self) -> None:
         assert gate.version_in('__all__ = ["x"]\n') is None

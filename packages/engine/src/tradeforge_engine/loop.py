@@ -118,6 +118,9 @@ class RunResult:
     final_account: AccountState
     candles_processed: int
 
+    warmed: int = 0
+    """Bars the run read before its window opened (ADR-0030): traded on, and never booked. The
+    bars of the window itself are `candles_processed`."""
     refusals: tuple[Refusal, ...] = ()
     """Every order the run intended and did not place, in the order it asked for them.
 
@@ -269,7 +272,7 @@ def run(  # noqa: PLR0913 — keyword-only; each one names a real axis of a back
     (`test_snapshots_off_change_nothing_but_the_snapshots`). It is not built and dropped later
     because the copy is the cost — up to 51 bars per entry, over millions of runs.
     """
-    recorder = RunRecorder()
+    recorder = RunRecorder(book_from=getattr(broker, "book_from", None))
     for outcome in iter_run(
         candles=candles,
         timeframe=timeframe,
@@ -289,19 +292,29 @@ class RunRecorder:
     A class of its own so a batch (`batch.run_batch`), which steps many runs a bar at a time
     instead of draining one, keeps each run's record exactly the way `run` does — one place
     that decides what a result is made of, not two that agree today (ADR-0029).
+
+    ⚠️ **What happens before `book_from` is not the run's** (ADR-0030): the warm-up's bars are
+    counted (`warmed`) and nothing else of them is kept — no fill, no refusal, no point of the
+    curve. The broker's ledger forgets them the same way; the instant comes from the broker, so
+    the two cannot disagree.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, book_from: dt.datetime | None = None) -> None:
+        self._book_from = book_from
         self._fills: list[Fill] = []
         self._refusals: list[Refusal] = []
         self._equity_curve: list[EquityPoint] = []
         self._processed = 0
+        self._warmed = 0
 
     def add(self, outcome: BarOutcome) -> None:
+        if self._book_from is not None and outcome.candle.time < self._book_from:
+            self._warmed += 1
+            return
         self._fills.extend(outcome.fills)
         self._refusals.extend(outcome.refusals)
         self._equity_curve.append(outcome.equity)
-        self._processed = outcome.index + 1
+        self._processed += 1
 
     def result(self, broker: Broker) -> RunResult:
         # The closing reads are pinned like every bar's work was. ⚠️ With the brokers in this repo
@@ -317,6 +330,7 @@ class RunRecorder:
                 equity_curve=tuple(self._equity_curve),
                 final_account=broker.account(),
                 candles_processed=self._processed,
+                warmed=self._warmed,
                 refusals=tuple(self._refusals),
             )
 

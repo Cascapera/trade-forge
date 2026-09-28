@@ -224,6 +224,7 @@ class BacktestBroker:
         take_profit_rr: Decimal | None = None,
         currency: str = "USD",
         swap: SwapRates | None = None,
+        book_from: dt.datetime | None = None,
     ) -> None:
         if slippage_ticks < ZERO:
             raise ValueError(f"slippage is a magnitude, got {slippage_ticks}")
@@ -231,8 +232,16 @@ class BacktestBroker:
             raise ValueError(f"take-profit R multiple must be positive, got {take_profit_rr}")
 
         self._instrument = instrument
+        # The first instant the account books (ADR-0030): what fills before it is warm-up, traded
+        # and forgotten. Public, and read by `run` — one place states it, so the ledger and the
+        # record of the run cannot disagree about where the window opens.
+        self.book_from = book_from
         self._portfolio = Portfolio(
-            initial_capital=initial_capital, instrument=instrument, currency=currency, swap=swap
+            initial_capital=initial_capital,
+            instrument=instrument,
+            currency=currency,
+            swap=swap,
+            book_from=book_from,
         )
         self._cost_model: CostModel = cost_model if cost_model is not None else NoCostModel()
         # Kept in ticks, converted to a price at fill time. `slippage_ticks * tick_size` in

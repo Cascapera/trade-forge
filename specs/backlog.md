@@ -2602,6 +2602,11 @@ nome (`grid.TAKE_PROFIT_RR`): um número **constrói** o bloco `{type: risk_mult
 `off` o **apaga**, e a leitura inversa devolve `None` para um documento sem alvo, que é o que põe o
 run de volta no eixo no heatmap.
 
+✅ **Conferido em 28/09: já funciona.** A tela oferece `off` no eixo da média longa
+(`offIsASetting`), o documento sai com `long_average_period: null` e o motor lê como filtro
+desligado. Quatro entradas do catálogo já usam (MM9 BASE COMPLETO: `[off, 20, 50, 100, 200]`; com
+`off` saem 452 trades em média por run, com 200 saem 324). O texto abaixo ficou de antes.
+
 ⚠️ **O mesmo problema continua aberto em `long_average_period`** (anotado no teste de eixos): uma
 grade pode variar o período do filtro de média longa, mas **não pode pedir o filtro desligado**,
 porque `null` não é um valor que o eixo enumera — "com filtro contra sem filtro" ainda são dois
@@ -2796,7 +2801,18 @@ Plano, na ordem:
    existe hoje; passa pelo `engine-guardian`) e testar o espelho **fora da amostra**, com o mesmo
    rigor dos vencedores (teste reservado + fatiamento por ano/blocos).
 
-## O painel geral de varreduras (`GET /sweeps/dashboard`) leva 10 s (25/09) — PENDENTE
+## O painel geral de varreduras (`GET /sweeps/dashboard`) leva 10 s (25/09) — MELHORADO no PR-347 (28/09)
+
+**28/09:** com 1,57 milhão de runs (1,3 milhão sem resultado, quase todos cancelados à mão) a
+abertura fria tinha ido a **52 s**. O PR-347 lê inteiros só os runs com resultado e traz os outros
+**contados pelo Postgres**, com a mesma regra de medição única: **14,5 s**, números idênticos
+(teste novo passa no código antigo e no novo). Ainda aberto:
+- ~6 s de Python montando 257 mil runs com resultado e ~8 s de SQL (a ordenação vai a disco: o
+  `work_mem` de 4 MB não sobe porque o container do Postgres tem 64 MB de `/dev/shm`);
+- a chave do cache custa 1,8 s em toda abertura, mesmo quente;
+- os cancelados à mão contam como `failed` no painel. Um estado `cancelled` de verdade os separaria.
+
+Texto original (25/09):
 
 Medido em 25/09 com cerca de 80 mil runs no banco: **10,3 s**. É o mesmo problema que o PR-313
 resolveu no resumo de uma varredura: lê todos os runs de todas as varreduras como objetos do ORM

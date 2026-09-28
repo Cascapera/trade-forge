@@ -1772,6 +1772,61 @@ class TestTheDashboard:
         assert (timeline[again]["runs"], timeline[again]["finished"]) == (2, 2)
         assert Decimal(timeline[again]["median_return"]) == Decimal("0.02")
 
+    def test_copies_without_a_result_count_as_launched_and_once_as_measured(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        """28/09: the runs without a result come counted by Postgres, not read one by one — and must
+        give what `distinct` gave over every run. Hand-worked:
+
+        first  (EURUSD x period 5, 9): finished, nets 100 and -100.
+        queued (the same two again):   still queued — copies of finished measurements, so they
+                                       count as launched and not as measured.
+        failed (the same two again):   failed — the same.
+        GBPUSD twice, neither finished (one queued, one failed, per period): two measurements with
+                                       no result anywhere — each counted once, as the first
+                                       launched, which is the queued one.
+        """
+        entry = an_entry(
+            client, name=f"counted {uuid.uuid4()}", grid={"setup.params.period": [5, 9]}
+        )
+        first = launch(client, [entry], ["EURUSD"])
+        queued = launch(client, [entry], ["EURUSD"])
+        failed = launch(client, [entry], ["EURUSD"])
+        gbp_queued = launch(client, [entry], ["GBPUSD"])
+        gbp_failed = launch(client, [entry], ["GBPUSD"])
+        nets = {5: 100, 9: -100}
+        for row in client.get(f"/sweeps/{first}").json()["runs"]:
+            finish(session_factory, row["run"]["id"], nets[row["values"]["setup.params.period"]])
+        with session_factory() as session:
+            for sweep_id in (failed, gbp_failed):
+                for run in session.scalars(
+                    select(Backtest).where(Backtest.sweep_id == uuid.UUID(sweep_id))
+                ):
+                    run.status = BacktestStatus.FAILED
+                    run.error = "cancelled by hand"
+                    run.started_at = run.finished_at = START
+            session.commit()
+
+        body = client.get("/sweeps/dashboard").json()
+
+        totals = body["totals"]
+        assert totals["runs"]["total"] == 10
+        assert (totals["runs"]["done"], totals["runs"]["queued"], totals["runs"]["failed"]) == (
+            2,
+            4,
+            4,
+        )
+        # EURUSD 5 and 9, GBPUSD 5 and 9.
+        assert totals["measurements"] == 4
+        overall = body["overall"]
+        assert (overall["runs"], overall["finished"], overall["failed"]) == (4, 2, 0)
+        symbols = {one["key"]: one for one in body["by_symbol"]}
+        assert (symbols["EURUSD"]["runs"], symbols["EURUSD"]["finished"]) == (2, 2)
+        # The first launched of each GBPUSD measurement is the queued one: none counted failed.
+        assert (symbols["GBPUSD"]["runs"], symbols["GBPUSD"]["failed"]) == (2, 0)
+        timeline = {one["id"]: one["runs"] for one in body["sweeps"]}
+        assert timeline == {first: 2, queued: 2, failed: 2, gbp_queued: 2, gbp_failed: 2}
+
     def test_the_dashboard_names_the_pairs_its_sweeps_left_out(
         self, client: Any, session_factory: Callable[[], Session]
     ) -> None:

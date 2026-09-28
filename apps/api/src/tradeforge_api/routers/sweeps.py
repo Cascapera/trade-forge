@@ -27,13 +27,26 @@ import functools
 import secrets
 import threading
 import uuid
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from decimal import Decimal
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response, status
 from pydantic import AwareDatetime
-from sqlalchemy import ColumnElement, Text, and_, case, cast, func, insert, literal, or_, select
+from sqlalchemy import (
+    ColumnElement,
+    Text,
+    TextClause,
+    and_,
+    case,
+    cast,
+    func,
+    insert,
+    literal,
+    or_,
+    select,
+    text,
+)
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import InstrumentedAttribute, Session, defer, selectinload
 
@@ -1016,18 +1029,16 @@ def get_sweep_dashboard(
     }
     # Per sweep: each run is looked up in the points of the sweep that launched it. A document
     # is reused by every later sweep of the same entry, so the sweep is the only key that says,
-    # without a second lookup, which record wrote this run's coordinates.
-    entry_of: dict[uuid.UUID, dict[str, str]] = {sweep.id: {} for sweep in sweeps}
-    for sweep_id, strategy_id, entry_id in session.execute(
-        select(PointRow.sweep_id, PointRow.strategy_id, PointRow.entry_id).where(
-            PointRow.sweep_id.in_(list(entry_of)), PointRow.same_as.is_(None)
-        )
-    ):
-        entry_of[sweep_id][str(strategy_id)] = entry_id
-
+    # without a second lookup, which record wrote this run's coordinates. ⚠️ Joined in the read
+    # below (28/09), never read apart: the points of every sweep were a million rows turned into a
+    # dictionary to look up the quarter of a million runs that have a result.
+    sweep_ids = [sweep.id for sweep in sweeps]
     # ⚠️ **Columns, not rows** (25/09). Every run of every sweep read as an ORM object with its
     # metrics loaded beside it took 10.3 s on 80 thousand runs; the dashboard reads eleven of their
     # fields and six of the metrics', and a tuple per run is what it needs.
+    # ⚠️ **Only the runs with a result, read whole** (28/09). The others — 1.3 million of 1.57
+    # million that day, most of them cancelled by hand — say nothing but their count, and reading
+    # them one by one was 40 of the dashboard's 52 s. They come counted (`_unmeasured`).
     rows = session.execute(
         select(
             Backtest.sweep_id,
@@ -1044,28 +1055,36 @@ def get_sweep_dashboard(
             cast(Backtest.cost_model, Text).label("cost_model"),
             Backtest.engine_version,
             Instrument.symbol,
-            BacktestMetrics.backtest_id,
             BacktestMetrics.net_profit,
             BacktestMetrics.total_trades,
             BacktestMetrics.win_rate,
             BacktestMetrics.profit_factor,
             BacktestMetrics.expectancy,
             BacktestMetrics.max_drawdown_pct,
+            PointRow.entry_id,
         )
         .join(Instrument, Instrument.id == Backtest.instrument_id)
-        .outerjoin(BacktestMetrics, BacktestMetrics.backtest_id == Backtest.id)
-        .where(Backtest.sweep_id.in_(list(entry_of)))
+        .join(BacktestMetrics, BacktestMetrics.backtest_id == Backtest.id)
+        .outerjoin(
+            PointRow,
+            and_(
+                PointRow.sweep_id == Backtest.sweep_id,
+                PointRow.strategy_id == Backtest.strategy_id,
+                PointRow.same_as.is_(None),
+            ),
+        )
+        .where(Backtest.sweep_id.in_(sweep_ids))
         # Launch order, so which copy of a repeated measurement is kept does not change between
         # two reads of the same data.
         .order_by(Backtest.created_at, Backtest.id)
     ).all()
 
-    runs: list[dashboard.DashboardRun] = []
+    finished: list[dashboard.DashboardRun] = []
     for row in rows:
         if row.sweep_id is None:  # pragma: no cover — the filter above selects by sweep
             continue
-        entry_id = entry_of[row.sweep_id].get(str(row.strategy_id), "")
-        runs.append(
+        entry_id = row.entry_id or ""
+        finished.append(
             dashboard.DashboardRun(
                 sweep_id=str(row.sweep_id),
                 entry_id=entry_id,
@@ -1084,11 +1103,7 @@ def get_sweep_dashboard(
                     row.cost_model,
                     row.engine_version,
                 ),
-                # A run has a result once its metrics row exists — `done` alone is not enough
-                # (`aggregate_points` says why), and the outer join says which is which.
-                result=None
-                if row.backtest_id is None
-                else dashboard.RunResult(
+                result=dashboard.RunResult(
                     net_profit=row.net_profit,
                     total_trades=row.total_trades,
                     win_rate=row.win_rate,
@@ -1098,6 +1113,8 @@ def get_sweep_dashboard(
                 ),
             )
         )
+    every, once = _unmeasured(session, sweep_ids, names)
+    runs = finished + every
 
     listed = [
         dashboard.DashboardSweepRow(
@@ -1110,12 +1127,12 @@ def get_sweep_dashboard(
     ]
     # Each measurement once for everything that summarises results; every run for what counts
     # launches. See the module's note on why a copy must not vote twice.
-    measured = dashboard.distinct(runs)
+    measured = dashboard.distinct(finished) + once
     win_rate, profit_factor, expectancy = dashboard.ratios(measured)
     out = SweepDashboardOut(
         launched_from=launched_from,
         launched_to=launched_to,
-        totals=dashboard.totals(listed, runs),
+        totals=dashboard.totals(listed, runs, measured),
         overall=dashboard.summarise("all", "All sweeps", measured),
         win_rate=win_rate,
         profit_factor=profit_factor,
@@ -1143,6 +1160,112 @@ the first read after costs what it always did."""
 
 _DASHBOARD_KEPT = 16
 """Windows remembered at once — the screen asks for a handful; past this it starts over."""
+
+
+_MEASUREMENT = (
+    "b.strategy_id, b.instrument_id, b.timeframe, b.date_from, b.date_to, b.initial_capital, "
+    "b.cost_model, b.engine_version"
+)
+"""What makes two runs one measurement — the same fields the dashboard's own key reads."""
+
+_KEY = _MEASUREMENT.replace("b.", "")
+"""The same key, read off the `marked` rows rather than the table."""
+
+_UNMEASURED_EVERY = text(
+    """
+    SELECT b.sweep_id, coalesce(p.entry_id, '') AS entry_id, i.symbol, b.timeframe, b.status,
+           count(*) AS runs
+    FROM backtests b
+    JOIN instruments i ON i.id = b.instrument_id
+    LEFT JOIN backtest_metrics m ON m.backtest_id = b.id
+    LEFT JOIN sweep_points p
+           ON p.sweep_id = b.sweep_id AND p.strategy_id = b.strategy_id AND p.same_as IS NULL
+    WHERE b.sweep_id = ANY(:sweeps) AND m.backtest_id IS NULL
+    GROUP BY 1, 2, 3, 4, 5
+    """
+)
+"""Every run without a result, counted by sweep, entry, market, chart and status."""
+
+# ⚠️ **One pass, no anti-join** (28/09). `(…) NOT IN (SELECT …)` over a row of eight columns, one of
+# them `jsonb`, could not be hashed and ran past five minutes; `NOT EXISTS` was a hash anti-join
+# the planner estimated at one row — for 1.16 million — and stalled once the list of sweeps came as
+# a bound parameter. A window marks whether any copy of each measurement has a result, and one sort
+# keeps the first of those that none has. ⚠️ The entry is joined in that first pass, where the
+# planner counts right: joined after the sort it was guessed at 7 738 rows, and looked up one by
+# one 1.16 million times.
+_UNMEASURED_ONCE = text(
+    f"""
+    WITH marked AS (
+        SELECT b.sweep_id, b.strategy_id, b.instrument_id, b.timeframe, b.status, b.created_at,
+               b.id, b.date_from, b.date_to, b.initial_capital, b.cost_model, b.engine_version,
+               coalesce(p.entry_id, '') AS entry_id,
+               bool_or(m.backtest_id IS NOT NULL) OVER (PARTITION BY {_MEASUREMENT}) AS any_measured
+        FROM backtests b
+        LEFT JOIN backtest_metrics m ON m.backtest_id = b.id
+        LEFT JOIN sweep_points p
+               ON p.sweep_id = b.sweep_id AND p.strategy_id = b.strategy_id AND p.same_as IS NULL
+        WHERE b.sweep_id = ANY(:sweeps)
+    ),
+    first AS (
+        SELECT DISTINCT ON ({_KEY}) sweep_id, entry_id, instrument_id, timeframe, status
+        FROM marked
+        WHERE NOT any_measured
+        ORDER BY {_KEY}, created_at, id
+    )
+    SELECT f.sweep_id, f.entry_id, i.symbol, f.timeframe, f.status, count(*) AS runs
+    FROM first f
+    JOIN instruments i ON i.id = f.instrument_id
+    GROUP BY 1, 2, 3, 4, 5
+    """  # noqa: S608 — interpolates two constants of column names; the sweeps are bound
+)
+"""The runs without a result that `dashboard.distinct` would keep, counted the same way: one per
+measurement no run of which has a result — the first launched — as the pure function keeps it."""
+
+
+def _unmeasured(
+    session: Session, sweeps: list[uuid.UUID], names: Mapping[str, str | None]
+) -> tuple[list[dashboard.DashboardRun], list[dashboard.DashboardRun]]:
+    """The runs without a result as tallies (`DashboardRun.count`): every one of them, for what
+    counts launches, and one per measurement, for what summarises — both counted by Postgres.
+
+    ⚠️ **The same answer `distinct` gives over every run, without reading them** (28/09). Of the
+    copies of one measurement `distinct` keeps the first with a result; only a measurement with
+    none keeps a run without one — its first. The second query is that rule in SQL, and the
+    dashboard's integration tests hold the numbers to what they were.
+    """
+    if not sweeps:
+        return [], []
+    # ⚠️ The sorts of the second query spill to disk at the server's 4 MB of `work_mem`, and that
+    # is left alone (28/09): raised for this read, the parallel sorts asked for more shared memory
+    # than the container has (64 MB of `/dev/shm`) and the query failed with "No space left".
+
+    def tallies(query: TextClause, kind: str) -> list[dashboard.DashboardRun]:
+        return [
+            dashboard.DashboardRun(
+                sweep_id=str(row.sweep_id),
+                entry_id=row.entry_id,
+                entry_name=names.get(row.entry_id),
+                symbol=row.symbol,
+                timeframe=row.timeframe,
+                status=BacktestStatus(row.status),
+                # Read only with a result, and a tally has none.
+                initial_capital=Decimal(1),
+                # Its own: a tally is never another row's copy (`DashboardRun.count`).
+                measurement=(
+                    kind,
+                    row.sweep_id,
+                    row.entry_id,
+                    row.symbol,
+                    row.timeframe,
+                    row.status,
+                ),
+                result=None,
+                count=row.runs,
+            )
+            for row in session.execute(query, {"sweeps": sweeps})
+        ]
+
+    return tallies(_UNMEASURED_EVERY, "every"), tallies(_UNMEASURED_ONCE, "once")
 
 
 def _dashboard_key(

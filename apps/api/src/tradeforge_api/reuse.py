@@ -19,12 +19,19 @@ depends on where it is (`retention.recorded_for`): a reserved-window test keeps 
 sweep only for a run that made money. An original that kept only its metrics cannot stand for a
 run that must keep its trades — that one runs.
 
+⚠️ **Only over the same candles.** The window asked for is not the data in it: a chart collected
+later with more history, or with a gap filled, gives the same request other bars — and the engine
+other trades. The original must have read exactly what the run would read now: as many bars, from
+the same first to the same last (`window_of`, measured on the disk as it is). ⚠️ A bar corrected
+in place — same count, same ends, another price — is not seen; that would take a hash of the data.
+
 Pieces of a longer run (2020-25 answering 2022-24) are not reused: warm-up, a trade open across
 the cut and the balance make them differ, by an amount not yet measured.
 """
 
 import datetime as dt
-from collections.abc import Mapping
+from bisect import bisect_left, bisect_right
+from collections.abc import Mapping, Sequence
 from decimal import Decimal
 from typing import Any
 
@@ -34,6 +41,7 @@ from sqlalchemy.orm import Session
 from tradeforge_api.retention import recorded_for
 from tradeforge_api.runner import ENGINE_VERSION
 from tradeforge_db.models import Backtest, BacktestMetrics, BacktestStatus, Recorded, Trade
+from tradeforge_engine.domain import Candle
 
 _KEEPS: Mapping[Recorded, int] = {Recorded.METRICS: 0, Recorded.TRADES: 1, Recorded.FULL: 2}
 """How much each level keeps: an original stands for a copy that keeps as much or less."""
@@ -41,6 +49,19 @@ _KEEPS: Mapping[Recorded, int] = {Recorded.METRICS: 0, Recorded.TRADES: 1, Recor
 _CANDIDATES = 5
 """Originals looked at per run, newest first. Identical measurements have identical results, so
 they differ only in what they kept; five is plenty to find one that kept enough."""
+
+
+def window_of(
+    candles: Sequence[Candle], date_from: dt.datetime, date_to: dt.datetime
+) -> tuple[int, dt.datetime, dt.datetime] | None:
+    """The bars a run over this window reads — how many, the first and the last — or `None` for
+    none. The same bounds as the run's own clip (`runner._candles_to_run`: both ends included),
+    by binary search: the reader hands candles in time order, and a sweep asks this per run."""
+    start = bisect_left(candles, date_from, key=lambda candle: candle.time)
+    end = bisect_right(candles, date_to, key=lambda candle: candle.time)
+    if end <= start:
+        return None
+    return end - start, candles[start].time, candles[end - 1].time
 
 
 def needs(run: Backtest, metrics: BacktestMetrics) -> Recorded:
@@ -60,14 +81,19 @@ def needs(run: Backtest, metrics: BacktestMetrics) -> Recorded:
 
 
 def original_for(
-    session: Session, run: Backtest, spec: Mapping[str, Any]
+    session: Session,
+    run: Backtest,
+    spec: Mapping[str, Any],
+    window: tuple[int, dt.datetime, dt.datetime],
 ) -> tuple[Backtest, Recorded] | None:
     """A finished run of the very same measurement that kept enough to stand for `run`, and what
     `run` will keep — or `None`, and `run` runs.
 
     `spec` is the instrument `run` executes with (`runner.spec_document`). An original that kept
-    none ran before 25/09 — under 0.1.0, so it is never a candidate anyway.
+    none ran before 25/09 — under 0.1.0, so it is never a candidate anyway. `window` is what the
+    run would read from the disk now (`window_of`).
     """
+    candles, first, last = window
     found = session.scalars(
         select(Backtest)
         .where(
@@ -81,6 +107,9 @@ def original_for(
             Backtest.engine_version == ENGINE_VERSION,
             Backtest.status == BacktestStatus.DONE,
             Backtest.instrument_spec == dict(spec),
+            Backtest.candles_seen == candles,
+            Backtest.first_candle == first,
+            Backtest.last_candle == last,
             Backtest.id != run.id,
         )
         .order_by(Backtest.finished_at.desc())
@@ -138,4 +167,4 @@ def copy_into(session: Session, original: Backtest, run: Backtest, recorded: Rec
     run.finished_at = now
 
 
-__all__ = ["copy_into", "needs", "original_for"]
+__all__ = ["copy_into", "needs", "original_for", "window_of"]

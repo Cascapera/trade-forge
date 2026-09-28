@@ -55,7 +55,7 @@ from tradeforge_api.queue import (
 )
 from tradeforge_api.r_metrics import r_metrics
 from tradeforge_api.retention import recorded_for
-from tradeforge_api.reuse import copy_into, original_for
+from tradeforge_api.reuse import copy_into, original_for, window_of
 from tradeforge_api.routers.sweeps import jobs_for
 from tradeforge_api.runner import (
     ENGINE_VERSION,
@@ -78,6 +78,7 @@ from tradeforge_db.models import (
     BacktestStatus,
     Collection,
     Instrument,
+    Recorded,
     SelectionMetric,
     Strategy,
     WalkForward,
@@ -136,21 +137,37 @@ def _kept_spec(backtest: Backtest, instrument: Instrument) -> InstrumentSpec:
     return spec
 
 
-async def _take_reused(session: Session, redis: Redis, run: Backtest) -> bool:
+def _original_of(
+    session: Session, run: Backtest, *, parquet_root: Path, read: CandleReader
+) -> tuple[Backtest, Recorded] | None:
+    """The finished run that can stand for this sweep's run (`reuse.original_for`), or `None`.
+
+    The candles are read as the run would read them (`read`, the worker's cache), so the original
+    must have seen the very bars on the disk now — a chart collected again since does not match.
+    """
+    instrument = session.get(Instrument, run.instrument_id)
+    if run.sweep_id is None or instrument is None:
+        return None
+    window = window_of(
+        read(parquet_root, instrument.symbol, run.timeframe), run.date_from, run.date_to
+    )
+    if window is None:
+        return None  # nothing to read: the run records that itself
+    spec = _kept_spec(run, instrument)
+    return original_for(session, run, spec_document(spec), window)
+
+
+async def _take_reused(
+    session: Session, redis: Redis, run: Backtest, *, parquet_root: Path, read: CandleReader
+) -> bool:
     """Copy the result of the very same measurement, already made under this engine, into a
     sweep's run — `True` if it was, and the run is done (`reuse`, 28/09).
 
     ⚠️ **A shortcut, never a reason to fail.** Anything that goes wrong here but an unreachable
     database is rolled back and the run simply runs: the copy is only ever a saving.
     """
-    if run.sweep_id is None:
-        return False
-    instrument = session.get(Instrument, run.instrument_id)
-    if instrument is None:
-        return False
     try:
-        spec = _kept_spec(run, instrument)
-        found = original_for(session, run, spec_document(spec))
+        found = _original_of(session, run, parquet_root=parquet_root, read=read)
         if found is None:
             return False
         original, recorded = found
@@ -258,7 +275,7 @@ async def process_backtest(  # noqa: PLR0913 — keyword-only; each names one th
         # CHECK that refuses that would replace the real reason with its own. Nothing enqueues a
         # finished run on purpose — every launch writes a new row.
         return
-    if reuse and await _take_reused(session, redis, backtest):
+    if reuse and await _take_reused(session, redis, backtest, parquet_root=parquet_root, read=read):
         return
 
     try:
@@ -343,7 +360,11 @@ async def process_batch(  # noqa: PLR0913 — keyword-only; each names one thing
     ]
     # Runs whose measurement was already made are copied first, and the batch runs the rest.
     if reuse:
-        runs = [run for run in runs if not await _take_reused(session, redis, run)]
+        runs = [
+            run
+            for run in runs
+            if not await _take_reused(session, redis, run, parquet_root=parquet_root, read=read)
+        ]
     if not runs:
         return
     first = runs[0]

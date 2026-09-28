@@ -27,6 +27,7 @@ from tradeforge_api.config import Settings
 from tradeforge_api.main import create_app
 from tradeforge_api.queue import RUN_BACKTEST, RUN_BACKTEST_BATCH
 from tradeforge_api.worker import process_backtest, process_batch
+from tradeforge_collector import write_candles
 from tradeforge_db.models import (
     Backtest,
     BacktestMetrics,
@@ -553,6 +554,36 @@ class TestTheSameMeasurementIsCopied:
 
         assert set(_origins(session_factory, second).values()) == {None}
         assert _written(session_factory, second) == _written(session_factory, first)
+
+    def test_a_run_over_other_candles_is_never_an_original(
+        self, client: Any, session_factory: Callable[[], Session], queue: _Queue, tmp_path: Path
+    ) -> None:
+        """The engine-guardian's case (28/09): the same window asked over data collected again.
+        A gap in the middle, filled later, keeps the first and last bar — only the count moves."""
+        walk = _walk(0)
+        write_candles(tmp_path, "EURUSD", "H1", walk[:600] + walk[700:])
+        entry = _entry(client)
+        first = _launch(client, entry)
+        _reserve(session_factory, first)
+        _run_all(queue, session_factory, tmp_path)
+        write_candles(tmp_path, "EURUSD", "H1", walk)
+        second = _launch(client, entry)
+        _reserve(session_factory, second)
+        _run_all(queue, session_factory, tmp_path)
+
+        assert set(_origins(session_factory, second).values()) == {None}
+        with session_factory() as session:
+            seen = {
+                run.sweep_id: (run.candles_seen, run.first_candle, run.last_candle)
+                for run in session.scalars(
+                    select(Backtest).where(
+                        Backtest.sweep_id.in_([uuid.UUID(first), uuid.UUID(second)])
+                    )
+                )
+            }
+        assert seen[uuid.UUID(first)][0] == BARS - 100
+        assert seen[uuid.UUID(second)][0] == BARS
+        assert seen[uuid.UUID(first)][1:] == seen[uuid.UUID(second)][1:]
 
     def test_a_run_under_another_engine_is_never_an_original(
         self, client: Any, session_factory: Callable[[], Session], queue: _Queue, tmp_path: Path

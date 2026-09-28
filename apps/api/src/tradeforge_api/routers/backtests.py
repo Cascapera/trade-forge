@@ -123,6 +123,7 @@ def list_item(
         status=run.status,
         error=run.error,
         recorded=run.recorded,
+        reused_from=run.reused_from,
         created_at=run.created_at,
         finished_at=run.finished_at,
         metrics=(None if run.metrics is None else MetricsOut.model_validate(run.metrics)),

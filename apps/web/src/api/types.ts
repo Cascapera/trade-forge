@@ -108,6 +108,9 @@ export interface Backtest {
   error: string | null
   engine_version: string
   recorded: Recorded
+  /** The finished run this one is a copy of: the same measurement under the same engine, taken
+   *  instead of run again (28/09). Null for a run that ran; absent from older fixtures. */
+  reused_from?: string | null
   created_at: string
   started_at: string | null
   finished_at: string | null
@@ -160,6 +163,8 @@ export interface BacktestListItem {
   status: BacktestStatus
   error: string | null
   recorded: Recorded
+  /** See `BacktestOut.reused_from`. */
+  reused_from?: string | null
   created_at: string
   finished_at: string | null
   metrics: Metrics | null

@@ -106,6 +106,17 @@ describe('RunTable', () => {
     }
   })
 
+  it('says a run is a copy of an earlier one, and nothing for one that ran', () => {
+    renderWithProviders(
+      <RunTable
+        runs={[listed({ id: 'copy', reused_from: 'original' }), listed({ id: 'ran' })]}
+        seats={EMPTY_SEATS}
+        onToggle={vi.fn()}
+      />,
+    )
+    expect(screen.getAllByText('copy of an earlier run')).toHaveLength(1)
+  })
+
   it('says what a sweep run kept, and nothing for one that kept everything', () => {
     renderWithProviders(
       <RunTable

@@ -162,6 +162,21 @@ export function Results(): React.JSX.Element {
         </p>
       )}
 
+      {typeof run.reused_from === 'string' && (
+        <p
+          role="status"
+          aria-label="this run is a copy"
+          className="rounded border border-sky-800 bg-sky-950/40 p-4 text-sm text-sky-200"
+        >
+          Not run again: the same measurement — strategy, market, chart, window, capital, costs,
+          instrument, candles and engine — had already been made, and its result was copied from{' '}
+          <Link to={`/results/${run.reused_from}`} className="underline hover:text-sky-100">
+            that run
+          </Link>
+          .
+        </p>
+      )}
+
       {run.status === 'done' && run.recorded !== 'full' && (
         <div
           role="status"

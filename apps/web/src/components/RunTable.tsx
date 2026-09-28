@@ -166,6 +166,9 @@ export function RunTable(props: {
                   {run.recorded !== 'full' && (
                     <div className="text-xs text-slate-500">{KEPT[run.recorded]}</div>
                   )}
+                  {typeof run.reused_from === 'string' && (
+                    <div className="text-xs text-sky-300">copy of an earlier run</div>
+                  )}
                 </td>
                 <td className="px-3 py-2">
                   <span className={`rounded px-2 py-1 text-xs font-medium ${badge[run.status]}`}>

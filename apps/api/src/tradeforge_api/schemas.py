@@ -476,6 +476,9 @@ class BacktestOut(_Out):
     """What the run kept: `full`, `trades` (no pictures, no equity curve) or `metrics` (the metrics
     alone). A sweep's runs keep less (`retention`); a screen reads this to say what is missing and
     why, instead of showing an empty chart as if the run had drawn one."""
+    reused_from: uuid.UUID | None = None
+    """The finished run this one is a copy of — the same measurement under the same engine, taken
+    instead of run again (`reuse`, 28/09). Null for a run that ran."""
     created_at: dt.datetime
     started_at: dt.datetime | None
     finished_at: dt.datetime | None
@@ -534,6 +537,8 @@ class BacktestListItem(_Out):
     recorded: str = "full"
     """See `BacktestOut.recorded`. On the list because comparing curves starts here, and a run
     with no curve must be told apart before it is ticked, not after."""
+    reused_from: uuid.UUID | None = None
+    """See `BacktestOut.reused_from`."""
     created_at: dt.datetime
     finished_at: dt.datetime | None
     metrics: MetricsOut | None = None

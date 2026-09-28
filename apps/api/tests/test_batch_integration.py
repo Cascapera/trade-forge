@@ -495,6 +495,14 @@ class TestTheSameMeasurementIsCopied:
                 session.scalars(select(Backtest).where(Backtest.sweep_id == uuid.UUID(second)))
             )
             assert {run.strategy_id: run.reused_from for run in copies} == originals
+            # The API says so, on the run and on the sweep's list of runs (28/09).
+            one = copies[0]
+            read = client.get(f"/backtests/{one.id}").json()
+            assert read["reused_from"] == str(one.reused_from)
+            listed = client.get(f"/sweeps/{second}").json()["runs"]
+            assert {row["run"]["reused_from"] for row in listed} == {
+                str(origin) for origin in originals.values()
+            }
             copied = 0
             for copy in copies:
                 source = session.get(Backtest, copy.reused_from)

@@ -1,4 +1,4 @@
-import { fireEvent, screen } from '@testing-library/react'
+import { fireEvent, screen, within } from '@testing-library/react'
 
 import type { Backtest, CandlesResponse, Collection, Metrics, Trade } from '../api/types'
 import { renderWithProviders } from '../test-utils'
@@ -474,6 +474,27 @@ describe('Results, for a sweep run that kept less', () => {
     )
     expect(screen.getByText('Not kept by this run — 12 were made.')).toBeInTheDocument()
     expect(mockedTrades).toHaveBeenLastCalledWith(undefined, false)
+  })
+
+  it('says a copied run was not run again, and links to the run it was copied from', () => {
+    stubBacktest({
+      isPending: false,
+      isError: false,
+      data: backtest({ status: 'done', metrics, recorded: 'metrics', reused_from: 'b0' }),
+    })
+    renderWithProviders(<Results />)
+    const note = screen.getByRole('status', { name: 'this run is a copy' })
+    expect(note).toHaveTextContent(/Not run again/)
+    expect(within(note).getByRole('link', { name: 'that run' })).toHaveAttribute(
+      'href',
+      '/results/b0',
+    )
+  })
+
+  it('says nothing about copies for a run that ran', () => {
+    stubBacktest({ isPending: false, isError: false, data: backtest({ status: 'done', metrics }) })
+    renderWithProviders(<Results />)
+    expect(screen.queryByRole('status', { name: 'this run is a copy' })).not.toBeInTheDocument()
   })
 
   it('runs the point again and takes the reader to the new run', () => {

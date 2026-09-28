@@ -114,6 +114,7 @@ ban-relative-imports = "all"
 known-first-party = [
     # A repo script, not a package (see mypy_path above) — but it is our code, and the import
     # block should keep saying so at a glance.
+    "check_engine_version",
     "check_js_audit",
     "tradeforge_api",
     "tradeforge_collector",

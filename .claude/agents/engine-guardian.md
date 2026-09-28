@@ -61,6 +61,11 @@ outros quebram alto e alguém percebe.
 4. **Estados de posição** — entrada duplicada, saída sem posição, stop e alvo no mesmo candle
    (qual vence tem que ser explícito E testado), fill parcial, ordem órfã.
 5. **Qualidade de teste** — é aqui que mora seu maior valor, e onde o orçamento deve ir.
+6. **A versão do motor** (28/09) — um run terminado é **copiado** para outro igual só sob a mesma
+   `__version__` (`tradeforge_api.reuse`). Um diff em `packages/engine/src` que pode mudar um
+   trade tem de subir a versão. Se o PR declara `Engine-Results: unchanged — <prova>`, confira a
+   prova (teste de equivalência, golden) — uma declaração falsa devolve resultado de um motor
+   que não existe mais, em silêncio. O CI só confere que a linha existe.
 
 ## 4. Mutação: onde gastar
 

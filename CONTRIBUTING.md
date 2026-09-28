@@ -53,6 +53,13 @@ tests (results worked by hand) plus property-based tests (`hypothesis`).
 styling is Tailwind. **DSL types are generated from the shared JSON Schema in `packages/schema`,
 never hand-written** — a copy would drift from the contract.
 
+**The engine's version moves with its results.** A finished run is reused for a new one only under
+the same `tradeforge_engine.__version__` (`tradeforge_api.reuse`), so a pull request that touches
+`packages/engine/src` either raises it (and `packages/engine/pyproject.toml`) or says in one of its
+commits, with the proof, that no result moves:
+`Engine-Results: unchanged — the batch equivalence tests pass`. CI checks it
+(`scripts/check_engine_version.py`); the engine-guardian checks the claim.
+
 **General.** Code and comments in English. Secrets only through environment variables; never
 commit `.env`.
 

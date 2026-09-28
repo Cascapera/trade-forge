@@ -266,6 +266,26 @@ jobs:
           npm audit --json > npm-audit.json || true
           uv run --no-project --python 3.12 scripts/check_js_audit.py < npm-audit.json
 
+  engine-version:
+    name: Engine version moves with its results
+    # A finished run is reused only under the same engine version (`tradeforge_api.reuse`), so a
+    # pull request that changes the engine must raise it, or say in a commit that no result
+    # moves: `Engine-Results: unchanged — <why>` (scripts/check_engine_version.py). Feature PRs
+    # only, for the reason `commitlint` gives below.
+    if: github.event_name == 'pull_request' && github.base_ref != 'main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+
+      - name: The engine's version, or its declared unchanged results
+        run: >-
+          uv run --no-project --python 3.12 scripts/check_engine_version.py
+          ${{ github.event.pull_request.base.sha }} ${{ github.event.pull_request.head.sha }}
+
   commitlint:
     name: Conventional commits
     # Feature PRs only. A release PR (develop -> main) carries commits that were

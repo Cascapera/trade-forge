@@ -63,6 +63,11 @@ class Settings(PostgresSettings, RedisConfig):
     # drops it, leaving its runs queued for good. Read by the launch, never by the worker.
     tradeforge_batch: bool = True
 
+    # A sweep's run whose measurement was already made under this engine is copied instead of run
+    # (`reuse`, 28/09). Off makes every run run — to check the engine against its own past, or on
+    # a machine whose results are not to be trusted as originals. Read by the worker.
+    tradeforge_reuse: bool = True
+
     # How many distinct days of paper trading a strategy must have on record before a live
     # session is allowed. **Policy, not invariant** — the database refuses a strategy that has
     # never completed a bar in paper at all (rev_0016), and that floor is not negotiable; this

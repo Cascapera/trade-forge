@@ -115,4 +115,8 @@ __all__ = [
     "unwarmed_indicators",
 ]
 
-__version__ = "0.1.0"
+# ⚠️ **Raised by every change that can move a result** (28/09). A finished run is reused for a new
+# one only under the same version (`tradeforge_api.reuse`), so a fix that changes a trade and keeps
+# the number would hand back results the engine no longer gives. It sat at 0.1.0 from July to
+# 28/09 through many such fixes; nothing run under 0.1.0 is reused.
+__version__ = "0.2.0"

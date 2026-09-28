@@ -20,7 +20,7 @@ from tradeforge_engine.testing import EURUSD, START, ImmediateFillBroker
 
 
 def test_engine_exposes_a_version() -> None:
-    assert tradeforge_engine.__version__ == "0.2.0"
+    assert tradeforge_engine.__version__ == "0.3.0"
 
 
 def test_both_brokers_satisfy_the_broker_protocol() -> None:

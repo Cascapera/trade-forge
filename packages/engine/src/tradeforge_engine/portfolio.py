@@ -16,8 +16,16 @@ property-based test over random trade sequences.
 Phase 1 holds at most one open position at a time (`max_open_positions` defaults to 1 in
 the DSL). This class enforces that rather than pretending to support a book it has never
 been tested with.
+
+⚠️ **A position opened before `book_from` is shadow** (ADR-0030). A run warms up on the bars before
+its window, trading as it would, so that its indicators and its structure are ready when the window
+opens — and so that a trade the warm-up took still occupies the one slot it would occupy in a
+longer run. Such a position is simulated to its end but never booked: its costs, its result and
+its unrealised value never touch the balance, and it never becomes a trade. The account opens at
+`book_from` with the initial capital, and the property above holds over what was booked.
 """
 
+import datetime as dt
 from dataclasses import replace
 from decimal import Decimal
 
@@ -48,6 +56,7 @@ class Portfolio:
         instrument: InstrumentSpec,
         currency: str = "USD",
         swap: SwapRates | None = None,
+        book_from: dt.datetime | None = None,
     ) -> None:
         if initial_capital <= ZERO:
             raise ValueError(f"initial capital must be positive, got {initial_capital}")
@@ -60,6 +69,9 @@ class Portfolio:
         self._position: Position | None = None
         self._trades: list[ClosedTrade] = []
         self._swap = swap if swap is not None else SwapRates()
+        self._book_from = book_from
+        # Whether the open position was opened before `book_from` — see the module's note.
+        self._shadow = False
 
     @property
     def initial_capital(self) -> Money:
@@ -97,8 +109,12 @@ class Portfolio:
 
         Equity, not balance. An account with a losing position still open has not lost the
         money yet — but it *has* drawn down, and a drawdown measured on balance reports a
-        serene flat line right up to the margin call.
+        serene flat line right up to the margin call. A shadow position is worth nothing to the
+        account (ADR-0030): it is not the account's.
         """
+        if self._shadow:
+            self._equity = self._balance
+            return
         self._equity = self._balance + self._unrealised(candle.close)
 
     def observe_price(self, price: Money) -> None:
@@ -179,10 +195,13 @@ class Portfolio:
                 f"aggregate them before returning a Fill"
             )
 
+        # Opened before the account opens: simulated, never booked (ADR-0030).
+        self._shadow = self._book_from is not None and fill.time < self._book_from
         # The entry's cost leaves the account the moment the order executes. But it is also
         # *remembered on the position*, because the trade this becomes has to report the
         # whole round trip — see ClosedTrade.
-        self._balance -= fill.costs
+        if not self._shadow:
+            self._balance -= fill.costs
         self._equity = self._balance
 
         self._position = Position(
@@ -229,8 +248,12 @@ class Portfolio:
         swap = self._swap.on(position.side, position.volume, position.entry_time, fill.time)
 
         # The balance only moves by what has not moved yet: the entry's cost was already
-        # taken at `_open`. The *trade*, however, reports both legs.
-        self._balance += gross - fill.costs + swap
+        # taken at `_open`. The *trade*, however, reports both legs. A shadow position moves
+        # nothing and is not kept (ADR-0030); the trade is still built and handed back, because
+        # the broker's caller reads it the same way either way.
+        shadow, self._shadow = self._shadow, False
+        if not shadow:
+            self._balance += gross - fill.costs + swap
         self._equity = self._balance
         self._position = None
 
@@ -263,7 +286,8 @@ class Portfolio:
             mae_r=_in_r(position, position.worst_price),
             swap=swap,
         )
-        self._trades.append(trade)
+        if not shadow:
+            self._trades.append(trade)
         return trade
 
     def _r_multiple(self, position: Position, net_pnl: Money) -> Money | None:

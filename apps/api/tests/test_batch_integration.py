@@ -27,7 +27,14 @@ from tradeforge_api.config import Settings
 from tradeforge_api.main import create_app
 from tradeforge_api.queue import RUN_BACKTEST, RUN_BACKTEST_BATCH
 from tradeforge_api.worker import process_backtest, process_batch
-from tradeforge_db.models import Backtest, BacktestMetrics, BacktestStatus, Instrument
+from tradeforge_db.models import (
+    Backtest,
+    BacktestMetrics,
+    BacktestStatus,
+    Instrument,
+    Recorded,
+    Sweep,
+)
 from tradeforge_engine.domain import AssetClass, Candle
 
 from .collector_fakes import running
@@ -219,6 +226,8 @@ def test_a_batch_writes_every_run_as_the_run_writes_itself_alone(
                     parquet_root=tmp_path,
                     run_ids=[uuid.UUID(one) for one in args[0]],
                     read=cache.read,
+                    # Both sweeps must run: a copy of the batch would prove nothing (`reuse`).
+                    reuse=False,
                 )
             )
 
@@ -235,6 +244,7 @@ def test_a_batch_writes_every_run_as_the_run_writes_itself_alone(
                         parquet_root=tmp_path,
                         backtest_id=uuid.UUID(run_id),
                         read=cache.read,
+                        reuse=False,
                     )
                 )
 
@@ -386,3 +396,177 @@ def test_a_launch_with_batching_switched_off_queues_every_run_alone(
     names = {job[0] for job in queue.jobs}
     assert names == {RUN_BACKTEST}
     assert len(queue.jobs) == 18
+
+
+def _run_all(
+    queue: _Queue,
+    session_factory: Callable[[], Session],
+    tmp_path: Path,
+    *,
+    reuse: bool = True,
+) -> None:
+    """Every run job queued so far, through the worker — batches as batches, the rest alone."""
+    cache = CandleCache()
+    for name, args, _options in queue.jobs:
+        with session_factory() as session:
+            if name == RUN_BACKTEST_BATCH:
+                asyncio.run(
+                    process_batch(
+                        session=session,
+                        redis=queue,  # type: ignore[arg-type]
+                        parquet_root=tmp_path,
+                        run_ids=[uuid.UUID(one) for one in args[0]],
+                        read=cache.read,
+                        reuse=reuse,
+                    )
+                )
+            elif name == RUN_BACKTEST:
+                asyncio.run(
+                    process_backtest(
+                        session=session,
+                        redis=queue,  # type: ignore[arg-type]
+                        parquet_root=tmp_path,
+                        backtest_id=uuid.UUID(args[0]),
+                        read=cache.read,
+                        reuse=reuse,
+                    )
+                )
+    queue.jobs.clear()
+
+
+def _origins(session_factory: Callable[[], Session], sweep_id: str) -> dict[uuid.UUID, Any]:
+    """Each run's `reused_from`, by strategy."""
+    with session_factory() as session:
+        return {
+            run.strategy_id: run.reused_from
+            for run in session.scalars(
+                select(Backtest).where(Backtest.sweep_id == uuid.UUID(sweep_id))
+            )
+        }
+
+
+def _reserve(session_factory: Callable[[], Session], sweep_id: str) -> None:
+    """Make a launched sweep a reserved-window test, which keeps every run's trades."""
+    with session_factory() as session:
+        sweep = session.get(Sweep, uuid.UUID(sweep_id))
+        assert sweep is not None
+        sweep.holdout_rule = {"metric": "net_profit", "top_n": 1, "min_trades": {}}
+        session.commit()
+
+
+def _recorded(session_factory: Callable[[], Session], sweep_id: str) -> dict[uuid.UUID, Any]:
+    with session_factory() as session:
+        return {
+            run.strategy_id: run.recorded
+            for run in session.scalars(
+                select(Backtest).where(Backtest.sweep_id == uuid.UUID(sweep_id))
+            )
+        }
+
+
+class TestTheSameMeasurementIsCopied:
+    """28/09, his ask: a run already made under this engine is taken, not run again (`reuse`).
+
+    The walk trades too little on H1 for a sweep's run to pass its floor of 30 and keep its trades,
+    so the tests that need trades kept make the sweep a reserved-window test, which keeps them all.
+    """
+
+    def test_a_second_identical_sweep_copies_every_run_and_reads_the_same(
+        self, client: Any, session_factory: Callable[[], Session], queue: _Queue, tmp_path: Path
+    ) -> None:
+        entry = _entry(client)
+        first = _launch(client, entry)
+        _reserve(session_factory, first)
+        _run_all(queue, session_factory, tmp_path)
+        second = _launch(client, entry)
+        _reserve(session_factory, second)
+        _run_all(queue, session_factory, tmp_path)
+
+        assert _written(session_factory, second) == _written(session_factory, first)
+        with session_factory() as session:
+            originals = {
+                run.strategy_id: run.id
+                for run in session.scalars(
+                    select(Backtest).where(Backtest.sweep_id == uuid.UUID(first))
+                )
+            }
+            copies = list(
+                session.scalars(select(Backtest).where(Backtest.sweep_id == uuid.UUID(second)))
+            )
+            assert {run.strategy_id: run.reused_from for run in copies} == originals
+            copied = 0
+            for copy in copies:
+                source = session.get(Backtest, copy.reused_from)
+                assert source is not None
+                # The trades the copy keeps are the original's, one for one, without pictures.
+                assert [(t.entry_time, t.net_pnl, t.context) for t in copy.trades] == [
+                    (t.entry_time, t.net_pnl, t.context) for t in source.trades
+                ]
+                assert all(t.snapshot is None for t in copy.trades)
+                assert copy.metrics is not None
+                assert copy.metrics.equity_curve is None
+                copied += len(copy.trades)
+            assert copied > 0, "the walk has to trade, or the copy compares nothing"
+        assert set(_origins(session_factory, first).values()) == {None}
+
+    def test_an_original_that_kept_trades_stands_for_a_copy_that_keeps_less(
+        self, client: Any, session_factory: Callable[[], Session], queue: _Queue, tmp_path: Path
+    ) -> None:
+        entry = _entry(client)
+        first = _launch(client, entry)
+        _reserve(session_factory, first)
+        _run_all(queue, session_factory, tmp_path)
+        second = _launch(client, entry)
+        _run_all(queue, session_factory, tmp_path)
+
+        assert None not in set(_origins(session_factory, second).values())
+        # What a sweep's run keeps, as if it had run: under its floor, the metrics alone.
+        assert set(_recorded(session_factory, second).values()) == {Recorded.METRICS}
+        with session_factory() as session:
+            for run in session.scalars(
+                select(Backtest).where(Backtest.sweep_id == uuid.UUID(second))
+            ):
+                assert run.trades == []
+
+    def test_a_copy_that_must_keep_trades_runs_when_the_original_kept_only_metrics(
+        self, client: Any, session_factory: Callable[[], Session], queue: _Queue, tmp_path: Path
+    ) -> None:
+        entry = _entry(client)
+        first = _launch(client, entry)
+        _run_all(queue, session_factory, tmp_path)
+        second = _launch(client, entry)
+        _reserve(session_factory, second)
+        _run_all(queue, session_factory, tmp_path)
+
+        assert set(_recorded(session_factory, first).values()) == {Recorded.METRICS}
+        assert set(_origins(session_factory, second).values()) == {None}
+        assert set(_recorded(session_factory, second).values()) == {Recorded.TRADES}
+
+    def test_switched_off_every_run_runs(
+        self, client: Any, session_factory: Callable[[], Session], queue: _Queue, tmp_path: Path
+    ) -> None:
+        entry = _entry(client)
+        first = _launch(client, entry)
+        _run_all(queue, session_factory, tmp_path)
+        second = _launch(client, entry)
+        _run_all(queue, session_factory, tmp_path, reuse=False)
+
+        assert set(_origins(session_factory, second).values()) == {None}
+        assert _written(session_factory, second) == _written(session_factory, first)
+
+    def test_a_run_under_another_engine_is_never_an_original(
+        self, client: Any, session_factory: Callable[[], Session], queue: _Queue, tmp_path: Path
+    ) -> None:
+        entry = _entry(client)
+        first = _launch(client, entry)
+        _run_all(queue, session_factory, tmp_path)
+        with session_factory() as session:
+            for run in session.scalars(
+                select(Backtest).where(Backtest.sweep_id == uuid.UUID(first))
+            ):
+                run.engine_version = "0.1.0"
+            session.commit()
+        second = _launch(client, entry)
+        _run_all(queue, session_factory, tmp_path)
+
+        assert set(_origins(session_factory, second).values()) == {None}

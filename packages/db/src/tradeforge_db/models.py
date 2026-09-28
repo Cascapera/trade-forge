@@ -916,6 +916,12 @@ class Backtest(Base):
     """What this run kept — see `Recorded`. Meaningful once it is `done`; `full` before that, which
     is what every run recorded before 2026-09-23 was."""
 
+    reused_from: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("backtests.id", ondelete="SET NULL"), index=True
+    )
+    """The finished run this one is a copy of (`rev_0037`, 28/09): the same measurement under the
+    same engine, taken instead of run again (`reuse`). Null for a run that ran."""
+
     @property
     def targets(self) -> dict[str, Any] | None:
         """The target ladder this run scored (`BacktestMetrics.targets`), or `None` before it has
@@ -990,6 +996,15 @@ class Backtest(Base):
             name="an_instrument_spec_is_an_object",
         ),
         Index("ix_backtests_status_created_at", "status", "created_at"),
+        # The worker's question before every run (`reuse`): has this measurement been made?
+        Index(
+            "ix_backtests_measurement",
+            "strategy_id",
+            "instrument_id",
+            "timeframe",
+            "date_from",
+            "date_to",
+        ),
     )
 
 

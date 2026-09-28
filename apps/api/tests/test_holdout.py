@@ -9,6 +9,7 @@ from tradeforge_api.holdout import (
     Bounds,
     Candidate,
     HoldoutRank,
+    behaviour,
     choose,
     floor_of,
     median_of,
@@ -19,6 +20,7 @@ from tradeforge_api.holdout import (
 from tradeforge_db.models import BacktestMetrics
 
 FLOORS = {"M15": 30, "H4": 0}
+GROUP = ("e1", "M15", "EURUSD")
 
 
 def a_candidate(
@@ -101,6 +103,73 @@ class TestChoose:
         chosen = choose(pool, metric=HoldoutRank.NET_PROFIT, top_n=1, floors=FLOORS)
 
         assert [one.order for one in chosen] == [0]
+
+
+def a_record(
+    order: int, *, net_r: str, y2021: str, group: tuple[str, str, str] = GROUP
+) -> Candidate:
+    """A run with a full record in R — what `behaviour` reads."""
+    return Candidate(
+        group=group,
+        order=order,
+        metrics=BacktestMetrics(
+            net_profit=Decimal(net_r) * 100,
+            total_trades=31,
+            long_trades=31,
+            short_trades=0,
+            net_r=Decimal(net_r),
+            max_drawdown_r=Decimal("9.9"),
+            yearly_r={"2020": "-9.9", "2021": y2021},
+        ),
+    )
+
+
+class TestDistinct:
+    """28/09: the first real chain chose five points of which three were one run — points that
+    differ in a target or a breakeven no trade reached make the very same trades."""
+
+    def test_a_clone_of_a_better_run_gives_its_place_to_the_next_distinct_one(self) -> None:
+        pool = [
+            a_record(0, net_r="7.7", y2021="17.6"),
+            a_record(1, net_r="7.7", y2021="17.6"),  # the same record: a clone of 0
+            a_record(2, net_r="4.5", y2021="14.4"),
+        ]
+
+        chosen = choose(pool, metric=HoldoutRank.NET_R, top_n=2, floors=FLOORS)
+
+        assert [one.order for one in chosen] == [0, 2]
+
+    def test_asked_not_to_it_keeps_the_clones(self) -> None:
+        pool = [a_record(0, net_r="7.7", y2021="17.6"), a_record(1, net_r="7.7", y2021="17.6")]
+
+        chosen = choose(pool, metric=HoldoutRank.NET_R, top_n=2, floors=FLOORS, distinct=False)
+
+        assert [one.order for one in chosen] == [0, 1]
+
+    def test_one_year_apart_is_not_a_clone(self) -> None:
+        """Exact, never close: the same total reached through different years is another run."""
+        pool = [a_record(0, net_r="7.7", y2021="17.6"), a_record(1, net_r="7.7", y2021="17.5")]
+
+        chosen = choose(pool, metric=HoldoutRank.NET_R, top_n=2, floors=FLOORS)
+
+        assert [one.order for one in chosen] == [0, 1]
+
+    def test_the_same_record_in_another_group_is_not_a_clone(self) -> None:
+        other = ("e1", "M15", "GBPUSD")
+        pool = [
+            a_record(0, net_r="7.7", y2021="17.6"),
+            a_record(1, net_r="7.7", y2021="17.6", group=other),
+        ]
+
+        chosen = choose(pool, metric=HoldoutRank.NET_R, top_n=1, floors=FLOORS)
+
+        assert [one.order for one in chosen] == [0, 1]
+
+    def test_the_years_are_read_in_any_order(self) -> None:
+        first = BacktestMetrics(total_trades=3, yearly_r={"2020": "1", "2021": "2"})
+        second = BacktestMetrics(total_trades=3, yearly_r={"2021": "2", "2020": "1"})
+
+        assert behaviour(first) == behaviour(second)
 
 
 class TestTheWindow:

@@ -57,6 +57,8 @@ export function HoldoutLauncher(props: { sweep: SweepOut }): React.JSX.Element {
   const [maxDrawdownR, setMaxDrawdownR] = useState('')
   const [minYearsPercent, setMinYearsPercent] = useState('')
   const [floors, setFloors] = useState<Record<string, string>>({})
+  // 28/09: points that make the very same trades are one answer, not N.
+  const [distinct, setDistinct] = useState(true)
 
   const overlaps = dateFrom < day(sweep.date_to) && day(sweep.date_from) < dateTo
   const backwards = dateTo <= dateFrom
@@ -86,6 +88,7 @@ export function HoldoutLauncher(props: { sweep: SweepOut }): React.JSX.Element {
           ? {}
           : { min_positive_year_share: String(Number(yearsLimit.value) / 100) }),
         min_trades: minTrades,
+        distinct,
       },
       {
         onSuccess: (created) => {
@@ -215,6 +218,16 @@ export function HoldoutLauncher(props: { sweep: SweepOut }): React.JSX.Element {
           </label>
         </div>
       </fieldset>
+      <label className="flex items-center gap-2 text-sm">
+        <input
+          type="checkbox"
+          checked={distinct}
+          onChange={(event) => {
+            setDistinct(event.target.checked)
+          }}
+        />
+        Skip clones — a point with the same trades as a better one gives its place to the next
+      </label>
       {!limitsValid && (
         <p role="alert" className="text-sm text-amber-300">
           A limit is a positive number, and a share of years at most 100%.

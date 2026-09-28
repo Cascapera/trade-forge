@@ -1218,6 +1218,9 @@ export interface HoldoutRule {
   max_drawdown_r?: string
   /** Present only when the test set it: the least share of positive years. */
   min_positive_year_share?: string
+  /** Clones skipped (28/09): a run with the same record as a better-ranked one was not chosen.
+   *  Absent on a test launched before, which kept them. */
+  distinct?: boolean
 }
 
 /** Test a sweep's best points on a window none of them was chosen on. */
@@ -1232,6 +1235,8 @@ export interface CreateHoldoutRequest {
   min_positive_year_share?: string
   /** Per chart, over the sweep's own floor; a chart left out keeps that floor. */
   min_trades: Record<string, number>
+  /** Skip a run with the same record as a better-ranked one. The server's default is true. */
+  distinct?: boolean
 }
 
 /** One run's result, on one side of the comparison. */

@@ -102,6 +102,15 @@ describe('HoldoutComparison', () => {
     // The floors in chart order, whatever order the server sent them in.
     expect(screen.getByText(/by net profit · fewest trades: M15 30, H1 30/)).toBeInTheDocument()
     expect(getHoldout).toHaveBeenCalledWith('test-1')
+    // A test launched before 28/09 kept its clones, and says nothing about them.
+    expect(screen.queryByText(/clones skipped/)).not.toBeInTheDocument()
+  })
+
+  it('says when the clones were skipped', async () => {
+    getHoldout.mockResolvedValue({ ...HOLDOUT, rule: { ...HOLDOUT.rule, distinct: true } })
+    renderWithProviders(<HoldoutComparison sweepId="test-1" />)
+
+    expect(await screen.findByText(/· clones skipped/)).toBeInTheDocument()
   })
 
   it('leads with the medians both ways and the share still positive, charts in order', async () => {

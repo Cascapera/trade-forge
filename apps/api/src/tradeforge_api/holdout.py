@@ -114,13 +114,38 @@ def floor_of(timeframe: str, floors: Mapping[str, int]) -> int:
     return max(floors.get(timeframe, 0), 1)
 
 
-def choose(
+def behaviour(metrics: BacktestMetrics) -> tuple[object, ...]:
+    """What a run did, read from its metrics: two runs with the same trades have the same one.
+
+    Points that differ only in a dial their trades never reached — a target no trade got to, a
+    breakeven never armed — make the very same trades, and a sweep ranks them side by side. The
+    first real chain (28/09, AUDUSD M5) chose five points of which three were one run: 31 trades,
+    7.6959 R, the same R year by year. Read from the metrics because a losing run keeps no trades
+    (`retention`), and the choice ranks every run.
+
+    ⚠️ **Exact, not close.** Two runs that share all but one trade differ here and both are kept;
+    only an identical record is a clone.
+    """
+    yearly = metrics.yearly_r or {}
+    return (
+        metrics.total_trades,
+        metrics.long_trades,
+        metrics.short_trades,
+        metrics.net_profit,
+        metrics.net_r,
+        metrics.max_drawdown_r,
+        tuple(sorted((year, str(value)) for year, value in yearly.items())),
+    )
+
+
+def choose(  # noqa: PLR0913 — keyword-only; each is one part of the rule
     candidates: Sequence[Candidate],
     *,
     metric: HoldoutRank,
     top_n: int,
     floors: Mapping[str, int],
     bounds: Bounds | None = None,
+    distinct: bool = True,
 ) -> list[Candidate]:
     """The `top_n` best of each group by `metric`, among the runs that can be ranked at all.
 
@@ -128,6 +153,10 @@ def choose(
     four metrics are nullable — a profit factor with no losing trade, a Sharpe over one trade —
     and a zero would put an unmeasured run above every losing one. The same refusal the
     walk-forward makes (`walkforward.choose`).
+
+    ⚠️ **`distinct` skips a run that did what a better-ranked one already did** (`behaviour`), and
+    the next distinct run takes its place (28/09). Tested again, clones return one answer N times,
+    and a cluster built from them opens one trade N times over.
     """
     by_group: dict[tuple[str, str, str], list[tuple[Decimal, Candidate]]] = {}
     for one in candidates:
@@ -140,7 +169,18 @@ def choose(
     chosen: list[Candidate] = []
     for ranked in by_group.values():
         ranked.sort(key=lambda pair: (-pair[0], pair[1].order))
-        chosen.extend(one for _value, one in ranked[:top_n])
+        seen: set[tuple[object, ...]] = set()
+        taken = 0
+        for _value, one in ranked:
+            if taken == top_n:
+                break
+            if distinct:
+                did = behaviour(one.metrics)
+                if did in seen:
+                    continue
+                seen.add(did)
+            chosen.append(one)
+            taken += 1
     return sorted(chosen, key=lambda one: one.order)
 
 
@@ -176,6 +216,7 @@ __all__ = [
     "Bounds",
     "Candidate",
     "HoldoutRank",
+    "behaviour",
     "choose",
     "floor_of",
     "median_of",

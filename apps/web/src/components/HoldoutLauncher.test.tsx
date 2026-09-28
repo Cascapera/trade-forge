@@ -79,6 +79,7 @@ describe('HoldoutLauncher', () => {
       top_n: 2,
       metric: 'profit_factor',
       min_trades: { D1: 10 },
+      distinct: true,
     })
   })
 
@@ -101,7 +102,24 @@ describe('HoldoutLauncher', () => {
         max_drawdown_r: '10',
         min_positive_year_share: '0.6',
         min_trades: {},
+        distinct: true,
       })
+    })
+  })
+
+  it('keeps the clones when asked to', async () => {
+    createHoldout.mockResolvedValue({ id: 'test-9', runs: 6, skipped: [] })
+    render()
+
+    fireEvent.change(field('To'), { target: { value: '2026-09-19' } })
+    fireEvent.click(screen.getByRole('checkbox', { name: /Skip clones/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Run the test' }))
+
+    await waitFor(() => {
+      expect(createHoldout).toHaveBeenCalledWith(
+        'sweep-1',
+        expect.objectContaining({ distinct: false }),
+      )
     })
   })
 

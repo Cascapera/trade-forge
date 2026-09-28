@@ -106,6 +106,7 @@ export function HoldoutComparison(props: { sweepId: string }): React.JSX.Element
             ` · drawdown at most ${data.rule.max_drawdown_r} R`}
           {data.rule.min_positive_year_share !== undefined &&
             ` · at least ${percent(data.rule.min_positive_year_share, 0)} of years positive`}
+          {data.rule.distinct === true && ' · clones skipped'}
         </p>
       </div>
 

@@ -2867,3 +2867,18 @@ um run apagado não pode ser a resposta de outro.
 Em fluxo (PR-327) a prévia do CONTINUATION em H1+H4 lê 870 mil documentos em ~35 s com 126 MB. A
 tela pergunta de novo a cada edição (400 ms de espera). A maior parte é montar cada documento
 (`grid._copy` + `fit_name`); dá para cortar sem mudar a resposta.
+
+## Reaproveitar run idêntico (PR-345, 28/09) — o que ficou para depois
+
+1. **Nada obriga a subir a versão do motor.** O reaproveitamento só é honesto se toda mudança que
+   pode mexer num resultado subir `tradeforge_engine.__version__` — e ela ficou em 0.1.0 de julho a
+   28/09 atravessando vários consertos. Candidato: um check de CI (ou item no template de PR) que
+   acusa diff em `packages/engine/src` sem mudança da versão; o engine-guardian pode cobrar.
+2. **O Xeon grava no mesmo banco.** Um worker remoto com código antigo e a mesma versão viraria
+   "original" de runs daqui. Hoje ele roda 0.1.0 (inelegível); ao atualizar, subir junto com a
+   versão, nunca um motor diferente sob o mesmo número.
+3. **Barra corrigida no lugar não é vista**: mesma contagem, mesma primeira e última barra, outro
+   preço. Fecharia com um hash dos dados da janela gravado no run.
+4. **Pedaços de um run mais longo** (2020–25 respondendo 2022–24, ou emendar um ano): medir antes
+   quanto aquecimento, trade aberto na virada e saldo mudam o resultado.
+5. **A tela não mostra que um run é cópia** (`reused_from`).

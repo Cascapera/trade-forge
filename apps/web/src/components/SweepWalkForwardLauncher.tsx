@@ -62,7 +62,11 @@ export function SweepWalkForwardLauncher(props: { sweep: SweepOut }): React.JSX.
   const [charts, setCharts] = useState<string[]>(sweep.timeframes)
   const [floors, setFloors] = useState<Record<string, string>>({})
 
-  const all = sweep.counts?.total ?? sweep.runs.length
+  // The runs a fold trains again: not the ones the sweep failed (cancelled by hand among them).
+  const all =
+    sweep.counts === undefined || sweep.counts === null
+      ? sweep.runs.length
+      : sweep.counts.total - sweep.counts.failed
   const some = charts.length < sweep.timeframes.length
   const runs = some ? Math.round((all * charts.length) / sweep.timeframes.length) : all
   const cost = runs * folds
@@ -72,13 +76,19 @@ export function SweepWalkForwardLauncher(props: { sweep: SweepOut }): React.JSX.
   const windows = planned(startYear, trainYears, testYears, folds, anchored)
   const lastTest = startYear + trainYears + folds * testYears - 1
   const thisYear = new Date().getUTCFullYear()
+  // Folds whose test starts by this year; a later one trains on what the last did and tests
+  // nothing — the server refuses it (28/09).
+  const fit = Array.from(
+    { length: folds },
+    (_, k) => startYear + trainYears + k * testYears,
+  ).filter((year) => year <= thisYear).length
   const why =
     !(Number.isInteger(folds) && folds >= 2 && folds <= 20)
       ? 'Between 2 and 20 folds.'
       : trainYears < 1 || testYears < 1
         ? 'Each window is at least a year.'
-        : startYear + trainYears > thisYear
-          ? 'The first test would start in the future.'
+        : fit < folds
+          ? `Fold ${String(fit + 1)} would test from ${String(startYear + trainYears + fit * testYears)}, in the future — ${fit >= 2 ? `at most ${String(fit)} folds fit` : 'these windows leave fewer than two folds to test'}.`
           : charts.length === 0
             ? 'Tick at least one chart.'
             : !floorsValid

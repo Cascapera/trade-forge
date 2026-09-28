@@ -87,7 +87,14 @@ async def create_sweep_walk_forward(
 
     rule = request.model_dump(
         mode="json",
-        include={"top_n", "metric", "min_trades", "max_drawdown_r", "min_positive_year_share"},
+        include={
+            "top_n",
+            "metric",
+            "min_trades",
+            "max_drawdown_r",
+            "min_positive_year_share",
+            "distinct",
+        },
         exclude_none=True,
     )
     walk = SweepWalkForward(

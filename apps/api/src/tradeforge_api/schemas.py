@@ -2066,6 +2066,9 @@ class CreateHoldout(BaseModel):
     """The fewest trades a run needs to be ranked, per chart, over the sweep's own floor
     (`retention.MIN_TRADES`, never below 1). His ask (24/09): on D1 and W1 that floor is 1, and the
     first test ranked runs of one to four trades there."""
+    distinct: bool = True
+    """Skip a run whose record is the same as a better-ranked one's (`holdout.behaviour`), so the N
+    tested are N different behaviours and not one run N times (28/09)."""
 
 
 class HoldoutSide(BaseModel):
@@ -2365,6 +2368,8 @@ class CreateSweepWalkForward(BaseModel):
     )
     max_drawdown_r: Decimal | None = Field(default=None, gt=0)
     min_positive_year_share: Decimal | None = Field(default=None, gt=0, le=1)
+    distinct: bool = True
+    """Each fold skips clones, as a reserved-window test does (`CreateHoldout.distinct`)."""
 
 
 class CreatedSweepWalkForward(BaseModel):

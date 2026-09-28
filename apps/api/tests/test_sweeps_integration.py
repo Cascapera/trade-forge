@@ -1924,6 +1924,7 @@ class TestTheReservedWindow:
             "metric": "net_profit",
             "top_n": 2,
             "min_trades": {"H1": 30},
+            "distinct": True,
         }
         # The two best — periods 13 and 11 — on the same documents, over the new window.
         by_strategy = {row["run"]["strategy_id"]: row for row in runs}

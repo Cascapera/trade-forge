@@ -1443,7 +1443,12 @@ def launch_holdout(
         min_positive_year_share=request.min_positive_year_share,
     )
     chosen = choose(
-        candidates, metric=request.metric, top_n=request.top_n, floors=floors, bounds=bounds
+        candidates,
+        metric=request.metric,
+        top_n=request.top_n,
+        floors=floors,
+        bounds=bounds,
+        distinct=request.distinct,
     )
     if not chosen:
         raise HTTPException(
@@ -1490,6 +1495,7 @@ def launch_holdout(
             "metric": request.metric.value,
             "top_n": request.top_n,
             "min_trades": {one: max(floors.get(one, 0), 1) for one in timeframes},
+            "distinct": request.distinct,
             # Only when asked: a rule that lists no limit is a test that set none.
             **(
                 {}

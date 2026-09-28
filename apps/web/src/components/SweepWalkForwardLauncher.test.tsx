@@ -28,6 +28,7 @@ const sweep = {
   id: 'sweep-1',
   date_from: '2009-01-01T00:00:00Z',
   date_to: '2020-01-01T00:00:00Z',
+  timeframes: ['H1', 'H4'],
   counts: { total: 1200, done: 1200, running: 0, queued: 0, failed: 0 },
   runs: [],
 } as unknown as SweepOut
@@ -81,6 +82,38 @@ describe('SweepWalkForwardLauncher', () => {
       })
     })
     expect(navigate).toHaveBeenCalledWith('/sweep-walkforwards/wf-1')
+  })
+
+  it('walks only the charts ticked, with their floors, and says the smaller cost', async () => {
+    renderWithProviders(<SweepWalkForwardLauncher sweep={sweep} />)
+
+    fireEvent.click(screen.getByRole('checkbox', { name: 'H4' }))
+    fireEvent.change(field('fewest trades on H1'), { target: { value: '10' } })
+
+    // Half the sweep's 1 200 runs, times four folds — an even split, and said so.
+    expect(screen.getByLabelText(/Queues about 2,400 training runs/)).toBeInTheDocument()
+    expect(screen.getByText(/on H1 only — an even share of the sweep's 1200/)).toBeInTheDocument()
+    expect(field('fewest trades on H4')).toBeDisabled()
+    fireEvent.click(screen.getByLabelText(/Queues about/))
+    fireEvent.click(screen.getByRole('button', { name: 'Walk forward' }))
+
+    await waitFor(() => {
+      expect(createSweepWalkForward).toHaveBeenCalledWith(
+        'sweep-1',
+        expect.objectContaining({ timeframes: ['H1'], min_trades: { H1: 10 } }),
+      )
+    })
+  })
+
+  it('refuses no chart at all, and a floor that is not a whole number', () => {
+    renderWithProviders(<SweepWalkForwardLauncher sweep={sweep} />)
+
+    fireEvent.change(field('fewest trades on H1'), { target: { value: '0' } })
+    expect(screen.getByText('A trade floor is a whole number of at least 1.')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('checkbox', { name: 'H1' }))
+    fireEvent.click(screen.getByRole('checkbox', { name: 'H4' }))
+    expect(screen.getByText('Tick at least one chart.')).toBeInTheDocument()
   })
 
   it('takes the confirmation back when the windows change', () => {

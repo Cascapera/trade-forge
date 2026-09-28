@@ -1226,14 +1226,18 @@ def jobs_for(session: Session, runs: Sequence[Backtest], *, batch: bool) -> list
             select(Strategy.id, Strategy.definition).where(
                 Strategy.id.in_({run.strategy_id for run in runs})
             )
-        ).tuples().all()
+        )
+        .tuples()
+        .all()
     )
     symbols = dict(
         session.execute(
             select(Instrument.id, Instrument.symbol).where(
                 Instrument.id.in_({run.instrument_id for run in runs})
             )
-        ).tuples().all()
+        )
+        .tuples()
+        .all()
     )
     batches = Batcher(enabled=batch)
     for run in runs:

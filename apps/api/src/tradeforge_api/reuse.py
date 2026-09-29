@@ -168,6 +168,8 @@ def copy_into(session: Session, original: Backtest, run: Backtest, recorded: Rec
     run.candles_seen = original.candles_seen
     run.first_candle = original.first_candle
     run.last_candle = original.last_candle
+    # What it warmed on, too (ADR-0030): `original_for` matched on it, so the copy read as many.
+    run.warmup_bars = original.warmup_bars
     run.status = BacktestStatus.DONE
     run.started_at = run.started_at or now
     run.finished_at = now

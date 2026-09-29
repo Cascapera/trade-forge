@@ -206,6 +206,7 @@ def _written(session_factory: Callable[[], Session], sweep_id: str) -> dict[uuid
                 metrics.max_drawdown_r,
                 metrics.targets,
                 metrics.yearly_r,
+                run.warmup_bars,
             )
             for run, metrics in rows
         }

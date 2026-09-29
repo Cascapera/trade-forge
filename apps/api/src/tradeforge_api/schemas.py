@@ -151,6 +151,10 @@ class StrategyListItem(_Out):
     strategy by, and every strategy in this project's database has one."""
 
     runs: int
+    catalog: list[str] = Field(default_factory=list)
+    """The catalogue's labels for this lineage (29/09), alphabetically — the names a person gave
+    it. The document behind "CHOCH COMPLETO" is called `SCHOCH-20260922-222429`, and a picker that
+    showed only that was a picker in which the base CHoCH could not be found."""
     created_at: dt.datetime
 
 

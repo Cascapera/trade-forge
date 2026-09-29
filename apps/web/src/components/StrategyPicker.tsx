@@ -1,6 +1,7 @@
 import { useStrategies } from '../api/hooks'
 import type { StrategyListItem } from '../api/types'
 import { count } from '../format'
+import { labelOf } from '../strategy/catalogue'
 
 /**
  * Choose a saved strategy to launch something over.
@@ -15,7 +16,11 @@ import { count } from '../format'
  * This project's own database holds `Structure — CHoCH 56454`, which runs `mme9_breakout`.
  *
  * A grid's own points are absent because the server leaves them out — a hundred-point study
- * writes a hundred strategies, and none of them is something a person picks from a list.
+ * writes a hundred strategies, and none of them is something a person picks from a list. A sweep's
+ * too, run or not (29/09): one is rerun from its sweep, never picked here.
+ *
+ * The catalogue's name leads when there is one (29/09): the base CHoCH is "CHOCH COMPLETO" to him
+ * and `SCHOCH-20260922-222429` to the document, and a list of document names hid it.
  */
 export function StrategyPicker(props: {
   value: string
@@ -45,7 +50,7 @@ export function StrategyPicker(props: {
         </option>
         {items.map((item) => (
           <option key={item.id} value={item.id}>
-            {item.name} · {item.setup ?? 'DSL'} · v{item.version} ·{' '}
+            {labelOf(item)} · {item.setup ?? 'DSL'} · v{item.version} ·{' '}
             {item.runs === 0 ? 'never run' : `${count(item.runs)} run${item.runs === 1 ? '' : 's'}`}
           </option>
         ))}
@@ -56,3 +61,4 @@ export function StrategyPicker(props: {
     </label>
   )
 }
+

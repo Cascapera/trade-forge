@@ -5766,3 +5766,18 @@ def test_a_win_ends_its_own_ladder_and_not_the_one_a_later_bos_opened() -> None:
 
     qualifier.qualify(_ctx(break_=_BOS_DOWN, marked=(second,), zones=both))  # during the trade
     assert qualifier.qualify(_ctx(won=first, zones=both)) is second
+
+
+def test_a_choch_win_ends_its_own_ladder_and_not_the_one_a_later_choch_opened() -> None:
+    """The engine-guardian's case (29/09): the choch short fills at its zone; an opposite change of
+    character confirms during the trade and, heard there, puts its own zone on the ladder; the
+    short then wins. The win ends the old regime's ladder only — the new choch's zone is the next
+    trade, not a rung behind the winner."""
+    qualifier = ChochQualifier()
+    old = _supply("110", "115", 12, primary=True)
+    new = _supply("80", "85", 14, primary=True)
+    zones = (TrackedZone(block=old), TrackedZone(block=new))
+    assert qualifier.qualify(_ctx(break_=_CHOCH_DOWN, marked=(old,), zones=zones)) is old
+
+    qualifier.qualify(_ctx(break_=_CHOCH_DOWN, marked=(new,), zones=zones))  # heard mid-trade
+    assert qualifier.qualify(_ctx(won=old, zones=zones)) is new

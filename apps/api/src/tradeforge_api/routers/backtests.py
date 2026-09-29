@@ -40,8 +40,10 @@ from tradeforge_api.schemas import (
     Symbol,
     TradeOut,
     TradesPage,
+    YearCutOut,
     ZoneOut,
 )
+from tradeforge_api.year_cut import NoCut, cut_years
 from tradeforge_collector import read_candles, step
 from tradeforge_collector.collect import year_slices
 from tradeforge_db.collections import create_collection
@@ -68,6 +70,9 @@ _Responses = dict[int | str, dict[str, Any]]
 _NOT_FOUND: _Responses = {status.HTTP_404_NOT_FOUND: {"description": "not found"}}
 # FastAPI answers an unparseable JSON body with 400, before validation ever runs.
 _BAD_BODY: _Responses = {status.HTTP_400_BAD_REQUEST: {"description": "malformed request body"}}
+_NO_CUT: _Responses = {
+    status.HTTP_422_UNPROCESSABLE_CONTENT: {"description": "this run cannot answer that cut"}
+}
 
 # The largest `offset` the database can be asked for. Postgres renders OFFSET as a bigint, so a
 # larger number is not a big page — it is a `NumericValueOutOfRange` raised inside the driver,
@@ -593,6 +598,52 @@ def get_equity(backtest_id: uuid.UUID, session: SessionDep) -> list[EquityPointO
             detail="this run kept no equity curve; run the point again to see it",
         )
     return [EquityPointOut.model_validate(point) for point in curve]
+
+
+@router.get(
+    "/backtests/{backtest_id}/years",
+    response_model=YearCutOut,
+    responses={**_NOT_FOUND, **_NO_CUT},
+)
+def get_year_cut(
+    backtest_id: uuid.UUID,
+    session: SessionDep,
+    first: Annotated[int, Query(ge=1970, le=2100, description="first year of the cut")],
+    last: Annotated[int, Query(ge=1970, le=2100, description="last year of the cut")],
+) -> YearCutOut:
+    """What a run of the whole years `[first, last]` would have made in R, cut from this one.
+
+    422 when this run cannot answer it — outside its window, recorded before it kept its sizing,
+    or sized where a run started in `first` could have turned signals away (`year_cut`). The
+    detail says which: each asks for the window to be run on its own.
+    """
+    backtest = _load(session, backtest_id)
+    metrics = backtest.metrics
+    if metrics is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="backtest has no results yet"
+        )
+    try:
+        cut = cut_years(
+            r_by_years=metrics.r_by_years,
+            sizing_by_years=metrics.sizing_by_years,
+            sizing_refusals=metrics.sizing_refusals,
+            initial_capital=backtest.initial_capital,
+            date_from=backtest.date_from,
+            date_to=backtest.date_to,
+            first_year=first,
+            last_year=last,
+        )
+    except NoCut as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+        ) from exc
+    return YearCutOut(
+        first_year=cut.first_year,
+        last_year=cut.last_year,
+        net_r=cut.net_r,
+        yearly_r={str(year): r for year, r in cut.yearly_r.items()},
+    )
 
 
 @router.get(

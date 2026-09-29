@@ -71,6 +71,7 @@ from tradeforge_api.sweep_walkforward_job import advance
 from tradeforge_api.template_queue_job import advance_queue
 from tradeforge_api.walkforward import Candidate, choose
 from tradeforge_api.warm_window import warmup_for
+from tradeforge_api.year_cut import Sizing, sizing_document
 from tradeforge_collector import read_candles, step
 from tradeforge_db.collections import finish_collection
 from tradeforge_db.models import (
@@ -199,6 +200,7 @@ def _record_done(  # noqa: PLR0913 — one finished run and what it came to
     trades: list[ClosedTrade],
     metrics: EngineMetrics,
     window: CandleWindow,
+    sizing: Sizing,
 ) -> None:
     """Write one finished run: what it keeps, its metrics in money and in R, what it read.
 
@@ -238,6 +240,9 @@ def _record_done(  # noqa: PLR0913 — one finished run and what it came to
         str(entered): {str(left): str(r) for left, r in sorted(exits.items())}
         for entered, exits in sorted(in_r.by_years.items())
     }
+    # What says whether `r_by_years` can be cut to a window of whole years (`year_cut`).
+    metrics_row.sizing_by_years = sizing_document(sizing)
+    metrics_row.sizing_refusals = sizing.refusals
     backtest.recorded = recorded
     session.add(metrics_row)
     session.add_all(trade_rows)
@@ -303,7 +308,7 @@ async def process_backtest(  # noqa: PLR0913 — keyword-only; each names one th
         # A sweep's run keeps no pictures, so it does not build them either (`retention`).
         in_sweep = backtest.sweep_id is not None
         spec = _kept_spec(backtest, instrument)
-        trades, metrics, window = execute_backtest(
+        trades, metrics, window, sizing = execute_backtest(
             definition=strategy.definition,
             instrument=spec,
             timeframe=backtest.timeframe,
@@ -324,6 +329,7 @@ async def process_backtest(  # noqa: PLR0913 — keyword-only; each names one th
             trades=trades,
             metrics=metrics,
             window=window,
+            sizing=sizing,
         )
         session.commit()
         await _announce(redis, backtest_id, {"status": "done", "progress": 1.0})
@@ -494,7 +500,7 @@ async def _write_one(  # noqa: PLR0913 — one run of a batch and what it came t
         _record_failure(session, run.id, outcome)
         await _announce(redis, run.id, {"status": "failed", "error": _reason(outcome)})
         return
-    trades, metrics, window = outcome
+    trades, metrics, window, sizing = outcome
     try:
         _record_done(
             session,
@@ -504,6 +510,7 @@ async def _write_one(  # noqa: PLR0913 — one run of a batch and what it came t
             trades=trades,
             metrics=metrics,
             window=window,
+            sizing=sizing,
         )
         session.commit()
     except DBAPIError as exc:

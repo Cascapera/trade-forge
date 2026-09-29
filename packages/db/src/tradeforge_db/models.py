@@ -1087,6 +1087,13 @@ class BacktestMetrics(Base):
     # `{"2019": {"2019": "2.5", "2020": "-1"}, ...}` — R by year of entry, then year of exit
     # (ADR-0030, rev_0038): what a longer run gives a window of whole years. Null before 28/09.
     r_by_years: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    # `{"2019": {"equity_at_start": "10000", "smallest_volume": "0.05"}, ...}` — per calendar year
+    # of the window, the equity the run held when the year opened and the smallest lot it entered at
+    # (null in a year with no trade); with `sizing_refusals`, the signals it turned away for a lot
+    # of zero (rev_0039, `year_cut`). What says whether cutting `r_by_years` gives what a run of the
+    # cut would. Null before 29/09.
+    sizing_by_years: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    sizing_refusals: Mapped[int | None] = mapped_column(Integer)
 
     backtest: Mapped[Backtest] = relationship(back_populates="metrics")
 
@@ -1119,6 +1126,14 @@ class BacktestMetrics(Base):
         CheckConstraint(
             "r_by_years IS NULL OR jsonb_typeof(r_by_years) = 'object'",
             name="r_by_years_is_an_object",
+        ),
+        CheckConstraint(
+            "sizing_by_years IS NULL OR jsonb_typeof(sizing_by_years) = 'object'",
+            name="sizing_by_years_is_an_object",
+        ),
+        CheckConstraint(
+            "sizing_refusals IS NULL OR sizing_refusals >= 0",
+            name="sizing_refusals_non_negative",
         ),
     )
 

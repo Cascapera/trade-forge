@@ -29,6 +29,7 @@ from tradeforge_engine.average_setups import AVERAGE_DIALS, AVERAGE_DIALS_READ, 
 from tradeforge_engine.bar_setups import GiftStop
 from tradeforge_engine.domain import TIMEFRAME_DELTAS, Side
 from tradeforge_engine.errors import EngineError
+from tradeforge_engine.higher_timeframe import RegionChoice
 from tradeforge_engine.protocols import Strategy
 from tradeforge_engine.reading import MarketReading
 from tradeforge_engine.setups import (
@@ -309,6 +310,14 @@ def _structure_kwargs(
     _optional_hours(params, "htf_offset", kwargs)
     if kwargs.get("htf") is not None:
         kwargs["timeframe"] = timeframe
+        # Which regions above may release (29/09) — read only with a filter, and passed only when
+        # they narrow the class's defaults (any region, secondaries included), the rule `side`
+        # follows below: a keyword the document never asked for is a place a default could hide.
+        _choice(params, "htf_regions", RegionChoice, kwargs)
+        if kwargs.get("htf_regions") is RegionChoice.ANY:
+            del kwargs["htf_regions"]
+        if params.get("htf_allow_secondary", True) is not True:
+            _flag(params, "htf_allow_secondary", kwargs)
     # ⚠️ `both` is the class's own default (`None`), so it is passed only when narrowed — the same
     # rule as the timeframe above: a keyword the document never asked for is a place a default
     # could hide. Anything but the three names is refused, never read as both.
@@ -433,6 +442,11 @@ def reading_for(
     return MarketReading(timeframe=timeframe, htf=htf, htf_offset=offset)
 
 
+HTF_CHOICES = frozenset({"htf_regions", "htf_allow_secondary"})
+"""The structure setups' choices of which regions above may release (29/09) — read only when the
+document names an `htf`, so unread without one (`unread_params`)."""
+
+
 _ZONE_SETUPS = frozenset({"structure_choch", "structure_continuation"})
 """The setups whose entry point is a `ZoneEntryPoint`, and so whose dials `DIALS_READ` knows."""
 
@@ -459,7 +473,9 @@ def unread_params(node: Mapping[str, object]) -> frozenset[str]:
         zone = raw.get("entry_point", ZoneEntryPoint.EDGE.value)
         if not isinstance(zone, str) or zone not in {one.value for one in ZoneEntryPoint}:
             return frozenset()
-        return ENTRY_DIALS - DIALS_READ[ZoneEntryPoint(zone)]
+        # Which regions above may release is a question only a filter asks (29/09).
+        unfiltered = HTF_CHOICES if raw.get("htf") is None else frozenset()
+        return (ENTRY_DIALS - DIALS_READ[ZoneEntryPoint(zone)]) | unfiltered
     if kind in _AVERAGE_SETUPS:
         average = raw.get("entry_point", AverageEntryPoint.CLASSIC.value)
         if not isinstance(average, str) or average not in {one.value for one in AverageEntryPoint}:

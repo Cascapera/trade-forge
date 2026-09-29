@@ -20,7 +20,8 @@ from tradeforge_engine.average_setups import AverageEntryPoint, PatternWatch
 from tradeforge_engine.bar_setups import GiftStop, GiftTrigger, IgnoredBarTrigger
 from tradeforge_engine.domain import Side
 from tradeforge_engine.errors import EngineError
-from tradeforge_engine.setup_factory import build_setup
+from tradeforge_engine.higher_timeframe import RegionChoice
+from tradeforge_engine.setup_factory import build_setup, unread_params
 from tradeforge_engine.setups import (
     ChochQualifier,
     ContinuationQualifier,
@@ -530,3 +531,66 @@ def test_one_side_is_the_bare_setup_under_its_own_name(
 def test_a_refused_side_names_all_three_it_would_take() -> None:
     with pytest.raises(EngineError, match="'long', 'short' or 'both'"):
         _built("ponto_continuo", side="ambos")
+
+
+# --------------------------------------------------------------------------- #
+# Which regions above may release (2026-09-29)                                  #
+# --------------------------------------------------------------------------- #
+
+
+def _filtered(**params: object) -> StructureStrategy:
+    setup = build_setup(
+        {"type": "structure_choch", "params": {"htf": "H4", **params}},
+        timeframe=dt.timedelta(minutes=15),
+    )
+    assert isinstance(setup, StructureStrategy)
+    return setup
+
+
+def test_the_region_choices_reach_the_gate_of_both_structure_setups() -> None:
+    """From the document to the gate, for the choch and the continuation alike — the filter is
+    the family's (his answer 7), and a test of the choch alone would leave the other unproven."""
+    for kind in ("structure_choch", "structure_continuation"):
+        setup = build_setup(
+            {
+                "type": kind,
+                "params": {"htf": "H4", "htf_regions": "with_trend", "htf_allow_secondary": False},
+            },
+            timeframe=dt.timedelta(minutes=15),
+        )
+        assert isinstance(setup, StructureStrategy)
+        assert setup._gate is not None
+        assert setup._gate._choice is RegionChoice.WITH_TREND
+        assert setup._gate._allow_secondary is False
+
+
+@pytest.mark.parametrize("params", [{}, {"htf_regions": "any", "htf_allow_secondary": True}])
+def test_the_defaults_named_or_omitted_are_any_region_and_every_region(
+    params: dict[str, object],
+) -> None:
+    gate = _filtered(**params)._gate
+    assert gate is not None
+    assert gate._choice is RegionChoice.ANY
+    assert gate._allow_secondary is True
+
+
+def test_a_region_choice_this_engine_does_not_have_is_refused_with_the_alternatives() -> None:
+    with pytest.raises(EngineError, match=r"setup htf_regions must be one of .*'with_trend'"):
+        _filtered(htf_regions="trend")
+
+
+def test_a_secondaries_flag_that_is_not_a_boolean_is_refused() -> None:
+    with pytest.raises(EngineError, match="setup htf_allow_secondary must be true or false"):
+        _filtered(htf_allow_secondary="no")
+
+
+def test_without_a_filter_the_region_choices_are_unread() -> None:
+    """No timeframe above, nothing to choose among: two documents differing only here run the
+    same, and a sweep runs the pair once (`unread_params`)."""
+    unfiltered = {"type": "structure_choch", "params": {"htf_regions": "with_trend"}}
+    filtered = {"type": "structure_choch", "params": {"htf": "H4", "htf_regions": "with_trend"}}
+    assert {"htf_regions", "htf_allow_secondary"} <= unread_params(unfiltered)
+    assert not {"htf_regions", "htf_allow_secondary"} & unread_params(filtered)
+    setup = build_setup(unfiltered)
+    assert isinstance(setup, StructureStrategy)
+    assert setup._gate is None

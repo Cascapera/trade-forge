@@ -176,7 +176,7 @@ function sideOf(condition: Condition | null | undefined, path: string, bad: Unsu
  * "chosen" the moment anybody re-saved, which is exactly the loss this module exists to prevent.
  */
 function valuesOf(
-  params: readonly { name: string; kind: string }[],
+  params: readonly { name: string; kind: string; default?: unknown }[],
   declared: Record<string, unknown>,
   path: string,
   bad: Unsupported,
@@ -185,7 +185,12 @@ function valuesOf(
   for (const param of params) {
     const given = declared[param.name]
     if (given === undefined || given === null) {
-      values[param.name] = param.kind === 'boolean' ? false : ''
+      // ⚠️ **An absent flag is its schema default, not `false`** — what the engine reads it as.
+      // Every flag defaulted to false until `htf_allow_secondary` (29/09, default true), so reading
+      // absent as unchecked was right by coincidence; kept, it would re-save a document that never
+      // chose "primaries only" as choosing it. A text box stays empty: there, empty *is* absent.
+      values[param.name] =
+        param.kind === 'boolean' ? (typeof param.default === 'boolean' ? param.default : false) : ''
       continue
     }
     if (typeof given === 'boolean' || typeof given === 'number' || typeof given === 'string') {

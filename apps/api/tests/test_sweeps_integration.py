@@ -3650,7 +3650,8 @@ class TestAResultSaysWhatItOptimised:
         for period, run in points.items():
             assert run["point"]["entry_id"] == entry
             assert run["point"]["entry_name"] == name
-            assert run["point"]["values"] == {"setup.params.period": period}
+            # The chart is a coordinate of the point too: a sweep writes it beside the axes.
+            assert run["point"]["values"] == {"timeframe": "H1", "setup.params.period": period}
 
     def test_the_entry_s_name_is_read_live_and_a_removed_entry_leaves_the_values(
         self, client: Any
@@ -3667,4 +3668,4 @@ class TestAResultSaysWhatItOptimised:
 
         assert live["entry_name"] == renamed
         assert gone["entry_name"] is None
-        assert gone["values"] == {"setup.params.period": 5}
+        assert gone["values"] == {"timeframe": "H1", "setup.params.period": 5}

@@ -362,8 +362,10 @@ class ChochQualifier:
         # Any break ends the entries before it, so the machinery is told to withdraw.
         self._superseded = context.break_ is not None
         # The outcome belongs to the regime that produced the trade, so it is settled before a
-        # new change of character replaces the ladder on this same bar.
-        if context.won is not None:
+        # new change of character replaces the ladder on this same bar. ⚠️ A win ends *its own*
+        # ladder only: a break heard while the trade was open (29/09) may already have put the next
+        # regime's zones here, and those are the next trades, not rungs behind the winner.
+        if context.won is not None and context.won in self._ladder:
             self._ladder = []
         elif context.stopped is not None and self._ladder and self._ladder[0] == context.stopped:
             self._ladder.pop(0)
@@ -471,8 +473,9 @@ class ContinuationQualifier:
         # and the order resting on one is withdrawn (his rule, 29/09; see `ChochQualifier`).
         self._superseded = context.break_ is not None
         # The outcome belongs to the regime that produced the trade, settled before a new break
-        # touches the ladder on this same bar (see `ChochQualifier.qualify`).
-        if context.won is not None:
+        # touches the ladder on this same bar (see `ChochQualifier.qualify`) — and a win ends only
+        # its own ladder, not the one a break heard during the trade put in its place.
+        if context.won is not None and context.won in self._ladder:
             self._ladder = []
         elif context.stopped is not None and self._ladder and self._ladder[0] == context.stopped:
             self._ladder.pop(0)
@@ -2428,7 +2431,7 @@ class StructureStrategy:
             # that end the trade — the strategy never closes one — but the stop is the strategy's
             # to move, and the break of structure that moves it arrives on exactly the bars this
             # branch used to return empty from.
-            self._armed = None
+            self._hear_break(candle, break_, marked)
             conducted = self._conduct(position, context, break_)
             return () if conducted is None else (conducted,)
 
@@ -2933,6 +2936,35 @@ class StructureStrategy:
     # ----------------------------------------------------------------------- #
     # Order lifetime                                                           #
     # ----------------------------------------------------------------------- #
+
+    def _hear_break(
+        self, candle: Candle, break_: StructureBreak | None, marked: tuple[OrderBlock, ...]
+    ) -> None:
+        """Tell the qualifier about a break that confirmed while this phase's position was open.
+
+        ⚠️ **The engine-guardian's blocker (29/09).** The position branch returned before `qualify`,
+        so a break during a trade never reached the ladder: a choch short stopped at breakeven
+        after a BOS stepped down to the choch's origin, and a BOS during a continuation trade was
+        neither a new ladder nor a count toward `max_bos`. His rule does not wait for the trade to
+        end — *"a partir do momento que faz um novo bos, a escada anterior já fica invalidada"*.
+
+        Only for a qualifier that can end entries (`supersedes`): one without it names a zone once
+        and keeps state that a bar it never used to see would change. What it would arm is thrown
+        away — nothing is armed while a position is open, which is why the armed zone is dropped
+        here first: any name still armed never reached the book (`_observe_fill` forgot a placed
+        one), and holding it would leave it going stale behind a position it knows nothing about.
+        """
+        self._armed = None
+        if break_ is None or getattr(self._qualifier, "supersedes", None) is None:
+            return
+        self._qualifier.qualify(
+            SetupContext(
+                candle=candle,
+                break_=break_,
+                marked=tuple(block for block in marked if block.primary or self._allow_secondary),
+                zones=self._blocks.zones,
+            )
+        )
 
     def _release_superseded(self, candle: Candle) -> tuple[Signal, ...]:
         """Withdraw the armed order when this bar's break ended the entries named before it.

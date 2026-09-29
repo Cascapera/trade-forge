@@ -5681,13 +5681,15 @@ def test_a_superseding_break_withdraws_the_order_resting_on_the_zone_before_it()
         bar(10, open_="124", close="120", high="125", low="119"),
         bar(11, open_="120", close="115", high="121", low="114"),
     ]
-    signals = _drive_from_bullish(
-        ageless_structure(qualifier=_OnceThenSuperseded(at=11)), [*_IMPULSE, *quiet]
-    )
+    strategy = ageless_structure(qualifier=_OnceThenSuperseded(at=11))
+    signals = _drive_from_bullish(strategy, [*_IMPULSE, *quiet])
 
     entry_id = signals[9][0].client_id
     assert signals[10] == []
     assert [(s.kind, s.client_id) for s in signals[11]] == [(SignalKind.CANCEL, entry_id)]
+    # And the zone is given up, not merely its order cancelled: an armed zone left behind is one a
+    # triggered entry would place again when price came back (the guardian's surviving mutant).
+    assert strategy._armed is None
 
 
 def test_a_qualifier_without_the_answer_never_withdraws_this_way() -> None:
@@ -5714,3 +5716,53 @@ def test_both_structure_setups_say_a_break_supersedes_and_a_quiet_bar_does_not(
     assert after(_ctx(break_=_CHOCH_DOWN))
     assert not after(_ctx())
     assert after(_ctx(break_=_BOS_DOWN))
+
+
+@dataclass
+class _MarkedAndHearing(_Marked):
+    """`_Marked` that also answers `supersedes` — a qualifier that can end entries, so a break on a
+    position bar is told to it."""
+
+    supersedes: bool = False
+
+
+def test_a_break_while_a_position_is_open_still_reaches_a_qualifier_that_can_end_entries() -> None:
+    """The engine-guardian's blocker (29/09): bar 9's BOS confirms with a position open. A qualifier
+    that can end entries hears it; one that cannot is left exactly as it was."""
+    hearing = _MarkedAndHearing()
+    deaf = _Marked()
+    _drive_from_bullish(ageless_structure(qualifier=hearing), _IMPULSE, position_on=frozenset({9}))
+    _drive_from_bullish(ageless_structure(qualifier=deaf), _IMPULSE, position_on=frozenset({9}))
+
+    heard = [_index_of(context.candle) for context in hearing.seen if context.break_ is not None]
+    unheard = [_index_of(context.candle) for context in deaf.seen if context.break_ is not None]
+    assert 9 in heard
+    assert 9 not in unheard
+
+
+def test_a_choch_whose_trade_a_bos_overtook_does_not_step_down_after_the_stop() -> None:
+    """His rule 2 (29/09), through the position: the choch's short fills at the near rung, a BOS
+    confirms during the trade, the stop comes back at breakeven — and the choch's origin is not
+    sold, because that BOS ended the choch's entries."""
+    qualifier = ChochQualifier()
+    near = _supply("110", "115", 12, primary=False)
+    origin = _supply("120", "125", 9, primary=True)
+    zones = (TrackedZone(block=near), TrackedZone(block=origin))
+    assert qualifier.qualify(_ctx(break_=_CHOCH_DOWN, marked=(origin, near), zones=zones)) is near
+
+    qualifier.qualify(_ctx(break_=_BOS_DOWN, zones=zones))  # heard on the position bar
+    assert qualifier.qualify(_ctx(stopped=near, zones=zones)) is None
+
+
+def test_a_win_ends_its_own_ladder_and_not_the_one_a_later_bos_opened() -> None:
+    """Continuation: BOS #1's zone is traded; BOS #2 confirms during the trade and opens its own
+    ladder; the win then ends BOS #1's, and BOS #2's zone is the next trade."""
+    qualifier = ContinuationQualifier()
+    qualifier.qualify(_ctx(break_=_CHOCH_DOWN))
+    first = _bos_zone("96", "100", 15, primary=True)
+    second = _bos_zone("70", "74", 21, primary=True)
+    both = (TrackedZone(block=first), TrackedZone(block=second))
+    assert qualifier.qualify(_ctx(break_=_BOS_DOWN, marked=(first,), zones=both)) is first
+
+    qualifier.qualify(_ctx(break_=_BOS_DOWN, marked=(second,), zones=both))  # during the trade
+    assert qualifier.qualify(_ctx(won=first, zones=both)) is second

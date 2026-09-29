@@ -54,6 +54,9 @@ def _grid(*, htf: bool, offset: int = 0) -> list[dict[str, Any]]:
                 "side": side,
                 "breakeven_at_r": breakeven,
                 **({"max_bos": 1} if kind == "structure_continuation" else {}),
+                # The age rule off (29/09): these walks are short, and what is tested here is that
+                # a batch, a shared reading or a warm-up changes nothing — which needs trades.
+                "min_bars_to_touch": 1,
                 **filtered,
             },
         )
@@ -110,7 +113,10 @@ def _batched(
 
 
 # (seed, filtered, broker clock): the last one cuts the bars above three hours off UTC.
-_WALKS = [(0, True, 0), (4, True, 0), (10, True, 0), (4, True, 3), (0, False, 0), (1, False, 0)]
+# The filtered walks are the seeds that still trade since 29/09: a break now takes the resting order
+# with it, and a withdrawn order spends the region above's one chance — seeds 0 and 10 stopped
+# trading under a filter altogether, and a batch equal to its runs over no trades proves nothing.
+_WALKS = [(4, True, 0), (5, True, 0), (9, True, 0), (4, True, 3), (0, False, 0), (1, False, 0)]
 
 
 @pytest.mark.parametrize("snapshots", [False, True], ids=["sweep", "snapshots"])

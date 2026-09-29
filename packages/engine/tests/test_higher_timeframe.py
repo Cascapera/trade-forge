@@ -67,6 +67,7 @@ from tradeforge_engine.testing import (
     HOUR,
     START,
     ImmediateFillBroker,
+    ageless_structure,
     bar,
 )
 
@@ -431,7 +432,7 @@ def test_a_different_clock_reads_different_regions_out_of_the_same_bars() -> Non
         list(
             _entries(
                 _drive(
-                    StructureStrategy(qualifier=_Marked(), htf=H4, htf_offset=HOUR, timeframe=HOUR),
+                    ageless_structure(qualifier=_Marked(), htf=H4, htf_offset=HOUR, timeframe=HOUR),
                     STREAM,
                 )
             )
@@ -489,8 +490,8 @@ def test_the_furthest_real_clock_is_accepted(offset: dt.timedelta) -> None:
 def test_a_filter_with_no_clock_is_cut_on_utc() -> None:
     """His decision of 2026-09-26 (*"nao vamos fazer o ajuste"*), reversing 2026-09-09: no
     offset is UTC, where the stored candles are — the same entries as a UTC broker stated."""
-    silent = StructureStrategy(qualifier=_Marked(), htf=H4, timeframe=HOUR)
-    stated = StructureStrategy(qualifier=_Marked(), htf=H4, htf_offset=_UTC_BROKER, timeframe=HOUR)
+    silent = ageless_structure(qualifier=_Marked(), htf=H4, timeframe=HOUR)
+    stated = ageless_structure(qualifier=_Marked(), htf=H4, htf_offset=_UTC_BROKER, timeframe=HOUR)
 
     assert silent._gate is not None
     assert silent._gate.offset == _UTC_BROKER
@@ -714,12 +715,12 @@ def test_the_supply_side_mirrors_the_release_the_two_heights_and_the_break() -> 
 def test_without_the_filter_the_stream_arms_five_times() -> None:
     """The baseline every test below is read against: the hourly structure marks zones on five
     bars of this stream, four of them before price ever reaches the region above."""
-    entries = _entries(_drive(StructureStrategy(qualifier=_Marked()), STREAM))
+    entries = _entries(_drive(ageless_structure(qualifier=_Marked()), STREAM))
     assert sorted(entries) == [26, 30, 44, 70, ARMS]
 
 
 def test_nothing_is_armed_before_price_reaches_a_region_above() -> None:
-    strategy = StructureStrategy(
+    strategy = ageless_structure(
         qualifier=_Marked(), htf=H4, htf_offset=_UTC_BROKER, timeframe=HOUR
     )
     signals = _drive(strategy, _through(TOUCH - 1))
@@ -727,7 +728,7 @@ def test_nothing_is_armed_before_price_reaches_a_region_above() -> None:
 
 
 def test_the_touch_releases_one_entry_and_the_entry_carries_the_region_above() -> None:
-    strategy = StructureStrategy(
+    strategy = ageless_structure(
         qualifier=_Marked(), htf=H4, htf_offset=_UTC_BROKER, timeframe=HOUR
     )
     entries = _entries(_drive(strategy, STREAM))
@@ -759,11 +760,11 @@ def test_the_arming_spends_the_release_and_a_later_zone_is_refused() -> None:
     # 89's three is the eleventh seen and the second is the twelfth.
     picks = {ARMS: 10, ARMS + 1: 11}
 
-    plain = _drive(StructureStrategy(qualifier=_Names(picks), allow_secondary=True), tail)
+    plain = _drive(ageless_structure(qualifier=_Names(picks), allow_secondary=True), tail)
     assert [signal.kind for signal in plain[ARMS + 1]] == [SignalKind.CANCEL, SignalKind.ENTRY]
 
     filtered = _drive(
-        StructureStrategy(
+        ageless_structure(
             qualifier=_Names(picks),
             allow_secondary=True,
             htf=H4,
@@ -785,11 +786,11 @@ def test_the_short_side_spends_its_own_release() -> None:
     # on 30 and 44, five on 70), and hour 89's first and second are the eighth and ninth seen.
     picks = {ARMS: 7, ARMS + 1: 8}
 
-    plain = _drive(StructureStrategy(qualifier=_Names(picks), allow_secondary=True), tail)
+    plain = _drive(ageless_structure(qualifier=_Names(picks), allow_secondary=True), tail)
     assert [signal.kind for signal in plain[ARMS + 1]] == [SignalKind.CANCEL, SignalKind.ENTRY]
 
     filtered = _drive(
-        StructureStrategy(
+        ageless_structure(
             qualifier=_Names(picks),
             allow_secondary=True,
             htf=H4,
@@ -811,11 +812,11 @@ def test_an_order_the_venue_turned_away_hands_the_release_back() -> None:
     picks = {ARMS: 4, ARMS + 1: 4}
     refused = {ARMS + 1: RefusedBy.BROKER}
 
-    plain = _drive(StructureStrategy(qualifier=_Names(picks)), tail, refused_on=refused)
+    plain = _drive(ageless_structure(qualifier=_Names(picks)), tail, refused_on=refused)
     assert [signal.kind for signal in plain[ARMS + 1]] == [SignalKind.ENTRY]
 
     filtered = _drive(
-        StructureStrategy(qualifier=_Names(picks), htf=H4, htf_offset=_UTC_BROKER, timeframe=HOUR),
+        ageless_structure(qualifier=_Names(picks), htf=H4, htf_offset=_UTC_BROKER, timeframe=HOUR),
         tail,
         refused_on=refused,
     )
@@ -834,11 +835,11 @@ def test_an_order_the_market_withdrew_keeps_the_release_spent() -> None:
     picks = {ARMS: 4, ARMS + 1: 4}
     refused = {ARMS + 1: RefusedBy.MARKET}
 
-    plain = _drive(StructureStrategy(qualifier=_Names(picks)), tail, refused_on=refused)
+    plain = _drive(ageless_structure(qualifier=_Names(picks)), tail, refused_on=refused)
     assert [signal.kind for signal in plain[ARMS + 1]] == [SignalKind.ENTRY]
 
     filtered = _drive(
-        StructureStrategy(qualifier=_Names(picks), htf=H4, htf_offset=_UTC_BROKER, timeframe=HOUR),
+        ageless_structure(qualifier=_Names(picks), htf=H4, htf_offset=_UTC_BROKER, timeframe=HOUR),
         tail,
         refused_on=refused,
     )
@@ -853,11 +854,11 @@ def test_a_refusal_that_lands_after_the_search_ended_hands_nothing_back() -> Non
     picks = {ARMS: 4, ARMS + 1: 4}
     refused = {ARMS + 1: RefusedBy.BROKER}
 
-    plain = _drive(StructureStrategy(qualifier=_Names(picks)), tail, refused_on=refused)
+    plain = _drive(ageless_structure(qualifier=_Names(picks)), tail, refused_on=refused)
     assert [signal.kind for signal in plain[ARMS + 1]] == [SignalKind.ENTRY]
 
     filtered = _drive(
-        StructureStrategy(qualifier=_Names(picks), htf=H4, htf_offset=_UTC_BROKER, timeframe=HOUR),
+        ageless_structure(qualifier=_Names(picks), htf=H4, htf_offset=_UTC_BROKER, timeframe=HOUR),
         tail,
         refused_on=refused,
     )
@@ -868,7 +869,7 @@ def test_a_region_above_reached_while_a_position_is_open_still_releases() -> Non
     """Every bar that touches [80, 100] — 72 through 88 — is spent inside a trade, and the trade
     ends just before the break that marks the zone. The gate has to have been reading those bars
     from behind the position branch, or nothing is released when it matters."""
-    strategy = StructureStrategy(
+    strategy = ageless_structure(
         qualifier=_Marked(), htf=H4, htf_offset=_UTC_BROKER, timeframe=HOUR
     )
     entries = _entries(_drive(strategy, STREAM, position_on=frozenset(range(TOUCH, ARMS))))
@@ -880,18 +881,18 @@ def test_a_zone_from_a_break_before_the_touch_is_not_armed_under_the_release() -
     73 — released, the zone standing — it is still refused: the break was not the reaction."""
     # Only primaries reach the qualifier: one each on hours 26, 30 and 44, then hour 70's.
     picks = {73: 3}
-    plain = _drive(StructureStrategy(qualifier=_Names(picks)), _through(73))
+    plain = _drive(ageless_structure(qualifier=_Names(picks)), _through(73))
     assert [signal.kind for signal in plain[73]] == [SignalKind.ENTRY]
 
     filtered = _drive(
-        StructureStrategy(qualifier=_Names(picks), htf=H4, htf_offset=_UTC_BROKER, timeframe=HOUR),
+        ageless_structure(qualifier=_Names(picks), htf=H4, htf_offset=_UTC_BROKER, timeframe=HOUR),
         _through(73),
     )
     assert filtered[73] == []
 
 
 def test_the_short_side_releases_end_to_end() -> None:
-    strategy = StructureStrategy(
+    strategy = ageless_structure(
         qualifier=_Marked(), htf=H4, htf_offset=_UTC_BROKER, timeframe=HOUR
     )
     entries = _entries(_drive(strategy, _mirror(STREAM)))
@@ -913,7 +914,7 @@ def test_the_regions_above_are_published_for_the_chart_named_by_their_timeframe(
     They come **first**, so a reader drawing in order puts the big ones behind, and each carries
     the name of the bar it belongs to — `H4` — because the legend has to name them.
     """
-    strategy = StructureStrategy(
+    strategy = ageless_structure(
         qualifier=_Marked(), htf=H4, htf_offset=_UTC_BROKER, timeframe=HOUR
     )
     _drive(strategy, STREAM)
@@ -941,7 +942,7 @@ def test_the_regions_above_end_on_the_higher_timeframe_s_clock_not_on_the_releas
     the bucket's opening and the detector's stamp are all the same number and four different
     implementations agree. Found by the guardian on exactly that reading.
     """
-    strategy = StructureStrategy(
+    strategy = ageless_structure(
         qualifier=_Marked(), htf=H4, htf_offset=_UTC_BROKER, timeframe=HOUR
     )
     _drive(strategy, _through(TOUCH + 2))
@@ -964,7 +965,7 @@ def test_the_regions_above_end_on_the_higher_timeframe_s_clock_not_on_the_releas
 def test_without_the_filter_only_the_setup_s_own_regions_are_published() -> None:
     """A key that is absent says something a key that is present and empty does not — and here it
     is a whole series. Nothing about the unfiltered chart changes."""
-    strategy = StructureStrategy(qualifier=_Marked())
+    strategy = ageless_structure(qualifier=_Marked())
     _drive(strategy, STREAM)
 
     assert {mark.label for mark in strategy.zones()} == {"zone"}
@@ -972,7 +973,7 @@ def test_without_the_filter_only_the_setup_s_own_regions_are_published() -> None
 
 def test_the_filter_needs_the_setup_s_own_timeframe() -> None:
     with pytest.raises(ValueError, match="own timeframe"):
-        StructureStrategy(qualifier=_Marked(), htf=H4, htf_offset=_UTC_BROKER)
+        ageless_structure(qualifier=_Marked(), htf=H4, htf_offset=_UTC_BROKER)
 
 
 def test_a_higher_timeframe_the_engine_cannot_name_is_refused_at_construction() -> None:
@@ -982,7 +983,7 @@ def test_a_higher_timeframe_the_engine_cannot_name_is_refused_at_construction() 
     the picture, which is the worst possible moment to find out. The factory only ever passes
     durations from the table; this is for every other caller."""
     with pytest.raises(ValueError, match="bar this engine can name"):
-        StructureStrategy(
+        ageless_structure(
             qualifier=_Marked(),
             htf=dt.timedelta(hours=5),
             htf_offset=_UTC_BROKER,
@@ -991,7 +992,7 @@ def test_a_higher_timeframe_the_engine_cannot_name_is_refused_at_construction() 
 
 
 def test_a_timeframe_alone_builds_no_gate() -> None:
-    strategy = StructureStrategy(qualifier=_Marked(), timeframe=HOUR)
+    strategy = ageless_structure(qualifier=_Marked(), timeframe=HOUR)
     assert strategy._gate is None
 
 

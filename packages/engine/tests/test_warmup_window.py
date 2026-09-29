@@ -152,7 +152,8 @@ def _course(trades: tuple[ClosedTrade, ...]) -> list[tuple[Any, ...]]:
     ]
 
 
-@pytest.mark.parametrize(("seed", "htf"), [(0, True), (4, True), (1, False)])
+# Seed 0 no longer trades under a filter since 29/09 (a break takes the resting order with it).
+@pytest.mark.parametrize(("seed", "htf"), [(5, True), (4, True), (1, False)])
 def test_a_warmed_run_takes_the_trades_a_longer_run_takes_from_book_from(
     seed: int, htf: bool
 ) -> None:

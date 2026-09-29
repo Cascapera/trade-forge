@@ -44,6 +44,7 @@ from tradeforge_engine.loop import ENGINE_CONTEXT, iter_run, run
 from tradeforge_engine.risk import PercentRiskManager
 from tradeforge_engine.setup_factory import build_setup
 from tradeforge_engine.setups import (
+    DEFAULT_MIN_BARS_TO_TOUCH,
     MAX_ARMING_ATTEMPTS,
     BotinhaActivation,
     ChochQualifier,
@@ -64,6 +65,7 @@ from tradeforge_engine.structure import (
     TrackedZone,
     Trend,
     ZoneKind,
+    ZoneView,
 )
 from tradeforge_engine.testing import (
     AAPL,
@@ -73,6 +75,7 @@ from tradeforge_engine.testing import (
     START,
     FixedRisk,
     ImmediateFillBroker,
+    ageless_structure,
     arms_a_resting_limit,
     bar,
 )
@@ -346,7 +349,7 @@ def test_the_authors_geometry_a_demand_zone_is_bought_at_its_top() -> None:
     The stop clears the far edge by a tenth of the zone's width — the region is where price is
     expected to turn, and a stop level *on* the edge is taken out by the turn itself.
     """
-    strategy = StructureStrategy(qualifier=_Marked(), name="test")
+    strategy = ageless_structure(qualifier=_Marked(), name="test")
     signals = _drive_from_bullish(strategy, _IMPULSE)
 
     assert [len(bar_signals) for bar_signals in signals] == [0] * 9 + [1]
@@ -373,7 +376,7 @@ def test_the_stop_buffer_moves_the_stop_on_a_limit_entry_too() -> None:
     copy of the number is what made the buy-side knob independently observable, and the mutation
     run is what noticed that nothing observed it.
     """
-    strategy = StructureStrategy(qualifier=_Marked(), stop_buffer=Decimal("0.5"))
+    strategy = ageless_structure(qualifier=_Marked(), stop_buffer=Decimal("0.5"))
     signals = _drive_from_bullish(strategy, _IMPULSE)
 
     [signal] = signals[9]
@@ -389,7 +392,7 @@ def test_the_stop_buffer_moves_the_midpoint_entry_stop_as_well() -> None:
     edge mutant on the test above and the midpoint one survived it. The entry moves to 95 and
     the stop to 85 — the buffer widens the stop without touching where the order waits, on both.
     """
-    strategy = StructureStrategy(
+    strategy = ageless_structure(
         qualifier=_Marked(), entry_point=ZoneEntryPoint.MIDPOINT, stop_buffer=Decimal("0.5")
     )
     signals = _drive_from_bullish(strategy, _IMPULSE)
@@ -409,7 +412,7 @@ def test_the_entry_records_the_region_it_is_waiting_at() -> None:
 
     The author's own zone: demand [90, 100], bought at its top.
     """
-    strategy = StructureStrategy(qualifier=_Marked(), name="test")
+    strategy = ageless_structure(qualifier=_Marked(), name="test")
     [signal] = _drive_from_bullish(strategy, _IMPULSE)[9]
 
     assert signal.context == {"zone_top": Decimal("100"), "zone_bottom": Decimal("90")}
@@ -430,7 +433,7 @@ def test_the_region_is_a_rectangle_starting_on_the_candle_before_the_gap() -> No
     Measured on the author's impulse: candle 3 runs 90 to 100, candle 4 opens at a low of 103 —
     the gap — so candle 3 is the marking candle and the rectangle is [90, 100] from candle 3.
     """
-    strategy = StructureStrategy(qualifier=_Marked(), name="test")
+    strategy = ageless_structure(qualifier=_Marked(), name="test")
     [signal] = _drive_from_bullish(strategy, _IMPULSE)[9]
 
     (region,) = signal.regions
@@ -463,7 +466,7 @@ def test_the_entry_records_the_structure_that_broke() -> None:
     Measured on the author's impulse: the level is 123, the high of bar 0, and bar 9 closes 124
     through it. Nine bars is how long that structure held.
     """
-    strategy = StructureStrategy(qualifier=_Marked(), name="test")
+    strategy = ageless_structure(qualifier=_Marked(), name="test")
     [signal] = _drive_from_bullish(strategy, _IMPULSE)[9]
 
     (level,) = signal.levels
@@ -484,7 +487,7 @@ def test_the_structural_level_ends_where_it_broke_not_at_the_entry() -> None:
     the opposite of what a reader is checking: how long ago the break was is exactly the thing
     that says whether this entry is still trading that break or a stale memory of one.
     """
-    strategy = StructureStrategy(qualifier=_Marked(), name="test")
+    strategy = ageless_structure(qualifier=_Marked(), name="test")
     [signal] = _drive_from_bullish(strategy, _IMPULSE)[9]
 
     (level,) = signal.levels
@@ -497,7 +500,7 @@ def test_the_structural_level_ends_where_it_broke_not_at_the_entry() -> None:
 def test_the_recorded_region_mirrors_for_a_supply_zone() -> None:
     """Reflected about 200: supply [100, 110], sold at its bottom. `top` stays the higher price
     — it names the edge, not the entry side — so a short's limit sits at `zone_bottom`."""
-    strategy = StructureStrategy(qualifier=_Marked(), name="test")
+    strategy = ageless_structure(qualifier=_Marked(), name="test")
     [signal] = _drive(strategy, _mirror(_IMPULSE))[9]
 
     assert signal.context == {"zone_top": Decimal("110"), "zone_bottom": Decimal("100")}
@@ -510,7 +513,7 @@ def test_the_geometry_mirrors_for_a_supply_zone() -> None:
     Sold at the *bottom* — a supply zone is approached from below, so its near edge is its low.
     Getting this backwards is the sign error `Signal` refuses, and it would be easy to write.
     """
-    strategy = StructureStrategy(qualifier=_Marked(), name="test")
+    strategy = ageless_structure(qualifier=_Marked(), name="test")
     signals = _drive(strategy, _mirror(_IMPULSE))
 
     [signal] = signals[9]
@@ -529,13 +532,13 @@ def test_the_stop_is_rounded_onto_the_tick_grid_away_from_the_entry() -> None:
     """
     candles = [*_IMPULSE]
     candles[3] = bar(3, open_="99", close="99", high="100.05", low="90")
-    strategy = StructureStrategy(qualifier=_Marked(), name="test")
+    strategy = ageless_structure(qualifier=_Marked(), name="test")
 
     [signal] = _drive_from_bullish(strategy, candles)[9]
     assert signal.limit_price == Decimal("100.05")
     assert signal.stop_loss == Decimal("88.99")  # not 89.00, which is nearer the zone
 
-    [short_signal] = _drive(StructureStrategy(qualifier=_Marked(), name="test"), _mirror(candles))[
+    [short_signal] = _drive(ageless_structure(qualifier=_Marked(), name="test"), _mirror(candles))[
         9
     ]
     assert short_signal.limit_price == Decimal("99.95")
@@ -561,7 +564,7 @@ def test_only_the_primary_zone_reaches_the_qualifier_by_default() -> None:
     """The impulse marks two zones. By default a setup is offered only the primary — the first
     gap event of the move — and the secondary is not its business to refuse."""
     qualifier = _Marked()
-    _drive_from_bullish(StructureStrategy(qualifier=qualifier), _IMPULSE)
+    _drive_from_bullish(ageless_structure(qualifier=qualifier), _IMPULSE)
 
     marked = _seen_at(qualifier.seen, 9).marked
     assert [(zone.time, zone.primary) for zone in marked] == [(_at(3), True)]
@@ -570,7 +573,7 @@ def test_only_the_primary_zone_reaches_the_qualifier_by_default() -> None:
 def test_allow_secondary_offers_both_zones() -> None:
     """Turned on, the same impulse offers both, primary first — the flag the author asked for."""
     qualifier = _Marked()
-    _drive_from_bullish(StructureStrategy(qualifier=qualifier, allow_secondary=True), _IMPULSE)
+    _drive_from_bullish(ageless_structure(qualifier=qualifier, allow_secondary=True), _IMPULSE)
 
     marked = _seen_at(qualifier.seen, 9).marked
     assert [(zone.time, zone.primary) for zone in marked] == [
@@ -587,7 +590,7 @@ def test_a_newly_qualified_zone_withdraws_the_order_resting_on_the_old_one() -> 
     would be decided by arrival order in a list.
     """
     qualifier = _Marked()
-    strategy = StructureStrategy(qualifier=qualifier, name="test")
+    strategy = ageless_structure(qualifier=qualifier, name="test")
     # A second impulse after the first, marking a second zone the qualifier will name.
     second = [
         bar(10, open_="124", close="118", high="125", low="117"),  # correction 1
@@ -628,7 +631,7 @@ def test_naming_the_same_zone_again_does_not_churn_the_order() -> None:
         bar(11, open_="122", close="120", high="123", low="119"),
         bar(12, open_="120", close="121", high="122", low="119"),
     ]
-    signals = _drive_from_bullish(StructureStrategy(qualifier=_Sticky()), [*_IMPULSE, *quiet])
+    signals = _drive_from_bullish(ageless_structure(qualifier=_Sticky()), [*_IMPULSE, *quiet])
 
     assert len(signals[9]) == 1  # armed once
     assert signals[9][0].kind is SignalKind.ENTRY
@@ -651,7 +654,7 @@ def test_the_order_is_withdrawn_when_its_zone_is_spent() -> None:
         bar(10, open_="124", close="110", high="125", low="108"),
         bar(11, open_="110", close="89", high="111", low="88"),  # closes under the zone
     ]
-    signals = _drive_from_bullish(StructureStrategy(qualifier=_Once()), [*_IMPULSE, *through])
+    signals = _drive_from_bullish(ageless_structure(qualifier=_Once()), [*_IMPULSE, *through])
 
     entry_id = signals[9][0].client_id
     assert [(s.kind, s.client_id) for s in signals[11]] == [(SignalKind.CANCEL, entry_id)]
@@ -667,7 +670,7 @@ def test_a_live_zone_keeps_its_order_resting() -> None:
         bar(10, open_="124", close="120", high="125", low="119"),
         bar(11, open_="120", close="115", high="121", low="114"),
     ]
-    signals = _drive_from_bullish(StructureStrategy(qualifier=_Marked()), [*_IMPULSE, *quiet])
+    signals = _drive_from_bullish(ageless_structure(qualifier=_Marked()), [*_IMPULSE, *quiet])
 
     assert signals[10] == []
     assert signals[11] == []
@@ -685,7 +688,7 @@ def test_nothing_is_armed_while_a_position_is_open() -> None:
     breakeven — the entry price, 124. What no bar may produce is an entry or a cancel.
     """
     signals = _drive_from_bullish(
-        StructureStrategy(qualifier=_Marked()), _IMPULSE, position_on=frozenset({9})
+        ageless_structure(qualifier=_Marked()), _IMPULSE, position_on=frozenset({9})
     )
 
     kinds = {signal.kind for bar_signals in signals for signal in bar_signals}
@@ -716,7 +719,7 @@ def test_a_region_price_is_inside_is_already_gone() -> None:
         bar(10, open_="124", close="96", high="125", low="95"),  # reaches into the region
         bar(11, open_="96", close="101", high="102", low="95"),  # too late; it is spent
     ]
-    strategy = StructureStrategy(qualifier=_OnBar(at=10), name="test")
+    strategy = ageless_structure(qualifier=_OnBar(at=10), name="test")
     signals = _drive_from_bullish(strategy, [*_IMPULSE, *inside])
 
     assert signals[11] == []
@@ -751,7 +754,7 @@ def test_a_zone_the_tracker_no_longer_holds_is_never_armed() -> None:
         primary=True,
     )
     quiet = [bar(10, open_="124", close="120", high="125", low="119")]
-    signals = _drive_from_bullish(StructureStrategy(qualifier=_Fixed(foreign)), [*_IMPULSE, *quiet])
+    signals = _drive_from_bullish(ageless_structure(qualifier=_Fixed(foreign)), [*_IMPULSE, *quiet])
 
     assert all(bar_signals == [] for bar_signals in signals)
 
@@ -776,7 +779,7 @@ def test_a_zone_spent_before_the_setup_names_it_is_never_armed() -> None:
         bar(12, open_="112", close="114", high="115", low="111"),  # the setup names it here
     ]
     signals = _drive_from_bullish(
-        StructureStrategy(qualifier=_Remembers(at=12)), [*_IMPULSE, *spent]
+        ageless_structure(qualifier=_Remembers(at=12)), [*_IMPULSE, *spent]
     )
 
     assert all(bar_signals == [] for bar_signals in signals)
@@ -801,7 +804,7 @@ def test_a_zone_that_gave_a_trade_is_never_armed_again() -> None:
         bar(11, open_="103", close="101", high="104", low="88"),  # stopped at 89
         bar(12, open_="101", close="104", high="105", low="100"),
     ]
-    strategy = StructureStrategy(qualifier=_Sticky())
+    strategy = ageless_structure(qualifier=_Sticky())
     signals = _drive_from_bullish(strategy, [*_IMPULSE, *after], position_on=frozenset({10}))
 
     assert signals[9][0].kind is SignalKind.ENTRY  # armed once, on the qualifying bar
@@ -828,7 +831,7 @@ def test_a_trade_that_opened_and_died_inside_one_bar_still_spends_its_zone() -> 
     fill observation forgets the armed name, so nothing later tries to withdraw an order the
     trade already used up.
     """
-    strategy = StructureStrategy(qualifier=_Sticky())
+    strategy = ageless_structure(qualifier=_Sticky())
     descent = [
         bar(10, open_="124", close="115", high="125", low="114"),
         bar(11, open_="115", close="105", high="116", low="104"),
@@ -898,7 +901,7 @@ def test_a_fill_spends_the_region_it_traded_and_no_other() -> None:
     construction under his mitigation rule and is kept on purpose. `StructureStrategy`'s docstring
     carries the argument and the measurement.
     """
-    strategy = StructureStrategy(
+    strategy = ageless_structure(
         qualifier=_Script(picks={9: 1, 13: 0, 14: 1}), allow_secondary=True
     )
     descent = [  # down off the break, but clear of 117: the secondary must survive to be filled
@@ -967,7 +970,7 @@ def test_a_zone_withdrawn_unfilled_may_be_offered_again() -> None:
         bar(15, open_="128", close="127", high="129", low="126"),  # zone one is named again
     ]
     signals = _drive_from_bullish(
-        StructureStrategy(qualifier=_Script(picks={9: 0, 14: 1, 15: 0})), [*_IMPULSE, *second]
+        ageless_structure(qualifier=_Script(picks={9: 0, 14: 1, 15: 0})), [*_IMPULSE, *second]
     )
 
     [first_entry] = signals[9]
@@ -995,7 +998,7 @@ def test_a_filled_order_is_not_withdrawn_when_a_later_zone_qualifies() -> None:
         bar(14, open_="128", close="128", high="129", low="126"),  # BOS -> a second zone
     ]
     signals = _drive_from_bullish(
-        StructureStrategy(qualifier=_Marked()), [*_IMPULSE, *after], position_on=frozenset({10})
+        ageless_structure(qualifier=_Marked()), [*_IMPULSE, *after], position_on=frozenset({10})
     )
 
     assert [s.kind for s in signals[14]] == [SignalKind.ENTRY]  # no cancel for the filled order
@@ -1011,11 +1014,11 @@ def test_a_secondary_zone_the_qualifier_read_from_the_tracker_is_refused() -> No
     qualifier reaches past `marked` into the tracker and names the secondary zone; with the flag
     off, nothing is armed.
     """
-    off = _drive_from_bullish(StructureStrategy(qualifier=_FromTracker(index=1)), _IMPULSE)
+    off = _drive_from_bullish(ageless_structure(qualifier=_FromTracker(index=1)), _IMPULSE)
     assert all(bar_signals == [] for bar_signals in off)
 
     on = _drive_from_bullish(
-        StructureStrategy(qualifier=_FromTracker(index=1), allow_secondary=True), _IMPULSE
+        ageless_structure(qualifier=_FromTracker(index=1), allow_secondary=True), _IMPULSE
     )
     [signal] = on[9]
     assert signal.limit_price == Decimal("117")  # the secondary zone's top
@@ -1028,7 +1031,7 @@ def test_a_secondary_zone_the_qualifier_read_from_the_tracker_is_refused() -> No
 
 def test_a_negative_stop_buffer_is_refused() -> None:
     with pytest.raises(ValueError, match="fraction of the zone width"):
-        StructureStrategy(qualifier=_Marked(), stop_buffer=Decimal("-0.1"))
+        ageless_structure(qualifier=_Marked(), stop_buffer=Decimal("-0.1"))
 
 
 def test_a_stop_that_would_land_at_or_below_zero_arms_nothing() -> None:
@@ -1041,7 +1044,7 @@ def test_a_stop_that_would_land_at_or_below_zero_arms_nothing() -> None:
     """
     candles = [*_IMPULSE]
     candles[3] = bar(3, open_="99", close="99", high="100", low="1")  # zone [1, 100]
-    signals = _drive_from_bullish(StructureStrategy(qualifier=_Marked()), candles)
+    signals = _drive_from_bullish(ageless_structure(qualifier=_Marked()), candles)
 
     assert all(bar_signals == [] for bar_signals in signals)
 
@@ -1052,7 +1055,7 @@ def test_a_zone_with_no_width_arms_nothing() -> None:
     candles = [*_IMPULSE]
     # A marking candle with no range: high == low, so top == bottom.
     candles[3] = bar(3, open_="100", close="100", high="100", low="100")
-    signals = _drive_from_bullish(StructureStrategy(qualifier=_Marked()), candles)
+    signals = _drive_from_bullish(ageless_structure(qualifier=_Marked()), candles)
 
     assert all(bar_signals == [] for bar_signals in signals)
 
@@ -1075,7 +1078,7 @@ def test_a_return_pass_zone_with_no_width_arms_nothing_either() -> None:
     # A marking candle with no range: high == low, so top == bottom.
     candles[3] = bar(3, open_="100", close="100", high="100", low="100")
     signals = _drive_from_bullish(
-        StructureStrategy(qualifier=_Marked(), entry_point=ZoneEntryPoint.RETURN_PASS), candles
+        ageless_structure(qualifier=_Marked(), entry_point=ZoneEntryPoint.RETURN_PASS), candles
     )
 
     assert all(bar_signals == [] for bar_signals in signals)
@@ -1103,7 +1106,7 @@ def test_the_order_fills_at_the_zone_edge_when_price_comes_back() -> None:
         candles=[*BULLISH_START, *_IMPULSE, *pullback],
         timeframe=HOUR,
         instrument=AAPL,
-        strategy=StructureStrategy(qualifier=_Marked()),
+        strategy=ageless_structure(qualifier=_Marked()),
         broker=BacktestBroker(instrument=AAPL, initial_capital=Decimal(10_000)),
         risk=FixedRisk(volume=Decimal(1)),
     )
@@ -1135,10 +1138,10 @@ def test_the_midpoint_entry_rests_at_half_the_region_with_the_same_stop() -> Non
     menor... permite aumentar a quantidade de contratos, mantendo o mesmo valor de risco".
     """
     [edge] = _drive_from_bullish(
-        StructureStrategy(qualifier=_Marked(), entry_point=ZoneEntryPoint.EDGE), _IMPULSE
+        ageless_structure(qualifier=_Marked(), entry_point=ZoneEntryPoint.EDGE), _IMPULSE
     )[9]
     [midpoint] = _drive_from_bullish(
-        StructureStrategy(qualifier=_Marked(), entry_point=ZoneEntryPoint.MIDPOINT), _IMPULSE
+        ageless_structure(qualifier=_Marked(), entry_point=ZoneEntryPoint.MIDPOINT), _IMPULSE
     )[9]
 
     assert (edge.limit_price, edge.stop_loss) == (Decimal("100"), Decimal("89"))
@@ -1158,10 +1161,10 @@ def test_the_midpoint_is_rounded_so_the_tick_never_flatters_the_entry() -> None:
     odd[3] = bar(3, open_="99", close="99", high="100", low="90.01")  # region [90.01, 100]
 
     [long_] = _drive_from_bullish(
-        StructureStrategy(qualifier=_Marked(), entry_point=ZoneEntryPoint.MIDPOINT), odd
+        ageless_structure(qualifier=_Marked(), entry_point=ZoneEntryPoint.MIDPOINT), odd
     )[9]
     [short] = _drive(
-        StructureStrategy(qualifier=_Marked(), entry_point=ZoneEntryPoint.MIDPOINT), _mirror(odd)
+        ageless_structure(qualifier=_Marked(), entry_point=ZoneEntryPoint.MIDPOINT), _mirror(odd)
     )[9]
 
     assert long_.limit_price == Decimal("95.01")  # up, away from a better buy
@@ -1182,7 +1185,7 @@ def test_the_pullback_that_fills_on_the_edge_leaves_the_midpoint_on_the_stone() 
             candles=[*BULLISH_START, *_IMPULSE, *_PULLBACK_TO_98],
             timeframe=HOUR,
             instrument=AAPL,
-            strategy=StructureStrategy(qualifier=_Marked(), entry_point=entry_point),
+            strategy=ageless_structure(qualifier=_Marked(), entry_point=entry_point),
             broker=BacktestBroker(instrument=AAPL, initial_capital=Decimal(10_000)),
             risk=FixedRisk(volume=Decimal(1)),
         )
@@ -1213,7 +1216,7 @@ def test_the_midpoint_order_outlives_the_touch_that_retires_its_region() -> None
         ],
         timeframe=HOUR,
         instrument=AAPL,
-        strategy=StructureStrategy(qualifier=_Marked(), entry_point=ZoneEntryPoint.MIDPOINT),
+        strategy=ageless_structure(qualifier=_Marked(), entry_point=ZoneEntryPoint.MIDPOINT),
         broker=BacktestBroker(instrument=AAPL, initial_capital=Decimal(10_000)),
         risk=FixedRisk(volume=Decimal(1)),
     )
@@ -1232,7 +1235,7 @@ def test_an_order_is_abandoned_once_price_leaves_a_region_it_visited() -> None:
     e a entrada neste ponto deve ser abortada."
     """
     signals = _drive_from_bullish(
-        StructureStrategy(qualifier=_Once(), entry_point=ZoneEntryPoint.MIDPOINT),
+        ageless_structure(qualifier=_Once(), entry_point=ZoneEntryPoint.MIDPOINT),
         [
             *_IMPULSE,
             *_PULLBACK_TO_98,
@@ -1263,7 +1266,7 @@ def test_the_sell_side_abandons_below_the_region_it_visited() -> None:
     the 100 edge; bar 13 goes no lower than 94; bar 14 reaches 90.
     """
     signals = _drive(
-        StructureStrategy(qualifier=_Once(), entry_point=ZoneEntryPoint.MIDPOINT),
+        ageless_structure(qualifier=_Once(), entry_point=ZoneEntryPoint.MIDPOINT),
         _mirror(
             [
                 *_IMPULSE,
@@ -1300,7 +1303,7 @@ def test_an_order_is_not_abandoned_while_price_has_never_come_back() -> None:
     placed for.
     """
     signals = _drive_from_bullish(
-        StructureStrategy(qualifier=_Once(), entry_point=ZoneEntryPoint.MIDPOINT),
+        ageless_structure(qualifier=_Once(), entry_point=ZoneEntryPoint.MIDPOINT),
         [*_IMPULSE, bar(10, open_="124", close="130", high="131", low="123")],  # never near 100
     )
 
@@ -1330,7 +1333,7 @@ def test_a_one_bar_round_trip_through_the_real_broker_spends_the_zone() -> None:
         candles=[*BULLISH_START, *_IMPULSE, *pullback],
         timeframe=HOUR,
         instrument=AAPL,
-        strategy=StructureStrategy(qualifier=_Sticky()),
+        strategy=ageless_structure(qualifier=_Sticky()),
         broker=BacktestBroker(instrument=AAPL, initial_capital=Decimal(10_000)),
         risk=FixedRisk(volume=Decimal(1)),
     )
@@ -1359,7 +1362,7 @@ def _return_pass() -> StructureStrategy:
     out again, which is decisive enough to mark zones of its own — and a qualifier that took one
     would leave the test asserting two setups at once.
     """
-    return StructureStrategy(qualifier=_Once(), entry_point=ZoneEntryPoint.RETURN_PASS)
+    return ageless_structure(qualifier=_Once(), entry_point=ZoneEntryPoint.RETURN_PASS)
 
 
 def test_the_return_pass_waits_for_the_fifty_percent_before_placing_anything() -> None:
@@ -1378,7 +1381,7 @@ def test_the_return_pass_waits_for_the_fifty_percent_before_placing_anything() -
     bars = [*_IMPULSE, *_PULLBACK_TO_98, _RETURN_TO_95]
 
     midpoint = _drive_from_bullish(
-        StructureStrategy(qualifier=_Once(), entry_point=ZoneEntryPoint.MIDPOINT), bars
+        ageless_structure(qualifier=_Once(), entry_point=ZoneEntryPoint.MIDPOINT), bars
     )
     return_pass = _drive_from_bullish(_return_pass(), bars)
 
@@ -1447,7 +1450,7 @@ def test_the_trigger_is_the_same_fifty_percent_the_midpoint_entry_rests_at() -> 
     odd[3] = bar(3, open_="99", close="99", high="100.01", low="90")
 
     [resting] = _drive_from_bullish(
-        StructureStrategy(qualifier=_Marked(), entry_point=ZoneEntryPoint.MIDPOINT), odd
+        ageless_structure(qualifier=_Marked(), entry_point=ZoneEntryPoint.MIDPOINT), odd
     )[9]
     assert resting.limit_price == Decimal("95.01")
 
@@ -1484,7 +1487,7 @@ def test_the_sell_trigger_is_the_same_fifty_percent_its_midpoint_entry_rests_at(
     odd[3] = bar(3, open_="99", close="99", high="100.01", low="90")
 
     [resting] = _drive(
-        StructureStrategy(qualifier=_Marked(), entry_point=ZoneEntryPoint.MIDPOINT), _mirror(odd)
+        ageless_structure(qualifier=_Marked(), entry_point=ZoneEntryPoint.MIDPOINT), _mirror(odd)
     )[9]
     assert resting.limit_price == Decimal("104.99")
 
@@ -1706,7 +1709,7 @@ def test_a_sell_trigger_the_buffer_drives_to_zero_or_below_arms_nothing() -> Non
     is the only one that says anything about the line this test exists for. Without the guard the
     order is not merely wrong, it raises: `Signal` refuses a non-positive stop price outright.
     """
-    absurd = StructureStrategy(
+    absurd = ageless_structure(
         qualifier=_Once(), entry_point=ZoneEntryPoint.RETURN_PASS, stop_buffer=Decimal(20)
     )
     bars = [*_IMPULSE, *_PULLBACK_TO_98, _RETURN_TO_95]
@@ -1835,7 +1838,7 @@ def test_choch_arms_the_zone_its_break_marked() -> None:
     Every bar before the choch is silence, and that includes bar 9: the BOS marks two demand
     zones, and this setup is not interested in a continuation's leavings.
     """
-    strategy = StructureStrategy(qualifier=ChochQualifier(), name="choch")
+    strategy = ageless_structure(qualifier=ChochQualifier(), name="choch")
     signals = _drive_from_bullish(strategy, [*_IMPULSE, *_CHOCH_LEG])
 
     assert all(bar_signals == [] for bar_signals in signals[:13])
@@ -1851,7 +1854,7 @@ def test_a_choch_without_inefficiency_offers_no_trade() -> None:
     same anchor, but every three-bar window overlaps — no gap, no zone, and the change of
     character goes untraded rather than inventing a region to sell from."""
     signals = _drive_from_bullish(
-        StructureStrategy(qualifier=ChochQualifier()), [*_IMPULSE, *_GAPLESS_LEG]
+        ageless_structure(qualifier=ChochQualifier()), [*_IMPULSE, *_GAPLESS_LEG]
     )
 
     assert all(bar_signals == [] for bar_signals in signals)
@@ -1870,7 +1873,7 @@ def test_the_choch_order_fills_on_the_pullback() -> None:
         candles=[*BULLISH_START, *_IMPULSE, *_CHOCH_LEG, *pullback],
         timeframe=HOUR,
         instrument=AAPL,
-        strategy=StructureStrategy(qualifier=ChochQualifier()),
+        strategy=ageless_structure(qualifier=ChochQualifier()),
         broker=BacktestBroker(instrument=AAPL, initial_capital=Decimal(10_000)),
         risk=FixedRisk(volume=Decimal(1)),
     )
@@ -1886,14 +1889,14 @@ def test_the_ladder_starts_at_the_zone_nearest_to_price() -> None:
     the secondary — the pullback reaches it first; an order at the primary could only fill after
     price traversed the secondary whole. With the flag off the ladder is the primary alone."""
     on = _drive_from_bullish(
-        StructureStrategy(qualifier=ChochQualifier(), allow_secondary=True),
+        ageless_structure(qualifier=ChochQualifier(), allow_secondary=True),
         [*_IMPULSE, *_TWO_ZONE_LEG],
     )
     [signal] = on[15]
     assert (signal.limit_price, signal.stop_loss) == (Decimal("103"), Decimal("109.60"))
 
     off = _drive_from_bullish(
-        StructureStrategy(qualifier=ChochQualifier()), [*_IMPULSE, *_TWO_ZONE_LEG]
+        ageless_structure(qualifier=ChochQualifier()), [*_IMPULSE, *_TWO_ZONE_LEG]
     )
     [signal] = off[15]
     assert (signal.limit_price, signal.stop_loss) == (Decimal("120"), Decimal("125.50"))
@@ -1923,7 +1926,7 @@ def test_a_stopped_rung_hands_the_order_to_the_primary() -> None:
         candles=[*BULLISH_START, *_IMPULSE, *_TWO_ZONE_LEG, *after],
         timeframe=HOUR,
         instrument=AAPL,
-        strategy=StructureStrategy(qualifier=ChochQualifier(), allow_secondary=True),
+        strategy=ageless_structure(qualifier=ChochQualifier(), allow_secondary=True),
         broker=BacktestBroker(instrument=AAPL, initial_capital=Decimal(10_000)),
         risk=FixedRisk(volume=Decimal(1)),
     )
@@ -1955,7 +1958,7 @@ def test_a_winning_trade_leaves_no_order_on_the_primary() -> None:
         candles=[*BULLISH_START, *_IMPULSE, *_TWO_ZONE_LEG, *after],
         timeframe=HOUR,
         instrument=AAPL,
-        strategy=StructureStrategy(qualifier=ChochQualifier(), allow_secondary=True),
+        strategy=ageless_structure(qualifier=ChochQualifier(), allow_secondary=True),
         broker=BacktestBroker(
             instrument=AAPL, initial_capital=Decimal(10_000), take_profit_rr=Decimal(1)
         ),
@@ -2085,7 +2088,7 @@ def test_the_ladder_survives_an_order_the_gap_discarded() -> None:
         candles=[*BULLISH_START, *_IMPULSE, *_TWO_ZONE_LEG, *gap],
         timeframe=HOUR,
         instrument=AAPL,
-        strategy=StructureStrategy(qualifier=ChochQualifier(), allow_secondary=True),
+        strategy=ageless_structure(qualifier=ChochQualifier(), allow_secondary=True),
         broker=BacktestBroker(instrument=AAPL, initial_capital=Decimal(10_000)),
         risk=FixedRisk(volume=Decimal(1)),
     )
@@ -2271,7 +2274,7 @@ def test_continuation_arms_the_bos_zone_after_a_change_of_character() -> None:
 
     That last line is the one this test was written for and it is unchanged: 96 and 100.40.
     """
-    strategy = StructureStrategy(qualifier=ContinuationQualifier(), name="continuation")
+    strategy = ageless_structure(qualifier=ContinuationQualifier(), name="continuation")
     signals = _drive_from_bullish(strategy, [*_IMPULSE, *_CHOCH_LEG, *_CONT_LEG])
 
     [armed] = signals[9]
@@ -2316,7 +2319,7 @@ def test_continuation_ignores_a_break_with_no_change_of_character_behind_it() ->
     `test_the_geometry_mirrors_for_a_supply_zone` drives this very stream on a fresh machine under
     `_Marked` and gets an entry on bar 9. The zones are there; this qualifier refuses them.
     """
-    signals = _drive(StructureStrategy(qualifier=ContinuationQualifier()), _mirror(_IMPULSE))
+    signals = _drive(ageless_structure(qualifier=ContinuationQualifier()), _mirror(_IMPULSE))
 
     assert all(bar_signals == [] for bar_signals in signals)
 
@@ -2426,8 +2429,9 @@ def test_a_winning_continuation_rung_ends_the_ladder() -> None:
 
 def test_max_bos_one_trades_only_the_first_break_after_a_turn() -> None:
     """`max_bos=1` is the strict reading — the one BOS that confirms the new trend, nothing after
-    it until the trend turns again. The second favourable break is ignored and the first leg's
-    ladder is left standing."""
+    it until the trend turns again. ⚠️ The second favourable break opens no trade **and ends the
+    first leg's ladder** (his rule, 29/09): this used to leave that ladder standing, and a region
+    below a structure that had already moved on filled hours later."""
     qualifier = ContinuationQualifier(max_bos=1)
     qualifier.qualify(_ctx(break_=_CHOCH_DOWN))
 
@@ -2441,7 +2445,23 @@ def test_max_bos_one_trades_only_the_first_break_after_a_turn() -> None:
     )
 
     both = (TrackedZone(block=first), TrackedZone(block=second))
-    assert qualifier.qualify(_ctx(break_=_BOS_DOWN, marked=(second,), zones=both)) is first
+    assert qualifier.qualify(_ctx(break_=_BOS_DOWN, marked=(second,), zones=both)) is None
+    # And nothing comes back on the quiet bars after it.
+    assert qualifier.qualify(_ctx(zones=both)) is None
+
+
+def test_a_zoneless_break_ends_the_ladder_before_it() -> None:
+    """His rule (29/09): a new BOS the same way ends the entries of the one before, and a BOS
+    that left no inefficiency is a new BOS all the same — it opens nothing, and it ends the old
+    ladder rather than leaving it resting."""
+    qualifier = ContinuationQualifier()
+    qualifier.qualify(_ctx(break_=_CHOCH_DOWN))
+    first = _bos_zone("96", "100", 15, primary=True)
+    alive = (TrackedZone(block=first),)
+    assert qualifier.qualify(_ctx(break_=_BOS_DOWN, marked=(first,), zones=alive)) is first
+
+    assert qualifier.qualify(_ctx(break_=_BOS_DOWN, marked=(), zones=alive)) is None
+    assert not qualifier.holds_rungs
 
 
 def test_by_default_every_favourable_break_re_arms() -> None:
@@ -2623,7 +2643,7 @@ def test_the_first_break_in_favour_brings_the_stop_to_the_entry_price() -> None:
     is 15, so its line is at 130 and bar 9's high of 125 does not reach it. One rule at a time.
     """
     signals = _drive_from_bullish(
-        StructureStrategy(qualifier=_Marked()),
+        ageless_structure(qualifier=_Marked()),
         _IMPULSE,
         position_on=frozenset({9}),
         held=_held(entry="100", stop="85"),
@@ -2644,7 +2664,7 @@ def test_every_break_after_the_first_puts_the_stop_at_the_leg_origin() -> None:
     breaks the stop does not move — there is no bar-by-bar trailing in this method either.
     """
     signals = _drive_from_bullish(
-        StructureStrategy(qualifier=_Marked()),
+        ageless_structure(qualifier=_Marked()),
         [*_IMPULSE, *_SECOND_LEG],
         position_on=frozenset({9, 10, 11, 12}),
         held=_held(entry="100", stop="85"),
@@ -2661,7 +2681,7 @@ def test_a_break_against_the_open_trade_moves_nothing() -> None:
     position is short, so it is not this trade's news. Its risk line is out of reach too — entry
     100 against a stop of 115 puts twice the risk at 70, and the bar's low is 120."""
     signals = _drive_from_bullish(
-        StructureStrategy(qualifier=_Marked()),
+        ageless_structure(qualifier=_Marked()),
         _IMPULSE,
         position_on=frozenset({9}),
         held=_held(entry="100", stop="115", side=Side.SHORT),
@@ -2678,7 +2698,7 @@ def test_touching_the_multiple_of_risk_brings_the_stop_to_the_entry_price() -> N
     asked for here can only have come from the risk rule.
     """
     signals = _drive_from_bullish(
-        StructureStrategy(qualifier=_Marked()),
+        ageless_structure(qualifier=_Marked()),
         _IMPULSE,
         position_on=frozenset({8}),
         held=_held(entry="100", stop="91"),
@@ -2695,7 +2715,7 @@ def test_switching_breakeven_off_leaves_structure_conducting_alone() -> None:
     taking this trade to breakeven early pay for itself" a question a backtest can answer.
     """
     signals = _drive_from_bullish(
-        StructureStrategy(qualifier=_Marked(), breakeven_at_r=None),
+        ageless_structure(qualifier=_Marked(), breakeven_at_r=None),
         _IMPULSE,
         position_on=frozenset({8, 9}),
         held=_held(entry="100", stop="91"),
@@ -2727,7 +2747,7 @@ def test_the_bar_that_filled_does_not_credit_its_own_excursion() -> None:
         candles=[*BULLISH_START, *_IMPULSE, *_TWO_ZONE_LEG, *after],
         timeframe=HOUR,
         instrument=AAPL,
-        strategy=StructureStrategy(qualifier=ChochQualifier(), allow_secondary=True),
+        strategy=ageless_structure(qualifier=ChochQualifier(), allow_secondary=True),
         broker=BacktestBroker(instrument=AAPL, initial_capital=Decimal(10_000)),
         risk=FixedRisk(volume=Decimal(1)),
     )
@@ -2741,7 +2761,7 @@ def test_a_short_is_conducted_by_the_mirror_of_the_same_rules() -> None:
     """The bearish mirror of the impulse: bar 9 confirms a bearish BOS, and the open short's
     first break in favour brings its stop to the entry price."""
     signals = _drive(
-        StructureStrategy(qualifier=_Marked()),
+        ageless_structure(qualifier=_Marked()),
         _mirror(_IMPULSE),
         position_on=frozenset({9}),
         held=_held(entry="100", stop="115", side=Side.SHORT),
@@ -2755,7 +2775,7 @@ def test_the_breakeven_multiple_must_be_positive() -> None:
     multiple of zero would put the trigger on the entry price itself, arming breakeven on the
     very bar that opened the trade."""
     with pytest.raises(ValueError, match="breakeven R multiple"):
-        StructureStrategy(qualifier=_Marked(), breakeven_at_r=Decimal(0))
+        ageless_structure(qualifier=_Marked(), breakeven_at_r=Decimal(0))
 
 
 # A third leg after `_SECOND_LEG`, so one instance can see a break of structure, then a *second*
@@ -2801,7 +2821,7 @@ def test_the_count_of_breaks_belongs_to_the_trade_not_to_the_strategy() -> None:
         initial_stop_loss=Decimal(80),
     )
     signals = _drive_from_bullish(
-        StructureStrategy(qualifier=_Marked()),
+        ageless_structure(qualifier=_Marked()),
         stream,
         held_by_bar={9: first, 13: second, 14: second, 15: second},
     )
@@ -2833,7 +2853,7 @@ def test_a_change_of_character_in_our_favour_is_not_a_break_in_our_favour() -> N
     and the bar's high is 118), so silence is the only correct answer.
     """
     signals = _drive(
-        StructureStrategy(qualifier=_Marked()),
+        ageless_structure(qualifier=_Marked()),
         [*_mirror(_IMPULSE), *_CLIMB_BACK],
         position_on=frozenset({10, 11}),
         held=_held(entry="100", stop="85"),
@@ -3481,7 +3501,7 @@ def test_the_botinha_order_chases_its_band_bar_by_bar() -> None:
     about price *level* does that, which is why the two move in opposite directions.
     """
     signals = _drive_from_bullish(
-        StructureStrategy(qualifier=_Marked(), entry_point=ZoneEntryPoint.BOTINHA),
+        ageless_structure(qualifier=_Marked(), entry_point=ZoneEntryPoint.BOTINHA),
         [*_IMPULSE, *_REACTION_IN_THE_REGION, *_DRIFTS_UP],
     )
 
@@ -3516,7 +3536,7 @@ def test_the_botinha_window_running_out_takes_the_order_back_for_good() -> None:
     does not merely retire the order, it spends the **region** — so nothing is armed again after.
     """
     signals = _drive_from_bullish(
-        StructureStrategy(qualifier=_Marked(), entry_point=ZoneEntryPoint.BOTINHA),
+        ageless_structure(qualifier=_Marked(), entry_point=ZoneEntryPoint.BOTINHA),
         [*_IMPULSE, *_REACTION_IN_THE_REGION, *_QUIET],
     )
 
@@ -3537,13 +3557,13 @@ def test_the_same_bars_without_volume_place_no_botinha_order() -> None:
     reason.
     """
     with_volume = _drive_from_bullish(
-        StructureStrategy(qualifier=_Marked(), entry_point=ZoneEntryPoint.BOTINHA),
+        ageless_structure(qualifier=_Marked(), entry_point=ZoneEntryPoint.BOTINHA),
         [*_IMPULSE, *_REACTION_IN_THE_REGION],
     )
     assert len(with_volume[14]) == 1
 
     mute = _drive_from_bullish(
-        StructureStrategy(qualifier=_Marked(), entry_point=ZoneEntryPoint.BOTINHA),
+        ageless_structure(qualifier=_Marked(), entry_point=ZoneEntryPoint.BOTINHA),
         [*_IMPULSE, *_without_volume(_REACTION_IN_THE_REGION)],
     )
     assert all(bar_signals == [] for bar_signals in mute)
@@ -3563,7 +3583,7 @@ def test_an_older_entry_point_is_never_re_priced(entry_point: ZoneEntryPoint) ->
     places once and is never withdrawn.
     """
     signals = _drive_from_bullish(
-        StructureStrategy(qualifier=_Marked(), entry_point=entry_point),
+        ageless_structure(qualifier=_Marked(), entry_point=entry_point),
         [*_IMPULSE, *_REACTION_IN_THE_REGION, *_DRIFTS_UP],
     )
 
@@ -3589,13 +3609,13 @@ def test_a_touched_region_is_refused_by_a_limit_entry_and_taken_by_the_botinha()
     bars = [*_IMPULSE, *_REACTION_IN_THE_REGION, _DRIFTS_UP[0]]
 
     limit = _drive_from_bullish(
-        StructureStrategy(qualifier=_LateMarked(after=22), entry_point=ZoneEntryPoint.MIDPOINT),
+        ageless_structure(qualifier=_LateMarked(after=22), entry_point=ZoneEntryPoint.MIDPOINT),
         bars,
     )
     assert all(bar_signals == [] for bar_signals in limit)
 
     formation = _drive_from_bullish(
-        StructureStrategy(qualifier=_LateMarked(after=22), entry_point=ZoneEntryPoint.BOTINHA),
+        ageless_structure(qualifier=_LateMarked(after=22), entry_point=ZoneEntryPoint.BOTINHA),
         bars,
     )
     [placed] = formation[14]
@@ -3616,7 +3636,7 @@ def test_a_region_the_window_ran_out_on_is_never_offered_again() -> None:
     the zone is offered on every remaining bar and armed on none of them.
     """
     signals = _drive_from_bullish(
-        StructureStrategy(qualifier=_LateMarked(after=0), entry_point=ZoneEntryPoint.BOTINHA),
+        ageless_structure(qualifier=_LateMarked(after=0), entry_point=ZoneEntryPoint.BOTINHA),
         [*_IMPULSE, *_REACTION_IN_THE_REGION, *_QUIET],
     )
 
@@ -3720,7 +3740,7 @@ _CONFIGURES_AGAIN = [
 
 def _fffd(candles: list[Candle]) -> list[list[Signal]]:
     return _drive_from_bullish(
-        StructureStrategy(qualifier=_Marked(), entry_point=ZoneEntryPoint.FFFD), candles
+        ageless_structure(qualifier=_Marked(), entry_point=ZoneEntryPoint.FFFD), candles
     )
 
 
@@ -3749,7 +3769,7 @@ def test_the_fffd_sell_is_the_exact_mirror_of_the_buy() -> None:
     inherited any one of them from the buy side still produces a short — at a price nobody chose.
     """
     [placed] = _drive(
-        StructureStrategy(qualifier=_Marked(), entry_point=ZoneEntryPoint.FFFD),
+        ageless_structure(qualifier=_Marked(), entry_point=ZoneEntryPoint.FFFD),
         _mirror([*_IMPULSE, *_UP_TO_THE_PUSH]),
     )[17]
 
@@ -3940,7 +3960,7 @@ def test_the_sell_side_loses_the_trigger_bars_high_the_same_way() -> None:
         bar(19, open_="96.4", close="96.6", high="96.9", low="96.2", tick_volume=900),
     ]
     signals = _drive(
-        StructureStrategy(qualifier=_Marked(), entry_point=ZoneEntryPoint.FFFD),
+        ageless_structure(qualifier=_Marked(), entry_point=ZoneEntryPoint.FFFD),
         _mirror([*_IMPULSE, *_UP_TO_THE_PUSH, *loses_the_high]),
     )
 
@@ -3965,7 +3985,7 @@ def test_touching_the_trigger_bars_high_exactly_ends_a_short_too() -> None:
         bar(19, open_="97.1", close="97.3", high="97.5", low="97.0", tick_volume=900),
     ]
     signals = _drive(
-        StructureStrategy(qualifier=_Marked(), entry_point=ZoneEntryPoint.FFFD),
+        ageless_structure(qualifier=_Marked(), entry_point=ZoneEntryPoint.FFFD),
         _mirror([*_IMPULSE, *_UP_TO_THE_PUSH, *touches_the_high]),
     )
 
@@ -4075,7 +4095,7 @@ def _hammer(index: int) -> Candle:
 
 def _martelo(candles: list[Candle]) -> list[list[Signal]]:
     return _drive_from_bullish(
-        StructureStrategy(qualifier=_Marked(), entry_point=ZoneEntryPoint.MARTELO), candles
+        ageless_structure(qualifier=_Marked(), entry_point=ZoneEntryPoint.MARTELO), candles
     )
 
 
@@ -4104,7 +4124,7 @@ def test_the_hammer_sell_is_the_exact_mirror_of_the_buy() -> None:
     inherited any one of them from the buy side still produces a short, at a price nobody chose.
     """
     [placed] = _drive(
-        StructureStrategy(qualifier=_Marked(), entry_point=ZoneEntryPoint.MARTELO),
+        ageless_structure(qualifier=_Marked(), entry_point=ZoneEntryPoint.MARTELO),
         _mirror([*_IMPULSE, *_FALLS_BACK, *_TOUCHES_AND_HAMMERS]),
     )[13]
 
@@ -4462,7 +4482,7 @@ def test_a_region_named_on_the_very_bar_that_hammers_still_sees_it() -> None:
     `_LateMarked(after=22)` offers the zone for the first time on bar 13, which is that bar.
     """
     late = _drive_from_bullish(
-        StructureStrategy(qualifier=_LateMarked(after=22), entry_point=ZoneEntryPoint.MARTELO),
+        ageless_structure(qualifier=_LateMarked(after=22), entry_point=ZoneEntryPoint.MARTELO),
         [*_IMPULSE, *_FALLS_BACK, *_TOUCHES_AND_HAMMERS],
     )
 
@@ -4508,7 +4528,7 @@ _QUIET_ABOVE_THE_FORCE = [
 
 def _martelo_forca(candles: list[Candle]) -> list[list[Signal]]:
     return _drive_from_bullish(
-        StructureStrategy(qualifier=_Marked(), entry_point=ZoneEntryPoint.MARTELO_FORCA), candles
+        ageless_structure(qualifier=_Marked(), entry_point=ZoneEntryPoint.MARTELO_FORCA), candles
     )
 
 
@@ -4541,7 +4561,7 @@ def test_the_force_variation_sell_is_the_exact_mirror_of_the_buy() -> None:
     that inherited any of them still produces a short at a price nobody chose.
     """
     [placed] = _drive(
-        StructureStrategy(qualifier=_Marked(), entry_point=ZoneEntryPoint.MARTELO_FORCA),
+        ageless_structure(qualifier=_Marked(), entry_point=ZoneEntryPoint.MARTELO_FORCA),
         _mirror([*_IMPULSE, *_FALLS_BACK, *_TOUCHES_AND_HAMMERS, _BAR_OF_FORCE]),
     )[14]
 
@@ -4864,17 +4884,17 @@ def _force_off_the_region_at(index: int) -> Candle:
 
 def _gift_setup(candles: list[Candle], **kwargs: object) -> list[list[Signal]]:
     return _drive_from_bullish(
-        StructureStrategy(qualifier=_Marked(), entry_point=ZoneEntryPoint.GIFT, **kwargs),  # type: ignore[arg-type]
+        ageless_structure(qualifier=_Marked(), entry_point=ZoneEntryPoint.GIFT, **kwargs),
         candles,
     )
 
 
 def _ignored_setup(candles: list[Candle], **kwargs: object) -> list[list[Signal]]:
     return _drive_from_bullish(
-        StructureStrategy(
+        ageless_structure(
             qualifier=_Marked(),
             entry_point=ZoneEntryPoint.BARRA_IGNORADA,
-            **kwargs,  # type: ignore[arg-type]
+            **kwargs,
         ),
         candles,
     )
@@ -4917,7 +4937,7 @@ def test_the_gift_sell_is_the_exact_mirror_of_the_buy() -> None:
     measured from all mirror at once, and a sell inheriting any one of them from the buy still
     produces a short at a price nobody chose."""
     [placed] = _drive(
-        StructureStrategy(qualifier=_Marked(), entry_point=ZoneEntryPoint.GIFT),
+        ageless_structure(qualifier=_Marked(), entry_point=ZoneEntryPoint.GIFT),
         _mirror([*_IMPULSE, *_FALLS_BACK, _FORCE_OFF_THE_REGION, _GIFT]),
     )[14]
 
@@ -4941,7 +4961,7 @@ def test_the_ignored_bar_arms_the_same_entry_with_the_force_bar_s_stop() -> None
 
 def test_the_ignored_bar_sell_is_the_exact_mirror_of_the_buy() -> None:
     [placed] = _drive(
-        StructureStrategy(qualifier=_Marked(), entry_point=ZoneEntryPoint.BARRA_IGNORADA),
+        ageless_structure(qualifier=_Marked(), entry_point=ZoneEntryPoint.BARRA_IGNORADA),
         _mirror([*_IMPULSE, *_FALLS_BACK, _FORCE_OFF_THE_REGION, _IGNORED_BAR]),
     )[14]
 
@@ -5301,7 +5321,7 @@ def test_a_region_named_on_the_very_bar_of_force_still_sees_it() -> None:
     runs twice on the bar a zone is armed; `_LateMarked(after=22)` names the region for the first
     time on bar 13, which is the force bar, and the gift on 14 has to find it remembered."""
     late = _drive_from_bullish(
-        StructureStrategy(qualifier=_LateMarked(after=22), entry_point=ZoneEntryPoint.GIFT),
+        ageless_structure(qualifier=_LateMarked(after=22), entry_point=ZoneEntryPoint.GIFT),
         [*_IMPULSE, *_FALLS_BACK, _FORCE_OFF_THE_REGION, _GIFT],
     )
 
@@ -5480,29 +5500,29 @@ class TestTheSideFilter:
         # ⚠️ `_drive_from_bullish` for the long, never `_drive`: from a fresh machine the impulse
         # confirms nothing, and a "never arms" beside it would pass for any filter at all.
         [bought] = _drive_from_bullish(
-            StructureStrategy(qualifier=_Marked(), name="test"), _IMPULSE
+            ageless_structure(qualifier=_Marked(), name="test"), _IMPULSE
         )[9]
-        [sold] = _drive(StructureStrategy(qualifier=_Marked(), name="test"), _mirror(_IMPULSE))[9]
+        [sold] = _drive(ageless_structure(qualifier=_Marked(), name="test"), _mirror(_IMPULSE))[9]
 
         assert (bought.side, sold.side) == (Side.LONG, Side.SHORT)
 
     def test_long_only_never_arms_a_supply_zone_and_still_arms_demand(self) -> None:
-        only_long = StructureStrategy(qualifier=_Marked(), name="test", side=Side.LONG)
+        only_long = ageless_structure(qualifier=_Marked(), name="test", side=Side.LONG)
         signals = _drive(only_long, _mirror(_IMPULSE))
 
         assert all(bar == [] for bar in signals)
         [bought] = _drive_from_bullish(
-            StructureStrategy(qualifier=_Marked(), name="test", side=Side.LONG), _IMPULSE
+            ageless_structure(qualifier=_Marked(), name="test", side=Side.LONG), _IMPULSE
         )[9]
         assert bought.side is Side.LONG
 
     def test_short_only_never_arms_a_demand_zone_and_still_arms_supply(self) -> None:
-        only_short = StructureStrategy(qualifier=_Marked(), name="test", side=Side.SHORT)
+        only_short = ageless_structure(qualifier=_Marked(), name="test", side=Side.SHORT)
         signals = _drive_from_bullish(only_short, _IMPULSE)
 
         assert all(bar == [] for bar in signals)
         [sold] = _drive(
-            StructureStrategy(qualifier=_Marked(), name="test", side=Side.SHORT),
+            ageless_structure(qualifier=_Marked(), name="test", side=Side.SHORT),
             _mirror(_IMPULSE),
         )[9]
         assert sold.side is Side.SHORT
@@ -5525,7 +5545,8 @@ def test_a_documents_side_reaches_the_engine_as_the_side_it_names(
     """
 
     def built() -> StructureStrategy:
-        setup = build_setup({"type": kind, "params": {"side": side}})
+        # The age rule off, as `ageless_structure` does for the constructor: the stream is short.
+        setup = build_setup({"type": kind, "params": {"side": side, "min_bars_to_touch": 1}})
         assert isinstance(setup, StructureStrategy)
         # The qualifier under test is the path, not a setup's own taste in zones: `_Marked`
         # names every zone the detector marks, so the side is the only filter left. ⚠️ Asserted
@@ -5540,3 +5561,156 @@ def test_a_documents_side_reaches_the_engine_as_the_side_it_names(
 
     assert any(bar != [] for bar in demand) is arms_demand
     assert any(bar != [] for bar in supply) is arms_supply
+
+
+# --------------------------------------------------------------------------- #
+# His minimum age of a region (29/09)                                          #
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class _Detected:
+    """The two things `_old_enough` reads off the detector: its regions and its bar count."""
+
+    zones: ZoneView
+    bar_index: int
+
+
+def _aged(block: OrderBlock, *, gap: int, touched: int | None) -> TrackedZone:
+    tracked = TrackedZone(block=block, gap_index=gap, touched_index=touched)
+    tracked.mitigated = touched is not None
+    return tracked
+
+
+def _may_arm_at(bar_index: int, tracked: TrackedZone, **kwargs: object) -> bool:
+    strategy = StructureStrategy(qualifier=ChochQualifier(), **kwargs)  # type: ignore[arg-type]
+    strategy._blocks = _Detected(ZoneView((tracked,)), bar_index)  # type: ignore[assignment]
+    return strategy._old_enough(tracked.block)
+
+
+_YOUNG = OrderBlock(
+    kind=ZoneKind.DEMAND,
+    top=Decimal(100),
+    bottom=Decimal(90),
+    time=START,
+    confirmed_at=START + 3 * HOUR,
+    break_kind=StructureKind.CHOCH,
+    primary=True,
+)
+
+
+def test_a_region_may_be_traded_from_the_close_of_its_seventh_bar() -> None:
+    """His count: the gap's third candle (detector bar 10 here) is bar one, so the seventh is bar
+    16 — the order may be put at its close, and not a bar before."""
+    tracked = _aged(_YOUNG, gap=10, touched=None)
+    assert not _may_arm_at(15, tracked)
+    assert _may_arm_at(16, tracked)
+    assert _may_arm_at(40, tracked)
+
+
+def test_a_touch_on_the_seventh_bar_or_before_cancels_the_trade_for_good() -> None:
+    """*"Se tocar na 7ª barra ou antes, não faz o trade"* — and it does not come back later."""
+    on_the_seventh = _aged(_YOUNG, gap=10, touched=16)
+    after_it = _aged(_YOUNG, gap=10, touched=17)
+    assert not _may_arm_at(16, on_the_seventh)
+    assert not _may_arm_at(60, on_the_seventh)
+    # A touch after the wait is the ordinary trade, the rule has nothing to say about it.
+    assert _may_arm_at(17, after_it)
+
+
+def test_one_bar_is_the_rule_switched_off() -> None:
+    tracked = _aged(_YOUNG, gap=10, touched=11)
+    assert _may_arm_at(10, _aged(_YOUNG, gap=10, touched=None), min_bars_to_touch=1)
+    assert _may_arm_at(11, tracked, min_bars_to_touch=1)
+
+
+def test_the_default_is_seven_and_a_count_below_one_is_refused() -> None:
+    assert DEFAULT_MIN_BARS_TO_TOUCH == 7
+    with pytest.raises(ValueError, match="at least the bar that confirmed its gap"):
+        StructureStrategy(qualifier=ChochQualifier(), min_bars_to_touch=0)
+
+
+def test_a_zone_with_no_gap_on_record_is_left_to_the_other_rules() -> None:
+    """Built by hand, a zone has no gap count; the age rule does not invent one."""
+    assert _may_arm_at(0, TrackedZone(block=_YOUNG))
+
+
+@pytest.mark.parametrize(("age", "trades"), [(1, True), (500, False)])
+def test_the_document_s_minimum_age_reaches_the_zone_it_gates(age: int, trades: bool) -> None:
+    """From the document to the arming decision: the measured scenario arms a resting limit with
+    the rule off, and an age no region of it can reach leaves the book empty."""
+    broker = BacktestBroker(instrument=EURUSD, initial_capital=Decimal("10000"))
+    for _outcome in iter_run(
+        candles=iter(arms_a_resting_limit()),
+        timeframe=HOUR,
+        instrument=EURUSD,
+        strategy=build_setup({"type": "structure_choch", "params": {"min_bars_to_touch": age}}),
+        broker=broker,
+        risk=PercentRiskManager(percent=Decimal("1")),
+    ):
+        pass
+    assert bool(broker.submitted) is trades
+
+
+# --------------------------------------------------------------------------- #
+# A break ends the entries named before it (his rule, 29/09)                    #
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class _OnceThenSuperseded:
+    """`_Once`, plus the optional `supersedes` answer — true on one chosen bar only."""
+
+    at: int
+    done: bool = False
+    supersedes: bool = False
+
+    def qualify(self, context: SetupContext) -> OrderBlock | None:
+        self.supersedes = _index_of(context.candle) == self.at
+        if self.done or not context.marked:
+            return None
+        self.done = True
+        return context.marked[0]
+
+
+def test_a_superseding_break_withdraws_the_order_resting_on_the_zone_before_it() -> None:
+    """The order armed on bar 9 rests through a quiet bar 10; on bar 11 the qualifier reports that
+    a break ended every entry named before it, and the order is taken back on that bar — the
+    withdrawal `None` alone never asked for."""
+    quiet = [
+        bar(10, open_="124", close="120", high="125", low="119"),
+        bar(11, open_="120", close="115", high="121", low="114"),
+    ]
+    signals = _drive_from_bullish(
+        ageless_structure(qualifier=_OnceThenSuperseded(at=11)), [*_IMPULSE, *quiet]
+    )
+
+    entry_id = signals[9][0].client_id
+    assert signals[10] == []
+    assert [(s.kind, s.client_id) for s in signals[11]] == [(SignalKind.CANCEL, entry_id)]
+
+
+def test_a_qualifier_without_the_answer_never_withdraws_this_way() -> None:
+    """The same bars under `_Once`, which has no `supersedes`: the order rests on."""
+    quiet = [
+        bar(10, open_="124", close="120", high="125", low="119"),
+        bar(11, open_="120", close="115", high="121", low="114"),
+    ]
+    signals = _drive_from_bullish(ageless_structure(qualifier=_Once()), [*_IMPULSE, *quiet])
+
+    assert signals[11] == []
+
+
+@pytest.mark.parametrize("qualifier", [ChochQualifier, ContinuationQualifier])
+def test_both_structure_setups_say_a_break_supersedes_and_a_quiet_bar_does_not(
+    qualifier: type[ChochQualifier] | type[ContinuationQualifier],
+) -> None:
+    setup = qualifier()
+
+    def after(context: SetupContext) -> bool:
+        setup.qualify(context)
+        return setup.supersedes
+
+    assert after(_ctx(break_=_CHOCH_DOWN))
+    assert not after(_ctx())
+    assert after(_ctx(break_=_BOS_DOWN))

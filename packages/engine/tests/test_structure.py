@@ -1913,8 +1913,8 @@ def _supply_100_110() -> OrderBlock:
 def _live(block: OrderBlock, candles: list[Candle]) -> TrackedZone:
     """Run a zone through the candles by hand, bypassing detection to isolate the lifecycle."""
     tracked = TrackedZone(block=block)
-    for candle in candles:
-        OrderBlockDetector._advance(tracked, candle)
+    for index, candle in enumerate(candles):
+        OrderBlockDetector._advance(tracked, candle, index)
     return tracked
 
 
@@ -2202,3 +2202,28 @@ def test_the_stamp_and_the_flag_are_set_by_the_same_bar() -> None:
     touched = _live(_demand_90_100(), [bar(0, open_="105", close="104", high="106", low="100")])
     assert touched.mitigated
     assert touched.mitigated_at == _at(0)
+
+
+def test_an_offered_region_knows_the_bar_that_confirmed_its_gap_and_the_bar_that_touched_it() -> (
+    None
+):
+    """His minimum age (29/09) is counted on these: the gap's third candle is the marking candle
+    plus two, in the detector's own count, and the first touch is recorded where `mitigated_at`
+    is — as a count, so an age needs no calendar."""
+    stream = [*BULLISH_START, *GAPPING_IMPULSE]
+    detector = OrderBlockDetector()
+    structure = MarketStructure()
+    for candle in stream:
+        detector.update(candle, structure.update(candle))
+    assert detector.bar_index == len(stream) - 1
+    assert detector.zones, "the golden has to offer a region, or this proves nothing"
+    position = {candle.time: index for index, candle in enumerate(stream)}
+    for tracked in detector.zones:
+        assert tracked.gap_index == position[tracked.block.time] + 2
+        assert tracked.touched_index is None
+
+    first = detector.zones[0]
+    touch = bar(len(stream), open_="200", close="200", high="200", low=str(first.block.top))
+    detector.update(touch, structure.update(touch))
+    assert first.touched_index == len(stream)
+    assert first.mitigated_at == touch.time

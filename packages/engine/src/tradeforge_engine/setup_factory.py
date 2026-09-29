@@ -303,6 +303,8 @@ def _structure_kwargs(
     _choice(params, "entry_point", ZoneEntryPoint, kwargs)
     _choice(params, "gift_stop", GiftStop, kwargs)
     _flag(params, "volume_filter", kwargs)
+    # His minimum age of a region before it may be traded (29/09), counted in bars.
+    _int(params, "min_bars_to_touch", kwargs)
     # The timeframe above, and this setup's own for it to build on. The base is passed only
     # when the document set a filter: the class accepts it unused, but a keyword the document
     # never asked for is a third place a default could hide (see the module docstring).

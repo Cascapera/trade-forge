@@ -403,6 +403,13 @@
           "default": null,
           "title": "Max Bos"
         },
+        "min_bars_to_touch": {
+          "default": 7,
+          "maximum": 500,
+          "minimum": 1,
+          "title": "Min Bars To Touch",
+          "type": "integer"
+        },
         "side": {
           "$ref": "#/$defs/TradeSide",
           "default": "both"
@@ -1419,6 +1426,13 @@
         "htf_regions": {
           "$ref": "#/$defs/HtfRegions",
           "default": "any"
+        },
+        "min_bars_to_touch": {
+          "default": 7,
+          "maximum": 500,
+          "minimum": 1,
+          "title": "Min Bars To Touch",
+          "type": "integer"
         },
         "side": {
           "$ref": "#/$defs/TradeSide",

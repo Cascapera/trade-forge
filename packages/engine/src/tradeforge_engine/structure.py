@@ -1073,6 +1073,15 @@ class TrackedZone:
     hundreds of bars past the touch that actually killed it.
     """
 
+    gap_index: int | None = None
+    """The detector's count of the bar that confirmed the region's gap — its third candle
+    (`OrderBlockDetector.bar_index`). `None` on a zone built by hand. What his minimum age is
+    counted from (`StructureStrategy`, `min_bars_to_touch`, 29/09)."""
+
+    touched_index: int | None = None
+    """The detector's count of the bar that first touched the entry edge — the bar `mitigated_at`
+    names, as a count rather than a time, so an age can be read off it without the calendar."""
+
     @property
     def usable(self) -> bool:
         """Whether the region still stands — nothing has come back to take it."""
@@ -1213,6 +1222,12 @@ class OrderBlockDetector:
         """Every region offered so far, oldest first, each with whether price has taken it."""
         return self._view
 
+    @property
+    def bar_index(self) -> int:
+        """How many bars this detector has read, less one — the count of the last bar folded in.
+        What `TrackedZone.gap_index` and `touched_index` are counted on; `-1` before any bar."""
+        return self._index
+
     def update(self, candle: Candle, break_: StructureBreak | None) -> tuple[OrderBlock, ...]:
         """Fold in one closed candle and the break it confirmed (if any); return the zones offered.
 
@@ -1226,7 +1241,7 @@ class OrderBlockDetector:
         # of the region on that bar, so the first touch can only come later.
         taken = False
         for tracked in self._live:
-            self._advance(tracked, candle)
+            self._advance(tracked, candle, self._index)
             taken = taken or tracked.mitigated
         if taken:
             self._live = [tracked for tracked in self._live if not tracked.mitigated]
@@ -1262,7 +1277,10 @@ class OrderBlockDetector:
             self._zone(region, break_, primary=position == 0)
             for position, region in enumerate(in_leg)
         )
-        fresh = [TrackedZone(block=block) for block in marked]
+        fresh = [
+            TrackedZone(block=block, gap_index=region.index)
+            for block, region in zip(marked, in_leg, strict=True)
+        ]
         self._zones.extend(fresh)
         self._live.extend(fresh)
         if len(self._zones) > self._MAX_ZONES:
@@ -1276,7 +1294,7 @@ class OrderBlockDetector:
         return marked
 
     @staticmethod
-    def _advance(tracked: TrackedZone, candle: Candle) -> None:
+    def _advance(tracked: TrackedZone, candle: Candle, index: int) -> None:
         """Fold one candle into an offered region: the first touch of its entry edge takes it.
 
         The whole rule, and permanent once set. What was here before — a flip mark, a departure
@@ -1292,6 +1310,7 @@ class OrderBlockDetector:
         # is true would keep overwriting it with every later visit — see `TrackedZone`.
         if reached and not tracked.mitigated:
             tracked.mitigated_at = candle.time
+            tracked.touched_index = index
         tracked.mitigated = tracked.mitigated or reached
 
     @staticmethod

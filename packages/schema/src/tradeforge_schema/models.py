@@ -905,6 +905,10 @@ class StructureParams(_Node):
     htf_offset: Annotated[float | None, Field(ge=-14, le=14)] = None
     htf_regions: HtfRegions = "any"
     htf_allow_secondary: bool = True
+    min_bars_to_touch: Annotated[int, Field(ge=1, le=500)] = 7
+    """How many bars a region must stand before it may be traded, the bar that confirmed its gap
+    counting as the first (his rule of 29/09, against micro breakouts): the order may be put at the
+    close of that bar, and a touch on it or before cancels the trade. `1` switches it off."""
 
 
 class StructureChochSetup(_Node):

@@ -62,7 +62,7 @@ class _Queue:
 
 def _walk(seed: int) -> list[Candle]:
     """Hourly bars that wander and trend, with an impulse now and then — the gaps his regions
-    need. The engine's own walk (`test_market_reading._walk`), bar for bar, so seed 0 trades."""
+    need. The engine's own walk (`test_market_reading._walk`), bar for bar, so seed 4 trades."""
     rng = random.Random(seed)  # noqa: S311 — a reproducible walk, not a secret
     price = Decimal("1.10000")
     drift = Decimal(rng.randint(-3, 3)) / 100_000
@@ -120,7 +120,7 @@ def client(
             )
         )
         seeding.commit()
-    collected(tmp_path, "EURUSD", "H1", _walk(0))
+    collected(tmp_path, "EURUSD", "H1", _walk(4))
     app = create_app(
         settings=settings.model_copy(update={"parquet_root": tmp_path, "tradeforge_workers": 1}),
         session_factory=session_factory,
@@ -144,6 +144,9 @@ def _entry(client: Any) -> str:
                 "entry_point": "edge",
                 "side": "both",
                 "breakeven_at_r": 2.0,
+                # The age rule off (29/09): the walk is short, and these tests are about batching
+                # and copying — they need it to trade, not to wait seven bars.
+                "min_bars_to_touch": 1,
             },
         },
         "exit": {"take_profit": {"type": "risk_multiple", "params": {"rr": 2}}},
@@ -386,7 +389,7 @@ def test_a_launch_with_batching_switched_off_queues_every_run_alone(
             )
         )
         seeding.commit()
-    collected(tmp_path, "EURUSD", "H1", _walk(0))
+    collected(tmp_path, "EURUSD", "H1", _walk(4))
     app = create_app(
         settings=settings.model_copy(
             update={"parquet_root": tmp_path, "tradeforge_workers": 1, "tradeforge_batch": False}
@@ -637,7 +640,7 @@ class TestTheSameMeasurementIsCopied:
     ) -> None:
         """The engine-guardian's case (28/09): the same window asked over data collected again.
         A gap in the middle, filled later, keeps the first and last bar — only the count moves."""
-        walk = _walk(0)
+        walk = _walk(4)
         write_candles(tmp_path, "EURUSD", "H1", walk[:600] + walk[700:])
         entry = _entry(client)
         first = _launch(client, entry)

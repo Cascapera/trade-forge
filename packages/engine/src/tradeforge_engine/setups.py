@@ -300,6 +300,10 @@ class SetupQualifier(Protocol):
     Qualifiers are stateful by design — continuation has to remember a change of character before
     the break that confirms it can qualify anything — so `qualify` is called on **every** bar,
     including bars that produced no break.
+
+    `None` is "nothing new to arm", **not** "withdraw": a qualifier names a zone once and the order
+    rests on. A qualifier that can also *end* an entry says so through an optional `supersedes`
+    property, read after `qualify` on the same bar — see `ChochQualifier.supersedes`.
     """
 
     def qualify(self, context: SetupContext) -> OrderBlock | None:
@@ -338,17 +342,30 @@ class ChochQualifier:
 
     def __init__(self) -> None:
         self._ladder: list[OrderBlock] = []
+        self._superseded = False
 
     @property
     def holds_rungs(self) -> bool:
         """Whether a rung is waiting — what a quiet bar asks (`StructureStrategy.quiet`)."""
         return bool(self._ladder)
 
+    @property
+    def supersedes(self) -> bool:
+        """Did this bar's break end every entry named before it — so the machinery withdraws the
+        order resting on one (his rule, 29/09)? Any break does, for this setup."""
+        return self._superseded
+
     def qualify(self, context: SetupContext) -> OrderBlock | None:
         """Name the ladder's current rung, advancing on the outcome the machinery reported."""
+        # ⚠️ **Emptying the ladder was never enough on its own** (29/09): a rung already armed kept
+        # its order resting after the ladder was gone, because `None` only means "nothing new".
+        # Any break ends the entries before it, so the machinery is told to withdraw.
+        self._superseded = context.break_ is not None
         # The outcome belongs to the regime that produced the trade, so it is settled before a
-        # new change of character replaces the ladder on this same bar.
-        if context.won is not None:
+        # new change of character replaces the ladder on this same bar. ⚠️ A win ends *its own*
+        # ladder only: a break heard while the trade was open (29/09) may already have put the next
+        # regime's zones here, and those are the next trades, not rungs behind the winner.
+        if context.won is not None and context.won in self._ladder:
             self._ladder = []
         elif context.stopped is not None and self._ladder and self._ladder[0] == context.stopped:
             self._ladder.pop(0)
@@ -418,6 +435,14 @@ class ContinuationQualifier:
     points: the reversal came back through the region the continuation was resting in, and the
     zones its own next BOS leaves are simply the next trades. The choch that turns the trend is not
     itself a continuation entry — its region is the choch setup's to trade, not this one's.
+
+    ⚠️ **Every BOS supersedes the ladder before it, whether or not it may be traded** (his rule,
+    29/09): *"a partir do momento que faz um novo bos, o bos anterior, a escada anterior já fica
+    invalidada, não tem mais entrada"*. A BOS past the cap and a BOS that left no zone used to leave
+    the previous ladder resting: with `max_bos=2`, the third BOS was ignored and the second's
+    secondary filled hours later, below a structure that had already moved on (AUDUSD H1,
+    05/01/2024). They still do not count toward the cap and open no trade — they only end the old
+    one.
     """
 
     def __init__(self, *, max_bos: int | None = None) -> None:
@@ -428,18 +453,29 @@ class ContinuationQualifier:
         # Breaks armed since the last change of character; `None` until the first choch is seen,
         # which is the "not eligible yet" state — a bootstrap BOS has no reversal behind it.
         self._since_choch: int | None = None
+        self._superseded = False
 
     @property
     def holds_rungs(self) -> bool:
         """Whether a rung is waiting — what a quiet bar asks (`StructureStrategy.quiet`)."""
         return bool(self._ladder)
 
+    @property
+    def supersedes(self) -> bool:
+        """Did this bar's break end every entry named before it — so the machinery withdraws the
+        order resting on one (his rule, 29/09)? Any break does, for this setup."""
+        return self._superseded
+
     def qualify(self, context: SetupContext) -> OrderBlock | None:
         """Name the ladder's current rung, arming on a favourable break once a choch has opened
         the trend and the cap still allows it."""
+        # A choch turns the trend and a BOS moves it on: either ends the entries named before it,
+        # and the order resting on one is withdrawn (his rule, 29/09; see `ChochQualifier`).
+        self._superseded = context.break_ is not None
         # The outcome belongs to the regime that produced the trade, settled before a new break
-        # touches the ladder on this same bar (see `ChochQualifier.qualify`).
-        if context.won is not None:
+        # touches the ladder on this same bar (see `ChochQualifier.qualify`) — and a win ends only
+        # its own ladder, not the one a break heard during the trade put in its place.
+        if context.won is not None and context.won in self._ladder:
             self._ladder = []
         elif context.stopped is not None and self._ladder and self._ladder[0] == context.stopped:
             self._ladder.pop(0)
@@ -458,14 +494,18 @@ class ContinuationQualifier:
             # ever added, the safe default is for continuation to ignore it rather than silently
             # treat it as a favourable break. No test can kill removing it while two kinds exist.
             and break_.kind is StructureKind.BOS
-            and self._since_choch is not None
-            and context.marked
-            and (self._max_bos is None or self._since_choch < self._max_bos)
         ):
-            # A favourable break that leaves zones, within the cap: it counts, and its leg's zones
-            # become the new ladder — nearest zone first, the leg's origin last.
-            self._since_choch += 1
-            self._ladder = list(reversed(context.marked))
+            # Any BOS ends the ladder before it (his rule, 29/09) — past the cap, zoneless, or
+            # before any choch alike. Only one that leaves zones, after a choch and within the cap,
+            # counts and opens the next ladder: nearest zone first, the leg's origin last.
+            self._ladder = []
+            if (
+                self._since_choch is not None
+                and context.marked
+                and (self._max_bos is None or self._since_choch < self._max_bos)
+            ):
+                self._since_choch += 1
+                self._ladder = list(reversed(context.marked))
 
         while self._ladder:
             rung = self._ladder[0]
@@ -929,6 +969,13 @@ class BotinhaActivation:
         """
         return self.spent(block)
 
+
+DEFAULT_MIN_BARS_TO_TOUCH = 7
+"""How many bars a structure region must stand before it may be traded, counting the bar that
+confirmed its gap (the gap's third candle) as the first — his rule of 29/09, against micro
+breakouts: *"o movimento entre o gap formar, romper e voltar para testar tem que ter no mínimo 7
+barras"*. The order may be put at the close of the seventh bar; a touch on it or before cancels the
+trade. `1` switches the rule off: the gap's own bar is then the whole wait."""
 
 DEFAULT_BARS_TO_BREAK = 2
 """How many bars the order has to be taken, counted from the bar after the trigger.
@@ -2135,6 +2182,7 @@ class StructureStrategy:
         htf_offset: dt.timedelta | None = None,
         htf_regions: RegionChoice = RegionChoice.ANY,
         htf_allow_secondary: bool = True,
+        min_bars_to_touch: int = DEFAULT_MIN_BARS_TO_TOUCH,
         timeframe: dt.timedelta | None = None,
         side: Side | None = None,
         reading: MarketReading | None = None,
@@ -2143,6 +2191,11 @@ class StructureStrategy:
             raise ValueError(f"stop buffer is a fraction of the zone width, got {stop_buffer}")
         if breakeven_at_r is not None and breakeven_at_r <= ZERO:
             raise ValueError(f"breakeven R multiple must be positive, got {breakeven_at_r}")
+        if min_bars_to_touch < 1:
+            raise ValueError(
+                f"a region stands at least the bar that confirmed its gap, got {min_bars_to_touch}"
+            )
+        self._min_bars_to_touch = min_bars_to_touch
         # The filter's own bars are assembled from this setup's, so it has to know how long one
         # of its own lasts. `timeframe` alone is accepted and unused — a document always carries
         # one — but a higher timeframe without it has nothing to build on, and refusing here is
@@ -2378,7 +2431,7 @@ class StructureStrategy:
             # that end the trade — the strategy never closes one — but the stop is the strategy's
             # to move, and the break of structure that moves it arrives on exactly the bars this
             # branch used to return empty from.
-            self._armed = None
+            self._hear_break(candle, break_, marked)
             conducted = self._conduct(position, context, break_)
             return () if conducted is None else (conducted,)
 
@@ -2430,6 +2483,7 @@ class StructureStrategy:
                 won=won,
             )
         )
+        signals.extend(self._release_superseded(candle))
         if chosen is not None and self._may_arm(chosen):
             if self._armed is not None:
                 signals.extend(self._release(self._armed, candle))
@@ -2866,6 +2920,8 @@ class StructureStrategy:
 
         if self._activation.spent(block):
             return False
+        if not self._old_enough(block):
+            return False
         # ⚠️ **Whether the touch retires the region is the activation's answer, not this
         # method's.** For the three that wait *on* the region it is: the wick that mitigates a
         # zone is the event their order was placed for. For a formation it is the opposite —
@@ -2880,6 +2936,73 @@ class StructureStrategy:
     # ----------------------------------------------------------------------- #
     # Order lifetime                                                           #
     # ----------------------------------------------------------------------- #
+
+    def _hear_break(
+        self, candle: Candle, break_: StructureBreak | None, marked: tuple[OrderBlock, ...]
+    ) -> None:
+        """Tell the qualifier about a break that confirmed while this phase's position was open.
+
+        ⚠️ **The engine-guardian's blocker (29/09).** The position branch returned before `qualify`,
+        so a break during a trade never reached the ladder: a choch short stopped at breakeven
+        after a BOS stepped down to the choch's origin, and a BOS during a continuation trade was
+        neither a new ladder nor a count toward `max_bos`. His rule does not wait for the trade to
+        end — *"a partir do momento que faz um novo bos, a escada anterior já fica invalidada"*.
+
+        Only for a qualifier that can end entries (`supersedes`): one without it names a zone once
+        and keeps state that a bar it never used to see would change. What it would arm is thrown
+        away — nothing is armed while a position is open, which is why the armed zone is dropped
+        here first: any name still armed never reached the book (`_observe_fill` forgot a placed
+        one), and holding it would leave it going stale behind a position it knows nothing about.
+        """
+        self._armed = None
+        if break_ is None or getattr(self._qualifier, "supersedes", None) is None:
+            return
+        self._qualifier.qualify(
+            SetupContext(
+                candle=candle,
+                break_=break_,
+                marked=tuple(block for block in marked if block.primary or self._allow_secondary),
+                zones=self._blocks.zones,
+            )
+        )
+
+    def _release_superseded(self, candle: Candle) -> tuple[Signal, ...]:
+        """Withdraw the armed order when this bar's break ended the entries named before it.
+
+        ⚠️ **His rule, 29/09, and it is the qualifier's to say** (`supersedes`): a qualifier's
+        `None` means "nothing new", so emptying a ladder never took the order already resting on
+        one of its rungs. With `max_bos=2` the third BOS emptied the ladder, the second's
+        secondary kept resting, and it filled nine bars later under a structure that had moved on
+        (AUDUSD H1, 05/01/2024). A qualifier without the property never withdraws this way.
+        """
+        if self._armed is None or not getattr(self._qualifier, "supersedes", False):
+            return ()
+        released = tuple(self._release(self._armed, candle))
+        self._armed = None
+        return released
+
+    def _old_enough(self, block: OrderBlock) -> bool:
+        """Has this region stood `min_bars_to_touch` bars, untouched — his rule against micro
+        breakouts (29/09)?
+
+        Counted on the detector's own bars (`OrderBlockDetector.bar_index`), never here: a batch
+        skips the bars it calls quiet, and a count kept by the strategy would then differ between a
+        run on its own and the same run in a batch. The gap's third candle is bar one; the order
+        may be put at the close of bar `min_bars_to_touch`, and a first touch on that bar or
+        before cancels the trade — for every activation alike, the formations included, since the
+        rule is about how far the move went before it came back, not about how the entry is made.
+
+        A zone the detector no longer holds, or one built by hand with no gap on record, is left to
+        the other refusals.
+        """
+        held = holding(self._blocks.zones, block)
+        if not held or held[0].gap_index is None:
+            return True
+        last_early = held[0].gap_index + self._min_bars_to_touch - 1
+        touched = held[0].touched_index
+        if touched is not None and touched <= last_early:
+            return False
+        return self._blocks.bar_index >= last_early
 
     def _still_standing(self, block: OrderBlock) -> bool:
         """May a *new* order be put on this zone — is it still held, and still unmitigated?

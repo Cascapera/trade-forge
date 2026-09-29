@@ -22,7 +22,7 @@ from tradeforge_engine.reading import MarketReading
 from tradeforge_engine.risk import PercentRiskManager
 from tradeforge_engine.setup_factory import _structure_kwargs
 from tradeforge_engine.setups import ChochQualifier, ContinuationQualifier, StructureStrategy
-from tradeforge_engine.testing import EURUSD, HOUR, START
+from tradeforge_engine.testing import EURUSD, HOUR, START, ageless_structure
 
 H4 = 4 * HOUR
 
@@ -79,10 +79,10 @@ def _setup(point: dict[str, Any], *, htf: bool, reading: MarketReading | None) -
     }
     kwargs = _structure_kwargs(params, HOUR)
     if point["max_bos"] is None:
-        return StructureStrategy(
+        return ageless_structure(
             qualifier=ChochQualifier(), name="choch", reading=reading, **kwargs
         )
-    return StructureStrategy(
+    return ageless_structure(
         qualifier=ContinuationQualifier(max_bos=point["max_bos"]),
         name="continuation",
         reading=reading,
@@ -113,8 +113,9 @@ class _Feed:
 
 
 # Seeds whose walk trades under each: a filter above lets through only a few of a walk's entries,
-# so its seeds are the ones that trade at all (measured on 27/09 — 4 to 16 trades each).
-_CASES = [(seed, True) for seed in (0, 4, 5, 10, 11)] + [(seed, False) for seed in range(6)]
+# so its seeds are the ones that trade at all (measured again on 29/09 — 2 to 8 trades each, since a
+# break takes the resting order with it; 0 and 10 no longer trade under a filter).
+_CASES = [(seed, True) for seed in (4, 5, 9, 11, 22)] + [(seed, False) for seed in range(6)]
 
 
 @pytest.mark.parametrize(("seed", "htf"), _CASES)

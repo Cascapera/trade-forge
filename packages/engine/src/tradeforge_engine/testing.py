@@ -14,6 +14,7 @@ import datetime as dt
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
+from typing import Any
 
 from tradeforge_engine.domain import (
     ZERO,
@@ -35,6 +36,7 @@ from tradeforge_engine.domain import (
     Volume,
 )
 from tradeforge_engine.portfolio import Portfolio
+from tradeforge_engine.setups import StructureStrategy
 
 EURUSD = InstrumentSpec(
     symbol="EURUSD",
@@ -650,3 +652,15 @@ def arms_a_resting_limit() -> list[Candle]:
     a fixture two suites can hand each other in a state neither wrote.
     """
     return list(ARMS_A_RESTING_LIMIT)
+
+
+def ageless_structure(**kwargs: Any) -> StructureStrategy:  # noqa: ANN401 — the constructor's own
+    """A structure strategy with his minimum age of a region switched off (`min_bars_to_touch=1`).
+
+    ⚠️ **For tests about the other rules, and only those.** The goldens these tests replay were
+    built to reach a region within a handful of bars — the shortest stream that shows a hammer, a
+    gift or a ladder — which is exactly the micro breakout his rule of 29/09 refuses. Replayed
+    with the default of seven, the region is touched before it may be traded and every one of them
+    tests nothing. The age rule has tests of its own, which build a strategy with its default.
+    """
+    return StructureStrategy(**{"min_bars_to_touch": 1, **kwargs})

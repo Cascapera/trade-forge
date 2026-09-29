@@ -200,6 +200,8 @@ _PROBES: dict[str, dict[str, tuple[Any, Any]]] = {
         # beside them — without one the factory reads neither.
         "htf_regions": ("with_trend", RegionChoice.WITH_TREND),
         "htf_allow_secondary": (False, False),
+        # His minimum age of a region (29/09), probed off its default of 7.
+        "min_bars_to_touch": (3, 3),
     },
     "structure_continuation": {
         "allow_secondary": (True, True),
@@ -215,6 +217,8 @@ _PROBES: dict[str, dict[str, tuple[Any, Any]]] = {
         "side": ("short", Side.SHORT),
         "htf_regions": ("with_trend", RegionChoice.WITH_TREND),
         "htf_allow_secondary": (False, False),
+        # His minimum age of a region (29/09), probed off its default of 7.
+        "min_bars_to_touch": (3, 3),
     },
 }
 

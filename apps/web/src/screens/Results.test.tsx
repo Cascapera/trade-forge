@@ -11,6 +11,8 @@ vi.mock('../api/hooks', () => ({
   useOverlays: vi.fn(),
   useTradeSnapshot: vi.fn(),
   useRerunBacktest: vi.fn(),
+  // The strategy block at the top has its own test (`RunStrategy.test.tsx`); here it waits.
+  useStrategy: () => ({ data: undefined }),
 }))
 
 const navigate = vi.fn()

@@ -458,6 +458,20 @@ class TargetRungOut(BaseModel):
     best_net_r: Money | None
 
 
+class BacktestPointOut(BaseModel):
+    """Where a sweep's run sits on its grid (29/09): what the result page says it optimised.
+
+    `values` are the point's own coordinates as the sweep wrote them (`sweep_points`), keyed by
+    dotted path — `{"setup.params.period": 21}` — so the page can tell a parameter the sweep
+    varied from one the document fixed. `entry_name` is the catalogue label, read live, and null
+    once the entry has been taken off the shelf."""
+
+    entry_id: str
+    entry_name: str | None
+    label: str
+    values: dict[str, Any]
+
+
 class BacktestOut(_Out):
     """A run: its request, what it actually read, its lifecycle status, and its metrics.
 
@@ -490,6 +504,8 @@ class BacktestOut(_Out):
     first_candle: dt.datetime | None = None
     last_candle: dt.datetime | None = None
     metrics: MetricsOut | None = None
+    point: BacktestPointOut | None = None
+    """The sweep point this run measured — null for a run launched on its own (29/09)."""
     targets: dict[str, TargetOutcomeOut | None] | None = None
     """What the run's trades would have made at each rung of the target ladder, keyed by the
     target in R (`"2"`). `None` for a run recorded before the ladder existed; a rung is `None` when

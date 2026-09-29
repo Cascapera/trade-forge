@@ -15,6 +15,7 @@ import { count } from '../format'
 import { EquityCurve } from '../components/EquityCurve'
 import { MetricCards } from '../components/MetricCards'
 import { PriceChart } from '../components/PriceChart'
+import { RunStrategy } from '../components/RunStrategy'
 import { RunTargets } from '../components/TargetLadder'
 import { TradesTable } from '../components/TradesTable'
 
@@ -108,6 +109,8 @@ export function Results(): React.JSX.Element {
         <h2 className="text-xl font-semibold">Backtest results</h2>
         <StatusBadge status={run.status} />
       </div>
+
+      <RunStrategy strategyId={run.strategy_id} point={run.point} />
 
       {coverage !== null && (
         <p

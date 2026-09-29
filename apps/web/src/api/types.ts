@@ -96,6 +96,15 @@ export interface TargetRung {
   best_net_r: string | null
 }
 
+/** Where a sweep's run sits on its grid (29/09): the catalogue entry it came from (read live;
+ *  null once taken off the shelf), the point's label and its coordinates by dotted path. */
+export interface BacktestPoint {
+  entry_id: string
+  entry_name: string | null
+  label: string
+  values: Record<string, unknown>
+}
+
 export interface Backtest {
   id: string
   strategy_id: string
@@ -110,6 +119,8 @@ export interface Backtest {
   recorded: Recorded
   /** The finished run this one is a copy of: the same measurement under the same engine, taken
    *  instead of run again (28/09). Null for a run that ran; absent from older fixtures. */
+  /** The sweep point this run measured; null or absent for a run launched on its own. */
+  point?: BacktestPoint | null
   reused_from?: string | null
   created_at: string
   started_at: string | null

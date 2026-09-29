@@ -704,6 +704,17 @@ class EquityPointOut(_Out):
     equity: Money
 
 
+class YearCutOut(BaseModel):
+    """A run cut to a window of whole years in R, without running it again (`year_cut`): what a run
+    of `[first_year, last_year]` would have made, with its trades that entered and left inside."""
+
+    first_year: int
+    last_year: int
+    net_r: Money
+    yearly_r: dict[str, Money]
+    """R per year of entry, of the trades the cut closes: `{"2022": "3.25"}`."""
+
+
 class CandleOut(_Out):
     """One bar of the price chart. Prices are strings for the same reason `Money` is.
 

@@ -24,6 +24,7 @@ from typing import Any, NamedTuple
 from pydantic import ValidationError
 
 from tradeforge_api.warm_window import WarmUp, warm_start, warmup_for
+from tradeforge_api.year_cut import Sizing, sizing_of
 from tradeforge_collector import step
 from tradeforge_db.models import Backtest, Instrument
 from tradeforge_engine import (
@@ -331,7 +332,7 @@ def execute_backtest(  # noqa: PLR0913 — keyword-only; each names one axis of 
     slippage_ticks: Decimal,
     candles: Sequence[Candle],
     record_snapshots: bool = True,
-) -> tuple[list[ClosedTrade], EngineMetrics, CandleWindow]:
+) -> Measured:
     """Run the strategy over the windowed candles and fold the result into the §5 metrics.
 
     Returns the window it actually read along with the result, so the caller can record what
@@ -368,8 +369,14 @@ class BatchRun(NamedTuple):
     cost_model: Mapping[str, Any]
 
 
-Measured = tuple[list[ClosedTrade], EngineMetrics, CandleWindow]
-"""What `execute_backtest` returns, and what each run of `execute_batch` comes to."""
+class Measured(NamedTuple):
+    """What `execute_backtest` returns, and what each run of `execute_batch` comes to."""
+
+    trades: list[ClosedTrade]
+    metrics: EngineMetrics
+    window: CandleWindow
+    sizing: Sizing
+    """How the run sized its trades, year by year — what says whether it can be cut (`year_cut`)."""
 
 
 def execute_batch(  # noqa: PLR0913 — keyword-only; each names one axis the batch shares
@@ -488,7 +495,13 @@ def _measured(result: RunResult, initial_capital: Decimal, windowed: Sequence[Ca
         initial_capital=initial_capital,
     )
     window = CandleWindow(len(windowed), windowed[0].time, windowed[-1].time, result.warmed)
-    return list(result.trades), metrics, window
+    sizing = sizing_of(
+        trades=result.trades,
+        equity_curve=result.equity_curve,
+        refusals=result.refusals,
+        initial_capital=initial_capital,
+    )
+    return Measured(list(result.trades), metrics, window, sizing)
 
 
 __all__ = [

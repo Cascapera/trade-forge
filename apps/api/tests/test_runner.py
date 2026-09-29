@@ -14,6 +14,7 @@ import pytest
 
 from tradeforge_api.runner import (
     CandleWindow,
+    Measured,
     execute_backtest,
     instrument_spec,
     spec_document,
@@ -21,8 +22,7 @@ from tradeforge_api.runner import (
     swap_rates,
 )
 from tradeforge_db.models import Backtest, Instrument
-from tradeforge_engine import BacktestMetrics as EngineMetrics
-from tradeforge_engine.domain import AssetClass, Candle, ClosedTrade
+from tradeforge_engine.domain import AssetClass, Candle
 from tradeforge_engine.errors import EngineError
 from tradeforge_engine.testing import BULLISH_START_EMA3, bar
 
@@ -90,7 +90,7 @@ def ma_cross() -> dict[str, object]:
     }
 
 
-def run_it(**overrides: object) -> tuple[list[ClosedTrade], EngineMetrics, CandleWindow]:
+def run_it(**overrides: object) -> Measured:
     kwargs: dict[str, object] = {
         "definition": ma_cross(),
         "instrument": instrument_spec(an_instrument()),
@@ -107,7 +107,7 @@ def run_it(**overrides: object) -> tuple[list[ClosedTrade], EngineMetrics, Candl
 
 
 def test_a_crossover_series_produces_a_trade_and_coherent_metrics() -> None:
-    trades, metrics, _ = run_it()
+    trades, metrics, _, _ = run_it()
     assert metrics.total_trades == len(trades)
     assert metrics.total_trades >= 1
     # Reconciliation is the engine's own invariant; here we only assert the metrics summarise the
@@ -147,7 +147,7 @@ def test_a_window_full_of_candles_that_produces_no_trades_still_succeeds() -> No
     """
     flat = [bar(index, open_="1.10000", close="1.10000") for index in range(10)]
 
-    trades, metrics, window = run_it(candles=flat, date_to=START + 9 * HOUR)
+    trades, metrics, window, _ = run_it(candles=flat, date_to=START + 9 * HOUR)
 
     assert trades == []
     assert metrics.total_trades == 0
@@ -156,7 +156,7 @@ def test_a_window_full_of_candles_that_produces_no_trades_still_succeeds() -> No
 
 def test_the_run_reports_the_window_it_actually_read() -> None:
     """Asking for more than the dataset holds must not be recorded as if it had it."""
-    _, _, window = run_it(date_from=START - 50 * HOUR, date_to=START + 500 * HOUR)
+    _, _, window, _ = run_it(date_from=START - 50 * HOUR, date_to=START + 500 * HOUR)
 
     series = dip_then_rally()
     assert window == CandleWindow(len(series), series[0].time, series[-1].time)
@@ -165,8 +165,8 @@ def test_the_run_reports_the_window_it_actually_read() -> None:
 def test_a_spread_cost_model_eats_into_the_result() -> None:
     """The same run with a spread nets less than costless — proof the cost model is wired, not
     ignored."""
-    _, costless, _ = run_it(cost_model={"type": "none"})
-    _, spread, _ = run_it(cost_model={"type": "spread", "spread_points": 20})
+    _, costless, _, _ = run_it(cost_model={"type": "none"})
+    _, spread, _, _ = run_it(cost_model={"type": "spread", "spread_points": 20})
     assert spread.net_profit < costless.net_profit
 
 
@@ -174,9 +174,9 @@ def test_a_spread_and_commission_model_charges_exactly_both() -> None:
     """A raw-spread account pays the spread and a commission per lot (24/09). Charged together, each
     trade costs exactly what the spread alone and the commission alone cost it — so a model that
     read one figure for the other, 7 points of spread and $20 a lot, is caught (engine-guardian)."""
-    spread_trades, _, _ = run_it(cost_model={"type": "spread", "spread_points": 20})
-    commission_trades, _, _ = run_it(cost_model={"type": "commission", "commission_per_unit": 7})
-    both_trades, _, _ = run_it(
+    spread_trades, _, _, _ = run_it(cost_model={"type": "spread", "spread_points": 20})
+    commission_trades, _, _, _ = run_it(cost_model={"type": "commission", "commission_per_unit": 7})
+    both_trades, _, _, _ = run_it(
         cost_model={"type": "spread_commission", "spread_points": 20, "commission_per_unit": 7}
     )
 
@@ -302,7 +302,7 @@ def test_a_setup_document_reproduces_the_engine_s_own_golden() -> None:
     conducted stop, above the entry price, which is what a stop-out looks like once the trade has
     been managed. A reader who maps "sl" to "loss" will misread this setup's best trades.
     """
-    trades, metrics, _ = run_it(
+    trades, metrics, _, _ = run_it(
         definition=ponto_continuo(),
         instrument=instrument_spec(a_stock()),
         candles=pullback_to_the_average(),
@@ -329,7 +329,7 @@ def test_a_setup_document_needs_no_indicators_entry_or_stop_block() -> None:
     assert "entry" not in document
     assert "stop_loss" not in document["exit"]  # type: ignore[operator]
 
-    trades, _, _ = run_it(
+    trades, _, _, _ = run_it(
         definition=document,
         instrument=instrument_spec(a_stock()),
         candles=pullback_to_the_average(),
@@ -341,13 +341,13 @@ def test_a_setup_document_needs_no_indicators_entry_or_stop_block() -> None:
 def test_switching_the_breakeven_rule_off_reaches_the_setup() -> None:
     """A parameter that travels from JSON through the factory into the state machine, proved by
     the trade it changes rather than by reading an attribute back."""
-    with_rule, _, _ = run_it(
+    with_rule, _, _, _ = run_it(
         definition=ponto_continuo(),
         instrument=instrument_spec(a_stock()),
         candles=pullback_to_the_average(),
         date_from=_GOLDEN_FROM,
     )
-    without_rule, _, _ = run_it(
+    without_rule, _, _, _ = run_it(
         definition=ponto_continuo(breakeven_at_r=None),
         instrument=instrument_spec(a_stock()),
         candles=pullback_to_the_average(),
@@ -389,8 +389,8 @@ def test_a_swap_beside_the_costs_lands_on_every_trade_it_held_overnight() -> Non
         for index in range(len(levels) - 1)
     ]
     window = {"candles": slow, "date_from": START, "date_to": START + 200 * HOUR}
-    plain, without, _ = run_it(cost_model={"type": "spread", "spread_points": 20}, **window)
-    trades, with_swap, _ = run_it(
+    plain, without, _, _ = run_it(cost_model={"type": "spread", "spread_points": 20}, **window)
+    trades, with_swap, _, _ = run_it(
         cost_model={
             "type": "spread",
             "spread_points": 20,

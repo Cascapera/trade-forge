@@ -13,7 +13,7 @@ from decimal import Decimal, localcontext
 from typing import Annotated, Any
 
 from fastapi import APIRouter, HTTPException, Query, status
-from sqlalchemy import ColumnElement, func, select
+from sqlalchemy import ColumnElement, String, cast, func, select
 from sqlalchemy.orm import Session, defer, selectinload
 
 from tradeforge_api.config import Settings
@@ -25,6 +25,7 @@ from tradeforge_api.runner import ENGINE_VERSION, spec_for
 from tradeforge_api.schemas import (
     BacktestListItem,
     BacktestOut,
+    BacktestPointOut,
     BacktestsPage,
     CandleOut,
     CandlesOut,
@@ -52,9 +53,11 @@ from tradeforge_db.models import (
     BacktestCollection,
     BacktestMetrics,
     BacktestStatus,
+    CatalogEntry,
     Collection,
     Instrument,
     Strategy,
+    SweepPoint,
     Trade,
 )
 from tradeforge_engine.domain import AccountState, Candle, Context
@@ -511,9 +514,38 @@ def list_backtests(  # noqa: PLR0913 — one filter per column a run is chosen b
 
 
 @router.get("/backtests/{backtest_id}", response_model=BacktestOut, responses=_NOT_FOUND)
-def get_backtest(backtest_id: uuid.UUID, session: SessionDep) -> Backtest:
-    """The run and, once it has finished, its metrics."""
-    return _load(session, backtest_id)
+def get_backtest(backtest_id: uuid.UUID, session: SessionDep) -> BacktestOut:
+    """The run and, once it has finished, its metrics — and, for a sweep's run, the point of the
+    grid it measured, so the result page can say what was optimised (29/09)."""
+    backtest = _load(session, backtest_id)
+    out = BacktestOut.model_validate(backtest)
+    if backtest.sweep_id is None:
+        return out
+    # One point per (sweep, strategy): a point's document is its own strategy row. Indexed by
+    # exactly that pair (`ix_sweep_points_sweep_id_strategy_id`).
+    row = session.execute(
+        select(SweepPoint, CatalogEntry.name)
+        .outerjoin(CatalogEntry, cast(CatalogEntry.id, String) == SweepPoint.entry_id)
+        .where(
+            SweepPoint.sweep_id == backtest.sweep_id,
+            SweepPoint.strategy_id == backtest.strategy_id,
+        )
+        .order_by(SweepPoint.position)
+        .limit(1)
+    ).first()
+    if row is None:
+        return out
+    point, entry_name = row
+    return out.model_copy(
+        update={
+            "point": BacktestPointOut(
+                entry_id=point.entry_id,
+                entry_name=entry_name,
+                label=point.label,
+                values=dict(point.coordinates),
+            )
+        }
+    )
 
 
 @router.get("/backtests/{backtest_id}/trades", response_model=TradesPage, responses=_NOT_FOUND)

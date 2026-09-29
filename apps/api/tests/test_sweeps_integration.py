@@ -3626,3 +3626,46 @@ class TestEachMarketPaysItsOwnCosts:
 
         assert refused.status_code == 422
         assert "cost model cannot be charged" in refused.json()["detail"]
+
+
+class TestAResultSaysWhatItOptimised:
+    """29/09, his ask: the top of a run's result names the strategy and the parameters its point
+    of the grid set — the page reads them from the run itself."""
+
+    def test_a_sweep_s_run_carries_its_point_and_the_entry_it_came_from(self, client: Any) -> None:
+        name = f"optimised {uuid.uuid4()}"
+        entry = an_entry(client, name=name, grid={"setup.params.period": [5, 9]})
+        launched = client.post("/sweeps", json=a_sweep_body([entry], ["EURUSD"], ["H1"]))
+        assert launched.status_code == 202, launched.text
+
+        rows = client.get(f"/sweeps/{launched.json()['id']}").json()["runs"]
+        points = {
+            row["values"]["setup.params.period"]: client.get(
+                f"/backtests/{row['run']['id']}"
+            ).json()
+            for row in rows
+        }
+
+        assert sorted(points) == [5, 9]
+        for period, run in points.items():
+            assert run["point"]["entry_id"] == entry
+            assert run["point"]["entry_name"] == name
+            # The chart is a coordinate of the point too: a sweep writes it beside the axes.
+            assert run["point"]["values"] == {"timeframe": "H1", "setup.params.period": period}
+
+    def test_the_entry_s_name_is_read_live_and_a_removed_entry_leaves_the_values(
+        self, client: Any
+    ) -> None:
+        entry = an_entry(client, name=f"before {uuid.uuid4()}", grid={"setup.params.period": [5]})
+        launched = client.post("/sweeps", json=a_sweep_body([entry], ["EURUSD"], ["H1"])).json()
+        (row,) = client.get(f"/sweeps/{launched['id']}").json()["runs"]
+        renamed = f"after {uuid.uuid4()}"
+
+        client.patch(f"/catalog/{entry}", json={"name": renamed})
+        live = client.get(f"/backtests/{row['run']['id']}").json()["point"]
+        client.delete(f"/catalog/{entry}")
+        gone = client.get(f"/backtests/{row['run']['id']}").json()["point"]
+
+        assert live["entry_name"] == renamed
+        assert gone["entry_name"] is None
+        assert gone["values"] == {"timeframe": "H1", "setup.params.period": 5}

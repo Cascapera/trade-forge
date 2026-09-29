@@ -1796,6 +1796,25 @@ class CreateCatalogEntry(BaseModel):
     one is how many axes it has."""
 
 
+class UpdateCatalogEntry(BaseModel):
+    """Change what a shelf entry says, in place — its label, its description, its grid (29/09).
+
+    Only what is sent changes. `description: null` clears it; `name` and `grid` cannot be null.
+    **The strategy is not here, and that is his choice**: which document an entry points at is
+    changed by saving a new version in the builder, not by editing the label.
+
+    ⚠️ **A grid edited is a different question from then on**, never a rewrite of the past: every
+    sweep already launched keeps the points it expanded (`sweep_points`) and the grids it expanded
+    (`Sweep.entry_grids`), so it reads as it ran, and `combine` refuses to join it with one
+    launched after the edit."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: StorableText | None = Field(default=None, min_length=1, max_length=120)
+    description: StorableText | None = Field(default=None, max_length=2000)
+    grid: dict[str, list[Any]] | None = None
+
+
 class CatalogEntryOut(BaseModel):
     """One shelf entry, with enough of its strategy to be chosen without opening it."""
 

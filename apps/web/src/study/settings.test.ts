@@ -4,9 +4,11 @@ import { ApiError } from '../api/client'
 
 import {
   OFF,
+  axesFrom,
   axesOf,
   combinationCount,
   emptyStudyForm,
+  gridOf,
   launchFailure,
   parseValues,
   studyLabel,
@@ -233,5 +235,29 @@ describe('launchFailure', () => {
 
   it('says something usable even for a shape it does not recognise', () => {
     expect(launchFailure({ weird: true })).toMatch(/Check the parameters/)
+  })
+})
+
+describe('axesFrom', () => {
+  it('writes a saved grid back as the lines it was typed from, and gridOf reads it back', () => {
+    const grid = {
+      'setup.params.period': [5, 9, 20],
+      'setup.params.htf': [null, 'H4'],
+      'setup.params.htf_allow_secondary': [true, false],
+      'setup.params.stop_buffer': [0.1, 0.25],
+    }
+    const axes = axesFrom(grid)
+
+    expect(axes).toEqual([
+      { path: 'setup.params.period', raw: '5, 9, 20' },
+      { path: 'setup.params.htf', raw: `${OFF}, H4` },
+      { path: 'setup.params.htf_allow_secondary', raw: 'true, false' },
+      { path: 'setup.params.stop_buffer', raw: '0.1, 0.25' },
+    ])
+    expect(gridOf(axes)).toEqual(grid)
+  })
+
+  it('gives an entry with nothing to vary the one blank row a new form starts from', () => {
+    expect(axesFrom({})).toEqual([{ path: '', raw: '' }])
   })
 })

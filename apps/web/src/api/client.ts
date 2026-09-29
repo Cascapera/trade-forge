@@ -15,6 +15,7 @@ import type {
   CreateBacktestRequest,
   CreateBasketRequest,
   CreateCatalogEntry,
+  UpdateCatalogEntry,
   CreateCollection,
   CreateStudyRequest,
   ClusterListItem,
@@ -178,6 +179,9 @@ export const api = {
   // 204, so nothing comes back. The caller refetches the list rather than patching it in place:
   // a shelf two tabs can write to is a shelf whose local copy is a guess.
   deleteCatalogEntry: (id: string): Promise<null> => request('DELETE', `/catalog/${id}`),
+  // Only the fields sent change; the server answers with the entry as it now stands.
+  updateCatalogEntry: (id: string, body: UpdateCatalogEntry): Promise<CatalogEntry> =>
+    request('PATCH', `/catalog/${id}`, body),
   createStrategy: (definition: unknown): Promise<StrategyOut> =>
     request('POST', '/strategies', definition),
   getStrategy: (id: string): Promise<StrategyOut> => request('GET', `/strategies/${id}`),

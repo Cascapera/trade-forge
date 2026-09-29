@@ -203,3 +203,20 @@ export function studyLabel(form: StudyForm): string {
 export function launchFailure(error: unknown): string {
   return apiFailure(error, 'The study was refused. Check the parameters and their values.')
 }
+
+/**
+ * A saved grid as the rows an editor shows — the inverse of `gridOf`, for editing an entry in
+ * place (29/09). Each value is written the way a line is typed (`textOf`, so `null` is `off`), and
+ * a grid with no axes is the one blank row a new form starts from.
+ *
+ * ⚠️ Inverse over what the DSL's axes hold — numbers, booleans, `null` and enum words. A string
+ * that looked like a number or held a comma would not come back as itself, and no parameter in
+ * the schema has such a value.
+ */
+export function axesFrom(grid: Record<string, readonly unknown[]>): Axis[] {
+  const axes = Object.entries(grid).map(([path, values]) => ({
+    path,
+    raw: values.map((value) => textOf(value as AxisValue)).join(', '),
+  }))
+  return axes.length > 0 ? axes : [{ path: '', raw: '' }]
+}

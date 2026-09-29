@@ -1829,6 +1829,14 @@ class Sweep(Base):
     sweep must go on being readable after somebody tidies the shelf. What the runs point at is
     the strategy document, which is immutable and cannot be deleted out from under them."""
 
+    entry_grids: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    """Each entry's grid as this sweep expanded it, keyed by entry id (rev_0040, 29/09).
+
+    An entry's grid can be edited in place since then, and the ids alone would let two sweeps of
+    one template — launched before and after an edit — be combined as one question over two
+    grids. Every view of a sweep reads its own points, never this; it is what `combine` compares.
+    Filled for the sweeps before it from the entries as they stood, which was exact."""
+
     symbols: Mapped[list[Any]] = mapped_column(JSONB, nullable=False)
     """The markets, by symbol. Text rather than instrument ids, for the same reason: the sweep
     records the question that was asked, and the runs record what it resolved to."""
@@ -1898,6 +1906,10 @@ class Sweep(Base):
         ),
         CheckConstraint(
             "summary IS NULL OR jsonb_typeof(summary) = 'object'", name="a_summary_is_an_object"
+        ),
+        CheckConstraint(
+            "entry_grids IS NULL OR jsonb_typeof(entry_grids) = 'object'",
+            name="entry_grids_are_an_object",
         ),
         CheckConstraint(
             "combines IS NULL OR jsonb_typeof(combines) = 'array'",

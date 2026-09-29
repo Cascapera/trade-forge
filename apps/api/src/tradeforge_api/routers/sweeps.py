@@ -24,6 +24,7 @@ did — which is why a hole is always written down, never merely left.
 import asyncio
 import datetime as dt
 import functools
+import json
 import secrets
 import threading
 import uuid
@@ -539,6 +540,9 @@ def launch_sweep(
 
     sweep = Sweep(
         entry_ids=[str(one) for one in request.entry_ids],
+        # The grids as expanded now: an entry's grid can be edited later (29/09), and `combine`
+        # compares these rather than the entries as they will stand.
+        entry_grids={str(entry.id): dict(entry.grid) for entry, _strategy in pairs},
         symbols=symbols,
         timeframes=timeframes,
         date_from=request.date_from,
@@ -1409,6 +1413,7 @@ def launch_window(
     empty = {(market.symbol, market.timeframe) for market in uncovered}
     sweep = Sweep(
         entry_ids=list(parent.entry_ids),
+        entry_grids=parent.entry_grids,
         symbols=list(parent.symbols),
         timeframes=charts,
         date_from=date_from,
@@ -1486,6 +1491,9 @@ def combine_sweeps(request: CombineSweeps, session: SessionDep) -> CreatedSweep:
     def question(sweep: Sweep) -> tuple[Any, ...]:
         return (
             tuple(sorted(sweep.entry_ids)),
+            # The grids each sweep expanded, not the entries as they stand now: an entry edited
+            # between two launches of one template asked two questions (29/09).
+            json.dumps(sweep.entry_grids, sort_keys=True),
             () if one_template else tuple(sorted(sweep.timeframes)),
             sweep.date_from,
             sweep.date_to,
@@ -1495,8 +1503,8 @@ def combine_sweeps(request: CombineSweeps, session: SessionDep) -> CreatedSweep:
     if len({question(one) for one in members}) != 1:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="these sweeps asked different questions — entries, charts, window or capital "
-            "differ; combine sweeps of one template",
+            detail="these sweeps asked different questions — entries, their grids, charts, "
+            "window or capital differ; combine sweeps of one template",
         )
     counted = {one.id: _count_runs(session, one) for one in members}
     still = [str(key) for key, one in counted.items() if one.queued + one.running > 0]
@@ -1511,6 +1519,7 @@ def combine_sweeps(request: CombineSweeps, session: SessionDep) -> CreatedSweep:
     templates = {one.template_id for one in members}
     combined = Sweep(
         entry_ids=list(first.entry_ids),
+        entry_grids=first.entry_grids,
         symbols=symbols,
         timeframes=list(dict.fromkeys(chart for one in members for chart in one.timeframes)),
         date_from=first.date_from,
@@ -1660,6 +1669,7 @@ def launch_holdout(
     tested = {str(run.strategy_id) for run, _symbol in runnable}
     holdout = Sweep(
         entry_ids=list(parent.entry_ids),
+        entry_grids=parent.entry_grids,
         symbols=symbols,
         timeframes=timeframes,
         date_from=request.date_from,

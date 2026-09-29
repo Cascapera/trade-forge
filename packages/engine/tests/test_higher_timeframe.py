@@ -1294,3 +1294,70 @@ def test_on_the_golden_stream_the_stricter_choices_release_what_the_default_does
     reference = gate.reference(_demand(_at(ARMS)))
     assert reference is not None
     assert reference == _fed(_through(TOUCH)).reference(_demand(_at(ARMS)))
+
+
+def test_each_break_above_replaces_the_last_leg_and_one_offering_nothing_empties_it() -> None:
+    """The engine-guardian's blocker (29/09): every test above saw one break, so a leg that
+    accumulated across breaks — an older region of the same side releasing again — or one kept
+    over a break that offered nothing would both have passed. His answer on the second: a break
+    with no region does **not** keep the leg before it, because by the time a region of that older
+    leg is reached the move that reaches it is already turning the trend.
+
+    Held over the random walks against a reference that reads the same bars with its own
+    detectors and replaces the leg on every break, bar by bar; and a gate choosing `WITH_TREND`
+    on the real tracker never releases from outside the leg as it stood when it released."""
+    empty_breaks = older_in_favour = released = 0
+    for seed in range(100):
+        rng = random.Random(seed)  # noqa: S311 — a reproducible walk, not a secret
+        tracker = RegionTracker(base=HOUR, target=3 * HOUR, offset=_UTC_BROKER)
+        gate = HigherTimeframeGate(
+            base=HOUR,
+            target=3 * HOUR,
+            offset=_UTC_BROKER,
+            regions=tracker,
+            choice=RegionChoice.WITH_TREND,
+        )
+        bars = BarAggregator(base=HOUR, target=3 * HOUR, offset=_UTC_BROKER)
+        structure = MarketStructure()
+        blocks = OrderBlockDetector()
+        trend: Trend | None = None
+        leg: frozenset[OrderBlock] = frozenset()
+        price, hour = 100, 0
+        for _ in range(600):
+            hour += rng.choice([1] * 8 + [2, 3, 4])
+            open_ = price
+            price = max(5, open_ + rng.randint(-3, 3))
+            candle = Candle(
+                time=START + hour * HOUR,
+                open=Decimal(open_),
+                high=Decimal(max(open_, price) + rng.randint(0, 2)),
+                low=Decimal(max(1, min(open_, price) - rng.randint(0, 2))),
+                close=Decimal(price),
+            )
+            for higher in bars.update(candle):
+                broke = structure.update(higher)
+                offered = blocks.update(higher, broke)
+                if broke is not None:
+                    trend, leg = broke.trend, frozenset(offered)
+                    empty_breaks += not offered
+            before = dict(gate._releases)
+            tracker.observe(candle)
+            gate.observe(candle)
+
+            assert tracker.trend == trend, (seed, hour)
+            for tracked in tracker.zones:
+                assert tracker.of_last_leg(tracked.block) == (tracked.block in leg), (seed, hour)
+                in_favour = trend is not None and (tracked.block.kind is ZoneKind.DEMAND) == (
+                    trend is Trend.BULLISH
+                )
+                older_in_favour += in_favour and tracked.block not in leg and tracked.usable
+            for side, release in gate._releases.items():
+                if before.get(side) != release:
+                    assert release.block in leg, (seed, hour, side)
+                    released += 1
+            if rng.random() < 0.05:
+                gate.spend(rng.choice([Side.LONG, Side.SHORT]))
+    # The walks have to reach the cases this exists for, or the equalities prove nothing.
+    assert empty_breaks > 0
+    assert older_in_favour > 0
+    assert released > 0

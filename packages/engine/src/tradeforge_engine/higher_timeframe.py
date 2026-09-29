@@ -47,7 +47,10 @@ venda em uma região antiga demais"*), he wanted both on offer, and primaries on
 
 * Only a region **of the last leg** releases — one the last break of the timeframe above offered.
   Those point the way that break left the trend (a bullish break offers demand), so they are the
-  regions in favour of it; an older one of the same side does not count.
+  regions in favour of it; an older one of the same side does not count. A break that offers no
+  region empties the leg rather than keeping the one before (*"se teve quebra quando ativar a
+  região vai estar ao mesmo tempo invertendo a tendência"*): by the time price reaches a region of
+  that older leg, the move reaching it is already turning the trend.
 * A region that does not qualify **still dies at its first touch**, and releases nothing — his
   mitigation rule is not suspended by the filter.
 * A side released and still without an entry **is shut when the structure above turns against

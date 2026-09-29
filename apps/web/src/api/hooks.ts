@@ -15,6 +15,7 @@ import type {
   CatalogEntry,
   CatalogPage,
   CreateCatalogEntry,
+  UpdateCatalogEntry,
   Backtest,
   BacktestFilters,
   BacktestStatus,
@@ -313,6 +314,16 @@ export function useCreateCatalogEntry() {
   const client = useQueryClient()
   return useMutation<CatalogEntry, Error, CreateCatalogEntry>({
     mutationFn: (body) => api.createCatalogEntry(body),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: ['catalog'] })
+    },
+  })
+}
+
+export function useUpdateCatalogEntry() {
+  const client = useQueryClient()
+  return useMutation<CatalogEntry, Error, { id: string; body: UpdateCatalogEntry }>({
+    mutationFn: ({ id, body }) => api.updateCatalogEntry(id, body),
     onSuccess: () => {
       void client.invalidateQueries({ queryKey: ['catalog'] })
     },

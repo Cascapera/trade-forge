@@ -8,8 +8,10 @@ double would be testing the double.
 Run locally with:  docker compose up -d  &&  uv run pytest -m integration
 """
 
+import datetime as dt
 import uuid
 from collections.abc import Callable
+from decimal import Decimal
 from typing import Any
 
 import pytest
@@ -19,6 +21,7 @@ from sqlalchemy.orm import Session
 
 from tradeforge_api.config import Settings
 from tradeforge_api.main import create_app
+from tradeforge_db.models import SweepTemplate, SweepTemplateItem, TemplateItemStatus
 
 pytestmark = pytest.mark.integration
 
@@ -253,3 +256,143 @@ class TestReadingAndRemoving:
                 text("DELETE FROM strategies WHERE id = :id"), {"id": uuid.UUID(strategy)}
             )
         session.rollback()
+
+
+def an_entry_of(client: Any, name: str, grid: dict[str, Any] | None = None) -> dict[str, Any]:
+    created = client.post(
+        "/catalog",
+        json={
+            "name": name,
+            "description": "written once",
+            "strategy_id": a_strategy(client),
+            "grid": grid or {},
+        },
+    )
+    assert created.status_code == 201, created.text
+    return dict(created.json())
+
+
+class TestEditingAnEntryInPlace:
+    """29/09, his ask: an entry's name, description and grid change in place; its strategy does
+    not — that moves by saving a new version in the builder."""
+
+    def test_only_what_is_sent_changes(self, client: Any) -> None:
+        entry = an_entry_of(client, f"before {uuid.uuid4()}", {"setup.params.stop_buffer": [0.1]})
+        renamed = f"after {uuid.uuid4()}"
+
+        edited = client.patch(f"/catalog/{entry['id']}", json={"name": renamed})
+
+        assert edited.status_code == 200, edited.text
+        body = edited.json()
+        assert body["name"] == renamed
+        assert (body["description"], body["grid"], body["strategy_id"]) == (
+            entry["description"],
+            entry["grid"],
+            entry["strategy_id"],
+        )
+        assert client.get(f"/catalog/{entry['id']}").json()["name"] == renamed
+
+    def test_a_null_description_clears_it_and_an_absent_one_keeps_it(self, client: Any) -> None:
+        entry = an_entry_of(client, f"described {uuid.uuid4()}")
+
+        kept = client.patch(f"/catalog/{entry['id']}", json={"grid": {}}).json()
+        cleared = client.patch(f"/catalog/{entry['id']}", json={"description": None}).json()
+
+        assert kept["description"] == "written once"
+        assert cleared["description"] is None
+
+    def test_the_grid_changes_and_its_size_follows(self, client: Any) -> None:
+        entry = an_entry_of(client, f"grid {uuid.uuid4()}")
+
+        edited = client.patch(
+            f"/catalog/{entry['id']}",
+            json={"grid": {"setup.params.stop_buffer": [0.1, 0.2, 0.3]}},
+        )
+
+        assert edited.status_code == 200, edited.text
+        assert edited.json()["points"] == 3
+
+    def test_a_grid_the_document_cannot_reach_is_refused_and_nothing_changes(
+        self, client: Any
+    ) -> None:
+        entry = an_entry_of(client, f"reach {uuid.uuid4()}", {"setup.params.stop_buffer": [0.1]})
+
+        refused = client.patch(
+            f"/catalog/{entry['id']}", json={"grid": {"setup.params.nowhere": [1, 2]}}
+        )
+
+        assert refused.status_code == 422
+        assert client.get(f"/catalog/{entry['id']}").json()["grid"] == entry["grid"]
+
+    def test_a_name_or_a_grid_cannot_be_null(self, client: Any) -> None:
+        entry = an_entry_of(client, f"nulls {uuid.uuid4()}")
+
+        assert client.patch(f"/catalog/{entry['id']}", json={"name": None}).status_code == 422
+        assert client.patch(f"/catalog/{entry['id']}", json={"grid": None}).status_code == 422
+
+    def test_a_name_another_entry_has_is_a_409_and_nothing_changes(self, client: Any) -> None:
+        first = an_entry_of(client, f"first {uuid.uuid4()}")
+        second = an_entry_of(client, f"second {uuid.uuid4()}")
+
+        taken = client.patch(
+            f"/catalog/{second['id']}", json={"name": first["name"], "description": "new"}
+        )
+
+        assert taken.status_code == 409
+        again = client.get(f"/catalog/{second['id']}").json()
+        assert (again["name"], again["description"]) == (second["name"], "written once")
+
+    def test_the_strategy_is_not_something_an_edit_can_send(self, client: Any) -> None:
+        entry = an_entry_of(client, f"pinned {uuid.uuid4()}")
+
+        moved = client.patch(f"/catalog/{entry['id']}", json={"strategy_id": a_strategy(client)})
+
+        assert moved.status_code == 422
+
+    def test_an_unknown_entry_is_a_404(self, client: Any) -> None:
+        assert client.patch(f"/catalog/{uuid.uuid4()}", json={"name": "x"}).status_code == 404
+
+    def test_the_grid_waits_for_a_template_s_queue_and_the_label_does_not(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        """A queued market launches later and reads the grid then: an edit mid-queue would split
+        one template over two grids. The name is a label, and changes whatever the queue holds;
+        sending the same grid back changes nothing, so it is not refused either."""
+        entry = an_entry_of(client, f"queued {uuid.uuid4()}", {"setup.params.stop_buffer": [0.1]})
+        template_name = f"template {uuid.uuid4()}"
+        with session_factory() as session:
+            template = SweepTemplate(
+                name=template_name,
+                entry_ids=[entry["id"]],
+                timeframes=["H1"],
+                date_from=dt.datetime(2024, 1, 1, tzinfo=dt.UTC),
+                date_to=dt.datetime(2024, 6, 1, tzinfo=dt.UTC),
+                initial_capital=Decimal(10000),
+            )
+            item = SweepTemplateItem(
+                template=template,
+                symbol="EURUSD",
+                timeframe="H1",
+                cost_model={"type": "none"},
+                position=0,
+                status=TemplateItemStatus.WAITING,
+            )
+            session.add_all([template, item])
+            session.commit()
+            item_id = item.id
+        other_grid = {"setup.params.stop_buffer": [0.1, 0.2]}
+
+        waiting = client.patch(f"/catalog/{entry['id']}", json={"grid": other_grid})
+        same_grid = client.patch(f"/catalog/{entry['id']}", json={"grid": entry["grid"]})
+        renamed = client.patch(f"/catalog/{entry['id']}", json={"name": f"r {uuid.uuid4()}"})
+
+        assert waiting.status_code == 409
+        assert template_name in waiting.json()["detail"]
+        assert same_grid.status_code == 200
+        assert renamed.status_code == 200
+        with session_factory() as session:
+            queued = session.get(SweepTemplateItem, item_id)
+            assert queued is not None
+            queued.status = TemplateItemStatus.REMOVED
+            session.commit()
+        assert client.patch(f"/catalog/{entry['id']}", json={"grid": other_grid}).status_code == 200

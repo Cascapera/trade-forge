@@ -36,8 +36,15 @@ from tradeforge_api.schemas import (
     CatalogEntryOut,
     CatalogPage,
     CreateCatalogEntry,
+    UpdateCatalogEntry,
 )
-from tradeforge_db.models import CatalogEntry, Strategy
+from tradeforge_db.models import (
+    CatalogEntry,
+    Strategy,
+    SweepTemplate,
+    SweepTemplateItem,
+    TemplateItemStatus,
+)
 
 router = APIRouter(tags=["catalog"])
 
@@ -157,6 +164,86 @@ def get_entry(entry_id: uuid.UUID, session: SessionDep) -> CatalogEntryOut:
     if row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="entry not found")
     entry, strategy = row
+    return _out(entry, strategy)
+
+
+@router.patch(
+    "/catalog/{entry_id}",
+    response_model=CatalogEntryOut,
+    responses={**_NOT_FOUND, **_CONFLICT, **_BAD_BODY},
+)
+def update_entry(
+    entry_id: uuid.UUID, request: UpdateCatalogEntry, session: SessionDep
+) -> CatalogEntryOut:
+    """Rename an entry, rewrite its description, or change its grid — in place (29/09).
+
+    The grid is checked against the strategy exactly as at creation. ⚠️ **Refused while a template
+    still has markets waiting to launch with this entry** (409): each queued market launches later
+    as a sweep of its own and reads the grid then, so an edit in the middle of a queue would split
+    one template's markets over two grids. Finish, remove or empty the queue, then edit.
+
+    A rename is a label and nothing more: every screen reads the name live, and what a finished
+    sweep ran is written on its own rows. The 409 on a taken name is the database's, as at
+    creation.
+    """
+    row = session.execute(
+        select(CatalogEntry, Strategy)
+        .join(Strategy, Strategy.id == CatalogEntry.strategy_id)
+        .where(CatalogEntry.id == entry_id)
+    ).first()
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="entry not found")
+    entry, strategy = row
+    sent = request.model_fields_set
+
+    if "name" in sent and request.name is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="an entry needs a name"
+        )
+    if "grid" in sent and request.grid is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="a grid cannot be null; an entry with nothing to vary has {}",
+        )
+
+    if request.grid is not None and request.grid != entry.grid:
+        if request.grid:
+            try:
+                check_grid(strategy.definition, request.grid)
+            except GridError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+                ) from exc
+        waiting = session.scalars(
+            select(SweepTemplate.name)
+            .join(SweepTemplateItem, SweepTemplateItem.template_id == SweepTemplate.id)
+            .where(
+                SweepTemplate.entry_ids.contains([str(entry.id)]),
+                SweepTemplateItem.status == TemplateItemStatus.WAITING,
+            )
+            .distinct()
+        ).all()
+        if waiting:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"template(s) {', '.join(sorted(waiting))} still have markets waiting to "
+                "launch with this entry; its grid can change once their queues are done",
+            )
+        entry.grid = dict(request.grid)
+
+    if request.name is not None:
+        entry.name = request.name
+    if "description" in sent:
+        entry.description = request.description
+    try:
+        session.commit()
+    except IntegrityError as exc:
+        session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"a catalogue entry named {request.name!r} already exists",
+        ) from exc
+    session.refresh(entry)
     return _out(entry, strategy)
 
 

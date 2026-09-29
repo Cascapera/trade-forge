@@ -5,21 +5,23 @@ import { ApiError } from '../api/client'
 import type { CatalogEntry, CatalogPage } from '../api/types'
 import { renderWithProviders } from '../test-utils'
 
-const { create, remove, state } = vi.hoisted(() => {
+const { create, remove, update, state } = vi.hoisted(() => {
   const state: {
     data: CatalogPage | undefined
     isPending: boolean
     isError: boolean
     createError: unknown
     removeError: unknown
+    updateError: unknown
   } = {
     data: undefined,
     isPending: false,
     isError: false,
     createError: null,
     removeError: null,
+    updateError: null,
   }
-  return { create: vi.fn(), remove: vi.fn(), state }
+  return { create: vi.fn(), remove: vi.fn(), update: vi.fn(), state }
 })
 
 vi.mock('../api/hooks', () => ({
@@ -46,6 +48,12 @@ vi.mock('../api/hooks', () => ({
     isPending: false,
     isError: state.removeError !== null,
     error: state.removeError,
+  }),
+  useUpdateCatalogEntry: () => ({
+    mutate: update,
+    isPending: false,
+    isError: state.updateError !== null,
+    error: state.updateError,
   }),
   // The picker asks the server what exists. Two rows, and ⚠️ neither name repeats its own
   // setup — a fixture where they matched would agree with a screen reading either one.
@@ -136,6 +144,7 @@ beforeEach(() => {
   state.isError = false
   state.createError = null
   state.removeError = null
+  state.updateError = null
 })
 
 afterEach(() => {
@@ -394,5 +403,96 @@ describe('building a strategy at the top', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Close the builder' }))
     expect(screen.queryByRole('heading', { name: 'Build a strategy' })).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'New strategy' })).toBeInTheDocument()
+  })
+})
+
+describe('editing an entry in place', () => {
+  function editing(name: string): HTMLElement {
+    fireEvent.click(screen.getByRole('button', { name: `Edit ${name}` }))
+    return screen.getByRole('form', { name: `Editing ${name}` })
+  }
+
+  function sent(): { id: string; body: Record<string, unknown> } {
+    const [call] = update.mock.calls[0] as [{ id: string; body: Record<string, unknown> }]
+    return call
+  }
+
+  it('opens on what the entry says, grid included', () => {
+    renderWithProviders(<StrategyCatalog />, '/catalog')
+    const form = editing('9.1 varrido')
+
+    expect(within(form).getByLabelText('Name')).toHaveValue('9.1 varrido')
+    expect(within(form).getByText('3 backtests per sweep')).toBeInTheDocument()
+    // The strategy is shown, and not offered.
+    expect(within(form).queryByLabelText('Strategy')).not.toBeInTheDocument()
+  })
+
+  it('sends only what changed, by id', () => {
+    renderWithProviders(<StrategyCatalog />, '/catalog')
+    const form = editing('9.1 sem filtro')
+
+    fireEvent.change(within(form).getByLabelText('Name'), { target: { value: '9.1 limpo' } })
+    fireEvent.click(within(form).getByRole('button', { name: 'Save changes' }))
+
+    expect(sent()).toEqual({ id: 'e1', body: { name: '9.1 limpo' } })
+  })
+
+  it('sends an emptied description as null, not as an empty string', () => {
+    renderWithProviders(<StrategyCatalog />, '/catalog')
+    const form = editing('9.1 sem filtro')
+
+    fireEvent.change(within(form).getByLabelText('Description'), { target: { value: '  ' } })
+    fireEvent.click(within(form).getByRole('button', { name: 'Save changes' }))
+
+    expect(sent().body).toEqual({ description: null })
+  })
+
+  it('sends the grid when an axis changed, and says the sweeps already run keep theirs', () => {
+    renderWithProviders(<StrategyCatalog />, '/catalog')
+    const form = editing('9.1 sem filtro')
+
+    fireEvent.change(within(form).getByLabelText('Parameter 1'), {
+      target: { value: 'setup.params.stop_buffer' },
+    })
+    setValues(1, '0.1, 0.2')
+
+    expect(within(form).getByText(/Sweeps already run keep the grid they ran/)).toBeInTheDocument()
+    fireEvent.click(within(form).getByRole('button', { name: 'Save changes' }))
+    expect(sent().body).toEqual({ grid: { 'setup.params.stop_buffer': [0.1, 0.2] } })
+  })
+
+  it('will not save when nothing changed or the name is emptied', () => {
+    renderWithProviders(<StrategyCatalog />, '/catalog')
+    const form = editing('9.1 sem filtro')
+
+    expect(within(form).getByRole('button', { name: 'Save changes' })).toBeDisabled()
+    expect(within(form).getByText('Nothing changed yet.')).toBeInTheDocument()
+    fireEvent.change(within(form).getByLabelText('Name'), { target: { value: ' ' } })
+    expect(within(form).getByText('An entry needs a name.')).toBeInTheDocument()
+    fireEvent.submit(form)
+    expect(update).not.toHaveBeenCalled()
+  })
+
+  it('gives the row back on cancel, sending nothing', () => {
+    renderWithProviders(<StrategyCatalog />, '/catalog')
+    const form = editing('9.1 sem filtro')
+
+    fireEvent.click(within(form).getByRole('button', { name: 'Cancel' }))
+
+    expect(screen.queryByRole('form', { name: 'Editing 9.1 sem filtro' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Edit 9.1 sem filtro' })).toBeInTheDocument()
+    expect(update).not.toHaveBeenCalled()
+  })
+
+  it('shows the server sentence when a template is still waiting on the grid', () => {
+    state.updateError = new ApiError(
+      409,
+      'template(s) majors still have markets waiting to launch with this entry; its grid can ' +
+        'change once their queues are done',
+    )
+    renderWithProviders(<StrategyCatalog />, '/catalog')
+    const form = editing('9.1 sem filtro')
+
+    expect(within(form).getByText(/majors still have markets waiting/)).toBeInTheDocument()
   })
 })

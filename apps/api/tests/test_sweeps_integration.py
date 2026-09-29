@@ -2880,6 +2880,35 @@ class TestSweepsReadTogether:
         assert ghost.status_code == 404
         assert client.post("/sweeps/combine", json={"sweep_ids": [eur, gbp]}).status_code == 201
 
+    def test_sweeps_launched_before_and_after_a_grid_edit_do_not_combine(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        """29/09: an entry's grid is editable in place. The sweep already run keeps the grid it
+        expanded — its points and `entry_grids` — and one launched after the edit asked another
+        question, so the two are refused as a combination rather than merged over two grids."""
+        entry, eur, _gbp = self.two_markets(client, session_factory)
+        edited = client.patch(f"/catalog/{entry}", json={"grid": {"setup.params.period": [5, 7]}})
+        assert edited.status_code == 200, edited.text
+        later = client.post("/sweeps", json=a_sweep_body([entry], ["USDJPY"], ["H1"])).json()["id"]
+        for row in client.get(f"/sweeps/{later}").json()["runs"]:
+            finish_trading(session_factory, row["run"]["id"], net=100, trades=40)
+
+        refused = client.post("/sweeps/combine", json={"sweep_ids": [eur, later]})
+
+        assert refused.status_code == 422
+        assert "their grids" in refused.json()["detail"]
+        # The sweep run before the edit still reads as it ran: three points, not two.
+        assert len(client.get(f"/sweeps/{eur}").json()["runs"]) == 3
+        with session_factory() as session:
+            grids = {
+                str(one.id): one.entry_grids
+                for one in session.scalars(
+                    select(Sweep).where(Sweep.id.in_([uuid.UUID(eur), uuid.UUID(later)]))
+                )
+            }
+        assert grids[eur] == {entry: {"setup.params.period": [5, 7, 9]}}
+        assert grids[later] == {entry: {"setup.params.period": [5, 7]}}
+
     def test_the_charts_of_one_template_combine_and_others_do_not(
         self, client: Any, session_factory: Callable[[], Session]
     ) -> None:

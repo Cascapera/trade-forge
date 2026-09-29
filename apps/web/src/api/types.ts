@@ -1077,6 +1077,16 @@ export interface CatalogPage {
   items: CatalogEntry[]
 }
 
+/**
+ * Change an entry in place — only what is sent (29/09). `description: null` clears it; the
+ * strategy is not here: it moves by saving a new version in the builder.
+ */
+export interface UpdateCatalogEntry {
+  name?: string
+  description?: string | null
+  grid?: Record<string, unknown[]>
+}
+
 export interface CreateCatalogEntry {
   name: string
   /** Omitted rather than sent empty when nobody wrote one: `null` and `''` are different facts

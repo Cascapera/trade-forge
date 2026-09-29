@@ -38,6 +38,24 @@ bar reached; a region reached and closed through on one bar spends itself and re
 the break may confirm on the touching bar itself; and the close, above. Each is credited where it
 runs, because a rule that says it is ours is the rule somebody loosens later.
 
+**Which regions may release, his choice since 2026-09-29** (`RegionChoice`, and whether the
+secondary regions of an impulse count). By default any region above that nobody has touched — the
+rule above, and every result recorded before. Asked whether it should be any region or only one
+in favour of the last structure (*"se ele fez um choch de alta ou bos de alta para ele não procurar
+venda em uma região antiga demais"*), he wanted both on offer, and primaries only beside all. With
+`WITH_TREND`, his three answers of the same day:
+
+* Only a region **of the last leg** releases — one the last break of the timeframe above offered.
+  Those point the way that break left the trend (a bullish break offers demand), so they are the
+  regions in favour of it; an older one of the same side does not count. A break that offers no
+  region empties the leg rather than keeping the one before (*"se teve quebra quando ativar a
+  região vai estar ao mesmo tempo invertendo a tendência"*): by the time price reaches a region of
+  that older leg, the move reaching it is already turning the trend.
+* A region that does not qualify **still dies at its first touch**, and releases nothing — his
+  mitigation rule is not suspended by the filter.
+* A side released and still without an entry **is shut when the structure above turns against
+  it** — a change of character the other way ends the search for the buy.
+
 **Where the H4 comes from.** The engine hands a strategy one stream of bars (`Context` carries
 one candle, and that is the anti-lookahead rule made structural). So the higher timeframe is
 **assembled here**, from the bars the setup already receives, and a region on it exists from the
@@ -61,6 +79,7 @@ import datetime as dt
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
+from enum import StrEnum
 from types import MappingProxyType
 from typing import Final
 
@@ -71,6 +90,7 @@ from tradeforge_engine.structure import (
     OrderBlock,
     OrderBlockDetector,
     TrackedZone,
+    Trend,
     ZoneKind,
 )
 
@@ -81,6 +101,17 @@ His number, in his example: a demand region of [90, 100] — ten high — and th
 for the buy when price reaches 120, the top plus two heights. Read off the bar's high, because
 *"atingir"* is price trading there, not settling there.
 """
+
+
+class RegionChoice(StrEnum):
+    """Which untouched regions above may release the timeframe below — see the module docstring."""
+
+    ANY = "any"
+    """Any region nobody has touched, whichever way the structure above points: the rule of
+    2026-09-08 and the default."""
+    WITH_TREND = "with_trend"
+    """Only a region the last break above offered — in favour of the structure it left."""
+
 
 # A Monday at midnight. Every bucket is a whole number of `target` from here, so an H1, H4 or D1
 # bucket starts on the hour, on a four-hour boundary or at midnight, and a W1 bucket on a Monday.
@@ -264,6 +295,10 @@ class RegionTracker:
         # offers a region, so this is rebuilt there, and shrinks on the bar a region is reached.
         self._untouched: list[OrderBlock] = []
         self._reached: dict[Side, tuple[OrderBlock, ...]] = {}
+        # The last break above: the trend it left, and the regions it offered (possibly none).
+        # Kept for every run alike — which of them may release is the gate's choice, not this.
+        self._trend: Trend | None = None
+        self._last_leg: frozenset[OrderBlock] = frozenset()
 
     @property
     def timeframe(self) -> dt.timedelta:
@@ -284,6 +319,15 @@ class RegionTracker:
         reached here and still read as standing there until its H4 bar closes.
         """
         return self._blocks.zones
+
+    @property
+    def trend(self) -> Trend | None:
+        """The trend the last break of the timeframe above left in force; `None` before any."""
+        return self._trend
+
+    def of_last_leg(self, block: OrderBlock) -> bool:
+        """Whether the last break above offered this region — his "in favour" (2026-09-29)."""
+        return block in self._last_leg
 
     @property
     def reached(self) -> Mapping[Side, tuple[OrderBlock, ...]]:
@@ -315,7 +359,12 @@ class RegionTracker:
             # half of a CHOCH run with an M15 gate over M5 — 52 million hashes of a frozen
             # dataclass in 372 thousand bars (27/09). Still pruned bar by bar when it does change,
             # which is what keeps `_touched` no larger than the detector's bounded list.
-            if self._blocks.update(bar, self._structure.update(bar)):
+            broke = self._structure.update(bar)
+            offered = self._blocks.update(bar, broke)
+            if broke is not None:
+                self._trend = broke.trend
+                self._last_leg = frozenset(offered)
+            if offered:
                 held = {tracked.block for tracked in self._blocks.zones}
                 self._touched.intersection_update(held)
                 changed = True
@@ -375,14 +424,20 @@ class HigherTimeframeGate:
     (*"1 - correto / 2 - correto"*).
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 — keyword-only; the bars, the clock and his two choices
         self,
         *,
         base: dt.timedelta,
         target: dt.timedelta,
         offset: dt.timedelta,
         regions: RegionTracker | None = None,
+        choice: RegionChoice = RegionChoice.ANY,
+        allow_secondary: bool = True,
     ) -> None:
+        # Which regions may release (2026-09-29): the run's own choice, read against the tracker's
+        # pure record — so runs choosing differently still share one tracker in a batch.
+        self._choice = choice
+        self._allow_secondary = allow_secondary
         # ⚠️ **A tracker handed in is advanced by whoever handed it in**, never here (ADR-0029): a
         # `MarketReading` owns it — the setup's own, or a batch's leader shared by many runs. The
         # gate then only reads what the bar reached. Without one the gate builds and advances its
@@ -423,7 +478,12 @@ class HigherTimeframeGate:
         """
         if self._owns_regions:
             self._regions.observe(candle)
-        for side, blocks in self._regions.reached.items():
+        for side, reached in self._regions.reached.items():
+            # A region that does not qualify was still reached, and the tracker has spent it: it
+            # dies at its first touch and releases nothing (his answer, 2026-09-29).
+            blocks = [block for block in reached if self._qualifies(block)]
+            if not blocks:
+                continue
             # A side already released keeps the bar that released it: *from that bar on* is
             # counted from the first region price came to, and only the reference moves. A region
             # reached and closed through on this same bar opens a release here and loses it in
@@ -434,8 +494,24 @@ class HigherTimeframeGate:
 
         for side in (Side.LONG, Side.SHORT):
             release = self._releases.get(side)
-            if release is not None and _search_over(release.block, candle):
+            if release is not None and (
+                _search_over(release.block, candle) or not self._trend_allows(side)
+            ):
                 del self._releases[side]
+
+    def _qualifies(self, block: OrderBlock) -> bool:
+        """May this region, reached, release its side? Always, under the defaults."""
+        if not block.primary and not self._allow_secondary:
+            return False
+        return self._choice is RegionChoice.ANY or self._regions.of_last_leg(block)
+
+    def _trend_allows(self, side: Side) -> bool:
+        """Whether the structure above lets this side stay released — always under `ANY`; under
+        `WITH_TREND`, not once the last break above points the other way (his answer, 29/09)."""
+        if self._choice is RegionChoice.ANY:
+            return True
+        trend = self._regions.trend
+        return trend is None or (trend is Trend.BULLISH) == (side is Side.LONG)
 
     def shut_on_this_bar(self) -> bool:
         """No side released now, and the base bar just read released none — asked before
@@ -496,7 +572,11 @@ class HigherTimeframeGate:
         is exactly the case his answer says spends the region. The caller keeps the two apart.
         """
         side = release.block.side
-        if side in self._releases or _search_over(release.block, candle):
+        if (
+            side in self._releases
+            or _search_over(release.block, candle)
+            or not self._trend_allows(side)
+        ):
             return
         self._releases[side] = release
 
@@ -540,6 +620,7 @@ __all__ = [
     "MAX_SERVER_OFFSET",
     "BarAggregator",
     "HigherTimeframeGate",
+    "RegionChoice",
     "RegionTracker",
     "Release",
 ]

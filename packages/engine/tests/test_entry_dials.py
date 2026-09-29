@@ -69,7 +69,9 @@ def test_the_table_is_what_activation_for_reads(entry: ZoneEntryPoint, dial: str
 class TestUnreadParams:
     def test_names_the_dials_the_entry_point_leaves_alone(self) -> None:
         def unread(entry: str) -> frozenset[str]:
-            return unread_params({"type": "structure_choch", "params": {"entry_point": entry}})
+            # With a filter above, so its region choices are read and only the dials are in play.
+            node = {"type": "structure_choch", "params": {"entry_point": entry, "htf": "H4"}}
+            return unread_params(node)
 
         assert unread("martelo") == ENTRY_DIALS
         assert unread("gift") == {"stop_buffer"}
@@ -77,7 +79,7 @@ class TestUnreadParams:
         assert unread("edge") == {"gift_stop", "volume_filter"}
 
     def test_reads_the_edge_when_no_entry_point_is_named(self) -> None:
-        node = {"type": "structure_continuation", "params": {}}
+        node = {"type": "structure_continuation", "params": {"htf": "H4"}}
         assert unread_params(node) == {"gift_stop", "volume_filter"}
 
     @pytest.mark.parametrize(

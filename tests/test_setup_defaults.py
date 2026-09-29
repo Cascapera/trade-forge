@@ -40,6 +40,7 @@ from tradeforge_engine import setup_factory
 from tradeforge_engine.average_setups import AverageEntryPoint
 from tradeforge_engine.bar_setups import GiftStop
 from tradeforge_engine.domain import Side
+from tradeforge_engine.higher_timeframe import RegionChoice
 from tradeforge_engine.setup_factory import _BUILDERS, build_setup
 from tradeforge_engine.setups import (
     ChochQualifier,
@@ -195,6 +196,10 @@ _PROBES: dict[str, dict[str, tuple[Any, Any]]] = {
         # The side filter (18/09): the wire string arrives as the engine's enum, and the probe is
         # `short` because `both` is what the class answers when nothing arrives.
         "side": ("short", Side.SHORT),
+        # Which regions above may release (29/09), probed off `any` and off `true`, with an `htf`
+        # beside them — without one the factory reads neither.
+        "htf_regions": ("with_trend", RegionChoice.WITH_TREND),
+        "htf_allow_secondary": (False, False),
     },
     "structure_continuation": {
         "allow_secondary": (True, True),
@@ -208,6 +213,8 @@ _PROBES: dict[str, dict[str, tuple[Any, Any]]] = {
         # And the broker's clock beside it (2026-09-09), demanded whenever `htf` is named.
         "htf_offset": (3, dt.timedelta(hours=3)),
         "side": ("short", Side.SHORT),
+        "htf_regions": ("with_trend", RegionChoice.WITH_TREND),
+        "htf_allow_secondary": (False, False),
     },
 }
 

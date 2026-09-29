@@ -43,6 +43,8 @@ from tradeforge_engine.higher_timeframe import (
     MAX_SERVER_OFFSET,
     BarAggregator,
     HigherTimeframeGate,
+    RegionChoice,
+    RegionTracker,
     Release,
     _innermost,
     _reaches,
@@ -55,6 +57,7 @@ from tradeforge_engine.structure import (
     OrderBlock,
     OrderBlockDetector,
     StructureKind,
+    Trend,
     ZoneKind,
 )
 from tradeforge_engine.testing import (
@@ -1084,4 +1087,277 @@ def test_rebuilding_only_when_a_region_is_offered_changes_nothing(
                 plain.spend(side)
     # The walk has to have reached the cases it exists for, or it proves nothing.
     assert two_at_once > 0
+    assert released > 0
+
+
+# --------------------------------------------------------------------------- #
+# Which regions above may release (his choice, 2026-09-29)                      #
+# --------------------------------------------------------------------------- #
+
+
+def _tracked(candles: list[Candle]) -> RegionTracker:
+    tracker = RegionTracker(base=HOUR, target=H4, offset=_UTC_BROKER)
+    with localcontext(ENGINE_CONTEXT):
+        for candle in candles:
+            tracker.observe(candle)
+    return tracker
+
+
+def test_the_tracker_keeps_the_last_break_above_and_the_regions_it_offered() -> None:
+    """The H4 that closes on hour 71 breaks upward and offers [80, 100] and [110, 117]: the trend
+    it leaves is bullish, and both are the last leg's."""
+    tracker = _tracked(_through(71))
+    assert tracker.trend is Trend.BULLISH
+    assert [tracked.block.primary for tracked in tracker.zones] == [True, False]
+    assert all(tracker.of_last_leg(tracked.block) for tracked in tracker.zones)
+
+
+def test_the_mirrored_stream_leaves_a_bearish_trend_and_supply_in_its_last_leg() -> None:
+    tracker = _tracked(_mirror(_through(71)))
+    assert tracker.trend is Trend.BEARISH
+    assert tracker.zones
+    assert all(tracked.block.kind is ZoneKind.SUPPLY for tracked in tracker.zones)
+    assert all(tracker.of_last_leg(tracked.block) for tracked in tracker.zones)
+
+
+@dataclass
+class _Above:
+    """A tracker set by hand: what the bar reached, the trend above and the last leg's regions —
+    the three facts the gate reads, without building an H4 history that produces each case."""
+
+    reached: dict[Side, tuple[OrderBlock, ...]] = field(default_factory=dict)
+    trend: Trend | None = None
+    leg: frozenset[OrderBlock] = frozenset()
+    timeframe: dt.timedelta = H4
+    offset: dt.timedelta = _UTC_BROKER
+    zones: tuple[object, ...] = ()
+
+    def of_last_leg(self, block: OrderBlock) -> bool:
+        return block in self.leg
+
+
+def _region(
+    bottom: str, top: str, *, kind: ZoneKind = ZoneKind.DEMAND, primary: bool = True
+) -> OrderBlock:
+    return OrderBlock(
+        kind=kind,
+        top=Decimal(top),
+        bottom=Decimal(bottom),
+        time=_at(0),
+        confirmed_at=_at(3),
+        break_kind=StructureKind.BOS,
+        primary=primary,
+    )
+
+
+def _gate(
+    above: _Above, *, choice: RegionChoice = RegionChoice.ANY, allow_secondary: bool = True
+) -> HigherTimeframeGate:
+    return HigherTimeframeGate(
+        base=HOUR,
+        target=H4,
+        offset=_UTC_BROKER,
+        regions=above,  # type: ignore[arg-type]
+        choice=choice,
+        allow_secondary=allow_secondary,
+    )
+
+
+def _quiet(hour: int) -> Candle:
+    """A base bar that ends no search below: no two heights run past, no close through."""
+    return bar(hour, open_="95", close="95", high="96", low="94")
+
+
+def _step(
+    gate: HigherTimeframeGate, above: _Above, hour: int, **reached: tuple[OrderBlock, ...]
+) -> None:
+    above.reached = {Side.LONG if name == "long" else Side.SHORT: v for name, v in reached.items()}
+    with localcontext(ENGINE_CONTEXT):
+        gate.observe(_quiet(hour))
+
+
+DEMAND = _region("90", "100")
+OLDER_DEMAND = _region("86", "90")
+SUPPLY = _region("110", "120", kind=ZoneKind.SUPPLY)
+SECONDARY = _region("92", "98", primary=False)
+
+
+def test_by_default_any_untouched_region_releases_whichever_way_the_structure_points() -> None:
+    """The rule every recorded result ran under: an older demand not of the last leg, and a supply
+    under a bullish trend, both release."""
+    above = _Above(trend=Trend.BULLISH, leg=frozenset({DEMAND}))
+    gate = _gate(above)
+    _step(gate, above, 10, long=(OLDER_DEMAND,), short=(SUPPLY,))
+    assert gate.reference(DEMAND) == OLDER_DEMAND
+    assert gate.reference(SUPPLY) == SUPPLY
+
+
+def test_with_trend_a_region_of_the_last_leg_releases() -> None:
+    above = _Above(trend=Trend.BULLISH, leg=frozenset({DEMAND}))
+    gate = _gate(above, choice=RegionChoice.WITH_TREND)
+    _step(gate, above, 10, long=(DEMAND,))
+    assert gate.reference(DEMAND) == DEMAND
+
+
+def test_with_trend_an_older_region_of_the_same_side_releases_nothing() -> None:
+    """His answer of 29/09: only the last leg's — an older demand does not count."""
+    above = _Above(trend=Trend.BULLISH, leg=frozenset({DEMAND}))
+    gate = _gate(above, choice=RegionChoice.WITH_TREND)
+    _step(gate, above, 10, long=(OLDER_DEMAND,))
+    assert gate.reference(DEMAND) is None
+
+
+def test_with_trend_a_region_against_the_structure_releases_nothing() -> None:
+    """A supply under a bullish trend is not of the last leg: reached, it releases no sell. The bar
+    still reached something, so it is not one `quiet` may skip."""
+    above = _Above(trend=Trend.BULLISH, leg=frozenset({DEMAND}))
+    gate = _gate(above, choice=RegionChoice.WITH_TREND)
+    _step(gate, above, 10, short=(SUPPLY,))
+    assert gate.reference(SUPPLY) is None
+    assert gate.shut_on_this_bar() is False
+
+
+def test_with_trend_a_turn_above_shuts_the_side_still_waiting_for_its_entry() -> None:
+    """His answer of 29/09: released for the buy, no entry yet, the structure above turns bearish —
+    the search for the buy ends on that bar. Under the default it stays open."""
+    for choice, stays in ((RegionChoice.WITH_TREND, False), (RegionChoice.ANY, True)):
+        above = _Above(trend=Trend.BULLISH, leg=frozenset({DEMAND}))
+        gate = _gate(above, choice=choice)
+        _step(gate, above, 10, long=(DEMAND,))
+        assert gate.reference(DEMAND) == DEMAND
+        above.trend = Trend.BEARISH
+        _step(gate, above, 11)
+        assert (gate.reference(DEMAND) is not None) is stays, choice
+
+
+def test_with_trend_a_new_leg_the_same_way_keeps_a_release_already_open() -> None:
+    """A later bullish break moves the last leg on; the buy it released before stays open — the
+    touch was in favour when it happened, and nothing turned against it."""
+    above = _Above(trend=Trend.BULLISH, leg=frozenset({DEMAND}))
+    gate = _gate(above, choice=RegionChoice.WITH_TREND)
+    _step(gate, above, 10, long=(DEMAND,))
+    above.leg = frozenset({_region("100", "104")})
+    _step(gate, above, 11)
+    assert gate.reference(DEMAND) == DEMAND
+
+
+def test_with_trend_a_refused_order_gets_no_release_back_once_the_structure_turned() -> None:
+    above = _Above(trend=Trend.BULLISH, leg=frozenset({DEMAND}))
+    gate = _gate(above, choice=RegionChoice.WITH_TREND)
+    _step(gate, above, 10, long=(DEMAND,))
+    release = gate.release_for(DEMAND)
+    assert release is not None
+    gate.spend(Side.LONG)
+    above.trend = Trend.BEARISH
+    gate.restore(release, _quiet(11))
+    assert gate.release_for(DEMAND) is None
+    # The control: with the structure bullish again, the same refusal hands it back.
+    above.trend = Trend.BULLISH
+    gate.restore(release, _quiet(12))
+    assert gate.release_for(DEMAND) == release
+
+
+def test_primaries_only_a_secondary_reached_releases_nothing() -> None:
+    above = _Above()
+    only_primaries = _gate(above, allow_secondary=False)
+    _step(only_primaries, above, 10, long=(SECONDARY,))
+    assert only_primaries.reference(DEMAND) is None
+    everything = _gate(above)
+    _step(everything, above, 10, long=(SECONDARY,))
+    assert everything.reference(DEMAND) == SECONDARY
+
+
+def test_primaries_only_a_bar_through_both_keeps_the_primary_as_the_reference() -> None:
+    """The secondary [92, 98] is the innermost of the two the bar reached; with secondaries off it
+    is no candidate, so the primary is the reference."""
+    above = _Above()
+    only_primaries = _gate(above, allow_secondary=False)
+    _step(only_primaries, above, 10, long=(DEMAND, SECONDARY))
+    assert only_primaries.reference(DEMAND) == DEMAND
+    everything = _gate(above)
+    _step(everything, above, 10, long=(DEMAND, SECONDARY))
+    assert everything.reference(DEMAND) == SECONDARY
+
+
+@pytest.mark.parametrize(
+    "choice", [{"choice": RegionChoice.WITH_TREND}, {"allow_secondary": False}]
+)
+def test_on_the_golden_stream_the_stricter_choices_release_what_the_default_does(
+    choice: dict[str, object],
+) -> None:
+    """On the golden stream the region touched is the last leg's, in favour, and the primary is
+    the innermost — so the stricter choices release exactly what the default does."""
+    gate = HigherTimeframeGate(base=HOUR, target=H4, offset=_UTC_BROKER, **choice)  # type: ignore[arg-type]
+    with localcontext(ENGINE_CONTEXT):
+        for candle in _through(TOUCH):
+            gate.observe(candle)
+    reference = gate.reference(_demand(_at(ARMS)))
+    assert reference is not None
+    assert reference == _fed(_through(TOUCH)).reference(_demand(_at(ARMS)))
+
+
+def test_each_break_above_replaces_the_last_leg_and_one_offering_nothing_empties_it() -> None:
+    """The engine-guardian's blocker (29/09): every test above saw one break, so a leg that
+    accumulated across breaks — an older region of the same side releasing again — or one kept
+    over a break that offered nothing would both have passed. His answer on the second: a break
+    with no region does **not** keep the leg before it, because by the time a region of that older
+    leg is reached the move that reaches it is already turning the trend.
+
+    Held over the random walks against a reference that reads the same bars with its own
+    detectors and replaces the leg on every break, bar by bar; and a gate choosing `WITH_TREND`
+    on the real tracker never releases from outside the leg as it stood when it released."""
+    empty_breaks = older_in_favour = released = 0
+    for seed in range(100):
+        rng = random.Random(seed)  # noqa: S311 — a reproducible walk, not a secret
+        tracker = RegionTracker(base=HOUR, target=3 * HOUR, offset=_UTC_BROKER)
+        gate = HigherTimeframeGate(
+            base=HOUR,
+            target=3 * HOUR,
+            offset=_UTC_BROKER,
+            regions=tracker,
+            choice=RegionChoice.WITH_TREND,
+        )
+        bars = BarAggregator(base=HOUR, target=3 * HOUR, offset=_UTC_BROKER)
+        structure = MarketStructure()
+        blocks = OrderBlockDetector()
+        trend: Trend | None = None
+        leg: frozenset[OrderBlock] = frozenset()
+        price, hour = 100, 0
+        for _ in range(600):
+            hour += rng.choice([1] * 8 + [2, 3, 4])
+            open_ = price
+            price = max(5, open_ + rng.randint(-3, 3))
+            candle = Candle(
+                time=START + hour * HOUR,
+                open=Decimal(open_),
+                high=Decimal(max(open_, price) + rng.randint(0, 2)),
+                low=Decimal(max(1, min(open_, price) - rng.randint(0, 2))),
+                close=Decimal(price),
+            )
+            for higher in bars.update(candle):
+                broke = structure.update(higher)
+                offered = blocks.update(higher, broke)
+                if broke is not None:
+                    trend, leg = broke.trend, frozenset(offered)
+                    empty_breaks += not offered
+            before = dict(gate._releases)
+            tracker.observe(candle)
+            gate.observe(candle)
+
+            assert tracker.trend == trend, (seed, hour)
+            for tracked in tracker.zones:
+                assert tracker.of_last_leg(tracked.block) == (tracked.block in leg), (seed, hour)
+                in_favour = trend is not None and (tracked.block.kind is ZoneKind.DEMAND) == (
+                    trend is Trend.BULLISH
+                )
+                older_in_favour += in_favour and tracked.block not in leg and tracked.usable
+            for side, release in gate._releases.items():
+                if before.get(side) != release:
+                    assert release.block in leg, (seed, hour, side)
+                    released += 1
+            if rng.random() < 0.05:
+                gate.spend(rng.choice([Side.LONG, Side.SHORT]))
+    # The walks have to reach the cases this exists for, or the equalities prove nothing.
+    assert empty_breaks > 0
+    assert older_in_favour > 0
     assert released > 0

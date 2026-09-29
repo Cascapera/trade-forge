@@ -89,6 +89,7 @@ type ZoneEntryPoint = Literal[
     "barra_ignorada",
 ]
 type GiftStop = Literal["gift", "forca"]
+type HtfRegions = Literal["any", "with_trend"]
 type AverageEntryPoint = Literal["classic", "martelo", "martelo_forca", "gift", "barra_ignorada"]
 type AverageKind = Literal["EMA", "SMA"]
 
@@ -875,6 +876,15 @@ class StructureParams(_Node):
     by the broker's offset — a known, accepted difference, not a silent one. Stating the number
     still moves the cut onto the server's clock. It was required from 2026-09-09 until then, and
     that refused every point of a grid varying `htf` without a clock beside it.
+
+    `htf_regions` and `htf_allow_secondary` choose which untouched regions above may release
+    (his choice, 2026-09-29). `any`, the default, is any region, whichever way the structure above
+    points; `with_trend` is only a region the **last break** above offered — in favour of the
+    structure it left, an older one of the same side not counting — and a side released and still
+    without an entry is shut when the structure above turns against it. `htf_allow_secondary`
+    false keeps an impulse's primary region alone. A region that does not qualify still dies at
+    its first touch and releases nothing. Both are read only with an `htf`; the defaults are the
+    rule every recorded result ran under.
     """
 
     side: TradeSide = "both"
@@ -893,6 +903,8 @@ class StructureParams(_Node):
     # `null` is UTC: the higher bars are cut where the stored candles are, with no broker
     # offset applied (2026-09-26). A number moves the cut onto the server's clock.
     htf_offset: Annotated[float | None, Field(ge=-14, le=14)] = None
+    htf_regions: HtfRegions = "any"
+    htf_allow_secondary: bool = True
 
 
 class StructureChochSetup(_Node):

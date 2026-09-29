@@ -76,7 +76,7 @@ from tradeforge_engine.domain import (
     to_tick,
 )
 from tradeforge_engine.errors import EngineError
-from tradeforge_engine.higher_timeframe import HigherTimeframeGate, Release
+from tradeforge_engine.higher_timeframe import HigherTimeframeGate, RegionChoice, Release
 from tradeforge_engine.reading import MarketReading
 from tradeforge_engine.structure import (
     OrderBlock,
@@ -2133,6 +2133,8 @@ class StructureStrategy:
         volume_filter: bool = False,
         htf: dt.timedelta | None = None,
         htf_offset: dt.timedelta | None = None,
+        htf_regions: RegionChoice = RegionChoice.ANY,
+        htf_allow_secondary: bool = True,
         timeframe: dt.timedelta | None = None,
         side: Side | None = None,
         reading: MarketReading | None = None,
@@ -2187,7 +2189,14 @@ class StructureStrategy:
             None
             if htf is None or timeframe is None
             else HigherTimeframeGate(
-                base=timeframe, target=htf, offset=offset, regions=reading.regions
+                base=timeframe,
+                target=htf,
+                offset=offset,
+                regions=reading.regions,
+                # Which regions above may release (his choice, 29/09): any, or only the last
+                # leg's; all of an impulse, or its primary only. Unread without a filter.
+                choice=htf_regions,
+                allow_secondary=htf_allow_secondary,
             )
         )
 

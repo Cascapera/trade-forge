@@ -286,12 +286,14 @@ export type Type15 = "ponto_continuo";
 export type AllowSecondary = boolean;
 export type BreakevenAtR5 = number | null;
 export type Timeframe = "M1" | "M5" | "M15" | "M30" | "H1" | "H4" | "D1" | "W1";
+export type HtfAllowSecondary = boolean;
 export type HtfOffset = number | null;
 export type StopBuffer = number;
 export type VolumeFilter2 = boolean;
 export type Type16 = "structure_choch";
 export type AllowSecondary1 = boolean;
 export type BreakevenAtR6 = number | null;
+export type HtfAllowSecondary1 = boolean;
 export type HtfOffset1 = number | null;
 export type MaxBos = number | null;
 export type StopBuffer1 = number;
@@ -901,6 +903,15 @@ export interface StructureChochSetup {
  * by the broker's offset — a known, accepted difference, not a silent one. Stating the number
  * still moves the cut onto the server's clock. It was required from 2026-09-09 until then, and
  * that refused every point of a grid varying `htf` without a clock beside it.
+ *
+ * `htf_regions` and `htf_allow_secondary` choose which untouched regions above may release
+ * (his choice, 2026-09-29). `any`, the default, is any region, whichever way the structure above
+ * points; `with_trend` is only a region the **last break** above offered — in favour of the
+ * structure it left, an older one of the same side not counting — and a side released and still
+ * without an entry is shut when the structure above turns against it. `htf_allow_secondary`
+ * false keeps an impulse's primary region alone. A region that does not qualify still dies at
+ * its first touch and releases nothing. Both are read only with an `htf`; the defaults are the
+ * rule every recorded result ran under.
  */
 export interface StructureParams {
   allow_secondary?: AllowSecondary;
@@ -909,7 +920,9 @@ export interface StructureParams {
     "edge" | "midpoint" | "return_pass" | "botinha" | "fffd" | "martelo" | "martelo_forca" | "gift" | "barra_ignorada";
   gift_stop?: "gift" | "forca";
   htf?: Timeframe | null;
+  htf_allow_secondary?: HtfAllowSecondary;
   htf_offset?: HtfOffset;
+  htf_regions?: "any" | "with_trend";
   side?: "long" | "short" | "both";
   stop_buffer?: StopBuffer;
   volume_filter?: VolumeFilter2;
@@ -934,7 +947,9 @@ export interface ContinuationParams {
     "edge" | "midpoint" | "return_pass" | "botinha" | "fffd" | "martelo" | "martelo_forca" | "gift" | "barra_ignorada";
   gift_stop?: "gift" | "forca";
   htf?: Timeframe | null;
+  htf_allow_secondary?: HtfAllowSecondary1;
   htf_offset?: HtfOffset1;
+  htf_regions?: "any" | "with_trend";
   max_bos?: MaxBos;
   side?: "long" | "short" | "both";
   stop_buffer?: StopBuffer1;

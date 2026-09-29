@@ -1,4 +1,4 @@
-import { validateStrategy, type Strategy } from '@tradeforge/schema'
+import { setupSpec, validateStrategy, type Strategy } from '@tradeforge/schema'
 
 import bollinger from '../../../../packages/schema/fixtures/valid/bollinger_breakout_with_adx_filter.json'
 import channel from '../../../../packages/schema/fixtures/valid/channel_breakout_with_atr_filter.json'
@@ -249,10 +249,15 @@ describe('the one document that comes back spelled out', () => {
     // the same decision, so that a blank timeframe above cannot be mistaken for a forgotten one.
     // `htf_offset` joined on 2026-09-09 with the broker's clock, which the semantic layer demands
     // beside `htf` and refuses without it — so `null` here is the pair being off together.
+    // `htf_allow_secondary` joined on 2026-09-29, a flag like `allow_secondary` and written the
+    // same way; `true` (every region above) is the rule every recorded result ran under, and the
+    // engine reads it only with an `htf`. Its sibling `htf_regions` is an enum with a default,
+    // left out when untouched like `entry_point`.
     expect(rebuilt.setup.params).toEqual({
       allow_secondary: false,
       breakeven_at_r: null,
       htf: null,
+      htf_allow_secondary: true,
       htf_offset: null,
       max_bos: null,
       volume_filter: false,
@@ -296,9 +301,19 @@ describe('what the form keeps that it has no control for', () => {
     // the path where the document leaves everything to the engine. A form that helpfully filled
     // in the schema's numbers would turn "unset" into "chosen" the moment anybody re-saved, and
     // the document would stop asking the question it was written to ask.
+    // A flag is the one exception, because a checkbox has no "unset": it is always written, so an
+    // absent one must come back as what the engine reads — its default. Until 29/09 every flag
+    // defaulted to false and this read `value === false`; `htf_allow_secondary` defaults to true.
     const result = formOf(setupContinuation as unknown as Strategy)
     if (!result.ok) throw new Error('refused')
-    expect(Object.values(result.form.setup.values).every((value) => value === '' || value === false))
-      .toBe(true)
+    const flags = new Map(
+      setupSpec('structure_continuation')
+        .params.filter((param) => param.kind === 'boolean')
+        .map((param) => [param.name, param.default]),
+    )
+    expect(flags.get('htf_allow_secondary')).toBe(true)
+    for (const [name, value] of Object.entries(result.form.setup.values)) {
+      expect(value, name).toBe(flags.has(name) ? flags.get(name) : '')
+    }
   })
 })

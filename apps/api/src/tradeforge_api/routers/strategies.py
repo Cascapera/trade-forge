@@ -17,7 +17,9 @@ from typing import Annotated, Any
 from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import ValidationError
 from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import aggregate_order_by
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import aliased
 
 from tradeforge_api.deps import SessionDep
 from tradeforge_api.runner import timeframe_refusal
@@ -27,7 +29,7 @@ from tradeforge_api.schemas import (
     StrategyListItem,
     StrategyOut,
 )
-from tradeforge_db.models import Backtest, Strategy
+from tradeforge_db.models import Backtest, CatalogEntry, Strategy, SweepPoint
 from tradeforge_schema import SemanticValidationError, assert_executable
 from tradeforge_schema import Strategy as StrategyDSL
 
@@ -215,12 +217,28 @@ def list_strategies(  # noqa: PLR0913 — one query parameter per question a pic
     # Derived from the runs, never flagged on the row: a boolean column would be a second place
     # for the same truth, and on the day the two disagreed it is the column that would be
     # believed.
-    generated = (
-        select(Backtest.strategy_id)
-        .where(Backtest.study_id.is_not(None) | Backtest.sweep_id.is_not(None))
-        .distinct()
-        .scalar_subquery()
+    #
+    # ⚠️ **And a sweep's point with no run of its own is still a point** (29/09). A point another
+    # point answers (`same_as`) or one refused at its chart is written to `sweep_points` with its
+    # strategy and never gets a run — so "has a run in a sweep" let 20 thousand of them through as
+    # authored, and his base CHoCH was lost among forty of its own points. `sweep_points` names
+    # every point a sweep expanded, run or not. Both read as anti-joins: one pass each over their
+    # tables (0.75 s over 7.4 million points, measured), where `NOT IN` a list that size is minutes.
+    ran_in_a_grid = (
+        select(Backtest.id)
+        .where(
+            Backtest.strategy_id == Strategy.id,
+            Backtest.study_id.is_not(None) | Backtest.sweep_id.is_not(None),
+        )
+        .exists()
     )
+    a_sweep_point = (
+        select(SweepPoint.sweep_id).where(SweepPoint.strategy_id == Strategy.id).exists()
+    )
+    # The shelf's labels for a lineage — any version of it, since an entry pins the version it was
+    # saved against and the row here is the latest. The name a person gave it is how he looks for
+    # it: the document behind "CHOCH COMPLETO" is called `SCHOCH-20260922-222429`.
+    shelved = aliased(Strategy)
 
     # The latest version of each lineage. `DISTINCT ON` is Postgres' own way of saying "one row
     # per name", and it is one pass over an index rather than the self-join a portable query
@@ -230,9 +248,7 @@ def list_strategies(  # noqa: PLR0913 — one query parameter per question a pic
         select(Strategy).distinct(Strategy.name).order_by(Strategy.name, Strategy.version.desc())
     )
     if not include_generated:
-        newest = newest.where(Strategy.id.not_in(generated))
-    if q is not None and q.strip() != "":
-        newest = newest.where(Strategy.name.ilike(f"%{q.strip()}%"))
+        newest = newest.where(~ran_in_a_grid, ~a_sweep_point)
     # ⚠️ Exact, and separate from `q` rather than a mode of it. The builder's question is "is
     # this name taken?", and answering it with a substring search means filtering in the client
     # and hoping the match landed on the first page — which is the same shape of guess that
@@ -240,7 +256,24 @@ def list_strategies(  # noqa: PLR0913 — one query parameter per question a pic
     if name is not None:
         newest = newest.where(Strategy.name == name)
 
-    lineages = newest.subquery()
+    # ⚠️ **The authored lineages first, the search over them after** (29/09, measured): left to
+    # itself Postgres pushed `q` inside and tested a substring of every strategy's name before the
+    # anti-joins cut them down — 2.8 s for "choch" over the real table. A materialised CTE holds
+    # the few authored lineages (0.2 s with `sweep_points` indexed by strategy) and the search
+    # reads only those: 0.34 s.
+    authored = newest.cte("authored").prefix_with("MATERIALIZED")
+    found = select(authored)
+    if q is not None and q.strip() != "":
+        pattern = f"%{q.strip()}%"
+        labelled = (
+            select(CatalogEntry.id)
+            .join(shelved, shelved.id == CatalogEntry.strategy_id)
+            .where(shelved.name == authored.c.name, CatalogEntry.name.ilike(pattern))
+            .exists()
+        )
+        found = found.where(authored.c.name.ilike(pattern) | labelled)
+
+    lineages = found.subquery()
     rows = session.execute(
         select(
             lineages,
@@ -251,6 +284,11 @@ def list_strategies(  # noqa: PLR0913 — one query parameter per question a pic
             .where(Backtest.strategy_id == lineages.c.id)
             .scalar_subquery()
             .label("runs"),
+            select(func.array_agg(aggregate_order_by(CatalogEntry.name, CatalogEntry.name)))
+            .join(shelved, shelved.id == CatalogEntry.strategy_id)
+            .where(shelved.name == lineages.c.name)
+            .scalar_subquery()
+            .label("catalog"),
         )
         .order_by(lineages.c.created_at.desc())
         .limit(limit)
@@ -271,6 +309,7 @@ def list_strategies(  # noqa: PLR0913 — one query parameter per question a pic
                 schema_version=row.schema_version,
                 setup=setup_of(row.definition),
                 runs=row.runs,
+                catalog=list(row.catalog or []),
                 created_at=row.created_at,
             )
             for row in rows

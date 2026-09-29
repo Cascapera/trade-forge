@@ -17,6 +17,7 @@ paragraph said the same thing on its own for months and the loss happened twice 
 """
 
 import datetime as dt
+import uuid
 from collections.abc import Callable
 from decimal import Decimal
 from pathlib import Path
@@ -29,7 +30,7 @@ from sqlalchemy.orm import Session
 
 from tradeforge_api.config import Settings
 from tradeforge_api.main import create_app
-from tradeforge_db.models import Dataset, Instrument
+from tradeforge_db.models import Dataset, Instrument, Sweep, SweepPoint
 from tradeforge_engine.domain import AssetClass
 
 pytestmark = pytest.mark.integration
@@ -343,3 +344,53 @@ def test_the_exact_lookup_finds_a_name_a_grid_generated(
     assert hidden["total"] == 0
     # …and findable when asked, which is what keeps a name from being offered twice.
     assert [item["name"] for item in shown["items"]] == ["MME9 base [period=5]"]
+
+
+def test_a_sweep_point_with_no_run_of_its_own_is_left_out_and_the_base_carries_its_label(
+    session_factory: Callable[[], Session], settings: Settings, tmp_path: Path
+) -> None:
+    """29/09, his report: forty CHoCH points in the picker and not the base CHoCH. A point another
+    point answers (`same_as`), or one refused at its chart, has no run — so "ran in a sweep" let it
+    through. `sweep_points` names it anyway. And the base is found by the name he gave it on the
+    shelf, which is not the document's (`SCHOCH-20260922-222429`)."""
+    with TestClient(_app(settings, session_factory, tmp_path)) as client:
+        base = _create(client, "SCHOCH-20260922-222429")
+        point = _create(client, "SCHOCH COMPLETO [M15 · period=21]", period=21)
+        entry = client.post("/catalog", json={"name": "CHOCH COMPLETO", "strategy_id": base})
+        assert entry.status_code == 201, entry.text
+        with session_factory() as session:
+            sweep = Sweep(
+                entry_ids=[entry.json()["id"]],
+                symbols=["EURUSD"],
+                timeframes=["M15"],
+                date_from=dt.datetime(2024, 1, 1, tzinfo=dt.UTC),
+                date_to=dt.datetime(2024, 6, 1, tzinfo=dt.UTC),
+                initial_capital=Decimal(10000),
+                skipped=[],
+            )
+            session.add(sweep)
+            session.flush()
+            # Written like a point answered by another: its strategy, and no run.
+            session.add(
+                SweepPoint(
+                    sweep_id=sweep.id,
+                    position=0,
+                    strategy_id=uuid.UUID(point),
+                    entry_id=entry.json()["id"],
+                    label="period=21",
+                    coordinates={"setup.params.period": 21},
+                    same_as="period=9",
+                )
+            )
+            session.commit()
+
+        default = client.get("/strategies").json()
+        everything = client.get("/strategies", params={"include_generated": True}).json()
+        by_label = client.get("/strategies", params={"q": "choch completo"}).json()
+
+    assert [(item["name"], item["catalog"]) for item in default["items"]] == [
+        ("SCHOCH-20260922-222429", ["CHOCH COMPLETO"])
+    ]
+    assert everything["total"] == 2
+    # Found by the shelf's name, though the document's name holds no "completo".
+    assert [item["id"] for item in by_label["items"]] == [base]

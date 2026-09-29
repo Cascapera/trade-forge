@@ -1963,6 +1963,8 @@ class SweepPoint(Base):
     __table_args__ = (
         CheckConstraint("jsonb_typeof(coordinates) = 'object'", name="coordinates_are_an_object"),
         Index("ix_sweep_points_sweep_id_strategy_id", "sweep_id", "strategy_id"),
+        # "Is this strategy a point of any sweep?" — the strategy picker's question (rev_0041).
+        Index("ix_sweep_points_strategy_id", "strategy_id"),
     )
 
 

@@ -737,6 +737,10 @@ export interface StrategyListItem {
    */
   setup: string | null
   /** How many backtests have used it — what tells a real strategy from an abandoned draft. */
+  /** The catalogue's labels for this lineage, alphabetically (29/09) — the names he gave it.
+   *  The document behind "CHOCH COMPLETO" is called `SCHOCH-20260922-222429`. Absent from
+   *  older fixtures. */
+  catalog?: string[]
   runs: number
   created_at: string
 }

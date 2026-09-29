@@ -1,3 +1,5 @@
+import type { StrategyListItem } from '../api/types'
+
 // What the catalogue shows out of what the server sent: the rows a search leaves behind, and a
 // sweep said in one line. Pure, and separate from the screen, because both are decisions with a
 // wrong answer — and a decision with a wrong answer wants a test that does not have to render.
@@ -51,4 +53,11 @@ export function gridSummary(grid: Record<string, unknown[]>): string {
   return Object.entries(grid)
     .map(([path, values]) => `${path.split('.').at(-1) ?? path}=${values.join(', ')}`)
     .join(' · ')
+}
+
+/** What an option is called: the catalogue's names first when the lineage is on the shelf, with
+ *  the document's name beside them, since the two are different facts. */
+export function labelOf(item: StrategyListItem): string {
+  const shelf = item.catalog ?? []
+  return shelf.length === 0 ? item.name : `${shelf.join(' / ')} — ${item.name}`
 }

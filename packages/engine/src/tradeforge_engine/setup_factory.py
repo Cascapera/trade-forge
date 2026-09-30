@@ -178,37 +178,22 @@ def _optional_timeframe(params: Mapping[str, object], key: str, into: dict[str, 
     into[key] = delta
 
 
-def _optional_hours(params: Mapping[str, object], key: str, into: dict[str, Any]) -> None:
-    """Copy a clock offset across as a duration; an explicit `null` means it was not stated.
+def _no_stated_clock(params: Mapping[str, object]) -> None:
+    """Refuse a document that states the broker's clock itself.
 
-    The document says hours ahead of UTC — `3`, `-5.5`, the same vocabulary the collector's
-    `--server-offset` takes — and the engine reasons in `timedelta`. Half hours are real
-    timezones, so this is a float rather than an int.
-
-    ⚠️ **No trip through `Decimal` here, unlike `_decimal` above, and the difference is the return
-    type.** That helper exists because its value stays a `Decimal` all the way into a stop price,
-    where a JSONB float's binary dust would survive; this one becomes a `timedelta`, which is
-    microseconds and rounds the dust away regardless. An earlier version wrote
-    `float(Decimal(str(raw)))` and claimed the same protection — measured, `float(Decimal(str(x)))`
-    is `float(x)` for every value this field takes, so the claim was decoration on a no-op. A
-    docstring is an assertion, and this one was false.
+    ⚠️ **The clock is the instrument's since 30/09** (his rule: *"htf offset não vamos usar em
+    nenhum time frame, vamos adotar o horário do servidor mt5 como real"*). It reaches the setup
+    from the run (`InstrumentSpec.server_offset`), the same number the collector stored the
+    candles under. Every saved document carries `htf_offset: null`, which is read as the silence
+    it is; a number is refused rather than obeyed or ignored — obeyed, two runs of one market
+    would cut its higher bars in two places again; ignored, the document would claim a cut it
+    did not get.
     """
-    if key in params and params[key] is None:
-        into[key] = None
-        return
-    if key not in params:
-        return
-    raw = params[key]
-    if isinstance(raw, bool) or not isinstance(raw, int | float | str):
-        raise EngineError(f"setup {key} must be hours ahead of UTC, got {raw!r}")
-    try:
-        hours = float(raw)
-    except ValueError:
-        # A string that is not a number reaches here only from a hand-built document — the DSL
-        # types the field as `number | null`. It still gets a sentence rather than the bare
-        # `ValueError` traceback `compile_strategy` promises never to raise.
-        raise EngineError(f"setup {key} must be hours ahead of UTC, got {raw!r}") from None
-    into[key] = dt.timedelta(hours=hours)
+    if params.get("htf_offset") is not None:
+        raise EngineError(
+            f"setup htf_offset is no longer read, got {params['htf_offset']!r}; the higher bars "
+            f"are cut on the broker's clock, which is the instrument's (server_offset)"
+        )
 
 
 def _one_or_both(
@@ -291,7 +276,7 @@ def _ponto_continuo(params: Mapping[str, object], _timeframe: dt.timedelta | Non
 
 
 def _structure_kwargs(
-    params: Mapping[str, object], timeframe: dt.timedelta | None
+    params: Mapping[str, object], timeframe: dt.timedelta | None, server_offset: dt.timedelta
 ) -> dict[str, Any]:
     kwargs: dict[str, Any] = {}
     _flag(params, "allow_secondary", kwargs)
@@ -309,9 +294,12 @@ def _structure_kwargs(
     # when the document set a filter: the class accepts it unused, but a keyword the document
     # never asked for is a third place a default could hide (see the module docstring).
     _optional_timeframe(params, "htf", kwargs)
-    _optional_hours(params, "htf_offset", kwargs)
+    _no_stated_clock(params)
     if kwargs.get("htf") is not None:
         kwargs["timeframe"] = timeframe
+        # The bars above close on the broker's clock, which is the instrument's (30/09) — passed
+        # only with a filter, the rule the base timeframe above follows.
+        kwargs["htf_offset"] = server_offset
         # Which regions above may release (29/09) — read only with a filter, and passed only when
         # they narrow the class's defaults (any region, secondaries included), the rule `side`
         # follows below: a keyword the document never asked for is a place a default could hide.
@@ -332,19 +320,21 @@ def _structure_kwargs(
 def _structure_choch(
     params: Mapping[str, object],
     timeframe: dt.timedelta | None,
+    server_offset: dt.timedelta,
     reading: MarketReading | None = None,
 ) -> Strategy:
     return StructureStrategy(
         qualifier=ChochQualifier(),
         name="choch",
         reading=reading,
-        **_structure_kwargs(params, timeframe),
+        **_structure_kwargs(params, timeframe, server_offset),
     )
 
 
 def _structure_continuation(
     params: Mapping[str, object],
     timeframe: dt.timedelta | None,
+    server_offset: dt.timedelta,
     reading: MarketReading | None = None,
 ) -> Strategy:
     continuation: dict[str, Any] = {}
@@ -353,12 +343,12 @@ def _structure_continuation(
         qualifier=ContinuationQualifier(**continuation),
         name="continuation",
         reading=reading,
-        **_structure_kwargs(params, timeframe),
+        **_structure_kwargs(params, timeframe, server_offset),
     )
 
 
 _ReadingBuilder = Callable[
-    [Mapping[str, object], dt.timedelta | None, MarketReading | None], Strategy
+    [Mapping[str, object], dt.timedelta | None, dt.timedelta, MarketReading | None], Strategy
 ]
 
 _READING_BUILDERS: dict[str, _ReadingBuilder] = {
@@ -374,15 +364,15 @@ _BUILDERS: dict[str, Callable[[Mapping[str, object], dt.timedelta | None], Strat
     "mme9_pullback": _mme9_pullback,
     "mme9_turn": _mme9_turn,
     "ponto_continuo": _ponto_continuo,
-    "structure_choch": _structure_choch,
-    "structure_continuation": _structure_continuation,
 }
+"""The setups that read no market of their own, and so neither a higher timeframe nor a clock."""
 
 
 def build_setup(
     node: Mapping[str, object],
     *,
     timeframe: dt.timedelta | None = None,
+    server_offset: dt.timedelta = dt.timedelta(0),
     reading: MarketReading | None = None,
 ) -> Strategy:
     """Build the named setup, or raise. `node` is the document's `setup` block.
@@ -397,43 +387,48 @@ def build_setup(
     and the class refuses such a filter without it, so a caller that builds a filtered setup by
     hand cannot get one that silently reads nothing.
 
+    `server_offset` is the broker's clock, the instrument's (`InstrumentSpec.server_offset`, 30/09):
+    where a setup reading a higher timeframe closes those bars. Zero is a broker on UTC.
+
     `reading` is a batch's shared market (ADR-0029), `shared_reading`'s answer for this block —
     refused for any setup that does not read one, rather than built without it and left to read
     a market of its own that the batch cannot see.
     """
     kind = node.get("type")
+    reads = _READING_BUILDERS.get(kind) if isinstance(kind, str) else None
+    if reads is not None:
+        return reads(_params(node), timeframe, server_offset, reading)
     if reading is not None:
-        reads = _READING_BUILDERS.get(kind) if isinstance(kind, str) else None
-        if reads is None:
-            raise EngineError(f"a {kind!r} setup does not read a shared market")
-        return reads(_params(node), timeframe, reading)
+        raise EngineError(f"a {kind!r} setup does not read a shared market")
     build = _BUILDERS.get(kind) if isinstance(kind, str) else None
     if build is None:
-        raise EngineError(f"unknown setup type {kind!r}; this engine builds {sorted(_BUILDERS)}")
+        known = sorted({*_BUILDERS, *_READING_BUILDERS})
+        raise EngineError(f"unknown setup type {kind!r}; this engine builds {known}")
     return build(_params(node), timeframe)
 
 
 def shared_reading(
-    node: Mapping[str, object], *, timeframe: dt.timedelta
+    node: Mapping[str, object],
+    *,
+    timeframe: dt.timedelta,
+    server_offset: dt.timedelta = dt.timedelta(0),
 ) -> tuple[dt.timedelta | None, dt.timedelta] | None:
     """What of the market this setup block reads, as a key — or `None` if it cannot share one.
 
     Two blocks with the same key, over the same bars, read the same market: the same structure and
     regions on the chart, and the same regions above (the higher timeframe and the broker's clock
-    it is cut on). That is what a batch groups runs by (ADR-0029), and `MarketReading` is built from
-    it. `None` for a setup that builds no reading, and for a block too malformed to parse — running
-    it on its own is never wrong, only slower.
+    it is cut on, the instrument's since 30/09). That is what a batch groups runs by (ADR-0029),
+    and `MarketReading` is built from it. `None` for a setup that builds no reading, and for a
+    block too malformed to parse — running it on its own is never wrong, only slower.
     """
     kind = node.get("type")
     if not isinstance(kind, str) or kind not in _READING_BUILDERS:
         return None
     try:
-        kwargs = _structure_kwargs(_params(node), timeframe)
+        kwargs = _structure_kwargs(_params(node), timeframe, server_offset)
     except (EngineError, ValueError):
         return None
-    htf = kwargs.get("htf")
-    offset = kwargs.get("htf_offset")
-    return (htf, dt.timedelta(0) if offset is None else offset)
+    return (kwargs.get("htf"), server_offset)
 
 
 def reading_for(

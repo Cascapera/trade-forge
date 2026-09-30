@@ -307,15 +307,13 @@ def test_an_axis_may_carry_null_and_the_documents_it_makes_are_runnable() -> Non
         "schema_version": "1.0",
         "name": "choch",
         "timeframe": "M15",
-        "setup": {"type": "structure_choch", "params": {"htf": "H4", "htf_offset": 3}},
+        "setup": {"type": "structure_choch", "params": {"htf": "H4"}},
         "risk": {"sizing": {"type": "percent_risk", "params": {"percent": 1.0}}},
     }
 
     points = expand(base, {"setup.params.htf": [None, "H4"]})
 
     assert [_params(point.document)["htf"] for point in points] == [None, "H4"]
-    # The clock stays put on both, which is what a cross product does to an axis it is not varying.
-    assert {_params(point.document)["htf_offset"] for point in points} == {3}
     for point in points:
         assert_executable(Strategy.model_validate(point.document))
 
@@ -327,7 +325,7 @@ def test_a_point_that_switches_a_rule_off_is_named_for_it() -> None:
         "schema_version": "1.0",
         "name": "choch",
         "timeframe": "M15",
-        "setup": {"type": "structure_choch", "params": {"htf": "H4", "htf_offset": 3}},
+        "setup": {"type": "structure_choch", "params": {"htf": "H4"}},
         "risk": {"sizing": {"type": "percent_risk", "params": {"percent": 1.0}}},
     }
 

@@ -405,8 +405,38 @@ def test_an_unknown_asset_class_is_rejected(session: Session) -> None:
             text(
                 "INSERT INTO instruments"
                 " (id, symbol, name, asset_class, currency_quote,"
+                "  tick_size, tick_value, contract_size, digits, server_offset)"
+                " VALUES (:id, 'X', 'X', 'nft', 'USD', 0.01, 0.01, 1, 2, interval '0')"
+            ),
+            {"id": uuid.uuid4()},
+        )
+
+
+@pytest.mark.parametrize("clock", ["15 hours", "-15 hours"])
+def test_a_broker_clock_no_timezone_has_is_rejected(session: Session, clock: str) -> None:
+    """A clock is a timezone, within fourteen hours of UTC — the engine's `MAX_SERVER_OFFSET`."""
+    with pytest.raises(IntegrityError, match="ck_instruments_server_offset_is_a_clock"):
+        session.execute(
+            text(
+                "INSERT INTO instruments"
+                " (id, symbol, name, asset_class, currency_quote,"
+                "  tick_size, tick_value, contract_size, digits, server_offset)"
+                " VALUES (:id, 'X', 'X', 'forex', 'USD', 0.01, 0.01, 1, 2,"
+                "  CAST(:clock AS interval))"
+            ),
+            {"id": uuid.uuid4(), "clock": clock},
+        )
+
+
+def test_an_instrument_written_without_a_clock_is_rejected(session: Session) -> None:
+    """No server default (30/09): SQL that forgets the broker's clock is refused, not given one."""
+    with pytest.raises(IntegrityError, match="server_offset"):
+        session.execute(
+            text(
+                "INSERT INTO instruments"
+                " (id, symbol, name, asset_class, currency_quote,"
                 "  tick_size, tick_value, contract_size, digits)"
-                " VALUES (:id, 'X', 'X', 'nft', 'USD', 0.01, 0.01, 1, 2)"
+                " VALUES (:id, 'X', 'X', 'forex', 'USD', 0.01, 0.01, 1, 2)"
             ),
             {"id": uuid.uuid4()},
         )

@@ -41,7 +41,7 @@ from tradeforge_engine.average_setups import AverageEntryPoint
 from tradeforge_engine.bar_setups import GiftStop
 from tradeforge_engine.domain import Side
 from tradeforge_engine.higher_timeframe import RegionChoice
-from tradeforge_engine.setup_factory import _BUILDERS, build_setup
+from tradeforge_engine.setup_factory import _BUILDERS, _READING_BUILDERS, build_setup
 from tradeforge_engine.setups import (
     ChochQualifier,
     ContinuationQualifier,
@@ -110,6 +110,17 @@ _SETUPS: dict[str, tuple[type[Any], dict[str, Any]]] = {
         _owned_by(ContinuationParams, StructureStrategy, max_bos=ContinuationQualifier),
     ),
 }
+
+# The fields the DSL keeps only as `null` and the factory reads nothing from — `htf_offset` since
+# 30/09, when the broker's clock became the instrument's. A document may still carry the silence;
+# there is no value to probe and no constructor to reach.
+_RETIRED = frozenset({"htf_offset"})
+
+
+def _live(model: type[Any]) -> set[str]:
+    """The fields a document can still set to something."""
+    return set(model.model_fields) - _RETIRED
+
 
 # Per setup, per field: what the document carries, and what must reach the constructor. Every
 # value here is deliberately *not* the field's default — `test_every_probe_is_a_non_default_value`
@@ -191,8 +202,6 @@ _PROBES: dict[str, dict[str, tuple[Any, Any]]] = {
         "volume_filter": (True, True),
         # The timeframe above (2026-09-08): the document names a bar, the class takes a duration.
         "htf": ("H4", dt.timedelta(hours=4)),
-        # And the broker's clock beside it (2026-09-09), demanded whenever `htf` is named.
-        "htf_offset": (3, dt.timedelta(hours=3)),
         # The side filter (18/09): the wire string arrives as the engine's enum, and the probe is
         # `short` because `both` is what the class answers when nothing arrives.
         "side": ("short", Side.SHORT),
@@ -212,8 +221,6 @@ _PROBES: dict[str, dict[str, tuple[Any, Any]]] = {
         "gift_stop": ("forca", GiftStop.FORCA),
         "volume_filter": (True, True),
         "htf": ("H4", dt.timedelta(hours=4)),
-        # And the broker's clock beside it (2026-09-09), demanded whenever `htf` is named.
-        "htf_offset": (3, dt.timedelta(hours=3)),
         "side": ("short", Side.SHORT),
         "htf_regions": ("with_trend", RegionChoice.WITH_TREND),
         "htf_allow_secondary": (False, False),
@@ -343,7 +350,7 @@ def test_every_parameter_the_schema_declares_is_probed(kind: str) -> None:
     probes is checked against the model itself: add a field to the DSL and this is what tells you
     the routing test has a hole, instead of the routing test quietly not covering it."""
     model, _ = _SETUPS[kind]
-    assert set(_PROBES[kind]) == set(model.model_fields)
+    assert set(_PROBES[kind]) == _live(model)
 
 
 @pytest.mark.parametrize("kind", _IDS)
@@ -387,7 +394,7 @@ def test_every_parameter_reaches_the_constructor(
             f"{kind}.{field}: expected a {type(expected).__name__}, the constructor got a "
             f"{type(seen[field]).__name__}"
         )
-    assert set(model.model_fields) <= set(seen)
+    assert _live(model) <= set(seen)
 
 
 @pytest.mark.parametrize("kind", _IDS)
@@ -430,7 +437,7 @@ def test_every_setup_the_schema_names_can_be_built() -> None:
         member.model_fields["type"].annotation.__args__[0]
         for member in get_args(get_args(Setup.__value__)[0])
     }
-    assert schema_types == set(_BUILDERS) == set(_SETUPS)
+    assert schema_types == set(_BUILDERS) | set(_READING_BUILDERS) == set(_SETUPS)
 
 
 def test_the_choch_qualifier_takes_no_parameters() -> None:

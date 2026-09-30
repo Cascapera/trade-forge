@@ -247,8 +247,8 @@ describe('the one document that comes back spelled out', () => {
     // `htf` joined on 2026-09-08, by the rule `max_bos` already followed: a cleared nullable
     // field is the rule switched off and is written as `null` — the first nullable *enum*, and
     // the same decision, so that a blank timeframe above cannot be mistaken for a forgotten one.
-    // `htf_offset` joined on 2026-09-09 with the broker's clock, which the semantic layer demands
-    // beside `htf` and refuses without it — so `null` here is the pair being off together.
+    // `htf_offset` is not written: since 2026-09-30 the broker's clock is the instrument's, and
+    // the DSL keeps the field only so documents saved with its `null` stay valid.
     // `htf_allow_secondary` joined on 2026-09-29, a flag like `allow_secondary` and written the
     // same way; `true` (every region above) is the rule every recorded result ran under, and the
     // engine reads it only with an `htf`. Its sibling `htf_regions` is an enum with a default,
@@ -258,7 +258,6 @@ describe('the one document that comes back spelled out', () => {
       breakeven_at_r: null,
       htf: null,
       htf_allow_secondary: true,
-      htf_offset: null,
       max_bos: null,
       volume_filter: false,
     })

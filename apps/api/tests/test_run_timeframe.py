@@ -24,7 +24,7 @@ def filtered(timeframe: str, htf: str = "H4") -> dict[str, Any]:
         "schema_version": "1.0",
         "name": f"CHoCH {timeframe} under {htf}",
         "timeframe": timeframe,
-        "setup": {"type": "structure_choch", "params": {"htf": htf, "htf_offset": 3}},
+        "setup": {"type": "structure_choch", "params": {"htf": htf}},
         "exit": {"take_profit": {"type": "risk_multiple", "params": {"rr": 3}}},
         "risk": {"sizing": {"type": "percent_risk", "params": {"percent": 0.5}}},
     }
@@ -81,9 +81,10 @@ class TestTheFilteredDocument:
         # **run's**, and when the document's is the finer of the two, `BarAggregator`'s straddle
         # guard compares the wrong width and stops firing.
         #
-        # Measured with a broker clock of 3h30, which `htf_offset` accepts: document H1 run at
-        # H1 raises on the bar that straddles 00:30, and document M15 run at H1 produces six H4
-        # bars and no complaint at all. The mismatch silences the guard that exists to catch it.
+        # Measured with a broker clock of 3h30, which an instrument's `server_offset` accepts:
+        # document H1 run at H1 raises on the bar that straddles 00:30, and document M15 run at H1
+        # produces six H4 bars and no complaint at all. The mismatch silences the guard that exists
+        # to catch it.
         reason = timeframe_refusal(filtered("M15"), run_at)
         assert reason is not None
         assert "M15" in reason

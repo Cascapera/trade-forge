@@ -43,9 +43,9 @@ def _document(kind: str, params: dict[str, object], *, rr: float | None = 2) -> 
     }
 
 
-def _grid(*, htf: bool, offset: int = 0) -> list[dict[str, Any]]:
+def _grid(*, htf: bool) -> list[dict[str, Any]]:
     """What a sweep varies over one market: entry, side, breakeven, the ladder — not the reading."""
-    filtered: dict[str, object] = {"htf": "H4", "htf_offset": offset} if htf else {}
+    filtered: dict[str, object] = {"htf": "H4"} if htf else {}
     return [
         _document(
             kind,
@@ -73,12 +73,18 @@ def _broker() -> BacktestBroker:
     )
 
 
-def _alone(document: dict[str, Any], candles: list[Candle], *, snapshots: bool) -> Any:
+def _alone(
+    document: dict[str, Any],
+    candles: list[Candle],
+    *,
+    snapshots: bool,
+    clock: dt.timedelta = dt.timedelta(0),
+) -> Any:
     return run(
         candles=candles,
         timeframe=HOUR,
         instrument=EURUSD,
-        strategy=compile_strategy(document),
+        strategy=compile_strategy(document, server_offset=clock),
         broker=_broker(),
         risk=PercentRiskManager(percent=Decimal(1)),
         record_snapshots=snapshots,
@@ -86,15 +92,22 @@ def _alone(document: dict[str, Any], candles: list[Candle], *, snapshots: bool) 
 
 
 def _batched(
-    documents: list[dict[str, Any]], candles: list[Candle], *, snapshots: bool
+    documents: list[dict[str, Any]],
+    candles: list[Candle],
+    *,
+    snapshots: bool,
+    clock: dt.timedelta = dt.timedelta(0),
 ) -> list[Any]:
-    keys = {shared_reading(document["setup"], timeframe=HOUR) for document in documents}
+    keys = {
+        shared_reading(document["setup"], timeframe=HOUR, server_offset=clock)
+        for document in documents
+    }
     (key,) = keys
     assert key is not None
     reading = reading_for(key, timeframe=HOUR)
     members = [
         BatchMember(
-            strategy=compile_strategy(document, reading=reading),
+            strategy=compile_strategy(document, server_offset=clock, reading=reading),
             broker=_broker(),
             risk=PercentRiskManager(percent=Decimal(1)),
         )
@@ -125,12 +138,15 @@ def test_every_member_comes_out_as_it_does_alone(
     seed: int, htf: bool, offset: int, snapshots: bool
 ) -> None:
     candles = _walk(seed)
-    documents = _grid(htf=htf, offset=offset)
+    documents = _grid(htf=htf)
+    # The broker's clock is the instrument's (30/09), handed to every run rather than written in
+    # its document.
+    clock = dt.timedelta(hours=offset)
 
-    outcomes = _batched(documents, candles, snapshots=snapshots)
+    outcomes = _batched(documents, candles, snapshots=snapshots, clock=clock)
 
     assert [outcome.error for outcome in outcomes] == [None] * len(documents)
-    alone = [_alone(document, candles, snapshots=snapshots) for document in documents]
+    alone = [_alone(document, candles, snapshots=snapshots, clock=clock) for document in documents]
     assert [outcome.result for outcome in outcomes] == alone
     # The walk has to have traded, or the equality is between empty results.
     assert sum(len(result.trades) for result in alone) > 0
@@ -249,13 +265,25 @@ class TestSharedReading:
         assert keys == {(4 * HOUR, dt.timedelta(0))}
 
     def test_a_filter_of_another_timeframe_or_clock_reads_another(self) -> None:
-        def key(params: dict[str, object]) -> object:
-            return shared_reading({"type": "structure_choch", "params": params}, timeframe=HOUR)
+        def key(params: dict[str, object], clock: int = 0) -> object:
+            return shared_reading(
+                {"type": "structure_choch", "params": params},
+                timeframe=HOUR,
+                server_offset=dt.timedelta(hours=clock),
+            )
 
         assert key({}) == (None, dt.timedelta(0))
         assert key({"htf": "H4"}) == (4 * HOUR, dt.timedelta(0))
         assert key({"htf": "D1"}) != key({"htf": "H4"})
-        assert key({"htf": "H4", "htf_offset": 3}) != key({"htf": "H4"})
+        # The clock is the instrument's (30/09), and it still tells two readings apart.
+        assert key({"htf": "H4"}, clock=3) == (4 * HOUR, dt.timedelta(hours=3))
+        assert key({"htf": "H4"}, clock=3) != key({"htf": "H4"})
+
+    def test_a_document_that_states_the_clock_cannot_share_a_reading(self) -> None:
+        # Refused by the factory (30/09), so read as "cannot share" — the same answer as any
+        # block too malformed to parse, and the run then fails alone with the reason.
+        stated = {"type": "structure_choch", "params": {"htf": "H4", "htf_offset": 3}}
+        assert shared_reading(stated, timeframe=HOUR) is None
 
     def test_a_setup_without_a_reading_cannot_share_one(self) -> None:
         average = {"type": "mme9_breakout", "params": {"side": "long", "period": 9}}

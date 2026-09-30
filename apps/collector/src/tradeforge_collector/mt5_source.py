@@ -239,6 +239,9 @@ class MT5Source:
             tick_value=Decimal(str(info.trade_tick_value)),
             contract_size=Decimal(str(info.trade_contract_size)),
             digits=digits,
+            # The clock every bar of this symbol is stored under (`_to_utc`), and so where its
+            # day and the bars above the chart begin (30/09) — the instrument's, not a strategy's.
+            server_offset=self._offset,
         )
 
     def symbols(self) -> list[SymbolInfo]:

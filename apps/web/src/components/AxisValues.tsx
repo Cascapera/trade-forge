@@ -205,9 +205,9 @@ export function AxisValues(props: {
           being compared against. Offered as a toggle rather than as a suggestion because it is
           not a number somebody might have meant to type.
 
-          ⚠️ `offIsASetting`, never `nullable`: `htf_offset` is nullable and its `null` is not a
-          choice — the semantics refuse it wherever `htf` is named, so this button used to be one
-          click from a 422 that takes a whole study with it. */}
+          ⚠️ `offIsASetting`, never `nullable`: a parameter whose `null` is legal only beside a null
+          companion is not a choice — `htf_offset` was one, and this button used to be one click
+          from a 422 that takes a whole study with it. */}
       {offIsASetting(numeric) && (
         <button
           type="button"

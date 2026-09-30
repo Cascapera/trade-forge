@@ -152,14 +152,18 @@ describe('the parameters a form has to treat specially', () => {
     })
   })
 
-  it('publishes requiredWith on no parameter since the clock became optional', () => {
-    // No parameter publishes the key since 26/09, when `htf_offset: null` became UTC; the
-    // reader's own branches are held by `params.test.ts`.
-    expect(param('structure_choch', 'htf_offset')).toMatchObject({ kind: 'number', nullable: true })
-    expect(param('structure_choch', 'htf_offset')).not.toHaveProperty('requiredWith')
+  it('publishes no control for the retired clock', () => {
+    // `htf_offset` survives in the DSL only as `null` since 30/09 — the broker's clock is the
+    // instrument's — so saved documents stay valid; a field with one answer is not a question.
+    for (const type of ['structure_choch', 'structure_continuation'] as const) {
+      expect(setupSpec(type).params.map((one) => one.name)).not.toContain('htf_offset')
+    }
+  })
 
-    // The mirror: nullable, and nothing required with it. Without this, a reader that stamped
-    // every nullable with the key would pass the assertion above.
+  it('publishes requiredWith on no parameter', () => {
+    // No parameter publishes the key since 26/09; the reader's own branches are held by
+    // `params.test.ts`. Without this, a reader that stamped every nullable with the key would
+    // pass unnoticed.
     // `not.toHaveProperty` rather than reading the field: a boolean parameter has no such key at
     // all, so the union does not offer it to read. And it separates absent from
     // present-and-`undefined`, which `toEqual` does not — a spread that carried the key along
@@ -173,7 +177,6 @@ describe('the parameters a form has to treat specially', () => {
     // grid's button and the builder's caption — and two of them were reading `nullable` alone.
     expect(offIsASetting(param('structure_choch', 'htf'))).toBe(true)
     expect(offIsASetting(param('structure_choch', 'breakeven_at_r'))).toBe(true)
-    expect(offIsASetting(param('structure_choch', 'htf_offset'))).toBe(true)
     // Required, so its absence is a forgotten answer rather than a rule switched off.
     expect(offIsASetting(param('mme9_breakout', 'period'))).toBe(false)
     // A flag is drawn as its two boxes, with no third for a value it could never hold.

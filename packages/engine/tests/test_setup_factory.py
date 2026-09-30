@@ -353,8 +353,9 @@ def test_the_higher_timeframe_reaches_both_structure_setups_as_a_duration() -> N
     is the one a test written against the choch alone would leave unproven."""
     for kind in ("structure_choch", "structure_continuation"):
         setup = build_setup(
-            {"type": kind, "params": {"htf": "H4", "htf_offset": 3}},
+            {"type": kind, "params": {"htf": "H4"}},
             timeframe=dt.timedelta(minutes=15),
+            server_offset=dt.timedelta(hours=3),
         )
         assert isinstance(setup, StructureStrategy)
         assert setup._gate is not None
@@ -383,59 +384,58 @@ def test_a_higher_timeframe_without_the_document_s_own_is_refused_by_the_class()
 def test_a_higher_timeframe_that_is_not_higher_is_refused_by_the_class() -> None:
     with pytest.raises(ValueError, match="coarser"):
         build_setup(
-            {"type": "structure_choch", "params": {"htf": "M15", "htf_offset": 0}},
+            {"type": "structure_choch", "params": {"htf": "M15"}},
             timeframe=dt.timedelta(hours=1),
         )
 
 
 @pytest.mark.parametrize("params", [{"htf": "H4"}, {"htf": "H4", "htf_offset": None}])
-def test_a_higher_timeframe_with_no_clock_is_cut_on_utc(params: dict[str, object]) -> None:
-    """Absent and `null` alike are UTC since 2026-09-26 (*"nao vamos fazer o ajuste"*)."""
+def test_a_higher_timeframe_is_cut_on_the_clock_it_is_handed(params: dict[str, object]) -> None:
+    """The broker's clock is the instrument's since 30/09 (*"vamos adotar o horário do servidor mt5
+    como real"*): it reaches the setup from the run, and the document's `null` is the silence every
+    saved one carries. Half hours are real timezones, so the probe is one — and it is not zero, or
+    the assertion would hold for a factory that dropped the clock and let the aggregator's own
+    arithmetic answer."""
     setup = build_setup(
-        {"type": "structure_choch", "params": params}, timeframe=dt.timedelta(minutes=15)
+        {"type": "structure_choch", "params": params},
+        timeframe=dt.timedelta(minutes=15),
+        server_offset=dt.timedelta(hours=-5, minutes=-30),
+    )
+    assert isinstance(setup, StructureStrategy)
+    assert setup._gate is not None
+    assert setup._gate.offset == dt.timedelta(hours=-5, minutes=-30)
+
+
+def test_a_higher_timeframe_handed_no_clock_is_cut_on_utc() -> None:
+    """Zero is a broker on UTC — the default of a setup built by hand, never a run's (`runner`)."""
+    setup = build_setup(
+        {"type": "structure_choch", "params": {"htf": "H4"}}, timeframe=dt.timedelta(minutes=15)
     )
     assert isinstance(setup, StructureStrategy)
     assert setup._gate is not None
     assert setup._gate.offset == dt.timedelta(0)
 
 
-def test_the_broker_s_clock_reaches_the_engine_as_a_duration_half_hours_included() -> None:
-    """The document says hours ahead of UTC; the engine reasons in durations. Half hours are real
-    timezones, so the probe is one — and it is not zero, or the assertion would hold for a factory
-    that dropped the field and let the aggregator's own arithmetic answer."""
-    setup = build_setup(
-        {"type": "structure_choch", "params": {"htf": "H4", "htf_offset": -5.5}},
-        timeframe=dt.timedelta(minutes=15),
-    )
-    assert isinstance(setup, StructureStrategy)
-    assert setup._gate is not None
-    assert setup._gate.offset == dt.timedelta(hours=-5, minutes=-30)
-
-
-@pytest.mark.parametrize("offset", [True, "abc", [3], {"hours": 3}])
-def test_a_clock_that_is_not_a_number_of_hours_is_refused(offset: object) -> None:
-    """Every shape that is not a number, and `"abc"` is the one that took a second look: the type
-    check lets a `str` through — `"3"` is a perfectly good number on a hand-built document — so
-    only the conversion can refuse it, and it has to refuse with a sentence. `compile_strategy`
-    promises a malformed document fails with one rather than a traceback, and a bare `ValueError`
-    from `float` would break that promise on this one field."""
-    with pytest.raises(EngineError, match="setup htf_offset must be hours ahead of UTC"):
+@pytest.mark.parametrize("offset", [3, 0, -5.5, "3", True])
+def test_a_document_that_states_the_clock_is_refused(offset: object) -> None:
+    """Obeyed, two runs of one market would cut its bars above in two places again; ignored, the
+    document would claim a cut it did not get. Zero too: a stated UTC is still a stated clock, and
+    the instrument's may not be UTC."""
+    with pytest.raises(EngineError, match="setup htf_offset is no longer read"):
         build_setup(
             {"type": "structure_choch", "params": {"htf": "H4", "htf_offset": offset}},
             timeframe=dt.timedelta(minutes=15),
+            server_offset=dt.timedelta(hours=3),
         )
 
 
-def test_a_clock_written_as_a_string_of_digits_is_read() -> None:
-    """The other half of letting `str` through: `"3"` is the number three, and refusing it would
-    make the type check the rule instead of the value."""
+def test_a_clock_handed_to_a_setup_without_a_filter_reaches_nothing() -> None:
+    """Passed only with a filter, like the base timeframe: without one there are no bars above."""
     setup = build_setup(
-        {"type": "structure_choch", "params": {"htf": "H4", "htf_offset": "-5.5"}},
-        timeframe=dt.timedelta(minutes=15),
+        {"type": "structure_continuation", "params": {}}, server_offset=dt.timedelta(hours=3)
     )
     assert isinstance(setup, StructureStrategy)
-    assert setup._gate is not None
-    assert setup._gate.offset == dt.timedelta(hours=-5, minutes=-30)
+    assert setup._gate is None
 
 
 # --------------------------------------------------------------------------- #

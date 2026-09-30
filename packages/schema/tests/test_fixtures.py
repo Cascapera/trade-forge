@@ -37,6 +37,9 @@ SCHEMA_ERRORS = {
     # its own because the engine would run a period of 2 quite happily — measured: it arms
     # identically to 3. What refuses it is the published grammar, not arithmetic.
     "average_period_below_the_floor.json": "greater than or equal to 3",
+    # The broker's clock is the instrument's since 30/09: the field survives only as `null`, so
+    # the documents saved with it stay valid, and a number is the schema's to refuse.
+    "htf_offset_stated.json": "htf_offset",
 }
 
 SEMANTIC_ERRORS = {

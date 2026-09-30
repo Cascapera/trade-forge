@@ -22,14 +22,12 @@ describe('apiFailure', () => {
     const refused = new ApiError(422, {
       message: 'strategy is well-formed but cannot run',
       errors:
-        "setup.params.htf_offset: a higher timeframe needs the broker's clock: give htf_offset, " +
-        "the hours its server runs ahead of UTC (the collector's --server-offset)",
+        'setup.params.htf: the higher timeframe H1 must be coarser than H4',
     })
 
     expect(apiFailure(refused, FALLBACK)).toBe(
-      'strategy is well-formed but cannot run: setup.params.htf_offset: a higher timeframe ' +
-        "needs the broker's clock: give htf_offset, the hours its server runs ahead of UTC " +
-        "(the collector's --server-offset)",
+      'strategy is well-formed but cannot run: setup.params.htf: the higher timeframe H1 must ' +
+        'be coarser than H4',
     )
   })
 

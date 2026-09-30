@@ -74,7 +74,7 @@ def _filtered(name: str) -> dict[str, Any]:
         "timeframe": "M15",
         "setup": {
             "type": "structure_choch",
-            "params": {"htf": "H4", "htf_offset": 3, "stop_buffer": 0.1},
+            "params": {"htf": "H4", "stop_buffer": 0.1},
         },
         "exit": {"take_profit": {"type": "risk_multiple", "params": {"rr": 3}}},
         "risk": {"sizing": {"type": "percent_risk", "params": {"percent": 0.5}}},
@@ -157,8 +157,9 @@ def test_a_filtered_backtest_runs_only_on_the_documents_own_timeframe(client: An
 
     H4 is a whole number of H1 bars, so the DSL is satisfied — but the gate is built with the
     **document's** bar width and fed the **run's**, and a document finer than the run silences
-    `BarAggregator`'s straddle guard. Measured with a broker clock of 3h30, which `htf_offset`
-    accepts: the honest run raises on a straddling bar and the mismatched one says nothing.
+    `BarAggregator`'s straddle guard. Measured with a broker clock of 3h30, which an instrument's
+    `server_offset` accepts: the honest run raises on a straddling bar and the mismatched one says
+    nothing.
     """
     filtered = _save(client, _filtered(f"choch {uuid.uuid4()}"))
 

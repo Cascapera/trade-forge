@@ -33,9 +33,11 @@ def batch_size(timeframe: str) -> int:
     return _SMALLER.get(timeframe, BATCH_SIZE)
 
 
-BatchKey = tuple[str, str, tuple[dt.timedelta | None, dt.timedelta], WarmUp]
-"""(symbol, chart, reading, warm-up) — every run of one launch already shares its window. The
-warm-up because a batch feeds one stream of bars to all its runs (ADR-0030, `warm_window`)."""
+BatchKey = tuple[str, str, dt.timedelta | None, WarmUp]
+"""(symbol, chart, timeframe above, warm-up) — every run of one launch already shares its window.
+The warm-up because a batch feeds one stream of bars to all its runs (ADR-0030, `warm_window`).
+The broker's clock the bars above are cut on is the symbol's (30/09), so the symbol already
+carries it; the worker reads it off the instrument when it builds the reading."""
 
 
 def batch_key(document: Mapping[str, Any], symbol: str, timeframe: str) -> BatchKey | None:
@@ -44,7 +46,7 @@ def batch_key(document: Mapping[str, Any], symbol: str, timeframe: str) -> Batch
     if not isinstance(setup, Mapping):
         return None
     reading = shared_reading(setup, timeframe=step(timeframe))
-    return None if reading is None else (symbol, timeframe, reading, warmup_for(document))
+    return None if reading is None else (symbol, timeframe, reading[0], warmup_for(document))
 
 
 class Batcher:

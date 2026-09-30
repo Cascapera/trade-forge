@@ -16,8 +16,8 @@ import { ApiError } from './client'
  * 1. **A sentence.** A `detail` that is a string — a 409 on a taken name, an unknown symbol.
  * 2. **`{message, errors}` with a list.** Pydantic refused the document's *shape*; `errors` is
  *    its structured failure list, one entry per field.
- * 3. **`{message, errors}` with a string.** The DSL's *meaning* check refused — `htf` without
- *    `htf_offset`, an `htf` finer than the document's own timeframe. `SemanticValidationError`
+ * 3. **`{message, errors}` with a string.** The DSL's *meaning* check refused — an `htf` finer
+ *    than the document's own timeframe, or not a whole number of its bars. `SemanticValidationError`
  *    joins its reasons into one line and the API forwards that line verbatim.
  *
  * ⚠️ **Shape 3 is the one that was being dropped**, and it is the shape a strategy meets most

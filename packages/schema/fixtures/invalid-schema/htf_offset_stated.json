@@ -1,0 +1,14 @@
+{
+  "schema_version": "1.0",
+  "name": "Relógio do HTF escrito na estratégia",
+  "description": "Desde 30/09 o relógio do servidor é do ativo, não da estratégia: htf_offset só aceita null. Um número aqui cortaria o H4 de um mercado em dois lugares, conforme a estratégia.",
+  "timeframe": "M15",
+  "setup": {
+    "type": "structure_choch",
+    "params": {
+      "htf": "H4",
+      "htf_offset": 3
+    }
+  },
+  "risk": { "sizing": { "type": "percent_risk", "params": { "percent": 1.0 } } }
+}

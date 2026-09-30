@@ -2898,3 +2898,16 @@ tela pergunta de novo a cada edição (400 ms de espera). A maior parte é monta
 4. **Pedaços de um run mais longo** (2020–25 respondendo 2022–24, ou emendar um ano): medir antes
    quanto aquecimento, trade aberto na virada e saldo mudam o resultado.
 5. **A tela não mostra que um run é cópia** (`reused_from`).
+
+## O relógio do servidor é do ativo (30/09) — o que ficou para depois
+
+- **O coletor não recusa um relógio diferente do que o ativo já tem.** O `upsert_instruments`
+  sobrescreve `server_offset` com o que a coleta mediu. Uma coleta que mede no inverno (2 h) sobre
+  um ativo gravado com 3 h deixa o parquet com barras deslocadas de dois jeitos e o ativo dizendo só
+  o último. Deveria recusar (ou exigir `--server-offset` igual ao gravado).
+- **Semana do agregador começa na segunda; a do MT5, no domingo (servidor).** Sem barras no domingo
+  do servidor não muda nada (forex/UKOIL abrem segunda 00:00 servidor), mas um ativo que negocia no
+  domingo do servidor teria o W1 de cima cortado diferente do gráfico. Não medido.
+- **Os runs com `htf` do motor 0.4.0** (UKOIL M15/M30/H1 da `87b0efc0`) ficaram obsoletos: foram
+  cortados em UTC. Não são reaproveitados (versão do motor), mas continuam no banco.
+

@@ -2202,11 +2202,10 @@ class StructureStrategy:
         # better than guessing the base from the spacing of the first two candles.
         if htf is not None and timeframe is None:
             raise ValueError("a higher-timeframe filter needs the setup's own timeframe")
-        # ⚠️ **No broker clock means UTC** — his decision of 2026-09-26 (*"nao vamos fazer o
-        # ajuste"*), reversing the rule of 2026-09-09 that demanded it. The stored candles are
-        # UTC, so an absent offset cuts the higher bars where they already are; a MetaTrader
-        # chart cuts them on the server's clock, and the regions above then sit displaced from
-        # his by the broker's offset. Known and accepted, and a stated offset still moves the cut.
+        # ⚠️ **The broker's clock comes from the instrument, not the document** (his rule, 30/09:
+        # the MetaTrader server's time is the real one). The factory hands over the run's
+        # `InstrumentSpec.server_offset`, so the bars above close where his chart closes them.
+        # `None` — a setup built by hand — is a broker on UTC.
         # ⚠️ **A timeframe with no name is refused here rather than at the chart.** `zones()`
         # labels the regions above with the bar's own name, and a duration outside the table has
         # none — built by hand, such a setup ran a whole backtest and then raised a bare

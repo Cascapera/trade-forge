@@ -570,8 +570,6 @@ function emptyHint(param: SchemaParam): string | null {
   // A parameter the schema marks `requiredWith` is nullable and its empty box is **not** off: it
   // is legal only while its companion is blank too. No parameter carries the key today.
   if (param.requiredWith !== undefined) return `empty only if ${param.requiredWith} is`
-  // `htf_offset` empty is the higher bars cut on UTC, with no broker clock applied (26/09).
-  if (param.name === 'htf_offset') return 'empty = UTC'
   return param.name === 'max_bos' ? 'empty = uncapped' : 'empty = off'
 }
 

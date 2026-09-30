@@ -38,7 +38,7 @@ def a_filtered_document() -> dict[str, Any]:
         "schema_version": "1.0",
         "name": "CHoCH under H4",
         "timeframe": "M15",
-        "setup": {"type": "structure_choch", "params": {"htf": "H4", "htf_offset": 3}},
+        "setup": {"type": "structure_choch", "params": {"htf": "H4"}},
         "risk": {"sizing": {"type": "percent_risk", "params": {"percent": 1.0}}},
     }
 

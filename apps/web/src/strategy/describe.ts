@@ -74,13 +74,6 @@ const PARAMS: Record<string, { label: string; say: Say }> = {
   max_bos: { label: 'Máximo de BOS', say: orOff('sem limite') },
   corrections: { label: 'Correções', say: String },
   htf: { label: 'Tempo gráfico superior (HTF)', say: orOff('desligado') },
-  htf_offset: {
-    label: 'Relógio do HTF',
-    say: orOff('UTC', (value) => {
-      const hours = Number(value)
-      return hours === 0 ? 'UTC' : `UTC${hours > 0 ? '+' : ''}${String(hours)}`
-    }),
-  },
   htf_regions: {
     label: 'Regiões do HTF',
     say: oneOf({
@@ -96,7 +89,6 @@ const PARAMS: Record<string, { label: string; say: Say }> = {
 
 /** Parameters read only when another one is on: shown only then, as the engine reads them. */
 const ONLY_WITH: Record<string, string> = {
-  htf_offset: 'htf',
   htf_regions: 'htf',
   htf_allow_secondary: 'htf',
 }

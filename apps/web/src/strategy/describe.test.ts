@@ -55,7 +55,8 @@ describe('describeParameters', () => {
     expect(row(on, 'Tempo gráfico superior (HTF)').value).toBe('H4')
     expect(row(on, 'Regiões do HTF').value).toBe('só a favor da última quebra')
     expect(row(on, 'Secundárias do HTF').value).toBe('só primárias')
-    expect(row(on, 'Relógio do HTF')).toMatchObject({ value: 'UTC', byDefault: true })
+    // The clock is the instrument's since 30/09, not a parameter of the strategy.
+    expect(on.some((one) => one.label === 'Relógio do HTF')).toBe(false)
   })
 
   it('marks what the sweep varied at this point, and nothing else', () => {

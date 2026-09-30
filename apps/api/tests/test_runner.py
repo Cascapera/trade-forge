@@ -12,16 +12,20 @@ from decimal import Decimal
 
 import pytest
 
+from tradeforge_api import runner
 from tradeforge_api.runner import (
+    BatchRun,
     CandleWindow,
     Measured,
     execute_backtest,
+    execute_batch,
     instrument_spec,
     spec_document,
     spec_for,
     swap_rates,
 )
 from tradeforge_db.models import Backtest, Instrument
+from tradeforge_engine import compile_strategy
 from tradeforge_engine.domain import AssetClass, Candle
 from tradeforge_engine.errors import EngineError
 from tradeforge_engine.testing import BULLISH_START_EMA3, bar
@@ -43,6 +47,7 @@ def an_instrument() -> Instrument:
         tick_value=Decimal("1"),
         contract_size=Decimal("100000"),
         digits=5,
+        server_offset=dt.timedelta(0),
     )
 
 
@@ -220,6 +225,7 @@ def a_stock() -> Instrument:
         tick_value=Decimal("0.01"),
         contract_size=Decimal("1"),
         digits=2,
+        server_offset=dt.timedelta(0),
     )
 
 
@@ -417,7 +423,10 @@ def test_swap_rates_are_read_signed_and_refused_when_not_an_object() -> None:
 class TestTheKeptInstrument:
     """25/09: a run keeps the instrument it first executed with (`Backtest.instrument_spec`)."""
 
-    def row(self, tick_value: str = "1.20646181") -> Instrument:
+    def row(
+        self, tick_value: str = "1.20646181", clock: dt.timedelta = dt.timedelta(hours=3)
+    ) -> Instrument:
+        # A broker three hours ahead, never zero: zero is what a clock lost on the way reads as.
         return Instrument(
             symbol="USDCHF",
             name="US Dollar vs Swiss Franc",
@@ -428,12 +437,26 @@ class TestTheKeptInstrument:
             tick_value=Decimal(tick_value),
             contract_size=Decimal(100000),
             digits=5,
+            server_offset=clock,
         )
 
-    def test_the_document_reads_back_as_the_same_specification(self) -> None:
-        spec = instrument_spec(self.row())
+    @pytest.mark.parametrize("hours", [3, -5.5])
+    def test_the_document_reads_back_as_the_same_specification(self, hours: float) -> None:
+        clock = dt.timedelta(hours=hours)
+        spec = instrument_spec(self.row(clock=clock))
 
-        assert spec_for(Backtest(instrument_spec=spec_document(spec)), self.row("9")) == spec
+        assert spec.server_offset == clock
+        kept = spec_document(spec)
+        assert kept["server_offset_hours"] == hours
+        assert spec_for(Backtest(instrument_spec=kept), self.row("9", dt.timedelta(0))) == spec
+
+    def test_a_run_kept_before_the_clock_reads_back_on_utc(self) -> None:
+        """Kept before 30/09, with no clock: its bars above were cut on UTC (`htf_offset` null
+        everywhere), so it reads back as the zero it ran under, never as the catalogue's clock."""
+        kept = spec_document(instrument_spec(self.row()))
+        del kept["server_offset_hours"]
+
+        assert spec_for(Backtest(instrument_spec=kept), self.row()).server_offset == dt.timedelta(0)
 
     def test_a_run_that_kept_one_ignores_the_catalogue_rewritten_since(self) -> None:
         """The catalogue's tick value is today's exchange rate; the run's is the one it used."""
@@ -445,3 +468,84 @@ class TestTheKeptInstrument:
 
     def test_a_run_that_kept_none_takes_the_catalogue(self) -> None:
         assert spec_for(Backtest(), self.row("1.25")).tick_value == Decimal("1.25")
+
+
+# --------------------------------------------------------------------------- #
+# The broker's clock reaches the setup (30/09)                                  #
+# --------------------------------------------------------------------------- #
+
+THREE_HOURS = dt.timedelta(hours=3)
+
+
+def _filtered() -> dict[str, object]:
+    return {
+        "schema_version": "1.0",
+        "name": "choch under H4",
+        "timeframe": "H1",
+        "setup": {"type": "structure_choch", "params": {"htf": "H4"}},
+        "risk": {"sizing": {"type": "percent_risk", "params": {"percent": 1.0}}},
+    }
+
+
+def _clocks_handed(monkeypatch: pytest.MonkeyPatch) -> list[object]:
+    """Every `server_offset` the runner hands `compile_strategy` — the real one still builds."""
+    handed: list[object] = []
+    real = compile_strategy
+
+    def spy(document: object, **kwargs: object) -> object:
+        handed.append(kwargs.get("server_offset", "not handed"))
+        return real(document, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(runner, "compile_strategy", spy)
+    return handed
+
+
+def test_a_run_cuts_the_bars_above_on_its_instruments_clock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handed = _clocks_handed(monkeypatch)
+    spec = replace(instrument_spec(an_instrument()), server_offset=THREE_HOURS)
+
+    run_it(definition=_filtered(), instrument=spec)
+
+    assert handed == [THREE_HOURS]
+
+
+def test_a_batch_cuts_every_member_on_its_instruments_clock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handed = _clocks_handed(monkeypatch)
+    spec = replace(instrument_spec(an_instrument()), server_offset=THREE_HOURS)
+    one = BatchRun(
+        definition=_filtered(), initial_capital=Decimal(10_000), cost_model={"type": "none"}
+    )
+
+    execute_batch(
+        key=(4 * HOUR, THREE_HOURS),
+        runs=[one, one],
+        instrument=spec,
+        timeframe="H1",
+        date_from=START,
+        date_to=START + 100 * HOUR,
+        candles=dip_then_rally(),
+    )
+
+    assert handed == [THREE_HOURS, THREE_HOURS]
+
+
+def test_a_batch_whose_reading_is_cut_on_another_clock_is_refused() -> None:
+    spec = replace(instrument_spec(an_instrument()), server_offset=THREE_HOURS)
+    one = BatchRun(
+        definition=_filtered(), initial_capital=Decimal(10_000), cost_model={"type": "none"}
+    )
+
+    with pytest.raises(ValueError, match="clock"):
+        execute_batch(
+            key=(4 * HOUR, dt.timedelta(0)),
+            runs=[one],
+            instrument=spec,
+            timeframe="H1",
+            date_from=START,
+            date_to=START + 100 * HOUR,
+            candles=dip_then_rally(),
+        )

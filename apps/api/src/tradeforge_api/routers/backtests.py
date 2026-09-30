@@ -742,7 +742,9 @@ def _zones_of(read: _Window) -> list[ZoneOut]:
     No strategy is both today, which is exactly why the day one becomes both is the day nobody
     would think to look here. One `compile_strategy` is the whole prevention.
     """
-    strategy = compile_strategy(read.strategy.definition)
+    spec = spec_for(read.backtest, read.instrument)
+    # On the clock the run was cut on (30/09), or the zones above land where the run's did not.
+    strategy = compile_strategy(read.strategy.definition, server_offset=spec.server_offset)
     # Two views of one object, and they are kept apart on purpose: `Zoned` declares only
     # `zones()`, so narrowing to it would take `on_bar` away — and this is the one reader that
     # needs both. The protocol stays minimal rather than growing a method it does not mean.
@@ -750,7 +752,6 @@ def _zones_of(read: _Window) -> list[ZoneOut]:
     if marking is None:
         return []
 
-    spec = spec_for(read.backtest, read.instrument)
     account = AccountState(
         equity=read.backtest.initial_capital,
         balance=read.backtest.initial_capital,
@@ -800,7 +801,10 @@ def get_overlays(backtest_id: uuid.UUID, session: SessionDep, settings: Settings
     A strategy that implements nothing charts as bars and trades, with an empty `series`.
     """
     read = _read_the_window(session, settings, _load(session, backtest_id))
-    strategy = compile_strategy(read.strategy.definition)
+    strategy = compile_strategy(
+        read.strategy.definition,
+        server_offset=spec_for(read.backtest, read.instrument).server_offset,
+    )
     # Built for this request and used for nothing else. `overlays` hands back live, mutable
     # indicators (see `protocols.Charted`), so driving them advances the very state a running
     # strategy would read — safe here only because this instance never executes anything.

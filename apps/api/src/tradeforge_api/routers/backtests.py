@@ -667,6 +667,7 @@ def get_year_cut(
             date_to=backtest.date_to,
             first_year=first,
             last_year=last,
+            trades_by_years=metrics.trades_by_years,
         )
     except NoCut as exc:
         raise HTTPException(
@@ -677,6 +678,7 @@ def get_year_cut(
         last_year=cut.last_year,
         net_r=cut.net_r,
         yearly_r={str(year): r for year, r in cut.yearly_r.items()},
+        trades=cut.trades,
     )
 
 

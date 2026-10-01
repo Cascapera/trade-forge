@@ -1111,6 +1111,11 @@ class BacktestMetrics(Base):
     # cut would. Null before 29/09.
     sizing_by_years: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     sizing_refusals: Mapped[int | None] = mapped_column(Integer)
+    # `{"2019": {"2019": 12, "2020": 1}, ...}` — how many trades make each cell of `r_by_years`
+    # (01/10, rev_0043): what a cut gives a trade floor to stand on (`year_cut`, the walk-forward by
+    # cut). ⚠️ The trades with an R only — the ones `r_by_years` sums; a trade with no stop is in
+    # `total_trades` and in no cell. Null before 01/10.
+    trades_by_years: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
 
     backtest: Mapped[Backtest] = relationship(back_populates="metrics")
 
@@ -1151,6 +1156,10 @@ class BacktestMetrics(Base):
         CheckConstraint(
             "sizing_refusals IS NULL OR sizing_refusals >= 0",
             name="sizing_refusals_non_negative",
+        ),
+        CheckConstraint(
+            "trades_by_years IS NULL OR jsonb_typeof(trades_by_years) = 'object'",
+            name="trades_by_years_is_an_object",
         ),
     )
 
@@ -2145,6 +2154,12 @@ class SweepWalkForward(Base):
     rule: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     """How each fold chooses: a `CreateHoldout` without its window — metric, top N, floors,
     limits in R."""
+    mode: Mapped[str] = mapped_column(
+        String(8), nullable=False, default="rerun", server_default=text("'rerun'")
+    )
+    """`rerun` — each fold's training is a sweep run again, its test a reserved-window test — or
+    `cut` (01/10, rev_0043): every fold answered from the parent's own runs, cut to whole years in
+    R (`sweep_walkforward_cut`), with nothing run at all."""
 
     status: Mapped[BacktestStatus] = mapped_column(
         _enum(BacktestStatus, "sweep_walk_forward_status"), nullable=False
@@ -2163,6 +2178,7 @@ class SweepWalkForward(Base):
     __table_args__ = (
         CheckConstraint("train_years >= 1 AND test_years >= 1", name="windows_are_whole_years"),
         CheckConstraint("jsonb_typeof(rule) = 'object'", name="a_walk_forward_rule_is_an_object"),
+        CheckConstraint("mode IN ('rerun', 'cut')", name="a_walk_forward_mode_is_known"),
         Index("ix_sweep_walk_forwards_parent_sweep_id", "parent_sweep_id"),
     )
 
@@ -2189,6 +2205,10 @@ class SweepWalkForwardFold(Base):
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     """Why this fold has no test — nothing in its training could be ranked, say — while the
     others go on."""
+    cut: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    """A walk-forward by cut's answer for this fold (01/10, `sweep_walkforward_cut.FoldCut`): the
+    runs it chose, each (entry, chart) read in and out of sample, and the runs left out by reason.
+    Null for a fold that re-runs its sweep, whose answer is its test sweep."""
 
     walk_forward: Mapped[SweepWalkForward] = relationship(back_populates="folds")
 
@@ -2196,6 +2216,9 @@ class SweepWalkForwardFold(Base):
         CheckConstraint("train_to = test_from", name="test_starts_at_training_end"),
         CheckConstraint(
             "train_from < train_to AND test_from < test_to", name="windows_run_forwards"
+        ),
+        CheckConstraint(
+            "cut IS NULL OR jsonb_typeof(cut) = 'object'", name="a_fold_cut_is_an_object"
         ),
     )
 

@@ -238,3 +238,63 @@ def test_a_year_with_no_trade_is_not_checked() -> None:
     sizing["2022"]["smallest_volume"] = None
 
     assert cut(2022, 2023, sizing_by_years=sizing) == Decimal("-3") + 4 + Decimal("1.5")
+
+
+# --- the trades of a cut (01/10) --------------------------------------------------------------
+
+TRADES_BY_YEARS = {
+    "2020": {"2020": 7, "2021": 1},
+    "2021": {"2021": 4},
+    "2022": {"2022": 6, "2023": 2},
+    "2023": {"2023": 3},
+    "2024": {"2024": 9, "2025": 1},
+}
+
+
+def test_the_cut_counts_its_trades_from_the_cells_it_sums() -> None:
+    """2021-2022: 2021's four, and 2022's six — its two that left in 2023 are not the cut's, nor is
+    2020's one that left in 2021."""
+    found = cut_years(
+        r_by_years=R_BY_YEARS,
+        sizing_by_years=healthy(),
+        sizing_refusals=0,
+        initial_capital=CAPITAL,
+        date_from=FROM,
+        date_to=TO,
+        first_year=2021,
+        last_year=2022,
+        trades_by_years=TRADES_BY_YEARS,
+    )
+
+    assert (found.net_r, found.trades) == (Decimal("-1"), 10)
+
+
+def test_without_the_counts_the_cut_is_given_and_its_count_is_unknown() -> None:
+    found = cut_years(
+        r_by_years=R_BY_YEARS,
+        sizing_by_years=healthy(),
+        sizing_refusals=0,
+        initial_capital=CAPITAL,
+        date_from=FROM,
+        date_to=TO,
+        first_year=2021,
+        last_year=2022,
+    )
+
+    assert (found.net_r, found.trades) == (Decimal("-1"), None)
+
+
+def test_a_cut_with_no_trade_counts_zero_not_unknown() -> None:
+    found = cut_years(
+        r_by_years={"2020": {"2020": "1"}},
+        sizing_by_years=healthy(),
+        sizing_refusals=0,
+        initial_capital=CAPITAL,
+        date_from=FROM,
+        date_to=TO,
+        first_year=2023,
+        last_year=2024,
+        trades_by_years={"2020": {"2020": 1}},
+    )
+
+    assert (found.net_r, found.trades, found.yearly_r) == (Decimal(0), 0, {})

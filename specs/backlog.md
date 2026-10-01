@@ -2943,3 +2943,24 @@ amostra (`holdout.BEHAVIOUR_FIELDS`) —, e o CSV ganhou `clone_of`. Ficou em ab
 - **O `sweep_points` é lido inteiro a cada página** (já era antes: o filtro por entrada é um seq
   scan de ~2 GB no banco de hoje). Um índice parcial `(sweep_id, entry_id) WHERE same_as IS NULL`
   provavelmente resolve — medir.
+
+
+## Walk-forward por recorte (01/10) — o que ficou para depois
+
+O walk-forward da varredura ganhou `mode: "cut"`: cada dobra é respondida pelos runs da própria
+varredura-mãe recortados em anos inteiros (`year_cut`), sem rodar nada — e os runs passaram a gravar
+`trades_by_years` (rev_0043) junto do `r_by_years`. Ficou em aberto:
+- **Ranquear por outra métrica no recorte.** Só R líquido: o recorte guarda R e nº de trades por
+  ano, nada mais. Profit factor, expectativa, Sharpe ou drawdown em R dos anos de treino exigiriam
+  guardar mais por ano (ganho/perda brutos por célula, a curva de R ou os trades) — migration e mais
+  bytes em todo run. Hoje o pedido com outra métrica ou `max_drawdown_r` é 422.
+- **Runs antigos ficam de fora** (`no_counts`): os gravados antes de 01/10 não têm `trades_by_years`,
+  e as cópias (`reuse`) de um original antigo herdam o nulo. Só uma varredura rodada (ou copiada de
+  um original) depois desta versão responde por recorte. Dá para preencher os que guardaram trades
+  (os positivos) a partir da tabela `trades`; os perdedores, só rodando de novo.
+- **A contagem é dos trades com R** (com stop) — os mesmos que o `r_by_years` soma. Um trade sem stop
+  está no `total_trades` e em nenhuma célula, então o piso do recorte pode ser mais duro que o do run.
+- **Síncrono no pedido** (numa thread): uma varredura de ~100 mil runs é lida e recortada na hora.
+  Não medido no banco real; se passar de alguns segundos, vira um job curto.
+- **A guarda do recorte é conservadora**: um run que recusou um sinal por lote zero em qualquer ano
+  não tem recorte nenhum (`refused_cut`), mesmo dos anos certos.

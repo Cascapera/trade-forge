@@ -57,6 +57,10 @@ class RMetrics:
     window would have closed inside it."""
     positive_year_share: Decimal | None
     """Years ending above zero R over years with a trade; `None` below `MIN_YEARS_FOR_SHARE`."""
+    trades_by_years: dict[int, dict[int, int]]
+    """How many trades make each cell of `by_years` (01/10): a cut of whole years counts its trades
+    from the same cells it sums its R from (`year_cut`), so a trade floor reads the cut and not the
+    whole run."""
 
 
 def r_metrics(trades: Sequence[ClosedTrade]) -> RMetrics:
@@ -79,6 +83,7 @@ def r_metrics(trades: Sequence[ClosedTrade]) -> RMetrics:
     worst_streak_r = _ZERO
     yearly: dict[int, Decimal] = {}
     by_years: dict[int, dict[int, Decimal]] = {}
+    trades_by_years: dict[int, dict[int, int]] = {}
 
     for entered, r, left in scored:
         total += r
@@ -98,6 +103,8 @@ def r_metrics(trades: Sequence[ClosedTrade]) -> RMetrics:
         yearly[entered.year] = yearly.get(entered.year, _ZERO) + r
         exits = by_years.setdefault(entered.year, {})
         exits[left.year] = exits.get(left.year, _ZERO) + r
+        counted = trades_by_years.setdefault(entered.year, {})
+        counted[left.year] = counted.get(left.year, 0) + 1
 
     share = (
         Decimal(sum(1 for value in yearly.values() if value > _ZERO)) / Decimal(len(yearly))
@@ -112,6 +119,7 @@ def r_metrics(trades: Sequence[ClosedTrade]) -> RMetrics:
         yearly_r=yearly,
         by_years=by_years,
         positive_year_share=share,
+        trades_by_years=trades_by_years,
     )
 
 

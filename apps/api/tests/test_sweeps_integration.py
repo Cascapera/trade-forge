@@ -4112,3 +4112,255 @@ class TestAResultSaysWhatItOptimised:
         assert live["entry_name"] == renamed
         assert gone["entry_name"] is None
         assert gone["values"] == {"timeframe": "H1", "setup.params.period": 5}
+
+
+class TestTheSweepWalksForwardByCut:
+    """01/10: a walk-forward answered from the parent's own runs, cut to whole years in R — nothing
+    queued. The parent is moved to 2020-2023 by hand and its four runs finished with their R and
+    trades by year; from 2020 with two years of training and one of test, fold 0 trains on 2020-21
+    and tests 2022, fold 1 trains on 2020-22 and tests 2023.
+
+    * period 5 — 3 R a year over 2020-21, then -1 and 2, forty trades a year: the one chosen;
+    * period 7 — 10 R a year over 2020-21 on five trades a year: under the H1 floor of 30 in fold 0;
+      in fold 1, 2022's thirty trades lift it over the floor, with 0 R;
+    * period 9 — the best R of all, recorded before runs kept their trades by year;
+    * period 11 — turned a signal away for a lot of zero: the guard refuses every cut of it.
+    """
+
+    BODY: dict[str, Any] = {  # noqa: RUF012 — read-only
+        "start_year": 2020,
+        "train_years": 2,
+        "test_years": 1,
+        "folds": 2,
+        "anchored": True,
+        "top_n": 1,
+        "mode": "cut",
+    }
+    FROM = dt.datetime(2020, 1, 1, tzinfo=dt.UTC)
+    TO = dt.datetime(2024, 1, 1, tzinfo=dt.UTC)
+    RUNS: dict[int, tuple[dict[int, str], dict[int, int] | None, int]] = {  # noqa: RUF012
+        5: ({2020: "3", 2021: "3", 2022: "-1", 2023: "2"}, dict.fromkeys(range(2020, 2024), 40), 0),
+        7: ({2020: "10", 2021: "10", 2022: "-20"}, {2020: 5, 2021: 5, 2022: 30}, 0),
+        9: ({2020: "50", 2021: "50", 2022: "50", 2023: "50"}, None, 0),
+        11: (
+            {2020: "40", 2021: "40", 2022: "40", 2023: "40"},
+            dict.fromkeys(range(2020, 2024), 40),
+            1,
+        ),
+    }
+
+    def parent(
+        self,
+        client: Any,
+        session_factory: Callable[[], Session],
+        *,
+        runs: dict[int, tuple[dict[int, str], dict[int, int] | None, int]] | None = None,
+        date_from: dt.datetime | None = None,
+    ) -> str:
+        table = self.RUNS if runs is None else runs
+        entry = an_entry(
+            client, name=f"cut {uuid.uuid4()}", grid={"setup.params.period": sorted(table)}
+        )
+        launched = client.post("/sweeps", json=a_sweep_body([entry], ["EURUSD"], ["H1"]))
+        assert launched.status_code == 202, launched.text
+        sweep_id = str(launched.json()["id"])
+        opens = self.FROM if date_from is None else date_from
+        with session_factory() as session:
+            sweep = session.get(Sweep, uuid.UUID(sweep_id))
+            assert sweep is not None
+            sweep.date_from, sweep.date_to = opens, self.TO
+            for run in session.scalars(select(Backtest).where(Backtest.sweep_id == sweep.id)):
+                run.date_from, run.date_to = opens, self.TO
+            session.commit()
+        for row in client.get(f"/sweeps/{sweep_id}").json()["runs"]:
+            r, trades, refusals = table[row["values"]["setup.params.period"]]
+            self.finish(session_factory, row["run"]["id"], r, trades, refusals)
+        return sweep_id
+
+    def finish(
+        self,
+        session_factory: Callable[[], Session],
+        run_id: str,
+        r: dict[int, str],
+        trades: dict[int, int] | None,
+        refusals: int,
+    ) -> None:
+        """A run whose every trade left in the year it entered, sized well above the step."""
+        counted = sum(dict.fromkeys(r, 40).values() if trades is None else trades.values())
+        finish_trading(session_factory, run_id, net=100, trades=counted)
+        with session_factory() as session:
+            run = session.get(Backtest, uuid.UUID(run_id))
+            assert run is not None
+            assert run.metrics is not None
+            run.metrics.net_r = sum((Decimal(one) for one in r.values()), Decimal(0))
+            run.metrics.yearly_r = {str(year): one for year, one in r.items()}
+            run.metrics.r_by_years = {str(year): {str(year): one} for year, one in r.items()}
+            run.metrics.trades_by_years = (
+                None
+                if trades is None
+                else {str(year): {str(year): count} for year, count in trades.items()}
+            )
+            run.metrics.sizing_by_years = {
+                str(year): {"equity_at_start": CAPITAL, "smallest_volume": "0.40"}
+                for year in range(2020, 2024)
+            }
+            run.metrics.sizing_refusals = refusals
+            session.commit()
+
+    def walk(self, client: Any, sweep_id: str, **over: Any) -> Any:
+        return client.post(f"/sweeps/{sweep_id}/walkforward", json={**self.BODY, **over})
+
+    def test_every_fold_is_answered_at_once_from_the_parents_runs(
+        self, client: Any, session_factory: Callable[[], Session], queue: _CapturingQueue
+    ) -> None:
+        sweep_id = self.parent(client, session_factory)
+        before = len(queue.jobs)
+
+        made = self.walk(client, sweep_id)
+
+        assert made.status_code == 202, made.text
+        assert (made.json()["folds"], made.json()["runs"]) == (2, 0)
+        assert queue.jobs[before:] == [], "a walk-forward by cut runs nothing"
+        walk = client.get(f"/sweep-walkforwards/{made.json()['id']}").json()
+        assert (walk["mode"], walk["status"]) == ("cut", "done")
+        assert walk["rule"]["metric"] == "net_r"
+        first, second = walk["folds"]
+        assert [fold["stage"] for fold in walk["folds"]] == ["done", "done"]
+        assert [fold["train_sweep_id"] for fold in walk["folds"]] == [None, None]
+        assert (first["candidates"], first["chosen"]) == (4, 1)
+        assert first["excluded"] == {"no_counts": 1, "refused_cut": 1, "under_floor": 1}
+        # Fold 1's 2022 lifts period 7 over the floor: ranked, and beaten.
+        assert second["excluded"] == {"no_counts": 1, "refused_cut": 1}
+
+        (group,) = walk["groups"]
+        assert group["timeframe"] == "H1"
+        assert [Decimal(one) for one in group["medians"]] == [Decimal(-1), Decimal(2)]
+        assert [Decimal(one) for one in group["in_sample_medians"]] == [Decimal(6), Decimal(5)]
+        assert [Decimal(one) for one in group["positive_shares"]] == [Decimal(0), Decimal(1)]
+        assert group["no_trades_out"] == [0, 0]
+        assert (group["folds"], group["positive_folds"], group["most_chosen_folds"]) == (2, 1, 2)
+        assert group["most_chosen"].startswith("EURUSD · ")
+        assert "5" in group["most_chosen"]
+        listed = client.get(f"/sweeps/{sweep_id}/walkforwards").json()
+        assert [(one["id"], one["mode"]) for one in listed] == [(made.json()["id"], "cut")]
+        # Nothing to conduct: the job leaves it as it is.
+        with session_factory() as session:
+            assert advance(session, uuid.UUID(made.json()["id"])) == ([], False)
+
+    def test_a_test_year_with_no_trade_is_counted_apart_not_as_zero(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        sweep_id = self.parent(
+            client,
+            session_factory,
+            runs={5: ({2020: "3", 2021: "3", 2022: "-1"}, {2020: 40, 2021: 40, 2022: 40}, 0)},
+        )
+
+        walk = client.get(f"/sweep-walkforwards/{self.walk(client, sweep_id).json()['id']}").json()
+
+        (group,) = walk["groups"]
+        assert group["medians"][1] is None
+        assert group["no_trades_out"] == [0, 1]
+        assert (group["folds"], group["positive_folds"]) == (2, 0)
+
+    def test_a_floor_asked_for_reads_the_cuts_trades(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        """A floor of 10 on H1 lets period 7's ten trades of 2020-21 in; its 20 R wins fold 0."""
+        sweep_id = self.parent(client, session_factory)
+
+        walk = client.get(
+            f"/sweep-walkforwards/{self.walk(client, sweep_id, min_trades={'H1': 10}).json()['id']}"
+        ).json()
+
+        first = walk["folds"][0]
+        assert first["excluded"] == {"no_counts": 1, "refused_cut": 1}
+        (group,) = walk["groups"]
+        assert Decimal(group["in_sample_medians"][0]) == Decimal(20)
+        assert Decimal(group["medians"][0]) == Decimal(-20)
+
+    def test_a_fold_with_nothing_to_rank_is_failed_with_why_and_is_no_look(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        sweep_id = self.parent(
+            client,
+            session_factory,
+            runs={9: ({2020: "1", 2021: "1", 2022: "1", 2023: "1"}, None, 0)},
+        )
+
+        made = self.walk(client, sweep_id)
+
+        walk = client.get(f"/sweep-walkforwards/{made.json()['id']}").json()
+        assert [fold["stage"] for fold in walk["folds"]] == ["failed", "failed"]
+        assert walk["folds"][0]["error"] == (
+            "no run of the sweep can be ranked on 2020-2021: "
+            "1 recorded before runs kept their trades by year"
+        )
+        assert walk["groups"] == []
+        # Its folds tested nothing: a second walk over the same years is a first look.
+        again = self.walk(client, sweep_id)
+        assert again.status_code == 202, again.text
+        assert (
+            "retest" not in client.get(f"/sweep-walkforwards/{again.json()['id']}").json()["rule"]
+        )
+
+    def test_what_a_cut_cannot_answer_is_refused(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        sweep_id = self.parent(client, session_factory)
+
+        metric = self.walk(client, sweep_id, metric="profit_factor")
+        drawdown = self.walk(client, sweep_id, max_drawdown_r="10")
+        outside = self.walk(client, sweep_id, start_year=2019)
+        net_r = self.walk(client, sweep_id, metric="net_r")
+
+        assert metric.status_code == 422
+        assert metric.json()["detail"] == (
+            "a walk-forward by cut ranks by net R only, not profit_factor: a cut keeps R and "
+            "trades by year, and nothing else"
+        )
+        assert drawdown.status_code == 422
+        assert "no drawdown limit" in drawdown.json()["detail"]
+        assert outside.status_code == 422
+        assert outside.json()["detail"] == (
+            "the sweep ran 2020-01-01 to 2024-01-01: 2019 lie outside it, and a cut answers only "
+            "years the sweep ran"
+        )
+        assert net_r.status_code == 202, net_r.text
+
+    def test_a_parent_that_does_not_hold_a_year_whole_is_refused(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        sweep_id = self.parent(
+            client, session_factory, date_from=dt.datetime(2020, 3, 1, tzinfo=dt.UTC)
+        )
+
+        refused = self.walk(client, sweep_id)
+
+        assert refused.status_code == 422
+        assert refused.json()["detail"] == (
+            "the sweep ran 2020-03-01 to 2024-01-01: 2020 are not whole years in it, and a cut "
+            "answers whole years only"
+        )
+
+    def test_its_test_years_are_used_once_as_any_walk_forwards(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        """His rule D (01/10) holds by cut too: the folds look at their test years."""
+        sweep_id = self.parent(client, session_factory)
+        first = self.walk(client, sweep_id).json()["id"]
+
+        by_cut = self.walk(client, sweep_id)
+        rerun = self.walk(client, sweep_id, mode="rerun", metric="net_profit")
+        retest = self.walk(client, sweep_id, retest=True)
+
+        assert by_cut.status_code == 409, by_cut.text
+        used = by_cut.json()["detail"]["used_by"]
+        assert {(one["kind"], one["id"], one["fold"]) for one in used} == {
+            ("walk_forward", first, 0),
+            ("walk_forward", first, 1),
+        }
+        assert rerun.status_code == 409, rerun.text
+        assert retest.status_code == 202, retest.text
+        rule = client.get(f"/sweep-walkforwards/{retest.json()['id']}").json()["rule"]
+        assert (rule["retest"], rule["retest_of"]) == (True, [first])

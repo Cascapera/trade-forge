@@ -36,6 +36,14 @@ function planned(
   })
 }
 
+/** The whole years a sweep's window holds: from the first 1 January it starts by, to the year
+ *  before the one it ends in — `year_cut`'s bounds, which a walk-forward by cut is refused past. */
+function wholeYears(dateFrom: string, dateTo: string): { first: number; last: number } {
+  const opens = Number(dateFrom.slice(0, 4))
+  const onNewYear = new Date(dateFrom).getTime() === Date.UTC(opens, 0, 1)
+  return { first: onNewYear ? opens : opens + 1, last: Number(dateTo.slice(0, 4)) - 1 }
+}
+
 /**
  * Walk a finished sweep forward (25/09, path B): at each fold the whole sweep runs again on a
  * training window, its best points are chosen by the rule below, and they run on the window after.
@@ -52,6 +60,11 @@ function planned(
  * ⚠️ **Test years an earlier test of this sweep already used are refused (01/10)** — a 409 naming
  * those tests, a reserved-window test's or an earlier walk-forward's folds — and the retest box is
  * offered then, as on the reserved-window launcher.
+ *
+ * ⚠️ **By cut (01/10) nothing runs**: every fold is answered from the sweep's own runs cut to whole
+ * years in R. So it ranks by net R alone, its years must be whole years inside the sweep's, and only
+ * runs recorded since 01/10 count their trades by year — the older ones are left out, and counted.
+ * No cost to confirm; the same test years are still used once.
  */
 export function SweepWalkForwardLauncher(props: { sweep: SweepOut }): React.JSX.Element {
   const { sweep } = props
@@ -70,7 +83,9 @@ export function SweepWalkForwardLauncher(props: { sweep: SweepOut }): React.JSX.
   const [charts, setCharts] = useState<string[]>(sweep.timeframes)
   const [floors, setFloors] = useState<Record<string, string>>({})
   const [retest, setRetest] = useState(false)
+  const [byCut, setByCut] = useState(false)
   const usedBy = windowUsedBy(create.error)
+  const whole = wholeYears(sweep.date_from, sweep.date_to)
 
   // The runs a fold trains again: not the ones the sweep failed (cancelled by hand among them).
   const all =
@@ -103,9 +118,11 @@ export function SweepWalkForwardLauncher(props: { sweep: SweepOut }): React.JSX.
             ? 'Tick at least one chart.'
             : !floorsValid
               ? 'A trade floor is a whole number of at least 1.'
-              : !understood
-                ? 'Confirm the cost first.'
-                : null
+              : byCut && (startYear < whole.first || lastTest > whole.last)
+                ? `By cut, every year must be a whole year of the sweep: ${String(whole.first)}–${String(whole.last)}.`
+                : !byCut && !understood
+                  ? 'Confirm the cost first.'
+                  : null
 
   const launch = (): void => {
     const minTrades: Record<string, number> = {}
@@ -121,11 +138,12 @@ export function SweepWalkForwardLauncher(props: { sweep: SweepOut }): React.JSX.
         folds,
         anchored,
         top_n: topN,
-        metric,
+        metric: byCut ? 'net_r' : metric,
         ...(Object.keys(minTrades).length > 0 ? { min_trades: minTrades } : {}),
         // In the sweep's order; left out when every chart walks, as before 28/09.
         ...(some ? { timeframes: sweep.timeframes.filter((one) => charts.includes(one)) } : {}),
         ...(retest ? { retest: true } : {}),
+        ...(byCut ? { mode: 'cut' as const } : {}),
       },
       {
         onSuccess: (made) => {
@@ -165,6 +183,40 @@ export function SweepWalkForwardLauncher(props: { sweep: SweepOut }): React.JSX.
         </p>
       </div>
 
+      <fieldset className="space-y-1 text-sm">
+        <legend className="sr-only">How each fold is answered</legend>
+        <label className="flex items-center gap-2">
+          <input
+            type="radio"
+            name="walk-mode"
+            checked={!byCut}
+            onChange={() => {
+              setByCut(false)
+            }}
+          />
+          Run every fold again
+        </label>
+        <label className="flex items-center gap-2">
+          <input
+            type="radio"
+            name="walk-mode"
+            checked={byCut}
+            onChange={() => {
+              setByCut(true)
+            }}
+          />
+          By cut (without running again)
+        </label>
+        {byCut && (
+          <p className="text-xs text-slate-400">
+            Every fold is read from this sweep&apos;s own runs, cut to whole years in R. It ranks by
+            net R only, its years must be whole years of the sweep ({whole.first}–{whole.last}),
+            and only runs recorded since 01/10 count their trades by year — older runs, and runs
+            whose cut a later start could have traded differently, are left out and counted.
+          </p>
+        )}
+      </fieldset>
+
       <div className="flex flex-wrap items-end gap-4 text-sm">
         {number('First training year', startYear, setStartYear)}
         {number('Training years', trainYears, setTrainYears)}
@@ -181,22 +233,26 @@ export function SweepWalkForwardLauncher(props: { sweep: SweepOut }): React.JSX.
           Anchored (training grows from the first year)
         </label>
         {number('Best per chart', topN, setTopN)}
-        <label className="flex flex-col gap-1">
-          Ranked by
-          <select
-            value={metric}
-            onChange={(event) => {
-              setMetric(event.target.value as HoldoutRank)
-            }}
-            className={input}
-          >
-            {METRICS.map((one) => (
-              <option key={one.value} value={one.value}>
-                {one.label}
-              </option>
-            ))}
-          </select>
-        </label>
+        {byCut ? (
+          <p className="self-center text-slate-400">Ranked by net R</p>
+        ) : (
+          <label className="flex flex-col gap-1">
+            Ranked by
+            <select
+              value={metric}
+              onChange={(event) => {
+                setMetric(event.target.value as HoldoutRank)
+              }}
+              className={input}
+            >
+              {METRICS.map((one) => (
+                <option key={one.value} value={one.value}>
+                  {one.label}
+                </option>
+              ))}
+            </select>
+          </label>
+        )}
       </div>
 
       <fieldset className="text-sm">
@@ -241,18 +297,20 @@ export function SweepWalkForwardLauncher(props: { sweep: SweepOut }): React.JSX.
         {lastTest > thisYear && ` · the last test reaches ${String(lastTest)} and stops at today`}
       </p>
 
-      <label className="flex items-center gap-2 text-sm text-amber-300">
-        <input
-          type="checkbox"
-          checked={understood}
-          onChange={(event) => {
-            setUnderstood(event.target.checked)
-          }}
-        />
-        Queues about {cost.toLocaleString('en-US')} training runs ({String(runs)} × {String(folds)}{' '}
-        folds{some && `, on ${charts.join(', ')} only — an even share of the sweep's ${String(all)}`}
-        ), plus each fold&apos;s tests.
-      </label>
+      {!byCut && (
+        <label className="flex items-center gap-2 text-sm text-amber-300">
+          <input
+            type="checkbox"
+            checked={understood}
+            onChange={(event) => {
+              setUnderstood(event.target.checked)
+            }}
+          />
+          Queues about {cost.toLocaleString('en-US')} training runs ({String(runs)} × {String(folds)}{' '}
+          folds{some && `, on ${charts.join(', ')} only — an even share of the sweep's ${String(all)}`}
+          ), plus each fold&apos;s tests.
+        </label>
+      )}
 
       {why !== null && <p className="text-xs text-amber-300">{why}</p>}
       {usedBy !== null ? (
@@ -284,7 +342,7 @@ export function SweepWalkForwardLauncher(props: { sweep: SweepOut }): React.JSX.
             <li key={one.id}>
               <Link to={`/sweep-walkforwards/${one.id}`} className="text-sky-400 hover:text-sky-300">
                 {one.folds.length} folds from {one.start_year}, {one.train_years}y train /{' '}
-                {one.test_years}y test
+                {one.test_years}y test{one.mode === 'cut' && ', by cut'}
               </Link>{' '}
               <span className="text-slate-500">· {one.status}</span>
             </li>

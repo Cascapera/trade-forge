@@ -119,3 +119,23 @@ def test_r_is_kept_by_year_of_entry_then_year_of_exit() -> None:
     # By entry the year still counts the trade it opened, as before.
     assert found.yearly_r == {2020: Decimal("1"), 2021: Decimal("3")}
     assert sum(r for exits in found.by_years.values() for r in exits.values()) == found.net_r
+
+
+def test_the_trades_are_counted_in_the_same_cells_as_their_r() -> None:
+    """01/10: a cut counts its trades from the cells it sums (`year_cut`). A trade with no stop is
+    in no cell of the R, and in no cell of the count either."""
+    new_years_eve = dt.datetime(2020, 12, 31, 23, tzinfo=dt.UTC)
+    trades = [
+        trade(day(10, 2020), "2"),
+        trade(day(11, 2020), None),
+        trade(new_years_eve, "-1"),
+        trade(day(10, 2021), "3"),
+        trade(day(11, 2021), "-1"),
+    ]
+
+    found = r_metrics(trades)
+
+    assert found.trades_by_years == {2020: {2020: 1, 2021: 1}, 2021: {2021: 2}}
+    assert {entered: set(exits) for entered, exits in found.trades_by_years.items()} == {
+        entered: set(exits) for entered, exits in found.by_years.items()
+    }

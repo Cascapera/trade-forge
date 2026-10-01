@@ -99,4 +99,49 @@ describe('SweepWalkForwardResult', () => {
     expect(screen.getByText('1 of 1')).toBeInTheDocument()
     expect(screen.getByText('EURUSD · H4 · rr=2 (1 of 1)')).toBeInTheDocument()
   })
+
+  it('marks a walk-forward by cut, reads its medians in R and says what each fold left out', async () => {
+    getSweepWalkForward.mockResolvedValue({
+      ...walk,
+      mode: 'cut',
+      rule: { top_n: 3, metric: 'net_r' },
+      folds: walk.folds.map((fold) => ({
+        ...fold,
+        train_sweep_id: null,
+        test_sweep_id: null,
+        stage: 'done' as const,
+        error: null,
+        candidates: 12,
+        chosen: 3,
+        excluded: { no_counts: 4, under_floor: 5 },
+      })),
+      groups: [
+        {
+          entry_id: 'e1',
+          entry_name: 'MM9',
+          timeframe: 'H4',
+          medians: ['1.5', '-2'],
+          folds: 2,
+          positive_folds: 1,
+          most_chosen: 'EURUSD · H4 · rr=2',
+          most_chosen_folds: 2,
+          in_sample_medians: ['6', '5'],
+          positive_shares: ['0.6667', '0'],
+          no_trades_out: [0, 1],
+        },
+      ],
+    })
+    show()
+
+    expect(await screen.findByText('by cut')).toBeInTheDocument()
+    expect(screen.getByText('+1.50 R')).toBeInTheDocument()
+    expect(screen.getByText('-2.00 R')).toBeInTheDocument()
+    expect(screen.getByText(/in \+6\.00 R · 67% positive/)).toBeInTheDocument()
+    expect(screen.getByText(/0% positive · 1 with no trade/)).toBeInTheDocument()
+    expect(
+      screen.getAllByText(
+        '3 chosen of 12 runs · left out: 4 recorded before runs kept their trades by year, 5 under the trade floor',
+      ),
+    ).toHaveLength(2)
+  })
 })

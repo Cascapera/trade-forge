@@ -47,6 +47,10 @@ def advance(session: Session, walk_forward_id: uuid.UUID) -> tuple[list[Backtest
     walk = session.get(SweepWalkForward, walk_forward_id)
     if walk is None or walk.status in (BacktestStatus.DONE, BacktestStatus.FAILED):
         return [], False
+    # A walk-forward by cut is answered at launch and never queued (01/10); were one called here,
+    # its folds have no training sweep, and each would be failed as one whose sweep was deleted.
+    if walk.mode == "cut":
+        return [], False
     walk.status = BacktestStatus.RUNNING
     session.commit()
 

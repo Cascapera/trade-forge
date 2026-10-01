@@ -124,6 +124,9 @@ class YearCut:
     net_r: Decimal
     yearly_r: dict[int, Decimal]
     """R per year of entry, of the trades the cut closes; a year with none is absent."""
+    trades: int | None = None
+    """How many trades the cut closes — from `trades_by_years`, the same cells as the R (01/10).
+    `None` for a run recorded before it kept them: unknown, never zero."""
 
 
 class NoCut(ValueError):  # noqa: N818 — an answer, not a failure: "this run has no such cut"
@@ -140,8 +143,12 @@ def cut_years(  # noqa: PLR0913 — keyword-only; each names one thing the cut i
     date_to: dt.datetime,
     first_year: int,
     last_year: int,
+    trades_by_years: Mapping[str, Mapping[str, int]] | None = None,
 ) -> YearCut:
-    """The cut `[first_year, last_year]` of a run over `[date_from, date_to)`, or `NoCut`."""
+    """The cut `[first_year, last_year]` of a run over `[date_from, date_to)`, or `NoCut`.
+
+    With `trades_by_years` the cut also counts its trades, from the cells it sums (01/10); without,
+    its count is `None`. ⚠️ A missing count never refuses the cut: the R stands on its own."""
     if first_year > last_year:
         raise NoCut(f"the cut starts in {first_year}, after it ends in {last_year}")
     if date_from > dt.datetime(first_year, 1, 1, tzinfo=dt.UTC):
@@ -171,6 +178,22 @@ def cut_years(  # noqa: PLR0913 — keyword-only; each names one thing the cut i
         last_year=last_year,
         net_r=sum(yearly.values(), _ZERO),
         yearly_r=dict(sorted(yearly.items())),
+        trades=None
+        if trades_by_years is None
+        else _count(trades_by_years, first_year=first_year, last_year=last_year),
+    )
+
+
+def _count(
+    trades_by_years: Mapping[str, Mapping[str, int]], *, first_year: int, last_year: int
+) -> int:
+    """The trades entered from `first_year` and left by `last_year`: the cells the R is cut from."""
+    return sum(
+        int(count)
+        for entered, exits in trades_by_years.items()
+        if first_year <= int(entered) <= last_year
+        for left, count in exits.items()
+        if int(left) <= last_year
     )
 
 

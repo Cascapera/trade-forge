@@ -532,6 +532,15 @@ class TestTheRunWarmsUpBeforeItsWindow:
                 cells = run.metrics.r_by_years or {}
                 total = sum(Decimal(r) for exits in cells.values() for r in exits.values())
                 assert total == (run.metrics.net_r or 0)
+                # The trades in the same cells (01/10): every trade of this walk has a stop.
+                counts = run.metrics.trades_by_years
+                assert counts is not None
+                assert {year: set(exits) for year, exits in counts.items()} == {
+                    year: set(exits) for year, exits in cells.items()
+                }
+                assert sum(n for exits in counts.values() for n in exits.values()) == (
+                    run.metrics.total_trades
+                )
                 traded += run.metrics.total_trades
             assert traded > 0, "the warmed window has to trade, or the checks are vacuous"
 
@@ -585,6 +594,11 @@ class TestTheSameMeasurementIsCopied:
                 assert all(t.snapshot is None for t in copy.trades)
                 assert copy.metrics is not None
                 assert copy.metrics.equity_curve is None
+                # Every column of the metrics, the trades by year among them (01/10).
+                assert source.metrics is not None
+                assert copy.metrics.trades_by_years is not None
+                assert copy.metrics.trades_by_years == source.metrics.trades_by_years
+                assert copy.metrics.r_by_years == source.metrics.r_by_years
                 copied += len(copy.trades)
             assert copied > 0, "the walk has to trade, or the copy compares nothing"
         assert set(_origins(session_factory, first).values()) == {None}

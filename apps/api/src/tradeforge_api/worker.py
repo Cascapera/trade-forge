@@ -240,6 +240,11 @@ def _record_done(  # noqa: PLR0913 — one finished run and what it came to
         str(entered): {str(left): str(r) for left, r in sorted(exits.items())}
         for entered, exits in sorted(in_r.by_years.items())
     }
+    # The trades in each of those cells (01/10): a cut's trade floor (`year_cut`).
+    metrics_row.trades_by_years = {
+        str(entered): {str(left): count for left, count in sorted(exits.items())}
+        for entered, exits in sorted(in_r.trades_by_years.items())
+    }
     # What says whether `r_by_years` can be cut to a window of whole years (`year_cut`).
     metrics_row.sizing_by_years = sizing_document(sizing)
     metrics_row.sizing_refusals = sizing.refusals

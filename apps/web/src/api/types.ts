@@ -78,6 +78,8 @@ export interface YearCut {
   last_year: number
   net_r: string
   yearly_r: Record<string, string>
+  /** How many trades the cut closes (01/10); null for a run recorded before it kept the count. */
+  trades?: number | null
 }
 
 /**
@@ -1576,7 +1578,15 @@ export interface CreateSweepWalkForwardRequest {
   timeframes?: string[]
   /** Walk over test windows an earlier test of this sweep already used (01/10). */
   retest?: boolean
+  /**
+   * `cut` (01/10): every fold answered from the sweep's own runs cut to whole years in R — nothing
+   * runs. Ranks by net R only and takes no drawdown limit. Left out, `rerun`.
+   */
+  mode?: WalkForwardMode
 }
+
+/** How a sweep's walk-forward answers its folds: running them again, or cutting the sweep's runs. */
+export type WalkForwardMode = 'rerun' | 'cut'
 
 export interface CreatedSweepWalkForward {
   id: string
@@ -1597,6 +1607,15 @@ export interface SweepWalkForwardFold {
   test_sweep_id: string | null
   stage: WalkForwardStage
   error: string | null
+  /** By cut only (01/10): the sweep's finished runs this fold could rank. */
+  candidates?: number | null
+  /** By cut only: the runs chosen on the training years. */
+  chosen?: number | null
+  /**
+   * By cut only: runs left out of the ranking by reason — `no_counts`, `refused_cut`,
+   * `under_floor`, `positive_years`.
+   */
+  excluded?: Record<string, number> | null
 }
 
 export interface SweepWalkForwardGroup {
@@ -1609,6 +1628,12 @@ export interface SweepWalkForwardGroup {
   positive_folds: number
   most_chosen: string | null
   most_chosen_folds: number
+  /** By cut only (01/10), per fold: the chosen runs' median net R on the training years. */
+  in_sample_medians?: (string | null)[] | null
+  /** By cut only, per fold: the share of the chosen whose test years ended above zero R. */
+  positive_shares?: (string | null)[] | null
+  /** By cut only, per fold: chosen runs with no trade in the test years, out of the median. */
+  no_trades_out?: (number | null)[] | null
 }
 
 export interface SweepWalkForwardOut {
@@ -1618,6 +1643,8 @@ export interface SweepWalkForwardOut {
   train_years: number
   test_years: number
   anchored: boolean
+  /** `cut` (01/10): every median is in R, read from the sweep's own runs. Absent before. */
+  mode?: WalkForwardMode
   rule: Record<string, unknown>
   status: BacktestStatus
   error: string | null

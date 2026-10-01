@@ -1,8 +1,8 @@
 import { Link, useParams } from 'react-router-dom'
 
 import { useSweepWalkForward } from '../api/hooks'
-import type { WalkForwardStage } from '../api/types'
-import { percent } from '../format'
+import type { SweepWalkForwardFold, WalkForwardStage } from '../api/types'
+import { inR, percent } from '../format'
 
 const STAGE_LABEL: Record<WalkForwardStage, string> = {
   training: 'training',
@@ -25,6 +25,28 @@ function lastYear(iso: string): string {
   return String(Number(iso.slice(0, 4)) - 1)
 }
 
+/** Why a walk-forward by cut left a run out of a fold's ranking (`sweep_walkforward_cut.Excluded`). */
+const EXCLUDED_LABEL: Record<string, string> = {
+  no_counts: 'recorded before runs kept their trades by year',
+  refused_cut: "refused by the cut's guard",
+  under_floor: 'under the trade floor',
+  positive_years: 'under the share of positive years',
+}
+
+/** A fold by cut: how many runs it could rank, chose, and left out — and why. */
+function CutCounts(props: { fold: SweepWalkForwardFold }): React.JSX.Element | null {
+  const { fold } = props
+  if (fold.candidates === undefined || fold.candidates === null) return null
+  const left = Object.entries(fold.excluded ?? {})
+  return (
+    <span className="block text-xs text-slate-500">
+      {fold.chosen ?? 0} chosen of {fold.candidates} runs
+      {left.length > 0 &&
+        ` · left out: ${left.map(([reason, n]) => `${String(n)} ${EXCLUDED_LABEL[reason] ?? reason}`).join(', ')}`}
+    </span>
+  )
+}
+
 /**
  * A sweep's walk-forward read as one answer (25/09): each fold's windows and stage, and per entry
  * and chart the out-of-sample median of every fold side by side.
@@ -32,6 +54,10 @@ function lastYear(iso: string): string {
  * ⚠️ **Medians and counts, never the best fold.** The question is whether the way of choosing held
  * fold after fold; the best fold is one more lucky draw. And "most chosen" says whether the same
  * point kept winning — a method whose winner changes every fold was choosing noise.
+ *
+ * ⚠️ **By cut (01/10) the medians are in R, not returns** — read from the sweep's own runs cut to
+ * whole years, nothing run again — so each cell also says the in-sample median and the share
+ * positive, and each fold the runs it left out by reason.
  */
 export function SweepWalkForwardResult(): React.JSX.Element {
   const { id } = useParams()
@@ -41,10 +67,18 @@ export function SweepWalkForwardResult(): React.JSX.Element {
   if (walk.isError) return <p className="text-red-400">Could not load the walk-forward.</p>
 
   const data = walk.data
+  const byCut = data.mode === 'cut'
   return (
     <section className="space-y-6">
       <header>
-        <h2 className="text-lg font-semibold text-slate-100">Walk-forward</h2>
+        <h2 className="text-lg font-semibold text-slate-100">
+          Walk-forward
+          {byCut && (
+            <span className="ml-2 rounded bg-slate-800 px-2 py-0.5 align-middle text-xs font-medium text-sky-300">
+              by cut
+            </span>
+          )}
+        </h2>
         <p className="mt-1 text-sm text-slate-400">
           {data.folds.length} folds from {data.start_year} · {data.train_years}y training (
           {data.anchored ? 'anchored' : 'rolling'}) · {data.test_years}y test · {data.status}
@@ -104,6 +138,7 @@ export function SweepWalkForwardResult(): React.JSX.Element {
                 {fold.error !== null && (
                   <span className="block text-xs text-slate-500">{fold.error}</span>
                 )}
+                <CutCounts fold={fold} />
               </td>
             </tr>
           ))}
@@ -113,6 +148,7 @@ export function SweepWalkForwardResult(): React.JSX.Element {
       <table className="w-full border-collapse text-left text-sm">
         <caption className="mb-2 text-left font-semibold">
           Out of sample, by entry and chart — each fold&apos;s median
+          {byCut && ' in R (in sample · share positive beneath)'}
         </caption>
         <thead>
           <tr className="border-b border-slate-800 text-xs tracking-wide text-slate-500 uppercase">
@@ -149,7 +185,15 @@ export function SweepWalkForwardResult(): React.JSX.Element {
                 <td className="px-3 py-2">{group.timeframe}</td>
                 {group.medians.map((median, k) => (
                   <td key={k} className={`px-3 py-2 ${tone(median)}`}>
-                    {median === null ? '—' : percent(median)}
+                    {byCut ? inR(median) : median === null ? '—' : percent(median)}
+                    {byCut && (group.in_sample_medians?.[k] ?? null) !== null && (
+                      <span className="block text-xs text-slate-500">
+                        in {inR(group.in_sample_medians?.[k] ?? null)} ·{' '}
+                        {percent(group.positive_shares?.[k] ?? null, 0)} positive
+                        {(group.no_trades_out?.[k] ?? 0) > 0 &&
+                          ` · ${String(group.no_trades_out?.[k])} with no trade`}
+                      </span>
+                    )}
                   </td>
                 ))}
                 <td className="px-3 py-2">

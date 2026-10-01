@@ -197,4 +197,42 @@ describe('SweepWalkForwardLauncher', () => {
     expect(createSweepWalkForward.mock.calls[0]?.[1]).not.toHaveProperty('retest')
     expect(createSweepWalkForward.mock.calls[1]?.[1]).toMatchObject({ retest: true })
   })
+
+  it('walks by cut without a cost to confirm, by net R, over whole years of the sweep (01/10)', async () => {
+    renderWithProviders(<SweepWalkForwardLauncher sweep={sweep} />)
+
+    fireEvent.click(screen.getByLabelText(/By cut/))
+
+    expect(screen.getByText(/ranks by\s+net R only/)).toBeInTheDocument()
+    expect(screen.getByText('Ranked by net R')).toBeInTheDocument()
+    expect(screen.queryByLabelText('Ranked by')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText(/Queues about/)).not.toBeInTheDocument()
+    // Four folds of two test years reach 2022; the sweep holds 2009–2019 whole.
+    expect(
+      screen.getByText('By cut, every year must be a whole year of the sweep: 2009–2019.'),
+    ).toBeInTheDocument()
+
+    fireEvent.change(field('Folds'), { target: { value: '2' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Walk forward' }))
+
+    await waitFor(() => {
+      expect(createSweepWalkForward).toHaveBeenCalledWith(
+        'sweep-1',
+        expect.objectContaining({ folds: 2, metric: 'net_r', mode: 'cut' }),
+      )
+    })
+  })
+
+  it('counts a sweep that starts after 1 January from its first whole year', () => {
+    renderWithProviders(
+      <SweepWalkForwardLauncher sweep={{ ...sweep, date_from: '2009-03-01T00:00:00Z' }} />,
+    )
+
+    fireEvent.click(screen.getByLabelText(/By cut/))
+    fireEvent.change(field('Folds'), { target: { value: '2' } })
+
+    expect(
+      screen.getByText('By cut, every year must be a whole year of the sweep: 2010–2019.'),
+    ).toBeInTheDocument()
+  })
 })

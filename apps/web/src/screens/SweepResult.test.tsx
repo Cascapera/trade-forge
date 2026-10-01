@@ -70,13 +70,17 @@ function served(
     offset: number
     limit: number
     allRuns?: boolean
+    showClones?: boolean
   },
 ) {
   const every = (data?.runs ?? []).filter((one) => one.entry_id === page.entryId)
   // The server's floor (01/10), over fixtures that count no trades: a run with no metrics is under
   // it, and every finished run here is over it.
   const over = every.filter((one) => one.run.metrics !== null)
-  const mine = page.allRuns === true ? every : over
+  const filtered = page.allRuns === true ? every : over
+  // A fixture marks a clone with `values.clone_of`; the server's grouping is held by the API tests.
+  const cloned = filtered.filter((one) => one.values.clone_of !== undefined)
+  const mine = page.showClones === true ? filtered : filtered.filter((one) => !cloned.includes(one))
   const { score } = rankingOf(page.rankBy)
   const scored = mine.map((one) => ({
     one,
@@ -91,6 +95,7 @@ function served(
     limit: page.limit,
     items: ordered.slice(page.offset, page.offset + page.limit),
     below_floor: every.length - over.length,
+    clones_hidden: cloned.length,
   }
 }
 
@@ -494,6 +499,40 @@ describe('SweepResult', () => {
     expect(hide).toHaveAttribute('aria-pressed', 'true')
     const asked = mockedRuns.mock.calls.map(([, page]) => page)
     expect(asked).toContainEqual(expect.objectContaining({ entryId: ZETA.id, allRuns: true }))
+  })
+
+  it('ranks a clone once, says so on the run kept, and shows them when asked (01/10)', () => {
+    const kept = { ...row('z9', ZETA, 'M15 · period=9 · target=3', '300'), clones: 2 }
+    const copies = ['z9b', 'z9c'].map((id) => {
+      const one = row(id, ZETA, `M15 · period=9 · target=${id}`, '300')
+      one.values = { clone_of: 'z9' }
+      return one
+    })
+    showing(
+      sweep({
+        runs: [row('a1', ALPHA, 'M15', '-200'), row('z5', ZETA, 'M15 · period=5', '200'), kept, ...copies],
+      }),
+    )
+    renderWithProviders(<SweepResult />)
+    const [zeta, alpha] = sections()
+
+    expect(within(zeta!).getByText(/^Runs 1–2 of 2,/)).toBeInTheDocument()
+    expect(within(zeta!).getByText('+2 clones')).toBeInTheDocument()
+    expect(within(alpha!).queryByRole('button', { name: /clone/ })).not.toBeInTheDocument()
+    const toggle = within(zeta!).getByRole('button', { name: 'Show 2 clones' })
+    expect(toggle).toHaveAttribute('aria-pressed', 'false')
+
+    fireEvent.click(toggle)
+
+    expect(within(zeta!).getByText(/^Runs 1–4 of 4,/)).toBeInTheDocument()
+    expect(within(zeta!).getByRole('button', { name: 'Hide 2 clones' })).toHaveAttribute(
+      'aria-pressed',
+      'true',
+    )
+    const asked = mockedRuns.mock.calls.map(([, page]) => page)
+    expect(asked).toContainEqual(
+      expect.objectContaining({ entryId: ZETA.id, showClones: true, offset: 0 }),
+    )
   })
 
   it('lists each entry best return first, ten at a time, with unfinished runs last', () => {

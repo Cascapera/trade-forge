@@ -43,6 +43,9 @@ export function RunTable(props: {
   runs: BacktestListItem[]
   seats: Seats
   onToggle: (id: string) => void
+  /** How many clones each run stands for, by run id (01/10) — a sweep's ranked page hides the
+   *  runs that made exactly another's trades, and says so on the one it kept. */
+  clones?: ReadonlyMap<string, number>
 }): React.JSX.Element {
   const full = isFull(props.seats)
 
@@ -119,6 +122,7 @@ export function RunTable(props: {
             const picked = isSelected(props.seats, run.id)
             const color = colorOf(props.seats, run.id)
             const blocked = !picked && full
+            const clones = props.clones?.get(run.id) ?? 0
 
             return (
               <tr
@@ -168,6 +172,14 @@ export function RunTable(props: {
                   )}
                   {typeof run.reused_from === 'string' && (
                     <div className="text-xs text-sky-300">copy of an earlier run</div>
+                  )}
+                  {clones > 0 && (
+                    <div
+                      className="text-xs text-slate-500"
+                      title="Runs of this entry, chart and market launched after this one that made exactly its trades: they differ only in a setting no trade reached"
+                    >
+                      +{String(clones)} clone{clones === 1 ? '' : 's'}
+                    </div>
                   )}
                 </td>
                 <td className="px-3 py-2">

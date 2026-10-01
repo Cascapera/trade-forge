@@ -38,7 +38,12 @@ from tradeforge_collector.source import MarketDataSource
 from tradeforge_collector.storage import Coverage, coverage, dataset_path, read_times
 from tradeforge_collector.timeframes import step
 from tradeforge_db.collections import finish_collection, record_progress, start_collection
-from tradeforge_db.instruments import CatalogueEntry, upsert_dataset, upsert_instruments
+from tradeforge_db.instruments import (
+    CatalogueEntry,
+    refuse_a_new_clock,
+    upsert_dataset,
+    upsert_instruments,
+)
 from tradeforge_db.models import Instrument
 from tradeforge_engine.domain import InstrumentSpec
 
@@ -144,6 +149,15 @@ class CollectionJournal(Protocol):
         """One more slice is on disk — or was found empty, which is also done."""
         ...
 
+    def same_clock(self, spec: InstrumentSpec) -> None:
+        """Raise if `spec` reads the broker's clock differently from data already collected.
+
+        Asked before each slice is written, not only when cataloguing (01/10): a symbol's bars
+        are turned into UTC with that clock, and a refusal after the write leaves them shifted
+        on disk.
+        """
+        ...
+
     def catalogued(self, spec: InstrumentSpec, spread: Decimal | None, on_disk: Coverage) -> None:
         """The instrument and what the files now hold, for the rest of the system to find."""
         ...
@@ -227,6 +241,7 @@ def _collect(  # noqa: PLR0913 — keyword-only; the same axes as `run_collectio
                 start=slice_from,
                 end=slice_to,
                 session=None,
+                before_write=journal.same_clock,
             )
         except LookupError:
             # ⚠️ An empty year is ordinary and must not fail the request. A symbol listed in
@@ -320,6 +335,11 @@ class DatabaseJournal:
     def year_done(self, years_done: int) -> None:
         record_progress(self._session, self._id, years_done=years_done)
         self._session.commit()
+
+    def same_clock(self, spec: InstrumentSpec) -> None:
+        # ⚠️ `ClockChangedError` is a `ValueError`: it passes the empty-year handler, and
+        # `run_collection` writes its sentence — the offset to type — on the collection's row.
+        refuse_a_new_clock(self._session, spec)
 
     def catalogued(self, spec: InstrumentSpec, spread: Decimal | None, on_disk: Coverage) -> None:
         upsert_instruments(self._session, (CatalogueEntry(spec, spread),))

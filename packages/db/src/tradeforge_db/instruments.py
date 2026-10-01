@@ -16,7 +16,7 @@ import datetime as dt
 from dataclasses import asdict, dataclass
 from decimal import Decimal
 
-from sqlalchemy import func
+from sqlalchemy import exists, func, select
 from sqlalchemy.dialects.postgresql import Insert, insert
 from sqlalchemy.orm import Session
 
@@ -46,6 +46,55 @@ class CatalogueEntry:
 
     spec: InstrumentSpec
     default_spread_points: Decimal | None = None
+
+
+class ClockChangedError(ValueError):
+    """A symbol with collected data was offered a different broker clock (his rule of 01/10).
+
+    A `ValueError` on purpose: the collector's command line prints those as one `error:` line
+    rather than a traceback, and the agent puts the sentence on the collection's row.
+    """
+
+    def __init__(self, symbol: str, recorded: dt.timedelta, offered: dt.timedelta) -> None:
+        self.symbol = symbol
+        self.recorded = recorded
+        self.offered = offered
+        super().__init__(
+            f"{symbol} is recorded on a server clock of {_hours(recorded)} and already has "
+            f"collected data on it; this collection reads the clock as {_hours(offered)}. "
+            f"Mixing the two would leave its bars shifted by {_hours(offered - recorded)} "
+            f"from one collection to the next. Run it again with --server-offset "
+            f"{_hours(recorded, unit='')} (the recorded clock; for the agent, "
+            f"TRADEFORGE_SERVER_OFFSET={_hours(recorded, unit='')}) — or, if the recorded one "
+            f"is wrong, remove {symbol}'s datasets and collect them all again"
+        )
+
+
+def _hours(offset: dt.timedelta, *, unit: str = " h") -> str:
+    """`+3 h`, `-2.5 h` — the way `--server-offset` is typed, so the hint can be copied."""
+    return f"{offset / dt.timedelta(hours=1):+g}{unit}"
+
+
+def refuse_a_new_clock(session: Session, spec: InstrumentSpec) -> None:
+    """Raise `ClockChangedError` if `spec` moves the clock of a symbol that already has data.
+
+    ⚠️ **The clock is part of every bar already on disk** (30/09): the collector turns the
+    broker's server time into UTC with it, so a dataset collected at +3 h and topped up at +2 h
+    holds bars shifted two ways, and the instrument would name only the last. A symbol with no
+    dataset yet has nothing to contradict, and may change its clock freely — that is how a
+    wrong first guess is corrected.
+
+    Public so a collector can ask **before** it writes Parquet, and not only when it catalogues:
+    by then the shifted bars are on disk.
+    """
+    recorded = session.execute(
+        select(Instrument.server_offset).where(
+            Instrument.symbol == spec.symbol,
+            exists().where(Dataset.instrument_id == Instrument.id),
+        )
+    ).scalar_one_or_none()
+    if recorded is not None and recorded != spec.server_offset:
+        raise ClockChangedError(spec.symbol, recorded, spec.server_offset)
 
 
 # Everything except the natural key. Re-running a backfill after a broker changes a
@@ -98,9 +147,17 @@ def upsert_instruments(
     already has the row. Accepted, and the alternative is worse — a seed silently outranking
     a measurement is how the data was lost in the first place, and the broker is the
     authority on every one of these columns anyway.
+
+    ⚠️ **Every column but one.** `server_offset` is not overwritten on a symbol that already has
+    a dataset: `ClockChangedError` is raised instead, before anything is written (01/10,
+    `refuse_a_new_clock`). The broker's clock is a fact about the bars on disk, not only about
+    the symbol.
     """
     if not entries:
         return 0
+    if overwrite:
+        for entry in entries:
+            refuse_a_new_clock(session, entry.spec if isinstance(entry, CatalogueEntry) else entry)
 
     rows = [
         {

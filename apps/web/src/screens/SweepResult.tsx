@@ -76,6 +76,11 @@ function Pager(props: {
  * ⚠️ **The page comes from the server, ranked there** (24/09). The screen used to hold every run
  * and sort them itself; on a sweep of 22 thousand runs that was 89 MB a poll. The summary above
  * the table is still the whole entry's — the server computes it over every run.
+ *
+ * ⚠️ **Only runs over their chart's trade floor are ranked, until asked** (01/10, `RANK_MIN_TRADES`
+ * in `sweep/rankFloor`). The top of a ranking was a W1 run of two trades. The button says how many
+ * were left out — every run not finished among them, which has no trades yet — and brings them
+ * back, last, as before.
  */
 function EntryRuns(props: {
   sweepId: string
@@ -88,6 +93,7 @@ function EntryRuns(props: {
   onToggle: (run: BacktestListItem) => void
 }): React.JSX.Element {
   const { entry } = props
+  const [allRuns, setAllRuns] = useState(false)
   const runs = useSweepRuns(
     props.sweepId,
     {
@@ -95,9 +101,11 @@ function EntryRuns(props: {
       rankBy: props.rankBy,
       offset: props.index * RUNS_PER_PAGE,
       limit: RUNS_PER_PAGE,
+      allRuns,
     },
     props.polling,
   )
+  const belowFloor = runs.data?.below_floor ?? 0
   const heading = `sweep-entry-${entry.entry_id}`
   const name = entry.entry_name ?? 'An entry since removed from the shelf'
   const total = runs.data?.total ?? 0
@@ -123,9 +131,28 @@ function EntryRuns(props: {
           {first === 0
             ? runs.isPending
               ? 'Loading the runs…'
-              : 'No runs yet.'
-            : `Runs ${String(first)}–${String(last)} of ${String(total)}, best ${rankingOf(props.rankBy).label.toLowerCase()} first. Runs with nothing to rank by — unfinished, failed, or without this measure — come last.`}
+              : !allRuns && belowFloor > 0
+                ? 'No run has its chart’s floor of trades yet.'
+                : 'No runs yet.'
+            : `Runs ${String(first)}–${String(last)} of ${String(total)}, best ${rankingOf(props.rankBy).label.toLowerCase()} first. ${
+                allRuns
+                  ? 'Runs with nothing to rank by — unfinished, failed, or without this measure — come last.'
+                  : 'Only finished runs with their chart’s floor of trades are ranked.'
+              }`}
         </p>
+      )}
+      {(allRuns || belowFloor > 0) && (
+        <button
+          type="button"
+          aria-pressed={allRuns}
+          onClick={() => {
+            setAllRuns((current) => !current)
+            props.onPage(0)
+          }}
+          className="rounded border border-slate-700 px-3 py-1 text-xs text-slate-300 hover:border-slate-500"
+        >
+          {allRuns ? 'Hide' : 'Show'} the {String(belowFloor)} under the trade floor
+        </button>
       )}
       <RunTable
         runs={items}

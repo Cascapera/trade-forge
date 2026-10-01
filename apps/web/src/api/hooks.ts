@@ -646,11 +646,25 @@ export function useSweep(id: string | undefined) {
  */
 export function useSweepRuns(
   id: string,
-  page: { entryId: string; rankBy: RankKey; offset: number; limit: number },
+  page: {
+    entryId: string
+    rankBy: RankKey
+    offset: number
+    limit: number
+    allRuns?: boolean
+  },
   polling: boolean,
 ) {
   return useQuery<SweepRunsPage>({
-    queryKey: ['sweep-runs', id, page.entryId, page.rankBy, page.offset, page.limit],
+    queryKey: [
+      'sweep-runs',
+      id,
+      page.entryId,
+      page.rankBy,
+      page.offset,
+      page.limit,
+      page.allRuns ?? false,
+    ],
     queryFn: () => api.getSweepRuns(id, page),
     placeholderData: (previous) => previous,
     refetchInterval: polling ? STUDY_POLL_MS : false,

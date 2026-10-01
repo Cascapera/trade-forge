@@ -2901,10 +2901,12 @@ tela pergunta de novo a cada edição (400 ms de espera). A maior parte é monta
 
 ## O relógio do servidor é do ativo (30/09) — o que ficou para depois
 
-- **O coletor não recusa um relógio diferente do que o ativo já tem.** O `upsert_instruments`
-  sobrescreve `server_offset` com o que a coleta mediu. Uma coleta que mede no inverno (2 h) sobre
-  um ativo gravado com 3 h deixa o parquet com barras deslocadas de dois jeitos e o ativo dizendo só
-  o último. Deveria recusar (ou exigir `--server-offset` igual ao gravado).
+- ~~**O coletor não recusa um relógio diferente do que o ativo já tem.**~~ **Feito (01/10).** Um
+  ativo que já tem dataset e recebe outro `server_offset` é recusado com `ClockChangedError`
+  (`tradeforge_db.instruments.refuse_a_new_clock`): a mensagem diz o símbolo, o relógio gravado, o
+  novo e o `--server-offset` a usar. A recusa vem **antes de gravar o parquet** (backfill pela
+  linha de comando e coleta pelo agente), não só no `upsert_instruments`. Sem dataset, o relógio
+  ainda pode mudar — é assim que se corrige um primeiro palpite errado.
 - **Semana do agregador começa na segunda; a do MT5, no domingo (servidor).** Sem barras no domingo
   do servidor não muda nada (forex/UKOIL abrem segunda 00:00 servidor), mas um ativo que negocia no
   domingo do servidor teria o W1 de cima cortado diferente do gráfico. Não medido.

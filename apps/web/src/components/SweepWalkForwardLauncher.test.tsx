@@ -84,6 +84,13 @@ describe('SweepWalkForwardLauncher', () => {
     expect(navigate).toHaveBeenCalledWith('/sweep-walkforwards/wf-1')
   })
 
+  it('shows each chart’s ranking floor where its field is blank (01/10)', () => {
+    renderWithProviders(<SweepWalkForwardLauncher sweep={sweep} />)
+
+    expect(field('fewest trades on H1').placeholder).toBe('30')
+    expect(field('fewest trades on H4').placeholder).toBe('20')
+  })
+
   it('walks only the charts ticked, with their floors, and says the smaller cost', async () => {
     renderWithProviders(<SweepWalkForwardLauncher sweep={sweep} />)
 

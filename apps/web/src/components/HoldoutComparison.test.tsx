@@ -123,6 +123,23 @@ describe('HoldoutComparison', () => {
     expect(h1).toHaveTextContent('H143.4%-5.8%33%2 / 3')
   })
 
+  it('says how many finished points never traded out, apart from the median (01/10)', async () => {
+    const [h1, m15] = HOLDOUT.groups
+    if (h1 === undefined || m15 === undefined) throw new Error('no groups')
+    getHoldout.mockResolvedValue({
+      ...HOLDOUT,
+      groups: [h1, { ...m15, no_trades_out: 1 }],
+    })
+    renderWithProviders(<HoldoutComparison sweepId="test-1" />)
+
+    const table = await screen.findByRole('table', {
+      name: 'By entry and chart',
+    })
+    const [, withNone, withAll] = within(table).getAllByRole('row')
+    expect(withNone).toHaveTextContent('3 / 31 with no trade out')
+    expect(withAll).not.toHaveTextContent(/no trade out/)
+  })
+
   it('shows each point beside the run it was chosen by, and what is still running', async () => {
     getHoldout.mockResolvedValue(HOLDOUT)
     renderWithProviders(<HoldoutComparison sweepId="test-1" />)

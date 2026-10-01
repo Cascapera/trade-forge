@@ -108,8 +108,10 @@ class Candidate:
 def floor_of(timeframe: str, floors: Mapping[str, int]) -> int:
     """The fewest trades a run needs on this chart to be chosen — never fewer than one.
 
-    The sweep's own floor (`retention.MIN_TRADES`) is zero on H4 and above, which suits deciding
-    what to keep and not what to test: a run that never traded ranks on nothing.
+    `floors` is the ranking floor (`ranking_floor.RANK_MIN_TRADES`, 01/10) with the request's own
+    lines over it. Not the keeping floor (`retention.MIN_TRADES`), which is zero on H4 and above:
+    that suits deciding what to keep and not what to test. The one-trade minimum stays for a
+    request that names a chart with no floor: a run that never traded ranks on nothing.
     """
     return max(floors.get(timeframe, 0), 1)
 

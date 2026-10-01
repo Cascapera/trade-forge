@@ -18,7 +18,12 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError, InternalError, ProgrammingError
 from sqlalchemy.orm import Session
 
-from tradeforge_db.instruments import CatalogueEntry, upsert_instruments
+from tradeforge_db.instruments import (
+    CatalogueEntry,
+    ClockChangedError,
+    upsert_dataset,
+    upsert_instruments,
+)
 from tradeforge_db.live_sessions import (
     BEAT_EVERY,
     STALE_AFTER,
@@ -649,6 +654,77 @@ def test_re_cataloguing_a_symbol_moves_its_updated_at(session: Session) -> None:
     assert first is not None
     assert second is not None
     assert second > first, f"updated_at did not move: {first} -> {second}"
+
+
+# --------------------------------------------------------------------------- #
+# The broker's clock of a symbol with data (01/10)                              #
+# --------------------------------------------------------------------------- #
+
+THREE_HOURS = dt.timedelta(hours=3)
+TWO_HOURS = dt.timedelta(hours=2)
+
+
+def _catalogued_on(session: Session, offset: dt.timedelta, *, with_data: bool) -> None:
+    """EURUSD recorded on `offset`, with one H1 dataset if asked — committed, as a collection
+    leaves it."""
+    spec = replace(INSTRUMENT_SEEDS[0], server_offset=offset)
+    upsert_instruments(session, (CatalogueEntry(spec, Decimal("8")),))
+    if with_data:
+        instrument_id = session.query(Instrument.id).filter_by(symbol=spec.symbol).scalar()
+        upsert_dataset(
+            session,
+            instrument_id=instrument_id,
+            timeframe="H1",
+            date_from=dt.datetime(2024, 1, 1, tzinfo=dt.UTC),
+            date_to=dt.datetime(2024, 12, 31, tzinfo=dt.UTC),
+            candle_count=6000,
+            parquet_path="data/EURUSD/H1",
+        )
+    session.commit()
+
+
+def test_the_same_clock_again_passes_with_data(session: Session) -> None:
+    _catalogued_on(session, THREE_HOURS, with_data=True)
+
+    again = replace(INSTRUMENT_SEEDS[0], server_offset=THREE_HOURS)
+    upsert_instruments(session, (CatalogueEntry(again, Decimal("9")),))
+    session.commit()
+
+    row = session.query(Instrument).filter_by(symbol="EURUSD").one()
+    assert (row.server_offset, row.default_spread_points) == (THREE_HOURS, Decimal("9"))
+
+
+def test_a_symbol_with_no_data_may_change_its_clock(session: Session) -> None:
+    """Nothing on disk to contradict: this is how a wrong first guess is corrected."""
+    _catalogued_on(session, THREE_HOURS, with_data=False)
+
+    winter = replace(INSTRUMENT_SEEDS[0], server_offset=TWO_HOURS)
+    upsert_instruments(session, (CatalogueEntry(winter, Decimal("8")),))
+    session.commit()
+
+    assert session.query(Instrument.server_offset).filter_by(symbol="EURUSD").scalar() == (
+        TWO_HOURS
+    )
+
+
+def test_a_symbol_with_data_refuses_another_clock_and_keeps_its_row(session: Session) -> None:
+    """The case of 30/09: a collection measured in winter (+2 h) over a symbol whose bars were
+    collected at +3 h would leave them shifted two ways, and the row naming only the last."""
+    _catalogued_on(session, THREE_HOURS, with_data=True)
+
+    winter = replace(INSTRUMENT_SEEDS[0], server_offset=TWO_HOURS)
+    with pytest.raises(ClockChangedError) as refused:
+        upsert_instruments(session, (CatalogueEntry(winter, Decimal("12")),))
+    session.rollback()
+
+    message = str(refused.value)
+    assert "EURUSD" in message
+    assert "+3 h" in message
+    assert "+2 h" in message
+    assert "--server-offset +3" in message
+    assert isinstance(refused.value, ValueError), "the collector prints ValueErrors as one line"
+    row = session.query(Instrument).filter_by(symbol="EURUSD").one()
+    assert (row.server_offset, row.default_spread_points) == (THREE_HOURS, Decimal("8"))
 
 
 # --------------------------------------------------------------------------- #

@@ -40,6 +40,9 @@ class SpyJournal:
     def year_done(self, years_done: int) -> None:
         self.entries.append(f"year {years_done}")
 
+    def same_clock(self, spec: InstrumentSpec) -> None:
+        """Every clock agrees here; the refusal is `tradeforge_db`'s, tested against Postgres."""
+
     def catalogued(self, spec: InstrumentSpec, spread: Decimal | None, on_disk: Coverage) -> None:
         self.entries.append(f"catalogued {spec.symbol}")
         self.catalogued_coverage = on_disk

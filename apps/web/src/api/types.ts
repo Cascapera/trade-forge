@@ -117,10 +117,10 @@ export interface Backtest {
   error: string | null
   engine_version: string
   recorded: Recorded
-  /** The finished run this one is a copy of: the same measurement under the same engine, taken
-   *  instead of run again (28/09). Null for a run that ran; absent from older fixtures. */
   /** The sweep point this run measured; null or absent for a run launched on its own. */
   point?: BacktestPoint | null
+  /** The finished run this one is a copy of: the same measurement under the same engine, taken
+   *  instead of run again (28/09). Null for a run that ran; absent from older fixtures. */
   reused_from?: string | null
   created_at: string
   started_at: string | null
@@ -1263,7 +1263,8 @@ export interface CreateHoldoutRequest {
   max_drawdown_r?: string
   /** Only runs with at least this share of years positive, as a decimal string. */
   min_positive_year_share?: string
-  /** Per chart, over the sweep's own floor; a chart left out keeps that floor. */
+  /** Per chart, over the ranking floor (`RANK_MIN_TRADES`, 01/10); a chart left out keeps that
+   *  floor. */
   min_trades: Record<string, number>
   /** Skip a run with the same record as a better-ranked one. The server's default is true. */
   distinct?: boolean
@@ -1304,6 +1305,9 @@ export interface HoldoutGroup {
   out_of_sample_median_return: string | null
   /** The fraction of the finished tests that made money on the reserved window. */
   out_of_sample_positive: string | null
+  /** Finished tests with no trade on the reserved window (01/10): out of the median and the
+   *  positive share, still counted in `done`. Absent from older fixtures. */
+  no_trades_out?: number
 }
 
 export interface HoldoutOut {
@@ -1507,6 +1511,7 @@ export interface CreateSweepWalkForwardRequest {
   anchored: boolean
   top_n: number
   metric: HoldoutRank
+  /** Per chart, over the ranking floor (`RANK_MIN_TRADES`, 01/10). */
   min_trades?: Record<string, number>
   max_drawdown_r?: string
   min_positive_year_share?: string
@@ -1662,10 +1667,16 @@ export interface SweepOut {
 
 /** One page of a sweep's runs, best first by the measure asked — ranked by the server. */
 export interface SweepRunsPage {
+  /** The runs `items` pages through: only those over their chart's ranking floor unless every run
+   *  was asked for (`allRuns`). */
   total: number
   offset: number
   limit: number
   items: SweepRunOut[]
+  /** How many of the filter's runs are under the ranking floor (01/10) — the same number with or
+   *  without `allRuns`. ⚠️ Every run not finished counts here: it has no trades yet. Absent from
+   *  older fixtures. */
+  below_floor?: number
 }
 
 /** How many of a sweep's runs sit in each status. The four always add up to `total`. */

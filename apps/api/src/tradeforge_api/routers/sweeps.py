@@ -68,7 +68,7 @@ from tradeforge_api.holdout import (
 )
 from tradeforge_api.montecarlo import Spread, observed, simulate
 from tradeforge_api.queue import COLLECT_QUEUE, COLLECT_RANGE
-from tradeforge_api.retention import MIN_TRADES
+from tradeforge_api.ranking_floor import RANK_MIN_TRADES
 from tradeforge_api.routers.backtests import failed_collections, list_item
 from tradeforge_api.routers.strategies import refusal_of
 from tradeforge_api.routers.studies import aggregate_scored, strategies_for
@@ -1622,7 +1622,9 @@ def launch_holdout(
                 metrics=run.metrics,
             )
         )
-    floors = {**MIN_TRADES, **request.min_trades}
+    # ⚠️ The ranking floor, not the keeping one (01/10): H4 and above keep any profit, but a run of
+    # two trades there is not a method to test.
+    floors = {**RANK_MIN_TRADES, **request.min_trades}
     bounds = Bounds(
         max_drawdown_r=request.max_drawdown_r,
         min_positive_year_share=request.min_positive_year_share,
@@ -1804,11 +1806,18 @@ def get_holdout(sweep_id: uuid.UUID, session: SessionDep) -> HoldoutOut:
         grouped.setdefault((row.entry_id, row.timeframe), []).append(row)
     groups: list[HoldoutGroup] = []
     for (entry_id, timeframe), members in grouped.items():
-        after = [
-            row.out_of_sample.net_return
+        finished = [
+            row.out_of_sample
             for row in members
             if row.out_of_sample.status == BacktestStatus.DONE.value
             and row.out_of_sample.net_return is not None
+        ]
+        # ⚠️ A test that never traded is not a zero (01/10): it is out of the median and the share,
+        # counted apart, and still `done`.
+        after = [
+            side.net_return
+            for side in finished
+            if side.net_return is not None and side.total_trades != 0
         ]
         before_returns = [
             row.in_sample.net_return
@@ -1821,10 +1830,11 @@ def get_holdout(sweep_id: uuid.UUID, session: SessionDep) -> HoldoutOut:
                 entry_name=names.get(entry_id),
                 timeframe=timeframe,
                 points=len(members),
-                done=len(after),
+                done=len(finished),
                 in_sample_median_return=median_of(before_returns),
                 out_of_sample_median_return=median_of(after),
                 out_of_sample_positive=positive_share(after),
+                no_trades_out=sum(1 for side in finished if side.total_trades == 0),
             )
         )
 
@@ -2364,6 +2374,24 @@ def _ranked(rank_by: RankBy) -> tuple[ColumnElement[Any], ...]:
     return _RANKINGS[rank_by]()
 
 
+def _over_the_floor() -> ColumnElement[bool]:
+    """A run finished with at least its chart's ranking floor of trades, in SQL (01/10).
+
+    ⚠️ **A run with no metrics is under it** — queued, running or failed, it has no trades to
+    count, and the ranking already put it last for having no score. A chart with no line would
+    need one trade: `holdout.floor_of`'s minimum, though every chart of the DSL has one.
+    """
+    floor = case(
+        *((Backtest.timeframe == chart, need) for chart, need in RANK_MIN_TRADES.items()),
+        else_=1,
+    )
+    return and_(
+        Backtest.status == BacktestStatus.DONE,
+        BacktestMetrics.total_trades.is_not(None),
+        BacktestMetrics.total_trades >= floor,
+    )
+
+
 @router.get("/sweeps/{sweep_id}/runs", response_model=SweepRunsPage, responses=_NOT_FOUND)
 def get_sweep_runs(  # noqa: PLR0913 — one query parameter per thing a page is asked by
     sweep_id: uuid.UUID,
@@ -2373,11 +2401,16 @@ def get_sweep_runs(  # noqa: PLR0913 — one query parameter per thing a page is
     rank_by: RankBy = "return",
     offset: Annotated[int, Query(ge=0)] = 0,
     limit: Annotated[int, Query(ge=1, le=100)] = 10,
+    all_runs: bool = False,
 ) -> SweepRunsPage:
     """One page of a sweep's runs — of one entry, when named — best first by `rank_by`.
 
     Ranked by the database rather than by the screen (24/09): the screen used to hold every run and
     sort them itself, which on a sweep of 22 thousand runs meant 89 MB per poll.
+
+    Only runs at or over their chart's ranking floor (`ranking_floor.RANK_MIN_TRADES`, 01/10)
+    unless `all_runs`: the top of a ranking was a W1 run of two trades. `below_floor` says how many
+    were left out, so the screen can offer them.
     """
     sweep = session.get(Sweep, sweep_id)
     if sweep is None:
@@ -2390,8 +2423,20 @@ def get_sweep_runs(  # noqa: PLR0913 — one query parameter per thing a page is
     )
     if entry_id is not None:
         strategies = strategies.where(PointRow.entry_id == str(entry_id))
-    where = (Backtest.sweep_id.in_(scope_of(sweep)), Backtest.strategy_id.in_(strategies))
-    total = session.scalar(select(func.count()).select_from(Backtest).where(*where)) or 0
+    where: list[ColumnElement[bool]] = [
+        Backtest.sweep_id.in_(scope_of(sweep)),
+        Backtest.strategy_id.in_(strategies),
+    ]
+    ranked = _over_the_floor()
+    every, passing = session.execute(
+        select(func.count(), func.count().filter(ranked))
+        .select_from(Backtest)
+        .outerjoin(BacktestMetrics, BacktestMetrics.backtest_id == Backtest.id)
+        .where(*where)
+    ).one()
+    if not all_runs:
+        where.append(ranked)
+    total = every if all_runs else passing
     rows = session.execute(
         select(Backtest, Strategy, Instrument)
         .join(Strategy, Strategy.id == Backtest.strategy_id)
@@ -2419,6 +2464,7 @@ def get_sweep_runs(  # noqa: PLR0913 — one query parameter per thing a page is
     }
     return SweepRunsPage(
         total=total,
+        below_floor=every - passing,
         offset=offset,
         limit=limit,
         items=[

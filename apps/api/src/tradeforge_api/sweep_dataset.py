@@ -73,6 +73,9 @@ CAVEATS: tuple[str, ...] = (
     "A row with same_as is not a measurement of its own: its point differs from the named one only "
     "in a parameter its entry point never reads, so both are one run and every outcome is that "
     "run's. Keep one row per run_id when counting evidence, or one run is counted several times.",
+    "A row with clone_of ran, but did exactly what the named point's run did: its trades never "
+    "reached the parameter that sets them apart. Counting evidence, keep the rows with clone_of "
+    "empty, or one result is counted as many times as the grid had values no trade reached.",
     "An empty cell means not measured, undefined or not applicable — never zero. In a param: "
     "column, empty means the entry does not sweep that path, and `null` means it swept the path "
     "and chose null (the setting off).",
@@ -128,6 +131,11 @@ class DatasetRun:
     same_as: str | None = None
     """The label of the point whose run answers this one, or `None` for a point that ran itself
     (24/09): a row for every point, and this says which rows share a run."""
+
+    clone_of: str | None = None
+    """The label of the first point (launch order) of this entry, chart and market whose run did
+    exactly what this row's run did (`holdout.behaviour`, 01/10), or `None` for that first one and
+    for a run with no metrics. Unlike `same_as`, this row's run did run."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,6 +211,19 @@ _BEFORE_PARAMS: tuple[Column, ...] = (
         "answers it: the two differ only in a parameter this entry point never reads, so they are "
         "one run, and run_id and every outcome are that run's.",
         lambda r: r.same_as,
+    ),
+    Column(
+        "clone_of",
+        "identity",
+        "text",
+        "Empty unless this row's run made exactly the trades of an earlier run of the same entry, "
+        "chart and market: then the label of that run's point, the first launched of the group. "
+        "Unlike same_as, the run did run — its point reads every parameter that differs, but no "
+        "trade reached the value that tells them apart (a target never hit, a break-even never "
+        "armed) — so run_id is its own, and every outcome is a copy of the named run's. Matched on "
+        "total_trades, long_trades, short_trades, net profit, net_r, max_drawdown_r and the R of "
+        "every year; empty too for a run not done.",
+        lambda r: r.clone_of,
     ),
     Column(
         "entry_id",

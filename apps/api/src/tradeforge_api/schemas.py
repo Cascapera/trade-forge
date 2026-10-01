@@ -34,6 +34,7 @@ from pydantic import (
 )
 
 from tradeforge_api.holdout import HoldoutRank
+from tradeforge_api.montecarlo import MAX_BLOCK_TRADES, MIN_BLOCK_TRADES
 from tradeforge_api.sweep_dataset import Role
 from tradeforge_api.walkforward import MAX_FOLDS, MIN_FOLDS
 from tradeforge_collector.classify import asset_class_from_path
@@ -2314,15 +2315,57 @@ class SlicingOut(BaseModel):
     points: list[SlicedPoint]
 
 
+RankBy = Literal[
+    "return",
+    "profit_factor",
+    "win_rate",
+    "expectancy",
+    "drawdown",
+    "net_r",
+    "recovery_r",
+    "positive_years",
+    "drawdown_r",
+]
+"""What a sweep's runs are ranked by — on its page (`GET /sweeps/{id}/runs`) and when the top of
+that ranking is resampled (01/10)."""
+
+MONTECARLO_MAX_TOP_N = 20
+"""The most runs per entry a ranking's Monte Carlo resamples: two pages of the screen. Each point
+costs a fraction of a second twice over, and the request waits for all of them."""
+
+
+class MonteCarloRanking(BaseModel):
+    """Which runs of a sweep's ranking are resampled (01/10): the first `top_n` of each entry,
+    ranked by `rank_by` exactly as the sweep's page ranks them — finished, over their chart's trade
+    floor, one run per clone group."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    rank_by: RankBy = "return"
+    top_n: int = Field(default=10, ge=1, le=MONTECARLO_MAX_TOP_N)
+
+
 class CreateMonteCarlo(BaseModel):
-    """Resample a finished reserved-window test's points (25/09, `montecarlo`)."""
+    """Resample a finished sweep's points (25/09, `montecarlo`): every point of a reserved-window
+    test, or — since 01/10 — the top of an ordinary sweep's ranking (`ranking`).
+
+    ⚠️ **`ranking` is required on an ordinary sweep and refused on a test.** A test's points are
+    few and were all chosen on other data, so all of them are resampled; a sweep can hold hundreds
+    of thousands of runs, and only its ranking's top is worth the seconds.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     paths: int = Field(default=1000, ge=100, le=5000)
-    """How many paths each point's trades are drawn into."""
+    """How many paths each point's trades are drawn into — by each of the two draws."""
     seed: str | None = Field(default=None, min_length=1, max_length=64)
     """Any string; blank draws one, which is stored — the answer is repeatable either way."""
+    block_trades: int | None = Field(default=None, ge=MIN_BLOCK_TRADES, le=MAX_BLOCK_TRADES)
+    """The trades in a row each block of the second draw holds (01/10). Blank takes each point's
+    own (`montecarlo.default_block_trades`: the cube root of its trades, rounded, at least 2). A
+    block of half a point's trades or more is refused with a 422 naming the point."""
+    ranking: MonteCarloRanking | None = None
+    """Which runs of an ordinary sweep: the first `top_n` of each entry by `rank_by`."""
 
 
 class SpreadOut(BaseModel):
@@ -2342,10 +2385,13 @@ class SimulatedOut(BaseModel):
     net_r: SpreadOut
     negative_share: Money
     """The share of paths that ended below zero R."""
+    block_trades: int | None = None
+    """The trades in a row each block held; `None` when drawn trade by trade."""
 
 
 class MonteCarloPoint(BaseModel):
-    """One tested point: what happened, and the spread of what could have."""
+    """One point: what happened, and the spread of what could have — drawn trade by trade
+    (`simulated`) and, since 01/10, in blocks of trades in a row (`in_blocks`)."""
 
     run_id: uuid.UUID
     entry_id: str
@@ -2354,13 +2400,17 @@ class MonteCarloPoint(BaseModel):
     timeframe: str
     label: str
     trades_kept: bool
-    """False for a test run from before 25/09 that lost: it kept no trades to resample."""
+    """False for a run that kept no trades to resample: a test run from before 25/09 that lost,
+    or a sweep's run under the bar for keeping them (`retention`) — "no trades kept"."""
     trades: int
     observed_net_r: Money
     observed_drawdown_r: Money
     observed_losing_streak: int
     simulated: SimulatedOut | None
-    """`None` below `montecarlo.MIN_TRADES` trades, or with none kept."""
+    """Trade by trade. `None` below `montecarlo.MIN_TRADES` trades, or with none kept."""
+    in_blocks: SimulatedOut | None = None
+    """In blocks (01/10), with the block it used. `None` when `simulated` is, and on every point
+    resampled before 01/10 — those were drawn trade by trade only."""
 
 
 class MonteCarloOut(BaseModel):
@@ -2368,6 +2418,10 @@ class MonteCarloOut(BaseModel):
     sweep_id: uuid.UUID
     paths: int
     seed: str
+    block_trades: int | None = None
+    """The block asked for (01/10); `None` took each point's own, or predates blocks."""
+    ranking: MonteCarloRanking | None = None
+    """Which runs of the ranking were resampled (01/10); `None` for a reserved-window test."""
     created_at: dt.datetime
     points: list[MonteCarloPoint]
 

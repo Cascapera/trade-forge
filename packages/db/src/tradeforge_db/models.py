@@ -2058,6 +2058,11 @@ class SweepMonteCarlo(Base):
     ⚠️ **The seed is stored**, and each point's draws come from it and the run's id: the same
     request always gives the same answer, which is the engine's invariant carried over to what
     judges the engine's output.
+
+    Since 01/10 (rev_0044) every point is drawn twice — trade by trade and in blocks of trades in
+    a row — and an ordinary sweep can be resampled too, the top of its ranking (`rank_by`,
+    `top_n`). A row from before keeps reading: its points carry no draw in blocks, and its three
+    new columns are null.
     """
 
     __tablename__ = "sweep_montecarlos"
@@ -2067,10 +2072,20 @@ class SweepMonteCarlo(Base):
     sweep_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("sweeps.id", ondelete="CASCADE"), nullable=False
     )
-    """The reserved-window test that was resampled; its answer goes with it."""
+    """The sweep that was resampled — a reserved-window test, or since 01/10 an ordinary sweep's
+    ranking; its answer goes with it."""
 
     paths: Mapped[int] = mapped_column(Integer, nullable=False)
     seed: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    block_trades: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    """The block asked for (01/10). Null took each point's own (the cube root of its trades), and
+    on every row from before blocks."""
+
+    rank_by: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    """What the ranking was ordered by, for an ordinary sweep (01/10); null for a test."""
+    top_n: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    """How many runs per entry of that ranking; null with `rank_by`."""
 
     result: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     """Per point: the simulated spreads beside what actually happened."""
@@ -2079,6 +2094,14 @@ class SweepMonteCarlo(Base):
 
     __table_args__ = (
         CheckConstraint("paths BETWEEN 100 AND 5000", name="paths_within_bounds"),
+        CheckConstraint(
+            "block_trades IS NULL OR block_trades BETWEEN 2 AND 50",
+            name="a_block_is_two_to_fifty_trades",
+        ),
+        CheckConstraint(
+            "(rank_by IS NULL) = (top_n IS NULL)", name="a_ranking_is_named_with_its_size"
+        ),
+        CheckConstraint("top_n IS NULL OR top_n BETWEEN 1 AND 20", name="top_n_within_bounds"),
         CheckConstraint("jsonb_typeof(result) = 'object'", name="a_montecarlo_result_is_an_object"),
         Index("ix_sweep_montecarlos_sweep_id", "sweep_id"),
     )

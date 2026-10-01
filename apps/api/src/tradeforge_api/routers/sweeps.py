@@ -76,7 +76,16 @@ from tradeforge_api.holdout import (
     positive_share,
     reusing,
 )
-from tradeforge_api.montecarlo import Spread, observed, simulate
+from tradeforge_api.montecarlo import (
+    MIN_TRADES,
+    Simulated,
+    Spread,
+    block_fits,
+    default_block_trades,
+    observed,
+    simulate,
+    simulate_in_blocks,
+)
 from tradeforge_api.queue import COLLECT_QUEUE, COLLECT_RANGE
 from tradeforge_api.ranking_floor import RANK_MIN_TRADES
 from tradeforge_api.routers.backtests import failed_collections, list_item
@@ -99,8 +108,10 @@ from tradeforge_api.schemas import (
     HoldoutSide,
     MonteCarloOut,
     MonteCarloPoint,
+    MonteCarloRanking,
     PlannedCollection,
     PreviewSweepRequest,
+    RankBy,
     RefusalGroup,
     SimulatedOut,
     SlicedGroup,
@@ -2201,6 +2212,10 @@ def _montecarlo_out(row: SweepMonteCarlo) -> MonteCarloOut:
         sweep_id=row.sweep_id,
         paths=row.paths,
         seed=row.seed,
+        block_trades=row.block_trades,
+        ranking=None
+        if row.rank_by is None or row.top_n is None
+        else MonteCarloRanking.model_validate({"rank_by": row.rank_by, "top_n": row.top_n}),
         created_at=row.created_at,
         points=[MonteCarloPoint.model_validate(one) for one in row.result["points"]],
     )
@@ -2208,6 +2223,103 @@ def _montecarlo_out(row: SweepMonteCarlo) -> MonteCarloOut:
 
 def _spread_out(spread: Spread) -> SpreadOut:
     return SpreadOut(p5=spread.p5, p50=spread.p50, p95=spread.p95, p99=spread.p99)
+
+
+def _simulated_out(simulated: Simulated | None) -> SimulatedOut | None:
+    if simulated is None:
+        return None
+    return SimulatedOut(
+        paths=simulated.paths,
+        trades=simulated.trades,
+        drawdown_r=_spread_out(simulated.drawdown_r),
+        losing_streak=_spread_out(simulated.losing_streak),
+        net_r=_spread_out(simulated.net_r),
+        negative_share=simulated.negative_share,
+        block_trades=simulated.block_trades,
+    )
+
+
+def _ranking_top(
+    session: Session, sweep: Sweep, ranking: MonteCarloRanking
+) -> list[tuple[Backtest, str]]:
+    """The first `top_n` runs of each entry of an ordinary sweep's ranking, as its page ranks them
+    (`get_sweep_runs` with no flag): finished, over the chart's trade floor, one per clone group.
+
+    ⚠️ **Refused while a run is queued or running** (409): the top of a ranking still filling is
+    not the top it will settle on, and a kept answer would name runs that later fall out of it.
+    """
+    pending = session.scalar(
+        select(func.count())
+        .select_from(Backtest)
+        .where(
+            Backtest.sweep_id.in_(scope_of(sweep)),
+            Backtest.status.in_((BacktestStatus.QUEUED, BacktestStatus.RUNNING)),
+        )
+    )
+    if pending:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="the sweep is still running: wait until every run has finished",
+        )
+    ranked = _over_the_floor()
+    chosen: list[uuid.UUID] = []
+    for entry in sweep.entry_ids:
+        strategies = select(PointRow.strategy_id).where(
+            PointRow.sweep_id == sweep.id,
+            PointRow.same_as.is_(None),
+            PointRow.entry_id == str(entry),
+        )
+        top = _clone_ranked(
+            sweep,
+            entry_id=uuid.UUID(str(entry)),
+            where=[
+                Backtest.sweep_id.in_(scope_of(sweep)),
+                Backtest.strategy_id.in_(strategies),
+                ranked,
+            ],
+            rank_by=ranking.rank_by,
+            ranked=ranked,
+            show_clones=False,
+        ).limit(ranking.top_n)
+        chosen += [row.id for row in session.execute(top)]
+    if not chosen:
+        return []
+    read = {
+        run.id: (run, symbol)
+        for run, symbol in session.execute(
+            select(Backtest, Instrument.symbol)
+            .join(Instrument, Instrument.id == Backtest.instrument_id)
+            .where(Backtest.id.in_(chosen))
+        ).all()
+    }
+    return [read[one] for one in chosen]
+
+
+def _blocks_refusal(
+    request: CreateMonteCarlo, done: list[tuple[Backtest, str]], counts: dict[uuid.UUID, int]
+) -> str | None:
+    """Why the block asked for cannot be used, before anything is drawn — or `None`.
+
+    Only points that would be resampled count: one under `MIN_TRADES`, or that kept no trades, is
+    shown without either draw whatever the block, and must not refuse the rest.
+    """
+    if request.block_trades is None:
+        return None
+    short = sorted(
+        (counts[run.id], f"{symbol} {run.timeframe}")
+        for run, symbol in done
+        if counts.get(run.id, 0) >= MIN_TRADES
+        and not block_fits(counts[run.id], request.block_trades)
+    )
+    if not short:
+        return None
+    fewest, market = short[0]
+    most = (fewest - 1) // 2
+    return (
+        f"blocks of {request.block_trades} trades are half or more of {len(short)} point(s)' "
+        f"trades — {market} has {fewest}: ask for at most {most}, or leave it blank for each "
+        "point's own"
+    )
 
 
 @router.post(
@@ -2219,27 +2331,79 @@ def _spread_out(spread: Spread) -> SpreadOut:
 def create_montecarlo(
     sweep_id: uuid.UUID, request: CreateMonteCarlo, session: SessionDep
 ) -> MonteCarloOut:
-    """Resample every point of a finished reserved-window test and keep the answer (25/09).
+    """Resample the points of a finished sweep and keep the answer (25/09; ranking and blocks
+    01/10).
 
-    Each point's trades are drawn with replacement into `paths` paths (`montecarlo.simulate`),
-    from a generator seeded by the request's seed and the run's id: repeatable, and no point's
-    draws depend on another's. Runs nothing — the test keeps its trades — but takes seconds on a
-    large test, which is why it is started by hand and kept.
+    Which points: every one of a reserved-window test, or the first `ranking.top_n` of each entry
+    of an ordinary sweep's ranking (`_ranking_top`). `ranking` is required on an ordinary sweep and
+    refused on a test (422 either way). A run that kept no trades — a sweep's run under the bar
+    for keeping them, or a test's loser from before 25/09 — is shown with "no trades kept".
+
+    Each point is drawn twice, from generators seeded by the request's seed and the run's id:
+    trade by trade (`montecarlo.simulate`, as before) and in blocks of trades in a row
+    (`montecarlo.simulate_in_blocks`), the block asked for or each point's own. Repeatable, and no
+    point's draws depend on another's. Runs nothing, but takes seconds, which is why it is started
+    by hand and kept.
+
+    ⚠️ **A block of half a point's trades or more is a 422 naming the point**, checked before any
+    draw: the request asked for one block for every point, and a silent fallback would answer a
+    different question than the one asked.
     """
-    test, done = _finished_test(session, sweep_id, doing="resampled")
+    sweep = session.get(Sweep, sweep_id)
+    if sweep is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="sweep not found")
+    if sweep.holdout_rule is not None and request.ranking is not None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="a reserved-window test resamples every point it tested; leave out ranking",
+        )
+    if sweep.holdout_rule is None and request.ranking is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=(
+                "name the runs to resample: the top of this sweep's ranking (ranking.rank_by, "
+                "ranking.top_n), or test the sweep first and resample the test"
+            ),
+        )
+    if request.ranking is None:
+        test, done = _finished_test(session, sweep_id, doing="resampled")
+    else:
+        test, done = sweep, _ranking_top(session, sweep, request.ranking)
     trades_of = _trades_of(session, done)
+    rs_of = {
+        run.id: [one.r for one in trades_of.get(run.id, []) if one.r is not None]
+        for run, _ in done
+        if run.recorded is not Recorded.METRICS
+    }
+    refused = _blocks_refusal(request, done, {key: len(value) for key, value in rs_of.items()})
+    if refused is not None:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=refused)
+
     seed = request.seed or secrets.token_hex(8)
-    own, _followers = _points_of(session, test)
+    # Only the chosen runs' points: an ordinary sweep can hold hundreds of thousands of them.
+    own, _followers = _points_of(session, test, strategy_ids={run.strategy_id for run, _ in done})
     names = _entry_names(session, test)
 
     points: list[MonteCarloPoint] = []
     for run, symbol in done:
         point = own.get(str(run.strategy_id), {})
         entry_id = str(point.get("entry_id", ""))
-        kept = run.recorded is not Recorded.METRICS
-        rs = [one.r for one in trades_of.get(run.id, []) if one.r is not None]
+        kept = run.id in rs_of
+        rs = rs_of.get(run.id, [])
         seen = observed(rs)
-        simulated = simulate(rs, paths=request.paths, seed=f"{seed}:{run.id}") if kept else None
+        # ⚠️ The trade-by-trade seed is the one used since 25/09, so an old request repeated
+        # gives the same first draw; the blocks draw from a seed of their own beside it.
+        one_by_one = simulate(rs, paths=request.paths, seed=f"{seed}:{run.id}") if kept else None
+        blocks = (
+            simulate_in_blocks(
+                rs,
+                paths=request.paths,
+                seed=f"{seed}:{run.id}:blocks",
+                block_trades=request.block_trades or default_block_trades(len(rs)),
+            )
+            if kept
+            else None
+        )
         points.append(
             MonteCarloPoint(
                 run_id=run.id,
@@ -2253,16 +2417,8 @@ def create_montecarlo(
                 observed_net_r=seen.net_r,
                 observed_drawdown_r=seen.drawdown_r,
                 observed_losing_streak=seen.losing_streak,
-                simulated=None
-                if simulated is None
-                else SimulatedOut(
-                    paths=simulated.paths,
-                    trades=simulated.trades,
-                    drawdown_r=_spread_out(simulated.drawdown_r),
-                    losing_streak=_spread_out(simulated.losing_streak),
-                    net_r=_spread_out(simulated.net_r),
-                    negative_share=simulated.negative_share,
-                ),
+                simulated=_simulated_out(one_by_one),
+                in_blocks=_simulated_out(blocks),
             )
         )
 
@@ -2270,6 +2426,9 @@ def create_montecarlo(
         sweep_id=test.id,
         paths=request.paths,
         seed=seed,
+        block_trades=request.block_trades,
+        rank_by=None if request.ranking is None else request.ranking.rank_by,
+        top_n=None if request.ranking is None else request.ranking.top_n,
         result={"points": [one.model_dump(mode="json") for one in points]},
     )
     session.add(row)
@@ -2282,7 +2441,7 @@ def create_montecarlo(
     "/sweeps/{sweep_id}/montecarlos", response_model=list[MonteCarloOut], responses=_NOT_FOUND
 )
 def list_montecarlos(sweep_id: uuid.UUID, session: SessionDep) -> list[MonteCarloOut]:
-    """Every resampling kept for this test, newest first."""
+    """Every resampling kept for this sweep — a test's, or its ranking's — newest first."""
     if session.get(Sweep, sweep_id) is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="sweep not found")
     rows = session.scalars(
@@ -2467,19 +2626,6 @@ def _run_out(
             for one in followers.get(str(run.strategy_id), [])
         ],
     )
-
-
-RankBy = Literal[
-    "return",
-    "profit_factor",
-    "win_rate",
-    "expectancy",
-    "drawdown",
-    "net_r",
-    "recovery_r",
-    "positive_years",
-    "drawdown_r",
-]
 
 
 def _recovery_r() -> tuple[ColumnElement[Any], ...]:

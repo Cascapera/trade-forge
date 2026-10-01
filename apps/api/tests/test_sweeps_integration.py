@@ -54,6 +54,7 @@ from tradeforge_db.models import (
     Instrument,
     Recorded,
     Sweep,
+    SweepMonteCarlo,
     SweepPoint,
     SymbolHistory,
     Trade,
@@ -3474,6 +3475,188 @@ class TestResamplingATest:
         assert client.post(f"/sweeps/{test_id}/montecarlos", json={}).status_code == 409
         assert client.post(f"/sweeps/{test_id}/montecarlos", json={"paths": 50}).status_code == 422
         assert client.get(f"/sweeps/{uuid.uuid4()}/montecarlos").status_code == 404
+
+    def test_each_point_is_also_drawn_in_blocks_of_its_own_size_or_the_one_asked(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        """01/10: beside trade by trade, the same trades dealt in blocks of trades in a row."""
+        test_id, runs = self.a_finished_test(client, session_factory)
+
+        own = client.post(f"/sweeps/{test_id}/montecarlos", json={"paths": 150, "seed": "s"})
+        asked = client.post(
+            f"/sweeps/{test_id}/montecarlos", json={"paths": 150, "seed": "s", "block_trades": 12}
+        )
+
+        assert own.status_code == 201, own.text
+        assert asked.status_code == 201, asked.text
+        assert (own.json()["block_trades"], asked.json()["block_trades"]) == (None, 12)
+        assert own.json()["ranking"] is None
+
+        def point(response: Any, period: int) -> Any:
+            return {one["run_id"]: one for one in response.json()["points"]}[runs[period]]
+
+        # 25 trades: the cube root, rounded, is 3.
+        blocks = point(own, 13)["in_blocks"]
+        assert (blocks["paths"], blocks["trades"], blocks["block_trades"]) == (150, 25, 3)
+        assert point(own, 13)["simulated"]["block_trades"] is None
+        assert point(asked, 13)["in_blocks"]["block_trades"] == 12
+        # The trade-by-trade draw is the one it always was: the block asked does not move it.
+        assert point(own, 13)["simulated"] == point(asked, 13)["simulated"]
+        assert point(own, 11)["in_blocks"] is None
+
+    def test_a_block_of_half_a_point_s_trades_is_refused_naming_the_point(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        test_id, _runs = self.a_finished_test(client, session_factory)
+
+        refused = client.post(f"/sweeps/{test_id}/montecarlos", json={"block_trades": 13})
+
+        assert refused.status_code == 422
+        detail = refused.json()["detail"]
+        assert "EURUSD H1 has 25" in detail
+        assert "at most 12" in detail
+        assert client.get(f"/sweeps/{test_id}/montecarlos").json() == []
+        too_small = client.post(f"/sweeps/{test_id}/montecarlos", json={"block_trades": 1})
+        assert too_small.status_code == 422
+
+    def test_a_test_resamples_every_point_and_refuses_a_ranking(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        test_id, _runs = self.a_finished_test(client, session_factory)
+
+        refused = client.post(
+            f"/sweeps/{test_id}/montecarlos", json={"ranking": {"rank_by": "return", "top_n": 1}}
+        )
+
+        assert refused.status_code == 422
+        assert "leave out ranking" in refused.json()["detail"]
+
+    def test_a_resampling_kept_before_blocks_still_reads(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        """A row from before 01/10: no block, no ranking, and points with no draw in blocks."""
+        test_id, runs = self.a_finished_test(client, session_factory)
+        spread = {"p5": "1", "p50": "2", "p95": "3", "p99": "4"}
+        with session_factory() as session:
+            session.add(
+                SweepMonteCarlo(
+                    sweep_id=uuid.UUID(test_id),
+                    paths=200,
+                    seed="old",
+                    result={
+                        "points": [
+                            {
+                                "run_id": runs[13],
+                                "entry_id": "",
+                                "entry_name": None,
+                                "symbol": "EURUSD",
+                                "timeframe": "H1",
+                                "label": "period=13",
+                                "trades_kept": True,
+                                "trades": 25,
+                                "observed_net_r": "9",
+                                "observed_drawdown_r": "1",
+                                "observed_losing_streak": 1,
+                                "simulated": {
+                                    "paths": 200,
+                                    "trades": 25,
+                                    "drawdown_r": spread,
+                                    "losing_streak": spread,
+                                    "net_r": spread,
+                                    "negative_share": "0.01",
+                                },
+                            }
+                        ]
+                    },
+                )
+            )
+            session.commit()
+
+        kept = client.get(f"/sweeps/{test_id}/montecarlos")
+
+        assert kept.status_code == 200, kept.text
+        (old,) = kept.json()
+        assert (old["block_trades"], old["ranking"]) == (None, None)
+        (point,) = old["points"]
+        assert point["in_blocks"] is None
+        assert point["simulated"]["block_trades"] is None
+        assert point["simulated"]["drawdown_r"]["p95"] == "3"
+
+
+class TestResamplingARanking:
+    """01/10: the top of an ordinary sweep's ranking resampled — the runs that kept their trades."""
+
+    def a_ranked_sweep(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> tuple[str, dict[int, str]]:
+        """Five runs ranked 13, 11, 9, 7, 5 by return. 13 kept 40 trades; 11 kept only metrics."""
+        sweep_id, rows = TestTheReservedWindow().swept(client, session_factory)
+        runs = {row["values"]["setup.params.period"]: row["run"]["id"] for row in rows}
+        trade_in(session_factory, runs[13], ["1", "1", "-1", "-1", "1"] * 8, first=START)
+        with session_factory() as session:
+            for period in (11, 9, 7, 5):
+                run = session.get(Backtest, uuid.UUID(runs[period]))
+                assert run is not None
+                run.recorded = Recorded.METRICS
+            session.commit()
+        return sweep_id, runs
+
+    def test_the_top_of_each_entry_is_resampled_and_a_run_without_trades_says_so(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        sweep_id, runs = self.a_ranked_sweep(client, session_factory)
+
+        made = client.post(
+            f"/sweeps/{sweep_id}/montecarlos",
+            json={"paths": 150, "seed": "r", "ranking": {"rank_by": "return", "top_n": 2}},
+        )
+
+        assert made.status_code == 201, made.text
+        body = made.json()
+        assert body["ranking"] == {"rank_by": "return", "top_n": 2}
+        # The page's own order: best return first, and only the first two.
+        assert [one["run_id"] for one in body["points"]] == [runs[13], runs[11]]
+        best, kept_nothing = body["points"]
+        assert best["trades"] == 40
+        assert best["label"] != ""
+        assert best["simulated"]["trades"] == 40
+        # 40 trades: the cube root, rounded, is 3.
+        assert best["in_blocks"]["block_trades"] == 3
+        assert (kept_nothing["trades_kept"], kept_nothing["simulated"]) == (False, None)
+        assert kept_nothing["in_blocks"] is None
+        assert [one["id"] for one in client.get(f"/sweeps/{sweep_id}/montecarlos").json()] == [
+            body["id"]
+        ]
+
+    def test_another_ranking_picks_other_runs(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        sweep_id, runs = self.a_ranked_sweep(client, session_factory)
+
+        made = client.post(
+            f"/sweeps/{sweep_id}/montecarlos",
+            json={"paths": 100, "ranking": {"rank_by": "drawdown", "top_n": 5}},
+        )
+
+        assert made.status_code == 201, made.text
+        assert {one["run_id"] for one in made.json()["points"]} == set(runs.values())
+
+    def test_an_ordinary_sweep_must_name_its_ranking_and_be_finished(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        sweep_id, _runs = self.a_ranked_sweep(client, session_factory)
+
+        bare = client.post(f"/sweeps/{sweep_id}/montecarlos", json={})
+        too_many = client.post(f"/sweeps/{sweep_id}/montecarlos", json={"ranking": {"top_n": 21}})
+
+        assert bare.status_code == 422
+        assert "ranking" in bare.json()["detail"]
+        assert too_many.status_code == 422
+
+        entry = an_entry(client, name=f"running {uuid.uuid4()}")
+        running_id = launch(client, [entry], ["EURUSD"])
+        still = client.post(f"/sweeps/{running_id}/montecarlos", json={"ranking": {"top_n": 1}})
+        assert still.status_code == 409
 
 
 class TestJudgingATestInPieces:

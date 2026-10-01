@@ -186,6 +186,13 @@ describe('api client', () => {
       limit: 10,
       allRuns: true,
     })
+    await api.getSweepRuns('s-1', {
+      entryId: 'e-1',
+      rankBy: 'return',
+      offset: 0,
+      limit: 10,
+      showClones: true,
+    })
     await api.getSweep('s-1')
 
     const paths = fetchMock.mock.calls.map((call) => String(call[0]))
@@ -193,6 +200,7 @@ describe('api client', () => {
       '/api/sweeps/s-1?runs=none',
       '/api/sweeps/s-1/runs?entry_id=e-1&rank_by=drawdown&offset=20&limit=10',
       '/api/sweeps/s-1/runs?entry_id=e-1&rank_by=return&offset=0&limit=10&all_runs=true',
+      '/api/sweeps/s-1/runs?entry_id=e-1&rank_by=return&offset=0&limit=10&show_clones=true',
       '/api/sweeps/s-1',
     ])
   })

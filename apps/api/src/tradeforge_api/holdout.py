@@ -116,6 +116,23 @@ def floor_of(timeframe: str, floors: Mapping[str, int]) -> int:
     return max(floors.get(timeframe, 0), 1)
 
 
+BEHAVIOUR_FIELDS: tuple[str, ...] = (
+    "total_trades",
+    "long_trades",
+    "short_trades",
+    "net_profit",
+    "net_r",
+    "max_drawdown_r",
+    "yearly_r",
+)
+"""The metrics `behaviour` reads, in its order — the one definition of "the same run" (01/10).
+
+Read by `behaviour` here, by the ranked page of a sweep's runs (`routers.sweeps._clone_ranked`),
+which groups on the same columns in SQL, and so by the dataset's `clone_of` through `behaviour`.
+⚠️ A field added here is added to all three: two lists would let the page hide a run the
+reserved-window test still counts as distinct."""
+
+
 def behaviour(metrics: BacktestMetrics) -> tuple[object, ...]:
     """What a run did, read from its metrics: two runs with the same trades have the same one.
 
@@ -129,14 +146,11 @@ def behaviour(metrics: BacktestMetrics) -> tuple[object, ...]:
     only an identical record is a clone.
     """
     yearly = metrics.yearly_r or {}
-    return (
-        metrics.total_trades,
-        metrics.long_trades,
-        metrics.short_trades,
-        metrics.net_profit,
-        metrics.net_r,
-        metrics.max_drawdown_r,
-        tuple(sorted((year, str(value)) for year, value in yearly.items())),
+    return tuple(
+        tuple(sorted((year, str(value)) for year, value in yearly.items()))
+        if name == "yearly_r"
+        else getattr(metrics, name)
+        for name in BEHAVIOUR_FIELDS
     )
 
 
@@ -215,6 +229,7 @@ def positive_share(values: Sequence[Decimal]) -> Decimal | None:
 
 
 __all__ = [
+    "BEHAVIOUR_FIELDS",
     "Bounds",
     "Candidate",
     "HoldoutRank",

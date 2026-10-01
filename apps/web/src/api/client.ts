@@ -241,12 +241,14 @@ export const api = {
       offset: number
       limit: number
       allRuns?: boolean
+      showClones?: boolean
     },
   ): Promise<SweepRunsPage> =>
     request(
       'GET',
-      // ⚠️ Without `all_runs` the server leaves out what is under its chart's ranking floor (01/10).
-      `/sweeps/${id}/runs${query({ entry_id: page.entryId, rank_by: page.rankBy, offset: page.offset, limit: page.limit, all_runs: page.allRuns ? 'true' : undefined })}`,
+      // ⚠️ Without `all_runs` the server leaves out what is under its chart's ranking floor, and
+      // without `show_clones` every run that made the trades of one launched before it (01/10).
+      `/sweeps/${id}/runs${query({ entry_id: page.entryId, rank_by: page.rankBy, offset: page.offset, limit: page.limit, all_runs: page.allRuns ? 'true' : undefined, show_clones: page.showClones ? 'true' : undefined })}`,
     ),
   // A sweep's best points, run again on a window none of them was chosen on (24/09) — itself a
   // sweep, read back by `getSweep` and compared by `getHoldout`.

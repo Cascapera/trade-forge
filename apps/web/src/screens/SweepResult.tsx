@@ -81,6 +81,10 @@ function Pager(props: {
  * in `sweep/rankFloor`). The top of a ranking was a W1 run of two trades. The button says how many
  * were left out — every run not finished among them, which has no trades yet — and brings them
  * back, last, as before.
+ *
+ * ⚠️ **A run that made exactly the trades of one launched before it is ranked once** (01/10): a
+ * target no trade reached or a breakeven never armed makes the same run under another label, and
+ * the page showed one result N times. The run kept says "+N clones"; the button brings them back.
  */
 function EntryRuns(props: {
   sweepId: string
@@ -94,6 +98,7 @@ function EntryRuns(props: {
 }): React.JSX.Element {
   const { entry } = props
   const [allRuns, setAllRuns] = useState(false)
+  const [showClones, setShowClones] = useState(false)
   const runs = useSweepRuns(
     props.sweepId,
     {
@@ -102,10 +107,13 @@ function EntryRuns(props: {
       offset: props.index * RUNS_PER_PAGE,
       limit: RUNS_PER_PAGE,
       allRuns,
+      showClones,
     },
     props.polling,
   )
   const belowFloor = runs.data?.below_floor ?? 0
+  const clonesHidden = runs.data?.clones_hidden ?? 0
+  const clones = new Map((runs.data?.items ?? []).map((row) => [row.run.id, row.clones ?? 0]))
   const heading = `sweep-entry-${entry.entry_id}`
   const name = entry.entry_name ?? 'An entry since removed from the shelf'
   const total = runs.data?.total ?? 0
@@ -154,8 +162,23 @@ function EntryRuns(props: {
           {allRuns ? 'Hide' : 'Show'} the {String(belowFloor)} under the trade floor
         </button>
       )}
+      {(showClones || clonesHidden > 0) && (
+        <button
+          type="button"
+          aria-pressed={showClones}
+          title="Runs that made exactly the trades of one launched before them, on the same chart and market"
+          onClick={() => {
+            setShowClones((current) => !current)
+            props.onPage(0)
+          }}
+          className="rounded border border-slate-700 px-3 py-1 text-xs text-slate-300 hover:border-slate-500"
+        >
+          {showClones ? 'Hide' : 'Show'} {String(clonesHidden)} clone{clonesHidden === 1 ? '' : 's'}
+        </button>
+      )}
       <RunTable
         runs={items}
+        clones={clones}
         seats={props.seats}
         onToggle={(runId) => {
           const run = items.find((one) => one.id === runId)

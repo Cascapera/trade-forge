@@ -36,6 +36,8 @@ from fastapi import APIRouter, HTTPException, Query, Request, Response, status
 from pydantic import AwareDatetime
 from sqlalchemy import (
     ColumnElement,
+    Select,
+    SQLColumnExpression,
     Text,
     TextClause,
     and_,
@@ -48,8 +50,11 @@ from sqlalchemy import (
     select,
     text,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import InstrumentedAttribute, Session, defer, selectinload
+from sqlalchemy.sql import operators
+from sqlalchemy.sql.elements import UnaryExpression
 
 from tradeforge_api import sweep_dashboard as dashboard
 from tradeforge_api.batching import Batcher, batch_key, enqueue_runs, runs_in
@@ -59,8 +64,10 @@ from tradeforge_api.deps import CollectorDep, QueueDep, SessionDep, SettingsDep
 from tradeforge_api.estimates import backtests_time
 from tradeforge_api.grid import GridPoint
 from tradeforge_api.holdout import (
+    BEHAVIOUR_FIELDS,
     Bounds,
     Candidate,
+    behaviour,
     choose,
     median_of,
     overlaps,
@@ -1728,12 +1735,19 @@ def _runs_of(
     session: Session, sweep: Sweep, *, done_only: bool = False
 ) -> list[tuple[Backtest, str]]:
     """A sweep's runs with their market, in launch order, metrics loaded without the heavy
-    columns — the curve and the ladder, which neither a choice nor a comparison reads."""
+    columns — the curve and the ladder, which neither a choice nor a comparison reads.
+
+    ⚠️ **Launch order is `created_at`, then the strategy's name, then the id** (01/10) — the ranked
+    page's and the dataset's (`_clone_ranked`, `_read_sweep`). A sweep's runs share one
+    `created_at`, and the id alone (a random uuid) let the choice keep a different clone than the
+    page showed: the same result, under another point's label, and another on each launch.
+    """
     query = (
         select(Backtest, Instrument.symbol)
         .join(Instrument, Instrument.id == Backtest.instrument_id)
+        .join(Strategy, Strategy.id == Backtest.strategy_id)
         .where(Backtest.sweep_id.in_(scope_of(sweep)))
-        .order_by(Backtest.created_at, Backtest.id)
+        .order_by(Backtest.created_at, Strategy.name, Backtest.id)
         .options(
             selectinload(Backtest.metrics).options(
                 defer(BacktestMetrics.equity_curve), defer(BacktestMetrics.targets)
@@ -2392,6 +2406,120 @@ def _over_the_floor() -> ColumnElement[bool]:
     )
 
 
+def _sort_key(clause: SQLColumnExpression[Any]) -> tuple[SQLColumnExpression[Any], bool]:
+    """An ORDER BY term as the value it sorts on and whether it sorts descending — so a ranking
+    written over the tables can be computed inside a subquery and sorted on outside it."""
+    if isinstance(clause, UnaryExpression) and clause.modifier in (
+        operators.desc_op,
+        operators.asc_op,
+    ):
+        return clause.element, clause.modifier is operators.desc_op
+    return clause, False
+
+
+def _clone_ranked(  # noqa: PLR0913 — keyword-only; each is one part of the page asked
+    sweep: Sweep,
+    *,
+    entry_id: uuid.UUID | None,
+    where: list[ColumnElement[bool]],
+    rank_by: RankBy,
+    ranked: ColumnElement[bool],
+    show_clones: bool,
+) -> Select[tuple[Any, ...]]:
+    """The page's runs best first, each with its `clones`, and the page's `shown` and `hidden`
+    counts riding on every row (01/10). One pass: the clone groups and the ranking read the same
+    join, and only ids and numbers come out — the caller reads the page's runs whole.
+
+    A clone group is the runs of one entry, chart and market that did the same thing
+    (`holdout.BEHAVIOUR_FIELDS`, the reserved-window test's `distinct`); the run shown is the first
+    launched — by `created_at`, then the strategy's name, which is how the ranking breaks its own
+    ties, then the id — and carries how many it hides. Without `show_clones` the others are left
+    out; with it they come back standing for nobody (`clones` 0), so `hidden` — the sum of
+    `clones` over the rows — is the same number in both states.
+
+    ⚠️ **Grouped among the runs the filter keeps.** `where` carries the floor unless `all_runs`, so
+    a run under it never hides one over it, and the window sorts only what the page ranks. The
+    floor's verdict is in the partition too, which keeps the rule exact with `all_runs`.
+
+    ⚠️ **A run with no metrics is nobody's clone.** Queued, running or failed, it did nothing yet;
+    the partition would put every such run in one group of nulls, so its place is forced to 1.
+
+    ⚠️ **Never a plain join to `sweep_points`.** Nothing in the schema makes a point's own row
+    (`same_as` null) unique per (sweep, strategy) — the key is (sweep, position) — so a join could
+    show a run twice the day one repeats. A page of one entry has one entry to partition by and
+    filters the strategies with a semi-join, as before (`where`); a page of every entry reads one
+    entry per strategy from a `GROUP BY`, slower and asked only by the API, never by the screen.
+
+    ⚠️ **One subquery, never a second pass joined back by id.** Measured on 01/10 over a sweep of
+    175 thousand runs: grouping in one statement and ranking in another, or joining the groups back
+    onto the ranking, doubled or tripled the page's time; the planner also misjudged a filter on
+    an outer-joined group and planned the page as a loop over a handful of rows.
+    """
+    measured = BacktestMetrics.backtest_id.is_not(None)
+    entries: list[ColumnElement[Any]] = []
+    owners = None
+    if entry_id is None:
+        owners = (
+            select(PointRow.strategy_id, func.min(PointRow.entry_id).label("entry_id"))
+            .where(PointRow.sweep_id == sweep.id, PointRow.same_as.is_(None))
+            .group_by(PointRow.strategy_id)
+            .subquery("owners")
+        )
+        entries = [owners.c.entry_id]
+    group = [
+        *entries,
+        Backtest.timeframe,
+        Backtest.instrument_id,
+        ranked,
+        *(
+            func.coalesce(BacktestMetrics.yearly_r, cast(literal("{}"), JSONB))
+            if name == "yearly_r"
+            else getattr(BacktestMetrics, name)
+            for name in BEHAVIOUR_FIELDS
+        ),
+    ]
+    nth = func.row_number().over(
+        partition_by=group, order_by=(Backtest.created_at, Strategy.name, Backtest.id)
+    )
+    keys = [
+        _sort_key(one)
+        for one in (*_ranked(rank_by), Backtest.created_at, Strategy.name, Instrument.symbol)
+    ]
+    inner = (
+        select(
+            Backtest.id.label("id"),
+            case((measured, nth), else_=1).label("nth"),
+            case(
+                (and_(measured, nth == 1), func.count().over(partition_by=group) - 1), else_=0
+            ).label("clones"),
+            *(value.label(f"key_{at}") for at, (value, _descending) in enumerate(keys)),
+        )
+        .select_from(Backtest)
+        .join(Strategy, Strategy.id == Backtest.strategy_id)
+        .join(Instrument, Instrument.id == Backtest.instrument_id)
+        .outerjoin(BacktestMetrics, BacktestMetrics.backtest_id == Backtest.id)
+        .where(*where)
+    )
+    if owners is not None:
+        inner = inner.join(owners, owners.c.strategy_id == Backtest.strategy_id)
+    grouped = inner.subquery("grouped")
+    return (
+        select(
+            grouped.c.id,
+            grouped.c.clones,
+            func.count().over().label("shown"),
+            func.sum(grouped.c.clones).over().label("hidden"),
+        )
+        .where(*([] if show_clones else [grouped.c.nth == 1]))
+        .order_by(
+            *(
+                grouped.c[f"key_{at}"].desc() if descending else grouped.c[f"key_{at}"]
+                for at, (_value, descending) in enumerate(keys)
+            )
+        )
+    )
+
+
 @router.get("/sweeps/{sweep_id}/runs", response_model=SweepRunsPage, responses=_NOT_FOUND)
 def get_sweep_runs(  # noqa: PLR0913 — one query parameter per thing a page is asked by
     sweep_id: uuid.UUID,
@@ -2402,6 +2530,7 @@ def get_sweep_runs(  # noqa: PLR0913 — one query parameter per thing a page is
     offset: Annotated[int, Query(ge=0)] = 0,
     limit: Annotated[int, Query(ge=1, le=100)] = 10,
     all_runs: bool = False,
+    show_clones: bool = False,
 ) -> SweepRunsPage:
     """One page of a sweep's runs — of one entry, when named — best first by `rank_by`.
 
@@ -2411,50 +2540,71 @@ def get_sweep_runs(  # noqa: PLR0913 — one query parameter per thing a page is
     Only runs at or over their chart's ranking floor (`ranking_floor.RANK_MIN_TRADES`, 01/10)
     unless `all_runs`: the top of a ranking was a W1 run of two trades. `below_floor` says how many
     were left out, so the screen can offer them.
+
+    Only the first run of each clone group unless `show_clones` (01/10, `_clone_ranked`): points
+    that differ in a dial no trade reached rank side by side as one result N times. Each run shown
+    says how many it stands for (`clones`), and `clones_hidden` how many the filter holds besides —
+    the same number either way, so the screen can name them in both states.
     """
     sweep = session.get(Sweep, sweep_id)
     if sweep is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="sweep not found")
     # ⚠️ **The entry's strategies as a subquery, not a list read first** (26/09): a sweep can hold
-    # hundreds of thousands of points, and this page is polled. Only the page's own points are
-    # read, below.
+    # hundreds of thousands of points, and this page is polled. Only the page's own runs are read
+    # whole, below; the clone groups are one window, in Postgres.
     strategies = select(PointRow.strategy_id).where(
         PointRow.sweep_id == sweep.id, PointRow.same_as.is_(None)
     )
     if entry_id is not None:
         strategies = strategies.where(PointRow.entry_id == str(entry_id))
-    where: list[ColumnElement[bool]] = [
-        Backtest.sweep_id.in_(scope_of(sweep)),
-        Backtest.strategy_id.in_(strategies),
-    ]
     ranked = _over_the_floor()
     every, passing = session.execute(
         select(func.count(), func.count().filter(ranked))
         .select_from(Backtest)
         .outerjoin(BacktestMetrics, BacktestMetrics.backtest_id == Backtest.id)
-        .where(*where)
+        .where(Backtest.sweep_id.in_(scope_of(sweep)), Backtest.strategy_id.in_(strategies))
     ).one()
-    if not all_runs:
-        where.append(ranked)
-    total = every if all_runs else passing
-    rows = session.execute(
-        select(Backtest, Strategy, Instrument)
-        .join(Strategy, Strategy.id == Backtest.strategy_id)
-        .join(Instrument, Instrument.id == Backtest.instrument_id)
-        .outerjoin(BacktestMetrics, BacktestMetrics.backtest_id == Backtest.id)
-        .where(*where)
-        # Ties keep the order `_read_sweep` reads in, which is the order the screen ranked in.
-        .order_by(*_ranked(rank_by), Backtest.created_at, Strategy.name, Instrument.symbol)
-        .offset(offset)
-        .limit(limit)
-        .options(
-            selectinload(Backtest.metrics).options(
-                defer(BacktestMetrics.equity_curve), defer(BacktestMetrics.targets)
+    where: list[ColumnElement[bool]] = [
+        Backtest.sweep_id.in_(scope_of(sweep)),
+        Backtest.strategy_id.in_(strategies),
+        *([] if all_runs else [ranked]),
+    ]
+    ranking = _clone_ranked(
+        sweep,
+        entry_id=entry_id,
+        where=where,
+        rank_by=rank_by,
+        ranked=ranked,
+        show_clones=show_clones,
+    )
+    page = session.execute(ranking.offset(offset).limit(limit)).all()
+    if page:
+        shown, clones_hidden = page[0].shown, page[0].hidden
+    elif offset == 0:
+        # Nothing shown is nothing hidden: every clone hides behind a run that is shown.
+        shown, clones_hidden = 0, 0
+    else:
+        # A page past the end carries no row to read the counts from: only then a second read.
+        counted = ranking.subquery()
+        shown, clones_hidden = session.execute(
+            select(func.count(), func.coalesce(func.sum(counted.c.clones), 0))
+        ).one()
+    read = {
+        run.id: (run, strategy, instrument)
+        for run, strategy, instrument in session.execute(
+            select(Backtest, Strategy, Instrument)
+            .join(Strategy, Strategy.id == Backtest.strategy_id)
+            .join(Instrument, Instrument.id == Backtest.instrument_id)
+            .where(Backtest.id.in_([row.id for row in page]))
+            .options(
+                selectinload(Backtest.metrics).options(
+                    defer(BacktestMetrics.equity_curve), defer(BacktestMetrics.targets)
+                )
             )
-        )
-    ).all()
+        ).all()
+    }
     own, followers = _points_of(
-        session, sweep, strategy_ids={run.strategy_id for run, _, _ in rows}
+        session, sweep, strategy_ids={run.strategy_id for run, _, _ in read.values()}
     )
     entries = {
         str(entry.id): entry
@@ -2463,18 +2613,19 @@ def get_sweep_runs(  # noqa: PLR0913 — one query parameter per thing a page is
         )
     }
     return SweepRunsPage(
-        total=total,
+        total=shown,
         below_floor=every - passing,
+        clones_hidden=clones_hidden,
         offset=offset,
         limit=limit,
         items=[
             _run_out(
-                (run, strategy, instrument),
-                own.get(str(run.strategy_id), {}),
+                read[row.id],
+                own.get(str(read[row.id][0].strategy_id), {}),
                 entries=entries,
                 followers=followers,
-            )
-            for run, strategy, instrument in rows
+            ).model_copy(update={"clones": row.clones})
+            for row in page
         ],
     )
 
@@ -2627,10 +2778,19 @@ def _dataset_runs(session: SessionDep, sweep_id: uuid.UUID) -> list[DatasetRun]:
     """
     sweep, entries, coordinates, followers, rows = _read_sweep(session, sweep_id)
     out: list[DatasetRun] = []
+    # ⚠️ **The first of each behaviour in this order is the original** (01/10): launch time, then
+    # the strategy's name — the ranked page's own rule (`_clone_ranked`), so the run a page shows
+    # is the run this file leaves `clone_of` empty on.
+    originals: dict[tuple[object, ...], tuple[uuid.UUID, str]] = {}
     for run, strategy, instrument in rows:
         point = coordinates.get(str(run.strategy_id), {})
         entry_id = str(point.get("entry_id", ""))
         shelved = entries.get(entry_id)
+        clone_of: str | None = None
+        if run.metrics is not None:
+            group = (entry_id, run.timeframe, instrument.symbol, behaviour(run.metrics))
+            first, label = originals.setdefault(group, (run.id, str(point.get("label", ""))))
+            clone_of = None if first == run.id else label
         # ⚠️ **A row for every point, the ones a run answers besides its own included** (his
         # answer, 24/09) — each at its own coordinates, each saying whose run it is.
         for one in [point, *followers.get(str(run.strategy_id), [])]:
@@ -2646,6 +2806,7 @@ def _dataset_runs(session: SessionDep, sweep_id: uuid.UUID) -> list[DatasetRun]:
                     asset_class=str(instrument.asset_class),
                     values=dict(one.get("values", {})),
                     same_as=None if same_as is None else str(same_as),
+                    clone_of=clone_of,
                 )
             )
     return out

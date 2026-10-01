@@ -3542,6 +3542,183 @@ class TestTheScreenReadsAPage:
         assert client.get(f"/sweeps/{uuid.uuid4()}/runs").status_code == 404
 
 
+def did_the_same(
+    session_factory: Callable[[], Session], run_ids: list[str], *, yearly: dict[str, str]
+) -> None:
+    """Give finished runs one record — 30 trades, +300, 6 R — and `yearly` as their R by year."""
+    with session_factory() as session:
+        for run_id in run_ids:
+            run = session.get(Backtest, uuid.UUID(run_id))
+            assert run is not None
+            assert run.metrics is not None
+            run.metrics.total_trades = run.metrics.long_trades = 30
+            run.metrics.net_profit = run.metrics.gross_profit = Decimal(300)
+            run.metrics.net_r = Decimal(6)
+            run.metrics.max_drawdown_r = Decimal(2)
+            run.metrics.yearly_r = yearly
+        session.commit()
+
+
+class TestClonesRankOnce:
+    """01/10: points that differ in a dial no trade reached make the same trades, and a ranking that
+    shows each of them shows one result N times. The page shows the first launched and says how
+    many it stands for."""
+
+    def cloned(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> tuple[str, str, list[str], str, str]:
+        """`five`, with periods 7, 11 and 9 one record and period 5 the same but for one year.
+
+        Returns the sweep, the original (the first of the three by name: they were launched in one
+        instant), its two clones, the near-copy and the run still queued."""
+        sweep_id, (n7, n11, n9, n5, queued) = TestTheScreenReadsAPage().five(
+            client, session_factory
+        )
+        did_the_same(session_factory, [n7, n11, n9], yearly={"2024": "4", "2025": "2"})
+        did_the_same(session_factory, [n5], yearly={"2024": "5", "2025": "1"})
+        every = client.get(
+            f"/sweeps/{sweep_id}/runs", params={"all_runs": True, "show_clones": True}
+        ).json()["items"]
+        names = {row["run"]["id"]: row["run"]["strategy_name"] for row in every}
+        original, *clones = sorted([n7, n11, n9], key=names.__getitem__)
+        return sweep_id, original, clones, n5, queued
+
+    def test_a_group_shows_its_first_run_and_counts_the_rest(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        sweep_id, original, _clones, n5, _queued = self.cloned(client, session_factory)
+
+        page = client.get(f"/sweeps/{sweep_id}/runs").json()
+
+        # Same trades, net and R, one year apart: n5 is not a clone, and is ranked on its own.
+        assert (page["total"], page["clones_hidden"], page["below_floor"]) == (2, 2, 1)
+        assert {row["run"]["id"]: row["clones"] for row in page["items"]} == {original: 2, n5: 0}
+
+    def test_the_clones_come_back_when_asked_and_are_counted_the_same(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        sweep_id, original, clones, n5, _queued = self.cloned(client, session_factory)
+
+        page = client.get(f"/sweeps/{sweep_id}/runs", params={"show_clones": True}).json()
+
+        assert (page["total"], page["clones_hidden"]) == (4, 2)
+        assert len(page["items"]) == page["total"]
+        counted = {row["run"]["id"]: row["clones"] for row in page["items"]}
+        assert counted == {original: 2, clones[0]: 0, clones[1]: 0, n5: 0}
+
+    def test_clones_are_counted_among_the_runs_the_floor_keeps(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        sweep_id, original, _clones, n5, queued = self.cloned(client, session_factory)
+
+        every = client.get(f"/sweeps/{sweep_id}/runs", params={"all_runs": True}).json()
+        both = client.get(
+            f"/sweeps/{sweep_id}/runs", params={"all_runs": True, "show_clones": True}
+        ).json()
+
+        assert (every["total"], every["clones_hidden"], every["below_floor"]) == (3, 2, 1)
+        assert {row["run"]["id"] for row in every["items"]} == {original, n5, queued}
+        assert (both["total"], both["clones_hidden"]) == (5, 2)
+        # Paged, the total is the rows the pages hold.
+        paged = [
+            row["run"]["id"]
+            for offset in (0, 2)
+            for row in client.get(
+                f"/sweeps/{sweep_id}/runs",
+                params={"all_runs": True, "limit": 2, "offset": offset},
+            ).json()["items"]
+        ]
+        assert sorted(paged) == sorted(row["run"]["id"] for row in every["items"])
+        # A page past the end still counts what it would have paged through.
+        past = client.get(f"/sweeps/{sweep_id}/runs", params={"offset": 50}).json()
+        assert (past["items"], past["total"], past["clones_hidden"]) == ([], 2, 2)
+
+    def test_the_reserved_window_keeps_the_run_the_page_shows(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        """01/10: the three tell their clones apart by launch order the same way — `created_at`,
+        then the strategy's name — not by a random id, so the test runs the point the page shows."""
+        sweep_id, original, _clones, n5, _queued = self.cloned(client, session_factory)
+        with session_factory() as session:
+            run = session.get(Backtest, uuid.UUID(n5))
+            assert run is not None
+            assert run.metrics is not None
+            run.metrics.net_profit = run.metrics.gross_profit = Decimal(100)
+            session.commit()
+        shown = client.get(f"/sweeps/{sweep_id}/runs").json()["items"][0]
+        assert shown["run"]["id"] == original
+
+        created = client.post(
+            f"/sweeps/{sweep_id}/holdout",
+            json=TestTheReservedWindow().after(top_n=1),
+        )
+
+        assert created.status_code == 202, created.text
+        (tested,) = client.get(f"/sweeps/{created.json()['id']}").json()["runs"]
+        assert tested["run"]["strategy_id"] == shown["run"]["strategy_id"]
+        assert tested["label"] == shown["label"]
+
+    def test_runs_with_nothing_measured_are_nobodys_clones(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        entry = an_entry(
+            client, name=f"unrun {uuid.uuid4()}", grid={"setup.params.period": [5, 7, 9]}
+        )
+        sweep_id = client.post("/sweeps", json=a_sweep_body([entry], ["EURUSD"], ["H1"])).json()[
+            "id"
+        ]
+
+        page = client.get(f"/sweeps/{sweep_id}/runs", params={"all_runs": True}).json()
+
+        assert (page["total"], page["clones_hidden"]) == (3, 0)
+        assert {row["clones"] for row in page["items"]} == {0}
+
+    def test_a_clone_of_another_entry_or_chart_is_not_one(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        first = an_entry(client, name=f"one {uuid.uuid4()}")
+        second = an_entry(client, name=f"two {uuid.uuid4()}")
+        sweep_id = client.post(
+            "/sweeps", json=a_sweep_body([first, second], ["EURUSD"], ["H1", "H4"])
+        ).json()["id"]
+        runs = [row["run"]["id"] for row in client.get(f"/sweeps/{sweep_id}").json()["runs"]]
+        assert len(runs) == 4
+        for run_id in runs:
+            finish(session_factory, run_id, 300)
+        did_the_same(session_factory, runs, yearly={"2024": "6"})
+
+        page = client.get(f"/sweeps/{sweep_id}/runs").json()
+        one = client.get(f"/sweeps/{sweep_id}/runs", params={"entry_id": first}).json()
+
+        assert (page["total"], page["clones_hidden"]) == (4, 0)
+        assert (one["total"], one["clones_hidden"]) == (2, 0)
+
+    def test_the_dataset_names_the_point_each_clone_copies(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        sweep_id, original, clones, n5, queued = self.cloned(client, session_factory)
+        label = {
+            row["run"]["id"]: row["label"]
+            for row in client.get(f"/sweeps/{sweep_id}").json()["runs"]
+        }
+
+        served = client.get(f"/sweeps/{sweep_id}/dataset.csv").text
+        rows = {row["run_id"]: row for row in csv.DictReader(io.StringIO(served))}
+
+        assert {run_id: rows[run_id]["clone_of"] for run_id in rows} == {
+            original: "",
+            clones[0]: label[original],
+            clones[1]: label[original],
+            n5: "",
+            queued: "",
+        }
+        names = [
+            column["name"]
+            for column in client.get(f"/sweeps/{sweep_id}/dataset/dictionary").json()["columns"]
+        ]
+        assert names.index("clone_of") == names.index("same_as") + 1
+
+
 class TestEachMarketPaysItsOwnCosts:
     """His account pays a spread and a commission per lot (24/09), and a sweep over several
     markets used to charge one spread to them all."""

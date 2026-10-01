@@ -1214,6 +1214,11 @@ export interface SweepRunOut {
   /** The coordinates, keyed by the grid's dotted paths plus `timeframe`. */
   values: Record<string, unknown>
   run: BacktestListItem
+  /** How many runs of the same entry, chart and market made exactly this run's trades and were
+   *  launched after it (01/10) — hidden behind it on the ranked page unless clones are asked for.
+   *  Unlike a point the run answers, each of them did run. 0 on a clone shown; absent from older
+   *  fixtures. */
+  clones?: number
 }
 
 /**
@@ -1677,6 +1682,10 @@ export interface SweepRunsPage {
    *  without `allRuns`. ⚠️ Every run not finished counts here: it has no trades yet. Absent from
    *  older fixtures. */
   below_floor?: number
+  /** How many of the ranked runs are clones of a run launched before them (01/10) — left out of
+   *  `total` and `items` unless `showClones`, and the same number either way. Absent from older
+   *  fixtures. */
+  clones_hidden?: number
 }
 
 /** How many of a sweep's runs sit in each status. The four always add up to `total`. */

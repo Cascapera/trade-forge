@@ -652,6 +652,7 @@ export function useSweepRuns(
     offset: number
     limit: number
     allRuns?: boolean
+    showClones?: boolean
   },
   polling: boolean,
 ) {
@@ -664,6 +665,7 @@ export function useSweepRuns(
       page.offset,
       page.limit,
       page.allRuns ?? false,
+      page.showClones ?? false,
     ],
     queryFn: () => api.getSweepRuns(id, page),
     placeholderData: (previous) => previous,

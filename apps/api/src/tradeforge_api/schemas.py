@@ -2064,6 +2064,12 @@ class SweepRunOut(BaseModel):
     as rows of their own, because a row is a run — counted, paged, linked — and these share one.
     The dataset is where each of them is a row."""
 
+    clones: int = 0
+    """How many runs of the same entry, chart and market did exactly what this one did
+    (`holdout.behaviour`) and were launched after it (01/10) — hidden behind it on the ranked page
+    unless `show_clones`. Unlike `equivalents`, each of them did run: its trades are this run's
+    trades because no trade reached the dial that tells them apart."""
+
 
 class SweepEntryOut(BaseModel):
     """One shelf entry's share of a sweep, summarised **on its own**.
@@ -2618,6 +2624,11 @@ class SweepRunsPage(BaseModel):
     ⚠️ **"Under the floor" includes every run not finished**: a queued, running or failed run has no
     trades to count, so it is not ranked until it has. With `all_runs` they come back, last, as
     before."""
+    clones_hidden: int = 0
+    """How many of the runs the page ranks are clones of a run launched before them (01/10,
+    `SweepRunOut.clones`) — left out of `total` and `items` unless `show_clones`, and counted the
+    same either way, so the screen can name them in both states. Counted after the floor: with
+    `all_runs` it counts the clones among every run."""
 
 
 class SweepRunCounts(BaseModel):

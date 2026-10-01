@@ -6,6 +6,7 @@ from decimal import Decimal
 import pytest
 
 from tradeforge_api.holdout import (
+    BEHAVIOUR_FIELDS,
     Bounds,
     Candidate,
     HoldoutRank,
@@ -170,6 +171,23 @@ class TestDistinct:
         second = BacktestMetrics(total_trades=3, yearly_r={"2021": "2", "2020": "1"})
 
         assert behaviour(first) == behaviour(second)
+
+    def test_every_field_it_reads_is_a_column_and_tells_runs_apart(self) -> None:
+        """01/10: the ranked page groups clones in SQL on `BEHAVIOUR_FIELDS`, so every name must be
+        a column of the metrics, and a change in any one of them must make another run."""
+        columns = set(BacktestMetrics.__table__.columns.keys())
+        assert set(BEHAVIOUR_FIELDS) <= columns
+        base = a_record(0, net_r="7.7", y2021="17.6").metrics
+        for name in BEHAVIOUR_FIELDS:
+            changed = BacktestMetrics(
+                **{field: getattr(base, field) for field in BEHAVIOUR_FIELDS},
+            )
+            setattr(
+                changed,
+                name,
+                {"2020": "0"} if name == "yearly_r" else getattr(base, name) + 1,
+            )
+            assert behaviour(changed) != behaviour(base), name
 
 
 class TestTheWindow:

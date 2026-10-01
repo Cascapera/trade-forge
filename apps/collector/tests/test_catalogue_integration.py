@@ -10,6 +10,7 @@ Run locally with:  docker compose up -d  &&  uv run pytest -m integration
 
 import datetime as dt
 from collections.abc import Iterator
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 
@@ -20,10 +21,12 @@ from sqlalchemy.orm import Session
 from tradeforge_collector.backfill import backfill
 from tradeforge_collector.synthetic import SyntheticSource
 from tradeforge_db.config import PostgresSettings
+from tradeforge_db.instruments import ClockChangedError
 from tradeforge_db.migrate import upgrade
 from tradeforge_db.models import Dataset, Instrument
 from tradeforge_db.session import create_db_engine, create_session_factory
 from tradeforge_db.testing import truncate
+from tradeforge_engine.domain import InstrumentSpec
 
 pytestmark = pytest.mark.integration
 
@@ -147,3 +150,51 @@ def test_a_stock_and_a_pair_land_side_by_side(session: Session, tmp_path: Path) 
 
     assert aapl.currency_base is None
     assert aapl.tick_size == Decimal("0.01")
+
+
+class _ClockedSource(SyntheticSource):
+    """The synthetic market read on another server clock — a collection measured in winter."""
+
+    def __init__(self, offset: dt.timedelta) -> None:
+        super().__init__()
+        self._offset = offset
+
+    def instrument(self, symbol: str) -> InstrumentSpec:
+        return replace(super().instrument(symbol), server_offset=self._offset)
+
+
+def test_a_backfill_on_another_clock_is_refused_before_it_writes(
+    session: Session, tmp_path: Path
+) -> None:
+    """01/10: the symbol has data on one clock, and a collection on another stops before a bar
+    is written — refusing only when cataloguing would leave the shifted bars on disk."""
+    first = backfill(
+        SyntheticSource(),
+        root=tmp_path,
+        symbol="EURUSD",
+        timeframe="H1",
+        start=JAN,
+        end=FEB,
+        session=session,
+    )
+    session.commit()
+    on_disk = sorted(str(path) for path in tmp_path.rglob("*"))
+    assert any(path.endswith(".parquet") for path in on_disk), "nothing to compare against"
+
+    with pytest.raises(ClockChangedError, match="--server-offset"):
+        backfill(
+            _ClockedSource(first.instrument.server_offset + dt.timedelta(hours=2)),
+            root=tmp_path,
+            symbol="EURUSD",
+            timeframe="H1",
+            start=dt.datetime(2025, 1, 1, tzinfo=dt.UTC),
+            end=dt.datetime(2025, 2, 1, tzinfo=dt.UTC),
+            session=session,
+        )
+    session.rollback()
+
+    assert sorted(str(path) for path in tmp_path.rglob("*")) == on_disk
+    recorded = session.execute(
+        select(Instrument.server_offset).where(Instrument.symbol == "EURUSD")
+    ).scalar_one()
+    assert recorded == first.instrument.server_offset

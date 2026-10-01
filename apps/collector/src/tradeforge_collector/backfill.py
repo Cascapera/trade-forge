@@ -11,6 +11,7 @@ the world looks the same as after running it once.
 
 import datetime as dt
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal
 from itertools import pairwise
@@ -23,7 +24,12 @@ from tradeforge_collector.gaps import Gap, find_gaps
 from tradeforge_collector.source import MarketDataSource
 from tradeforge_collector.storage import write_candles
 from tradeforge_collector.timeframes import step
-from tradeforge_db.instruments import CatalogueEntry, upsert_dataset, upsert_instruments
+from tradeforge_db.instruments import (
+    CatalogueEntry,
+    refuse_a_new_clock,
+    upsert_dataset,
+    upsert_instruments,
+)
 from tradeforge_db.models import Instrument
 from tradeforge_engine.domain import Candle, InstrumentSpec
 
@@ -56,11 +62,18 @@ def backfill(  # noqa: PLR0913 — all keyword-only, and each one names a real a
     start: dt.datetime,
     end: dt.datetime,
     session: Session | None = None,
+    before_write: Callable[[InstrumentSpec], None] | None = None,
 ) -> BackfillReport:
     """Download a symbol's history, store it, catalogue it, and report the holes.
 
     `session` is optional so the data path can be exercised without a database — the
     Parquet is the product, the catalogue is bookkeeping about it.
+
+    ⚠️ **The clock is checked before a bar is written** (01/10). With a `session`, a symbol
+    that already has data on another server clock is refused here (`refuse_a_new_clock`)
+    rather than when it is catalogued — by then the shifted bars would be in its Parquet.
+    `before_write` is the same question for a caller without a session (`collect`), asked of
+    its journal.
     """
     _require_utc(start, "start")
     _require_utc(end, "end")
@@ -68,6 +81,10 @@ def backfill(  # noqa: PLR0913 — all keyword-only, and each one names a real a
         raise ValueError(f"end ({end}) is before start ({start})")
 
     spec = source.instrument(symbol)
+    if session is not None:
+        refuse_a_new_clock(session, spec)
+    if before_write is not None:
+        before_write(spec)
     candles = source.candles(symbol, timeframe, start, end)
     if not candles:
         raise LookupError(f"no candles for {symbol} {timeframe} between {start} and {end}")

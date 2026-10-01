@@ -1,6 +1,7 @@
 """Choosing a sweep's best points to test on a reserved window — the arithmetic, no database."""
 
 import datetime as dt
+import uuid
 from decimal import Decimal
 
 import pytest
@@ -10,13 +11,16 @@ from tradeforge_api.holdout import (
     Bounds,
     Candidate,
     HoldoutRank,
+    WindowUse,
     behaviour,
     choose,
     floor_of,
+    keys_of,
     median_of,
     overlaps,
     positive_share,
     recovery_r,
+    reusing,
 )
 from tradeforge_db.models import BacktestMetrics
 
@@ -208,6 +212,58 @@ class TestTheWindow:
     ) -> None:
         window = (dt.datetime(*start, tzinfo=dt.UTC), dt.datetime(*end, tzinfo=dt.UTC))
         assert overlaps(*window, *self.SEARCHED) is shares
+
+
+def a_use(
+    start: int,
+    end: int,
+    *,
+    walk: uuid.UUID | None = None,
+    fold: int | None = None,
+    launched: int = 1,
+) -> WindowUse:
+    return WindowUse(
+        test_id=None if walk is not None else uuid.uuid4(),
+        walk_forward_id=walk,
+        fold=fold,
+        date_from=dt.datetime(start, 1, 1, tzinfo=dt.UTC),
+        date_to=dt.datetime(end, 1, 1, tzinfo=dt.UTC),
+        created_at=dt.datetime(2026, 10, launched, tzinfo=dt.UTC),
+    )
+
+
+class TestTheWindowIsUsedOnce:
+    """01/10: the earlier looks a new test of the same sweep would repeat."""
+
+    def test_only_the_uses_sharing_a_bar_oldest_first(self) -> None:
+        later, touching, earlier = (
+            a_use(2025, 2026, launched=3),
+            a_use(2024, 2025),
+            a_use(2025, 2027),
+        )
+        found = reusing(
+            dt.datetime(2025, 6, 1, tzinfo=dt.UTC),
+            dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+            [later, touching, earlier],
+        )
+        assert found == [earlier, later]
+
+    def test_a_walk_forward_is_one_earlier_test_however_many_folds_overlap(self) -> None:
+        walk = uuid.uuid4()
+        alone = a_use(2025, 2026)
+        uses = [a_use(2024, 2025, walk=walk, fold=0), alone, a_use(2025, 2026, walk=walk, fold=1)]
+        assert keys_of(uses) == [str(walk), str(alone.key)]
+
+    def test_a_use_is_a_test_or_a_fold(self) -> None:
+        with pytest.raises(ValueError, match="a use is a test or a fold"):
+            _ = WindowUse(
+                test_id=None,
+                walk_forward_id=None,
+                fold=None,
+                date_from=dt.datetime(2025, 1, 1, tzinfo=dt.UTC),
+                date_to=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+                created_at=dt.datetime(2026, 10, 1, tzinfo=dt.UTC),
+            ).key
 
 
 class TestSummaries:

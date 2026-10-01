@@ -15,8 +15,16 @@ from sqlalchemy import select
 
 from tradeforge_api.batching import enqueue_runs
 from tradeforge_api.deps import QueueDep, SessionDep, SettingsDep
+from tradeforge_api.holdout import reusing
 from tradeforge_api.queue import RUN_SWEEP_WALK_FORWARD
-from tradeforge_api.routers.sweeps import get_holdout, jobs_for, launch_window
+from tradeforge_api.routers.sweeps import (
+    get_holdout,
+    jobs_for,
+    launch_window,
+    retest_rule,
+    window_used,
+    window_uses,
+)
 from tradeforge_api.schemas import (
     CreatedSweepWalkForward,
     CreateSweepWalkForward,
@@ -63,6 +71,9 @@ async def create_sweep_walk_forward(
     ⚠️ **Refused for a reserved-window test** — its points were chosen elsewhere, and walking it
     forward would re-choose among a handful — and for windows whose first test starts in the
     future, which would test nothing.
+
+    ⚠️ **Refused with a 409 when a test window was already used** by an earlier test of this
+    sweep, or a fold of an earlier walk-forward of it (01/10) — unless the request says `retest`.
     """
     parent = session.get(Sweep, sweep_id)
     if parent is None:
@@ -114,6 +125,14 @@ async def create_sweep_walk_forward(
             ),
         )
 
+    # ⚠️ **Each test window weighed against the sweep's earlier looks, before anything is kept**
+    # (01/10): a walk-forward that tests years an earlier test of this sweep already used is a
+    # 409, as a reserved-window test is (`launch_holdout`). Its own folds are not weighed against
+    # each other: their tests tile, so one span from the first to the last is exactly their union.
+    prior = reusing(planned[0].test_from, planned[-1].test_to, window_uses(session, parent.id))
+    if prior and not request.retest:
+        raise window_used(prior, what="a test window of this walk-forward")
+
     rule = request.model_dump(
         mode="json",
         include={
@@ -126,6 +145,9 @@ async def create_sweep_walk_forward(
         },
         exclude_none=True,
     )
+    # A retest is marked on the walk-forward too, with the looks it repeats; each fold's test
+    # carries its own (`sweep_walkforward_job.advance`).
+    rule |= retest_rule(prior)
     walk = SweepWalkForward(
         parent_sweep_id=parent.id,
         start_year=request.start_year,

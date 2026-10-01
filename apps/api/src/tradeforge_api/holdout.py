@@ -13,7 +13,8 @@ would test the luckiest corner of one entry on one chart and call it the sweep's
 """
 
 import datetime as dt
-from collections.abc import Callable, Mapping, Sequence
+import uuid
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import StrEnum
@@ -216,6 +217,57 @@ def overlaps(
     return date_from < searched_to and searched_from < date_to
 
 
+@dataclass(frozen=True, slots=True)
+class WindowUse:
+    """One earlier look at data a sweep's points were not chosen on (01/10): a reserved-window test
+    of the sweep, or one fold of a walk-forward of it.
+
+    ⚠️ **A fold counts from launch, not from its test.** A walk-forward's tests start only when
+    each training ends, hours later; a window counted only once tested would let a second
+    walk-forward over the same years in through that gap.
+    """
+
+    test_id: uuid.UUID | None
+    """The test sweep; `None` for a fold whose training has not ended yet."""
+    walk_forward_id: uuid.UUID | None
+    """The walk-forward the fold belongs to; `None` for a test launched on its own."""
+    fold: int | None
+    date_from: dt.datetime
+    date_to: dt.datetime
+    created_at: dt.datetime
+
+    @property
+    def key(self) -> uuid.UUID:
+        """What a person launched: the walk-forward for a fold, the test itself otherwise."""
+        if self.walk_forward_id is not None:
+            return self.walk_forward_id
+        if self.test_id is None:
+            raise ValueError("a use is a test or a fold of a walk-forward")
+        return self.test_id
+
+
+def reusing(
+    date_from: dt.datetime, date_to: dt.datetime, uses: Iterable[WindowUse]
+) -> list[WindowUse]:
+    """The earlier uses that share a bar with `[date_from, date_to)` — `overlaps`'s rule, so
+    touching ends do not count — oldest first.
+
+    His rule (01/10): **the reserved year is used once per sweep.** Every test is a look at it;
+    choosing, looking, adjusting and testing again turns the reserved window into one more window
+    chosen on, and its second answer reads as a second opinion it is not.
+    """
+    return sorted(
+        (use for use in uses if overlaps(date_from, date_to, use.date_from, use.date_to)),
+        key=lambda use: (use.created_at, use.fold or 0),
+    )
+
+
+def keys_of(uses: Iterable[WindowUse]) -> list[str]:
+    """The distinct things launched behind `uses`, in their order — what a retest records as
+    `retest_of`. A walk-forward whose two folds overlap is one earlier test, not two."""
+    return list(dict.fromkeys(str(use.key) for use in uses))
+
+
 def median_of(values: Sequence[Decimal]) -> Decimal | None:
     """The median, or `None` for nothing to take it of — never a zero that reads as measured."""
     return median(values) if values else None
@@ -233,11 +285,14 @@ __all__ = [
     "Bounds",
     "Candidate",
     "HoldoutRank",
+    "WindowUse",
     "behaviour",
     "choose",
     "floor_of",
+    "keys_of",
     "median_of",
     "overlaps",
     "positive_share",
     "recovery_r",
+    "reusing",
 ]

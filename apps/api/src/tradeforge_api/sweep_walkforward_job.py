@@ -13,7 +13,8 @@ from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from tradeforge_api.routers.sweeps import launch_holdout
+from tradeforge_api.holdout import reusing
+from tradeforge_api.routers.sweeps import RETEST_KEYS, launch_holdout, window_uses
 from tradeforge_api.schemas import CreateHoldout
 from tradeforge_db.models import Backtest, BacktestStatus, SweepWalkForward
 
@@ -49,6 +50,8 @@ def advance(session: Session, walk_forward_id: uuid.UUID) -> tuple[list[Backtest
     walk.status = BacktestStatus.RUNNING
     session.commit()
 
+    # The rule without the walk-forward's own retest marks: each fold's test writes its own.
+    choice = {key: value for key, value in walk.rule.items() if key not in RETEST_KEYS}
     queue: list[Backtest] = []
     for fold in walk.folds:
         if fold.error is not None or fold.test_sweep_id is not None:
@@ -60,13 +63,31 @@ def advance(session: Session, walk_forward_id: uuid.UUID) -> tuple[list[Backtest
             continue
         # A test window reaching past today ends today: there is nothing later to test on.
         until = min(fold.test_to, _now())
+        # ⚠️ The looks this fold repeats, as they stood when the walk-forward was launched — and
+        # weighed then (01/10): recorded on its test, never refused here. A test launched since
+        # does not make the fold a retest, and the walk-forward's own folds never count.
+        prior = (
+            []
+            if walk.parent_sweep_id is None
+            else reusing(
+                fold.test_from,
+                fold.test_to,
+                window_uses(
+                    session,
+                    walk.parent_sweep_id,
+                    skip_walk_forward=walk.id,
+                    before=walk.created_at,
+                ),
+            )
+        )
         try:
             test, runs, _skipped = launch_holdout(
                 session,
                 fold.train_sweep_id,
                 CreateHoldout.model_validate(
-                    {**walk.rule, "date_from": fold.test_from, "date_to": until}
+                    {**choice, "date_from": fold.test_from, "date_to": until}
                 ),
+                prior=prior,
             )
         except HTTPException as refused:
             session.rollback()

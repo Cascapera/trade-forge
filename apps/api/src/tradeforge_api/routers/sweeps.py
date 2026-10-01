@@ -67,11 +67,14 @@ from tradeforge_api.holdout import (
     BEHAVIOUR_FIELDS,
     Bounds,
     Candidate,
+    WindowUse,
     behaviour,
     choose,
+    keys_of,
     median_of,
     overlaps,
     positive_share,
+    reusing,
 )
 from tradeforge_api.montecarlo import Spread, observed, simulate
 from tradeforge_api.queue import COLLECT_QUEUE, COLLECT_RANGE
@@ -118,6 +121,7 @@ from tradeforge_api.schemas import (
     SweepRunsPage,
     SweepsPage,
     UncoveredMarket,
+    WindowUseOut,
 )
 from tradeforge_api.slices import ClosedTrade, by_blocks, by_year, verdict
 from tradeforge_api.sweep import (
@@ -147,6 +151,8 @@ from tradeforge_db.models import (
     Sweep,
     SweepMonteCarlo,
     SweepSlicing,
+    SweepWalkForward,
+    SweepWalkForwardFold,
     Trade,
 )
 from tradeforge_db.models import SweepPoint as PointRow
@@ -1339,6 +1345,10 @@ async def create_holdout(
 
     ⚠️ **Refused, not warned:** a window that shares a bar with the one searched, and a test of a
     test — its points would be chosen on the reserved window itself.
+
+    ⚠️ **The reserved window is used once (01/10)**: a window an earlier test of this sweep — or a
+    fold of a walk-forward of it — already used is a 409 naming those tests, unless the request
+    says `retest` (`window_uses`).
     """
     holdout, runs, uncovered = launch_holdout(session, sweep_id, request)
     # After the commit, and with job ids derived from the runs — the sweep launch's reasons.
@@ -1583,14 +1593,136 @@ def combine_sweeps(request: CombineSweeps, session: SessionDep) -> CreatedSweep:
     )
 
 
+def window_uses(
+    session: Session,
+    sweep_id: uuid.UUID,
+    *,
+    skip_walk_forward: uuid.UUID | None = None,
+    before: dt.datetime | None = None,
+) -> list[WindowUse]:
+    """Every earlier look at data `sweep_id`'s points were not chosen on (01/10): its
+    reserved-window tests, and every fold of its walk-forwards that was not refused.
+
+    ⚠️ **A fold's test does not point at this sweep.** It tests the fold's own training sweep
+    (`holdout_of` is that sweep), so the folds are read through their walk-forward
+    (`parent_sweep_id`) — reading `holdout_of` alone would miss every one of them.
+
+    `skip_walk_forward` and `before` read the uses as they stood when that walk-forward was
+    launched: its own folds never count against each other, and a test launched after it does
+    not turn its folds into retests.
+    """
+    tests: list[ColumnElement[bool]] = [
+        Sweep.holdout_of == sweep_id,
+        Sweep.holdout_rule.is_not(None),
+    ]
+    folds: list[ColumnElement[bool]] = [SweepWalkForward.parent_sweep_id == sweep_id]
+    if skip_walk_forward is not None:
+        folds.append(SweepWalkForward.id != skip_walk_forward)
+    if before is not None:
+        tests.append(Sweep.created_at < before)
+        folds.append(SweepWalkForward.created_at < before)
+    return _test_uses(session, *tests) + _fold_uses(session, *folds)
+
+
+def _test_uses(session: Session, *where: ColumnElement[bool]) -> list[WindowUse]:
+    """The reserved-window tests matching `where`, each one look at its own window."""
+    return [
+        WindowUse(
+            test_id=test.id,
+            walk_forward_id=None,
+            fold=None,
+            date_from=test.date_from,
+            date_to=test.date_to,
+            created_at=test.created_at,
+        )
+        for test in session.scalars(select(Sweep).where(*where))
+    ]
+
+
+def _fold_uses(session: Session, *where: ColumnElement[bool]) -> list[WindowUse]:
+    """The folds of the walk-forwards matching `where` that were not refused, each one look.
+
+    ⚠️ **A refused fold never ran its test**: nothing of its window was seen, and it uses none.
+    """
+    return [
+        WindowUse(
+            test_id=fold.test_sweep_id,
+            walk_forward_id=fold.walk_forward_id,
+            fold=fold.index,
+            # The window the fold was launched over, not the one its test runs: a test reaching
+            # past today ends today, and the years after it are still promised to the fold.
+            date_from=fold.test_from,
+            date_to=fold.test_to,
+            created_at=created_at,
+        )
+        for fold, created_at in session.execute(
+            select(SweepWalkForwardFold, SweepWalkForward.created_at)
+            .join(SweepWalkForward, SweepWalkForward.id == SweepWalkForwardFold.walk_forward_id)
+            .where(SweepWalkForwardFold.error.is_(None), *where)
+        ).tuples()
+    ]
+
+
+def use_out(use: WindowUse) -> WindowUseOut:
+    """An earlier look as the API shows it — in a 409's `used_by` and a retest's `retest_of`."""
+    return WindowUseOut(
+        kind="holdout" if use.walk_forward_id is None else "walk_forward",
+        id=use.key,
+        test_id=use.test_id,
+        fold=use.fold,
+        date_from=use.date_from,
+        date_to=use.date_to,
+        created_at=use.created_at,
+    )
+
+
+def window_used(uses: Sequence[WindowUse], *, what: str) -> HTTPException:
+    """The 409 for a window already used (01/10): the sentence, and every earlier look by name.
+
+    `used_by` is the screen's to list — which test, over which window, launched when — so that
+    looking again is a choice made knowing which look it repeats.
+    """
+    launched = len(keys_of(uses))
+    tests = "test" if launched == 1 else "tests"
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={
+            "message": f"{what} was already used by {launched} earlier {tests} of this sweep; "
+            "the reserved window is used once — send retest: true to test it again knowingly",
+            "used_by": [use_out(use).model_dump(mode="json") for use in uses],
+        },
+    )
+
+
+RETEST_KEYS: tuple[str, ...] = ("retest", "retest_of")
+"""What `retest_rule` writes — kept out of the choice a walk-forward hands each fold's test."""
+
+
+def retest_rule(uses: Sequence[WindowUse]) -> dict[str, Any]:
+    """What a retest adds to its rule: nothing for a first look, else the looks it repeats.
+
+    ⚠️ **Written only when the window was really used before**, whatever the request said: a
+    `retest` asked over fresh data is a first look, and marking it would cry wolf.
+    """
+    return {} if not uses else {"retest": True, "retest_of": keys_of(uses)}
+
+
 def launch_holdout(
-    session: Session, sweep_id: uuid.UUID, request: CreateHoldout
+    session: Session,
+    sweep_id: uuid.UUID,
+    request: CreateHoldout,
+    *,
+    prior: Sequence[WindowUse] | None = None,
 ) -> tuple[Sweep, list[Backtest], list[UncoveredMarket]]:
     """Choose, keep and commit a reserved-window test of `sweep_id`; the caller queues its runs.
 
     Shared by the endpoint above and a sweep's walk-forward (`sweep_walkforward_job`), which
     tests each fold's training sweep the same way. Refusals are `HTTPException`s with the
     sentence a person reads, which the walk-forward records on the fold.
+
+    `prior` is the walk-forward's: the earlier looks at the fold's window, weighed when the
+    walk-forward was launched — recorded on the test, never refused again. Left out, the window's
+    earlier uses are read here and refused unless `request.retest` (01/10).
     """
     parent = session.get(Sweep, sweep_id)
     if parent is None:
@@ -1613,6 +1745,10 @@ def launch_holdout(
                 "out of sample"
             ),
         )
+    if prior is None:
+        prior = reusing(request.date_from, request.date_to, window_uses(session, parent.id))
+        if prior and not request.retest:
+            raise window_used(prior, what="this test window")
 
     own, _followers = _points_of(session, parent)
     runs_of: dict[int, tuple[Backtest, str]] = {}
@@ -1702,6 +1838,7 @@ def launch_holdout(
                 if request.min_positive_year_share is None
                 else {"min_positive_year_share": str(request.min_positive_year_share)}
             ),
+            **retest_rule(prior),
         },
     )
     session.add(holdout)
@@ -1852,6 +1989,7 @@ def get_holdout(sweep_id: uuid.UUID, session: SessionDep) -> HoldoutOut:
             )
         )
 
+    retest_of = [str(one) for one in holdout.holdout_rule.get("retest_of", [])]
     return HoldoutOut(
         id=holdout.id,
         holdout_of=holdout.holdout_of,
@@ -1862,7 +2000,24 @@ def get_holdout(sweep_id: uuid.UUID, session: SessionDep) -> HoldoutOut:
         searched_to=None if parent is None else parent.date_to,
         groups=groups,
         rows=rows,
+        retest_of=[use_out(use) for use in _looks(session, holdout, retest_of)],
+        earlier_uses=len(retest_of),
     )
+
+
+def _looks(session: Session, test: Sweep, keys: Sequence[str]) -> list[WindowUse]:
+    """The earlier looks a retest names (`retest_of`), read live and cut to the ones that share
+    a bar with its window: a walk-forward is shown by the folds that overlap, not all of them.
+
+    Read by id rather than through the sweep, because a fold's test hangs from its training
+    sweep and its looks from the walk-forward's parent — two roads to the same answer.
+    """
+    ids = [uuid.UUID(one) for one in keys]
+    if not ids:
+        return []
+    uses = _test_uses(session, Sweep.id.in_(ids), Sweep.holdout_rule.is_not(None))
+    uses += _fold_uses(session, SweepWalkForward.id.in_(ids))
+    return reusing(test.date_from, test.date_to, uses)
 
 
 def _entry_names(session: Session, sweep: Sweep) -> dict[str, str]:

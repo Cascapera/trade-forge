@@ -17,6 +17,7 @@ import { ComparisonChart } from '../components/ComparisonChart'
 import { FailedDownloads } from '../components/FailedDownloads'
 import { HoldoutComparison } from '../components/HoldoutComparison'
 import { HoldoutLauncher } from '../components/HoldoutLauncher'
+import { MonteCarlo } from '../components/MonteCarlo'
 import { SweepWalkForwardLauncher } from '../components/SweepWalkForwardLauncher'
 import { RunTable } from '../components/RunTable'
 import { StudyDispersion } from '../components/StudyDispersion'
@@ -399,6 +400,14 @@ export function SweepResult(): React.JSX.Element {
           years={years}
         />
       ))}
+
+      {/* The top of the ranking above resampled (01/10), by the measure picked there. Not on a
+          test: its own panel above resamples every point it tested. */}
+      {(data.holdout_rule === undefined || data.holdout_rule === null) && (
+        <div className="border-t border-slate-800 pt-5">
+          <MonteCarlo sweepId={data.id} settled={isSweepSettled(data)} rankBy={rankBy} />
+        </div>
+      )}
     </div>
   )
 }

@@ -27,6 +27,13 @@ vi.mock('../components/HoldoutLauncher', () => ({
 vi.mock('../components/SweepWalkForwardLauncher', () => ({
   SweepWalkForwardLauncher: () => <div data-testid="walk-forward-launcher" />,
 }))
+vi.mock('../components/MonteCarlo', () => ({
+  MonteCarlo: (props: { sweepId: string; settled: boolean; rankBy?: string }) => (
+    <div data-testid="montecarlo">
+      {props.sweepId} · {props.settled ? 'settled' : 'running'} · {props.rankBy ?? 'test'}
+    </div>
+  ),
+}))
 vi.mock('../components/HoldoutComparison', () => ({
   HoldoutComparison: ({ sweepId }: { sweepId: string }) => (
     <div data-testid="holdout-comparison">{sweepId}</div>
@@ -735,6 +742,37 @@ describe('SweepResult — the reserved-window test', () => {
 
     expect(screen.getByTestId('holdout-comparison')).toHaveTextContent('test-1')
     expect(screen.queryByTestId('holdout-launcher')).not.toBeInTheDocument()
+  })
+
+  it('resamples the top of the ranking by the measure picked, from the sweep itself (01/10)', () => {
+    showing(sweep())
+    renderWithProviders(<SweepResult />, '/sweeps/sweep-1')
+
+    expect(screen.getByTestId('montecarlo')).toHaveTextContent('sweep-1 · settled · return')
+    fireEvent.change(screen.getByLabelText("Rank each entry's runs by"), {
+      target: { value: 'net_r' },
+    })
+    expect(screen.getByTestId('montecarlo')).toHaveTextContent('sweep-1 · settled · net_r')
+  })
+
+  it('says the ranking is still moving while runs are landing (01/10)', () => {
+    showing(sweep({ runs: [row('a1', ALPHA, 'M15', null)] }))
+    renderWithProviders(<SweepResult />, '/sweeps/sweep-1')
+
+    expect(screen.getByTestId('montecarlo')).toHaveTextContent('running')
+  })
+
+  it('leaves a test’s resampling to its own panel (01/10)', () => {
+    showing(
+      sweep({
+        id: 'test-1',
+        holdout_of: 'sweep-1',
+        holdout_rule: { metric: 'net_profit', top_n: 3, min_trades: { M15: 30 } },
+      }),
+    )
+    renderWithProviders(<SweepResult />, '/sweeps/test-1')
+
+    expect(screen.queryByTestId('montecarlo')).not.toBeInTheDocument()
   })
 
   it('still reads as a test once the searched sweep is gone', () => {

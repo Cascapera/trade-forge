@@ -6,6 +6,8 @@
 // to keep it exact — a JSON number would be a float, and the precision the engine and database
 // preserved would be lost on the wire. The UI parses these only at the edge, to display.
 
+import type { RankKey } from '../sweep/ranking'
+
 export type BacktestStatus = 'queued' | 'running' | 'done' | 'failed'
 
 export interface Instrument {
@@ -1439,11 +1441,23 @@ export interface SlicingOut {
   points: SlicedPoint[]
 }
 
-/** Resample a finished reserved-window test's points (25/09). */
+/** Which runs of an ordinary sweep's ranking are resampled (01/10): the first `top_n` of each
+ * entry, ranked by `rank_by` as the sweep's page ranks them. */
+export interface MonteCarloRanking {
+  rank_by: RankKey
+  top_n: number
+}
+
+/** Resample a finished sweep's points (25/09): a reserved-window test's, or since 01/10 the top
+ * of an ordinary sweep's ranking — `ranking` is required on one and refused on the other. */
 export interface CreateMonteCarloRequest {
   paths: number
   /** Blank draws one on the server, which is kept — the answer is repeatable either way. */
   seed?: string
+  /** The trades in a row each block holds (01/10, 2–50). Blank takes each point's own: the cube
+   * root of its trades. Half a point's trades or more is refused with a 422 naming it. */
+  block_trades?: number
+  ranking?: MonteCarloRanking
 }
 
 /** Percentiles of one measure across the simulated paths, as decimal strings. */
@@ -1462,6 +1476,8 @@ export interface Simulated {
   net_r: Spread
   /** The share of paths that ended below zero R. */
   negative_share: string
+  /** The trades in a row each block held (01/10); null or absent when drawn trade by trade. */
+  block_trades?: number | null
 }
 
 export interface MonteCarloPoint {
@@ -1477,8 +1493,11 @@ export interface MonteCarloPoint {
   observed_net_r: string
   observed_drawdown_r: string
   observed_losing_streak: number
-  /** Null below 20 trades, or with none kept. */
+  /** Trade by trade. Null below 20 trades, or with none kept. */
   simulated: Simulated | null
+  /** In blocks of trades in a row (01/10). Null when `simulated` is; absent on a resampling kept
+   * before 01/10, which drew trade by trade only. */
+  in_blocks?: Simulated | null
 }
 
 export interface MonteCarloOut {
@@ -1486,6 +1505,10 @@ export interface MonteCarloOut {
   sweep_id: string
   paths: number
   seed: string
+  /** The block asked for (01/10); null took each point's own, or predates blocks. */
+  block_trades?: number | null
+  /** Which runs of the ranking (01/10); null for a reserved-window test. */
+  ranking?: MonteCarloRanking | null
   created_at: string
   points: MonteCarloPoint[]
 }

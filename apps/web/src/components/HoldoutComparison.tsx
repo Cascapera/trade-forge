@@ -3,7 +3,7 @@ import { Link } from 'react-router-dom'
 import { isHoldoutSettled, useHoldout } from '../api/hooks'
 import type { HoldoutRank, HoldoutRow, HoldoutSide } from '../api/types'
 import { percent } from '../format'
-import { HoldoutMonteCarlo } from './HoldoutMonteCarlo'
+import { MonteCarlo } from './MonteCarlo'
 import { HoldoutSlicings } from './HoldoutSlicings'
 import { WindowUseList } from './WindowUses'
 
@@ -245,7 +245,7 @@ export function HoldoutComparison(props: { sweepId: string }): React.JSX.Element
 
       <HoldoutSlicings sweepId={data.id} settled={isHoldoutSettled(data)} />
 
-      <HoldoutMonteCarlo sweepId={data.id} settled={isHoldoutSettled(data)} />
+      <MonteCarlo sweepId={data.id} settled={isHoldoutSettled(data)} />
     </section>
   )
 }

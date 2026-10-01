@@ -3633,6 +3633,31 @@ class TestClonesRankOnce:
         past = client.get(f"/sweeps/{sweep_id}/runs", params={"offset": 50}).json()
         assert (past["items"], past["total"], past["clones_hidden"]) == ([], 2, 2)
 
+    def test_the_reserved_window_keeps_the_run_the_page_shows(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        """01/10: the three tell their clones apart by launch order the same way — `created_at`,
+        then the strategy's name — not by a random id, so the test runs the point the page shows."""
+        sweep_id, original, _clones, n5, _queued = self.cloned(client, session_factory)
+        with session_factory() as session:
+            run = session.get(Backtest, uuid.UUID(n5))
+            assert run is not None
+            assert run.metrics is not None
+            run.metrics.net_profit = run.metrics.gross_profit = Decimal(100)
+            session.commit()
+        shown = client.get(f"/sweeps/{sweep_id}/runs").json()["items"][0]
+        assert shown["run"]["id"] == original
+
+        created = client.post(
+            f"/sweeps/{sweep_id}/holdout",
+            json=TestTheReservedWindow().after(top_n=1),
+        )
+
+        assert created.status_code == 202, created.text
+        (tested,) = client.get(f"/sweeps/{created.json()['id']}").json()["runs"]
+        assert tested["run"]["strategy_id"] == shown["run"]["strategy_id"]
+        assert tested["label"] == shown["label"]
+
     def test_runs_with_nothing_measured_are_nobodys_clones(
         self, client: Any, session_factory: Callable[[], Session]
     ) -> None:

@@ -2913,3 +2913,23 @@ tela pergunta de novo a cada edição (400 ms de espera). A maior parte é monta
 - **Os runs com `htf` do motor 0.4.0** (UKOIL M15/M30/H1 da `87b0efc0`) ficaram obsoletos: foram
   cortados em UTC. Não são reaproveitados (versão do motor), mas continuam no banco.
 
+
+## Clones no ranking e no dataset (01/10) — o que ficou para depois
+
+`GET /sweeps/{id}/runs` agora esconde, por padrão, os runs que fizeram exatamente os trades de um
+lançado antes deles na mesma (entrada, gráfico, ativo) — a mesma regra do `distinct` do teste fora da
+amostra (`holdout.BEHAVIOUR_FIELDS`) —, e o CSV ganhou `clone_of`. Ficou em aberto:
+- **Custo medido no banco real (01/10, leitura):** na página padrão (acima do piso) o tempo ficou
+  igual ao de antes nas varreduras de 175 mil runs; com `all_runs` ficou 1,2–2× (a janela ordena
+  todos os runs medidos da entrada; 65 mil runs: ~300 → ~700 ms com paralelismo). Se pesar, a saída
+  é gravar a chave do comportamento (hash) em `backtest_metrics` quando o run termina — migration.
+- **Runs de zero trade viram um grupo só** por (entrada, gráfico, ativo): todos "fizeram o mesmo"
+  (nada). Com `all_runs` isso esconde milhares de runs sem trade atrás de um. Correto pela definição,
+  mas pode valer tratar zero trade à parte.
+- **O desempate do "primeiro" difere do teste fora da amostra:** a página e o CSV usam `created_at`
+  e depois o nome da estratégia (a ordem do ranking); `launch_holdout` usa `created_at` e o id do run
+  (uuid aleatório — numa varredura todos têm o mesmo `created_at`). Mesmo grupo, original
+  possivelmente diferente; o resultado é idêntico, só o rótulo muda.
+- **O `sweep_points` é lido inteiro a cada página** (já era antes: o filtro por entrada é um seq
+  scan de ~2 GB no banco de hoje). Um índice parcial `(sweep_id, entry_id) WHERE same_as IS NULL`
+  provavelmente resolve — medir.

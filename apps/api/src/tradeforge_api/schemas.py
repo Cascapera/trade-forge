@@ -741,6 +741,8 @@ class YearCutOut(BaseModel):
     net_r: Money
     yearly_r: dict[str, Money]
     """R per year of entry, of the trades the cut closes: `{"2022": "3.25"}`."""
+    trades: int | None = None
+    """How many trades the cut closes (01/10); null for a run recorded before it kept the count."""
 
 
 class CandleOut(_Out):

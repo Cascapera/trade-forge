@@ -535,6 +535,19 @@ describe('SweepResult', () => {
     )
   })
 
+  it('shows each run’s R by year of entry, a column per year of the sweep’s window (01/10)', () => {
+    const data = sweep({ date_from: '2022-01-01T00:00:00Z', date_to: '2024-01-01T00:00:00Z' })
+    const [, five] = data.runs
+    five!.run.metrics = { ...five!.run.metrics!, yearly_r: { '2022': '4', '2023': '-1.5' } }
+    showing(data)
+    renderWithProviders(<SweepResult />)
+    const [zeta] = sections()
+    expect(within(zeta!).getByRole('columnheader', { name: '2022' })).toBeInTheDocument()
+    expect(within(zeta!).getByRole('columnheader', { name: '2023' })).toBeInTheDocument()
+    expect(within(zeta!).getByText('+4.00')).toBeInTheDocument()
+    expect(within(zeta!).getByText('-1.50')).toBeInTheDocument()
+  })
+
   it('lists each entry best return first, ten at a time, with unfinished runs last', () => {
     showing(long())
     renderWithProviders(<SweepResult />)

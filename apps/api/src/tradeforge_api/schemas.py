@@ -510,6 +510,14 @@ class BacktestOut(_Out):
     """What the run's trades would have made at each rung of the target ladder, keyed by the
     target in R (`"2"`). `None` for a run recorded before the ladder existed; a rung is `None` when
     some trade could not answer it."""
+    r_by_years: dict[str, dict[str, str]] | None = None
+    """R by year of entry, then year of exit, as decimal strings (`backtest_metrics.r_by_years`,
+    ADR-0030): `{"2021": {"2021": "2.5", "2022": "-1"}}`. The run page shows a row per year of
+    entry and says when a trade left in a later year (01/10). `None` for a run recorded before
+    29/09, and while there are no results.
+
+    ⚠️ **Here and not on `MetricsOut`**: that one rides on every row of a sweep's ranked page, which
+    reads `MetricsOut.yearly_r` — the same R summed by year of entry — and needs no matrix."""
     waiting_for: list[CollectionOut] = Field(default_factory=list)
     """The downloads this run is waiting for before it can start, oldest window first.
 

@@ -1,4 +1,4 @@
-import { fireEvent, screen } from '@testing-library/react'
+import { fireEvent, screen, within } from '@testing-library/react'
 
 import type { BacktestListItem, Metrics } from '../api/types'
 import { EMPTY_SEATS, MAX_COMPARED, SERIES_COLORS, compareLabel, toggleSeat } from '../backtest/compare'
@@ -182,5 +182,52 @@ describe('RunTable', () => {
     renderWithProviders(<RunTable runs={[run]} seats={seats} onToggle={vi.fn()} />)
 
     expect(box(run)).toBeEnabled()
+  })
+
+  describe('R by year of entry (01/10)', () => {
+    it('has no year columns unless given the years', () => {
+      renderWithProviders(<RunTable runs={[listed({})]} seats={EMPTY_SEATS} onToggle={vi.fn()} />)
+      expect(screen.queryByText('R by year of entry')).not.toBeInTheDocument()
+    })
+
+    it('puts a column per year, a dot for a year with no trade and a dash for no measure', () => {
+      const measured = listed({
+        metrics: { ...metrics, yearly_r: { '2021': '2.5', '2023': '-1.25' } },
+      })
+      const before = listed({ id: 'b2', metrics: { ...metrics, yearly_r: null } })
+      renderWithProviders(
+        <RunTable
+          runs={[measured, before]}
+          seats={EMPTY_SEATS}
+          onToggle={vi.fn()}
+          years={[2021, 2022, 2023]}
+        />,
+      )
+      expect(screen.getByText('R by year of entry')).toBeInTheDocument()
+      for (const year of ['2021', '2022', '2023']) {
+        expect(screen.getByRole('columnheader', { name: year })).toBeInTheDocument()
+      }
+      const [, , first, second] = screen.getAllByRole('row')
+      expect(within(first!).getByText('+2.50')).toBeInTheDocument()
+      expect(within(first!).getByTitle('No trade entered in 2022')).toHaveTextContent('·')
+      expect(within(first!).getByText('-1.25')).toBeInTheDocument()
+      // A run recorded before R by year: one dash across the years, not three zeros.
+      const dash = within(second!).getByText('—', { selector: 'td[colspan="3"]' })
+      expect(dash).toBeInTheDocument()
+    })
+
+    it('draws a row of bars, with each year in its label, past eight years', () => {
+      const years = [2014, 2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024]
+      const run = listed({ metrics: { ...metrics, yearly_r: { '2014': '3', '2020': '-2' } } })
+      renderWithProviders(
+        <RunTable runs={[run]} seats={EMPTY_SEATS} onToggle={vi.fn()} years={years} />,
+      )
+      expect(screen.getByRole('columnheader', { name: '2014–2024' })).toBeInTheDocument()
+      expect(screen.queryByRole('columnheader', { name: '2015' })).not.toBeInTheDocument()
+      const bars = screen.getByRole('img', { name: /R by year of entry/ })
+      expect(bars).toHaveAccessibleName(expect.stringContaining('2014 +3.00 R'))
+      expect(bars).toHaveAccessibleName(expect.stringContaining('2015 no trade'))
+      expect(bars).toHaveAccessibleName(expect.stringContaining('2020 -2.00 R'))
+    })
   })
 })

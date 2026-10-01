@@ -28,6 +28,13 @@ export function ratio(value: string | null, digits = 2): string {
   return Number(value).toFixed(digits)
 }
 
+/** An R figure with its sign spelled out: `+0.30 R`, `-1.20 R`. A dash when there is none. The
+ *  sign is the marker; R wears no colour of its own. */
+export function inR(value: string | null): string {
+  if (value === null) return '—'
+  return `${sign(value) === 'up' ? '+' : ''}${ratio(value)} R`
+}
+
 /** Positive → good, negative → bad, zero → neutral. Drives the one status colour on the P&L. */
 export function sign(value: string): 'up' | 'down' | 'flat' {
   const n = Number(value)

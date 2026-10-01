@@ -908,6 +908,32 @@ def test_a_single_run_keeps_everything(
         assert ladder["3"] is None
 
 
+def test_the_run_carries_its_r_by_year_of_entry_and_exit_and_a_cut_it_cannot_answer_says_why(
+    session_factory: Callable[[], Session],
+    settings: Settings,
+    tmp_path: Path,
+    collected: Callable[..., None],
+) -> None:
+    """01/10: the run page shows R by year from `r_by_years`, and asks `/years` for a cut. The
+    matrix sums, per year of entry, to `yearly_r`; a window of 100 hours holds no whole year, so
+    the cut is refused with the reason the page shows."""
+    with _app(session_factory, settings, tmp_path, collected) as client:
+        backtest_id = _launch(client)
+        assert client.get(f"/backtests/{backtest_id}").json()["r_by_years"] is None
+        _work(session_factory, tmp_path, backtest_id)
+
+        run = client.get(f"/backtests/{backtest_id}").json()
+        by_years = run["r_by_years"]
+        assert by_years == {"2024": {"2024": run["metrics"]["yearly_r"]["2024"]}}
+        assert Decimal(by_years["2024"]["2024"]) == Decimal(run["metrics"]["net_r"])
+
+        refused = client.get(
+            f"/backtests/{backtest_id}/years", params={"first": 2024, "last": 2024}
+        )
+        assert refused.status_code == 422
+        assert "before the end of 2024" in refused.json()["detail"]
+
+
 def test_a_run_keeps_the_instrument_it_executed_with_and_never_rewrites_it(
     session_factory: Callable[[], Session],
     settings: Settings,

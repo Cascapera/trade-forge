@@ -15,6 +15,7 @@ import { count } from '../format'
 import { EquityCurve } from '../components/EquityCurve'
 import { MetricCards } from '../components/MetricCards'
 import { PriceChart } from '../components/PriceChart'
+import { RByYear } from '../components/RByYear'
 import { RunStrategy } from '../components/RunStrategy'
 import { RunTargets } from '../components/TargetLadder'
 import { TradesTable } from '../components/TradesTable'
@@ -246,6 +247,10 @@ export function Results(): React.JSX.Element {
                 ) : (
                   equity.data !== undefined && <EquityCurve points={equity.data} />
                 )}
+              </section>
+              <section>
+                <h3 className="mb-2 font-medium">R by year</h3>
+                <RByYear run={run} />
               </section>
               {run.targets !== null && (
                 <section>

@@ -12,6 +12,7 @@ import {
   selectedIds,
   toggleSeat,
 } from '../backtest/compare'
+import { windowYears } from '../backtest/years'
 import { ComparisonChart } from '../components/ComparisonChart'
 import { FailedDownloads } from '../components/FailedDownloads'
 import { HoldoutComparison } from '../components/HoldoutComparison'
@@ -95,6 +96,8 @@ function EntryRuns(props: {
   polling: boolean
   seats: Seats
   onToggle: (run: BacktestListItem) => void
+  /** The sweep window's years, for each run's R by year of entry (01/10). */
+  years: readonly number[]
 }): React.JSX.Element {
   const { entry } = props
   const [allRuns, setAllRuns] = useState(false)
@@ -179,6 +182,7 @@ function EntryRuns(props: {
       <RunTable
         runs={items}
         clones={clones}
+        years={props.years}
         seats={props.seats}
         onToggle={(runId) => {
           const run = items.find((one) => one.id === runId)
@@ -239,6 +243,8 @@ export function SweepResult(): React.JSX.Element {
 
   const data = sweep.data
   const counts = data.counts ?? tally(data.runs)
+  // Every run of a sweep shares its window, so one set of year columns serves every entry's table.
+  const years = windowYears(data.date_from, data.date_to)
 
   return (
     <div className="space-y-6">
@@ -390,6 +396,7 @@ export function SweepResult(): React.JSX.Element {
           polling={!settled(counts)}
           seats={seats}
           onToggle={toggle}
+          years={years}
         />
       ))}
     </div>

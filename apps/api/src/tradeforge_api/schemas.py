@@ -2118,9 +2118,10 @@ class CreateHoldout(BaseModel):
     min_trades: dict[Timeframe, Annotated[int, Field(ge=1, le=1_000_000)]] = Field(
         default_factory=dict
     )
-    """The fewest trades a run needs to be ranked, per chart, over the sweep's own floor
-    (`retention.MIN_TRADES`, never below 1). His ask (24/09): on D1 and W1 that floor is 1, and the
-    first test ranked runs of one to four trades there."""
+    """The fewest trades a run needs to be ranked, per chart, over the ranking floor
+    (`ranking_floor.RANK_MIN_TRADES`, never below 1). His ask (24/09): the first test ranked D1 and
+    W1 runs of one to four trades. Since 01/10 the default is that floor — 20 on H4, 10 on D1, 5 on
+    W1 — and no longer the keeping one (`retention.MIN_TRADES`), which is zero there."""
     distinct: bool = True
     """Skip a run whose record is the same as a better-ranked one's (`holdout.behaviour`), so the N
     tested are N different behaviours and not one run N times (28/09)."""
@@ -2167,7 +2168,14 @@ class HoldoutGroup(BaseModel):
     in_sample_median_return: Money | None
     out_of_sample_median_return: Money | None
     out_of_sample_positive: Money | None
-    """The fraction of the finished tests that made money on the reserved window."""
+    """The fraction of the finished tests that made money on the reserved window — of those that
+    traded there (`no_trades_out`)."""
+    no_trades_out: int = 0
+    """Finished tests that made no trade on the reserved window (01/10). Left out of the median and
+    the positive share: a run that never traded returned zero without being measured, and a group
+    of them read as a method that "held flat".
+
+    ⚠️ Still counted in `done` — they did finish."""
 
 
 class HoldoutOut(BaseModel):
@@ -2421,6 +2429,8 @@ class CreateSweepWalkForward(BaseModel):
     min_trades: dict[Timeframe, Annotated[int, Field(ge=1, le=1_000_000)]] = Field(
         default_factory=dict
     )
+    """Each fold's floor of trades per chart, over the ranking floor
+    (`ranking_floor.RANK_MIN_TRADES`, 01/10) — as a reserved-window test's (`CreateHoldout`)."""
     max_drawdown_r: Decimal | None = Field(default=None, gt=0)
     min_positive_year_share: Decimal | None = Field(default=None, gt=0, le=1)
     distinct: bool = True
@@ -2597,10 +2607,17 @@ class SweepRunsPage(BaseModel):
     """One page of a sweep's runs, best first by the measure asked (`GET /sweeps/{id}/runs`)."""
 
     total: int
-    """How many runs the filter holds, across every page."""
+    """How many runs the filter holds, across every page — the runs `items` pages through."""
     offset: int
     limit: int
     items: list[SweepRunOut]
+    below_floor: int = 0
+    """How many of the filter's runs are under the ranking floor (01/10) — hidden from `total` and
+    `items` unless `all_runs` was asked, and counted the same either way.
+
+    ⚠️ **"Under the floor" includes every run not finished**: a queued, running or failed run has no
+    trades to count, so it is not ranked until it has. With `all_runs` they come back, last, as
+    before."""
 
 
 class SweepRunCounts(BaseModel):

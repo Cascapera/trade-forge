@@ -32,6 +32,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import Engine, event, select
 from sqlalchemy.orm import Session
 
+from tradeforge_api import ranking_floor
 from tradeforge_api.cluster_job import process_cluster
 from tradeforge_api.config import Settings
 from tradeforge_api.main import create_app
@@ -2017,6 +2018,40 @@ class TestTheReservedWindow:
         assert Decimal(group["in_sample_median_return"]) == Decimal("0.12")
         assert Decimal(group["out_of_sample_positive"]) == Decimal("0.5")
 
+    def test_a_test_that_never_traded_out_of_sample_is_counted_apart(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        """01/10: a point with no trade on the reserved window returned zero without being
+        measured. It is out of the median and the positive share, and the group says how many."""
+        sweep_id, _runs = self.swept(client, session_factory)
+        holdout_id = client.post(f"/sweeps/{sweep_id}/holdout", json=self.after()).json()["id"]
+        for row in client.get(f"/sweeps/{holdout_id}").json()["runs"]:
+            if row["values"]["setup.params.period"] == 13:
+                finish_trading(session_factory, row["run"]["id"], net=-80, trades=10)
+            else:
+                finish(session_factory, row["run"]["id"], net=0)
+
+        (group,) = client.get(f"/sweeps/{holdout_id}/holdout").json()["groups"]
+
+        assert (group["points"], group["done"], group["no_trades_out"]) == (2, 2, 1)
+        assert Decimal(group["out_of_sample_median_return"]) == Decimal("-0.008")
+        assert Decimal(group["out_of_sample_positive"]) == Decimal(0)
+
+    def test_the_default_floor_is_the_ranking_one_not_the_keeping_one(
+        self, client: Any, session_factory: Callable[[], Session], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """01/10: the floors part ways on H4 and above. Moved on H1 here, where the sweep is, the
+        launch follows the ranking floor and the keeping floor (30) is not read at all."""
+        sweep_id, _runs = self.swept(client, session_factory)
+        monkeypatch.setitem(ranking_floor.RANK_MIN_TRADES, "H1", 41)
+
+        refused = client.post(f"/sweeps/{sweep_id}/holdout", json=self.after())
+        asked = client.post(f"/sweeps/{sweep_id}/holdout", json=self.after(min_trades={"H1": 40}))
+
+        assert refused.status_code == 422
+        assert "trade floor" in refused.json()["detail"]
+        assert asked.status_code == 202, asked.text
+
     def test_a_window_that_shares_a_bar_with_the_search_is_refused(
         self, client: Any, session_factory: Callable[[], Session]
     ) -> None:
@@ -3388,9 +3423,10 @@ class TestTheScreenReadsAPage:
     ) -> None:
         sweep_id, best_first = self.five(client, session_factory)
 
-        first = client.get(f"/sweeps/{sweep_id}/runs", params={"limit": 2}).json()
-        rest = client.get(f"/sweeps/{sweep_id}/runs", params={"limit": 2, "offset": 2}).json()
-        last = client.get(f"/sweeps/{sweep_id}/runs", params={"limit": 2, "offset": 4}).json()
+        every = {"all_runs": True, "limit": 2}
+        first = client.get(f"/sweeps/{sweep_id}/runs", params=every).json()
+        rest = client.get(f"/sweeps/{sweep_id}/runs", params={**every, "offset": 2}).json()
+        last = client.get(f"/sweeps/{sweep_id}/runs", params={**every, "offset": 4}).json()
 
         assert first["total"] == 5
         ids = [row["run"]["id"] for page in (first, rest, last) for row in page["items"]]
@@ -3414,7 +3450,9 @@ class TestTheScreenReadsAPage:
             session.commit()
 
         def ranked(by: str) -> list[str]:
-            page = client.get(f"/sweeps/{sweep_id}/runs", params={"rank_by": by}).json()
+            page = client.get(
+                f"/sweeps/{sweep_id}/runs", params={"rank_by": by, "all_runs": True}
+            ).json()
             return [row["run"]["id"] for row in page["items"]]
 
         n7, n11, n9, n5, queued = best_first
@@ -3447,7 +3485,9 @@ class TestTheScreenReadsAPage:
             session.commit()
 
         def ranked(by: str) -> list[str]:
-            page = client.get(f"/sweeps/{sweep_id}/runs", params={"rank_by": by}).json()
+            page = client.get(
+                f"/sweeps/{sweep_id}/runs", params={"rank_by": by, "all_runs": True}
+            ).json()
             return [row["run"]["id"] for row in page["items"]]
 
         assert ranked("net_r") == [n7, n11, n9, n5, queued]
@@ -3459,6 +3499,31 @@ class TestTheScreenReadsAPage:
         assert by_years[:3] == [n11, n5, n7]
         assert set(by_years[3:]) == {n9, queued}
 
+    def test_a_page_hides_what_is_under_its_charts_ranking_floor_unless_asked(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        """His bar (01/10): 30 trades on H1. Of the five, period 7 traded 30 and period 11 traded
+        31; periods 5 and 9 stayed at 10, and period 13 is still queued — none of those three is
+        ranked until asked for, and the page says how many it left out."""
+        sweep_id, best_first = self.five(client, session_factory)
+        n7, n11, n9, n5, queued = best_first
+        with session_factory() as session:
+            for run_id, trades in ((n7, 30), (n11, 31)):
+                run = session.get(Backtest, uuid.UUID(run_id))
+                assert run is not None
+                assert run.metrics is not None
+                run.metrics.total_trades = trades
+                run.metrics.long_trades = trades
+            session.commit()
+
+        ranked = client.get(f"/sweeps/{sweep_id}/runs").json()
+        every = client.get(f"/sweeps/{sweep_id}/runs", params={"all_runs": True}).json()
+
+        assert (ranked["total"], ranked["below_floor"]) == (2, 3)
+        assert [row["run"]["id"] for row in ranked["items"]] == [n7, n11]
+        assert (every["total"], every["below_floor"]) == (5, 3)
+        assert [row["run"]["id"] for row in every["items"]] == [n7, n11, n9, n5, queued]
+
     def test_a_page_of_one_entry_holds_only_its_runs(
         self, client: Any, session_factory: Callable[[], Session]
     ) -> None:
@@ -3468,7 +3533,9 @@ class TestTheScreenReadsAPage:
             "/sweeps", json=a_sweep_body([mine, other], ["EURUSD"], ["H1"])
         ).json()["id"]
 
-        page = client.get(f"/sweeps/{sweep_id}/runs", params={"entry_id": mine}).json()
+        page = client.get(
+            f"/sweeps/{sweep_id}/runs", params={"entry_id": mine, "all_runs": True}
+        ).json()
 
         assert page["total"] == 2
         assert {row["entry_id"] for row in page["items"]} == {mine}

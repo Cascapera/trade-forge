@@ -20,13 +20,16 @@ in `Decimal` that is minutes, in float well under a second a point (measured 25/
 2000 paths of 300 trades). The inputs are R to a few decimals and the outputs are percentiles read
 to two — a float's error is far below either.
 
-Trades are assumed independent, which is what resampling means. A method whose trades cluster —
-losses that come in runs because the market's regime does — is understated here, and the per-year
-and per-block cuts (`slices`) are where that shows.
+Trade by trade assumes the trades independent, which is what resampling one at a time means. A
+method whose losses come in runs — because the market's regime does — is understated by it. Since
+01/10 every point is also drawn **in blocks** (`simulate_in_blocks`): runs of N trades in a row,
+kept in the order they happened, so a losing stretch is dealt whole. The two side by side answer
+"are the losses clustered": a drawdown much deeper in blocks says they are.
 """
 
+import math
 import random
-from collections.abc import Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 
@@ -36,6 +39,12 @@ trades repeats the same few and dresses them as a distribution."""
 
 DEFAULT_PATHS = 1000
 MAX_PATHS = 5000
+
+MIN_BLOCK_TRADES = 2
+"""A block of one trade is trade by trade again."""
+MAX_BLOCK_TRADES = 50
+"""The most a request may ask for. Past this a block is a large part of any sample worth
+resampling, and each path is a few long pieces of the one that happened, reshuffled."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +70,8 @@ class Simulated:
     net_r: Spread
     negative_share: Decimal
     """The share of paths that ended below zero R."""
+    block_trades: int | None = None
+    """The trades in a row each block held (01/10); `None` when drawn trade by trade."""
 
 
 def _percentile(ordered: Sequence[float], share: float) -> Decimal:
@@ -105,28 +116,22 @@ def observed(rs: Sequence[Decimal]) -> Observed:
     return Observed(net_r=total, drawdown_r=deepest, losing_streak=longest)
 
 
-def simulate(rs: Sequence[Decimal], *, paths: int, seed: str) -> Simulated | None:
-    """`paths` paths of `len(rs)` trades each, drawn with replacement from `rs`.
+def _measured(
+    drawn: Iterable[Sequence[float]], *, paths: int, trades: int, block_trades: int | None
+) -> Simulated:
+    """Each drawn path walked once: its deepest fall, longest losing streak and final R.
 
-    `None` below `MIN_TRADES`. `seed` is any string — the caller makes it unique per point.
+    ⚠️ **One ruler for both draws.** Trade by trade and in blocks are measured by this same loop,
+    so a difference between them is the draw's and never the measuring's.
     """
-    if len(rs) < MIN_TRADES:
-        return None
-    if paths < 1:
-        raise ValueError(f"a simulation needs at least one path, got {paths}")
-
-    pool = [float(r) for r in rs]
-    draw = random.Random(seed)  # noqa: S311 — a simulation, not a secret
-    count = len(pool)
     drawdowns: list[float] = []
     streaks: list[float] = []
     finals: list[float] = []
     negative = 0
-
-    for _ in range(paths):
+    for path in drawn:
         total = peak = deepest = 0.0
         streak = longest = 0
-        for r in draw.choices(pool, k=count):
+        for r in path:
             total += r
             peak = max(peak, total)
             deepest = max(deepest, peak - total)
@@ -143,21 +148,116 @@ def simulate(rs: Sequence[Decimal], *, paths: int, seed: str) -> Simulated | Non
 
     return Simulated(
         paths=paths,
-        trades=count,
+        trades=trades,
         drawdown_r=_spread(drawdowns),
         losing_streak=_spread(streaks),
         net_r=_spread(finals),
         negative_share=Decimal(negative) / Decimal(paths),
+        block_trades=block_trades,
     )
+
+
+def simulate(rs: Sequence[Decimal], *, paths: int, seed: str) -> Simulated | None:
+    """`paths` paths of `len(rs)` trades each, drawn with replacement from `rs` one at a time.
+
+    `None` below `MIN_TRADES`. `seed` is any string — the caller makes it unique per point.
+    """
+    if len(rs) < MIN_TRADES:
+        return None
+    if paths < 1:
+        raise ValueError(f"a simulation needs at least one path, got {paths}")
+
+    pool = [float(r) for r in rs]
+    draw = random.Random(seed)  # noqa: S311 — a simulation, not a secret
+    count = len(pool)
+    # ⚠️ One `choices` call per path, as before 01/10: a seed kept on 25/09 still deals the same.
+    drawn = (draw.choices(pool, k=count) for _ in range(paths))
+    return _measured(drawn, paths=paths, trades=count, block_trades=None)
+
+
+def default_block_trades(trades: int) -> int:
+    """The block a sample of `trades` is cut into when the request names none (01/10): the cube
+    root of the sample, rounded, never under `MIN_BLOCK_TRADES` — 3 for 20 trades, 5 for 150, 7
+    for 300.
+
+    The cube root is the textbook order of a block bootstrap's block (Hall, Horowitz & Jing, 1995):
+    long enough to carry a short run of related trades, short enough to leave many blocks to draw
+    from. A rule of thumb, not a fit — the request's `block_trades` overrides it.
+    """
+    return max(MIN_BLOCK_TRADES, round(math.cbrt(trades)))
+
+
+def block_fits(trades: int, block_trades: int) -> bool:
+    """Whether blocks of `block_trades` leave a sample of `trades` something to resample.
+
+    ⚠️ **Refused from half the sample up.** Two blocks or fewer to a path is the path that
+    happened cut in two and dealt again — a spread that looks like a distribution and is not one.
+    """
+    return 2 * block_trades < trades
+
+
+def simulate_in_blocks(
+    rs: Sequence[Decimal], *, paths: int, seed: str, block_trades: int | None = None
+) -> Simulated | None:
+    """`paths` paths of `len(rs)` trades each, dealt in blocks of `block_trades` trades in a row
+    (01/10): a circular moving block bootstrap.
+
+    Each block starts at a trade drawn uniformly, with replacement, and runs on for `block_trades`
+    trades in the order they happened; blocks are laid end to end and the last one cut, so each
+    path has as many trades as the run. `block_trades` defaults to `default_block_trades(len(rs))`.
+
+    ⚠️ **Circular**: a block that starts near the end wraps round to the first trades. Without the
+    wrap a trade near either end sits in fewer possible blocks than one in the middle, and is dealt
+    less often — the first and last trades would weigh less for nothing but where they fell. The
+    price is a seam joining the last trade to the first, no worse than any other join of blocks.
+
+    ⚠️ **The streak and the drawdown run across the joins.** A block ending in losses followed by
+    one starting in losses is one longer streak, as it would be live.
+
+    `None` below `MIN_TRADES`. A `ValueError` for a block that does not fit (`block_fits`) — the
+    caller tells the person so before simulating anything.
+    """
+    if len(rs) < MIN_TRADES:
+        return None
+    if paths < 1:
+        raise ValueError(f"a simulation needs at least one path, got {paths}")
+    count = len(rs)
+    size = default_block_trades(count) if block_trades is None else block_trades
+    if size < MIN_BLOCK_TRADES:
+        raise ValueError(f"a block holds at least {MIN_BLOCK_TRADES} trades, got {size}")
+    if not block_fits(count, size):
+        raise ValueError(f"a block of {size} trades is half or more of {count} trades")
+
+    pool = [float(r) for r in rs]
+    # The ring: a block that starts near the end reads straight on into the first trades.
+    ring = pool + pool[: size - 1]
+    starts = range(count)
+    blocks = -(-count // size)
+    draw = random.Random(seed)  # noqa: S311 — a simulation, not a secret
+
+    def drawn() -> Iterator[list[float]]:
+        for _ in range(paths):
+            path: list[float] = []
+            for start in draw.choices(starts, k=blocks):
+                path.extend(ring[start : start + size])
+            del path[count:]
+            yield path
+
+    return _measured(drawn(), paths=paths, trades=count, block_trades=size)
 
 
 __all__ = [
     "DEFAULT_PATHS",
+    "MAX_BLOCK_TRADES",
     "MAX_PATHS",
+    "MIN_BLOCK_TRADES",
     "MIN_TRADES",
     "Observed",
     "Simulated",
     "Spread",
+    "block_fits",
+    "default_block_trades",
     "observed",
     "simulate",
+    "simulate_in_blocks",
 ]

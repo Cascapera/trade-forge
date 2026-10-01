@@ -518,7 +518,9 @@ def get_backtest(backtest_id: uuid.UUID, session: SessionDep) -> BacktestOut:
     """The run and, once it has finished, its metrics — and, for a sweep's run, the point of the
     grid it measured, so the result page can say what was optimised (29/09)."""
     backtest = _load(session, backtest_id)
-    out = BacktestOut.model_validate(backtest)
+    out = BacktestOut.model_validate(backtest).model_copy(
+        update={"r_by_years": None if backtest.metrics is None else backtest.metrics.r_by_years}
+    )
     if backtest.sweep_id is None:
         return out
     # One point per (sweep, strategy): a point's document is its own strategy row. Indexed by

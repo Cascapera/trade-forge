@@ -1,10 +1,12 @@
 import { useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 
-import { apiFailure } from '../api/failure'
+import { apiFailure, windowUsedBy } from '../api/failure'
 import { useCreateSweepWalkForward, useSweepWalkForwards } from '../api/hooks'
 import type { HoldoutRank, SweepOut } from '../api/types'
 import { floorPlaceholder } from '../sweep/rankFloor'
+
+import { RetestPrompt } from './WindowUses'
 
 const METRICS: { value: HoldoutRank; label: string }[] = [
   { value: 'net_profit', label: 'Net profit' },
@@ -46,6 +48,10 @@ function planned(
  * The trade floor is per chart, as the reserved-window test's: blank keeps the ranking floor (01/10,
  * shown as the placeholder; 60 on M1 and M5), which no run of a quiet setup may reach — and then
  * every fold is refused.
+ *
+ * ⚠️ **Test years an earlier test of this sweep already used are refused (01/10)** — a 409 naming
+ * those tests, a reserved-window test's or an earlier walk-forward's folds — and the retest box is
+ * offered then, as on the reserved-window launcher.
  */
 export function SweepWalkForwardLauncher(props: { sweep: SweepOut }): React.JSX.Element {
   const { sweep } = props
@@ -63,6 +69,8 @@ export function SweepWalkForwardLauncher(props: { sweep: SweepOut }): React.JSX.
   const [understood, setUnderstood] = useState(false)
   const [charts, setCharts] = useState<string[]>(sweep.timeframes)
   const [floors, setFloors] = useState<Record<string, string>>({})
+  const [retest, setRetest] = useState(false)
+  const usedBy = windowUsedBy(create.error)
 
   // The runs a fold trains again: not the ones the sweep failed (cancelled by hand among them).
   const all =
@@ -117,6 +125,7 @@ export function SweepWalkForwardLauncher(props: { sweep: SweepOut }): React.JSX.
         ...(Object.keys(minTrades).length > 0 ? { min_trades: minTrades } : {}),
         // In the sweep's order; left out when every chart walks, as before 28/09.
         ...(some ? { timeframes: sweep.timeframes.filter((one) => charts.includes(one)) } : {}),
+        ...(retest ? { retest: true } : {}),
       },
       {
         onSuccess: (made) => {
@@ -246,10 +255,19 @@ export function SweepWalkForwardLauncher(props: { sweep: SweepOut }): React.JSX.
       </label>
 
       {why !== null && <p className="text-xs text-amber-300">{why}</p>}
-      {create.isError && (
-        <p role="alert" className="text-sm text-red-400">
-          {apiFailure(create.error, 'Could not start the walk-forward.')}
-        </p>
+      {usedBy !== null ? (
+        <RetestPrompt
+          message={apiFailure(create.error, 'These test years were already used.')}
+          uses={usedBy}
+          retest={retest}
+          onRetest={setRetest}
+        />
+      ) : (
+        create.isError && (
+          <p role="alert" className="text-sm text-red-400">
+            {apiFailure(create.error, 'Could not start the walk-forward.')}
+          </p>
+        )
       )}
       <button
         type="button"

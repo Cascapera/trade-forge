@@ -30,6 +30,23 @@ const SWEEP: SweepOut = {
   failed_collections: [],
 }
 
+const USED = {
+  message:
+    'this test window was already used by 1 earlier test of this sweep; the reserved window is ' +
+    'used once — send retest: true to test it again knowingly',
+  used_by: [
+    {
+      kind: 'holdout',
+      id: 'test-0',
+      test_id: 'test-0',
+      fold: null,
+      date_from: '2026-01-01T00:00:00Z',
+      date_to: '2026-06-01T00:00:00Z',
+      created_at: '2026-09-20T10:00:00Z',
+    },
+  ],
+}
+
 function Landed(): React.JSX.Element {
   const { id } = useParams<{ id: string }>()
   return <p>landed on {id}</p>
@@ -180,5 +197,44 @@ describe('HoldoutLauncher', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Run the test' }))
 
     expect(await screen.findByRole('alert')).toHaveTextContent(/can be ranked/)
+    expect(screen.queryByLabelText(/Test again \(retest\)/)).not.toBeInTheDocument()
+  })
+
+  it('names the earlier tests of a used window, and resends as a retest only once ticked (01/10)', async () => {
+    createHoldout.mockRejectedValueOnce(new ApiError(409, USED))
+    createHoldout.mockResolvedValueOnce({ id: 'test-2', runs: 6, skipped: [] })
+    render()
+
+    fireEvent.change(field('To'), { target: { value: '2026-09-19' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Run the test' }))
+
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent(/already used by 1 earlier test/)
+    expect(alert).toHaveTextContent(/tested 2026-01-01 → 2026-06-01 · launched 2026-09-20/)
+    expect(screen.getByRole('link', { name: 'Reserved-window test' })).toHaveAttribute(
+      'href',
+      '/sweeps/test-0',
+    )
+    const box = field(/Test again \(retest\) — this window was already used/)
+    expect(box.checked).toBe(false)
+
+    fireEvent.click(box)
+    fireEvent.click(screen.getByRole('button', { name: 'Run the retest' }))
+
+    expect(await screen.findByText('landed on test-2')).toBeInTheDocument()
+    expect(createHoldout).toHaveBeenCalledTimes(2)
+    expect(createHoldout.mock.calls[0]?.[1]).not.toHaveProperty('retest')
+    expect(createHoldout.mock.calls[1]?.[1]).toMatchObject({ retest: true })
+  })
+
+  it('offers no retest for another conflict', async () => {
+    createHoldout.mockRejectedValue(new ApiError(409, 'the test is still running'))
+    render()
+
+    fireEvent.change(field('To'), { target: { value: '2026-09-19' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Run the test' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('the test is still running')
+    expect(screen.queryByLabelText(/Test again/)).not.toBeInTheDocument()
   })
 })

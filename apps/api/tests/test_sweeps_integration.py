@@ -2598,6 +2598,202 @@ class TestTheSweepWalksForward:
         assert client.get(f"/sweep-walkforwards/{uuid.uuid4()}").status_code == 404
 
 
+class TestTheReservedWindowIsUsedOnce:
+    """His rule (01/10): the reserved year is used once per sweep. A second look at a window an
+    earlier test of the same sweep used — choose, look, adjust, test again — is a choice made on
+    it, so it is a 409 naming the earlier tests unless the request says `retest`."""
+
+    window = TestTheReservedWindow()
+    walking = TestTheSweepWalksForward()
+
+    def holdout(self, client: Any, sweep_id: str, **over: Any) -> Any:
+        return client.post(f"/sweeps/{sweep_id}/holdout", json=self.window.after(**over))
+
+    def walk(self, client: Any, sweep_id: str, **over: Any) -> Any:
+        return client.post(f"/sweeps/{sweep_id}/walkforward", json={**self.walking.BODY, **over})
+
+    def test_a_second_look_at_the_window_is_refused_with_the_first(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        sweep_id, _runs = self.window.swept(client, session_factory)
+        first = self.holdout(client, sweep_id)
+        assert first.status_code == 202, first.text
+
+        # Shifted by fifty hours: half of it is bars the first test already showed.
+        again = self.holdout(
+            client,
+            sweep_id,
+            date_from=(START + 250 * HOUR).isoformat(),
+            date_to=(START + 350 * HOUR).isoformat(),
+        )
+
+        assert again.status_code == 409, again.text
+        detail = again.json()["detail"]
+        assert "retest" in detail["message"]
+        (used,) = detail["used_by"]
+        assert used["kind"] == "holdout"
+        assert used["id"] == used["test_id"] == first.json()["id"]
+        assert dt.datetime.fromisoformat(used["date_from"]) == START + 200 * HOUR
+        assert dt.datetime.fromisoformat(used["date_to"]) == START + 300 * HOUR
+        assert used["created_at"] is not None
+
+    def test_asked_as_a_retest_it_runs_and_says_which_looks_it_repeats(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        sweep_id, _runs = self.window.swept(client, session_factory)
+        first = self.holdout(client, sweep_id).json()["id"]
+        second = self.holdout(client, sweep_id, retest=True)
+        assert second.status_code == 202, second.text
+        third = self.holdout(client, sweep_id, retest=True)
+        assert third.status_code == 202, third.text
+
+        rule = client.get(f"/sweeps/{second.json()['id']}").json()["holdout_rule"]
+        assert rule["retest"] is True
+        assert rule["retest_of"] == [first]
+        compared = client.get(f"/sweeps/{third.json()['id']}/holdout").json()
+        assert compared["earlier_uses"] == 2
+        assert [one["id"] for one in compared["retest_of"]] == [first, second.json()["id"]]
+        untouched = client.get(f"/sweeps/{first}/holdout").json()
+        assert (untouched["earlier_uses"], untouched["retest_of"]) == (0, [])
+        assert "retest" not in untouched["rule"]
+
+    def test_a_retest_asked_over_fresh_data_is_a_first_look(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        sweep_id, _runs = self.window.swept(client, session_factory)
+
+        made = self.holdout(client, sweep_id, retest=True)
+
+        assert made.status_code == 202, made.text
+        assert "retest" not in client.get(f"/sweeps/{made.json()['id']}").json()["holdout_rule"]
+
+    def test_a_window_that_only_touches_the_end_of_the_last_is_new(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        sweep_id, _runs = self.window.swept(client, session_factory)
+        self.holdout(client, sweep_id)
+
+        after = self.holdout(
+            client,
+            sweep_id,
+            date_from=(START + 300 * HOUR).isoformat(),
+            date_to=(START + 400 * HOUR).isoformat(),
+        )
+
+        assert after.status_code == 202, after.text
+
+    def test_another_sweep_has_its_own_reserved_window(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        one, _runs = self.window.swept(client, session_factory)
+        other, _runs = self.window.swept(client, session_factory)
+        self.holdout(client, one)
+
+        assert self.holdout(client, other).status_code == 202
+
+    def test_a_test_of_a_test_is_still_refused_first(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        sweep_id, _runs = self.window.swept(client, session_factory)
+        test_id = self.holdout(client, sweep_id).json()["id"]
+
+        again = self.holdout(client, test_id, retest=True)
+
+        assert again.status_code == 422
+        assert "reserved-window test" in again.json()["detail"]
+
+    def test_a_walk_forward_over_a_tested_window_is_refused_unless_a_retest(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        """Its first fold tests 2024, where the test of the 9th to the 13th of January sits."""
+        sweep_id, _runs = self.window.swept(client, session_factory)
+        test_id = self.holdout(client, sweep_id).json()["id"]
+
+        refused = self.walk(client, sweep_id)
+        made = self.walk(client, sweep_id, retest=True)
+
+        assert refused.status_code == 409, refused.text
+        assert [one["id"] for one in refused.json()["detail"]["used_by"]] == [test_id]
+        assert made.status_code == 202, made.text
+        walk = client.get(f"/sweep-walkforwards/{made.json()['id']}").json()
+        assert (walk["rule"]["retest"], walk["rule"]["retest_of"]) == (True, [test_id])
+
+    def test_a_walk_forward_over_an_earlier_one_is_refused(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        sweep_id, _runs = self.window.swept(client, session_factory)
+        first = self.walk(client, sweep_id).json()["id"]
+
+        refused = self.walk(client, sweep_id, anchored=False)
+
+        assert refused.status_code == 409, refused.text
+        used = refused.json()["detail"]["used_by"]
+        assert {(one["id"], one["fold"]) for one in used} == {(first, 0), (first, 1)}
+
+    def test_a_test_over_a_walk_forwards_fold_is_refused_and_names_it(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        """A fold's test hangs from its training sweep, not this one: read through the
+        walk-forward, and from launch — its test does not exist until its training ends."""
+        sweep_id, _runs = self.window.swept(client, session_factory)
+        walk_id = self.walk(client, sweep_id).json()["id"]
+
+        refused = self.holdout(client, sweep_id)
+
+        assert refused.status_code == 409, refused.text
+        (used,) = refused.json()["detail"]["used_by"]
+        assert (used["kind"], used["id"], used["fold"], used["test_id"]) == (
+            "walk_forward",
+            walk_id,
+            0,
+            None,
+        )
+        assert self.holdout(client, sweep_id, retest=True).status_code == 202
+
+    def test_the_folds_of_one_walk_forward_do_not_block_each_other(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        """Each fold's window is its own walk-forward's use: weighed against itself, every fold
+        would read as a retest of the walk-forward launching it."""
+        sweep_id, _runs = self.window.swept(client, session_factory)
+        walk_id = self.walk(client, sweep_id).json()["id"]
+        for fold in client.get(f"/sweep-walkforwards/{walk_id}").json()["folds"]:
+            self.walking.finish_sweep(client, session_factory, fold["train_sweep_id"])
+
+        self.walking.step(session_factory, walk_id)
+
+        tested, empty = client.get(f"/sweep-walkforwards/{walk_id}").json()["folds"]
+        assert tested["error"] is None
+        rule = client.get(f"/sweeps/{tested['test_sweep_id']}").json()["holdout_rule"]
+        assert "retest" not in rule
+        # 2025 has no candles, and that is the only thing the second fold is refused for.
+        assert "no candles" in empty["error"]
+
+    def test_a_retest_walk_forwards_folds_name_the_looks_they_repeat(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        sweep_id, _runs = self.window.swept(client, session_factory)
+        first = self.walk(client, sweep_id).json()["id"]
+        # A test launched after the first walk-forward is not a look its folds repeat.
+        self.holdout(client, sweep_id, retest=True)
+        second = self.walk(client, sweep_id, retest=True).json()["id"]
+        assert len(client.get(f"/sweep-walkforwards/{second}").json()["rule"]["retest_of"]) == 2
+        for one in (first, second):
+            for fold in client.get(f"/sweep-walkforwards/{one}").json()["folds"]:
+                self.walking.finish_sweep(client, session_factory, fold["train_sweep_id"])
+            self.walking.step(session_factory, one)
+
+        old = client.get(f"/sweep-walkforwards/{first}").json()["folds"][0]["test_sweep_id"]
+        new = client.get(f"/sweep-walkforwards/{second}").json()["folds"][0]["test_sweep_id"]
+        assert "retest" not in client.get(f"/sweeps/{old}").json()["holdout_rule"]
+        compared = client.get(f"/sweeps/{new}/holdout").json()
+        assert compared["rule"]["retest"] is True
+        assert compared["earlier_uses"] == 2
+        assert {(one["kind"], one["id"]) for one in compared["retest_of"]} >= {
+            ("walk_forward", first)
+        }
+
+
 class TestTemplatesRunMarketByMarket:
     """26/09: a sweep without its markets, kept; a queue that runs one market's sweep at a time."""
 

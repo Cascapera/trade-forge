@@ -1256,6 +1256,11 @@ export interface HoldoutRule {
   /** Clones skipped (28/09): a run with the same record as a better-ranked one was not chosen.
    *  Absent on a test launched before, which kept them. */
   distinct?: boolean
+  /** Present only on a retest (01/10): this window had been used by an earlier test of the same
+   *  sweep, and the test was launched knowing it. */
+  retest?: boolean
+  /** The earlier tests it repeats — a test's id, or a walk-forward's for its folds. */
+  retest_of?: string[]
 }
 
 /** Test a sweep's best points on a window none of them was chosen on. */
@@ -1273,6 +1278,9 @@ export interface CreateHoldoutRequest {
   min_trades: Record<string, number>
   /** Skip a run with the same record as a better-ranked one. The server's default is true. */
   distinct?: boolean
+  /** Test again a window an earlier test of this sweep already used (01/10). Without it such a
+   *  launch is a 409 naming those tests (`WindowUsedDetail`). */
+  retest?: boolean
 }
 
 /** One run's result, on one side of the comparison. */
@@ -1315,6 +1323,28 @@ export interface HoldoutGroup {
   no_trades_out?: number
 }
 
+/**
+ * An earlier look at a reserved window (01/10): a test of the same sweep, or one fold of a
+ * walk-forward of it. Listed by a 409 that refuses a second look, and by a retest.
+ */
+export interface WindowUse {
+  kind: 'holdout' | 'walk_forward'
+  /** The test, or the walk-forward the fold belongs to. */
+  id: string
+  /** The test sweep — null for a fold still training. */
+  test_id: string | null
+  fold: number | null
+  date_from: string
+  date_to: string
+  created_at: string
+}
+
+/** The body of the 409 for a window already used (01/10). */
+export interface WindowUsedDetail {
+  message: string
+  used_by: WindowUse[]
+}
+
 export interface HoldoutOut {
   id: string
   holdout_of: string | null
@@ -1325,6 +1355,10 @@ export interface HoldoutOut {
   searched_to: string | null
   groups: HoldoutGroup[]
   rows: HoldoutRow[]
+  /** The earlier looks this retest repeats, read live — one since deleted is left out here. */
+  retest_of: WindowUse[]
+  /** How many earlier tests had used the window when this one was launched; 0 for a first look. */
+  earlier_uses: number
 }
 
 /** How a reserved-window test is cut when it is judged in pieces (25/09). */
@@ -1522,6 +1556,8 @@ export interface CreateSweepWalkForwardRequest {
   min_positive_year_share?: string
   /** The charts to walk (28/09); left out, every chart of the sweep. */
   timeframes?: string[]
+  /** Walk over test windows an earlier test of this sweep already used (01/10). */
+  retest?: boolean
 }
 
 export interface CreatedSweepWalkForward {

@@ -17,7 +17,7 @@ import datetime as dt
 import uuid
 from collections.abc import Sequence
 from decimal import Decimal
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from pydantic import (
     AfterValidator,
@@ -2131,6 +2131,13 @@ class CreateHoldout(BaseModel):
     distinct: bool = True
     """Skip a run whose record is the same as a better-ranked one's (`holdout.behaviour`), so the N
     tested are N different behaviours and not one run N times (28/09)."""
+    retest: bool = False
+    """Test again a window an earlier test of this sweep already used (01/10). Without it such a
+    launch is refused with a 409 naming those tests; with it the test is kept with `retest` and
+    `retest_of` in its rule, so it never reads as a first look.
+
+    ⚠️ **Not a free second opinion.** The reserved window is used once: a second look after
+    adjusting is a choice made on it, and the flag only keeps that visible."""
 
 
 class HoldoutSide(BaseModel):
@@ -2184,6 +2191,21 @@ class HoldoutGroup(BaseModel):
     ⚠️ Still counted in `done` — they did finish."""
 
 
+class WindowUseOut(BaseModel):
+    """An earlier look at a reserved window (01/10, `holdout.WindowUse`): a test of the same sweep,
+    or a fold of a walk-forward of it."""
+
+    kind: Literal["holdout", "walk_forward"]
+    id: uuid.UUID
+    """The test, or the walk-forward the fold belongs to."""
+    test_id: uuid.UUID | None
+    """The test sweep — `None` for a fold still training."""
+    fold: int | None
+    date_from: dt.datetime
+    date_to: dt.datetime
+    created_at: dt.datetime
+
+
 class HoldoutOut(BaseModel):
     """A reserved-window test read against the sweep it came from."""
 
@@ -2196,6 +2218,12 @@ class HoldoutOut(BaseModel):
     searched_to: dt.datetime | None
     groups: list[HoldoutGroup]
     rows: list[HoldoutRow]
+    retest_of: list[WindowUseOut] = Field(default_factory=list)
+    """The earlier looks at this window this test was launched over (01/10), read live: a look
+    since deleted is left out here and still counted in `earlier_uses`."""
+    earlier_uses: int = 0
+    """How many earlier tests had used this window when this one was launched — zero for a first
+    look. A walk-forward counts once, however many of its folds overlap."""
 
 
 class CreateSlicing(BaseModel):
@@ -2441,6 +2469,10 @@ class CreateSweepWalkForward(BaseModel):
     min_positive_year_share: Decimal | None = Field(default=None, gt=0, le=1)
     distinct: bool = True
     """Each fold skips clones, as a reserved-window test does (`CreateHoldout.distinct`)."""
+    retest: bool = False
+    """Walk forward over test windows an earlier test of this sweep already used (01/10) — as a
+    reserved-window test's (`CreateHoldout.retest`). The folds of one walk-forward never count
+    against each other."""
     timeframes: list[Timeframe] | None = Field(default=None, min_length=1)
     """The charts to walk (28/09); blank is every chart of the sweep. Each fold trains only these —
     a sweep over M5 and M15 walked on M5 alone does not re-run M15 in every window."""

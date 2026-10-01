@@ -5,6 +5,7 @@ import type { HoldoutRank, HoldoutRow, HoldoutSide } from '../api/types'
 import { percent } from '../format'
 import { HoldoutMonteCarlo } from './HoldoutMonteCarlo'
 import { HoldoutSlicings } from './HoldoutSlicings'
+import { WindowUseList } from './WindowUses'
 
 const METRIC_LABEL: Record<HoldoutRank, string> = {
   net_profit: 'net profit',
@@ -63,6 +64,10 @@ function sortRows(rows: HoldoutRow[]): HoldoutRow[] {
  * ⚠️ **Medians first, and the share still positive beside them — never the best.** The best
  * out-of-sample run is again the best of several draws. Whether the method held is what the median
  * and the share of points still making money say; the rows below are there to be read after.
+ *
+ * ⚠️ **A retest says so before anything else (01/10).** The reserved window is used once; a test
+ * launched over a window an earlier test of the same sweep had used carries a "Retest" mark and
+ * names those tests, so its result never reads as a first look.
  */
 export function HoldoutComparison(props: { sweepId: string }): React.JSX.Element {
   const holdout = useHoldout(props.sweepId)
@@ -97,6 +102,21 @@ export function HoldoutComparison(props: { sweepId: string }): React.JSX.Element
           )}
           .
         </p>
+        {data.earlier_uses > 0 && (
+          <div aria-label="retest" className="my-2 space-y-1 text-amber-300">
+            <p>
+              <span className="mr-2 rounded bg-amber-900/60 px-2 py-0.5 text-xs font-semibold tracking-wide uppercase">
+                Retest
+              </span>
+              This window had been used by {String(data.earlier_uses)} earlier{' '}
+              {data.earlier_uses === 1 ? 'test' : 'tests'} of the sweep when this one was launched
+              {data.retest_of.length < data.earlier_uses &&
+                ` (${String(data.earlier_uses - data.retest_of.length)} since deleted)`}
+              .
+            </p>
+            {data.retest_of.length > 0 && <WindowUseList uses={data.retest_of} />}
+          </div>
+        )}
         <p className="text-slate-400">
           Chosen on {data.searched_from === null ? '—' : day(data.searched_from)} →{' '}
           {data.searched_to === null ? '—' : day(data.searched_to)} · tested on{' '}

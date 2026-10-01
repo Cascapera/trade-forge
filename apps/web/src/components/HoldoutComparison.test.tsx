@@ -83,6 +83,8 @@ const HOLDOUT: HoldoutOut = {
     row({}),
     row({ label: 'M15 · gone', in_sample: null, out_of_sample: side('out-3', '0.049') }),
   ],
+  retest_of: [],
+  earlier_uses: 0,
 }
 
 describe('HoldoutComparison', () => {
@@ -104,6 +106,59 @@ describe('HoldoutComparison', () => {
     expect(getHoldout).toHaveBeenCalledWith('test-1')
     // A test launched before 28/09 kept its clones, and says nothing about them.
     expect(screen.queryByText(/clones skipped/)).not.toBeInTheDocument()
+  })
+
+  it('marks a retest and names the earlier tests of its window (01/10)', async () => {
+    getHoldout.mockResolvedValue({
+      ...HOLDOUT,
+      rule: { ...HOLDOUT.rule, retest: true, retest_of: ['test-0', 'walk-1', 'gone-1'] },
+      earlier_uses: 3,
+      retest_of: [
+        {
+          kind: 'holdout',
+          id: 'test-0',
+          test_id: 'test-0',
+          fold: null,
+          date_from: '2026-01-01T00:00:00Z',
+          date_to: '2026-06-01T00:00:00Z',
+          created_at: '2026-09-20T10:00:00Z',
+        },
+        {
+          kind: 'walk_forward',
+          id: 'walk-1',
+          test_id: null,
+          fold: 2,
+          date_from: '2026-01-01T00:00:00Z',
+          date_to: '2027-01-01T00:00:00Z',
+          created_at: '2026-09-21T10:00:00Z',
+        },
+      ],
+    })
+    renderWithProviders(<HoldoutComparison sweepId="test-1" />)
+
+    const mark = await screen.findByLabelText('retest')
+    expect(within(mark).getByText('Retest')).toBeInTheDocument()
+    expect(
+      within(mark).getByText(/used by 3 earlier tests of the sweep .* \(1 since deleted\)/),
+    ).toBeInTheDocument()
+    expect(within(mark).getByRole('link', { name: 'Reserved-window test' })).toHaveAttribute(
+      'href',
+      '/sweeps/test-0',
+    )
+    expect(within(mark).getByRole('link', { name: 'Walk-forward, fold 3' })).toHaveAttribute(
+      'href',
+      '/sweep-walkforwards/walk-1',
+    )
+    expect(within(mark).getByText(/tested 2026-01-01 → 2026-06-01 · launched 2026-09-20/))
+      .toBeInTheDocument()
+  })
+
+  it('says nothing of retests on a first look', async () => {
+    getHoldout.mockResolvedValue(HOLDOUT)
+    renderWithProviders(<HoldoutComparison sweepId="test-1" />)
+
+    await screen.findByRole('link', { name: 'the sweep it came from' })
+    expect(screen.queryByText('Retest')).not.toBeInTheDocument()
   })
 
   it('says when the clones were skipped', async () => {

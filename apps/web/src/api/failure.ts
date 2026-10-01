@@ -7,6 +7,7 @@
 // its bars; M5 is not"*. Showing the status instead throws that away.
 
 import { ApiError } from './client'
+import type { WindowUse } from './types'
 
 /**
  * The sentence the server sent, or `fallback` when it did not send one.
@@ -68,4 +69,19 @@ function reasonOf(errors: unknown): string | null {
   // names an internal model and would only puzzle a reader.
   const field: unknown = Array.isArray(loc) ? loc.at(-1) : undefined
   return typeof field === 'string' ? `${field} ${msg.toLowerCase()}` : msg
+}
+
+/**
+ * The earlier tests a 409 names when a reserved window was already used (01/10), or `null` for
+ * any other failure.
+ *
+ * ⚠️ **Only a 409 whose body lists them.** A 409 is also "still running" or a taken name, and
+ * offering a retest there would offer a checkbox that answers a question nobody asked.
+ */
+export function windowUsedBy(error: unknown): WindowUse[] | null {
+  if (!(error instanceof ApiError) || error.status !== 409) return null
+  const { detail } = error
+  if (detail === null || typeof detail !== 'object' || !('used_by' in detail)) return null
+  const used = detail.used_by
+  return Array.isArray(used) ? (used as WindowUse[]) : null
 }

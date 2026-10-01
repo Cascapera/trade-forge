@@ -2770,8 +2770,17 @@ Pendências:
   análise mostra "no trades kept" em vez de julgar; para julgá-los, é preciso lançar o teste de novo.
 - **Walk-forward de verdade** (caminho B: reotimizar a cada janela, uma varredura por janela) fica
   para depois de o fatiamento mostrar se vale o custo.
-- O ano reservado é outro teste fora da amostra da mesma varredura. Nada impede, ainda, que ele
-  seja lançado antes da hora; hoje isso depende da disciplina.
+- ~~O ano reservado é outro teste fora da amostra da mesma varredura. Nada impede, ainda, que ele
+  seja lançado antes da hora; hoje isso depende da disciplina.~~ **Feito (01/10): o ano reservado é
+  usado uma vez por varredura.** `POST /sweeps/{id}/holdout` com uma janela que divide alguma barra
+  (pontas que só se tocam não contam, `holdout.overlaps`) com um teste anterior da mesma varredura —
+  ou com uma dobra de um walk-forward dela, contada desde o lançamento, mesmo antes do treino
+  terminar — é recusado com **409**, e o corpo lista os testes (`used_by`: tipo, id, dobra, janela,
+  quando). Com `retest: true` ele roda e grava `retest` e `retest_of` (ids) na `holdout_rule`; o
+  `GET /sweeps/{id}/holdout` devolve `retest_of` (lido na hora) e `earlier_uses`, e a tela mostra o
+  selo "Retest". O walk-forward da varredura segue a mesma regra no lançamento (409 sem `retest`);
+  as dobras dele não se bloqueiam, e cada teste de dobra registra só os olhares anteriores ao
+  walk-forward. Sem migração (JSONB).
 
 ## Operar contra setups consistentemente ruins (25/09) — PENDENTE, para o FINAL, com tudo pronto
 

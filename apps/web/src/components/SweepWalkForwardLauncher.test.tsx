@@ -1,7 +1,7 @@
 import { fireEvent, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { api } from '../api/client'
+import { ApiError, api } from '../api/client'
 import type { SweepOut } from '../api/types'
 import { renderWithProviders } from '../test-utils'
 
@@ -32,6 +32,23 @@ const sweep = {
   counts: { total: 1200, done: 1200, running: 0, queued: 0, failed: 0 },
   runs: [],
 } as unknown as SweepOut
+
+const USED = {
+  message:
+    'a test window of this walk-forward was already used by 1 earlier test of this sweep; the reserved window is ' +
+    'used once — send retest: true to test it again knowingly',
+  used_by: [
+    {
+      kind: 'holdout',
+      id: 'test-0',
+      test_id: 'test-0',
+      fold: null,
+      date_from: '2026-01-01T00:00:00Z',
+      date_to: '2026-06-01T00:00:00Z',
+      created_at: '2026-09-20T10:00:00Z',
+    },
+  ],
+}
 
 function field(label: string): HTMLInputElement {
   return screen.getByLabelText(label)
@@ -157,5 +174,27 @@ describe('SweepWalkForwardLauncher', () => {
     fireEvent.change(field('Folds'), { target: { value: '5' } })
 
     expect(screen.getByText('Confirm the cost first.')).toBeInTheDocument()
+  })
+
+  it('names the earlier tests of used test years, and walks again as a retest once ticked (01/10)', async () => {
+    createSweepWalkForward.mockRejectedValueOnce(new ApiError(409, USED))
+    renderWithProviders(<SweepWalkForwardLauncher sweep={sweep} />)
+
+    fireEvent.click(screen.getByLabelText(/Queues about/))
+    fireEvent.click(screen.getByRole('button', { name: 'Walk forward' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(/already used by 1 earlier test/)
+    expect(screen.getByRole('link', { name: 'Reserved-window test' })).toHaveAttribute(
+      'href',
+      '/sweeps/test-0',
+    )
+    fireEvent.click(screen.getByLabelText(/Test again \(retest\)/))
+    fireEvent.click(screen.getByRole('button', { name: 'Walk forward' }))
+
+    await waitFor(() => {
+      expect(navigate).toHaveBeenCalledWith('/sweep-walkforwards/wf-1')
+    })
+    expect(createSweepWalkForward.mock.calls[0]?.[1]).not.toHaveProperty('retest')
+    expect(createSweepWalkForward.mock.calls[1]?.[1]).toMatchObject({ retest: true })
   })
 })

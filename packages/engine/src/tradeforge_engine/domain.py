@@ -37,6 +37,12 @@ type Volume = Decimal
 
 ZERO = Decimal(0)
 
+# A clock is a timezone, and the furthest any inhabited place sits from UTC is +14. The same bound
+# `collector.mt5_source.offset_is_plausible` uses, and for the same reason: beyond it the number
+# being stated is not a clock at all. Here because a broker's clock is part of an instrument's
+# venue (`InstrumentSpec.server_offset`), and `higher_timeframe` reads it from here.
+MAX_SERVER_OFFSET: Final = dt.timedelta(hours=14)
+
 
 def _require_utc(moment: dt.datetime, field: str) -> None:
     """A naive datetime is not an instant, and the failure it causes is silent.
@@ -127,8 +133,23 @@ class InstrumentSpec:
     digits: int
     exchange: str | None = None
     currency_base: str | None = None
+    server_offset: dt.timedelta = dt.timedelta(0)
+    """How far the broker's server clock runs ahead of the stored candles' UTC — where its day,
+    and so every bar above the chart, begins (his rule, 30/09: *"vamos adotar o horário do
+    servidor mt5 como real"*).
+
+    ⚠️ **A fact about the data, not a choice of the strategy.** The collector shifts every bar it
+    stores by this same number (`--server-offset`), so the server's midnight sits at a fixed UTC
+    hour in the file — 21:00 for a broker three hours ahead, summer and winter alike, measured on
+    every stored series. Until 30/09 each strategy stated it (`htf_offset`), which let two runs of
+    the same market cut its higher bars in two places. Zero is a broker on UTC."""
 
     def __post_init__(self) -> None:
+        if abs(self.server_offset) > MAX_SERVER_OFFSET:
+            raise ValueError(
+                f"{self.symbol}: a broker's clock sits within {MAX_SERVER_OFFSET} of UTC, "
+                f"got {self.server_offset}"
+            )
         if self.tick_size <= ZERO:
             raise ValueError(f"{self.symbol}: tick_size must be positive, got {self.tick_size}")
         if self.tick_value <= ZERO:

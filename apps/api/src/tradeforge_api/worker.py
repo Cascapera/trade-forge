@@ -386,11 +386,15 @@ async def process_batch(  # noqa: PLR0913 — keyword-only; each names one thing
     first = runs[0]
     instrument = session.get(Instrument, first.instrument_id)
     strategies = [session.get(Strategy, run.strategy_id) for run in runs]
+    specs = [_kept_spec(run, instrument) for run in runs] if instrument is not None else []
+    # The broker's clock the bars above are cut on is the instrument's (30/09); a batch whose runs
+    # kept different ones is refused below (`len(set(specs)) != 1`), so the first speaks for all.
+    clock = specs[0].server_offset if specs else dt.timedelta(0)
     # The reading and the warm-up: a batch feeds its runs one stream of bars (ADR-0030).
     keys = {
         None
         if strategy is None
-        or (reading := shared_reading_of(strategy.definition, first.timeframe)) is None
+        or (reading := shared_reading_of(strategy.definition, first.timeframe, clock)) is None
         else (reading, warmup_for(strategy.definition))
         for strategy in strategies
     }
@@ -404,7 +408,6 @@ async def process_batch(  # noqa: PLR0913 — keyword-only; each names one thing
             for run in runs
         )
     )
-    specs = [_kept_spec(run, instrument) for run in runs] if instrument is not None else []
     if not one_market or len(set(specs)) != 1:
         session.rollback()
         for run in runs:
@@ -545,13 +548,14 @@ async def _fail_open(
 
 
 def shared_reading_of(
-    definition: Mapping[str, Any], timeframe: str
+    definition: Mapping[str, Any], timeframe: str, server_offset: dt.timedelta
 ) -> tuple[dt.timedelta | None, dt.timedelta] | None:
-    """The reading of the market a stored document's setup shares (`shared_reading`), if any."""
+    """The reading of the market a stored document's setup shares (`shared_reading`), if any —
+    its bars above cut on `server_offset`, the instrument's clock (30/09)."""
     setup = definition.get("setup")
     if not isinstance(setup, Mapping):
         return None
-    return shared_reading(setup, timeframe=step(timeframe))
+    return shared_reading(setup, timeframe=step(timeframe), server_offset=server_offset)
 
 
 # --------------------------------------------------------------------------- #

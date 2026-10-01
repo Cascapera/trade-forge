@@ -71,7 +71,7 @@ class _MarkedTwice:
         )
 
 
-def _window(strategy: object) -> _Window:
+def _window(strategy: object, kept: dict[str, object] | None = None) -> _Window:
     instrument = Instrument(
         symbol="EURUSD",
         name="Euro vs US Dollar",
@@ -82,6 +82,8 @@ def _window(strategy: object) -> _Window:
         tick_value=Decimal("1"),
         contract_size=Decimal("100000"),
         digits=5,
+        # Three hours ahead, never zero: zero is what a clock lost on the way reads as.
+        server_offset=dt.timedelta(hours=3),
     )
     candles = [
         Candle(
@@ -94,7 +96,7 @@ def _window(strategy: object) -> _Window:
         for index in range(3)
     ]
     return _Window(
-        backtest=Backtest(id=uuid.uuid4(), initial_capital=Decimal(10_000)),
+        backtest=Backtest(id=uuid.uuid4(), initial_capital=Decimal(10_000), instrument_spec=kept),
         instrument=instrument,
         strategy=Strategy(id=uuid.uuid4(), definition={}),
         seen=len(candles),
@@ -106,8 +108,15 @@ def _window(strategy: object) -> _Window:
 
 @pytest.fixture(name="compiles_to")
 def _compiles_to(monkeypatch: pytest.MonkeyPatch) -> Any:
-    def use(strategy: object) -> None:
-        monkeypatch.setattr(router, "compile_strategy", lambda _document: strategy)
+    def use(strategy: object) -> list[object]:
+        handed: list[object] = []
+
+        def stand_in(_document: object, **kwargs: object) -> object:
+            handed.append(kwargs.get("server_offset", "not handed"))
+            return strategy
+
+        monkeypatch.setattr(router, "compile_strategy", stand_in)
+        return handed
 
     return use
 
@@ -181,3 +190,27 @@ def test_a_strategy_that_marks_no_regions_answers_with_an_empty_list(compiles_to
     compiles_to(strategy)
 
     assert _zones_of(_window(strategy)) == []
+
+
+def test_the_regions_are_marked_on_the_clock_the_run_was_cut_on(compiles_to: Any) -> None:
+    """The run's own clock (30/09): the catalogue's the first time, and the kept one after — a
+    region above drawn on another clock sits hours away from the one the run traded."""
+    handed = compiles_to(_MarkedTwice())
+
+    _zones_of(_window(_MarkedTwice()))
+    kept = {
+        "symbol": "EURUSD",
+        "name": "Euro vs US Dollar",
+        "asset_class": "forex",
+        "currency_quote": "USD",
+        "currency_base": "EUR",
+        "tick_size": "0.00001",
+        "tick_value": "1",
+        "contract_size": "100000",
+        "digits": 5,
+        "exchange": None,
+        "server_offset_hours": 2.0,
+    }
+    _zones_of(_window(_MarkedTwice(), kept=kept))
+
+    assert handed == [dt.timedelta(hours=3), dt.timedelta(hours=2)]

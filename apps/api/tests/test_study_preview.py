@@ -30,7 +30,7 @@ _FILTERED: dict[str, Any] = {
     # path the document has nothing at — an axis can only vary a key that is already written.
     "setup": {
         "type": "structure_choch",
-        "params": {"htf": "H4", "htf_offset": 3, "stop_buffer": 0.1},
+        "params": {"htf": "H4", "stop_buffer": 0.1},
     },
     "risk": {"sizing": {"type": "percent_risk", "params": {"percent": 1.0}}},
 }

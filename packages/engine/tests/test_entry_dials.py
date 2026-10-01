@@ -7,6 +7,7 @@ itself, both ways — an unread dial builds the same activation, a read one a di
 then on the whole compiled setup: every unread dial changed leaves its entire state as it was.
 """
 
+import datetime as dt
 import pickle
 from decimal import Decimal
 
@@ -111,7 +112,11 @@ def _document(kind: str, params: dict[str, object]) -> dict[str, object]:
 
 def _state(kind: str, params: dict[str, object]) -> bytes:
     """Everything a freshly compiled setup holds, as bytes two equal states spell the same way."""
-    return pickle.dumps(compile_strategy(_document(kind, params)))
+    # A broker three hours ahead (the instrument's clock since 30/09), so the gate is built as a
+    # real run builds it rather than on UTC.
+    return pickle.dumps(
+        compile_strategy(_document(kind, params), server_offset=dt.timedelta(hours=3))
+    )
 
 
 @pytest.mark.parametrize("kind", ["structure_choch", "structure_continuation"])
@@ -136,7 +141,7 @@ def test_unread_dials_leave_the_whole_setup_as_it_was(
         "stop_buffer": 0.1,
         "gift_stop": "gift",
         "volume_filter": False,
-        **({"htf": htf, "htf_offset": 3} if htf is not None else {}),
+        **({"htf": htf} if htf is not None else {}),
     }
     unread = unread_params({"type": kind, "params": base})
 

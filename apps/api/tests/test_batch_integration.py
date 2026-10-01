@@ -140,7 +140,6 @@ def _entry(client: Any) -> str:
             "type": "structure_choch",
             "params": {
                 "htf": "H4",
-                "htf_offset": 0,
                 "entry_point": "edge",
                 "side": "both",
                 "breakeven_at_r": 2.0,
@@ -336,8 +335,8 @@ class TestTheLaunchCutsBatches:
     def test_runs_are_cut_by_market_in_batches_of_at_most_the_size(self) -> None:
         batcher = Batcher(size=2)
         eur, gbp = (
-            ("EURUSD", "H1", (None, dt.timedelta(0)), _NO_WARMUP),
-            ("GBPUSD", "H1", (None, dt.timedelta(0)), _NO_WARMUP),
+            ("EURUSD", "H1", None, _NO_WARMUP),
+            ("GBPUSD", "H1", None, _NO_WARMUP),
         )
         ids = [uuid.uuid4() for _ in range(6)]
         for run_id, key in zip(ids, [eur, gbp, eur, None, eur, gbp], strict=True):
@@ -354,7 +353,7 @@ class TestTheLaunchCutsBatches:
         batcher = Batcher()
         ids = [uuid.uuid4() for _ in range(13)]
         for run_id in ids:
-            batcher.add(run_id, ("EURUSD", "M1", (None, dt.timedelta(0)), _NO_WARMUP))
+            batcher.add(run_id, ("EURUSD", "M1", None, _NO_WARMUP))
         assert [len(job) for job in batcher.jobs()] == [6, 6, 1]
 
     def test_switched_off_every_run_goes_alone(self) -> None:
@@ -362,7 +361,7 @@ class TestTheLaunchCutsBatches:
         batcher = Batcher(enabled=False)
         ids = [uuid.uuid4() for _ in range(3)]
         for run_id in ids:
-            batcher.add(run_id, ("EURUSD", "H1", (None, dt.timedelta(0)), _NO_WARMUP))
+            batcher.add(run_id, ("EURUSD", "H1", None, _NO_WARMUP))
         assert batcher.jobs() == [[one] for one in ids]
 
 

@@ -172,7 +172,7 @@ def a_filtered_document(name: str) -> dict[str, Any]:
         "schema_version": "1.0",
         "name": name,
         "timeframe": "M15",
-        "setup": {"type": "structure_choch", "params": {"htf": "H4", "htf_offset": 3}},
+        "setup": {"type": "structure_choch", "params": {"htf": "H4"}},
         "risk": {"sizing": {"type": "percent_risk", "params": {"percent": 1.0}}},
     }
 
@@ -405,11 +405,14 @@ class TestTheTimeframeIsRealHere:
         """⚠️ **One item per reason, not per point** (26/09). One per point made a preview of a
         grid of 435 thousand points per chart answer 1.09 GB, and it took the API down."""
         monkeypatch.setattr(sweeps_router, "REFUSAL_EXAMPLES", 2)
+        document = a_filtered_document(f"choch {uuid.uuid4()}")
+        # A grid only varies what the document states (the clock was that axis until 30/09).
+        document["setup"]["params"]["breakeven_at_r"] = 2.0
         entry = an_entry(
             client,
             name=f"filtered {uuid.uuid4()}",
-            grid={"setup.params.htf_offset": [0, 1, 3]},
-            document=a_filtered_document(f"choch {uuid.uuid4()}"),
+            grid={"setup.params.breakeven_at_r": [1, 2, 3]},
+            document=document,
         )
         body = a_sweep_body([entry], ["EURUSD"], ["M15", "H4"])
 
@@ -422,7 +425,7 @@ class TestTheTimeframeIsRealHere:
 
         (refusal,) = preview["entries"][0]["refusals"]
         assert refusal["count"] == 3
-        assert refusal["examples"] == ["H4 · htf_offset=0", "H4 · htf_offset=1"]
+        assert refusal["examples"] == ["H4 · breakeven_at_r=1", "H4 · breakeven_at_r=2"]
         assert (preview["documents"], preview["runs"]) == (6, 3)
 
     def test_the_two_timeframes_do_not_collide_on_a_name(self, client: Any) -> None:

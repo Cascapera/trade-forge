@@ -297,7 +297,10 @@ def _compile_side(entry: Mapping[str, object], side: str) -> Condition | None:
 
 
 def compile_strategy(
-    document: Mapping[str, object], *, reading: MarketReading | None = None
+    document: Mapping[str, object],
+    *,
+    server_offset: dt.timedelta = dt.timedelta(0),
+    reading: MarketReading | None = None,
 ) -> Strategy:
     """Compile a validated DSL document into a runnable strategy.
 
@@ -311,6 +314,10 @@ def compile_strategy(
     **names** a setup — a state machine no tree can express — and is built by `build_setup`
     (ADR-0019). Both satisfy the one method the loop calls, which is why this stays a single
     entry point and no caller grows a branch.
+
+    `server_offset` is the broker's clock (`InstrumentSpec.server_offset`): where a setup reading
+    a higher timeframe closes those bars (his rule, 30/09). A run passes its instrument's; zero is
+    a broker on UTC. A document of conditions reads no bars above and ignores it.
     """
     version = document.get("schema_version")
     if version != SUPPORTED_SCHEMA_VERSION:
@@ -332,7 +339,12 @@ def compile_strategy(
         # and an engine that refuses to interpret one must refuse to interpret the other. The
         # timeframe is handed over because a setup may read a *higher* one, and it can only build
         # those bars knowing how long its own are.
-        return build_setup(_require_mapping(setup, "setup"), timeframe=timeframe, reading=reading)
+        return build_setup(
+            _require_mapping(setup, "setup"),
+            timeframe=timeframe,
+            server_offset=server_offset,
+            reading=reading,
+        )
 
     # ⚠️ A shared market is read by a setup; a document of conditions reads none, and building
     # it as if it did would leave a batch advancing a reading nobody reads.

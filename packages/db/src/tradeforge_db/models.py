@@ -299,6 +299,18 @@ class Instrument(Base):
     # reconcile. Storing the raw MT5 number would leave that conversion to every reader.
     default_spread_points: Mapped[Decimal | None] = mapped_column(PRICE)
 
+    # How far the broker's server clock runs ahead of the stored candles' UTC — the number the
+    # collector shifted every bar by, and so where this market's day and every bar above the
+    # chart begin (`InstrumentSpec.server_offset`, his rule of 30/09). A fact about the data, which
+    # is why it lives with the instrument and not with a strategy. The migration that added it
+    # filled the rows it found with the three hours measured on every stored series; the collector
+    # states its own on every write (`upsert_instruments`). A row built by hand gets what a
+    # hand-built `InstrumentSpec` gets — zero, a broker on UTC — and no server default, so SQL
+    # that forgets the column is refused rather than handed a clock.
+    server_offset: Mapped[dt.timedelta] = mapped_column(
+        Interval, nullable=False, default=dt.timedelta(0)
+    )
+
     created_at: Mapped[dt.datetime] = _created_at()
     updated_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True),
@@ -329,6 +341,11 @@ class Instrument(Base):
         CheckConstraint(
             "default_spread_points IS NULL OR default_spread_points >= 0",
             name="default_spread_points_non_negative",
+        ),
+        # A clock is a timezone: within fourteen hours of UTC (`MAX_SERVER_OFFSET`).
+        CheckConstraint(
+            "server_offset BETWEEN interval '-14 hours' AND interval '14 hours'",
+            name="server_offset_is_a_clock",
         ),
     )
 

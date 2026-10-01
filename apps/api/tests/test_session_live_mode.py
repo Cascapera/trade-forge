@@ -23,12 +23,13 @@ import uuid
 from collections.abc import Callable, Iterator, Sequence
 from decimal import Decimal
 from pathlib import Path
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
+from tradeforge_api.live import session as live_session
 from tradeforge_api.live.heartbeat import Heartbeat
 from tradeforge_api.live.session import SessionOutcome, SessionPlan, run_session
 from tradeforge_db.live_sessions import STALE_AFTER
@@ -251,6 +252,7 @@ def rows(session: Session) -> tuple[Strategy, Instrument]:
         tick_value=EURUSD.tick_value,
         contract_size=EURUSD.contract_size,
         digits=EURUSD.digits,
+        server_offset=dt.timedelta(0),
     )
     strategy = Strategy(definition=choch_strategy(), version=1)
     session.add_all([instrument, strategy])
@@ -864,7 +866,7 @@ def filtered_strategy() -> dict[str, object]:
         # any other width would be refused for the mismatch rather than for the filter, and
         # the test below would then pass without the filter rule existing at all.
         "timeframe": "H1",
-        "setup": {"type": "structure_choch", "params": {"htf": "H4", "htf_offset": 3}},
+        "setup": {"type": "structure_choch", "params": {"htf": "H4"}},
         "risk": {"sizing": {"type": "percent_risk", "params": {"percent": 1.0}}},
     }
 
@@ -963,3 +965,49 @@ def test_a_session_on_the_documents_own_timeframe_is_not_refused(
     # It got past the guard and read its bars — which is the whole assertion. What the session
     # then *did* is `test_session_integration.py`'s subject, not this one's.
     assert source.reads > 0
+
+
+def test_a_session_cuts_the_bars_above_on_its_instruments_clock(
+    session: Session,
+    session_factory: Callable[[], Session],
+    rows: tuple[Strategy, Instrument],
+    parquet_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same clock the candles were stored under (30/09): three hours here, never zero — zero
+    is what a clock lost between the catalogue and the setup reads as."""
+    _, instrument = rows
+    instrument.server_offset = dt.timedelta(hours=3)
+    filtered = Strategy(definition=filtered_strategy(), version=1)
+    session.add(filtered)
+    session.commit()
+    paper_evidence(session, filtered, instrument, days=5)
+
+    handed: list[object] = []
+    real = compile_strategy
+
+    def spy(document: Any, **kwargs: Any) -> Any:
+        handed.append(kwargs.get("server_offset", "not handed"))
+        return real(document, **kwargs)
+
+    monkeypatch.setattr(live_session, "compile_strategy", spy)
+    history, live_bars, cut = split()
+    plan = SessionPlan(
+        strategy_id=filtered.id,
+        instrument_id=instrument.id,
+        timeframe="H1",
+        initial_capital=Decimal("10000"),
+        cost_model={"type": "none"},
+    )
+
+    run_session(
+        factory=factory_of(session_factory),
+        source=CountingSource(history, live_bars),
+        plan=plan,
+        parquet_root=parquet_root,
+        stopping=lambda: False,
+        venue=None,
+        now=lambda: cut,
+    )
+
+    assert handed == [dt.timedelta(hours=3)]

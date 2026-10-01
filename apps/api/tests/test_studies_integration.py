@@ -408,7 +408,7 @@ def test_a_higher_timeframe_no_coarser_than_the_chart_is_left_out(
         "schema_version": "1.0",
         "name": "CHoCH under a higher timeframe",
         "timeframe": "H1",
-        "setup": {"type": "structure_choch", "params": {"htf": "H4", "htf_offset": 3}},
+        "setup": {"type": "structure_choch", "params": {"htf": "H4"}},
         "risk": {"sizing": {"type": "percent_risk", "params": {"percent": 1.0}}},
     }
     grid = {"setup.params.htf": ["M30", "H4", "D1"]}

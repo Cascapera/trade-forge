@@ -75,9 +75,10 @@ def _setup(point: dict[str, Any], *, htf: bool, reading: MarketReading | None) -
         "entry_point": point["entry_point"],
         "side": point["side"],
         "breakeven_at_r": point["breakeven_at_r"],
-        **({"htf": "H4", "htf_offset": 0} if htf else {}),
+        **({"htf": "H4"} if htf else {}),
     }
-    kwargs = _structure_kwargs(params, HOUR)
+    # On UTC: the reading these setups share is built at offset zero below.
+    kwargs = _structure_kwargs(params, HOUR, dt.timedelta(0))
     if point["max_bos"] is None:
         return ageless_structure(
             qualifier=ChochQualifier(), name="choch", reading=reading, **kwargs

@@ -132,3 +132,37 @@ corretora não estiver em UTC. É uma diferença conhecida e escolhida, não sil
 docstring de `StructureParams` e na legenda da tela (`empty = UTC`). A palavra-chave
 `requiredWith` do schema ficou sem nenhum campo que a use; o leitor dela no front continua, testado
 por `params.test.ts`.
+
+## Revisão — 2026-09-30: o relógio é do ativo, não da estratégia
+
+⚠️ **Decisão dele**: *"htf offset não vamos usar em nenhum time frame, vamos adotar o horário do
+servidor mt5 como real"*. As barras de cima passam a ser cortadas no relógio do servidor da
+corretora, e esse relógio vem do **ativo** (`instruments.server_offset`, migração 0042;
+`InstrumentSpec.server_offset` no motor), não do documento.
+
+O motivo foi outra varredura real (`87b0efc0`, UKOIL, 29/09): com o corte em UTC, a barra H4 das
+21:00 UTC — a da meia-noite do servidor — atravessa a meia-noite UTC do D1/W1 de cima, o
+`BarAggregator` recusa, e **todos** os 32.832 runs de H4 e D1 falharam.
+
+Medido antes de decidir: todo parquet guardado (UKOIL, EURUSD, AUDUSD, 2009 a 2026) foi gravado
+com o servidor menos **3 h fixas**, no verão e no inverno — o D1 abre sempre às 21:00 UTC. O
+coletor subtrai um número só (`--server-offset` ou o medido na conexão), então o relógio do
+servidor é sempre "hora gravada + esse número", sem ambiguidade de horário de verão.
+
+| Onde | Antes (26/09) | Agora (30/09) |
+|------|---------------|---------------|
+| documento | `htf_offset` número ou `null` (= UTC) | só `null` — um número é recusado pelo schema e pelo motor |
+| ativo | — | `server_offset` (preenchido com 3 h nos existentes; o coletor grava o que usou) |
+| run | o `htf_offset` do documento | o `server_offset` do ativo, guardado em `instrument_spec` |
+| motor | 0.4.0 | **0.5.0** (todo run com `htf` muda de resultado) |
+
+**Por que estreitar em vez de remover o campo:** as 19 estratégias salvas têm `htf_offset: null`;
+removido, o schema recusaria todas (`extra="forbid"`) ou exigiria `schema_version` nova, que o
+motor recusa. Estreitado para `null`, o `schema_version` fica 1.0 — o mesmo caminho de estreitamentos
+anteriores.
+
+**O que se perde:** um mesmo ativo não pode mais ser testado cortado em dois relógios; se um dia
+precisar, é outro ativo (ou outra coleta). **Risco anotado no backlog:** se uma coleta futura medir
+o relógio no inverno (2 h) e gravar por cima de dados gravados com 3 h, o mesmo ativo fica com
+barras deslocadas de dois jeitos — o coletor deveria recusar gravar com um relógio diferente do que
+o ativo já tem.

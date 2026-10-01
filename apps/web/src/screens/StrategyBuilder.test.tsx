@@ -187,23 +187,18 @@ describe('the strategy picker', () => {
     expect(screen.getByLabelText('setup max_bos')).toHaveValue('')
   })
 
-  it('says an empty clock is UTC, not that it is the filter switched off', () => {
-    // `htf_offset` empty is the higher bars cut on UTC (his decision, 26/09) — a setting, but not
-    // "off": the filter still runs, only its clock is UTC.
+  it('asks for no clock, and says what each empty box means', () => {
+    // The broker's clock is the instrument's since 30/09, so the builder has no box for it.
     renderWithProviders(<StrategyBuilder />)
     fireEvent.change(screen.getByLabelText('strategy'), {
       target: { value: 'structure_continuation' },
     })
 
-    // Scoped to each field's own label, because several parameters here carry a caption and a
-    // page-wide search would only prove that *some* box says "off".
-    const clock = screen.getByLabelText('setup htf_offset').closest('label')
-    expect(clock).toHaveTextContent('empty = UTC')
-    expect(clock).not.toHaveTextContent('empty = off')
+    expect(screen.queryByLabelText('setup htf_offset')).not.toBeInTheDocument()
 
-    // The two that keep their own caption, and they are what makes this a distinction rather
-    // than a caption applied to everything: `htf` empty really is the filter off, and `max_bos`
-    // empty really is uncapped.
+    // Scoped to each field's own label, because several parameters here carry a caption and a
+    // page-wide search would only prove that *some* box says "off": `htf` empty really is the
+    // filter off, and `max_bos` empty really is uncapped.
     expect(screen.getByLabelText('setup htf').closest('label')).toHaveTextContent('empty = off')
     expect(screen.getByLabelText('setup max_bos').closest('label')).toHaveTextContent(
       'empty = uncapped',
@@ -739,13 +734,12 @@ describe('when the API refuses the save', () => {
     saveState.error = new ApiError(422, {
       message: 'strategy is well-formed but cannot run',
       errors:
-        "setup.params.htf_offset: a higher timeframe needs the broker's clock: give htf_offset, " +
-        'the hours its server runs ahead of UTC',
+        'setup.params.htf: the higher timeframe H1 must be coarser than H4',
     })
 
     renderWithProviders(<StrategyBuilder />)
 
-    expect(screen.getByText(/a higher timeframe needs the broker's clock/)).toBeInTheDocument()
+    expect(screen.getByText(/must be coarser than H4/)).toBeInTheDocument()
     expect(screen.queryByText(/API error 422/)).not.toBeInTheDocument()
     expect(screen.queryByText(/immutable/i)).not.toBeInTheDocument()
   })

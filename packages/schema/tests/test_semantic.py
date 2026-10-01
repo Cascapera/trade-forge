@@ -386,15 +386,10 @@ def test_a_document_that_is_neither_a_setup_nor_a_strategy_is_refused() -> None:
 
 
 def _filtered(timeframe: str, htf: str) -> Strategy:
-    """A filtered document that is sound apart from whatever the caller is testing.
-
-    The broker's clock is always stated: since 2026-09-09 a document that names a higher timeframe
-    and no offset is unrunnable for that reason alone, and a fixture missing it would make every
-    assertion below pass for the wrong error.
-    """
+    """A filtered document that is sound apart from whatever the caller is testing. No clock: the
+    broker's is the instrument's since 2026-09-30, and a document may not state one."""
     return setup_strategy(
-        timeframe=timeframe,
-        setup={"type": "structure_choch", "params": {"htf": htf, "htf_offset": 3}},
+        timeframe=timeframe, setup={"type": "structure_choch", "params": {"htf": htf}}
     )
 
 
@@ -424,63 +419,35 @@ def test_a_higher_timeframe_that_is_not_higher_is_refused(timeframe: str, htf: s
 def test_the_continuation_setup_is_held_to_the_same_rule() -> None:
     model = setup_strategy(
         timeframe="H4",
-        setup={"type": "structure_continuation", "params": {"htf": "H1", "htf_offset": 3}},
+        setup={"type": "structure_continuation", "params": {"htf": "H1"}},
     )
     assert "coarser than H4" in messages(model)
 
 
 # --------------------------------------------------------------------------- #
-# The broker's clock beside the higher timeframe (2026-09-09)                   #
+# The broker's clock is the instrument's (2026-09-30)                          #
 # --------------------------------------------------------------------------- #
 
 
 @pytest.mark.parametrize("setup_type", ["structure_choch", "structure_continuation"])
-def test_a_higher_timeframe_without_a_clock_is_sound_and_runs_on_utc(setup_type: str) -> None:
-    """His decision of 2026-09-26 (*"nao vamos fazer o ajuste"*), reversing 2026-09-09: an `htf`
-    with no `htf_offset` is cut on UTC, where the stored candles are. Refusing it had refused every
-    point of a sweep grid varying `htf` without a clock beside it."""
-    model = setup_strategy(timeframe="M15", setup={"type": setup_type, "params": {"htf": "H4"}})
+@pytest.mark.parametrize("params", [{"htf": "H4"}, {"htf": "H4", "htf_offset": None}])
+def test_a_higher_timeframe_needs_no_clock_from_the_document(
+    setup_type: str, params: dict[str, object]
+) -> None:
+    """His rule of 2026-09-30: *"htf offset não vamos usar em nenhum time frame, vamos adotar o
+    horário do servidor mt5 como real"*. The bars above are cut on the instrument's clock, so a
+    document names the filter alone — and the `null` every saved one carries is still sound."""
+    model = setup_strategy(timeframe="M15", setup={"type": setup_type, "params": params})
 
     assert validate_semantics(model) == []
 
 
-def test_a_clock_with_no_higher_timeframe_is_sound_because_a_grid_needs_it() -> None:
-    """A clock without `htf` produces nothing at all: no gate is built and the number is never
-    read.
-
-    It *was* refused too, until a study grid needed it. Varying `htf` over `[off, H4]` is the
-    experiment the whole filter exists to justify, and a grid is a cross product — so the clock
-    has to hold still at one value while the filter moves, which means the unfiltered point
-    necessarily carries a clock that configures nothing. Refusing it made the comparison
-    impossible to ask for."""
-    model = setup_strategy(
-        timeframe="M15", setup={"type": "structure_choch", "params": {"htf_offset": 3}}
-    )
-    assert validate_semantics(model) == []
-
-
-@pytest.mark.parametrize("offset", [15, -15, 100, -100])
-def test_a_clock_no_terminal_could_have_is_refused_by_the_schema(offset: float) -> None:
-    """The shape layer's own bound, and it needs a document to be observable at all.
-
-    ⚠️ Both signs. `Field(ge=-14, le=14)` is two numbers, and a fixture that only ever carries
-    `3` proves neither — the engine's own guard is the same story from the other side. A `-19`
-    here is a real confusion rather than a typo: the offset of a UTC+5 broker written the wrong
-    way round. It has to fail at the API, with the field named, rather than inside a backtest.
-    """
-    with pytest.raises(ValidationError):
+@pytest.mark.parametrize("offset", [3, 0, -5.5, 14, 15, "3"])
+def test_a_clock_in_the_document_is_refused_by_the_schema(offset: object) -> None:
+    """Zero included: a stated UTC is still a stated clock, and the instrument's may not be UTC.
+    Refused at the API with the field named, rather than inside a backtest."""
+    with pytest.raises(ValidationError, match="htf_offset"):
         setup_strategy(
             timeframe="M15",
             setup={"type": "structure_choch", "params": {"htf": "H4", "htf_offset": offset}},
         )
-
-
-def test_the_pair_together_is_sound_and_a_half_hour_clock_is_a_clock() -> None:
-    # ±14 exactly: Kiritimati and Baker Island, the two ends of the inhabited world, and the two
-    # values the bound has to admit or the schema and the engine stop agreeing about one number.
-    for offset in (3, -5.5, 0, 14, -14):
-        model = setup_strategy(
-            timeframe="M15",
-            setup={"type": "structure_choch", "params": {"htf": "H4", "htf_offset": offset}},
-        )
-        assert validate_semantics(model) == []

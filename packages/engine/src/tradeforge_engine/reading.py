@@ -42,7 +42,7 @@ class MarketReading:
             raise ValueError("a higher-timeframe reading needs the setup's own timeframe")
         self._structure = MarketStructure()
         self._blocks = OrderBlockDetector()
-        # ⚠️ No broker clock means UTC — the setup's rule of 2026-09-26, and the same default.
+        # ⚠️ No broker clock means UTC — the setup's default; a run hands over its instrument's.
         self._regions = (
             None
             if htf is None or timeframe is None

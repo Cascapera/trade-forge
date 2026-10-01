@@ -72,6 +72,7 @@ def instrument_spec(instrument: Instrument) -> InstrumentSpec:
         contract_size=instrument.contract_size,
         digits=instrument.digits,
         exchange=instrument.exchange,
+        server_offset=instrument.server_offset,
     )
 
 
@@ -89,6 +90,8 @@ def spec_document(spec: InstrumentSpec) -> dict[str, Any]:
         "contract_size": str(spec.contract_size),
         "digits": spec.digits,
         "exchange": spec.exchange,
+        # Hours, as the collector's `--server-offset` states it; `timedelta` is not JSON.
+        "server_offset_hours": spec.server_offset / dt.timedelta(hours=1),
     }
 
 
@@ -103,6 +106,10 @@ def spec_for(run: Backtest, instrument: Instrument) -> InstrumentSpec:
     kept = run.instrument_spec
     if kept is None:
         return instrument_spec(instrument)
+    # ⚠️ A run kept before 30/09 kept no clock: its higher bars were cut on the strategy's
+    # `htf_offset`, which was null everywhere — UTC. Read back as the zero it ran under, never as
+    # the catalogue's clock, which would re-run it cut somewhere else.
+    hours = kept.get("server_offset_hours", 0)
     return InstrumentSpec(
         symbol=kept["symbol"],
         name=kept["name"],
@@ -114,6 +121,7 @@ def spec_for(run: Backtest, instrument: Instrument) -> InstrumentSpec:
         contract_size=Decimal(kept["contract_size"]),
         digits=int(kept["digits"]),
         exchange=kept["exchange"],
+        server_offset=dt.timedelta(hours=float(hours)),
     )
 
 
@@ -210,7 +218,7 @@ def timeframe_refusal(definition: Mapping[str, Any], timeframe: str) -> str | No
     document's is the finer of the two, `BarAggregator`'s straddle guard compares the wrong
     width and stops firing. The honest run raises and the mismatched one does not — the guard
     that exists to catch misalignment is silenced by the misalignment. Half-hour broker clocks
-    are not hypothetical: `htf_offset` accepts them, and the ADR says so in as many words.
+    are not hypothetical: `InstrumentSpec.server_offset` accepts them, and the ADR says so.
 
     **Neither rule is restated here.** The semantic one is the DSL's own — a filter has to be
     coarser than the chart and a whole number of its bars —
@@ -346,7 +354,7 @@ def execute_backtest(  # noqa: PLR0913 — keyword-only; each names one axis of 
         candles=[*_warm(candles, warmup_for(definition), date_from), *windowed],
         timeframe=step(timeframe),
         instrument=instrument,
-        strategy=compile_strategy(definition),
+        strategy=compile_strategy(definition, server_offset=instrument.server_offset),
         broker=broker_for(
             definition=definition,
             instrument=instrument,
@@ -404,6 +412,13 @@ def execute_batch(  # noqa: PLR0913 — keyword-only; each names one axis the ba
     if len(warmups) != 1:
         raise ValueError(f"a batch's runs warm up differently: {sorted(map(str, warmups))}")
     (warmup,) = warmups
+    # The bars above are cut on the instrument's clock (30/09); a key built on another would
+    # hand every run a market cut where this instrument's is not.
+    if key[1] != instrument.server_offset:
+        raise ValueError(
+            f"a batch's reading is cut at {key[1]}, not on {instrument.symbol}'s clock "
+            f"({instrument.server_offset})"
+        )
     reading = reading_for(key, timeframe=step(timeframe))
     outcomes: list[Measured | Exception | None] = []
     members: list[BatchMember] = []
@@ -411,7 +426,11 @@ def execute_batch(  # noqa: PLR0913 — keyword-only; each names one axis the ba
         try:
             members.append(
                 BatchMember(
-                    strategy=compile_strategy(batch_run.definition, reading=reading),
+                    strategy=compile_strategy(
+                        batch_run.definition,
+                        server_offset=instrument.server_offset,
+                        reading=reading,
+                    ),
                     broker=broker_for(
                         definition=batch_run.definition,
                         instrument=instrument,

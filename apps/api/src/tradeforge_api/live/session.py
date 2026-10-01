@@ -244,7 +244,8 @@ def run_session(  # noqa: PLR0913 — keyword-only; each names one seam of a ses
         take_profit_rr=take_profit_rr(definition),
     )
     risk = PercentRiskManager(percent=risk_percent(definition))
-    compiled = compile_strategy(definition)
+    # The bars above close on the instrument's clock (30/09), the one its candles are stored on.
+    compiled = compile_strategy(definition, server_offset=spec.server_offset)
 
     for _outcome in iter_run(
         candles=candles.warmup(),

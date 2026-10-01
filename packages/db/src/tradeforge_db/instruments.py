@@ -62,6 +62,7 @@ _INSTRUMENT_UPDATABLE = (
     "contract_size",
     "digits",
     "default_spread_points",
+    "server_offset",
 )
 
 

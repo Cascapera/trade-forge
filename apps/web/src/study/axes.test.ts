@@ -13,14 +13,12 @@ describe('axesFor', () => {
     expect(side?.hint).not.toMatch(/off/)
   })
 
-  it('offers off on the broker clock, whose null is UTC', () => {
-    // `htf_offset: null` became a setting on 26/09 — the higher bars cut on UTC.
-    const offset = axesFor('structure_choch').find(
-      (axis) => axis.path === 'setup.params.htf_offset',
-    )
-
-    expect(offset?.param.kind).toBe('number')
-    expect(offset?.hint).toMatch(/or off for none/)
+  it("offers no axis for the broker clock, which is the instrument's", () => {
+    // Since 30/09 the higher bars are cut on the instrument's clock; a grid varying it would
+    // vary nothing the run reads.
+    for (const setup of ['structure_choch', 'structure_continuation'] as const) {
+      expect(axesFor(setup).map((axis) => axis.path)).not.toContain('setup.params.htf_offset')
+    }
   })
 
   it('offers the parameters the chosen setup actually has', () => {

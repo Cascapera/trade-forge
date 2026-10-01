@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { fireEvent, render, screen } from '@testing-library/react'
 import { useState } from 'react'
 import { describe, expect, it } from 'vitest'
 
@@ -212,12 +212,7 @@ describe('an axis over a number', () => {
     expect(screen.queryByLabelText(`${LABEL} off`)).toBeNull()
   })
 
-  it('offers off on a nullable number, the broker clock included', () => {
-    // `htf_offset: null` is UTC since 26/09, a value a grid may hold like any other.
-    show(option('structure_choch', 'htf_offset'))
-    expect(screen.getByLabelText(`${LABEL} off`)).toBeInTheDocument()
-
-    cleanup()
+  it('offers off on a nullable number', () => {
     show(option('structure_choch', 'breakeven_at_r'))
     expect(screen.getByLabelText(`${LABEL} off`)).toBeInTheDocument()
   })

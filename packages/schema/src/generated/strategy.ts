@@ -287,7 +287,7 @@ export type AllowSecondary = boolean;
 export type BreakevenAtR5 = number | null;
 export type Timeframe = "M1" | "M5" | "M15" | "M30" | "H1" | "H4" | "D1" | "W1";
 export type HtfAllowSecondary = boolean;
-export type HtfOffset = number | null;
+export type HtfOffset = null;
 export type MinBarsToTouch = number;
 export type StopBuffer = number;
 export type VolumeFilter2 = boolean;
@@ -295,7 +295,7 @@ export type Type16 = "structure_choch";
 export type AllowSecondary1 = boolean;
 export type BreakevenAtR6 = number | null;
 export type HtfAllowSecondary1 = boolean;
-export type HtfOffset1 = number | null;
+export type HtfOffset1 = null;
 export type MaxBos = number | null;
 export type MinBarsToTouch1 = number;
 export type StopBuffer1 = number;
@@ -897,14 +897,13 @@ export interface StructureChochSetup {
  * character and the continuation alike. The value must be coarser than the document's own
  * `timeframe` and a whole number of its bars — `semantic.py` refuses the rest.
  *
- * `htf_offset` is how far the broker's clock runs ahead of UTC, in hours (`3`, `-5.5`) — the
- * same number the collector takes as `--server-offset`. **Optional since 2026-09-26** (his
- * decision: *"nao vamos fazer o ajuste"*): `null`, the default, assembles the higher bars on
- * UTC, where the stored candles already are. A MetaTrader chart closes its H4 at 00:00, 04:00
- * and 08:00 *server* time, so without the offset the regions above sit displaced from his chart
- * by the broker's offset — a known, accepted difference, not a silent one. Stating the number
- * still moves the cut onto the server's clock. It was required from 2026-09-09 until then, and
- * that refused every point of a grid varying `htf` without a clock beside it.
+ * `htf_offset` is kept only as `null`, and read by nobody (his rule of 2026-09-30: *"htf offset
+ * não vamos usar em nenhum time frame, vamos adotar o horário do servidor mt5 como real"*). The
+ * higher bars close on the broker's server clock, which is the **instrument's** — the number the
+ * collector stored its candles under — and not a strategy's to state. It held hours ahead of UTC
+ * from 2026-09-09, and from 2026-09-26 its `null` meant UTC, which put a broker's 21:00 H4 bar
+ * across the UTC midnight of the D1 above. Narrowed rather than removed so every saved document,
+ * all of which carry `null`, stays valid under `schema_version` 1.0.
  *
  * `htf_regions` and `htf_allow_secondary` choose which untouched regions above may release
  * (his choice, 2026-09-29). `any`, the default, is any region, whichever way the structure above

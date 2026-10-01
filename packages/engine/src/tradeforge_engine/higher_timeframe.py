@@ -62,17 +62,17 @@ one candle, and that is the anti-lookahead rule made structural). So the higher 
 close of the H4 bar that revealed it — the moment his chart would draw it, and never earlier.
 ADR-0026 has the alternatives.
 
-⚠️ **The bars close on the broker's clock, and stating it is optional.** *"Sempre levar em
-consideração o horário do MT5"* (2026-09-09). A MetaTrader chart closes its H4 at 00:00, 04:00 and
-08:00 **server** time, and the collector converts everything to UTC before storing it — so an
-aggregator anchored on UTC cuts the bars somewhere else entirely, and with a broker three hours
+⚠️ **The bars close on the broker's clock.** *"Sempre levar em consideração o horário do MT5"*
+(2026-09-09). A MetaTrader chart closes its H4 at 00:00, 04:00 and 08:00 **server** time, and
+the collector converts everything to UTC before storing it — so an aggregator anchored on UTC
+cuts the bars somewhere else entirely, and with a broker three hours
 ahead every region comes out three hours displaced from the one he is looking at. Plausible, and
 wrong. `offset` is how far the broker's clock runs ahead of UTC, the same number and the same
-vocabulary the collector takes as `--server-offset`. A document that does not state it is cut on
-UTC (his decision of 2026-09-26, *"nao vamos fazer o ajuste"*, reversing the rule above): the
-regions then sit displaced from his chart by the broker's offset, known and accepted. The gate
-itself still takes the offset as a number, never measured — a measured clock is a
-nondeterministic one.
+vocabulary the collector takes as `--server-offset`. Since 2026-09-30 it is the **instrument's**
+(`InstrumentSpec.server_offset`), never the strategy's: a document stated it from 09/09, and from
+26/09 one that did not was cut on UTC — which put a broker's 21:00 H4 bar across the UTC midnight
+of the D1 above and refused it. The gate itself still takes the offset as a number, never
+measured — a measured clock is a nondeterministic one.
 """
 
 import datetime as dt
@@ -83,7 +83,7 @@ from enum import StrEnum
 from types import MappingProxyType
 from typing import Final
 
-from tradeforge_engine.domain import Candle, Money, Side
+from tradeforge_engine.domain import MAX_SERVER_OFFSET, Candle, Money, Side
 from tradeforge_engine.errors import EngineError
 from tradeforge_engine.structure import (
     MarketStructure,
@@ -118,11 +118,6 @@ class RegionChoice(StrEnum):
 # The epoch itself (a Thursday) would put the week's edge on the wrong day. Read as an instant on
 # the **broker's** clock, not on UTC — `BarAggregator` shifts it by the offset.
 _ANCHOR: Final = dt.datetime(1970, 1, 5, tzinfo=dt.UTC)
-
-# A clock is a timezone, and the furthest any inhabited place sits from UTC is +14. The same bound
-# `collector.mt5_source.offset_is_plausible` uses, and for the same reason: beyond it the number
-# being stated is not a clock at all.
-MAX_SERVER_OFFSET: Final = dt.timedelta(hours=14)
 
 
 class BarAggregator:

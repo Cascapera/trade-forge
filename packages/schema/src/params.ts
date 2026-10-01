@@ -39,11 +39,11 @@ export type SchemaParam =
        * The parameter whose presence makes this one required, when the schema names one.
        *
        * ⚠️ **`nullable` alone does not mean a form may offer "off".** `breakeven_at_r: null` is a
-       * setting somebody chooses; `htf_offset: null` is legal only while `htf` is null too, and
-       * the semantics refuse it otherwise. A screen reading `nullable` on its own offered the
-       * second as a button, one click from a 422 that fails a whole study — the same shape of
-       * defect as `minimum ?? exclusiveMinimum` below, and for the same reason: a fact the schema
-       * had was flattened away before the form could see it.
+       * setting somebody chooses; a parameter whose `null` is legal only while a companion is null
+       * too is not — the semantics refuse it otherwise. `htf_offset` was that parameter from 09/09
+       * to 26/09, and a screen reading `nullable` on its own offered it as a button, one click from
+       * a 422 that fails a whole study — the same shape of defect as `minimum ?? exclusiveMinimum`
+       * below: a fact the schema had was flattened away before the form could see it.
        */
       requiredWith?: string
       min?: number
@@ -196,8 +196,11 @@ export function describeParam(
  */
 export function readParams(paramsNode: SchemaNode, resolve: Resolve): readonly SchemaParam[] {
   const required = new Set(paramsNode.required ?? [])
-  const described = Object.entries(paramsNode.properties ?? {}).map(([name, node]) =>
-    describeParam(name, node, required.has(name), resolve),
-  )
+  const described = Object.entries(paramsNode.properties ?? {})
+    // ⚠️ A parameter whose only value is `null` is retired, not a question: it stays in the DSL so
+    // documents saved with it still validate, and nothing reads it. `htf_offset` since 30/09 — the
+    // broker's clock is the instrument's now. There is no control for a field with one answer.
+    .filter(([, node]) => deref(node, resolve).type !== 'null')
+    .map(([name, node]) => describeParam(name, node, required.has(name), resolve))
   return [...described.filter((one) => one.required), ...described.filter((one) => !one.required)]
 }

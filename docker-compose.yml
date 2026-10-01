@@ -29,6 +29,10 @@ services:
     image: postgres:18.6-alpine
     container_name: tradeforge-postgres
     restart: unless-stopped
+    # Parallel queries share memory through /dev/shm, which Docker caps at 64 MB: on 01/10 two
+    # reads of a 175-thousand-run sweep failed with `DiskFull: could not resize shared memory
+    # segment` while the workers ran. Takes effect when the container is recreated.
+    shm_size: 1g
     environment:
       POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
       POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}

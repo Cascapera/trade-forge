@@ -2486,6 +2486,11 @@ class CreateSweepWalkForward(BaseModel):
     timeframes: list[Timeframe] | None = Field(default=None, min_length=1)
     """The charts to walk (28/09); blank is every chart of the sweep. Each fold trains only these —
     a sweep over M5 and M15 walked on M5 alone does not re-run M15 in every window."""
+    mode: Literal["rerun", "cut"] = "rerun"
+    """`rerun` runs every fold's training and test again; `cut` (01/10) answers every fold from the
+    sweep's own runs cut to whole years in R (`sweep_walkforward_cut`), with nothing run. ⚠️ By cut
+    the windows must be whole years inside the sweep's, the ranking is net R alone (another
+    `metric` is a 422) and there is no drawdown limit (`max_drawdown_r` is a 422)."""
 
 
 class CreatedSweepWalkForward(BaseModel):
@@ -2507,6 +2512,14 @@ class SweepWalkForwardGroupOut(BaseModel):
     positive_folds: int
     most_chosen: str | None
     most_chosen_folds: int
+    in_sample_medians: list[Money | None] | None = None
+    """By cut only (01/10), per fold: the median net R of the chosen runs on the training years.
+    Null for a walk-forward that re-runs — its in-sample side is its test's to show."""
+    positive_shares: list[Money | None] | None = None
+    """By cut only, per fold: the share of the chosen whose test years ended above zero R."""
+    no_trades_out: list[int | None] | None = None
+    """By cut only, per fold: chosen runs with no trade in the test years — out of the median and
+    the share (01/10)."""
 
 
 class SweepWalkForwardFoldOut(BaseModel):
@@ -2520,6 +2533,13 @@ class SweepWalkForwardFoldOut(BaseModel):
     stage: str
     """`training`, `testing`, `done` or `failed`."""
     error: str | None
+    candidates: int | None = None
+    """By cut only (01/10): the parent's finished runs this fold could rank."""
+    chosen: int | None = None
+    """By cut only: the runs chosen on the training years."""
+    excluded: dict[str, int] | None = None
+    """By cut only: the runs left out of the ranking, by reason — `no_counts` (recorded before they
+    kept trades by year), `refused_cut` (the cut's guard), `under_floor`, `positive_years`."""
 
 
 class SweepWalkForwardOut(BaseModel):
@@ -2529,6 +2549,8 @@ class SweepWalkForwardOut(BaseModel):
     train_years: int
     test_years: int
     anchored: bool
+    mode: Literal["rerun", "cut"] = "rerun"
+    """`cut` (01/10): every median is in R, read from the sweep's own runs — nothing was run."""
     rule: dict[str, Any]
     status: str
     error: str | None

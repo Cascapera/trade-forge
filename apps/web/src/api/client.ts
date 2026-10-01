@@ -68,6 +68,7 @@ import type {
   SymbolSearch,
   TradesPage,
   WalkForwardOut,
+  YearCut,
 } from './types'
 
 const BASE_URL = import.meta.env.VITE_API_URL ?? '/api'
@@ -199,6 +200,10 @@ export const api = {
   getTrades: (id: string, limit = 100, offset = 0): Promise<TradesPage> =>
     request('GET', `/backtests/${id}/trades?limit=${String(limit)}&offset=${String(offset)}`),
   getEquity: (id: string): Promise<EquityPoint[]> => request('GET', `/backtests/${id}/equity`),
+  /** The run cut to whole years `[first, last]` in R. ⚠️ A 422 is an answer, not a failure: its
+   *  `detail` says why this run cannot stand for that window (`year_cut`). */
+  getYearCut: (id: string, first: number, last: number): Promise<YearCut> =>
+    request('GET', `/backtests/${id}/years${query({ first, last })}`),
   // No window parameters, and that is the endpoint's design rather than an omission: the run
   // already recorded which candles it read, so the chart cannot be asked for a period the run
   // did not execute over. A client that assembled the window itself could get it subtly wrong,

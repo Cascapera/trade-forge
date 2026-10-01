@@ -11,6 +11,8 @@ vi.mock('../api/hooks', () => ({
   useOverlays: vi.fn(),
   useTradeSnapshot: vi.fn(),
   useRerunBacktest: vi.fn(),
+  // The cut has its own test (`RByYear.test.tsx`); here it waits.
+  useYearCut: () => ({ isPending: true, fetchStatus: 'fetching', isError: false, data: undefined }),
   // The strategy block at the top has its own test (`RunStrategy.test.tsx`); here it waits.
   useStrategy: () => ({ data: undefined }),
 }))
@@ -181,6 +183,22 @@ describe('Results', () => {
     expect(screen.getByText('+100.00')).toBeInTheDocument()
     expect(screen.getByText('equity chart')).toBeInTheDocument()
     expect(screen.getByText('This run produced no trades.')).toBeInTheDocument()
+  })
+
+  it('shows the R by year of a run that kept it, and says when a run is too old to (01/10)', () => {
+    stubBacktest({
+      isPending: false,
+      isError: false,
+      data: backtest({ status: 'done', metrics, r_by_years: { '2024': { '2024': '1.5' } } }),
+    })
+    const { rerender } = renderWithProviders(<Results />)
+    expect(screen.getByRole('table', { name: 'R by year' })).toBeInTheDocument()
+    expect(screen.getByText('Cutting the run…')).toBeInTheDocument()
+
+    stubBacktest({ isPending: false, isError: false, data: backtest({ status: 'done', metrics }) })
+    rerender(<Results />)
+    expect(screen.queryByRole('table', { name: 'R by year' })).not.toBeInTheDocument()
+    expect(screen.getByText(/recorded before 29\/09 and kept no R by year/)).toBeInTheDocument()
   })
 
   it('warns when the run covered less than was asked for', () => {

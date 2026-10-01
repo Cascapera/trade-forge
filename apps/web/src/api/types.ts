@@ -69,6 +69,18 @@ export interface Metrics {
 }
 
 /**
+ * A run cut to whole years `[first_year, last_year]` in R, without running it again
+ * (`GET /backtests/{id}/years`): what a run of that window would have made, from the trades that
+ * entered and left inside it. `yearly_r` is per year of entry; a year with no such trade is absent.
+ */
+export interface YearCut {
+  first_year: number
+  last_year: number
+  net_r: string
+  yearly_r: Record<string, string>
+}
+
+/**
  * What a finished run kept of itself (2026-09-23). A sweep's runs keep less — see the server's
  * `retention`: `trades` has no entry pictures and no equity curve, `metrics` has the metrics alone.
  * A screen reads this to say what is missing and why, rather than drawing an empty chart as if
@@ -138,6 +150,12 @@ export interface Backtest {
    * answer it (it had a target of its own below that rung).
    */
   targets: Record<string, TargetOutcome | null> | null
+  /**
+   * R by year of entry, then year of exit: `{ "2021": { "2021": "2.5", "2022": "-1" } }` (01/10).
+   * Null for a run recorded before 29/09 and while there are no results; absent from older
+   * fixtures. A sweep's ranked rows carry only `metrics.yearly_r`, the same R summed per entry year.
+   */
+  r_by_years?: Record<string, Record<string, string>> | null
   /**
    * The downloads this run is waiting for before it can start, oldest window first.
    *

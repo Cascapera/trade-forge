@@ -11,6 +11,7 @@ import {
   isSelected,
 } from '../backtest/compare'
 import { count, percent, ratio, sign, signedMoney } from '../format'
+import { YearBars } from './YearBars'
 
 const badge: Record<BacktestStatus, string> = {
   queued: 'bg-slate-700 text-slate-200',
@@ -26,6 +27,15 @@ const KEPT = {
 } as const
 
 const toneClass = { up: 'text-emerald-400', down: 'text-red-400', flat: 'text-slate-100' } as const
+
+/** Up to this many years a run's R by year is a column per year; past it, a row of small bars —
+ *  eleven signed numbers per row read as a wall (01/10). */
+export const MAX_YEAR_COLUMNS = 8
+
+/** An R figure in a cell under an "R" header: `+1.25`, `-0.50`. The sign is the marker. */
+function signedR(value: string): string {
+  return `${sign(value) === 'up' ? '+' : ''}${ratio(value)}`
+}
 
 /** The calendar day of an ISO instant — the granularity a window is actually read at. */
 function day(iso: string): string {
@@ -46,14 +56,24 @@ export function RunTable(props: {
   /** How many clones each run stands for, by run id (01/10) — a sweep's ranked page hides the
    *  runs that made exactly another's trades, and says so on the one it kept. */
   clones?: ReadonlyMap<string, number>
+  /** The years of the window, for R by year of entry (01/10) — a sweep's ranked page, where every
+   *  run shares one window. Absent: no such columns. */
+  years?: readonly number[]
 }): React.JSX.Element {
   const full = isFull(props.seats)
+  const years = props.years ?? []
+  const asBars = years.length > MAX_YEAR_COLUMNS
+  const yearColumns = years.length === 0 ? 0 : asBars ? 1 : years.length
 
   return (
     // Twelve columns will not fit a narrow window, so the table scrolls inside its own box. The
     // page itself never scrolls sideways.
     <div className="overflow-x-auto rounded-lg border border-slate-800">
-      <table className="w-full min-w-[68rem] border-collapse text-left text-sm">
+      <table
+        className="w-full min-w-[68rem] border-collapse text-left text-sm"
+        // Each year column widens the table rather than squeezing the twelve before it.
+        style={yearColumns === 0 ? undefined : { minWidth: `${String(68 + yearColumns * 4.5)}rem` }}
+      >
         <thead>
           <tr className="border-b border-slate-800 text-xs tracking-wide text-slate-500 uppercase">
             <th scope="col" className="px-3 py-2" />
@@ -71,6 +91,16 @@ export function RunTable(props: {
             <th scope="colgroup" className="border-l border-slate-800 px-3 py-2">
               Costs
             </th>
+            {yearColumns > 0 && (
+              <th
+                scope="colgroup"
+                colSpan={yearColumns}
+                className="border-l border-slate-800 px-3 py-2"
+                title="R of the trades that entered in each year, wherever they left"
+              >
+                R by year of entry
+              </th>
+            )}
           </tr>
           <tr className="border-b border-slate-800 text-xs font-medium text-slate-400">
             <th scope="col" className="px-3 py-2">
@@ -109,6 +139,25 @@ export function RunTable(props: {
             <th scope="col" className="border-l border-slate-800 px-3 py-2">
               Model
             </th>
+            {asBars ? (
+              <th
+                scope="col"
+                className="border-l border-slate-800 px-3 py-2"
+                title="One bar per year, scaled to the run's own largest year — hover a bar for its R"
+              >
+                {String(years[0])}–{String(years[years.length - 1])}
+              </th>
+            ) : (
+              years.map((year, index) => (
+                <th
+                  key={year}
+                  scope="col"
+                  className={`px-3 py-2 text-right ${index === 0 ? 'border-l border-slate-800' : ''}`}
+                >
+                  {year}
+                </th>
+              ))
+            )}
           </tr>
         </thead>
         <tbody>
@@ -218,11 +267,63 @@ export function RunTable(props: {
                 <td className="border-l border-slate-800 px-3 py-2 text-xs text-slate-400">
                   {costLabel(run.cost_model)}
                 </td>
+                {yearColumns > 0 && <YearCells years={years} asBars={asBars} yearly={metrics?.yearly_r} />}
               </tr>
             )
           })}
         </tbody>
       </table>
     </div>
+  )
+}
+
+/**
+ * One row's R by year of entry: a cell per year, or one cell of bars past `MAX_YEAR_COLUMNS`.
+ * ⚠️ A dash is "not measured" — unfinished, or recorded before R by year existed; a dot is "no trade
+ * entered that year", a measured nothing that must not read as a missing number.
+ */
+function YearCells(props: {
+  years: readonly number[]
+  asBars: boolean
+  yearly: Record<string, string> | null | undefined
+}): React.JSX.Element {
+  const { yearly } = props
+  if (yearly === null || yearly === undefined) {
+    return (
+      <td
+        colSpan={props.asBars ? 1 : props.years.length}
+        className="border-l border-slate-800 px-3 py-2 text-right text-slate-500"
+      >
+        —
+      </td>
+    )
+  }
+  if (props.asBars) {
+    return (
+      <td className="border-l border-slate-800 px-3 py-2">
+        <YearBars years={props.years} yearly={yearly} />
+      </td>
+    )
+  }
+  return (
+    <>
+      {props.years.map((year, index) => {
+        const r = yearly[String(year)]
+        const edge = index === 0 ? 'border-l border-slate-800' : ''
+        return r === undefined ? (
+          <td
+            key={year}
+            title={`No trade entered in ${String(year)}`}
+            className={`${edge} px-3 py-2 text-right text-slate-500`}
+          >
+            ·
+          </td>
+        ) : (
+          <td key={year} className={`${edge} px-3 py-2 text-right tabular-nums`}>
+            {signedR(r)}
+          </td>
+        )
+      })}
+    </>
   )
 }

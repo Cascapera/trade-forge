@@ -1,14 +1,7 @@
 import type { TargetOutcome, TargetRung } from '../api/types'
-import { count, ratio, sign } from '../format'
+import { count, inR, ratio, sign } from '../format'
 
 const toneClass = { up: 'text-sky-400', down: 'text-red-400', flat: 'text-slate-100' } as const
-
-/** An R figure with its sign spelled out: `+0.30 R`, `-1.20 R`. A dash when there is none. */
-function inR(value: string | null): string {
-  if (value === null) return '—'
-  const plain = ratio(value)
-  return `${sign(value) === 'up' ? '+' : ''}${plain} R`
-}
 
 const head = 'px-3 py-2 text-right text-xs font-medium text-slate-400'
 const cell = 'px-3 py-2 text-right tabular-nums'

@@ -76,6 +76,7 @@ import type {
   SweepsPage,
   TradesPage,
   WalkForwardOut,
+  YearCut,
 } from './types'
 
 const POLL_MS = 1000
@@ -423,6 +424,22 @@ export function useEquity(id: string | undefined, enabled: boolean) {
   return useQuery<EquityPoint[]>({
     queryKey: ['equity', id],
     queryFn: id !== undefined && enabled ? () => api.getEquity(id) : skipToken,
+  })
+}
+
+/**
+ * A finished run cut to the whole years `[first, last]` in R (01/10).
+ *
+ * ⚠️ `retry: false` because a 422 is the answer "this run cannot stand for that window", with the
+ * reason in its detail — asked again it says the same thing. Kept for good: a finished run's cut
+ * never changes.
+ */
+export function useYearCut(id: string | undefined, first: number, last: number, enabled: boolean) {
+  return useQuery<YearCut>({
+    queryKey: ['year-cut', id, first, last],
+    queryFn: id !== undefined && enabled ? () => api.getYearCut(id, first, last) : skipToken,
+    retry: false,
+    staleTime: Infinity,
   })
 }
 

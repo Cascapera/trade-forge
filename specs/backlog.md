@@ -2926,10 +2926,11 @@ amostra (`holdout.BEHAVIOUR_FIELDS`) —, e o CSV ganhou `clone_of`. Ficou em ab
 - **Runs de zero trade viram um grupo só** por (entrada, gráfico, ativo): todos "fizeram o mesmo"
   (nada). Com `all_runs` isso esconde milhares de runs sem trade atrás de um. Correto pela definição,
   mas pode valer tratar zero trade à parte.
-- **O desempate do "primeiro" difere do teste fora da amostra:** a página e o CSV usam `created_at`
-  e depois o nome da estratégia (a ordem do ranking); `launch_holdout` usa `created_at` e o id do run
-  (uuid aleatório — numa varredura todos têm o mesmo `created_at`). Mesmo grupo, original
-  possivelmente diferente; o resultado é idêntico, só o rótulo muda.
+- ~~**O desempate do "primeiro" difere do teste fora da amostra.**~~ **Feito (01/10).** Holdout,
+  walk-forward, página e CSV usam `created_at`, nome da estratégia e id — o mesmo original nos três.
+- **Página de todas as entradas (só pela API) ficou mais lenta**: sem constraint única de ponto
+  próprio por (sweep, estratégia), a entrada de cada run vem de um `GROUP BY` em `sweep_points`
+  (~1,7× na página padrão). A tela sempre pede por entrada e não paga isso.
 - **O `sweep_points` é lido inteiro a cada página** (já era antes: o filtro por entrada é um seq
   scan de ~2 GB no banco de hoje). Um índice parcial `(sweep_id, entry_id) WHERE same_as IS NULL`
   provavelmente resolve — medir.

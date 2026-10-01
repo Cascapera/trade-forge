@@ -235,11 +235,18 @@ export const api = {
     request('GET', `/sweeps/${id}${runs === 'none' ? '?runs=none' : ''}`),
   getSweepRuns: (
     id: string,
-    page: { entryId: string; rankBy: RankKey; offset: number; limit: number },
+    page: {
+      entryId: string
+      rankBy: RankKey
+      offset: number
+      limit: number
+      allRuns?: boolean
+    },
   ): Promise<SweepRunsPage> =>
     request(
       'GET',
-      `/sweeps/${id}/runs${query({ entry_id: page.entryId, rank_by: page.rankBy, offset: page.offset, limit: page.limit })}`,
+      // ⚠️ Without `all_runs` the server leaves out what is under its chart's ranking floor (01/10).
+      `/sweeps/${id}/runs${query({ entry_id: page.entryId, rank_by: page.rankBy, offset: page.offset, limit: page.limit, all_runs: page.allRuns ? 'true' : undefined })}`,
     ),
   // A sweep's best points, run again on a window none of them was chosen on (24/09) — itself a
   // sweep, read back by `getSweep` and compared by `getHoldout`.

@@ -4,6 +4,7 @@ import { useNavigate } from 'react-router-dom'
 import { apiFailure } from '../api/failure'
 import { useCreateHoldout } from '../api/hooks'
 import type { HoldoutRank, SweepOut } from '../api/types'
+import { floorPlaceholder } from '../sweep/rankFloor'
 
 const METRICS: { value: HoldoutRank; label: string }[] = [
   { value: 'net_profit', label: 'Net profit' },
@@ -41,9 +42,10 @@ function startOf(value: string): string {
  * A test that shares bars with the search is partly the search again. The default is only where
  * the first honest window can begin; the reader moves the end to however much data exists.
  *
- * The trade floor is per chart and blank means the sweep's own — 30 on the short charts, 1 above
- * them, which is too low to rank on D1 and W1 and is why the field exists. The floor actually used
- * is shown on the test once it runs, so a blank here never hides what was applied.
+ * The trade floor is per chart and blank means the ranking floor (01/10, `sweep/rankFloor`) — 60 on
+ * M1 and M5, 30 up to H1, then 20, 10 and 5 — which each field shows as its placeholder. Before it,
+ * blank was the keeping floor, 1 above H1, and the first test ranked D1 runs of one trade. The floor
+ * actually used is shown on the test once it runs, so a blank here never hides what was applied.
  */
 export function HoldoutLauncher(props: { sweep: SweepOut }): React.JSX.Element {
   const { sweep } = props
@@ -166,7 +168,7 @@ export function HoldoutLauncher(props: { sweep: SweepOut }): React.JSX.Element {
       </div>
       <fieldset className="text-sm">
         <legend className="mb-1 text-slate-400">
-          Fewest trades to be ranked, per chart — blank keeps the sweep&apos;s floor
+          Fewest trades to be ranked, per chart — blank keeps the ranking floor
         </legend>
         <div className="flex flex-wrap gap-3">
           {sweep.timeframes.map((timeframe) => (
@@ -175,7 +177,7 @@ export function HoldoutLauncher(props: { sweep: SweepOut }): React.JSX.Element {
               <input
                 aria-label={`fewest trades on ${timeframe}`}
                 inputMode="numeric"
-                placeholder="default"
+                placeholder={floorPlaceholder(timeframe)}
                 value={floors[timeframe] ?? ''}
                 onChange={(event) => {
                   setFloors((current) => ({ ...current, [timeframe]: event.target.value }))

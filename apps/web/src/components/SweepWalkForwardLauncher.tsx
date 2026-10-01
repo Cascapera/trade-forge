@@ -4,6 +4,7 @@ import { Link, useNavigate } from 'react-router-dom'
 import { apiFailure } from '../api/failure'
 import { useCreateSweepWalkForward, useSweepWalkForwards } from '../api/hooks'
 import type { HoldoutRank, SweepOut } from '../api/types'
+import { floorPlaceholder } from '../sweep/rankFloor'
 
 const METRICS: { value: HoldoutRank; label: string }[] = [
   { value: 'net_profit', label: 'Net profit' },
@@ -42,8 +43,9 @@ function planned(
  * click and the queue it fills is hours long. With some charts only, the runs are the sweep's
  * share on those charts, estimated as an even split: the sweep does not count its runs per chart.
  *
- * The trade floor is per chart, as the reserved-window test's: blank keeps the sweep's own (60 on
- * M1 and M5), which no run of a quiet setup may reach — and then every fold is refused.
+ * The trade floor is per chart, as the reserved-window test's: blank keeps the ranking floor (01/10,
+ * shown as the placeholder; 60 on M1 and M5), which no run of a quiet setup may reach — and then
+ * every fold is refused.
  */
 export function SweepWalkForwardLauncher(props: { sweep: SweepOut }): React.JSX.Element {
   const { sweep } = props
@@ -190,8 +192,7 @@ export function SweepWalkForwardLauncher(props: { sweep: SweepOut }): React.JSX.
 
       <fieldset className="text-sm">
         <legend className="mb-1 text-slate-400">
-          Charts to walk, and the fewest trades to be chosen on each — blank keeps the sweep&apos;s
-          floor
+          Charts to walk, and the fewest trades to be chosen on each — blank keeps the ranking floor
         </legend>
         <div className="flex flex-wrap gap-4">
           {sweep.timeframes.map((chart) => (
@@ -213,7 +214,7 @@ export function SweepWalkForwardLauncher(props: { sweep: SweepOut }): React.JSX.
               <input
                 aria-label={`fewest trades on ${chart}`}
                 inputMode="numeric"
-                placeholder="default"
+                placeholder={floorPlaceholder(chart)}
                 disabled={!charts.includes(chart)}
                 value={floors[chart] ?? ''}
                 onChange={(event) => {

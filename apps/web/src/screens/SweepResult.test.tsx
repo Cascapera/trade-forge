@@ -64,9 +64,19 @@ const mockedRuns = vi.mocked(useSweepRuns)
  */
 function served(
   data: SweepOut | undefined,
-  page: { entryId: string; rankBy: RankKey; offset: number; limit: number },
+  page: {
+    entryId: string
+    rankBy: RankKey
+    offset: number
+    limit: number
+    allRuns?: boolean
+  },
 ) {
-  const mine = (data?.runs ?? []).filter((one) => one.entry_id === page.entryId)
+  const every = (data?.runs ?? []).filter((one) => one.entry_id === page.entryId)
+  // The server's floor (01/10), over fixtures that count no trades: a run with no metrics is under
+  // it, and every finished run here is over it.
+  const over = every.filter((one) => one.run.metrics !== null)
+  const mine = page.allRuns === true ? every : over
   const { score } = rankingOf(page.rankBy)
   const scored = mine.map((one) => ({
     one,
@@ -80,6 +90,7 @@ function served(
     offset: page.offset,
     limit: page.limit,
     items: ordered.slice(page.offset, page.offset + page.limit),
+    below_floor: every.length - over.length,
   }
 }
 
@@ -453,10 +464,43 @@ describe('SweepResult', () => {
       .map((link) => link.getAttribute('href')?.replace('/results/z', '') ?? '?')
   }
 
+  it('ranks only the runs over the trade floor, and shows the rest when asked (01/10)', () => {
+    showing(long())
+    renderWithProviders(<SweepResult />)
+    const [zeta, alpha] = sections()
+
+    expect(
+      within(zeta!).getByText(
+        'Runs 1–10 of 23, best return first. Only finished runs with their chart’s floor of trades are ranked.',
+      ),
+    ).toBeInTheDocument()
+    fireEvent.click(within(zeta!).getByRole('button', { name: 'Worse →' }))
+    fireEvent.click(within(zeta!).getByRole('button', { name: 'Worse →' }))
+    expect(shownIn(zeta!)).toEqual(['3', '2', '1'])
+    // Nothing under the floor in alpha: no button to offer.
+    expect(within(alpha!).queryByRole('button', { name: /trade floor/ })).not.toBeInTheDocument()
+
+    const toggle = within(zeta!).getByRole('button', {
+      name: 'Show the 1 under the trade floor',
+    })
+    expect(toggle).toHaveAttribute('aria-pressed', 'false')
+    fireEvent.click(toggle)
+
+    // Back to the best page, now counting the queued run.
+    expect(within(zeta!).getByText(/^Runs 1–10 of 24,/)).toBeInTheDocument()
+    const hide = within(zeta!).getByRole('button', {
+      name: 'Hide the 1 under the trade floor',
+    })
+    expect(hide).toHaveAttribute('aria-pressed', 'true')
+    const asked = mockedRuns.mock.calls.map(([, page]) => page)
+    expect(asked).toContainEqual(expect.objectContaining({ entryId: ZETA.id, allRuns: true }))
+  })
+
   it('lists each entry best return first, ten at a time, with unfinished runs last', () => {
     showing(long())
     renderWithProviders(<SweepResult />)
     const [zeta] = sections()
+    fireEvent.click(within(zeta!).getByRole('button', { name: /^Show the 1 under/ }))
 
     expect(shownIn(zeta!)).toEqual(['23', '22', '21', '20', '19', '18', '17', '16', '15', '14'])
     expect(
@@ -483,7 +527,7 @@ describe('SweepResult', () => {
 
     fireEvent.click(within(zeta!).getByRole('button', { name: 'Worse →' }))
 
-    expect(within(zeta!).getByText(/^Runs 11–20 of 24,/)).toBeInTheDocument()
+    expect(within(zeta!).getByText(/^Runs 11–20 of 23,/)).toBeInTheDocument()
     expect(within(alpha!).getByText(/^Runs 1–10 of 12,/)).toBeInTheDocument()
   })
 
@@ -510,7 +554,7 @@ describe('SweepResult', () => {
     // Shallowest first: the opposite of the return order.
     expect(shownIn(zeta!)).toEqual(['1', '2', '3', '4', '5', '6', '7', '8', '9', '10'])
     expect(
-      within(zeta!).getByText(/^Runs 1–10 of 24, best smallest drawdown first\./),
+      within(zeta!).getByText(/^Runs 1–10 of 23, best smallest drawdown first\./),
     ).toBeInTheDocument()
     expect(within(alpha!).getByText(/^Runs 1–10 of 12,/)).toBeInTheDocument()
   })

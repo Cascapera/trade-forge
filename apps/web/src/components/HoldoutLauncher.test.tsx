@@ -60,6 +60,13 @@ describe('HoldoutLauncher', () => {
     expect(field('Best per chart').value).toBe('3')
   })
 
+  it('shows each chart’s ranking floor where its field is blank (01/10)', () => {
+    render()
+
+    expect(field('fewest trades on M15').placeholder).toBe('30')
+    expect(field('fewest trades on D1').placeholder).toBe('10')
+  })
+
   it('sends the window, the rule and only the floors that were set, then opens the test', async () => {
     createHoldout.mockResolvedValue({ id: 'test-9', runs: 6, skipped: [] })
     render()

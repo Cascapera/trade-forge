@@ -179,12 +179,20 @@ describe('api client', () => {
 
     await api.getSweep('s-1', 'none')
     await api.getSweepRuns('s-1', { entryId: 'e-1', rankBy: 'drawdown', offset: 20, limit: 10 })
+    await api.getSweepRuns('s-1', {
+      entryId: 'e-1',
+      rankBy: 'return',
+      offset: 0,
+      limit: 10,
+      allRuns: true,
+    })
     await api.getSweep('s-1')
 
     const paths = fetchMock.mock.calls.map((call) => String(call[0]))
     expect(paths).toEqual([
       '/api/sweeps/s-1?runs=none',
       '/api/sweeps/s-1/runs?entry_id=e-1&rank_by=drawdown&offset=20&limit=10',
+      '/api/sweeps/s-1/runs?entry_id=e-1&rank_by=return&offset=0&limit=10&all_runs=true',
       '/api/sweeps/s-1',
     ])
   })

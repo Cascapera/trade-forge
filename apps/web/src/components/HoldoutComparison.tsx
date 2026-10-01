@@ -169,6 +169,14 @@ export function HoldoutComparison(props: { sweepId: string }): React.JSX.Element
               <td className="px-3 py-2">{percent(group.out_of_sample_positive, 0)}</td>
               <td className="px-3 py-2 text-slate-400">
                 {String(group.done)} / {String(group.points)}
+                {/* ⚠️ Out of the median and the share beside it (01/10): a point that never traded
+                    returned zero without being measured. Said here, or the group's numbers read
+                    as covering every finished point. */}
+                {(group.no_trades_out ?? 0) > 0 && (
+                  <span className="block text-xs text-amber-300">
+                    {String(group.no_trades_out)} with no trade out
+                  </span>
+                )}
               </td>
             </tr>
           ))}

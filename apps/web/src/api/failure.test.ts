@@ -1,5 +1,5 @@
 import { ApiError } from './client'
-import { apiFailure } from './failure'
+import { apiFailure, windowUsedBy } from './failure'
 
 const FALLBACK = 'The request was refused.'
 
@@ -93,5 +93,30 @@ describe('apiFailure', () => {
 
   it('falls back for a shape it does not recognise', () => {
     expect(apiFailure({ weird: true }, FALLBACK)).toBe(FALLBACK)
+  })
+})
+
+describe('windowUsedBy', () => {
+  const used = {
+    kind: 'holdout',
+    id: 'test-0',
+    test_id: 'test-0',
+    fold: null,
+    date_from: '2026-01-01T00:00:00Z',
+    date_to: '2026-06-01T00:00:00Z',
+    created_at: '2026-09-20T10:00:00Z',
+  }
+
+  it('reads the earlier tests a 409 names when a reserved window was already used (01/10)', () => {
+    const refused = new ApiError(409, { message: 'already used', used_by: [used] })
+
+    expect(windowUsedBy(refused)).toEqual([used])
+  })
+
+  it('is null for any other refusal, a 409 among them', () => {
+    expect(windowUsedBy(new ApiError(409, 'the test is still running'))).toBeNull()
+    expect(windowUsedBy(new ApiError(422, { message: 'x', used_by: [used] }))).toBeNull()
+    expect(windowUsedBy(new ApiError(409, { message: 'x', used_by: 'nobody' }))).toBeNull()
+    expect(windowUsedBy(new Error('Failed to fetch'))).toBeNull()
   })
 })

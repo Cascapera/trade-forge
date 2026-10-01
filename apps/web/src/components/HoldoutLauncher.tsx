@@ -1,10 +1,12 @@
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 
-import { apiFailure } from '../api/failure'
+import { apiFailure, windowUsedBy } from '../api/failure'
 import { useCreateHoldout } from '../api/hooks'
 import type { HoldoutRank, SweepOut } from '../api/types'
 import { floorPlaceholder } from '../sweep/rankFloor'
+
+import { RetestPrompt } from './WindowUses'
 
 const METRICS: { value: HoldoutRank; label: string }[] = [
   { value: 'net_profit', label: 'Net profit' },
@@ -46,6 +48,10 @@ function startOf(value: string): string {
  * M1 and M5, 30 up to H1, then 20, 10 and 5 — which each field shows as its placeholder. Before it,
  * blank was the keeping floor, 1 above H1, and the first test ranked D1 runs of one trade. The floor
  * actually used is shown on the test once it runs, so a blank here never hides what was applied.
+ *
+ * ⚠️ **The reserved window is used once (01/10).** A window an earlier test of this sweep already
+ * used comes back as a 409 naming those tests; only then is the retest box offered, and only a
+ * box ticked by hand sends the launch again with `retest`.
  */
 export function HoldoutLauncher(props: { sweep: SweepOut }): React.JSX.Element {
   const { sweep } = props
@@ -61,6 +67,8 @@ export function HoldoutLauncher(props: { sweep: SweepOut }): React.JSX.Element {
   const [floors, setFloors] = useState<Record<string, string>>({})
   // 28/09: points that make the very same trades are one answer, not N.
   const [distinct, setDistinct] = useState(true)
+  const [retest, setRetest] = useState(false)
+  const usedBy = windowUsedBy(create.error)
 
   const overlaps = dateFrom < day(sweep.date_to) && day(sweep.date_from) < dateTo
   const backwards = dateTo <= dateFrom
@@ -91,6 +99,7 @@ export function HoldoutLauncher(props: { sweep: SweepOut }): React.JSX.Element {
           : { min_positive_year_share: String(Number(yearsLimit.value) / 100) }),
         min_trades: minTrades,
         distinct,
+        ...(retest ? { retest: true } : {}),
       },
       {
         onSuccess: (created) => {
@@ -251,10 +260,19 @@ export function HoldoutLauncher(props: { sweep: SweepOut }): React.JSX.Element {
           A trade floor is a whole number of at least 1.
         </p>
       )}
-      {create.isError && (
-        <p role="alert" className="text-sm text-red-400">
-          {apiFailure(create.error, 'Could not launch the test.')}
-        </p>
+      {usedBy !== null ? (
+        <RetestPrompt
+          message={apiFailure(create.error, 'This window was already used.')}
+          uses={usedBy}
+          retest={retest}
+          onRetest={setRetest}
+        />
+      ) : (
+        create.isError && (
+          <p role="alert" className="text-sm text-red-400">
+            {apiFailure(create.error, 'Could not launch the test.')}
+          </p>
+        )
       )}
       <button
         type="button"
@@ -262,7 +280,7 @@ export function HoldoutLauncher(props: { sweep: SweepOut }): React.JSX.Element {
         onClick={launch}
         className="rounded bg-sky-600 px-4 py-2 text-sm font-medium disabled:opacity-40"
       >
-        {create.isPending ? 'Launching…' : 'Run the test'}
+        {create.isPending ? 'Launching…' : retest ? 'Run the retest' : 'Run the test'}
       </button>
     </section>
   )

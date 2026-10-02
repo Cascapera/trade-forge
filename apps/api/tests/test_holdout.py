@@ -2,6 +2,7 @@
 
 import datetime as dt
 import uuid
+from collections.abc import Callable
 from decimal import Decimal
 
 import pytest
@@ -192,6 +193,108 @@ class TestDistinct:
                 {"2020": "0"} if name == "yearly_r" else getattr(base, name) + 1,
             )
             assert behaviour(changed) != behaviour(base), name
+
+
+T1 = dt.datetime(2021, 3, 1, 10, tzinfo=dt.UTC)
+T2 = dt.datetime(2021, 6, 1, 14, tzinfo=dt.UTC)
+
+
+def reading(
+    entries: dict[int, tuple[tuple[dt.datetime, str], ...] | None],
+) -> tuple[list[int], Callable[[Candidate], tuple[tuple[dt.datetime, str], ...] | None]]:
+    """An `entries_of` over `entries` by launch order, and the orders it was asked for."""
+    asked: list[int] = []
+
+    def entries_of(one: Candidate) -> tuple[tuple[dt.datetime, str], ...] | None:
+        asked.append(one.order)
+        return entries[one.order]
+
+    return asked, entries_of
+
+
+class TestNearClones:
+    """02/10: the MM9 sweep's three best points for 2025 differed only in a target, a breakeven
+    and a stop buffer — three records in sample, one trade out of it."""
+
+    SAME = ((T1, "long"), (T2, "short"))
+
+    def test_the_same_entries_closed_another_way_give_their_place(self) -> None:
+        pool = [
+            a_record(0, net_r="9.1", y2021="19.0"),
+            a_record(1, net_r="7.7", y2021="17.6"),  # another exit, the same entries as 0
+            a_record(2, net_r="4.5", y2021="14.4"),
+        ]
+        _asked, entries_of = reading({0: self.SAME, 1: self.SAME, 2: ((T1, "long"),)})
+
+        chosen = choose(
+            pool, metric=HoldoutRank.NET_R, top_n=2, floors=FLOORS, entries_of=entries_of
+        )
+
+        assert [one.order for one in chosen] == [0, 2]
+
+    def test_one_side_apart_is_not_a_near_clone(self) -> None:
+        pool = [a_record(0, net_r="9.1", y2021="19.0"), a_record(1, net_r="7.7", y2021="17.6")]
+        _asked, entries_of = reading({0: self.SAME, 1: ((T1, "long"), (T2, "long"))})
+
+        chosen = choose(
+            pool, metric=HoldoutRank.NET_R, top_n=2, floors=FLOORS, entries_of=entries_of
+        )
+
+        assert [one.order for one in chosen] == [0, 1]
+
+    def test_a_run_that_kept_no_trades_is_kept_unknown_is_not_the_same(self) -> None:
+        pool = [a_record(0, net_r="9.1", y2021="19.0"), a_record(1, net_r="7.7", y2021="17.6")]
+        _asked, entries_of = reading({0: None, 1: None})
+
+        chosen = choose(
+            pool, metric=HoldoutRank.NET_R, top_n=2, floors=FLOORS, entries_of=entries_of
+        )
+
+        assert [one.order for one in chosen] == [0, 1]
+
+    def test_asked_not_to_it_keeps_them_and_reads_nothing(self) -> None:
+        pool = [a_record(0, net_r="9.1", y2021="19.0"), a_record(1, net_r="7.7", y2021="17.6")]
+        asked, entries_of = reading({0: self.SAME, 1: self.SAME})
+
+        chosen = choose(
+            pool,
+            metric=HoldoutRank.NET_R,
+            top_n=2,
+            floors=FLOORS,
+            distinct=False,
+            entries_of=entries_of,
+        )
+
+        assert ([one.order for one in chosen], asked) == ([0, 1], [])
+
+    def test_only_the_runs_walked_past_are_read(self) -> None:
+        """A group of thousands costs a few reads: the choice stops at its N, and an exact clone
+        is skipped on its record before its trades are asked for."""
+        pool = [
+            a_record(0, net_r="9.1", y2021="19.0"),
+            a_record(1, net_r="9.1", y2021="19.0"),  # an exact clone of 0
+            a_record(2, net_r="7.7", y2021="17.6"),
+            a_record(3, net_r="4.5", y2021="14.4"),
+        ]
+        asked, entries_of = reading({0: self.SAME, 2: ((T1, "long"),), 3: ((T2, "short"),)})
+
+        choose(pool, metric=HoldoutRank.NET_R, top_n=2, floors=FLOORS, entries_of=entries_of)
+
+        assert asked == [0, 2]
+
+    def test_the_same_entries_in_another_group_are_not_a_near_clone(self) -> None:
+        other = ("e1", "M15", "GBPUSD")
+        pool = [
+            a_record(0, net_r="9.1", y2021="19.0"),
+            a_record(1, net_r="7.7", y2021="17.6", group=other),
+        ]
+        _asked, entries_of = reading({0: self.SAME, 1: self.SAME})
+
+        chosen = choose(
+            pool, metric=HoldoutRank.NET_R, top_n=1, floors=FLOORS, entries_of=entries_of
+        )
+
+        assert [one.order for one in chosen] == [0, 1]
 
 
 class TestTheWindow:

@@ -155,6 +155,13 @@ def behaviour(metrics: BacktestMetrics) -> tuple[object, ...]:
     )
 
 
+Entries = tuple[tuple[dt.datetime, str], ...]
+"""The trades a run opened, as `(entry_time, direction)` in time order — what `entries_of` reads."""
+
+EntriesOf = Callable[[Candidate], Entries | None]
+"""Given a run, the trades it opened, or `None` when it kept none to read (`Recorded.METRICS`)."""
+
+
 def choose(  # noqa: PLR0913 — keyword-only; each is one part of the rule
     candidates: Sequence[Candidate],
     *,
@@ -163,6 +170,7 @@ def choose(  # noqa: PLR0913 — keyword-only; each is one part of the rule
     floors: Mapping[str, int],
     bounds: Bounds | None = None,
     distinct: bool = True,
+    entries_of: EntriesOf | None = None,
 ) -> list[Candidate]:
     """The `top_n` best of each group by `metric`, among the runs that can be ranked at all.
 
@@ -174,6 +182,13 @@ def choose(  # noqa: PLR0913 — keyword-only; each is one part of the rule
     ⚠️ **`distinct` skips a run that did what a better-ranked one already did** (`behaviour`), and
     the next distinct run takes its place (28/09). Tested again, clones return one answer N times,
     and a cluster built from them opens one trade N times over.
+
+    ⚠️ **With `entries_of`, `distinct` also skips a run that opened the trades a better one opened**
+    — the same entries at the same instants on the same side, closed some other way (02/10). The
+    MM9 sweep's three best points for 2025 differed only in a target, a breakeven and a stop
+    buffer: three records in sample, one trade out of it. Read only for the runs the choice walks
+    past, so a group of thousands costs a few reads. A run that kept no trades (`None`) cannot be
+    compared and is kept: unknown is not the same.
     """
     by_group: dict[tuple[str, str, str], list[tuple[Decimal, Candidate]]] = {}
     for one in candidates:
@@ -187,6 +202,7 @@ def choose(  # noqa: PLR0913 — keyword-only; each is one part of the rule
     for ranked in by_group.values():
         ranked.sort(key=lambda pair: (-pair[0], pair[1].order))
         seen: set[tuple[object, ...]] = set()
+        opened: set[Entries] = set()
         taken = 0
         for _value, one in ranked:
             if taken == top_n:
@@ -195,7 +211,12 @@ def choose(  # noqa: PLR0913 — keyword-only; each is one part of the rule
                 did = behaviour(one.metrics)
                 if did in seen:
                     continue
+                entries = None if entries_of is None else entries_of(one)
+                if entries is not None and entries in opened:
+                    continue
                 seen.add(did)
+                if entries is not None:
+                    opened.add(entries)
             chosen.append(one)
             taken += 1
     return sorted(chosen, key=lambda one: one.order)

@@ -1985,6 +1985,7 @@ class TestTheReservedWindow:
             "top_n": 2,
             "min_trades": {"H1": 30},
             "distinct": True,
+            "same_entries": True,
         }
         # The two best — periods 13 and 11 — on the same documents, over the new window.
         by_strategy = {row["run"]["strategy_id"]: row for row in runs}
@@ -1994,6 +1995,31 @@ class TestTheReservedWindow:
         assert {dt.datetime.fromisoformat(row["run"]["date_from"]) for row in tested} == {
             START + 200 * HOUR
         }
+
+    def test_a_point_that_opened_a_better_ones_trades_gives_its_place(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        """02/10: three best points that differed only in how they closed made one trade out of
+        sample. Period 11 opens 13's trades, closed another way; 9 opens its own."""
+        sweep_id, runs = self.swept(client, session_factory)
+        run_of = {row["values"]["setup.params.period"]: row["run"]["id"] for row in runs}
+        trade_in(session_factory, run_of[13], ["2", "1"], first=START)
+        trade_in(session_factory, run_of[11], ["1", "-1"], first=START)
+        trade_in(session_factory, run_of[9], ["1", "1"], first=START + HOUR)
+
+        skipped = client.post(f"/sweeps/{sweep_id}/holdout", json=self.after()).json()["id"]
+        kept = client.post(
+            f"/sweeps/{sweep_id}/holdout", json=self.after(distinct=False, retest=True)
+        ).json()["id"]
+
+        def periods(test_id: str) -> list[int]:
+            tested = client.get(f"/sweeps/{test_id}").json()["runs"]
+            return sorted(row["values"]["setup.params.period"] for row in tested)
+
+        assert periods(skipped) == [9, 13]
+        assert periods(kept) == [11, 13]
+        rule = client.get(f"/sweeps/{kept}").json()["holdout_rule"]
+        assert "same_entries" not in rule
 
     def test_the_comparison_sets_each_point_beside_the_run_it_was_chosen_by(
         self, client: Any, session_factory: Callable[[], Session]

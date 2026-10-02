@@ -67,6 +67,7 @@ from tradeforge_api.holdout import (
     BEHAVIOUR_FIELDS,
     Bounds,
     Candidate,
+    Entries,
     WindowUse,
     behaviour,
     choose,
@@ -1718,6 +1719,34 @@ def retest_rule(uses: Sequence[WindowUse]) -> dict[str, Any]:
     return {} if not uses else {"retest": True, "retest_of": keys_of(uses)}
 
 
+def _entries_reader(
+    session: Session, runs_of: Mapping[int, tuple[Backtest, str]]
+) -> Callable[[Candidate], Entries | None]:
+    """What `holdout.choose` reads to tell near-clones apart: the trades a candidate opened, read
+    one run at a time, only for the runs the choice walks past (02/10).
+
+    ⚠️ **`None` for a run with no trades to read** — one that kept only its metrics
+    (`Recorded.METRICS`), or none at all — never an empty tuple: no trades kept is not no trades
+    opened, and two such runs would read as the same entries.
+    """
+
+    def entries_of(candidate: Candidate) -> Entries | None:
+        run, _symbol = runs_of[candidate.order]
+        if run.recorded is Recorded.METRICS:
+            return None
+        entries = tuple(
+            (entry_time, direction.value)
+            for entry_time, direction in session.execute(
+                select(Trade.entry_time, Trade.direction)
+                .where(Trade.backtest_id == run.id)
+                .order_by(Trade.entry_time, Trade.direction)
+            )
+        )
+        return entries or None
+
+    return entries_of
+
+
 def launch_holdout(
     session: Session,
     sweep_id: uuid.UUID,
@@ -1790,6 +1819,7 @@ def launch_holdout(
         floors=floors,
         bounds=bounds,
         distinct=request.distinct,
+        entries_of=_entries_reader(session, runs_of),
     )
     if not chosen:
         raise HTTPException(
@@ -1838,6 +1868,9 @@ def launch_holdout(
             "top_n": request.top_n,
             "min_trades": {one: max(floors.get(one, 0), 1) for one in timeframes},
             "distinct": request.distinct,
+            # 02/10: a test that skipped clones skipped near-clones too — the same entries, closed
+            # some other way. Written so a test from before reads as the narrower rule it ran.
+            **({"same_entries": True} if request.distinct else {}),
             # Only when asked: a rule that lists no limit is a test that set none.
             **(
                 {}

@@ -1,6 +1,6 @@
 # ADR-0031 — Meta-labeling: um modelo filtra o sinal do setup, não prevê o preço
 
-- **Status**: proposto
+- **Status**: aceito
 - **Data**: 2026-10-02
 - **Contexto do PR**: PR-372
 
@@ -44,9 +44,11 @@ qualquer modelo daqui em diante.
    ou perdendo, e diz de onde cada linha veio.
 4. **O rótulo é o resultado em R líquido do trade** (com custos e swap). O rótulo binário (R > 0)
    e o contínuo vão juntos.
-5. **Validação no tempo, nunca embaralhada.** Treina no passado e testa no futuro, com uma folga
-   (embargo) entre os dois do tamanho do trade mais longo, para que um trade do treino não se
-   sobreponha a um do teste. O último ano fica reservado, como nas varreduras.
+5. **Validação no tempo e em ativos que o modelo não viu, nunca embaralhada.** Treina no passado e
+   testa no futuro, com uma folga (embargo) entre os dois do tamanho do trade mais longo, para que
+   um trade do treino não se sobreponha a um do teste. O último ano fica reservado, como nas
+   varreduras. E um grupo de ativos fica fora do treino inteiro: um modelo que só acerta nos ativos
+   em que treinou aprendeu sobre esses pares, não sobre o setup.
 6. **A métrica é R médio por trade aceito, fora da amostra**, comparado com pegar todos os sinais,
    ao lado de quantos trades sobraram. Acurácia e AUC aparecem, mas não decidem.
 7. **Reprodutível.** Semente fixa, e cada modelo grava a versão do motor, a versão do construtor de
@@ -85,11 +87,24 @@ escolhe trade nem calcula estatística.
 
 ## Consequências
 
-- `sdd.md` §1.2 e ADR-08 atualizados neste PR.
-- **Fase 1:** construtor do dataset de eventos em `packages/ml` (variáveis sem lookahead, uma linha
-  por entrada distinta, rótulo em R), com testes de anti-lookahead.
-- **Fase 2:** um jeito de rodar uma configuração fixa em vários ativos guardando todos os trades
-  (como já faz o teste fora da amostra). A ser desenhado no PR dessa fase.
-- **Fases 3 e 4:** primeiro modelo (regressão logística, depois gradient boosting), validação no
-  tempo com embargo e SHAP para leitura. Cada fase com sua lição.
-- O primeiro setup é o **MM9**: é o mais rodado e o que mais entra.
+**Os dados vêm antes do modelo** (decisão dele, 02/10). Rodar mais varreduras como estão não
+produz dados para ML, porque elas só guardam os trades dos runs vencedores. O que precisa estar
+guardado são os trades de **poucas configurações fixas, em muitos ativos, ganhando ou perdendo**.
+As variáveis não precisam: são calculadas depois, dos candles e da hora de entrada. A ordem fica:
+
+1. `sdd.md` §1.2 e ADR-08 atualizados neste PR.
+2. **Mais ativos:** buscar e adicionar o ativo da corretora ao lançar um teste (pedido aberto desde
+   24/09) e coletar em lote. Hoje há 15 instrumentos cadastrados e a corretora oferece 84; chegar a
+   500–800 exige outra fonte, decidida depois.
+3. **Rodar para ML:** um jeito de rodar configurações fixas em vários ativos guardando **todos** os
+   trades (como já faz o teste fora da amostra), desenhado no PR dessa fase.
+4. **A base consolidada:** as configurações do MM9 rodadas em todos os ativos.
+5. **Dataset de eventos** em `packages/ml` (variáveis sem lookahead, uma linha por entrada
+   distinta, rótulo em R), com testes de anti-lookahead.
+6. **Modelos:** regressão logística, depois gradient boosting, com validação no tempo e por ativo;
+   SHAP para a leitura. Cada fase com sua lição.
+7. **Uma página no front** para o ML, com o conteúdo que ele vai definir quando chegar lá.
+
+O primeiro setup é o **MM9**: é o mais rodado e o que mais entra. Um banco "para ML" é bem menor
+que o banco de combinações do plano grande: poucas configurações em muitos ativos, não cada
+variação em cada ativo.

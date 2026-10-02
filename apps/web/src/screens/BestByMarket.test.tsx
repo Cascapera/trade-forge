@@ -144,6 +144,142 @@ describe('BestByMarket', () => {
     expect(within(panel).getByText(/-3\.10 R over 19 trades/)).toBeInTheDocument()
   })
 
+  it('filters by market, and the reset brings every market back', () => {
+    renderWithProviders(<BestByMarket />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Metals', pressed: false }))
+
+    expect(screen.queryByRole('button', { name: /EURUSD, MM9 H1/ })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /GOLD, MM9 H1/ })).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'all' }))
+
+    expect(screen.getByRole('button', { name: /EURUSD, MM9 H1/ })).toBeInTheDocument()
+  })
+
+  it('filters by setup and by chart, and a chip pressed again lets go', () => {
+    renderWithProviders(<BestByMarket />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'H1', pressed: false }))
+    fireEvent.click(screen.getByRole('button', { name: 'MM9', pressed: false }))
+    expect(screen.getByRole('button', { name: /EURUSD, MM9 H1/ })).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'MM9', pressed: true }))
+    expect(screen.getByRole('button', { name: 'MM9', pressed: false })).toBeInTheDocument()
+  })
+
+  it('asks for the runs under their chart’s floor when ticked', () => {
+    renderWithProviders(<BestByMarket />)
+
+    fireEvent.click(screen.getByRole('checkbox', { name: /under their chart/ }))
+
+    expect(map).toHaveBeenLastCalledWith('recovery_r', true)
+  })
+
+  it('unfolds a folded market group', () => {
+    renderWithProviders(<BestByMarket />)
+
+    fireEvent.click(screen.getByRole('button', { name: /Metals \(1 market\)/ }))
+    fireEvent.click(screen.getByRole('button', { name: /Metals \(1 market\)/ }))
+
+    expect(screen.getByRole('button', { name: /GOLD, MM9 H1/ })).toBeInTheDocument()
+  })
+
+  it('says it is loading, and says why the map could not be read', () => {
+    map.mockReturnValue({ data: undefined, isPending: true, isError: false, error: null } as never)
+    const { unmount } = renderWithProviders(<BestByMarket />)
+    expect(screen.getByText('Loading…')).toBeInTheDocument()
+    unmount()
+
+    map.mockReturnValue({
+      data: undefined,
+      isPending: false,
+      isError: true,
+      error: new Error('boom'),
+    } as never)
+    renderWithProviders(<BestByMarket />)
+    expect(screen.getByRole('alert')).toHaveTextContent('boom')
+  })
+
+  it('writes an unbounded ratio as infinity, names a removed setup, and marks an empty cell', () => {
+    map.mockReturnValue(
+      answer({
+        ...MAP,
+        cells: [
+          { ...MAP.cells[0], value: null, unbounded: true },
+          { ...MAP.cells[1], entry_id: 'gone1234567', entry_name: null, timeframe: 'D1' },
+        ],
+      }),
+    )
+
+    renderWithProviders(<BestByMarket />)
+
+    expect(screen.getByRole('button', { name: /EURUSD, MM9 H1: ∞/ })).toBeInTheDocument()
+    expect(screen.getAllByText('removed entry gone1234').length).toBeGreaterThan(0)
+    expect(screen.getAllByText('·').length).toBeGreaterThan(0)
+  })
+
+  it('closes the panel, and says when it is loading, failed or empty', () => {
+    renderWithProviders(<BestByMarket />)
+    fireEvent.click(screen.getByRole('button', { name: /EURUSD, MM9 H1/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }))
+    expect(screen.queryByRole('complementary')).not.toBeInTheDocument()
+
+    cell.mockReturnValue({ data: undefined, isPending: true, isError: false, error: null } as never)
+    fireEvent.click(screen.getByRole('button', { name: /EURUSD, MM9 H1/ }))
+    expect(within(screen.getByRole('complementary')).getByText('Loading…')).toBeInTheDocument()
+
+    cell.mockReturnValue({
+      data: undefined,
+      isPending: false,
+      isError: true,
+      error: new Error('nope'),
+    } as never)
+    fireEvent.click(screen.getByRole('button', { name: /GOLD, MM9 H1/ }))
+    expect(within(screen.getByRole('complementary')).getByRole('alert')).toHaveTextContent('nope')
+
+    cell.mockReturnValue(answer({ ...TOP, ranked: 1, points: [] }))
+    fireEvent.click(screen.getByRole('button', { name: /EURUSD, MM9 H1/ }))
+    expect(screen.getByText(/1 run ranked in this cell/)).toBeInTheDocument()
+    expect(screen.getByText('No run of this cell can be ranked.')).toBeInTheDocument()
+  })
+
+  it('says a point was never validated, and a test still running by its status', () => {
+    const [point] = TOP.points
+    cell.mockReturnValue(
+      answer({
+        ...TOP,
+        points: [
+          {
+            ...point,
+            run_id: 'r9',
+            label: '',
+            sweep_id: null,
+            unbounded: true,
+            value: null,
+            max_drawdown_r: null,
+            yearly_r: {},
+            tests: [],
+          },
+          {
+            ...point,
+            run_id: 'r10',
+            tests: [{ ...point!.tests[0]!, sweep_id: null, net_r: null, status: 'running' }],
+          },
+        ],
+      }),
+    )
+    map.mockReturnValue(answer(MAP))
+
+    renderWithProviders(<BestByMarket />)
+    fireEvent.click(screen.getByRole('button', { name: /EURUSD, MM9 H1/ }))
+
+    const panel = screen.getByRole('complementary')
+    expect(within(panel).getByText(/Not validated/)).toBeInTheDocument()
+    expect(within(panel).getByText('no parameters')).toBeInTheDocument()
+    expect(within(panel).getByText(/: running/)).toBeInTheDocument()
+  })
+
   it('says when nothing can be ranked yet', () => {
     map.mockReturnValue(answer({ ...MAP, cells: [] }))
 

@@ -229,6 +229,18 @@ class TestTheCell:
         assert out["sweep_id"] == test.json()["id"]
         assert points[1]["tests"] == []
 
+    @pytest.mark.parametrize("field", ["symbol", "entry_id"])
+    def test_text_the_database_cannot_store_is_refused_not_a_server_error(
+        self, client: Any, field: str
+    ) -> None:
+        """Schemathesis (02/10): a NUL in a query parameter reached Postgres as a 500."""
+        params = {"symbol": "EURUSD", "entry_id": str(uuid.uuid4()), "timeframe": "H1"}
+        params[field] = "\0"
+
+        refused = client.get("/best/cell", params=params)
+
+        assert refused.status_code == 422, refused.text
+
     def test_a_cell_with_nothing_ranked_is_empty_not_an_error(
         self, client: Any, session_factory: Callable[[], Session]
     ) -> None:

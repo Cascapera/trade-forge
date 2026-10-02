@@ -55,6 +55,9 @@ import type {
   StrategyOut,
   StudyOut,
   StudyPreview,
+  BestCellOut,
+  BestMapOut,
+  BestMetric,
   HoldoutOut,
   MonteCarloOut,
   SlicingOut,
@@ -260,6 +263,14 @@ export const api = {
   createHoldout: (sweepId: string, payload: CreateHoldoutRequest): Promise<CreatedSweep> =>
     request('POST', `/sweeps/${sweepId}/holdout`, payload),
   getHoldout: (id: string): Promise<HoldoutOut> => request('GET', `/sweeps/${id}/holdout`),
+  // The best runs by market, setup and chart across every sweep (02/10): the map, then a cell.
+  getBestMap: (metric: BestMetric, everyRun: boolean): Promise<BestMapOut> =>
+    request('GET', `/best/map${query({ metric, every_run: everyRun ? 'true' : undefined })}`),
+  getBestCell: (cell: BestCellQuery): Promise<BestCellOut> =>
+    request(
+      'GET',
+      `/best/cell${query({ symbol: cell.symbol, entry_id: cell.entryId, timeframe: cell.timeframe, metric: cell.metric, every_run: cell.everyRun ? 'true' : undefined })}`,
+    ),
   // A finished test cut by year or into blocks of trades, and kept (25/09). Runs nothing.
   createSlicing: (id: string, payload: CreateSlicingRequest): Promise<SlicingOut> =>
     request('POST', `/sweeps/${id}/slicings`, payload),
@@ -374,4 +385,13 @@ export function socketUrl(path: string): string {
   const url = new URL(`${BASE_URL}${path}`, window.location.href)
   url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
   return url.toString()
+}
+
+/** The cell `getBestCell` asks for. */
+export interface BestCellQuery {
+  symbol: string
+  entryId: string
+  timeframe: string
+  metric: BestMetric
+  everyRun: boolean
 }

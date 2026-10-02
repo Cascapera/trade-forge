@@ -1912,3 +1912,78 @@ export interface SweepsPage {
   offset: number
   items: SweepListItem[]
 }
+
+/** What "best" means on the best-by-market page — his four (02/10). */
+export type BestMetric = 'recovery_r' | 'net_r' | 'net_r_per_year' | 'positive_years'
+
+/** The best run of one (market, setup, chart) — a cell of `GET /best/map`. */
+export interface BestMapCell {
+  /** The first folder of the broker's tree (`Forex`, `Metals`, `Cash Indices`…), or the asset
+   *  class for a symbol the broker's list does not hold. */
+  market: string
+  symbol: string
+  entry_id: string
+  /** Null once the catalogue entry was removed: its runs still rank. */
+  entry_name: string | null
+  timeframe: string
+  /** The run's value under the metric asked; null when `unbounded`. */
+  value: string | null
+  /** A drawdown ratio with a gain and no drawdown: above every finite one, with no number. */
+  unbounded: boolean
+  run_id: string
+  sweep_id: string | null
+  /** How many runs of the cell were ranked — the draws its best is the best of. */
+  ranked: number
+}
+
+export interface BestMapOut {
+  metric: BestMetric
+  every_run: boolean
+  engine_version: string
+  cells: BestMapCell[]
+}
+
+/** One reserved-window test of a point. */
+export interface BestTestOut {
+  sweep_id: string | null
+  status: string
+  date_from: string
+  date_to: string
+  net_r: string | null
+  total_trades: number | null
+}
+
+/** One of a cell's top runs, with every measure the page can rank by. */
+export interface BestPointOut {
+  run_id: string
+  sweep_id: string | null
+  strategy_id: string
+  label: string
+  values: Record<string, unknown>
+  date_from: string
+  date_to: string
+  value: string | null
+  unbounded: boolean
+  net_r: string | null
+  net_r_per_year: string | null
+  recovery_r: string | null
+  positive_year_share: string | null
+  max_drawdown_r: string | null
+  total_trades: number
+  profit_factor: string | null
+  yearly_r: Record<string, string>
+  /** Its reserved-window tests, oldest window first; empty for a point never validated. */
+  tests: BestTestOut[]
+}
+
+export interface BestCellOut {
+  symbol: string
+  entry_id: string
+  entry_name: string | null
+  timeframe: string
+  metric: BestMetric
+  every_run: boolean
+  /** How many runs of the cell were ranked, before clones and near-clones gave their place. */
+  ranked: number
+  points: BestPointOut[]
+}

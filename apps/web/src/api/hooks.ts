@@ -10,7 +10,7 @@ import { useEffect, useRef } from 'react'
 import { settled } from '../sweep/progress'
 import type { RankKey } from '../sweep/ranking'
 
-import { api } from './client'
+import { api, type BestCellQuery } from './client'
 import type {
   CatalogEntry,
   CatalogPage,
@@ -65,6 +65,9 @@ import type {
   StudyOut,
   StudyPreview,
   PreviewSweepRequest,
+  BestCellOut,
+  BestMapOut,
+  BestMetric,
   HoldoutOut,
   MonteCarloOut,
   SlicingOut,
@@ -1151,5 +1154,24 @@ export function useEngageKillSwitch() {
     onSuccess: (state) => {
       client.setQueryData(['kill-switch'], state)
     },
+  })
+}
+
+/** Every (market, setup, chart)'s best run by `metric` (02/10). Polled slowly: sweeps land runs
+ *  for hours, and the map is read while they do. */
+export function useBestMap(metric: BestMetric, everyRun: boolean) {
+  return useQuery<BestMapOut>({
+    queryKey: ['best-map', metric, everyRun],
+    queryFn: () => api.getBestMap(metric, everyRun),
+    placeholderData: (previous) => previous,
+    refetchInterval: 60_000,
+  })
+}
+
+/** One cell's top runs, without clones or near-clones — `undefined` until a cell is chosen. */
+export function useBestCell(cell: BestCellQuery | undefined) {
+  return useQuery<BestCellOut>({
+    queryKey: ['best-cell', cell?.symbol, cell?.entryId, cell?.timeframe, cell?.metric, cell?.everyRun],
+    queryFn: cell === undefined ? skipToken : () => api.getBestCell(cell),
   })
 }

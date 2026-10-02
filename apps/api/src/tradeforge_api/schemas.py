@@ -33,6 +33,7 @@ from pydantic import (
     model_validator,
 )
 
+from tradeforge_api.best import BestMetric
 from tradeforge_api.holdout import HoldoutRank
 from tradeforge_api.montecarlo import MAX_BLOCK_TRADES, MIN_BLOCK_TRADES
 from tradeforge_api.sweep_dataset import Role
@@ -2981,3 +2982,81 @@ class CreatedSweep(BaseModel):
     skipped: list[UncoveredMarket] = Field(default_factory=list)
     """Pairs left out for having no candles in the window — his answer "do not collect" (18/09).
     The same list the sweep keeps (`SweepOut.skipped`), so the launch and a later read agree."""
+
+
+class BestMapCell(BaseModel):
+    """The best run of one (market, setup, chart) — a cell of `GET /best/map` (02/10)."""
+
+    market: str
+    """The first folder of the broker's tree (`Forex`, `Metals`, `Cash Indices`…), or the asset
+    class for a symbol the broker's list does not hold (`best.market_of`)."""
+    symbol: str
+    entry_id: str
+    entry_name: str | None
+    """`None` once the catalogue entry was removed: its runs still rank."""
+    timeframe: str
+    value: Decimal | None
+    """The run's value under the metric asked; `None` when `unbounded`."""
+    unbounded: bool = False
+    """A drawdown ratio with a gain and no drawdown: above every finite one, with no number."""
+    run_id: uuid.UUID
+    sweep_id: uuid.UUID | None
+    ranked: int
+    """How many runs of the cell were ranked — the draws its best is the best of."""
+
+
+class BestMapOut(BaseModel):
+    metric: BestMetric
+    every_run: bool
+    """Every run with a value, not only those over the chart's ranking floor."""
+    engine_version: str
+    """The engine whose runs were ranked: runs of an older one are left out."""
+    cells: list[BestMapCell]
+
+
+class BestTestOut(BaseModel):
+    """One reserved-window test of a point — the validation the page names beside it."""
+
+    sweep_id: uuid.UUID | None
+    status: str
+    date_from: dt.datetime
+    date_to: dt.datetime
+    net_r: Decimal | None
+    total_trades: int | None
+
+
+class BestPointOut(BaseModel):
+    """One of a cell's top runs, with every measure the page can rank by."""
+
+    run_id: uuid.UUID
+    sweep_id: uuid.UUID | None
+    strategy_id: uuid.UUID
+    label: str
+    values: dict[str, Any]
+    """The point's coordinates on its sweep's grid."""
+    date_from: dt.datetime
+    date_to: dt.datetime
+    value: Decimal | None
+    unbounded: bool = False
+    net_r: Decimal | None
+    net_r_per_year: Decimal | None
+    recovery_r: Decimal | None
+    positive_year_share: Decimal | None
+    max_drawdown_r: Decimal | None
+    total_trades: int
+    profit_factor: Decimal | None
+    yearly_r: dict[str, Any]
+    tests: list[BestTestOut]
+    """Its reserved-window tests, oldest window first; empty for a point never validated."""
+
+
+class BestCellOut(BaseModel):
+    symbol: str
+    entry_id: str
+    entry_name: str | None
+    timeframe: str
+    metric: BestMetric
+    every_run: bool
+    ranked: int
+    """How many runs of the cell were ranked, before clones and near-clones gave their place."""
+    points: list[BestPointOut]

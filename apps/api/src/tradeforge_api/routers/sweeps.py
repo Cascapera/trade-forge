@@ -1724,7 +1724,7 @@ def retest_rule(uses: Sequence[WindowUse]) -> dict[str, Any]:
     return {} if not uses else {"retest": True, "retest_of": keys_of(uses)}
 
 
-def _entries_reader(
+def entries_reader(
     session: Session, runs_of: Mapping[int, tuple[Backtest, str]]
 ) -> Callable[[Candidate], Entries | None]:
     """What `holdout.choose` reads to tell near-clones apart: the trades a candidate opened, read
@@ -1824,7 +1824,7 @@ def launch_holdout(
         floors=floors,
         bounds=bounds,
         distinct=request.distinct,
-        entries_of=_entries_reader(session, runs_of),
+        entries_of=entries_reader(session, runs_of),
     )
     if not chosen:
         raise HTTPException(

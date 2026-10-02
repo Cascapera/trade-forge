@@ -113,7 +113,7 @@ class TestTheMap:
 
         def best(metric: str) -> str:
             cells = client.get("/best/map", params={"metric": metric}).json()["cells"]
-            return next(one["run_id"] for one in cells if one["entry_id"] == entry)
+            return str(next(one["run_id"] for one in cells if one["entry_id"] == entry))
 
         assert best("net_r") == run_of[5]
         assert best("recovery_r") == run_of[7]  # 20 / 2 beats 30 / 15
@@ -128,7 +128,7 @@ class TestTheMap:
             cells = client.get(
                 "/best/map", params={"metric": "net_r", "every_run": every_run}
             ).json()["cells"]
-            return next(one["run_id"] for one in cells if one["entry_id"] == entry)
+            return str(next(one["run_id"] for one in cells if one["entry_id"] == entry))
 
         assert best(every_run=False) == run_of[5]
         assert best(every_run=True) == run_of[7]

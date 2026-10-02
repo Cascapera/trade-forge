@@ -1278,6 +1278,9 @@ export interface HoldoutRule {
   /** Clones skipped (28/09): a run with the same record as a better-ranked one was not chosen.
    *  Absent on a test launched before, which kept them. */
   distinct?: boolean
+  /** Near-clones skipped too (02/10): a run that opened the same trades as a better-ranked one,
+   *  closed some other way, was not chosen. Absent on a test launched before. */
+  same_entries?: boolean
   /** Present only on a retest (01/10): this window had been used by an earlier test of the same
    *  sweep, and the test was launched knowing it. */
   retest?: boolean
@@ -1298,7 +1301,8 @@ export interface CreateHoldoutRequest {
   /** Per chart, over the ranking floor (`RANK_MIN_TRADES`, 01/10); a chart left out keeps that
    *  floor. */
   min_trades: Record<string, number>
-  /** Skip a run with the same record as a better-ranked one. The server's default is true. */
+  /** Skip a run with the same record as a better-ranked one, or the same entries (02/10). The
+   *  server's default is true. */
   distinct?: boolean
   /** Test again a window an earlier test of this sweep already used (01/10). Without it such a
    *  launch is a 409 naming those tests (`WindowUsedDetail`). */

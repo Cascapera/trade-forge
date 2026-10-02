@@ -168,6 +168,16 @@ describe('HoldoutComparison', () => {
     expect(await screen.findByText(/· clones skipped/)).toBeInTheDocument()
   })
 
+  it('says when the near-clones were skipped too', async () => {
+    getHoldout.mockResolvedValue({
+      ...HOLDOUT,
+      rule: { ...HOLDOUT.rule, distinct: true, same_entries: true },
+    })
+    renderWithProviders(<HoldoutComparison sweepId="test-1" />)
+
+    expect(await screen.findByText(/· clones and near-clones skipped/)).toBeInTheDocument()
+  })
+
   it('leads with the medians both ways and the share still positive, charts in order', async () => {
     getHoldout.mockResolvedValue(HOLDOUT)
     renderWithProviders(<HoldoutComparison sweepId="test-1" />)

@@ -61,6 +61,7 @@ from tradeforge_api import sweep_dashboard as dashboard
 from tradeforge_api.batching import Batcher, batch_key, enqueue_runs, runs_in
 from tradeforge_api.config import Settings
 from tradeforge_api.coverage import describe, to_collect, uncovered_markets
+from tradeforge_api.density import real_start
 from tradeforge_api.deps import CollectorDep, QueueDep, SessionDep, SettingsDep
 from tradeforge_api.estimates import backtests_time
 from tradeforge_api.grid import GridPoint
@@ -133,6 +134,7 @@ from tradeforge_api.schemas import (
     SweepRunOut,
     SweepRunsPage,
     SweepsPage,
+    TrimmedMarket,
     UncoveredMarket,
     WindowUseOut,
 )
@@ -232,6 +234,44 @@ def streams_of(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
             ) from exc
     return out
+
+
+def _real_starts(
+    root: Path,
+    symbols: list[str],
+    timeframes: list[str],
+    request: CreateSweep,
+    uncovered: list[UncoveredMarket],
+) -> tuple[dict[tuple[str, str], dt.datetime], list[UncoveredMarket]]:
+    """Each pair's runs start at its first year of real bars when the window reaches before it
+    (02/10), and a pair with no real bar in the window is skipped like one with none at all.
+
+    ⚠️ **Cut, and said.** Before 2017-2018 this broker's intraday history of its metals, US indices
+    and cryptos is one bar a day stored as the chart (`density`): a run over those years trades a
+    setup meant for M15 on daily bars. The cut is written on the sweep (`Sweep.trimmed`) and
+    answered by the launch, so a window that was asked is never silently another.
+    """
+    empty = {(market.symbol, market.timeframe) for market in uncovered}
+    starts: dict[tuple[str, str], dt.datetime] = {}
+    synthetic: list[UncoveredMarket] = []
+    for symbol in symbols:
+        for timeframe in timeframes:
+            if (symbol, timeframe) in empty:
+                continue
+            start = real_start(root, symbol, timeframe)
+            if start is None or start <= request.date_from:
+                continue
+            if start >= request.date_to:
+                synthetic.append(
+                    UncoveredMarket(
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        covers=f"real bars only from {start:%Y-%m-%d}",
+                    )
+                )
+            else:
+                starts[(symbol, timeframe)] = start
+    return starts, synthetic
 
 
 def _markets_by_chart(
@@ -488,7 +528,13 @@ async def create_sweep(
         await queue.enqueue_job(COLLECT_RANGE, str(collection.id), _queue_name=COLLECT_QUEUE)
     await enqueue_runs(queue, jobs)
 
-    return CreatedSweep(id=sweep.id, runs=runs_in(jobs), shared=shared_count, skipped=skipped)
+    return CreatedSweep(
+        id=sweep.id,
+        runs=runs_in(jobs),
+        shared=shared_count,
+        skipped=skipped,
+        trimmed=[TrimmedMarket.model_validate(one) for one in sweep.trimmed],
+    )
 
 
 LAUNCH_BLOCK = 2000
@@ -538,11 +584,8 @@ def launch_sweep(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=f"unknown symbols: {', '.join(unknown)}",
         )
-    costs = _priced(
-        _costs_for(request.cost_model, found),
-        found,
-        Settings().parquet_root if parquet_root is None else parquet_root,
-    )
+    root = Settings().parquet_root if parquet_root is None else parquet_root
+    costs = _priced(_costs_for(request.cost_model, found), found, root)
     streams = streams_of(pairs, timeframes)
 
     planned = (
@@ -573,6 +616,8 @@ def launch_sweep(
         )
         if (market.symbol, market.timeframe) not in collectable
     ]
+    starts, synthetic = _real_starts(root, symbols, timeframes, request, uncovered)
+    uncovered += synthetic
     markets = _markets_by_chart(
         symbols, timeframes, {(market.symbol, market.timeframe) for market in uncovered}
     )
@@ -590,6 +635,10 @@ def launch_sweep(
         skipped=[],
         template_id=template_id,
         keep_all_trades=request.keep_all_trades,
+        trimmed=[
+            {"symbol": symbol, "timeframe": timeframe, "date_from": start.isoformat()}
+            for (symbol, timeframe), start in sorted(starts.items())
+        ],
     )
     session.add(sweep)
     session.flush()
@@ -603,6 +652,7 @@ def launch_sweep(
         costs=costs,
         collectable=collectable,
         batch=batch,
+        starts=starts,
     )
     for stream in streams:
         for doc in stream:
@@ -679,8 +729,10 @@ class _SweepWriter:
         costs: dict[str, dict[str, Any]],
         collectable: dict[tuple[str, str], PlannedCollection],
         batch: bool = True,
+        starts: Mapping[tuple[str, str], dt.datetime] | None = None,
     ) -> None:
         self._session = session
+        self._starts = starts or {}
         self._sweep = sweep
         self._request = request
         self._markets = markets
@@ -803,7 +855,8 @@ class _SweepWriter:
             # The document's timeframe and the run's are one value, read from one place — which
             # is what makes PR-238's equality rule unreachable here.
             "timeframe": doc.timeframe,
-            "date_from": self._request.date_from,
+            # ⚠️ From the first year of real bars when the window reaches before it (`density`).
+            "date_from": self._starts.get((symbol, doc.timeframe), self._request.date_from),
             "date_to": self._request.date_to,
             "initial_capital": self._request.initial_capital,
             "cost_model": self._costs[symbol],
@@ -2595,6 +2648,7 @@ def get_sweep(
         else [uuid.UUID(str(one)) for one in sweep.combines],
         template_id=sweep.template_id,
         keep_all_trades=sweep.keep_all_trades,
+        trimmed=[TrimmedMarket.model_validate(one) for one in sweep.trimmed],
         counts=counts,
         entries=summaries,
         runs=out,

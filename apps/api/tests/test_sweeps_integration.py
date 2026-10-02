@@ -4669,3 +4669,78 @@ class TestTheSweepWalksForwardByCut:
         assert retest.status_code == 202, retest.text
         rule = client.get(f"/sweep-walkforwards/{retest.json()['id']}").json()["rule"]
         assert (rule["retest"], rule["retest_of"]) == (True, [first])
+
+
+class TestTheRealBars:
+    """02/10: before 2017-2018 this broker's intraday history of its metals, US indices and cryptos
+    is one bar a day stored as the chart. A launch starts each pair at its first year of real bars,
+    and says so."""
+
+    def collected(self, root: Path, session_factory: Callable[[], Session]) -> None:
+        """GBPUSD H1: one bar a day in 2019-2021, then a bar an hour in 2022-2025."""
+        level = Decimal("1.25")
+
+        def bar(at: dt.datetime) -> Candle:
+            return Candle(time=at, open=level, high=level, low=level, close=level, tick_volume=1)
+
+        start = dt.datetime(2019, 1, 1, tzinfo=dt.UTC)
+        real = dt.datetime(2022, 1, 1, tzinfo=dt.UTC)
+        end = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
+        days = [bar(start + dt.timedelta(days=day)) for day in range((real - start).days)]
+        hours = [
+            bar(real + dt.timedelta(hours=hour))
+            for hour in range(int((end - real).total_seconds() // 3600))
+        ]
+        write_candles(root, "GBPUSD", "H1", days + hours)
+        with session_factory() as session:
+            instrument = session.scalars(
+                select(Instrument).where(Instrument.symbol == "GBPUSD")
+            ).one()
+            indexed = session.scalars(
+                select(Dataset).where(
+                    Dataset.instrument_id == instrument.id, Dataset.timeframe == "H1"
+                )
+            ).one()
+            indexed.date_from = start
+            indexed.date_to = end
+            indexed.candle_count = len(days) + len(hours)
+            session.commit()
+
+    def test_a_pair_starts_at_its_first_year_of_real_bars(
+        self, client: Any, session_factory: Callable[[], Session], tmp_path: Path
+    ) -> None:
+        self.collected(tmp_path, session_factory)
+        entry = an_entry(client, name=f"real {uuid.uuid4()}")
+        body = {
+            **a_sweep_body([entry], ["EURUSD", "GBPUSD"], ["H1"]),
+            "date_from": "2020-01-01T00:00:00Z",
+            "date_to": "2025-01-01T00:00:00Z",
+        }
+
+        launched = client.post("/sweeps", json=body)
+
+        assert launched.status_code == 202, launched.text
+        cut = {"symbol": "GBPUSD", "timeframe": "H1", "date_from": "2022-01-01T00:00:00Z"}
+        assert launched.json()["trimmed"] == [cut]
+        read = client.get(f"/sweeps/{launched.json()['id']}").json()
+        assert read["trimmed"] == [cut]
+        starts = {row["run"]["symbol"]: row["run"]["date_from"] for row in read["runs"]}
+        assert starts["GBPUSD"].startswith("2022-01-01")
+        assert starts["EURUSD"].startswith("2020-01-01")  # nothing on disk to judge it by
+
+    def test_a_window_wholly_before_the_real_bars_is_refused_and_says_why(
+        self, client: Any, session_factory: Callable[[], Session], tmp_path: Path
+    ) -> None:
+        self.collected(tmp_path, session_factory)
+        entry = an_entry(client, name=f"synthetic {uuid.uuid4()}")
+        body = {
+            **a_sweep_body([entry], ["EURUSD", "GBPUSD"], ["H1"]),
+            "date_from": "2019-06-01T00:00:00Z",
+            "date_to": "2021-06-01T00:00:00Z",
+        }
+
+        launched = client.post("/sweeps", json=body)
+
+        # Nothing else in the window either: the launch is refused, and says why for each pair.
+        assert launched.status_code == 422, launched.text
+        assert "GBPUSD H1 (on disk: real bars only from 2022-01-01)" in launched.json()["detail"]

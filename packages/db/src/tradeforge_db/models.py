@@ -1920,6 +1920,11 @@ class Sweep(Base):
     """How the tested points were chosen — `metric`, `top_n` per (entry, chart, market), and the
     trade floor per chart. "The best" means nothing without "by what"."""
 
+    trimmed: Mapped[list[Any]] = mapped_column(JSONB, nullable=False, server_default="[]")
+    """The pairs whose runs start later than the sweep's window (rev_0047, 02/10):
+    `[{"symbol", "timeframe", "date_from"}]` — the first year of real bars, where the window
+    reached into years a broker filled with one bar a day stored as the chart (`density`)."""
+
     keep_all_trades: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=text("false")
     )
@@ -1937,6 +1942,7 @@ class Sweep(Base):
         # would meet its first surprise inside the transaction that is already writing runs.
         CheckConstraint("jsonb_typeof(entry_ids) = 'array'", name="entries_are_a_list"),
         CheckConstraint("jsonb_typeof(symbols) = 'array'", name="symbols_are_a_list"),
+        CheckConstraint("jsonb_typeof(trimmed) = 'array'", name="trimmed_is_a_list"),
         CheckConstraint("jsonb_typeof(timeframes) = 'array'", name="timeframes_are_a_list"),
         CheckConstraint("jsonb_typeof(skipped) = 'array'", name="skipped_is_a_list"),
         CheckConstraint("date_to > date_from", name="a_window_runs_forwards"),

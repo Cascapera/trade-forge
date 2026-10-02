@@ -287,7 +287,29 @@ export function SweepResult(): React.JSX.Element {
                   <span className="font-medium">
                     {pair.symbol} {pair.timeframe}
                   </span>{' '}
-                  — {pair.covers === null ? 'never collected' : `collected ${pair.covers}`}
+                  —{' '}
+                  {pair.covers === null
+                    ? 'never collected'
+                    : pair.covers.startsWith('real bars')
+                      ? pair.covers
+                      : `collected ${pair.covers}`}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+        {/* The window was cut where the broker's intraday history is one bar a day stored as the
+            chart (02/10): said here, because the axes above say the window that was asked. */}
+        {(data.trimmed ?? []).length > 0 && (
+          <div role="status" aria-label="cut to real bars" className="mt-2 text-sm text-amber-300">
+            <p>Started later — before these dates the broker&apos;s history is one bar a day:</p>
+            <ul className="mt-1 space-y-0.5 text-xs text-amber-300/80">
+              {(data.trimmed ?? []).map((pair) => (
+                <li key={`${pair.symbol}-${pair.timeframe}`}>
+                  <span className="font-medium">
+                    {pair.symbol} {pair.timeframe}
+                  </span>{' '}
+                  — from {pair.date_from.slice(0, 10)}
                 </li>
               ))}
             </ul>

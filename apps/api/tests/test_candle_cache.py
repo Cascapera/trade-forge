@@ -13,7 +13,8 @@ from pathlib import Path
 
 import pytest
 
-from tradeforge_api.candle_cache import CandleCache, fingerprint
+from tradeforge_api.candle_cache import CandleCache, fingerprint, read_window
+from tradeforge_api.warm_window import WarmUp, warm_start
 from tradeforge_collector import read_candles, write_candles
 from tradeforge_collector.storage import dataset_path
 from tradeforge_engine.domain import Candle
@@ -45,10 +46,20 @@ class Counting:
 
     def __init__(self) -> None:
         self.calls = 0
+        self.asked: list[tuple[dt.datetime | None, dt.datetime | None]] = []
 
-    def __call__(self, root: Path, symbol: str, timeframe: str) -> Sequence[Candle]:
+    def __call__(
+        self,
+        root: Path,
+        symbol: str,
+        timeframe: str,
+        *,
+        start: dt.datetime | None = None,
+        end: dt.datetime | None = None,
+    ) -> Sequence[Candle]:
         self.calls += 1
-        return read_candles(root, symbol, timeframe)
+        self.asked.append((start, end))
+        return read_candles(root, symbol, timeframe, start=start, end=end)
 
 
 class TestAHit:
@@ -133,7 +144,14 @@ class TestTheFilesChanging:
         write_candles(tmp_path, SYMBOL, TF, candles(START, 20))
         calls = 0
 
-        def racing(root: Path, symbol: str, timeframe: str) -> Sequence[Candle]:
+        def racing(
+            root: Path,
+            symbol: str,
+            timeframe: str,
+            *,
+            start: dt.datetime | None = None,
+            end: dt.datetime | None = None,
+        ) -> Sequence[Candle]:
             nonlocal calls
             calls += 1
             read = read_candles(root, symbol, timeframe)
@@ -182,3 +200,104 @@ class TestTheFingerprint:
         names = [name for name, _, _ in fingerprint(tmp_path, SYMBOL, TF)]
 
         assert names == ["year=2024/part-0.parquet", "year=2025/part-0.parquet"]
+
+
+def hourly(start: dt.datetime, end: dt.datetime) -> list[Candle]:
+    """An H1 bar every hour of every weekday from `start` to `end` — a market shut on weekends."""
+    bars: list[Candle] = []
+    at = start
+    level = Decimal("1.25000")
+    while at <= end:
+        if at.weekday() < 5:
+            bars.append(
+                Candle(time=at, open=level, high=level, low=level, close=level, tick_volume=1)
+            )
+        at += dt.timedelta(hours=1)
+    return bars
+
+
+def warmed(candles: Sequence[Candle], date_from: dt.datetime, warmup: WarmUp) -> list[Candle]:
+    """The bars a run over `date_from` onwards reads: its warm-up and its window."""
+    return list(candles[warm_start(candles, warmup, date_from) :])
+
+
+class TestTheWindow:
+    """02/10: twelve workers each holding whole M5 series since 1993 filled 31 GB."""
+
+    FROM = dt.datetime(2022, 3, 1, tzinfo=dt.UTC)
+    TO = dt.datetime(2022, 6, 30, 23, tzinfo=dt.UTC)
+
+    @pytest.mark.parametrize(
+        "warmup",
+        [
+            WarmUp(bars=0, span=None),
+            WarmUp(bars=800, span=None),
+            WarmUp(bars=80, span=dt.timedelta(days=365)),
+        ],
+    )
+    def test_a_run_reads_the_bars_a_whole_read_would_hand_it(
+        self, tmp_path: Path, warmup: WarmUp
+    ) -> None:
+        write_candles(
+            tmp_path, SYMBOL, "H1", hourly(dt.datetime(2015, 1, 1, tzinfo=dt.UTC), self.TO)
+        )
+        whole = read_candles(tmp_path, SYMBOL, "H1", end=self.TO)
+
+        read = read_window(
+            CandleCache().read,
+            tmp_path,
+            SYMBOL,
+            "H1",
+            date_from=self.FROM,
+            date_to=self.TO,
+            warmup=warmup,
+        )
+
+        assert warmed(read, self.FROM, warmup) == warmed(whole, self.FROM, warmup)
+        assert read[0].time.year >= 2020, "it read years the run never needs"
+        assert read[-1].time <= self.TO
+
+    def test_a_series_that_starts_inside_the_warm_up_is_read_whole(self, tmp_path: Path) -> None:
+        """Too few bars before the window: the read falls back to every bar there is."""
+        write_candles(
+            tmp_path, SYMBOL, "H1", hourly(dt.datetime(2022, 2, 25, tzinfo=dt.UTC), self.TO)
+        )
+        reader = Counting()
+        warmup = WarmUp(bars=800, span=None)
+
+        read = read_window(
+            CandleCache(reader=reader).read,
+            tmp_path,
+            SYMBOL,
+            "H1",
+            date_from=self.FROM,
+            date_to=self.TO,
+            warmup=warmup,
+        )
+
+        assert reader.calls == 2
+        assert reader.asked[-1][0] is None
+        assert warmed(read, self.FROM, warmup) == warmed(
+            read_candles(tmp_path, SYMBOL, "H1", end=self.TO), self.FROM, warmup
+        )
+
+    def test_the_variants_of_one_sweep_share_one_read(self, tmp_path: Path) -> None:
+        """Warm-ups that differ by a few hundred bars start on the same 1 January."""
+        write_candles(
+            tmp_path, SYMBOL, "H1", hourly(dt.datetime(2019, 1, 1, tzinfo=dt.UTC), self.TO)
+        )
+        reader = Counting()
+        cache = CandleCache(reader=reader)
+
+        for bars in (0, 80, 200, 400):
+            read_window(
+                cache.read,
+                tmp_path,
+                SYMBOL,
+                "H1",
+                date_from=self.FROM,
+                date_to=self.TO,
+                warmup=WarmUp(bars=bars, span=None),
+            )
+
+        assert reader.calls == 1

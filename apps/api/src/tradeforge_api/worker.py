@@ -38,7 +38,7 @@ from sqlalchemy.exc import DBAPIError, OperationalError
 from sqlalchemy.orm import Session
 
 from tradeforge_api.batching import enqueue_runs
-from tradeforge_api.candle_cache import CandleCache, CandleReader
+from tradeforge_api.candle_cache import CandleCache, CandleReader, read_window
 from tradeforge_api.cluster_job import process_cluster
 from tradeforge_api.collector import running as collector_running
 from tradeforge_api.config import RedisConfig, Settings
@@ -151,12 +151,17 @@ def _original_of(
     strategy = session.get(Strategy, run.strategy_id)
     if run.sweep_id is None or instrument is None or strategy is None:
         return None
-    window = window_of(
-        read(parquet_root, instrument.symbol, run.timeframe),
-        run.date_from,
-        run.date_to,
-        warmup_for(strategy.definition),
+    warmup = warmup_for(strategy.definition)
+    candles = read_window(
+        read,
+        parquet_root,
+        instrument.symbol,
+        run.timeframe,
+        date_from=run.date_from,
+        date_to=run.date_to,
+        warmup=warmup,
     )
+    window = window_of(candles, run.date_from, run.date_to, warmup)
     if window is None:
         return None  # nothing to read: the run records that itself
     spec = _kept_spec(run, instrument)
@@ -310,7 +315,15 @@ async def process_backtest(  # noqa: PLR0913 — keyword-only; each names one th
         if strategy is None or instrument is None:
             raise ValueError("backtest references a missing strategy or instrument")
 
-        candles = read(parquet_root, instrument.symbol, backtest.timeframe)
+        candles = read_window(
+            read,
+            parquet_root,
+            instrument.symbol,
+            backtest.timeframe,
+            date_from=backtest.date_from,
+            date_to=backtest.date_to,
+            warmup=warmup_for(strategy.definition),
+        )
         # A sweep's run keeps no pictures, so it does not build them either (`retention`).
         in_sweep = backtest.sweep_id is not None
         spec = _kept_spec(backtest, instrument)
@@ -442,7 +455,16 @@ async def process_batch(  # noqa: PLR0913 — keyword-only; each names one thing
         for run_id in ids:
             await _announce(redis, run_id, {"status": "running", "progress": 0.0})
 
-        candles = read(parquet_root, instrument.symbol, first.timeframe)
+        # One window and one warm-up for the whole batch: `one_market` and `batch_key` say so.
+        candles = read_window(
+            read,
+            parquet_root,
+            instrument.symbol,
+            first.timeframe,
+            date_from=first.date_from,
+            date_to=first.date_to,
+            warmup=warmup_for(next(one for one in strategies if one is not None).definition),
+        )
         outcomes = execute_batch(
             key=key,
             runs=[

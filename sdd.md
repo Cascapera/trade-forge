@@ -21,7 +21,7 @@ O diferencial central de arquitetura: **a estratégia é escrita uma única vez*
 ### 1.2 Não-objetivos (por enquanto)
 
 - HFT / execução em tick-by-tick de baixa latência.
-- Previsão de preço por ML (baixa credibilidade; a IA entra em análise e geração de estratégia, não em previsão).
+- Previsão de preço por ML (baixa credibilidade; a IA entra em análise e geração de estratégia, não em previsão). Desde 02/10/2026, **meta-labeling** entra no escopo: um modelo que aceita ou recusa os sinais que um setup já deu, como análise offline e sob as regras do ADR-0031 (sem lookahead, validação no tempo, fora do caminho ao vivo).
 - Mobile app.
 - Suporte a corretoras via API própria (fase futura; MT5 é o gateway inicial de execução).
 
@@ -104,7 +104,7 @@ O diferencial central de arquitetura: **a estratégia é escrita uma única vez*
 | ADR-05 | **Postgres para metadados/trades + Parquet para OHLCV** | Séries históricas são colunar-friendly (leitura rápida com pandas/polars); dados relacionais ficam onde consultas SQL brilham | Tudo no Postgres (OHLCV de anos × vários ativos fica lento e caro) |
 | ADR-06 | **Redis** como broker de mensagens (streams/pub-sub) | Simples, suficiente para candles/ordens/fills; upgrade natural p/ RabbitMQ ou NATS se precisar | Kafka (overkill nesta escala) |
 | ADR-07 | Custos de transação como **componente plugável** (`CostModel`) | Forex = spread + swap; ações = comissão; índices/futuros = ambos. Multi-ativo sem `if` espalhado | Custos hard-coded |
-| ADR-08 | IA via **LLM (API)** para análise e geração de estratégia | Alto valor, resultado confiável, ótima vitrine de AI Engineering (tool use, structured output, validação) | ML preditivo de preço |
+| ADR-08 | IA via **LLM (API)** para análise e geração de estratégia | Alto valor, resultado confiável, ótima vitrine de AI Engineering (tool use, structured output, validação) | ML preditivo de preço (meta-labeling sobre sinais de setup entra pelo ADR-0031) |
 
 ### 3.3 Componentes
 

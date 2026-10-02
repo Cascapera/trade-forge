@@ -171,6 +171,7 @@ def choose(  # noqa: PLR0913 — keyword-only; each is one part of the rule
     bounds: Bounds | None = None,
     distinct: bool = True,
     entries_of: EntriesOf | None = None,
+    score: Callable[[Candidate], Decimal | None] | None = None,
 ) -> list[Candidate]:
     """The `top_n` best of each group by `metric`, among the runs that can be ranked at all.
 
@@ -194,13 +195,16 @@ def choose(  # noqa: PLR0913 — keyword-only; each is one part of the rule
     one's, or hold all of them, is skipped too. The CHoCH sweep's second best opened 270 of its
     best's 273 entries — a wider stop buffer skipped three — and the two made the very same 18
     trades in 2025. No share to choose: a run that adds nothing, or only adds, is not another bet.
+
+    `score`, when given, ranks in place of `metric`'s column — for a measure the metrics row does
+    not hold on its own, such as R per year of the run's window (`best`, 02/10).
     ⚠️ So a one-side point under a both-sides one is skipped too — its entries are the both-sides
     run's shorts or longs — and that is his call, made seeing it take 48 points of CHoCH's group:
     the both-sides test already opens those trades.
     """
     by_group: dict[tuple[str, str, str], list[tuple[Decimal, Candidate]]] = {}
     for one in candidates:
-        value = _METRIC_OF[metric](one.metrics)
+        value = _METRIC_OF[metric](one.metrics) if score is None else score(one)
         if value is None or one.metrics.total_trades < floor_of(one.group[1], floors):
             continue
         if bounds is not None and not bounds.admit(one.metrics):

@@ -309,6 +309,58 @@ def test_net_profit_must_equal_gross_profit_plus_gross_loss(session: Session) ->
         session.commit()
 
 
+def test_an_account_that_went_below_zero_is_recorded_with_its_ruin(session: Session) -> None:
+    """02/10: a crypto spread wider than an M5 stop lost more than the account in one trade. The
+    drawdown past 100 % used to fail the run on a CHECK; it is the ruin it was, with its date."""
+    backtest = a_backtest(session)
+    ruined = dt.datetime(2024, 3, 1, 10, tzinfo=dt.UTC)
+    session.add(
+        BacktestMetrics(
+            backtest_id=backtest.id,
+            net_profit=Decimal("-21793.95"),
+            gross_profit=Decimal("0"),
+            gross_loss=Decimal("-21793.95"),
+            total_trades=44,
+            long_trades=44,
+            short_trades=0,
+            win_rate=Decimal("0"),
+            max_drawdown_abs=Decimal("21793.95"),
+            max_drawdown_pct=Decimal("2.179395"),
+            max_dd_duration_days=3,
+            equity_curve=[],
+            ruined_at=ruined,
+        )
+    )
+    session.commit()
+
+    row = session.get(BacktestMetrics, backtest.id)
+    assert row is not None
+    assert row.ruined_at == ruined
+
+
+def test_a_drawdown_is_never_negative(session: Session) -> None:
+    backtest = a_backtest(session)
+    session.add(
+        BacktestMetrics(
+            backtest_id=backtest.id,
+            net_profit=Decimal("0"),
+            gross_profit=Decimal("0"),
+            gross_loss=Decimal("0"),
+            total_trades=0,
+            long_trades=0,
+            short_trades=0,
+            win_rate=Decimal("0"),
+            max_drawdown_abs=Decimal("0"),
+            max_drawdown_pct=Decimal("-0.1"),
+            max_dd_duration_days=0,
+            equity_curve=[],
+        )
+    )
+
+    with pytest.raises(IntegrityError, match="max_drawdown_pct_non_negative"):
+        session.commit()
+
+
 def test_the_trade_counts_must_add_up(session: Session) -> None:
     backtest = a_backtest(session)
     session.add(

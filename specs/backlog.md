@@ -2971,3 +2971,21 @@ varredura-mãe recortados em anos inteiros (`year_cut`), sem rodar nada — e os
   varredura comum. Para rodar uma base de ML ativo por ativo pela fila, o modelo precisa do campo.
 - **Combinar varreduras** só marca a combinada como "todos os trades" quando todas as partes são.
 - **Espaço não medido ainda:** medir na primeira base (MM9 para ML, 16 ativos) antes de crescer.
+
+## Os testes de broker falham com o sistema rodando (02/10) — PENDENTE
+
+`apps/api/tests/test_broker_integration.py` falha 5 de 8 localmente quando a pilha está de pé (agente do
+coletor e workers do Xeon ligados ao mesmo Redis), também no `develop`. No CI, isolado, passa. Os testes leem
+e escrevem streams/chaves no Redis do `.env`, o mesmo do sistema em uso. Conserto provável: um banco Redis
+próprio para os testes (`REDIS_DB` de teste, como o `POSTGRES_DB=tradeforge_test`), ou prefixo de chaves.
+
+## Ruína e spread proporcional (02/10, PR-377) — o que ficou para depois
+
+- **Só a varredura cota o spread de cripto.** Um backtest avulso, um estudo ou uma cesta da mesma cripto
+  continuam cobrando pontos fixos: resultados não comparáveis com os da varredura.
+- **O preço de referência é o último fechamento do dia do lançamento**: o mesmo corpo de varredura, lançado
+  em dias diferentes, grava `cost_model` diferente e não reaproveita runs de cripto entre esses dias.
+- **Cripto sem D1/H4/H1 nos últimos 60 dias** volta a cobrar pontos fixos sem avisar.
+- **Drawdown acima de 1 no ranking e no dataset** (piso, mediana, `/best`): não conferido.
+- **Ordem em repouso preenche depois da ruína** (o motor só para o dimensionamento) — hoje os setups
+  descartam a ordem em repouso ao abrir posição, então não acontece; um setup novo pode mudar isso.

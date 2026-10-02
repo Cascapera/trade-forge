@@ -299,6 +299,7 @@ def _metrics_row(metrics: RunMetrics, backtest_id: uuid.UUID) -> BacktestMetrics
         expectancy=metrics.expectancy,
         max_drawdown_abs=metrics.max_drawdown_abs,
         max_drawdown_pct=metrics.max_drawdown_pct,
+        ruined_at=metrics.ruined_at,
         # The column is granular to the day (PR-101); a sub-day drawdown maps to 0.
         max_dd_duration_days=metrics.max_drawdown_duration.days,
         sharpe=metrics.sharpe,

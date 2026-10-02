@@ -52,7 +52,7 @@ class BacktestMetrics:
     expectancy: Money | None  # net profit / trade
 
     max_drawdown_abs: Money
-    max_drawdown_pct: Money  # a fraction in [0, 1]
+    max_drawdown_pct: Money  # a fraction, above 1 only for an account that went below zero
     max_drawdown_duration: dt.timedelta
 
     sharpe: Money | None
@@ -62,6 +62,20 @@ class BacktestMetrics:
     avg_trade_duration: dt.timedelta | None
 
     equity_curve: tuple[EquityPoint, ...]
+
+    ruined_at: dt.datetime | None = None
+    """The close at which the account's equity first reached zero or below (02/10), or `None`.
+
+    ⚠️ **Recorded, not prevented.** A position sized on its stop can lose more than the account
+    when its costs dwarf that stop — a crypto spread wider than an M5 stop cost 9 to 30 R a
+    trade — and the account then sits below zero, as a broker without negative-balance
+    protection would leave it; the drawdown says how far below zero it went.
+
+    ⚠️ **No order is sized while equity is at or below zero** (`PercentRiskManager` sizes on it),
+    but the engine stops nothing else: an order resting since before the ruin still fills, and an
+    open position can bring equity back above zero, after which orders are sized again. Today's
+    setups rest one order and drop it when a position opens (engine-guardian, 02/10), so in
+    practice a ruined run stops trading; `ruined_at` stays the first close at or below zero."""
 
 
 def compute_metrics(
@@ -124,6 +138,7 @@ def _compute(
         cagr=cagr,
         avg_trade_duration=avg_duration,
         equity_curve=tuple(equity_curve),
+        ruined_at=next((point.time for point in equity_curve if point.equity <= ZERO), None),
     )
 
 

@@ -36,6 +36,7 @@ from tradeforge_engine import (
     InstrumentSpec,
     NoCostModel,
     PercentRiskManager,
+    ProportionalSpreadCostModel,
     SpreadCostModel,
     SwapRates,
     compile_strategy,
@@ -136,6 +137,19 @@ def build_cost_model(spec: Mapping[str, Any]) -> CostModel:
     kind = spec.get("type")
     if kind == "none":
         return NoCostModel()
+    if kind in {"spread", "spread_commission"} and spec.get("spread_reference_price") is not None:
+        # The spread quoted at one price, charged in proportion to each fill's (02/10): a crypto's
+        # price moved by multiples over the years a run covers (`ProportionalSpreadCostModel`).
+        spread: CostModel = ProportionalSpreadCostModel(
+            spread_points=_decimal(spec["spread_points"]),
+            reference_price=_decimal(spec["spread_reference_price"]),
+        )
+        if kind == "spread":
+            return spread
+        return CombinedCostModel(
+            spread,
+            CommissionCostModel(commission_per_unit=_decimal(spec["commission_per_unit"])),
+        )
     if kind == "spread":
         return SpreadCostModel(spread_points=_decimal(spec["spread_points"]))
     if kind == "commission":

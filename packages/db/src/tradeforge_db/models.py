@@ -1099,6 +1099,10 @@ class BacktestMetrics(Base):
     losing_streak: Mapped[int | None] = mapped_column(Integer)
     losing_streak_r: Mapped[Decimal | None] = mapped_column(RATIO)
     positive_year_share: Mapped[Decimal | None] = mapped_column(RATIO)
+    # The close at which the equity first reached zero or below (rev_0046, 02/10): the account
+    # was ruined there and no order could be sized after it. Null for a run that never was, and
+    # for every run recorded before — none of which reached zero, or it could not be recorded.
+    ruined_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
     # `{"2019": "3.25", ...}` — R per calendar year of entry, for the years that had a trade.
     yearly_r: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     # `{"2019": {"2019": "2.5", "2020": "-1"}, ...}` — R by year of entry, then year of exit
@@ -1127,7 +1131,10 @@ class BacktestMetrics(Base):
         CheckConstraint("total_trades >= 0", name="total_trades_non_negative"),
         CheckConstraint("win_rate BETWEEN 0 AND 1", name="win_rate_is_a_fraction"),
         CheckConstraint("max_drawdown_abs >= 0", name="max_drawdown_abs_non_negative"),
-        CheckConstraint("max_drawdown_pct BETWEEN 0 AND 1", name="max_drawdown_pct_is_a_fraction"),
+        # Above 1 for an account that went below zero (rev_0046): a crypto spread wider than an M5
+        # stop lost more than the account in one trade, and the CHECK turned the run into a
+        # failure instead of the ruin it was. `ruined_at` names those runs.
+        CheckConstraint("max_drawdown_pct >= 0", name="max_drawdown_pct_non_negative"),
         CheckConstraint("max_dd_duration_days >= 0", name="max_dd_duration_non_negative"),
         CheckConstraint(
             "max_drawdown_r IS NULL OR max_drawdown_r >= 0", name="max_drawdown_r_non_negative"

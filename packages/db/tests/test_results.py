@@ -431,6 +431,24 @@ def test_metrics_row_carries_every_field_across() -> None:
     assert row.avg_trade_duration == dt.timedelta(minutes=30)
 
 
+def test_the_ruin_is_carried_across_and_its_absence_too() -> None:
+    """02/10: `ruined_at` is the one way to find in the database the runs that lost the account."""
+    ruined = START + 3 * HOUR
+    row, _ = to_rows(
+        trades=[],
+        metrics=a_metrics(ruined_at=ruined, max_drawdown_pct=Decimal("2.18")),
+        backtest_id=BACKTEST_ID,
+        instrument_id=INSTRUMENT_ID,
+    )
+    whole, _ = to_rows(
+        trades=[], metrics=a_metrics(), backtest_id=BACKTEST_ID, instrument_id=INSTRUMENT_ID
+    )
+
+    assert row.ruined_at == ruined
+    assert row.max_drawdown_pct == Decimal("2.18")
+    assert whole.ruined_at is None
+
+
 def test_drawdown_duration_is_stored_as_whole_days() -> None:
     """The column is granular to the day (PR-101). Three days and four hours is three days;
     a sub-day drawdown is zero."""

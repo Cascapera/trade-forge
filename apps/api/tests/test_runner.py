@@ -192,6 +192,37 @@ def test_a_spread_and_commission_model_charges_exactly_both() -> None:
     ]
 
 
+def test_a_spread_quoted_at_a_price_is_charged_in_proportion() -> None:
+    """02/10: a crypto's spread scales with the price (`ProportionalSpreadCostModel`). Quoted at
+    twice the run's prices, it charges half of what the same points charge flat."""
+    flat, _, _, _ = run_it(cost_model={"type": "spread", "spread_points": 20})
+    reference = dip_then_rally()[0].close * 2
+    scaled, _, _, _ = run_it(
+        cost_model={
+            "type": "spread",
+            "spread_points": 20,
+            "spread_reference_price": str(reference),
+        }
+    )
+    # A raw-spread crypto account pays its commission too, on each leg (engine-guardian, 02/10).
+    commissioned, _, _, _ = run_it(
+        cost_model={
+            "type": "spread_commission",
+            "spread_points": 20,
+            "commission_per_unit": 7,
+            "spread_reference_price": str(reference),
+        }
+    )
+
+    assert scaled
+    for one, other in zip(scaled, flat, strict=True):
+        assert one.costs < other.costs
+        assert one.costs > other.costs / 3
+    assert [trade.costs for trade in commissioned] == [
+        trade.costs + 2 * 7 * trade.volume for trade in scaled
+    ]
+
+
 def test_an_unknown_cost_model_raises() -> None:
     with pytest.raises(ValueError, match="unknown cost model type"):
         run_it(cost_model={"type": "teleport"})

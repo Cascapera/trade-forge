@@ -275,7 +275,9 @@ describe('SweepResult', () => {
 
     renderWithProviders(<SweepResult />)
 
-    expect(screen.getByRole('heading', { level: 2 })).toHaveTextContent('2 entries over 3 backtests')
+    expect(screen.getByRole('heading', { level: 2 })).toHaveTextContent(
+      '2 entries over 3 backtests',
+    )
     expect(
       screen.getByText('EURUSD, GBPUSD · M15, H1 · 2024-01-01 → 2024-02-01 · 10,000.00 per run'),
     ).toBeInTheDocument()
@@ -301,6 +303,25 @@ describe('SweepResult', () => {
     expect(warning).toHaveTextContent('Left out — no candles in this window for 2 pairs:')
     expect(warning).toHaveTextContent('GBPUSD H1 — never collected')
     expect(warning).toHaveTextContent('EURUSD H1 — collected 2020-01-01 to 2021-01-01')
+  })
+
+  it('says where a pair started later, at its first year of real bars', () => {
+    // 02/10: before 2017-2018 the broker's intraday history of its metals, indices and cryptos is
+    // one bar a day stored as the chart; the launch cut those pairs and the sweep says so.
+    showing(
+      sweep({
+        skipped: [{ symbol: 'XRPUSD', timeframe: 'M15', covers: 'real bars only from 2018-01-01' }],
+        trimmed: [{ symbol: 'GOLD', timeframe: 'M15', date_from: '2018-01-01T00:00:00Z' }],
+      }),
+    )
+
+    renderWithProviders(<SweepResult />)
+
+    const cut = screen.getByRole('status', { name: 'cut to real bars' })
+    expect(cut).toHaveTextContent('GOLD M15 — from 2018-01-01')
+    expect(screen.getByRole('status', { name: 'left out' })).toHaveTextContent(
+      'XRPUSD M15 — real bars only from 2018-01-01',
+    )
   })
 
   it('says which downloads failed, apart from the pairs that were left out', () => {
@@ -517,7 +538,12 @@ describe('SweepResult', () => {
     })
     showing(
       sweep({
-        runs: [row('a1', ALPHA, 'M15', '-200'), row('z5', ZETA, 'M15 · period=5', '200'), kept, ...copies],
+        runs: [
+          row('a1', ALPHA, 'M15', '-200'),
+          row('z5', ZETA, 'M15 · period=5', '200'),
+          kept,
+          ...copies,
+        ],
       }),
     )
     renderWithProviders(<SweepResult />)
@@ -800,7 +826,9 @@ describe('SweepResult — read without its runs', () => {
     renderWithProviders(<SweepResult />, '/sweeps/sweep-1')
 
     expect(screen.getByText(/over 22176 backtests/)).toBeInTheDocument()
-    expect(screen.getByRole('status')).toHaveTextContent('22000 of 22176 done · 6 running · 170 queued')
+    expect(screen.getByRole('status')).toHaveTextContent(
+      '22000 of 22176 done · 6 running · 170 queued',
+    )
   })
 
   it('asks each entry for its own page, and stops asking once the sweep has landed', () => {

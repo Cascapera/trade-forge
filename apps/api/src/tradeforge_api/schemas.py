@@ -2721,6 +2721,8 @@ class SweepOut(BaseModel):
     """How those points were chosen — `metric`, `top_n`, `min_trades` per chart."""
     keep_all_trades: bool = False
     """Every run keeps its trades, won or lost (02/10): a base for meta-labeling (ADR-0031)."""
+    trimmed: list[TrimmedMarket] = Field(default_factory=list)
+    """Pairs whose runs start at their first year of real bars, later than the window (02/10)."""
     counts: SweepRunCounts | None = None
     """How many runs sit in each status — what a screen polls on, without the runs themselves."""
     entries: list[SweepEntryOut]
@@ -2978,6 +2980,14 @@ class DatasetDictionaryOut(BaseModel):
     omitted: list[DatasetOmissionOut]
 
 
+class TrimmedMarket(BaseModel):
+    """A pair whose runs start later than the sweep's window: at its first year of real bars."""
+
+    symbol: str
+    timeframe: str
+    date_from: dt.datetime
+
+
 class CreatedSweep(BaseModel):
     id: uuid.UUID
     runs: int
@@ -2986,6 +2996,9 @@ class CreatedSweep(BaseModel):
     skipped: list[UncoveredMarket] = Field(default_factory=list)
     """Pairs left out for having no candles in the window — his answer "do not collect" (18/09).
     The same list the sweep keeps (`SweepOut.skipped`), so the launch and a later read agree."""
+    trimmed: list[TrimmedMarket] = Field(default_factory=list)
+    """Pairs whose runs start at their first year of real bars, later than the window asked
+    (02/10): before it the broker's intraday history is one bar a day stored as the chart."""
 
 
 class BestMapCell(BaseModel):

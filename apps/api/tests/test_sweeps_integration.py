@@ -59,7 +59,7 @@ from tradeforge_db.models import (
     SymbolHistory,
     Trade,
 )
-from tradeforge_engine.domain import AssetClass, Side
+from tradeforge_engine.domain import AssetClass, Candle, Side
 
 from .collector_fakes import running
 
@@ -1926,6 +1926,18 @@ class TestTheDashboard:
         assert one == three, f"one sweep took {one} queries and three took {three}"
 
 
+def no_candles(
+    root: Path,
+    symbol: str,
+    timeframe: str,
+    *,
+    start: dt.datetime | None = None,
+    end: dt.datetime | None = None,
+) -> list[Candle]:
+    """A `CandleReader` with nothing on disk — for a replay that needs no bars."""
+    return []
+
+
 def finish_trading(
     session_factory: Callable[[], Session], run_id: str, net: int, trades: int
 ) -> None:
@@ -2248,7 +2260,7 @@ class TestClusters:
                 session=session,
                 parquet_root=Path("unused"),
                 cluster_id=uuid.UUID(body["id"]),
-                read=lambda _root, _symbol, _timeframe: [],
+                read=no_candles,
             )
         read = client.get(f"/clusters/{body['id']}").json()
 
@@ -2348,7 +2360,7 @@ class TestClusterMembersRunAgain:
                     session=session,
                     parquet_root=Path("unused"),
                     cluster_id=uuid.UUID(body["id"]),
-                    read=lambda _root, _symbol, _timeframe: [],
+                    read=no_candles,
                 )
 
         assert work() is True
@@ -2409,7 +2421,7 @@ class TestClusterMembersRunAgain:
                 session=session,
                 parquet_root=Path("unused"),
                 cluster_id=uuid.UUID(body["id"]),
-                read=lambda _root, _symbol, _timeframe: [],
+                read=no_candles,
             )
 
         read = client.get(f"/clusters/{body['id']}").json()

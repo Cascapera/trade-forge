@@ -16,7 +16,7 @@ at construction instead of as a strategy that mysteriously prints money.
 """
 
 from collections.abc import Sequence
-from decimal import Decimal
+from decimal import ROUND_HALF_EVEN, Decimal
 
 from tradeforge_engine.domain import ZERO, Candle, InstrumentSpec, Money, OrderRequest, Volume
 from tradeforge_engine.protocols import CostModel
@@ -65,6 +65,11 @@ class SpreadCostModel:
         return self._half_spread(instrument, order.volume)
 
 
+COST_QUANTUM = Decimal("1e-10")
+"""The precision a cost that does not terminate is rounded to — far below a cent, and far below the
+eight decimals a stored amount keeps, so no recorded money changes."""
+
+
 class ProportionalSpreadCostModel:
     """A spread quoted in points at one price, charged in proportion to the price of each fill
     (02/10) — for a market whose price moved by multiples over the years a run covers.
@@ -87,7 +92,13 @@ class ProportionalSpreadCostModel:
 
     def _half_spread(self, instrument: InstrumentSpec, volume: Volume, price: Money) -> Money:
         points = self._spread_points * price / self._reference_price
-        return (points / 2) * instrument.tick_value * volume
+        # ⚠️ Rounded to `COST_QUANTUM`: the division by the reference price is the first cost in
+        # the engine that does not terminate, and a ledger summing unterminated costs drifts from
+        # its own balance in the twentieth decimal (engine-guardian, 02/10) — `sum(net_pnl) ==
+        # final equity - initial capital` must hold exactly.
+        return ((points / 2) * instrument.tick_value * volume).quantize(
+            COST_QUANTUM, rounding=ROUND_HALF_EVEN
+        )
 
     def entry_cost(  # the bar is not consulted: the fill's own price scales the spread
         self,

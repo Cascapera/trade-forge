@@ -4249,6 +4249,23 @@ class TestEachMarketPaysItsOwnCosts:
             session.commit()
         today = dt.datetime.now(tz=dt.UTC).replace(hour=0, minute=0, second=0, microsecond=0)
         level = Decimal("2.5")
+        # The pair has a price on disk too: a `_priced` that quoted every market would quote it
+        # (engine-guardian, 02/10), and a pair with nothing to quote at would prove nothing.
+        write_candles(
+            tmp_path,
+            "EURUSD",
+            "D1",
+            [
+                Candle(
+                    time=today - dt.timedelta(days=1),
+                    open=Decimal("1.1"),
+                    high=Decimal("1.1"),
+                    low=Decimal("1.1"),
+                    close=Decimal("1.1"),
+                    tick_volume=1,
+                )
+            ],
+        )
         write_candles(
             tmp_path,
             "USDJPY",

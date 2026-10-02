@@ -69,8 +69,13 @@ class BacktestMetrics:
     ⚠️ **Recorded, not prevented.** A position sized on its stop can lose more than the account
     when its costs dwarf that stop — a crypto spread wider than an M5 stop cost 9 to 30 R a
     trade — and the account then sits below zero, as a broker without negative-balance
-    protection would leave it. From that close no order can be sized (`PercentRiskManager` sizes
-    on equity), so the run stops opening trades; the drawdown says how far below zero it went."""
+    protection would leave it; the drawdown says how far below zero it went.
+
+    ⚠️ **No order is sized while equity is at or below zero** (`PercentRiskManager` sizes on it),
+    but the engine stops nothing else: an order resting since before the ruin still fills, and an
+    open position can bring equity back above zero, after which orders are sized again. Today's
+    setups rest one order and drop it when a position opens (engine-guardian, 02/10), so in
+    practice a ruined run stops trading; `ruined_at` stays the first close at or below zero."""
 
 
 def compute_metrics(

@@ -10,8 +10,11 @@ import datetime as dt
 from decimal import Decimal
 
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 from tradeforge_engine.costs import (
+    COST_QUANTUM,
     BarSpreadCostModel,
     CombinedCostModel,
     CommissionCostModel,
@@ -19,7 +22,7 @@ from tradeforge_engine.costs import (
     ProportionalSpreadCostModel,
     SpreadCostModel,
 )
-from tradeforge_engine.domain import OrderRequest, Side, SignalKind
+from tradeforge_engine.domain import ZERO, OrderRequest, Side, SignalKind
 from tradeforge_engine.testing import AAPL, EURUSD, bar
 
 T0 = dt.datetime(2024, 1, 1, tzinfo=dt.UTC)
@@ -219,6 +222,36 @@ class TestProportionalSpread:
         model = ProportionalSpreadCostModel(spread_points=Decimal(10), reference_price=Decimal(1))
 
         assert model.entry_cost(an_order(), EURUSD, Decimal(1), A_BAR) == Decimal(5)
+
+    def test_the_ticks_are_worth_the_instruments_tick_value(self) -> None:
+        """AAPL's tick is worth $0.01: 100 points at the reference price, half on the entry, at
+        one unit, is 50 ticks = $0.50 — not the $50 a model that dropped `tick_value` charges."""
+        model = ProportionalSpreadCostModel(
+            spread_points=Decimal(100), reference_price=Decimal(200)
+        )
+
+        assert model.entry_cost(an_order(), AAPL, Decimal(200), A_BAR) == Decimal("0.5")
+
+    def test_a_spread_of_zero_charges_nothing(self) -> None:
+        model = ProportionalSpreadCostModel(spread_points=ZERO, reference_price=Decimal(1))
+
+        assert model.entry_cost(an_order(), EURUSD, Decimal("1.1"), A_BAR) == ZERO
+
+    @given(
+        price=st.decimals(min_value=Decimal("0.0001"), max_value=Decimal(100_000), places=4),
+        volume=st.decimals(min_value=Decimal("0.01"), max_value=Decimal(100), places=2),
+    )
+    def test_every_cost_terminates_so_the_ledger_balances_exactly(
+        self, price: Decimal, volume: Decimal
+    ) -> None:
+        """A division by the reference price need not terminate; summed unrounded, a ledger
+        drifts from its balance in the twentieth decimal (engine-guardian, 02/10)."""
+        model = ProportionalSpreadCostModel(spread_points=Decimal(7), reference_price=Decimal(3))
+
+        cost = model.entry_cost(an_order(str(volume)), EURUSD, price, A_BAR)
+
+        assert cost == cost.quantize(COST_QUANTUM)
+        assert cost.as_tuple().exponent >= COST_QUANTUM.as_tuple().exponent  # type: ignore[operator]
 
     @pytest.mark.parametrize(("points", "price"), [("-1", "1"), ("1", "0"), ("1", "-2")])
     def test_a_negative_spread_or_a_price_that_is_not_positive_is_refused(

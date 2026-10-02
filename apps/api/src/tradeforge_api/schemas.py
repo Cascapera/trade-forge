@@ -415,11 +415,15 @@ class MetricsOut(_Out):
     expectancy: Money | None
     max_drawdown_abs: Money
     max_drawdown_pct: Money
+    """A fraction of the peak; above 1 only for an account that went below zero (`ruined_at`)."""
     max_dd_duration_days: int
     sharpe: Money | None
     sortino: Money | None
     cagr: Money | None
     avg_trade_duration: dt.timedelta | None
+    ruined_at: dt.datetime | None = None
+    """The close at which the account first reached zero or below (02/10): from there no order
+    could be sized. Null for a run that never was."""
 
     # In R (25/09, `r_metrics`). All null for a run recorded before them.
     net_r: Money | None = None

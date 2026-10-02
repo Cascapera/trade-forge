@@ -41,6 +41,7 @@ from tradeforge_api.routers import sweeps as sweeps_router
 from tradeforge_api.routers.strategies import refusal_of
 from tradeforge_api.sweep_walkforward_job import advance
 from tradeforge_api.template_queue_job import advance_queue
+from tradeforge_collector import write_candles
 from tradeforge_db.broker_symbols import BrokerSymbolEntry, replace_snapshot
 from tradeforge_db.models import (
     Backtest,
@@ -4236,6 +4237,70 @@ class TestEachMarketPaysItsOwnCosts:
             "commission_per_unit": "0",
         }
         assert charged["EURUSD"]["commission_per_unit"] == "3.5"
+
+    def test_a_cryptos_spread_is_quoted_at_its_last_close(
+        self, client: Any, session_factory: Callable[[], Session], tmp_path: Path
+    ) -> None:
+        """02/10: a crypto's spread in points is today's, and its price moved by multiples over the
+        years a run covers; the run is charged in proportion, from the last close on disk."""
+        with session_factory() as session:
+            crypto = session.scalars(select(Instrument).where(Instrument.symbol == "USDJPY")).one()
+            crypto.asset_class = AssetClass.CRYPTO
+            session.commit()
+        today = dt.datetime.now(tz=dt.UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+        level = Decimal("2.5")
+        write_candles(
+            tmp_path,
+            "USDJPY",
+            "D1",
+            [
+                Candle(
+                    time=today - dt.timedelta(days=days),
+                    open=level,
+                    high=level + Decimal(days) / 100,
+                    low=level,
+                    close=level + Decimal(days) / 100,
+                    tick_volume=1,
+                )
+                for days in (5, 3, 1)
+            ],
+        )
+        entry = an_entry(client, name=f"quoted {uuid.uuid4()}")
+        body = {
+            **a_sweep_body([entry], ["EURUSD", "USDJPY"], ["H1"]),
+            "cost_model": {
+                "type": "per_market",
+                "markets": {"EURUSD": {"spread_points": "8"}, "USDJPY": {"spread_points": "100"}},
+            },
+        }
+
+        launched = client.post("/sweeps", json=body)
+
+        assert launched.status_code == 202, launched.text
+        runs = client.get(f"/sweeps/{launched.json()['id']}").json()["runs"]
+        charged = {row["run"]["symbol"]: row["run"]["cost_model"] for row in runs}
+        assert Decimal(charged["USDJPY"]["spread_reference_price"]) == Decimal("2.51")  # last close
+        assert charged["USDJPY"]["spread_points"] == "100"
+        assert "spread_reference_price" not in charged["EURUSD"]  # a currency pair keeps points
+
+    def test_a_crypto_with_nothing_on_disk_keeps_its_points(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        with session_factory() as session:
+            crypto = session.scalars(select(Instrument).where(Instrument.symbol == "USDJPY")).one()
+            crypto.asset_class = AssetClass.CRYPTO
+            session.commit()
+        entry = an_entry(client, name=f"unquoted {uuid.uuid4()}")
+        body = {
+            **a_sweep_body([entry], ["USDJPY"], ["H1"]),
+            "cost_model": {"type": "per_market", "markets": {"USDJPY": {"spread_points": "100"}}},
+        }
+
+        launched = client.post("/sweeps", json=body)
+
+        assert launched.status_code == 202, launched.text
+        (row, *_rest) = client.get(f"/sweeps/{launched.json()['id']}").json()["runs"]
+        assert "spread_reference_price" not in row["run"]["cost_model"]
 
     def test_a_market_left_out_of_the_typed_costs_is_refused_by_name(self, client: Any) -> None:
         entry = an_entry(client, name=f"half typed {uuid.uuid4()}")

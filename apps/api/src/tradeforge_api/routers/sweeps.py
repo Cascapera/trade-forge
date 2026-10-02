@@ -30,6 +30,7 @@ import threading
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from decimal import Decimal
+from pathlib import Path
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response, status
@@ -146,6 +147,7 @@ from tradeforge_api.sweep import (
 )
 from tradeforge_api.sweep_dataset import CAVEATS, OMITTED, ROW, DatasetRun, columns_for, to_csv
 from tradeforge_api.targets import rungs_of
+from tradeforge_collector import read_candles
 from tradeforge_collector.collect import year_slices
 from tradeforge_db.base import Base
 from tradeforge_db.collections import create_collection
@@ -168,6 +170,7 @@ from tradeforge_db.models import (
     Trade,
 )
 from tradeforge_db.models import SweepPoint as PointRow
+from tradeforge_engine.domain import AssetClass
 from tradeforge_engine.setup_factory import unread_params
 
 router = APIRouter(tags=["sweeps"])
@@ -465,7 +468,13 @@ async def create_sweep(
     if request.collect_missing and not collector.alive():
         request = request.model_copy(update={"collect_missing": False})
     sweep, jobs, collections, shared_count, skipped = await asyncio.to_thread(
-        functools.partial(launch_sweep, session, request, batch=settings.tradeforge_batch)
+        functools.partial(
+            launch_sweep,
+            session,
+            request,
+            batch=settings.tradeforge_batch,
+            parquet_root=settings.parquet_root,
+        )
     )
 
     # ⚠️ After the commit, and with the run's own id as the job id. A worker is fast enough to
@@ -495,6 +504,7 @@ def launch_sweep(
     *,
     template_id: uuid.UUID | None = None,
     batch: bool = True,
+    parquet_root: Path | None = None,
 ) -> tuple[Sweep, list[list[uuid.UUID]], list[Collection], int, list[UncoveredMarket]]:
     """Decide, write and commit a sweep — the endpoint's body, shared with a template's queue
     (`sweep_templates`, 26/09), which launches one market at a time. Returns the runs to queue as
@@ -528,7 +538,11 @@ def launch_sweep(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=f"unknown symbols: {', '.join(unknown)}",
         )
-    costs = _costs_for(request.cost_model, found)
+    costs = _priced(
+        _costs_for(request.cost_model, found),
+        found,
+        Settings().parquet_root if parquet_root is None else parquet_root,
+    )
     streams = streams_of(pairs, timeframes)
 
     planned = (
@@ -890,6 +904,47 @@ def _costs_for(
                 detail=f"cost model cannot be charged: {exc}",
             ) from exc
     return resolved
+
+
+QUOTE_LOOKBACK = dt.timedelta(days=60)
+"""How far back the price a crypto's spread was quoted at is looked for: its last close."""
+
+
+def _priced(
+    costs: dict[str, dict[str, Any]], instruments: Mapping[str, Instrument], parquet_root: Path
+) -> dict[str, dict[str, Any]]:
+    """Each crypto's spread charged in proportion to the price (02/10): the spread typed is
+    today's, quoted at the last close on disk, which the document keeps as
+    `spread_reference_price` (`ProportionalSpreadCostModel`).
+
+    ⚠️ **Crypto only, and only with a spread in points.** A currency pair's or an index's price
+    stays within a small factor over the years a run covers, and its spread in points is the
+    right figure for all of them. A crypto's moved by multiples: XRP's 100-point spread, quoted at
+    $2.50, was 5 % of a 2020 price and charged twelve times what the venue did. A market with
+    nothing on disk to quote at keeps its points, as before.
+    """
+    priced: dict[str, dict[str, Any]] = {}
+    for symbol, model in costs.items():
+        instrument = instruments[symbol]
+        quoted = (
+            _last_close(parquet_root, symbol)
+            if instrument.asset_class is AssetClass.CRYPTO
+            and model.get("type") in {"spread", "spread_commission"}
+            and model.get("spread_points") is not None
+            else None
+        )
+        priced[symbol] = model if quoted is None else {**model, "spread_reference_price": quoted}
+    return priced
+
+
+def _last_close(parquet_root: Path, symbol: str) -> str | None:
+    """The last close on disk within `QUOTE_LOOKBACK`, on the longest chart that has one."""
+    since = dt.datetime.now(tz=dt.UTC) - QUOTE_LOOKBACK
+    for timeframe in ("D1", "H4", "H1"):
+        bars = read_candles(parquet_root, symbol, timeframe, start=since)
+        if bars:
+            return str(bars[-1].close)
+    return None
 
 
 def _typed(market: object) -> dict[str, Any]:

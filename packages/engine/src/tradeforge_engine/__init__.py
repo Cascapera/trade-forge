@@ -24,6 +24,7 @@ from tradeforge_engine.costs import (
     CombinedCostModel,
     CommissionCostModel,
     NoCostModel,
+    ProportionalSpreadCostModel,
     SpreadCostModel,
 )
 from tradeforge_engine.domain import (
@@ -96,6 +97,7 @@ __all__ = [
     "PercentRiskManager",
     "Portfolio",
     "Position",
+    "ProportionalSpreadCostModel",
     "RiskManager",
     "RunResult",
     "Side",

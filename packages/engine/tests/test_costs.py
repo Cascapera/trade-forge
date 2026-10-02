@@ -16,6 +16,7 @@ from tradeforge_engine.costs import (
     CombinedCostModel,
     CommissionCostModel,
     NoCostModel,
+    ProportionalSpreadCostModel,
     SpreadCostModel,
 )
 from tradeforge_engine.domain import OrderRequest, Side, SignalKind
@@ -186,3 +187,44 @@ def test_a_combined_model_asks_each_part_for_the_same_leg() -> None:
     model = CombinedCostModel(_Uneven(), SpreadCostModel(spread_points=Decimal(10)))
     assert model.entry_cost(an_order(), EURUSD, Decimal("1.1"), A_BAR) == Decimal(6)
     assert model.exit_cost(an_order(), EURUSD, Decimal("1.1"), A_BAR) == Decimal(7)
+
+
+class TestProportionalSpread:
+    """02/10: XRP's 100-point spread, quoted at $2.50, was 5 % of a 2020 price in points."""
+
+    def test_at_the_price_it_was_quoted_at_it_is_the_spread_in_points(self) -> None:
+        fixed = SpreadCostModel(spread_points=Decimal(10))
+        scaled = ProportionalSpreadCostModel(
+            spread_points=Decimal(10), reference_price=Decimal("1.10000")
+        )
+
+        price = Decimal("1.10000")
+        assert scaled.entry_cost(an_order(), EURUSD, price, A_BAR) == (
+            fixed.entry_cost(an_order(), EURUSD, price, A_BAR)
+        )
+
+    def test_a_tenth_of_the_price_pays_a_tenth_of_the_spread_on_each_leg(self) -> None:
+        model = ProportionalSpreadCostModel(
+            spread_points=Decimal(100), reference_price=Decimal("2.5")
+        )
+
+        entry = model.entry_cost(an_order(), EURUSD, Decimal("0.25"), A_BAR)
+        exit_ = model.exit_cost(an_order("2"), EURUSD, Decimal("0.25"), A_BAR)
+
+        assert entry == Decimal(5)  # 10 points at a tenth of the price, half of it, $1 a point
+        assert exit_ == Decimal(10)  # and twice the volume
+
+    def test_the_bar_is_not_what_it_reads_the_fill_price_is(self) -> None:
+        """`A_BAR` quotes a spread of 40: a model reading it would charge 20, not 5."""
+        model = ProportionalSpreadCostModel(spread_points=Decimal(10), reference_price=Decimal(1))
+
+        assert model.entry_cost(an_order(), EURUSD, Decimal(1), A_BAR) == Decimal(5)
+
+    @pytest.mark.parametrize(("points", "price"), [("-1", "1"), ("1", "0"), ("1", "-2")])
+    def test_a_negative_spread_or_a_price_that_is_not_positive_is_refused(
+        self, points: str, price: str
+    ) -> None:
+        with pytest.raises(ValueError, match=r"magnitude|positive"):
+            ProportionalSpreadCostModel(
+                spread_points=Decimal(points), reference_price=Decimal(price)
+            )

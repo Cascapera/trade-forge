@@ -65,6 +65,49 @@ class SpreadCostModel:
         return self._half_spread(instrument, order.volume)
 
 
+class ProportionalSpreadCostModel:
+    """A spread quoted in points at one price, charged in proportion to the price of each fill
+    (02/10) — for a market whose price moved by multiples over the years a run covers.
+
+    A spread in points is what a broker quotes today. On a currency pair it is the right figure
+    for every year: EURUSD has stayed within a factor of two. On a crypto it is not: XRP was
+    $0.20 in 2020 and $2.50 when its 100-point spread was quoted, so the same points were 5 % of
+    the price then and 0.4 % now, and a run over 2020 paid twelve times what the venue charged.
+    The venue's spread scales with the price; so does this one: `spread_points · price /
+    reference_price`, half on each leg, in ticks converted the engine's one way.
+    """
+
+    def __init__(self, *, spread_points: Decimal, reference_price: Decimal) -> None:
+        if spread_points < ZERO:
+            raise ValueError(f"spread must be a magnitude, got {spread_points}")
+        if reference_price <= ZERO:
+            raise ValueError(f"a reference price must be positive, got {reference_price}")
+        self._spread_points = spread_points
+        self._reference_price = reference_price
+
+    def _half_spread(self, instrument: InstrumentSpec, volume: Volume, price: Money) -> Money:
+        points = self._spread_points * price / self._reference_price
+        return (points / 2) * instrument.tick_value * volume
+
+    def entry_cost(  # the bar is not consulted: the fill's own price scales the spread
+        self,
+        order: OrderRequest,
+        instrument: InstrumentSpec,
+        price: Money,
+        candle: Candle,  # noqa: ARG002
+    ) -> Money:
+        return self._half_spread(instrument, order.volume, price)
+
+    def exit_cost(  # see entry_cost
+        self,
+        order: OrderRequest,
+        instrument: InstrumentSpec,
+        price: Money,
+        candle: Candle,  # noqa: ARG002
+    ) -> Money:
+        return self._half_spread(instrument, order.volume, price)
+
+
 class CommissionCostModel:
     """Stocks: a flat commission per unit traded, charged on each leg.
 
@@ -212,5 +255,6 @@ __all__ = [
     "CombinedCostModel",
     "CommissionCostModel",
     "NoCostModel",
+    "ProportionalSpreadCostModel",
     "SpreadCostModel",
 ]

@@ -80,15 +80,19 @@ services:
       retries: 10
       start_period: 5s
 
-  # One-shot: bring the schema to head and seed the example instruments, then exit. api and worker
-  # wait on it completing, so migrations run exactly once — never a race between two replicas each
-  # trying to migrate the same database on startup.
+  # One-shot: bring the schema to head, then exit. api and worker wait on it completing, so
+  # migrations run exactly once — never a race between two replicas each trying to migrate the
+  # same database on startup.
+  # ⚠️ No seed here (02/10): the example instruments (`tradeforge-db seed`) came back on every
+  # deploy, and `US500` and `AAPL` sat in the symbol pickers beside the broker's real `Usa500`,
+  # with no candles and no symbol to collect them by. The collector registers every instrument it
+  # collects; a fresh clone without a broker runs the seed by hand (README, step 2).
   migrate:
     build:
       context: .
       dockerfile: apps/api/Dockerfile
     image: tradeforge-api
-    command: ['sh', '-c', 'tradeforge-db upgrade && tradeforge-db seed']
+    command: ['tradeforge-db', 'upgrade']
     environment: *backend-env
     depends_on:
       postgres:

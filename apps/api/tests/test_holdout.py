@@ -224,7 +224,7 @@ class TestNearClones:
             a_record(1, net_r="7.7", y2021="17.6"),  # another exit, the same entries as 0
             a_record(2, net_r="4.5", y2021="14.4"),
         ]
-        _asked, entries_of = reading({0: self.SAME, 1: self.SAME, 2: ((T1, "long"),)})
+        _asked, entries_of = reading({0: self.SAME, 1: self.SAME, 2: ((T1, "short"),)})
 
         chosen = choose(
             pool, metric=HoldoutRank.NET_R, top_n=2, floors=FLOORS, entries_of=entries_of
@@ -276,11 +276,56 @@ class TestNearClones:
             a_record(2, net_r="7.7", y2021="17.6"),
             a_record(3, net_r="4.5", y2021="14.4"),
         ]
-        asked, entries_of = reading({0: self.SAME, 2: ((T1, "long"),), 3: ((T2, "short"),)})
+        asked, entries_of = reading({0: self.SAME, 2: ((T1, "short"),), 3: ((T2, "long"),)})
 
         choose(pool, metric=HoldoutRank.NET_R, top_n=2, floors=FLOORS, entries_of=entries_of)
 
         assert asked == [0, 2]
+
+    def test_entries_all_within_a_better_ones_give_their_place(self) -> None:
+        """02/10: the CHoCH sweep's second best opened 270 of its best's 273 entries, and the two
+        made the same 18 trades in 2025."""
+        pool = [
+            a_record(0, net_r="9.1", y2021="19.0"),
+            a_record(1, net_r="7.7", y2021="17.6"),  # one of 0's two entries, and no other
+            a_record(2, net_r="4.5", y2021="14.4"),
+        ]
+        _asked, entries_of = reading({0: self.SAME, 1: ((T2, "short"),), 2: ((T1, "short"),)})
+
+        chosen = choose(
+            pool, metric=HoldoutRank.NET_R, top_n=2, floors=FLOORS, entries_of=entries_of
+        )
+
+        assert [one.order for one in chosen] == [0, 2]
+
+    def test_entries_holding_all_of_a_better_ones_give_their_place(self) -> None:
+        pool = [
+            a_record(0, net_r="9.1", y2021="19.0"),
+            a_record(1, net_r="7.7", y2021="17.6"),  # 0's entries, and one more
+            a_record(2, net_r="4.5", y2021="14.4"),
+        ]
+        later = dt.datetime(2021, 9, 1, 9, tzinfo=dt.UTC)
+        _asked, entries_of = reading(
+            {0: ((T1, "long"),), 1: ((T1, "long"), (later, "long")), 2: ((T2, "short"),)}
+        )
+
+        chosen = choose(
+            pool, metric=HoldoutRank.NET_R, top_n=2, floors=FLOORS, entries_of=entries_of
+        )
+
+        assert [one.order for one in chosen] == [0, 2]
+
+    def test_entries_that_only_overlap_are_another_bet(self) -> None:
+        """Nested, never "mostly the same": each opens a trade the other never does."""
+        pool = [a_record(0, net_r="9.1", y2021="19.0"), a_record(1, net_r="7.7", y2021="17.6")]
+        later = dt.datetime(2021, 9, 1, 9, tzinfo=dt.UTC)
+        _asked, entries_of = reading({0: self.SAME, 1: ((T1, "long"), (later, "short"))})
+
+        chosen = choose(
+            pool, metric=HoldoutRank.NET_R, top_n=2, floors=FLOORS, entries_of=entries_of
+        )
+
+        assert [one.order for one in chosen] == [0, 1]
 
     def test_the_same_entries_in_another_group_are_not_a_near_clone(self) -> None:
         other = ("e1", "M15", "GBPUSD")

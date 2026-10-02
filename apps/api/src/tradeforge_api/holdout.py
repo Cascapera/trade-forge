@@ -189,6 +189,14 @@ def choose(  # noqa: PLR0913 — keyword-only; each is one part of the rule
     buffer: three records in sample, one trade out of it. Read only for the runs the choice walks
     past, so a group of thousands costs a few reads. A run that kept no trades (`None`) cannot be
     compared and is kept: unknown is not the same.
+
+    ⚠️ **Nested, not only equal** (his call, 02/10): a run whose entries all lie within a chosen
+    one's, or hold all of them, is skipped too. The CHoCH sweep's second best opened 270 of its
+    best's 273 entries — a wider stop buffer skipped three — and the two made the very same 18
+    trades in 2025. No share to choose: a run that adds nothing, or only adds, is not another bet.
+    ⚠️ So a one-side point under a both-sides one is skipped too — its entries are the both-sides
+    run's shorts or longs — and that is his call, made seeing it take 48 points of CHoCH's group:
+    the both-sides test already opens those trades.
     """
     by_group: dict[tuple[str, str, str], list[tuple[Decimal, Candidate]]] = {}
     for one in candidates:
@@ -202,7 +210,7 @@ def choose(  # noqa: PLR0913 — keyword-only; each is one part of the rule
     for ranked in by_group.values():
         ranked.sort(key=lambda pair: (-pair[0], pair[1].order))
         seen: set[tuple[object, ...]] = set()
-        opened: set[Entries] = set()
+        opened: list[frozenset[tuple[dt.datetime, str]]] = []
         taken = 0
         for _value, one in ranked:
             if taken == top_n:
@@ -211,12 +219,15 @@ def choose(  # noqa: PLR0913 — keyword-only; each is one part of the rule
                 did = behaviour(one.metrics)
                 if did in seen:
                     continue
-                entries = None if entries_of is None else entries_of(one)
-                if entries is not None and entries in opened:
+                read = None if entries_of is None else entries_of(one)
+                entries = None if read is None else frozenset(read)
+                if entries is not None and any(
+                    entries <= kept or kept <= entries for kept in opened
+                ):
                     continue
                 seen.add(did)
                 if entries is not None:
-                    opened.add(entries)
+                    opened.append(entries)
             chosen.append(one)
             taken += 1
     return sorted(chosen, key=lambda one: one.order)

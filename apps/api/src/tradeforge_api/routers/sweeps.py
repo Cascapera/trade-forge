@@ -1868,9 +1868,10 @@ def launch_holdout(
             "top_n": request.top_n,
             "min_trades": {one: max(floors.get(one, 0), 1) for one in timeframes},
             "distinct": request.distinct,
-            # 02/10: a test that skipped clones skipped near-clones too — the same entries, closed
-            # some other way. Written so a test from before reads as the narrower rule it ran.
-            **({"same_entries": True} if request.distinct else {}),
+            # 02/10: a test that skipped clones skipped near-clones too — entries all within a
+            # better run's, or holding all of them. Written so a test from before reads as the
+            # narrower rule it ran.
+            **({"nested_entries": True} if request.distinct else {}),
             # Only when asked: a rule that lists no limit is a test that set none.
             **(
                 {}

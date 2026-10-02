@@ -2141,9 +2141,9 @@ class CreateHoldout(BaseModel):
     W1 — and no longer the keeping one (`retention.MIN_TRADES`), which is zero there."""
     distinct: bool = True
     """Skip a run whose record is the same as a better-ranked one's (`holdout.behaviour`), so the N
-    tested are N different behaviours and not one run N times (28/09) — and, since 02/10, one that
-    opened the same trades as a better-ranked one and closed them some other way (`same_entries`
-    in the rule)."""
+    tested are N different behaviours and not one run N times (28/09) — and, since 02/10, one whose
+    entries all lie within a better-ranked one's, or hold all of them, however it closed them
+    (`nested_entries` in the rule)."""
     retest: bool = False
     """Test again a window an earlier test of this sweep already used (01/10). Without it such a
     launch is refused with a 409 naming those tests; with it the test is kept with `retest` and

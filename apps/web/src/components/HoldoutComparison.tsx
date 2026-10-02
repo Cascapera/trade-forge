@@ -127,7 +127,7 @@ export function HoldoutComparison(props: { sweepId: string }): React.JSX.Element
           {data.rule.min_positive_year_share !== undefined &&
             ` · at least ${percent(data.rule.min_positive_year_share, 0)} of years positive`}
           {data.rule.distinct === true &&
-            (data.rule.same_entries === true
+            (data.rule.nested_entries === true
               ? ' · clones and near-clones skipped'
               : ' · clones skipped')}
         </p>

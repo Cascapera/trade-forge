@@ -171,7 +171,7 @@ describe('HoldoutComparison', () => {
   it('says when the near-clones were skipped too', async () => {
     getHoldout.mockResolvedValue({
       ...HOLDOUT,
-      rule: { ...HOLDOUT.rule, distinct: true, same_entries: true },
+      rule: { ...HOLDOUT.rule, distinct: true, nested_entries: true },
     })
     renderWithProviders(<HoldoutComparison sweepId="test-1" />)
 

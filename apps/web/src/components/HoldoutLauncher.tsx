@@ -237,7 +237,8 @@ export function HoldoutLauncher(props: { sweep: SweepOut }): React.JSX.Element {
             setDistinct(event.target.checked)
           }}
         />
-        Skip clones — a point with the same trades as a better one gives its place to the next
+        Skip clones — a point with the same trades as a better one, or the same entries closed
+        another way, gives its place to the next
       </label>
       {!limitsValid && (
         <p role="alert" className="text-sm text-amber-300">

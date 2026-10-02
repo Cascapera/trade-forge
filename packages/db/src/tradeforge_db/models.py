@@ -1913,6 +1913,13 @@ class Sweep(Base):
     """How the tested points were chosen — `metric`, `top_n` per (entry, chart, market), and the
     trade floor per chart. "The best" means nothing without "by what"."""
 
+    keep_all_trades: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    """Every run keeps its trades, won or lost (rev_0045, 02/10) — a base for meta-labeling
+    (ADR-0031). An ordinary sweep keeps them only for the runs that passed the bar
+    (`retention`), and a model trained on those would only ever see winners."""
+
     created_at: Mapped[dt.datetime] = _created_at()
 
     backtests: Mapped[list[Backtest]] = relationship(back_populates="sweep", passive_deletes="all")

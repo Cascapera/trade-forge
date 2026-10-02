@@ -169,7 +169,7 @@ def _entry(client: Any) -> str:
     return str(entry.json()["id"])
 
 
-def _launch(client: Any, entry: str) -> str:
+def _launch(client: Any, entry: str, *, keep_all_trades: bool = False) -> str:
     launched = client.post(
         "/sweeps",
         json={
@@ -181,6 +181,7 @@ def _launch(client: Any, entry: str) -> str:
             "initial_capital": "10000",
             "cost_model": {"type": "none"},
             "collect_missing": False,
+            "keep_all_trades": keep_all_trades,
         },
     )
     assert launched.status_code == 202, launched.text
@@ -635,6 +636,35 @@ class TestTheSameMeasurementIsCopied:
         assert set(_recorded(session_factory, first).values()) == {Recorded.METRICS}
         assert set(_origins(session_factory, second).values()) == {None}
         assert set(_recorded(session_factory, second).values()) == {Recorded.TRADES}
+
+    def test_a_sweep_that_keeps_every_trade_keeps_them_under_the_floor(
+        self, client: Any, session_factory: Callable[[], Session], queue: _Queue, tmp_path: Path
+    ) -> None:
+        """02/10, a base for meta-labeling (ADR-0031): the runs an ordinary sweep keeps as metrics
+        alone keep their trades too — and a copy of an original that kept only metrics runs."""
+        entry = _entry(client)
+        first = _launch(client, entry)
+        _run_all(queue, session_factory, tmp_path)
+        second = _launch(client, entry, keep_all_trades=True)
+        _run_all(queue, session_factory, tmp_path)
+
+        assert set(_recorded(session_factory, first).values()) == {Recorded.METRICS}
+        assert set(_origins(session_factory, second).values()) == {None}
+        assert set(_recorded(session_factory, second).values()) == {Recorded.TRADES}
+        assert client.get(f"/sweeps/{second}").json()["keep_all_trades"] is True
+        assert client.get(f"/sweeps/{first}").json()["keep_all_trades"] is False
+        with session_factory() as session:
+            kept = [
+                trade
+                for run in session.scalars(
+                    select(Backtest).where(Backtest.sweep_id == uuid.UUID(second))
+                )
+                for trade in run.trades
+            ]
+            assert kept, "the walk has to trade, or nothing was kept"
+            # Kept for reading, not for looking at: no pictures, as any sweep's run (`{}` is the
+            # column's "nothing recorded").
+            assert all(not trade.snapshot for trade in kept)
 
     def test_switched_off_every_run_runs(
         self, client: Any, session_factory: Callable[[], Session], queue: _Queue, tmp_path: Path

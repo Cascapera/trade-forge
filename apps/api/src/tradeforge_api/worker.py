@@ -219,6 +219,7 @@ def _record_done(  # noqa: PLR0913 — one finished run and what it came to
         total_trades=metrics.total_trades,
         target_net_r=[None if rung is None else rung.net_r for rung in ladder.values()],
         reserved_test=backtest.sweep is not None and backtest.sweep.holdout_rule is not None,
+        every_trade=backtest.sweep is not None and backtest.sweep.keep_all_trades,
     )
     metrics_row, trade_rows = to_rows(
         trades=trades,

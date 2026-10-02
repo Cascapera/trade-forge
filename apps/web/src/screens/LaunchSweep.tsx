@@ -367,6 +367,25 @@ export function LaunchSweep(): React.JSX.Element {
           </label>
         </div>
 
+        <label className="flex items-start gap-2 text-sm text-slate-300">
+          <input
+            type="checkbox"
+            className="mt-1"
+            checked={form.keepAllTrades}
+            onChange={(event) => {
+              set({ keepAllTrades: event.target.checked })
+            }}
+          />
+          <span>
+            Keep every trade (for ML)
+            <span className="block text-xs text-slate-500">
+              Every run keeps its trades, won or lost, so a model can learn from the losers too.
+              Off, only the runs that pass the bar keep them. Takes more space: use it on a few
+              configurations over many markets, not on a whole grid.
+            </span>
+          </span>
+        </label>
+
         <div className="flex flex-wrap items-center gap-4">
           <button
             type="submit"

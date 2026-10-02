@@ -195,6 +195,11 @@ describe('toSweepRequest', () => {
     expect(body.initial_capital).toBe('10000.50')
   })
 
+  it('asks for every trade only when ticked', () => {
+    expect(toSweepRequest(aForm()).keep_all_trades).toBeUndefined()
+    expect(toSweepRequest(aForm({ keepAllTrades: true })).keep_all_trades).toBe(true)
+  })
+
   it('copies the axes instead of aliasing the form', () => {
     // Aliasing would let a later edit to the form mutate a request already in flight.
     const form = aForm({ symbols: ['EURUSD'] })

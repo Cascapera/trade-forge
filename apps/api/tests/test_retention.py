@@ -137,3 +137,22 @@ def test_a_reserved_window_test_keeps_its_trades_win_or_lose(net_profit: Decimal
         )
         is Recorded.TRADES
     )
+
+
+@pytest.mark.parametrize("net_profit", ["-1000", "0", "1"])
+@pytest.mark.parametrize("trades", [0, 1, 500])
+def test_a_sweep_that_keeps_every_trade_keeps_them_whatever_the_run_did(
+    net_profit: str, trades: int
+) -> None:
+    """02/10, a base for meta-labeling (ADR-0031): a model trained only on the runs that passed
+    the bar would never see a losing trade of a losing configuration."""
+    assert (
+        recorded_for(
+            in_sweep=True,
+            timeframe="H1",
+            net_profit=Decimal(net_profit),
+            total_trades=trades,
+            every_trade=True,
+        )
+        is Recorded.TRADES
+    )

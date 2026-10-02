@@ -80,6 +80,7 @@ def needs(run: Backtest, metrics: BacktestMetrics) -> Recorded:
             None if rung is None else Decimal(str(rung["net_r"])) for rung in targets.values()
         ],
         reserved_test=run.sweep is not None and run.sweep.holdout_rule is not None,
+        every_trade=run.sweep is not None and run.sweep.keep_all_trades,
     )
 
 

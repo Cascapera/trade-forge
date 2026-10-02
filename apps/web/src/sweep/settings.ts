@@ -31,6 +31,8 @@ export interface SweepForm {
    * never a spread of zero.
    */
   costs: Record<string, MarketCosts>
+  /** Every run keeps its trades, won or lost — a base for meta-labeling (02/10, ADR-0031). */
+  keepAllTrades: boolean
 }
 
 /**
@@ -54,6 +56,7 @@ export const emptySweepForm: SweepForm = {
   dateTo: '',
   initialCapital: '10000',
   costs: {},
+  keepAllTrades: false,
 }
 
 /**
@@ -244,6 +247,7 @@ export function toSweepRequest(form: SweepForm, collectMissing = false): CreateS
           ),
         },
     collect_missing: collectMissing,
+    ...(form.keepAllTrades ? { keep_all_trades: true } : {}),
   }
 }
 

@@ -12,6 +12,10 @@ of it pictures and an equity curve that nobody opens one run at a time. So a swe
 * **never** the entry pictures or the equity curve. The engine is deterministic: running the same
   point again rebuilds both, exactly.
 
+A sweep launched with **`keep_all_trades`** (02/10) keeps every run's trades, win or lose: it is a
+base for meta-labeling (ADR-0031), and a model trained only on the runs that passed the bar would
+never see a losing trade of a losing configuration.
+
 A **reserved-window test** is a sweep too (`Sweep.holdout_rule`), and its runs keep their trades
 **win or lose** (25/09): a point that failed out of sample is exactly the one to cut into years and
 blocks to see *where* it failed (`slices`), and a test holds only the few chosen points.
@@ -51,6 +55,7 @@ def recorded_for(  # noqa: PLR0913 — keyword-only; each is a fact about the ru
     total_trades: int,
     target_net_r: Iterable[Decimal | None] = (),
     reserved_test: bool = False,
+    every_trade: bool = False,
 ) -> Recorded:
     """What a finished run keeps. See the module docstring for why.
 
@@ -69,7 +74,7 @@ def recorded_for(  # noqa: PLR0913 — keyword-only; each is a fact about the ru
     """
     if not in_sweep:
         return Recorded.FULL
-    if reserved_test:
+    if reserved_test or every_trade:
         return Recorded.TRADES
     floor = MIN_TRADES[timeframe]
     profitable = net_profit > 0 or any(r is not None and r > 0 for r in target_net_r)

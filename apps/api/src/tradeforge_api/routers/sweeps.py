@@ -575,6 +575,7 @@ def launch_sweep(
         initial_capital=request.initial_capital,
         skipped=[],
         template_id=template_id,
+        keep_all_trades=request.keep_all_trades,
     )
     session.add(sweep)
     session.flush()
@@ -1449,6 +1450,8 @@ def launch_window(
         date_to=date_to,
         initial_capital=parent.initial_capital,
         skipped=[market.model_dump(mode="json") for market in uncovered],
+        # The same question over other years: it keeps what its parent kept.
+        keep_all_trades=parent.keep_all_trades,
     )
     session.add(sweep)
     session.flush()
@@ -1557,6 +1560,8 @@ def combine_sweeps(request: CombineSweeps, session: SessionDep) -> CreatedSweep:
         skipped=[market for one in members for market in one.skipped],
         template_id=templates.pop() if len(templates) == 1 else None,
         combines=[str(one.id) for one in members],
+        # Only when every member did: one that kept winners only would pass for a base it is not.
+        keep_all_trades=all(one.keep_all_trades for one in members),
     )
     session.add(combined)
     session.flush()
@@ -2534,6 +2539,7 @@ def get_sweep(
         if sweep.combines is None
         else [uuid.UUID(str(one)) for one in sweep.combines],
         template_id=sweep.template_id,
+        keep_all_trades=sweep.keep_all_trades,
         counts=counts,
         entries=summaries,
         runs=out,

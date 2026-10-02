@@ -1895,6 +1895,9 @@ class CreateSweep(BaseModel):
     initial_capital: Decimal = Field(gt=0)
     cost_model: dict[str, Any]
     collect_missing: bool = True
+    keep_all_trades: bool = False
+    """Every run keeps its trades, won or lost (02/10) — a base for meta-labeling (ADR-0031).
+    Off, a run keeps them only when it passed the bar (`retention`). Never pictures or curves."""
     """Collect what each (market, chart) is missing, and run once those downloads have landed.
 
     ⚠️ **One collection per pair, not per run.** A pair here is shared by every point of every
@@ -2711,6 +2714,8 @@ class SweepOut(BaseModel):
     """The sweeps this one reads together (26/09); null for a sweep that ran."""
     template_id: uuid.UUID | None = None
     """How those points were chosen — `metric`, `top_n`, `min_trades` per chart."""
+    keep_all_trades: bool = False
+    """Every run keeps its trades, won or lost (02/10): a base for meta-labeling (ADR-0031)."""
     counts: SweepRunCounts | None = None
     """How many runs sit in each status — what a screen polls on, without the runs themselves."""
     entries: list[SweepEntryOut]

@@ -1217,6 +1217,9 @@ export interface CreateSweepRequest {
   /** Collect what each pair is missing, once per pair, and run once the downloads land
    *  (PR-268). Left out, a pair with no candles is skipped and named. */
   collect_missing?: boolean
+  /** Every run keeps its trades, won or lost (02/10) — a base for meta-labeling (ADR-0031).
+   *  Left out, a run keeps them only when it passed the bar. */
+  keep_all_trades?: boolean
 }
 
 export interface CreatedSweep {
@@ -1762,6 +1765,8 @@ export interface SweepOut {
   /** The sweeps this one reads together (26/09); null for a sweep that ran. */
   combines?: string[] | null
   template_id?: string | null
+  /** Every run kept its trades, won or lost (02/10). Absent from a server before it. */
+  keep_all_trades?: boolean
   /** How many runs sit in each status — what the screen polls on (24/09). */
   counts?: SweepRunCounts | null
   /** In the order the entries were asked for. */

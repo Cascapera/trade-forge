@@ -2712,7 +2712,7 @@ cobre só os setups de estrutura (`structure_choch`, `structure_continuation`), 
 - a chave de equivalência compara o JSON do documento: `0` e `0.0` no mesmo eixo contam como
   diferentes (só custa um run a mais, nunca junta o que difere).
 
-## Seletores de ativo mostram só os instrumentos cadastrados (24/09) — PENDENTE, pedido dele
+## ~~Seletores de ativo mostram só os instrumentos cadastrados (24/09)~~ — FEITO (PR-306 busca na corretora, PR-329 o lançamento coleta sozinho; conferido 02/10)
 
 "Mesmo que eu colete no coletor vários ativos sempre aparece somente os mesmos 4." As telas de
 varredura, backtest, estudo e basket listam `GET /instruments` (a tabela `instruments`: 4 linhas —
@@ -2964,3 +2964,10 @@ varredura-mãe recortados em anos inteiros (`year_cut`), sem rodar nada — e os
   Não medido no banco real; se passar de alguns segundos, vira um job curto.
 - **A guarda do recorte é conservadora**: um run que recusou um sinal por lote zero em qualquer ano
   não tem recorte nenhum (`refused_cut`), mesmo dos anos certos.
+
+## A varredura guarda todos os trades (02/10, PR-373) — o que ficou para depois
+
+- **A fila de modelos (`template_queue_job`) não leva `keep_all_trades`.** Cada item lança uma
+  varredura comum. Para rodar uma base de ML ativo por ativo pela fila, o modelo precisa do campo.
+- **Combinar varreduras** só marca a combinada como "todos os trades" quando todas as partes são.
+- **Espaço não medido ainda:** medir na primeira base (MM9 para ML, 16 ativos) antes de crescer.

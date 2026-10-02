@@ -1,6 +1,7 @@
 import { NavLink, Navigate, Route, Routes } from 'react-router-dom'
 
 import { BasketResult } from './screens/BasketResult'
+import { BestByMarket } from './screens/BestByMarket'
 import { CollectSymbol } from './screens/CollectSymbol'
 import { LaunchBacktest } from './screens/LaunchBacktest'
 import { LaunchBasket } from './screens/LaunchBasket'
@@ -105,6 +106,10 @@ export function App(): React.JSX.Element {
             <NavLink to="/sweeps/dashboard" className={navClass}>
               Sweep dashboard
             </NavLink>
+            {/* Every sweep's best run per market, setup and chart, as a map (02/10). */}
+            <NavLink to="/best" className={navClass}>
+              Best by market
+            </NavLink>
             {/* Finished runs on one shared account — built from a reserved-window test's
                 points, or by hand. `end`: `/clusters/:id` is one cluster being read. */}
             <NavLink to="/clusters" end className={navClass}>
@@ -167,6 +172,7 @@ export function App(): React.JSX.Element {
             <Route path="/sweeps" element={<SweepHistory />} />
             {/* A static segment outranks `:id` in React Router, so this is never read as a sweep. */}
             <Route path="/sweeps/dashboard" element={<SweepDashboard />} />
+            <Route path="/best" element={<BestByMarket />} />
             <Route path="/sweeps/:id" element={<SweepResult />} />
             <Route path="/walkforwards/:id" element={<WalkForwardResult />} />
             <Route path="/clusters" element={<Clusters />} />

@@ -50,6 +50,7 @@ from tradeforge_api.schemas import (
     BestMapOut,
     BestPointOut,
     BestTestOut,
+    Symbol,
 )
 from tradeforge_db.models import (
     Backtest,
@@ -217,8 +218,10 @@ def best_map(
 def best_cell(  # noqa: PLR0913 — query parameters; each is one part of the cell asked
     session: SessionDep,
     *,
-    symbol: str,
-    entry_id: str,
+    # ⚠️ Text the database can store, refused at the edge (schemathesis, 02/10): a NUL in either
+    # reached Postgres as a 500 rather than a 422.
+    symbol: Symbol,
+    entry_id: Symbol,
     timeframe: Timeframe,
     metric: BestMetric = BestMetric.RECOVERY_R,
     every_run: bool = False,

@@ -10,6 +10,7 @@ members = [
     "tradeforge-db",
     "tradeforge-engine",
     "tradeforge-executor",
+    "tradeforge-ml",
     "tradeforge-schema",
 ]
 
@@ -969,6 +970,7 @@ dependencies = [
     { name = "tradeforge-db" },
     { name = "tradeforge-engine" },
     { name = "tradeforge-executor" },
+    { name = "tradeforge-ml" },
     { name = "tradeforge-schema" },
 ]
 
@@ -991,6 +993,7 @@ requires-dist = [
     { name = "tradeforge-db", editable = "packages/db" },
     { name = "tradeforge-engine", editable = "packages/engine" },
     { name = "tradeforge-executor", editable = "apps/executor" },
+    { name = "tradeforge-ml", editable = "packages/ml" },
     { name = "tradeforge-schema", editable = "packages/schema" },
 ]
 
@@ -1109,6 +1112,21 @@ requires-dist = [
     { name = "redis", specifier = ">=5.2" },
     { name = "tradeforge-db", editable = "packages/db" },
     { name = "tradeforge-engine", editable = "packages/engine" },
+]
+
+[[package]]
+name = "tradeforge-ml"
+version = "0.1.0"
+source = { editable = "packages/ml" }
+dependencies = [
+    { name = "pyarrow" },
+    { name = "tradeforge-db" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "pyarrow", specifier = ">=18.1" },
+    { name = "tradeforge-db", editable = "packages/db" },
 ]
 
 [[package]]

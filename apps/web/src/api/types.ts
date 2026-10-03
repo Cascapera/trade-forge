@@ -1792,6 +1792,8 @@ export interface SweepOut {
   /** Pairs whose runs start at their first year of real bars, later than the window (02/10).
    *  Absent from a server before it. */
   trimmed?: TrimmedMarket[]
+  /** When the sweep was paused: its waiting runs are out of the queue until resumed (02/10). */
+  paused_at?: string | null
   /** Downloads that failed under this sweep's runs, once each (his rule of 22/09). Unlike
    *  `skipped`, these runs *did* run — on what was on disk. */
   failed_collections: Collection[]
@@ -2000,4 +2002,18 @@ export interface BestCellOut {
   /** How many runs of the cell were ranked, before clones and near-clones gave their place. */
   ranked: number
   points: BestPointOut[]
+}
+
+/** What a sweep's pause or resume did, and what is left (02/10). */
+export interface SweepPauseOut {
+  /** When the sweep was paused; null once resumed. */
+  paused_at: string | null
+  /** The sweep's waiting runs: out of the queue while paused, back in it once resumed. */
+  queued: number
+  /** Runs a worker still holds. Safe to turn the machines off when this is zero and paused. */
+  running: number
+  withdrawn?: number
+  requeued_jobs?: number
+  /** Runs a resume found `running` with no worker holding any job, and queued again. */
+  released?: number
 }

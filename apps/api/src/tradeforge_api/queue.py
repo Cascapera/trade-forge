@@ -9,9 +9,11 @@ itself did.
 """
 
 import uuid
+from collections.abc import Sequence
 from typing import Protocol
 
 from arq.connections import RedisSettings
+from arq.constants import default_queue_name, in_progress_key_prefix, job_key_prefix
 
 from tradeforge_api.config import RedisConfig
 
@@ -120,3 +122,42 @@ def progress_channel(backtest_id: uuid.UUID) -> str:
     """The pub/sub channel one backtest's progress flows through. Per-run, so a subscriber
     hears only the run it asked about."""
     return f"backtest:progress:{backtest_id}"
+
+
+WITHDRAW_BLOCK = 1000
+"""Jobs withdrawn from the queue per Redis round trip."""
+
+
+async def withdraw_jobs(queue: object, job_ids: Sequence[str]) -> int:
+    """Take these jobs out of the backtest queue before any worker picks them up, and say how many
+    were there (02/10, a sweep's pause).
+
+    ⚠️ **Only what has not started.** A job a worker holds is in arq's in-progress set, not in the
+    queue; it finishes, and its run is recorded as any other. Its id is removed with the rest, so a
+    later resume cannot queue it twice while it still runs.
+
+    Works on anything that speaks Redis (`zrem`, `delete`) — the arq pool does. A queue that does
+    not, a test's recorder, withdraws nothing and says so.
+    """
+    zrem = getattr(queue, "zrem", None)
+    delete = getattr(queue, "delete", None)
+    if zrem is None or delete is None:
+        return 0
+    removed = 0
+    for start in range(0, len(job_ids), WITHDRAW_BLOCK):
+        block = list(job_ids[start : start + WITHDRAW_BLOCK])
+        removed += int(await zrem(default_queue_name, *block))
+        await delete(*(f"{job_key_prefix}{job_id}" for job_id in block))
+    return removed
+
+
+async def jobs_in_progress(queue: object) -> int | None:
+    """How many backtest jobs a worker holds right now, or `None` when the queue cannot say.
+
+    Read from arq's in-progress keys: zero after a machine was turned off with work in hand, and a
+    run left `running` then is a run nobody is running (`routers.sweeps.resume_sweep`).
+    """
+    scan = getattr(queue, "scan_iter", None)
+    if scan is None:
+        return None
+    return sum([1 async for _key in scan(match=f"{in_progress_key_prefix}*", count=1000)])

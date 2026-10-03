@@ -56,6 +56,7 @@ import type {
   StudyOut,
   StudyPreview,
   BestCellOut,
+  SweepPauseOut,
   BestMapOut,
   BestMetric,
   HoldoutOut,
@@ -263,6 +264,9 @@ export const api = {
   createHoldout: (sweepId: string, payload: CreateHoldoutRequest): Promise<CreatedSweep> =>
     request('POST', `/sweeps/${sweepId}/holdout`, payload),
   getHoldout: (id: string): Promise<HoldoutOut> => request('GET', `/sweeps/${id}/holdout`),
+  // Take a sweep's waiting runs out of the queue, and queue them again from the table (02/10).
+  pauseSweep: (id: string): Promise<SweepPauseOut> => request('POST', `/sweeps/${id}/pause`),
+  resumeSweep: (id: string): Promise<SweepPauseOut> => request('POST', `/sweeps/${id}/resume`),
   // The best runs by market, setup and chart across every sweep (02/10): the map, then a cell.
   getBestMap: (metric: BestMetric, everyRun: boolean): Promise<BestMapOut> =>
     request('GET', `/best/map${query({ metric, every_run: everyRun ? 'true' : undefined })}`),

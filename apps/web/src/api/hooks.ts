@@ -66,6 +66,7 @@ import type {
   StudyPreview,
   PreviewSweepRequest,
   BestCellOut,
+  SweepPauseOut,
   BestMapOut,
   BestMetric,
   HoldoutOut,
@@ -1173,5 +1174,16 @@ export function useBestCell(cell: BestCellQuery | undefined) {
   return useQuery<BestCellOut>({
     queryKey: ['best-cell', cell?.symbol, cell?.entryId, cell?.timeframe, cell?.metric, cell?.everyRun],
     queryFn: cell === undefined ? skipToken : () => api.getBestCell(cell),
+  })
+}
+
+/** Pause or resume a sweep (02/10); the sweep is read again either way. */
+export function usePauseSweep(id: string) {
+  const client = useQueryClient()
+  return useMutation<SweepPauseOut, Error, 'pause' | 'resume'>({
+    mutationFn: (action) => (action === 'pause' ? api.pauseSweep(id) : api.resumeSweep(id)),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: ['sweep', id] })
+    },
   })
 }

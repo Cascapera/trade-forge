@@ -2723,6 +2723,8 @@ class SweepOut(BaseModel):
     """Every run keeps its trades, won or lost (02/10): a base for meta-labeling (ADR-0031)."""
     trimmed: list[TrimmedMarket] = Field(default_factory=list)
     """Pairs whose runs start at their first year of real bars, later than the window (02/10)."""
+    paused_at: dt.datetime | None = None
+    """When the sweep was paused: its waiting runs are out of the queue until resumed (02/10)."""
     counts: SweepRunCounts | None = None
     """How many runs sit in each status — what a screen polls on, without the runs themselves."""
     entries: list[SweepEntryOut]
@@ -3077,3 +3079,20 @@ class BestCellOut(BaseModel):
     ranked: int
     """How many runs of the cell were ranked, before clones and near-clones gave their place."""
     points: list[BestPointOut]
+
+
+class SweepPauseOut(BaseModel):
+    """What a pause or a resume did, and what is left (02/10)."""
+
+    paused_at: dt.datetime | None
+    """When the sweep was paused; null once resumed."""
+    queued: int
+    """The sweep's runs waiting: out of the queue while paused, back in it once resumed."""
+    running: int
+    """Runs a worker still holds. Safe to turn the machines off when this is zero and paused."""
+    withdrawn: int = 0
+    """Jobs a pause took out of the queue."""
+    requeued_jobs: int = 0
+    """Jobs a resume queued, a batch counting once."""
+    released: int = 0
+    """Runs a resume found `running` with no worker holding any job, and queued again."""

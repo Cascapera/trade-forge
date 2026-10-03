@@ -18,6 +18,7 @@ import { FailedDownloads } from '../components/FailedDownloads'
 import { HoldoutComparison } from '../components/HoldoutComparison'
 import { HoldoutLauncher } from '../components/HoldoutLauncher'
 import { MonteCarlo } from '../components/MonteCarlo'
+import { SweepPause } from '../components/SweepPause'
 import { SweepWalkForwardLauncher } from '../components/SweepWalkForwardLauncher'
 import { RunTable } from '../components/RunTable'
 import { StudyDispersion } from '../components/StudyDispersion'
@@ -374,6 +375,9 @@ export function SweepResult(): React.JSX.Element {
         {summarise(counts)}
         {settled(counts) ? '' : ' — this updates on its own.'}
       </p>
+      {id !== undefined && (
+        <SweepPause sweepId={id} pausedAt={data.paused_at ?? null} counts={counts} />
+      )}
 
       {/* ⚠️ The median sits above every ranked list, in each entry's summary: the best of a
           sweep is the best of its whole search, and a list that starts from it reads as a result

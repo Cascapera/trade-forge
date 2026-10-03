@@ -35,6 +35,7 @@ from sqlalchemy.orm import Session
 from tradeforge_api import ranking_floor
 from tradeforge_api.cluster_job import process_cluster
 from tradeforge_api.config import Settings
+from tradeforge_api.deps import get_queue
 from tradeforge_api.main import create_app
 from tradeforge_api.queue import COLLECT_QUEUE, COLLECT_RANGE, RUN_BACKTEST, RUN_BACKTEST_BATCH
 from tradeforge_api.routers import sweeps as sweeps_router
@@ -4744,3 +4745,122 @@ class TestTheRealBars:
         # Nothing else in the window either: the launch is refused, and says why for each pair.
         assert launched.status_code == 422, launched.text
         assert "GBPUSD H1 (on disk: real bars only from 2022-01-01)" in launched.json()["detail"]
+
+
+class _RedisQueue(_CapturingQueue):
+    """The recorder, with the Redis commands a pause and a resume speak (02/10)."""
+
+    def __init__(self, in_progress: int = 0) -> None:
+        super().__init__()
+        self.withdrawn: list[str] = []
+        self.in_progress = in_progress
+
+    async def zrem(self, name: str, *values: str) -> int:
+        self.withdrawn += values
+        return len(values)
+
+    async def delete(self, *names: str) -> int:
+        return len(names)
+
+    async def scan_iter(self, match: str, count: int) -> Any:
+        for n in range(self.in_progress):
+            yield f"arq:in-progress:{n}"
+
+
+class TestPauseAndResume:
+    """His ask (02/10): pause a sweep, turn the machines off, and carry on where it was."""
+
+    def launched(self, client: Any) -> tuple[str, list[str]]:
+        entry = an_entry(client, name=f"pause {uuid.uuid4()}", grid={"setup.params.period": [5, 7]})
+        launched = client.post("/sweeps", json=a_sweep_body([entry], ["EURUSD"], ["H1"]))
+        assert launched.status_code == 202, launched.text
+        sweep_id = launched.json()["id"]
+        runs = [row["run"]["id"] for row in client.get(f"/sweeps/{sweep_id}").json()["runs"]]
+        return sweep_id, runs
+
+    def test_a_pause_takes_the_waiting_runs_out_of_the_queue_and_keeps_them_here(
+        self, client: Any
+    ) -> None:
+        sweep_id, runs = self.launched(client)
+        redis = _RedisQueue()
+        client.app.dependency_overrides[get_queue] = lambda: redis
+
+        paused = client.post(f"/sweeps/{sweep_id}/pause")
+
+        assert paused.status_code == 200, paused.text
+        body = paused.json()
+        assert body["paused_at"] is not None
+        assert (body["queued"], body["running"], body["withdrawn"]) == (2, 0, 2)
+        assert sorted(redis.withdrawn) == sorted(runs)
+        read = client.get(f"/sweeps/{sweep_id}").json()
+        assert read["paused_at"] == body["paused_at"]
+        assert {row["run"]["status"] for row in read["runs"]} == {"queued"}
+
+    def test_a_resume_queues_the_waiting_runs_again_from_the_table(
+        self, client: Any, queue: _CapturingQueue
+    ) -> None:
+        sweep_id, runs = self.launched(client)
+        assert client.post(f"/sweeps/{sweep_id}/pause").status_code == 200
+        before = len(queue.jobs)
+
+        resumed = client.post(f"/sweeps/{sweep_id}/resume")
+
+        assert resumed.status_code == 200, resumed.text
+        body = resumed.json()
+        assert body["paused_at"] is None
+        assert body["queued"] == 2
+        assert body["requeued_jobs"] >= 1
+        sent = queue.jobs[before:]
+        queued_ids = {
+            str(one)
+            for _name, args, _opts in sent
+            for one in (args[0] if isinstance(args[0], list) else [args[0]])
+        }
+        assert queued_ids == set(runs)
+        assert client.get(f"/sweeps/{sweep_id}").json()["paused_at"] is None
+
+    def test_a_run_left_running_by_a_machine_turned_off_is_queued_again(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        sweep_id, runs = self.launched(client)
+        with session_factory() as session:
+            stuck = session.get(Backtest, uuid.UUID(runs[0]))
+            assert stuck is not None
+            stuck.status = BacktestStatus.RUNNING
+            stuck.started_at = dt.datetime.now(tz=dt.UTC)
+            session.commit()
+        idle = _RedisQueue(in_progress=0)
+        client.app.dependency_overrides[get_queue] = lambda: idle
+
+        resumed = client.post(f"/sweeps/{sweep_id}/resume").json()
+
+        assert resumed["released"] == 1
+        assert resumed["queued"] == 2
+        with session_factory() as session:
+            run = session.get(Backtest, uuid.UUID(runs[0]))
+            assert run is not None
+            assert run.status is BacktestStatus.QUEUED
+            assert run.started_at is None
+
+    def test_while_a_worker_holds_a_job_a_running_run_is_left_to_it(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        sweep_id, runs = self.launched(client)
+        with session_factory() as session:
+            busy = session.get(Backtest, uuid.UUID(runs[0]))
+            assert busy is not None
+            busy.status = BacktestStatus.RUNNING
+            busy.started_at = dt.datetime.now(tz=dt.UTC)
+            session.commit()
+        working = _RedisQueue(in_progress=3)
+        client.app.dependency_overrides[get_queue] = lambda: working
+
+        resumed = client.post(f"/sweeps/{sweep_id}/resume").json()
+
+        assert (resumed["released"], resumed["queued"], resumed["running"]) == (0, 1, 1)
+
+    def test_a_sweep_that_does_not_exist_or_runs_nothing_of_its_own_cannot_be_paused(
+        self, client: Any
+    ) -> None:
+        assert client.post(f"/sweeps/{uuid.uuid4()}/pause").status_code == 404
+        assert client.post(f"/sweeps/{uuid.uuid4()}/resume").status_code == 404

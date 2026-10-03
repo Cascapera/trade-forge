@@ -89,7 +89,7 @@ from tradeforge_api.montecarlo import (
     simulate,
     simulate_in_blocks,
 )
-from tradeforge_api.queue import COLLECT_QUEUE, COLLECT_RANGE
+from tradeforge_api.queue import COLLECT_QUEUE, COLLECT_RANGE, jobs_in_progress, withdraw_jobs
 from tradeforge_api.ranking_floor import RANK_MIN_TRADES
 from tradeforge_api.routers.backtests import failed_collections, list_item
 from tradeforge_api.routers.strategies import refusal_of
@@ -128,6 +128,7 @@ from tradeforge_api.schemas import (
     SweepListEntry,
     SweepListItem,
     SweepOut,
+    SweepPauseOut,
     SweepPoint,
     SweepPreview,
     SweepRunCounts,
@@ -2648,6 +2649,7 @@ def get_sweep(
         else [uuid.UUID(str(one)) for one in sweep.combines],
         template_id=sweep.template_id,
         keep_all_trades=sweep.keep_all_trades,
+        paused_at=sweep.paused_at,
         trimmed=[TrimmedMarket.model_validate(one) for one in sweep.trimmed],
         counts=counts,
         entries=summaries,
@@ -3313,4 +3315,107 @@ def get_sweep_dataset_dictionary(sweep_id: uuid.UUID, session: SessionDep) -> Da
             for column in columns_for(runs)
         ],
         omitted=[DatasetOmissionOut(name=name, reason=reason) for name, reason in OMITTED],
+    )
+
+
+def _pausable(session: Session, sweep_id: uuid.UUID) -> Sweep:
+    sweep = session.get(Sweep, sweep_id)
+    if sweep is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="sweep not found")
+    if sweep.combines:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="a combination runs nothing of its own: pause the sweeps it reads",
+        )
+    return sweep
+
+
+def _count(session: Session, sweep_id: uuid.UUID, wanted: BacktestStatus) -> int:
+    return (
+        session.scalar(
+            select(func.count())
+            .select_from(Backtest)
+            .where(Backtest.sweep_id == sweep_id, Backtest.status == wanted)
+        )
+        or 0
+    )
+
+
+@router.post("/sweeps/{sweep_id}/pause", response_model=SweepPauseOut)
+async def pause_sweep(sweep_id: uuid.UUID, session: SessionDep, queue: QueueDep) -> SweepPauseOut:
+    """Take the sweep's waiting runs out of the queue, so the machines can be turned off (02/10).
+
+    ⚠️ **The runs stay `queued` here, and that is the pause.** The table, not the queue, is what
+    `resume` reads: a job in Redis expires after a day, and a pause can last longer. The runs a
+    worker already holds finish and are recorded; the page says it is safe to turn off once none
+    is `running`.
+    """
+    sweep = _pausable(session, sweep_id)
+    if sweep.paused_at is None:
+        sweep.paused_at = dt.datetime.now(tz=dt.UTC)
+        session.commit()
+    waiting = [
+        str(run_id)
+        for run_id in session.scalars(
+            select(Backtest.id).where(
+                Backtest.sweep_id == sweep_id, Backtest.status == BacktestStatus.QUEUED
+            )
+        )
+    ]
+    withdrawn = await withdraw_jobs(queue, waiting)
+    return SweepPauseOut(
+        paused_at=sweep.paused_at,
+        queued=len(waiting),
+        running=_count(session, sweep_id, BacktestStatus.RUNNING),
+        withdrawn=withdrawn,
+    )
+
+
+@router.post("/sweeps/{sweep_id}/resume", response_model=SweepPauseOut)
+async def resume_sweep(
+    sweep_id: uuid.UUID, session: SessionDep, queue: QueueDep, settings: SettingsDep
+) -> SweepPauseOut:
+    """Queue the sweep's waiting runs again, from the table — after a pause, or after the machines
+    went off with work in hand (02/10).
+
+    ⚠️ **A run left `running` is queued again only when no worker holds any job.** That is the
+    state after a machine was turned off mid-run: the run was recorded as started and nobody is
+    running it. While workers are busy, a `running` run may be theirs, and it is left alone.
+
+    Batched as a launch batches (`batching`), and with the same job ids, so a job still in the
+    queue is not queued twice.
+    """
+    sweep = _pausable(session, sweep_id)
+    sweep.paused_at = None
+    released = 0
+    if await jobs_in_progress(queue) == 0:
+        stuck = session.scalars(
+            select(Backtest).where(
+                Backtest.sweep_id == sweep_id, Backtest.status == BacktestStatus.RUNNING
+            )
+        ).all()
+        for run in stuck:
+            run.status = BacktestStatus.QUEUED
+            run.started_at = None
+        released = len(stuck)
+    session.commit()
+
+    batches = Batcher(enabled=settings.tradeforge_batch)
+    waiting = session.execute(
+        select(Backtest.id, Backtest.timeframe, Strategy.definition, Instrument.symbol)
+        .join(Strategy, Strategy.id == Backtest.strategy_id)
+        .join(Instrument, Instrument.id == Backtest.instrument_id)
+        .where(Backtest.sweep_id == sweep_id, Backtest.status == BacktestStatus.QUEUED)
+        .order_by(Backtest.created_at, Strategy.name, Backtest.id)
+    ).all()
+    for run_id, timeframe, definition, symbol in waiting:
+        batches.add(run_id, batch_key(definition, symbol, timeframe))
+    jobs = batches.jobs()
+    await enqueue_runs(queue, jobs)
+    return SweepPauseOut(
+        paused_at=None,
+        queued=len(waiting),
+        running=_count(session, sweep_id, BacktestStatus.RUNNING),
+        requeued_jobs=len(jobs),
+        released=released,
     )

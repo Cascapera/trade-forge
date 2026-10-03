@@ -1920,6 +1920,11 @@ class Sweep(Base):
     """How the tested points were chosen — `metric`, `top_n` per (entry, chart, market), and the
     trade floor per chart. "The best" means nothing without "by what"."""
 
+    paused_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    """When the sweep was paused (rev_0048, 02/10): its waiting runs were taken out of the queue
+    and stay `queued` here, so the machines can be turned off; resuming queues them again from
+    this table. Null for a sweep running, or never paused."""
+
     trimmed: Mapped[list[Any]] = mapped_column(JSONB, nullable=False, server_default="[]")
     """The pairs whose runs start later than the sweep's window (rev_0047, 02/10):
     `[{"symbol", "timeframe", "date_from"}]` — the first year of real bars, where the window

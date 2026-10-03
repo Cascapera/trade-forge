@@ -11,6 +11,7 @@ dependencies = [
     "tradeforge-db",
     "tradeforge-engine",
     "tradeforge-executor",
+    "tradeforge-ml",
     "tradeforge-schema",
 ]
 
@@ -27,6 +28,7 @@ members = [
     "apps/executor",
     "packages/db",
     "packages/engine",
+    "packages/ml",
     "packages/schema",
 ]
 
@@ -36,6 +38,7 @@ tradeforge-collector = { workspace = true }
 tradeforge-db = { workspace = true }
 tradeforge-engine = { workspace = true }
 tradeforge-executor = { workspace = true }
+tradeforge-ml = { workspace = true }
 tradeforge-schema = { workspace = true }
 
 [dependency-groups]
@@ -121,6 +124,7 @@ known-first-party = [
     "tradeforge_db",
     "tradeforge_engine",
     "tradeforge_executor",
+    "tradeforge_ml",
     "tradeforge_schema",
 ]
 
@@ -159,6 +163,7 @@ mypy_path = [
     "apps/executor/src",
     "packages/db/src",
     "packages/engine/src",
+    "packages/ml/src",
     "packages/schema/src",
     # `scripts/` is not a package and must not become one — the workflow runs those files
     # directly, with no install step. Telling mypy where they live is what keeps them under
@@ -188,6 +193,7 @@ testpaths = [
     "apps/executor/tests",
     "packages/db/tests",
     "packages/engine/tests",
+    "packages/ml/tests",
     "packages/schema/tests",
 ]
 addopts = [

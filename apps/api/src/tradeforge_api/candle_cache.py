@@ -34,6 +34,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Protocol
 
+from tradeforge_api.density import real_start
 from tradeforge_api.warm_window import WarmUp
 from tradeforge_collector import Candle, read_candles
 from tradeforge_collector.storage import dataset_path
@@ -135,7 +136,38 @@ def read_window(  # noqa: PLR0913 — keyword-only; each bounds the read
     years before the window's, so the variants of one sweep share an entry. When it still finds
     fewer bars before the window than the warm-up asks — the series starts there, or the market
     barely trades — it reads the whole series, which is what every run read before.
+
+    ⚠️ **The warm-up stops where the real bars begin (04/10).** Before some year a broker's
+    intraday history is thin or one bar a day stored as the chart (`density`); a launch starts the
+    window at the first real year (#379), but the warm-up still reached back into the thin bars.
+    Measured on UsaTec M15 over 2018-2024: warmed on 2017, whose January and February hold about
+    400 bars a month against 1 900, a run made no trade in seven years; warmed from April 2017, or
+    not at all, the same run made 157. So the warm-up's bars before the series' first real year are
+    dropped: it warms on less, as it does where a series simply starts. The window's own bars are
+    never dropped.
     """
+    candles = _read_window(
+        read, root, symbol, timeframe, date_from=date_from, date_to=date_to, warmup=warmup
+    )
+    real = real_start(root, symbol, timeframe)
+    if real is None:
+        return candles
+    cut = min(real, date_from)
+    first = bisect_left(candles, cut, key=lambda candle: candle.time)
+    return candles if first == 0 else candles[first:]
+
+
+def _read_window(  # noqa: PLR0913 — keyword-only; each bounds the read
+    read: CandleReader,
+    root: Path,
+    symbol: str,
+    timeframe: str,
+    *,
+    date_from: dt.datetime,
+    date_to: dt.datetime,
+    warmup: WarmUp,
+) -> Sequence[Candle]:
+    """`read_window` before the cut at the real bars: the window and the warm-up asked for."""
     lead = warmup.bars * step(timeframe) * GAP_FACTOR
     if warmup.span is not None:
         lead = max(lead, warmup.span)

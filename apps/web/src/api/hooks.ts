@@ -62,6 +62,8 @@ import type {
   StrategyOut,
   SymbolHistory,
   SymbolSearch,
+  SymbolBrowse,
+  Markets,
   StudyOut,
   StudyPreview,
   PreviewSweepRequest,
@@ -114,6 +116,33 @@ export function useSymbolSearch(q: string) {
   return useQuery<SymbolSearch>({
     queryKey: ['symbols', q],
     queryFn: () => api.searchSymbols(q),
+    placeholderData: (previous) => previous,
+  })
+}
+
+/** The market browser's tabs: every market, with how many symbols the broker lists in each. */
+export function useMarkets(enabled = true) {
+  return useQuery<Markets>({
+    queryKey: ['symbols', 'markets'],
+    queryFn: () => api.getMarkets(),
+    enabled,
+  })
+}
+
+/**
+ * One page of a market's symbols. `placeholderData` keeps the page on screen while the next one
+ * loads, for the reason `useSymbolSearch` gives.
+ */
+export function useBrowseSymbols(params: {
+  market: string
+  q: string
+  collected: boolean
+  offset: number
+  limit: number
+}) {
+  return useQuery<SymbolBrowse>({
+    queryKey: ['symbols', 'browse', params],
+    queryFn: () => api.browseSymbols(params),
     placeholderData: (previous) => previous,
   })
 }
@@ -1046,10 +1075,9 @@ export function useSymbolHistories(symbols: readonly string[], timeframe: string
  * `missing` only ever names symbols whose query has already come back empty, so nothing is
  * probed while its own measurement is still in flight.
  */
-export function useAutoProbe(args: {
-  missing: readonly string[]
-  timeframe: string
-}): { queued: number } {
+export function useAutoProbe(args: { missing: readonly string[]; timeframe: string }): {
+  queued: number
+} {
   const { missing, timeframe } = args
   const { mutate } = useProbeSymbol()
   const asked = useRef(new Set<string>())
@@ -1172,7 +1200,14 @@ export function useBestMap(metric: BestMetric, everyRun: boolean) {
 /** One cell's top runs, without clones or near-clones — `undefined` until a cell is chosen. */
 export function useBestCell(cell: BestCellQuery | undefined) {
   return useQuery<BestCellOut>({
-    queryKey: ['best-cell', cell?.symbol, cell?.entryId, cell?.timeframe, cell?.metric, cell?.everyRun],
+    queryKey: [
+      'best-cell',
+      cell?.symbol,
+      cell?.entryId,
+      cell?.timeframe,
+      cell?.metric,
+      cell?.everyRun,
+    ],
     queryFn: cell === undefined ? skipToken : () => api.getBestCell(cell),
   })
 }

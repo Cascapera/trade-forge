@@ -7,23 +7,29 @@ import { useMissingDataGate } from '../collect/gate'
 import { neverCollected, neverCollectedReason } from '../basket/settings'
 import { anythingToRun, pairsOf } from '../collect/missing'
 import { MissingDataPrompt } from '../components/MissingDataPrompt'
+import { Pager } from '../components/Pager'
+import { clampOffset, pageOf } from '../components/paging'
 import { SymbolPicker } from '../components/SymbolPicker'
 import { roughly } from '../format'
 import { TIMEFRAMES } from '../strategy/builder'
 import { useSweepRehearsal } from '../sweep/preview'
 import {
+  MAX_SWEEP_SYMBOLS,
+  chooseMarkets,
   emptySweepForm,
   isCostless,
   launchFailure,
   runCount,
   toSweepRequest,
-  toggleMarket,
   whyNotLaunchable,
   type SweepForm,
 } from '../sweep/settings'
 
 const inputClass =
   'rounded border border-slate-700 bg-slate-900 px-2 py-1 text-sm text-slate-100 focus:border-sky-500 focus:outline-none'
+
+/** Markets whose costs show at once; the rest a page at a time. */
+const COSTS_PER_PAGE = 10
 
 function toggle(list: readonly string[], value: string): string[] {
   return list.includes(value) ? list.filter((one) => one !== value) : [...list, value]
@@ -52,6 +58,8 @@ export function LaunchSweep(): React.JSX.Element {
   // Set when the plan came back empty for a sweep whose every pair lacks data: there is nothing
   // to collect either, and the all-skipped refusal stands. Cleared by any edit, like the prompt.
   const [nothingToFetch, setNothingToFetch] = useState(false)
+  const [costsOffset, setCostsOffset] = useState(0)
+  const costsShown = clampOffset(costsOffset, COSTS_PER_PAGE, form.symbols.length)
   const entries: CatalogEntry[] = catalog.data?.items ?? []
 
   const rehearsal = useSweepRehearsal(form)
@@ -205,13 +213,13 @@ export function LaunchSweep(): React.JSX.Element {
           </p>
         </fieldset>
 
-        {/* The basket's own picker, not a second one. A copy would be a second place to decide
-            how many markets a request may name, and it would stop matching. */}
+        {/* The basket's own picker, not a second one — with the sweep's own ceiling. */}
         <SymbolPicker
           instruments={instruments.data}
           chosen={form.symbols}
-          onToggle={(symbol) => {
-            const next = toggleMarket(form, symbol, instruments.data)
+          max={MAX_SWEEP_SYMBOLS}
+          onChange={(symbols) => {
+            const next = chooseMarkets(form, symbols, instruments.data)
             set({ symbols: next.symbols, costs: next.costs })
           }}
         />
@@ -224,7 +232,7 @@ export function LaunchSweep(): React.JSX.Element {
           <fieldset className="space-y-2">
             <legend className="text-sm text-slate-300">Costs per market</legend>
             <div className="space-y-1">
-              {form.symbols.map((symbol) => {
+              {pageOf(form.symbols, costsShown, COSTS_PER_PAGE).map((symbol) => {
                 const costs = {
                   spread: '',
                   commission: '',
@@ -292,6 +300,13 @@ export function LaunchSweep(): React.JSX.Element {
                 )
               })}
             </div>
+            <Pager
+              label="Cost pages"
+              offset={costsShown}
+              limit={COSTS_PER_PAGE}
+              total={form.symbols.length}
+              onOffset={setCostsOffset}
+            />
             {isCostless(form) && (
               <p role="status" className="text-xs text-amber-300">
                 No costs on any market: every result is an upper bound, not a P&amp;L.
@@ -530,10 +545,10 @@ export function LaunchSweep(): React.JSX.Element {
           project's own data: a grid of 4 points degraded 4 percentage points out of sample, one
           of 50 degraded 9. */}
       <p className="max-w-3xl text-xs text-slate-500">
-        Fifty points over five markets and three charts is seven hundred and fifty measurements,
-        and the best of them is the best of seven hundred and fifty draws. Re-running the winner
-        over the same window returns the identical number — the engine is deterministic, so that
-        is not a second opinion. The only honest follow-up is data the winner was not chosen on: a
+        Fifty points over five markets and three charts is seven hundred and fifty measurements, and
+        the best of them is the best of seven hundred and fifty draws. Re-running the winner over
+        the same window returns the identical number — the engine is deterministic, so that is not a
+        second opinion. The only honest follow-up is data the winner was not chosen on: a
         walk-forward, another market, a window you held back.
       </p>
     </section>

@@ -4,7 +4,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { ApiError, api } from '../api/client'
 import type { CatalogEntry, PlannedCollection, SweepPreview } from '../api/types'
-import { renderWithProviders } from '../test-utils'
+import { browsed, fakeBroker, renderWithProviders } from '../test-utils'
 
 import { LaunchSweep } from './LaunchSweep'
 
@@ -20,6 +20,8 @@ vi.mock('../api/client', async () => {
       previewSweep: vi.fn(),
       planCollections: vi.fn(),
       searchSymbols: vi.fn(),
+      getMarkets: vi.fn(),
+      browseSymbols: vi.fn(),
     },
   }
 })
@@ -91,17 +93,22 @@ function preview(patch: Partial<SweepPreview> = {}): SweepPreview {
 }
 
 /**
- * Fill in every axis so the form is launchable, leaving one thing for the test to break.
+ * Tick markets in the market browser (04/10) and close it, as somebody choosing them would.
  *
- * ⚠️ The market is matched on an **anchored** pattern, never on the bare symbol. `SymbolPicker`
- * gives each checkbox the accessible name `EURUSD, 8 ticks` — the measured cost is part of the
- * label on purpose, so somebody choosing markets by ear makes the same decision a sighted reader
- * makes by reading the column. An exact-string query finds nothing and reads like a missing
- * element rather than like a label that says more than the test assumed.
+ * ⚠️ Matched on an **anchored** pattern, never on the bare symbol. Each checkbox's accessible name
+ * is `EURUSD, 8 ticks` — the measured cost is part of the label on purpose, so somebody choosing
+ * markets by ear makes the same decision a sighted reader makes by reading the column.
  */
+async function chooseMarkets(...labels: RegExp[]): Promise<void> {
+  fireEvent.click(screen.getByRole('button', { name: 'Choose markets…' }))
+  for (const label of labels) fireEvent.click(await screen.findByLabelText(label))
+  fireEvent.click(screen.getByRole('button', { name: 'Done' }))
+}
+
+/** Fill in every axis so the form is launchable, leaving one thing for the test to break. */
 async function fillIn(): Promise<void> {
   fireEvent.click(await screen.findByLabelText(/nine one plain/i))
-  fireEvent.click(await screen.findByLabelText(/^EURUSD,/))
+  await chooseMarkets(/^EURUSD,/)
   fireEvent.click(screen.getByLabelText('M15'))
   fireEvent.change(screen.getByLabelText('From'), { target: { value: '2025-01-01' } })
   fireEvent.change(screen.getByLabelText('To'), { target: { value: '2025-06-01' } })
@@ -110,6 +117,9 @@ async function fillIn(): Promise<void> {
 beforeEach(() => {
   vi.clearAllMocks()
   listInstruments.mockResolvedValue([instrument('EURUSD'), instrument('GBPUSD')])
+  const broker = fakeBroker([browsed('EURUSD', 'forex', '8'), browsed('GBPUSD', 'forex', '8')])
+  vi.mocked(api.getMarkets).mockImplementation(broker.markets)
+  vi.mocked(api.browseSymbols).mockImplementation(broker.browse)
   listCatalog.mockResolvedValue({
     total: 2,
     items: [entry('a', 'nine one plain', 1), entry('b', 'nine one swept', 3)],
@@ -191,8 +201,7 @@ describe('the count on screen', () => {
 
     fireEvent.click(await screen.findByLabelText(/nine one plain/i))
     fireEvent.click(await screen.findByLabelText(/nine one swept/i))
-    fireEvent.click(await screen.findByLabelText(/^EURUSD,/))
-    fireEvent.click(screen.getByLabelText(/^GBPUSD,/))
+    await chooseMarkets(/^EURUSD,/, /^GBPUSD,/)
     fireEvent.click(screen.getByLabelText('M15'))
 
     expect(await screen.findByText('8 backtests.')).toBeInTheDocument()
@@ -426,7 +435,9 @@ describe('the three refusals stay apart', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /run the sweep/i }))
 
-    expect(await screen.findByText(/nothing to collect for this window either/i)).toBeInTheDocument()
+    expect(
+      await screen.findByText(/nothing to collect for this window either/i),
+    ).toBeInTheDocument()
     expect(createSweep).not.toHaveBeenCalled()
     expect(screen.getByRole('button', { name: /run the sweep/i })).toBeDisabled()
 
@@ -434,7 +445,6 @@ describe('the three refusals stay apart', () => {
     fireEvent.change(screen.getByLabelText('Initial capital'), { target: { value: '20000' } })
     expect(screen.queryByText(/nothing to collect for this window either/i)).not.toBeInTheDocument()
   })
-
 })
 
 describe('the answer on hand', () => {
@@ -547,9 +557,7 @@ describe('launching', () => {
     fireEvent.click(screen.getByRole('button', { name: /run the sweep/i }))
 
     await waitFor(() => {
-      expect(createSweep).toHaveBeenCalledWith(
-        expect.objectContaining({ collect_missing: false }),
-      )
+      expect(createSweep).toHaveBeenCalledWith(expect.objectContaining({ collect_missing: false }))
     })
     expect(planCollections).toHaveBeenCalledWith(
       expect.objectContaining({ symbols: ['EURUSD'], timeframes: ['M15', 'H4'] }),
@@ -654,7 +662,7 @@ describe('launching', () => {
     renderWithProviders(<LaunchSweep />)
 
     fireEvent.click(await screen.findByLabelText(/nine one plain/i))
-    fireEvent.click(await screen.findByLabelText(/^EURUSD,/))
+    await chooseMarkets(/^EURUSD,/)
     fireEvent.click(screen.getByLabelText('M15'))
 
     await waitFor(() => {
@@ -663,7 +671,6 @@ describe('launching', () => {
     expect(previewSweep).not.toHaveBeenCalled()
   })
 })
-
 
 describe('LaunchSweep — costs per market', () => {
   it('starts each ticked market from its quoted spread and lets the reader correct it', async () => {

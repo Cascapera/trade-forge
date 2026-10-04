@@ -10,7 +10,7 @@
 // ones nobody has measured.
 
 import { ApiError } from '../api/client'
-import type { BacktestListItem, CreateBasketRequest, Instrument } from '../api/types'
+import type { BrowsedSymbol, BacktestListItem, CreateBasketRequest, Instrument } from '../api/types'
 import { toIso } from '../backtest/settings'
 
 /** A basket of one is a backtest, and the screen that already does that is better at it. */
@@ -65,6 +65,16 @@ export function measuredSpread(instrument: Instrument | undefined): string | nul
   const spread = instrument?.default_spread_points
   if (spread === undefined || spread === null) return null
   return String(Number(spread))
+}
+
+/**
+ * What a row says it costs. ⚠️ "no spread measured" and "never collected" are not "0 ticks": zero
+ * is the claim that the market is free to trade, and the truth is that nobody has looked.
+ */
+export function browsedCost(row: BrowsedSymbol): string {
+  if (!row.catalogued) return 'never collected'
+  if (row.spread_points === null) return 'no spread measured'
+  return `${String(Number(row.spread_points))} ticks`
 }
 
 /**
@@ -176,9 +186,7 @@ export function newlyComparable(
   runs: readonly BacktestListItem[],
   offered: ReadonlySet<string>,
 ): BacktestListItem[] {
-  return runs.filter(
-    (run) => run.status === 'done' && run.metrics !== null && !offered.has(run.id),
-  )
+  return runs.filter((run) => run.status === 'done' && run.metrics !== null && !offered.has(run.id))
 }
 
 /**

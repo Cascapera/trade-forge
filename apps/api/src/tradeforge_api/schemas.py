@@ -886,6 +886,11 @@ _MIN_SYMBOLS = 2
 # Twenty is well past what a human reads off one screen and far short of what hurts the queue.
 _MAX_SYMBOLS = 20
 
+# A sweep's own ceiling (02/10): his markets are chosen a market at a time — every crypto, eighty
+# Brazilian shares — and a sweep of a whole market is the question. Still a ceiling: one POST still
+# writes a sweep's whole grid. A basket keeps twenty: it is a portfolio picked by hand.
+_MAX_SWEEP_SYMBOLS = 500
+
 
 class CreateBasketRequest(BaseModel):
     """Launch one strategy over several symbols, one run each.
@@ -1561,7 +1566,7 @@ class PlanCollectionRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    symbols: list[Symbol] = Field(min_length=1, max_length=_MAX_SYMBOLS)
+    symbols: list[Symbol] = Field(min_length=1, max_length=_MAX_SWEEP_SYMBOLS)
     timeframes: list[Timeframe] = Field(min_length=1, max_length=8)
     date_from: dt.datetime
     date_to: dt.datetime
@@ -1886,7 +1891,7 @@ class CreateSweep(BaseModel):
     entry_ids: list[uuid.UUID] = Field(min_length=1, max_length=50)
     """Which entries to sweep. One is the ordinary case and is not a special case."""
 
-    symbols: list[Symbol] = Field(min_length=1, max_length=_MAX_SYMBOLS)
+    symbols: list[Symbol] = Field(min_length=1, max_length=_MAX_SWEEP_SYMBOLS)
     """The markets. Unlike a basket, one market is legal here: a sweep of one entry over one
     market across three timeframes is a coherent question, and it is a study's shape plus a
     chart axis."""
@@ -1950,7 +1955,7 @@ class PreviewSweepRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     entry_ids: list[uuid.UUID] = Field(min_length=1, max_length=50)
-    symbols: list[Symbol] = Field(min_length=1, max_length=_MAX_SYMBOLS)
+    symbols: list[Symbol] = Field(min_length=1, max_length=_MAX_SWEEP_SYMBOLS)
     timeframes: list[Timeframe] = Field(min_length=1, max_length=8)
     date_from: AwareInstant
     date_to: AwareInstant
@@ -3096,3 +3101,39 @@ class SweepPauseOut(BaseModel):
     """Jobs a resume queued, a batch counting once."""
     released: int = 0
     """Runs a resume found `running` with no worker holding any job, and queued again."""
+
+
+class MarketOut(BaseModel):
+    """One market of the symbol browser's tabs, and how many symbols the broker lists in it."""
+
+    key: str
+    label: str
+    count: int
+    collected: int = 0
+    """How many of them have candles — the ones a sweep can run today."""
+
+
+class MarketsOut(BaseModel):
+    markets: list[MarketOut]
+    """Every market in the browser's order — those with no symbol too, so the tabs never move."""
+    snapshot: SymbolSnapshotOut | None = None
+    """Where the list came from; null when the broker was never synced."""
+
+
+class BrowsedSymbolOut(BaseModel):
+    symbol: str
+    description: str | None = None
+    path: str | None = None
+    market: str
+    catalogued: bool
+    """Whether the system has collected it: a launch over one that is not collects it first."""
+    spread_points: Decimal | None = None
+
+
+class SymbolBrowseOut(BaseModel):
+    """One page of a market's symbols, matching the search, alphabetical."""
+
+    total: int
+    offset: int
+    limit: int
+    items: list[BrowsedSymbolOut]

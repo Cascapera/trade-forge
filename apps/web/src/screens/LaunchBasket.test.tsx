@@ -61,13 +61,45 @@ vi.mock('../api/hooks', () => ({
   useStrategies: () => ({ data: { total: 0, limit: 200, offset: 0, items: [] }, isPending: false }),
   // The market search over the broker's list (PR-306). Empty: these tests tick the grid.
   useSymbolSearch: () => ({ data: { symbols: [], snapshot: null } }),
+  // The market browser (04/10): the catalogue's four, in one tab.
+  useMarkets: () => ({
+    data: {
+      markets: [{ key: 'forex', label: 'Forex', count: 4, collected: 4 }],
+      snapshot: { server: 'Broker', synced_at: '2026-10-02T12:00:00Z' },
+    },
+    isPending: false,
+  }),
+  useBrowseSymbols: () => ({
+    data: {
+      total: 4,
+      offset: 0,
+      limit: 25,
+      items: [
+        ['EURUSD', '8.0000000000'],
+        ['GBPUSD', '9.0000000000'],
+        ['US500', null],
+        ['XAUUSD', null],
+      ].map(([symbol, spread]) => ({
+        symbol,
+        description: null,
+        path: null,
+        market: 'forex',
+        catalogued: true,
+        spread_points: spread,
+      })),
+    },
+    isPending: false,
+  }),
   useSyncSymbols: () => ({ mutate: vi.fn(), isPending: false }),
 }))
 
 import { LaunchBasket } from './LaunchBasket'
 
+/** Tick one market in the market browser and close it, by the name that carries its cost. */
 function pick(name: string): void {
+  fireEvent.click(screen.getByRole('button', { name: 'Choose markets…' }))
   fireEvent.click(screen.getByRole('checkbox', { name }))
+  fireEvent.click(screen.getByRole('button', { name: 'Done' }))
 }
 
 beforeEach(() => {
@@ -257,7 +289,6 @@ describe('LaunchBasket when data is missing', () => {
 
     expect(navigate).toHaveBeenCalledWith('/baskets/k9', { state: { skipped } })
   })
-
 
   it('still offers the run when only one market of the basket is empty', () => {
     // ⚠️ The basket's rule: the markets with data run, and the server names the one left out.

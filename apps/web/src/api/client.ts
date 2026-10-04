@@ -70,6 +70,8 @@ import type {
   LaunchWindow,
   SymbolHistory,
   SymbolSearch,
+  SymbolBrowse,
+  Markets,
   TradesPage,
   WalkForwardOut,
   YearCut,
@@ -153,6 +155,19 @@ export const api = {
   // MetaTrader: the API runs in a Linux container and cannot reach it (ADR-02, ADR-0021).
   searchSymbols: (q: string, limit?: number): Promise<SymbolSearch> =>
     request('GET', `/symbols/search${query({ q, limit })}`),
+  // The broker's list by market — the browser's tabs, then one page of a tab (02/10).
+  getMarkets: (): Promise<Markets> => request('GET', '/symbols/markets'),
+  browseSymbols: (params: {
+    market?: string
+    q?: string
+    collected?: boolean
+    offset?: number
+    limit?: number
+  }): Promise<SymbolBrowse> =>
+    request(
+      'GET',
+      `/symbols/browse${query({ ...params, collected: params.collected ? 'true' : undefined })}`,
+    ),
   // Asks the host agent to photograph the catalogue again. Returns as soon as the job is
   // queued — it cannot know whether a terminal is even running.
   syncSymbols: (): Promise<{ job: string }> => request('POST', '/symbols/sync'),
@@ -336,7 +351,10 @@ export const api = {
   // The same `query` helper the run log's filters use: an absent filter and an empty one are
   // different requests, and that distinction is already written down once.
   listStrategies: (filters: StrategyFilters = {}): Promise<StrategiesPage> =>
-    request('GET', `/strategies${query({ ...filters, include_generated: filters.include_generated === true ? 'true' : undefined })}`),
+    request(
+      'GET',
+      `/strategies${query({ ...filters, include_generated: filters.include_generated === true ? 'true' : undefined })}`,
+    ),
 
   // ⚠️ The list is the one endpoint here that cannot be taken down by Redis — it is pure Postgres
   // on the server, on purpose, because it is the screen somebody opens when they suspect
@@ -344,7 +362,8 @@ export const api = {
   // guessing at the stop state.
   listLiveSessions: (status?: string): Promise<LiveSessionsPage> =>
     request('GET', `/live-sessions${query({ status })}`),
-  getLiveSession: (id: string): Promise<LiveSessionDetail> => request('GET', `/live-sessions/${id}`),
+  getLiveSession: (id: string): Promise<LiveSessionDetail> =>
+    request('GET', `/live-sessions/${id}`),
   listSessionEvents: (id: string, limit?: number): Promise<SessionEventsPage> =>
     request('GET', `/live-sessions/${id}/events${query({ limit })}`),
   // Asks the session to finish the bar it is on and stop. **It does not close the position** —

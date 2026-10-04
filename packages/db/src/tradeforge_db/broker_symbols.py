@@ -7,7 +7,9 @@ broker offers, and the process that serves the screen never has to know MetaTrad
 """
 
 import datetime as dt
+import re
 from dataclasses import dataclass
+from decimal import Decimal
 
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
@@ -15,8 +17,12 @@ from sqlalchemy.orm import Session
 from tradeforge_db.models import BrokerSymbol, Instrument
 
 __all__ = [
+    "MARKETS",
     "BrokerSymbolEntry",
+    "BrowsedSymbol",
     "SymbolMatch",
+    "browse_symbols",
+    "market_of",
     "replace_snapshot",
     "search_symbols",
     "snapshot_taken_at",
@@ -187,3 +193,97 @@ def snapshot_taken_at(session: Session) -> tuple[str | None, dt.datetime] | None
     """
     row = session.scalars(select(BrokerSymbol).limit(1)).first()
     return None if row is None else (row.server, row.synced_at)
+
+
+MARKETS: tuple[tuple[str, str], ...] = (
+    ("forex", "Forex"),
+    ("crypto", "Crypto"),
+    ("indices", "Indices"),
+    ("metals", "Metals"),
+    ("commodities", "Commodities"),
+    ("stocks_us", "Stocks USA"),
+    ("stocks_br", "Stocks BR"),
+    ("stocks_other", "Stocks (other)"),
+    ("futures", "Futures"),
+    ("other", "Other"),
+)
+"""The markets the symbol browser groups a broker's list into, in the order its tabs show (02/10).
+
+His ask: with hundreds of symbols, choose a market first — crypto, forex, indices, US and
+Brazilian shares — then the symbols in it."""
+
+_US_WORDS = frozenset({"us", "usa", "nasdaq", "nyse", "america", "american", "united"})
+_BR_WORDS = frozenset({"br", "brazil", "brasil", "bovespa", "b3", "brazilian"})
+
+
+_EXCHANGE_SUFFIX = re.compile(r"\.[a-z]{2,3}$")
+"""A ticker's exchange suffix — `.FR`, `.SE`, `.US`, `.SA` — which marks a share wherever a broker
+files it."""
+
+
+def market_of(path: str | None, symbol: str) -> str:  # noqa: PLR0911 — one answer per market
+    """The market a broker symbol belongs to, from its tree path and its name.
+
+    ⚠️ **Read from words, not from one broker's folder names.** ActivTrades files currencies under
+    `Forex`, indices under `Cash Indices`, shares under `CFD UK Shares`; another broker says
+    `Stocks/US/AAPL` or names its tickers `PETR4.SA`. The order of the checks is the rule: a
+    future on an index is a future, a crypto filed under `Crypto Currency` is not a currency.
+    """
+    text = (path or "").lower()
+    words = set(text.replace("\\", " ").replace("/", " ").replace("_", " ").split())
+    name = symbol.lower()
+    if "crypto" in text:
+        return "crypto"
+    if "forward" in text or "future" in text:
+        return "futures"
+    if "metal" in text:
+        return "metals"
+    if "energ" in text or "commodit" in text or "oil" in words:
+        return "commodities"
+    if "indices" in text or "index" in text:
+        return "indices"
+    if "forex" in text or "currenc" in text or words & {"fx", "majors", "minors", "exotics"}:
+        return "forex"
+    if "share" in text or "stock" in text or "equit" in text or _EXCHANGE_SUFFIX.search(name):
+        if name.endswith((".us", ".usa")) or words & _US_WORDS:
+            return "stocks_us"
+        if name.endswith(".sa") or words & _BR_WORDS:
+            return "stocks_br"
+        return "stocks_other"
+    return "other"
+
+
+@dataclass(frozen=True, slots=True)
+class BrowsedSymbol:
+    """A broker symbol as the browser lists it: a search hit, with its market."""
+
+    match: SymbolMatch
+    market: str
+    spread_points: Decimal | None = None
+    """The spread the collector measured when it catalogued the symbol; `None` until then."""
+
+
+def browse_symbols(session: Session) -> list[BrowsedSymbol]:
+    """Every symbol of the snapshot with its market, alphabetical — filtered and paged by the
+    caller. A broker lists hundreds to a few thousand symbols: classified here once per request,
+    in memory, because the market is read from words no column holds."""
+    statement = (
+        select(BrokerSymbol, Instrument.id, Instrument.default_spread_points)
+        .outerjoin(Instrument, Instrument.symbol == BrokerSymbol.symbol)
+        .order_by(BrokerSymbol.symbol)
+    )
+    return [
+        BrowsedSymbol(
+            match=SymbolMatch(
+                symbol=row.symbol,
+                description=row.description,
+                path=row.path,
+                digits=row.digits,
+                visible=row.visible,
+                catalogued=instrument_id is not None,
+            ),
+            market=market_of(row.path, row.symbol),
+            spread_points=spread,
+        )
+        for row, instrument_id, spread in session.execute(statement)
+    ]

@@ -2,91 +2,151 @@ import { useId, useState } from 'react'
 import { Link } from 'react-router-dom'
 
 import type { BrokerSymbol, Instrument } from '../api/types'
-import { MAX_SYMBOLS, measuredSpread, neverCollected } from '../basket/settings'
+import { neverCollected } from '../basket/settings'
+import { MarketBrowser } from './MarketBrowser'
+import { Pager } from './Pager'
+import { clampOffset, pageOf } from './paging'
 import { inputClass, useListboxKeys, useSymbolResults } from './symbolSearch'
 import { SnapshotFooter, SymbolOptions } from './SymbolOptions'
 
+/** Chosen markets shown at once under the picker; the rest a page at a time. */
+export const CHIPS_PER_PAGE = 40
+
 /**
- * The catalogue as a grid of checkboxes, each showing what that market will be charged.
+ * The chosen markets, and the two ways to choose more.
  *
- * The cost is rendered *beside the tick*, not in a footnote, because on this screen the user is
- * not choosing a cost — the server charges each instrument its own measured spread — and the only
- * way that decision stays honest is if it is visible at the moment the market is picked.
+ * ## By market, in a dialog (04/10)
  *
- * ⚠️ An unmeasured symbol says **"no spread measured"**, never "0 ticks". Zero is the claim that
- * an instrument is free to trade; the truth is that nobody has looked. Ticking it is allowed —
- * refusing would make the catalogue's gaps invisible — and the launch screen says which ones they
- * were before anything is enqueued.
+ * His ask: the catalogue grows from 18 to hundreds, so the grid of checkboxes this used to be
+ * stops being something anyone can scan. "Choose markets…" opens `MarketBrowser` — a tab per
+ * market, 25 rows a page, a whole market in one click. Each row still shows what that market will
+ * be charged beside its tick: the server charges each instrument its own measured spread, and the
+ * decision only stays honest if the cost is visible at the moment the market is picked.
  *
- * The rows keep the catalogue's order however the ticks come and go: a list that re-sorted the
- * chosen markets to the top would move a row out from under the cursor mid-click.
+ * ## One ticker, typed
  *
- * ## Any market the broker offers, not only the catalogued ones
+ * The search box over the broker's whole list stays (24/09) for the one market somebody already
+ * knows the name of. A result that was never collected is still chosen — finding it is the point —
+ * and shows as an amber chip with the way to the collect screen. The launch screens refuse those
+ * before the click: until the collector has run, nobody knows the market's tick or contract.
  *
- * Above the grid, a search over the broker's whole list (his ask, 24/09: "even when I collect
- * several assets, the same four always show"). A catalogued result ticks its row in the grid;
- * one that was never collected is still chosen — finding it is the point — and shows below the
- * grid as a chip that says so, with the way to the collect screen. The launch screens refuse
- * those before the click: until the collector has run, nobody knows the market's tick or contract.
- *
- * ⚠️ The grid stays because the catalogue is small today and one click beats typing. With
- * hundreds of instruments it stops being a grid anyone can scan (specs/backlog.md).
+ * The chips keep the order the markets were chosen in, a page at a time once there are many.
  */
 export function SymbolPicker(props: {
   instruments: Instrument[] | undefined
   chosen: readonly string[]
-  onToggle: (symbol: string) => void
+  onChange: (next: string[]) => void
+  /** How many markets the launch accepts: twenty for a basket, hundreds for a sweep. */
+  max: number
 }): React.JSX.Element {
-  const { instruments, chosen, onToggle } = props
-  const full = chosen.length >= MAX_SYMBOLS
-  const outside = neverCollected(chosen, instruments)
+  const { instruments, chosen, onChange, max } = props
+  const [browsing, setBrowsing] = useState(false)
+  const [offset, setOffset] = useState(0)
+  const full = chosen.length >= max
+  const outside = new Set(neverCollected(chosen, instruments))
+  const shown = clampOffset(offset, CHIPS_PER_PAGE, chosen.length)
+
+  const toggle = (symbol: string): void => {
+    onChange(chosen.includes(symbol) ? chosen.filter((one) => one !== symbol) : [...chosen, symbol])
+  }
 
   return (
     <fieldset className="space-y-2">
       <legend className="text-sm text-slate-300">
-        Markets{chosen.length > 0 && <span className="text-slate-500"> — {chosen.length} chosen</span>}
+        Markets
+        {chosen.length > 0 && <span className="text-slate-500"> — {chosen.length} chosen</span>}
       </legend>
 
-      <MarketSearch chosen={chosen} full={full} onToggle={onToggle} />
+      <div className="flex flex-wrap items-end gap-3">
+        <button
+          type="button"
+          onClick={() => {
+            setBrowsing(true)
+          }}
+          className="rounded border border-sky-700 bg-sky-950/40 px-3 py-1.5 text-sm text-sky-100 hover:border-sky-500"
+        >
+          Choose markets…
+        </button>
+        {chosen.length > 0 && (
+          <button
+            type="button"
+            onClick={() => {
+              onChange([])
+            }}
+            className="rounded border border-slate-700 px-3 py-1.5 text-sm text-slate-300 hover:border-slate-500"
+          >
+            Clear all
+          </button>
+        )}
+        <div className="min-w-56 grow">
+          <MarketSearch chosen={chosen} full={full} max={max} onToggle={toggle} />
+        </div>
+      </div>
 
-      {instruments === undefined ? (
-        <p className="text-sm text-slate-400">Loading the catalogue…</p>
-      ) : instruments.length === 0 ? (
-        <p className="text-sm text-slate-400">No instruments catalogued yet.</p>
+      {chosen.length === 0 ? (
+        <p className="text-sm text-slate-400">
+          No market chosen yet.
+          {instruments !== undefined && ` ${String(instruments.length)} collected so far.`}
+        </p>
       ) : (
-        <CatalogueGrid instruments={instruments} chosen={chosen} full={full} onToggle={onToggle} />
+        <div className="space-y-2">
+          <ul aria-label="Chosen markets" className="flex flex-wrap gap-1">
+            {pageOf(chosen, shown, CHIPS_PER_PAGE).map((symbol) => {
+              const never = outside.has(symbol)
+              return (
+                <li key={symbol}>
+                  <button
+                    type="button"
+                    aria-label={never ? `Remove ${symbol}, never collected` : `Remove ${symbol}`}
+                    className={`flex items-center gap-1 rounded border px-2 py-0.5 font-mono text-xs ${
+                      never
+                        ? 'border-amber-800 bg-amber-950/30 text-amber-200 hover:border-amber-600'
+                        : 'border-sky-800 bg-sky-950/30 text-sky-100 hover:border-sky-600'
+                    }`}
+                    onClick={() => {
+                      toggle(symbol)
+                    }}
+                  >
+                    {symbol}
+                    {never && <span className="font-sans text-amber-400">never collected</span>}
+                    <span aria-hidden="true" className="text-slate-500">
+                      ×
+                    </span>
+                  </button>
+                </li>
+              )
+            })}
+          </ul>
+          <Pager
+            label="Chosen market pages"
+            offset={shown}
+            limit={CHIPS_PER_PAGE}
+            total={chosen.length}
+            onOffset={setOffset}
+          />
+        </div>
       )}
 
-      {outside.length > 0 && (
-        <div className="space-y-1">
-          <div className="flex flex-wrap gap-1">
-            {outside.map((symbol) => (
-              <button
-                key={symbol}
-                type="button"
-                aria-label={`Remove ${symbol}, never collected`}
-                className="flex items-center gap-1 rounded border border-amber-800 bg-amber-950/30 px-2 py-0.5 font-mono text-xs text-amber-200 hover:border-amber-600"
-                onClick={() => {
-                  onToggle(symbol)
-                }}
-              >
-                {symbol}
-                <span className="font-sans text-amber-400">never collected</span>
-                <span aria-hidden="true" className="text-amber-500">
-                  ×
-                </span>
-              </button>
-            ))}
-          </div>
-          <p className="text-xs text-amber-300">
-            No candles yet for {outside.join(', ')} —{' '}
-            <Link to="/collect" className="underline hover:text-amber-200">
-              collect {outside.length === 1 ? 'it' : 'them'} first
-            </Link>
-            . The instrument is written by the collector, which is the only thing that can read its
-            tick and contract from the terminal.
-          </p>
-        </div>
+      {outside.size > 0 && (
+        <p className="text-xs text-amber-300">
+          No candles yet for {[...outside].join(', ')} —{' '}
+          <Link to="/collect" className="underline hover:text-amber-200">
+            collect {outside.size === 1 ? 'it' : 'them'} first
+          </Link>
+          . The instrument is written by the collector, which is the only thing that can read its
+          tick and contract from the terminal.
+        </p>
+      )}
+
+      {browsing && (
+        <MarketBrowser
+          chosen={chosen}
+          max={max}
+          onChange={onChange}
+          onClose={() => {
+            setBrowsing(false)
+          }}
+        />
       )}
     </fieldset>
   )
@@ -97,14 +157,15 @@ export function SymbolPicker(props: {
  * — the collect screen's multi-picker, speaking symbols rather than `BrokerSymbol`, because the
  * forms these screens hold are lists of names.
  *
- * ⚠️ At the ceiling, adding is refused and removing is not — the same rule as the grid.
+ * ⚠️ At the ceiling, adding is refused and removing is not — the same rule as the browser.
  */
 function MarketSearch(props: {
   chosen: readonly string[]
   full: boolean
+  max: number
   onToggle: (symbol: string) => void
 }): React.JSX.Element {
-  const { chosen, full, onToggle } = props
+  const { chosen, full, max, onToggle } = props
   const [text, setText] = useState('')
   const [open, setOpen] = useState(false)
   const [refused, setRefused] = useState(false)
@@ -176,63 +237,11 @@ function MarketSearch(props: {
 
       {refused && (
         <p className="text-xs text-amber-300">
-          ⚠️ Already at {MAX_SYMBOLS} markets — remove one to add another.
+          ⚠️ Already at {max} markets — remove one to add another.
         </p>
       )}
 
       <SnapshotFooter snapshot={snapshot} />
-    </div>
-  )
-}
-
-function CatalogueGrid(props: {
-  instruments: Instrument[]
-  chosen: readonly string[]
-  full: boolean
-  onToggle: (symbol: string) => void
-}): React.JSX.Element {
-  const { instruments, chosen, full, onToggle } = props
-  return (
-    <div className="grid gap-2 sm:grid-cols-2">
-      {instruments.map((instrument) => {
-        const spread = measuredSpread(instrument)
-        const picked = chosen.includes(instrument.symbol)
-        const blocked = !picked && full
-        // The accessible name carries the cost too: a screen-reader user picking markets is
-        // making the same decision by ear that a sighted one makes by reading the column.
-        const cost = spread === null ? 'no spread measured' : `${spread} ticks`
-
-        return (
-          <label
-            key={instrument.id}
-            className={`flex items-center gap-3 rounded border px-3 py-2 text-sm ${
-              picked
-                ? 'border-sky-700 bg-sky-950/30'
-                : 'border-slate-800 bg-slate-900/40 hover:border-slate-700'
-            } ${blocked ? 'opacity-40' : ''}`}
-          >
-            <input
-              type="checkbox"
-              checked={picked}
-              disabled={blocked}
-              onChange={() => {
-                onToggle(instrument.symbol)
-              }}
-              aria-label={`${instrument.symbol}, ${cost}`}
-              title={
-                blocked ? `Already at ${String(MAX_SYMBOLS)} markets — untick one first` : undefined
-              }
-              className="size-4 accent-sky-500 disabled:opacity-30"
-            />
-            <span className="font-medium">{instrument.symbol}</span>
-            <span
-              className={`ml-auto text-xs ${spread === null ? 'text-amber-300' : 'text-slate-400'}`}
-            >
-              {cost}
-            </span>
-          </label>
-        )
-      })}
     </div>
   )
 }

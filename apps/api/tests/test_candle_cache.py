@@ -301,3 +301,69 @@ class TestTheWindow:
             )
 
         assert reader.calls == 1
+
+
+def daily_as_hourly(start: dt.datetime, end: dt.datetime) -> list[Candle]:
+    """One bar a weekday stored as H1 — the broker's old intraday history (`density`)."""
+    return [bar for bar in hourly(start, end) if bar.time.hour == 0]
+
+
+class TestTheWarmUpStopsAtTheRealBars:
+    """04/10: UsaTec M15 from 2018 warmed on the thin bars of early 2017 and never traded."""
+
+    REAL = dt.datetime(2017, 1, 1, tzinfo=dt.UTC)
+    TO = dt.datetime(2022, 12, 31, 23, tzinfo=dt.UTC)
+    WARMUP = WarmUp(bars=80, span=dt.timedelta(days=365))
+
+    def write(self, root: Path) -> None:
+        old = daily_as_hourly(dt.datetime(2014, 1, 1, tzinfo=dt.UTC), self.REAL)
+        real = hourly(self.REAL, self.TO)
+        write_candles(
+            root,
+            SYMBOL,
+            "H1",
+            [*old[:-1], *real] if old[-1].time == real[0].time else [*old, *real],
+        )
+
+    def read(self, root: Path, date_from: dt.datetime) -> Sequence[Candle]:
+        return read_window(
+            CandleCache().read,
+            root,
+            SYMBOL,
+            "H1",
+            date_from=date_from,
+            date_to=self.TO,
+            warmup=self.WARMUP,
+        )
+
+    def test_a_window_just_after_the_real_start_warms_on_real_bars_only(
+        self, tmp_path: Path
+    ) -> None:
+        self.write(tmp_path)
+        date_from = dt.datetime(2017, 3, 1, tzinfo=dt.UTC)
+
+        read = self.read(tmp_path, date_from)
+
+        assert read[0].time >= self.REAL, "the warm-up read the daily bars before the real ones"
+        assert [bar.time for bar in read if bar.time >= date_from] == [
+            bar.time for bar in hourly(date_from, self.TO)
+        ]
+
+    def test_a_window_inside_the_daily_bars_keeps_its_own_bars(self, tmp_path: Path) -> None:
+        """The cut never reaches into the window: a run asked over the old years reads them."""
+        self.write(tmp_path)
+        date_from = dt.datetime(2016, 6, 1, tzinfo=dt.UTC)
+
+        read = self.read(tmp_path, date_from)
+
+        assert read[0].time >= date_from
+        assert read[0].time < self.REAL
+
+    def test_a_window_far_from_the_real_start_is_read_as_before(self, tmp_path: Path) -> None:
+        self.write(tmp_path)
+        date_from = dt.datetime(2020, 3, 1, tzinfo=dt.UTC)
+        whole = read_candles(tmp_path, SYMBOL, "H1", end=self.TO)
+
+        read = self.read(tmp_path, date_from)
+
+        assert warmed(read, date_from, self.WARMUP) == warmed(whole, date_from, self.WARMUP)

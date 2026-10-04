@@ -3003,3 +3003,20 @@ Dos ~399 mil runs `failed` dos últimos dois dias, quase todos foram cancelados 
   provavelmente um run reposto por resume/release que guardou o `started_at` novo e o `finished_at` antigo.
 - **5 runs (M5) com `ENOMEM`** lendo Parquet: memória no limite com 14–16 workers no M5. Lembrar disso
   antes do M1.
+
+## O aquecimento lia o histórico ralo antes do início real (04/10) — o que ficou para depois
+
+- **A régua da densidade é por ano.** O conserto corta o aquecimento no primeiro ano real (`density`), mas um ano
+  que passa dos 80% ainda pode ter meses ralos (UsaTec M15 2017: jan/fev ~400 barras/mês contra ~1 900; o ano
+  inteiro deu 18 622, logo abaixo do piso). Uma régua por mês resolveria o resto.
+- **Dois meses ralos travaram o setup por sete anos** (structure_continuation, UsaTec M15 2018–2024: 0 trades
+  aquecendo em 2017 inteiro, 157 sem aquecimento). Barras ruins no início não deveriam calar o setup para sempre:
+  investigar no motor qual estado da estrutura nunca se desfaz (engine-guardian).
+- **Runs antigos afetados:** todo par cortado pela guarda (#379) desde 02/10 — metais, índices e cripto em
+  M15/M30/H1/H4 — aqueceu no histórico ralo. Relançar os que importarem.
+
+## A pausa deixa lotes na fila (04/10) — PENDENTE
+
+Pausando a d3249da1 (UsaTec, ~563 mil runs em lotes de 24), a API retirou 67 392 jobs e deixaram 19 296 lotes
+`batch-*` no Redis; os workers seguiram pegando. Removidos à mão. Provável: os ids de lote que a pausa recalcula
+(`jobs_for`) não batem com os do lançamento para parte dos lotes. Conferir antes de confiar na pausa de novo.

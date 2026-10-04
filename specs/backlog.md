@@ -2989,3 +2989,17 @@ próprio para os testes (`REDIS_DB` de teste, como o `POSTGRES_DB=tradeforge_tes
 - **Drawdown acima de 1 no ranking e no dataset** (piso, mediana, `/best`): não conferido.
 - **Ordem em repouso preenche depois da ruína** (o motor só para o dimensionamento) — hoje os setups
   descartam a ordem em repouso ao abrir posição, então não acontece; um setup novo pode mudar isso.
+
+## Falhas reais na varredura M5 de 03–04/10 — PENDENTE
+
+Dos ~399 mil runs `failed` dos últimos dois dias, quase todos foram cancelados à mão em 02/10. Os de verdade:
+
+- **58 runs (M5) com drawdown acima de 100%**: a conta de 10 000 terminou em −21 574 (`max_drawdown_pct`
+  1,70) e o `CHECK` de `backtest_metrics` recusou a gravação. O saldo atravessou o zero: a ruína
+  (`ruined_at`, PR-377) para o dimensionamento, mas uma posição aberta ainda perde além do saldo (gap, custo).
+  É do motor: decidir se a ruína fecha a conta em zero ou se o drawdown fica limitado a 1. Passa pelo
+  engine-guardian.
+- **29 runs (M5/M30) com `finished_at` antes de `started_at`** (`ck_backtests_finished_after_started`):
+  provavelmente um run reposto por resume/release que guardou o `started_at` novo e o `finished_at` antigo.
+- **5 runs (M5) com `ENOMEM`** lendo Parquet: memória no limite com 14–16 workers no M5. Lembrar disso
+  antes do M1.

@@ -4,6 +4,12 @@ import { Link, useNavigate, useParams } from 'react-router-dom'
 import { apiFailure } from '../api/failure'
 import { useCombineSweeps, useInstruments, useSweepTemplate, useTemplateQueue } from '../api/hooks'
 import type { QueueMarket, TemplateItem } from '../api/types'
+import { Pager } from '../components/Pager'
+import { usePaged } from '../components/paging'
+import { SymbolPicker } from '../components/SymbolPicker'
+
+/** Markets one request may add to a queue — the API's own ceiling. */
+const MAX_QUEUED = 200
 
 /** A market being prepared for the queue: ticked, with its costs as typed so far. */
 interface Draft {
@@ -45,21 +51,33 @@ export function TemplateQueue(): React.JSX.Element {
   const combine = useCombineSweeps()
   const [drafts, setDrafts] = useState<Record<string, Draft>>({})
   const [chosen, setChosen] = useState<string[]>([])
+  // Before the early returns, as every hook: the queue of a template grows a market at a time.
+  const itemPages = usePaged(template.data?.items ?? [], 50)
+  const draftPages = usePaged(Object.entries(drafts), 10)
 
   if (template.isPending) return <p className="text-slate-400">Loading the template…</p>
   if (template.isError) return <p className="text-red-400">Could not load the template.</p>
   const data = template.data
 
-  const tick = (symbol: string, spread: string | null): void => {
-    setDrafts((current) => {
-      if (symbol in current) {
-        return Object.fromEntries(Object.entries(current).filter(([key]) => key !== symbol))
-      }
-      return {
-        ...current,
-        [symbol]: { spread: measured(spread), commission: '', swapLong: '', swapShort: '' },
-      }
-    })
+  /** The drafts for exactly `symbols`: a new one starts from its measured spread, a kept one keeps
+   * what was typed. */
+  const choose = (symbols: readonly string[]): void => {
+    setDrafts((current) =>
+      Object.fromEntries(
+        symbols.map((symbol) => [
+          symbol,
+          current[symbol] ?? {
+            spread: measured(
+              instruments.data?.find((one) => one.symbol === symbol)?.default_spread_points ??
+                null,
+            ),
+            commission: '',
+            swapLong: '',
+            swapShort: '',
+          },
+        ]),
+      ),
+    )
   }
   const edit = (symbol: string, patch: Partial<Draft>): void => {
     setDrafts((current) => {
@@ -164,7 +182,7 @@ export function TemplateQueue(): React.JSX.Element {
               </td>
             </tr>
           ) : (
-            data.items.map((item) => (
+            itemPages.page.map((item) => (
               <tr key={item.id} className="border-b border-slate-900 align-top">
                 <td className="px-3 py-2">
                   {item.finished && item.sweep_id !== null && (
@@ -230,6 +248,7 @@ export function TemplateQueue(): React.JSX.Element {
           )}
         </tbody>
       </table>
+      <Pager label="Queue pages" {...itemPages.pager} />
 
       {finished.length > 1 && (
         <div className="flex flex-wrap items-center gap-3 text-sm">
@@ -260,20 +279,13 @@ export function TemplateQueue(): React.JSX.Element {
 
       <div className="space-y-3 rounded border border-slate-800 p-4">
         <h3 className="font-semibold">Add markets to the queue</h3>
-        <div className="grid gap-1 text-sm sm:grid-cols-3">
-          {(instruments.data ?? []).map((instrument) => (
-            <label key={instrument.id} className="flex items-center gap-2">
-              <input
-                type="checkbox"
-                checked={instrument.symbol in drafts}
-                onChange={() => {
-                  tick(instrument.symbol, instrument.default_spread_points)
-                }}
-              />
-              {instrument.symbol}
-            </label>
-          ))}
-        </div>
+        {/* The launch screens' picker (04/10): a tab per market, a page at a time. */}
+        <SymbolPicker
+          instruments={instruments.data}
+          chosen={Object.keys(drafts)}
+          max={MAX_QUEUED}
+          onChange={choose}
+        />
         {Object.keys(drafts).length > 0 && (
           <table className="text-sm">
             <thead>
@@ -286,7 +298,7 @@ export function TemplateQueue(): React.JSX.Element {
               </tr>
             </thead>
             <tbody>
-              {Object.entries(drafts).map(([symbol, draft]) => (
+              {draftPages.page.map(([symbol, draft]) => (
                 <tr key={symbol}>
                   <td className="px-2 py-1">{symbol}</td>
                   <td className="px-2 py-1">
@@ -306,6 +318,7 @@ export function TemplateQueue(): React.JSX.Element {
             </tbody>
           </table>
         )}
+        <Pager label="Cost pages" {...draftPages.pager} />
         {queue.add.isError && (
           <p role="alert" className="text-sm text-red-400">
             {apiFailure(queue.add.error, 'Could not queue them.')}

@@ -18,6 +18,7 @@ vi.mock('./client', () => ({
     listSweeps: vi.fn(),
     getSweepDashboard: vi.fn(),
     planCollections: vi.fn(),
+    listCatalog: vi.fn(),
   },
 }))
 
@@ -25,6 +26,8 @@ import type { BasketOut, HoldoutOut, SweepOut, SweepsPage, TemplateItem } from '
 import { api } from './client'
 import {
   SWEEPS_PER_PAGE,
+  allTrades,
+  wholeCatalog,
   isHistorySettled,
   isSettled,
   isHoldoutSettled,
@@ -155,7 +158,10 @@ describe('isHoldoutSettled', () => {
 describe('isSweepSettled', () => {
   it('reads the counts when the body carries them instead of the runs', () => {
     const counted = (running: number, queued: number) =>
-      ({ runs: [], counts: { total: 5, done: 5 - running - queued, running, queued, failed: 0 } }) as unknown as SweepOut
+      ({
+        runs: [],
+        counts: { total: 5, done: 5 - running - queued, running, queued, failed: 0 },
+      }) as unknown as SweepOut
     expect(isSweepSettled(counted(0, 0))).toBe(true)
     expect(isSweepSettled(counted(1, 0))).toBe(false)
     expect(isSweepSettled(counted(0, 2))).toBe(false)
@@ -368,9 +374,69 @@ describe('useTrades and useEquity', () => {
     const trades = renderHook(() => useTrades('b1', true), { wrapper: makeWrapper() })
     const equity = renderHook(() => useEquity('b1', true), { wrapper: makeWrapper() })
     await waitFor(() => {
-      expect(trades.result.current.data).toEqual({ total: 0, items: [] })
+      expect(trades.result.current.data).toMatchObject({ total: 0, items: [] })
       expect(equity.result.current.data).toEqual([])
     })
+  })
+})
+
+describe('reading a long list whole', () => {
+  // ⚠️ The first page used to be the whole answer: trades stopped at 100 and the shelf at 100,
+  // with nothing on screen saying more existed (04/10).
+  it('reads every trade, a thousand at a time', async () => {
+    const trade = (id: number) => ({ id }) as never
+    mockedApi.getTrades
+      .mockResolvedValueOnce({
+        total: 1500,
+        limit: 1000,
+        offset: 0,
+        items: Array.from({ length: 1000 }, (_, i) => trade(i)),
+      })
+      .mockResolvedValueOnce({
+        total: 1500,
+        limit: 1000,
+        offset: 1000,
+        items: Array.from({ length: 500 }, (_, i) => trade(1000 + i)),
+      })
+
+    const page = await allTrades('b1')
+
+    expect(page.items).toHaveLength(1500)
+    expect(mockedApi.getTrades.mock.calls).toEqual([
+      ['b1', 1000, 0],
+      ['b1', 1000, 1000],
+    ])
+  })
+
+  it('stops when the server hands back nothing more, whatever its total said', async () => {
+    mockedApi.getTrades
+      .mockResolvedValueOnce({ total: 5, limit: 1000, offset: 0, items: [{ id: 1 }] as never })
+      .mockResolvedValueOnce({ total: 5, limit: 1000, offset: 1, items: [] })
+
+    expect((await allTrades('b1')).items).toHaveLength(1)
+  })
+
+  it('reads the whole shelf, two hundred at a time', async () => {
+    const entry = (id: number) => ({ id: String(id) }) as never
+    mockedApi.listCatalog
+      .mockResolvedValueOnce({ total: 250, items: Array.from({ length: 200 }, (_, i) => entry(i)) })
+      .mockResolvedValueOnce({
+        total: 250,
+        items: Array.from({ length: 50 }, (_, i) => entry(200 + i)),
+      })
+
+    const shelf = await wholeCatalog()
+
+    expect(shelf.items).toHaveLength(250)
+    expect(mockedApi.listCatalog).toHaveBeenLastCalledWith(200, 200)
+  })
+
+  it('stops reading the shelf when a page comes back empty', async () => {
+    mockedApi.listCatalog
+      .mockResolvedValueOnce({ total: 3, items: [{ id: 'a' }] as never })
+      .mockResolvedValueOnce({ total: 3, items: [] })
+
+    expect((await wholeCatalog()).items).toHaveLength(1)
   })
 })
 
@@ -547,7 +613,9 @@ describe('useSaveStrategy', () => {
     // saving under its name was a `POST` onto a name that already had a version 1. Nothing
     // about this test involves the session store, because nothing about the decision does any
     // more.
-    vi.mocked(api.listStrategies).mockResolvedValue(page([{ id: 'from-another-tab', name: 'MME9' }]))
+    vi.mocked(api.listStrategies).mockResolvedValue(
+      page([{ id: 'from-another-tab', name: 'MME9' }]),
+    )
     vi.mocked(api.updateStrategy).mockResolvedValue({ id: 'v2' } as never)
 
     const { result } = renderHook(() => useSaveStrategy(), { wrapper: makeWrapper() })

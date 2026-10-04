@@ -5,6 +5,8 @@ import { apiFailure } from '../api/failure'
 import { useCreateSlicing, useSlicings } from '../api/hooks'
 import type { SliceMode, SliceOut, SlicedPoint, SlicingOut } from '../api/types'
 import { percent } from '../format'
+import { Pager, PagedList } from './Pager'
+import { usePaged } from './paging'
 
 const CHART_ORDER = ['M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1', 'W1']
 
@@ -81,6 +83,8 @@ function Slicing(props: { slicing: SlicingOut }): React.JSX.Element {
       (left.entry_name ?? '').localeCompare(right.entry_name ?? '') ||
       CHART_ORDER.indexOf(left.timeframe) - CHART_ORDER.indexOf(right.timeframe),
   )
+  const groupPages = usePaged(groups, 25)
+  const pointPages = usePaged(sortPoints(slicing.points), 50)
   return (
     <article aria-label={describe(slicing)} className="space-y-3 rounded border border-slate-800 p-4">
       <p className="text-sm text-slate-300">{describe(slicing)}</p>
@@ -118,7 +122,7 @@ function Slicing(props: { slicing: SlicingOut }): React.JSX.Element {
           </tr>
         </thead>
         <tbody>
-          {groups.map((group) => (
+          {groupPages.page.map((group) => (
             <tr key={`${group.entry_id}-${group.timeframe}`} className="border-b border-slate-900">
               <td className="px-3 py-2">{group.entry_name ?? '(removed entry)'}</td>
               <td className="px-3 py-2">{group.timeframe}</td>
@@ -132,6 +136,7 @@ function Slicing(props: { slicing: SlicingOut }): React.JSX.Element {
           ))}
         </tbody>
       </table>
+      <Pager label="Group pages" {...groupPages.pager} />
 
       <table className="w-full border-collapse text-left text-sm">
         <caption className="mb-2 text-left font-semibold">Point by point</caption>
@@ -158,7 +163,7 @@ function Slicing(props: { slicing: SlicingOut }): React.JSX.Element {
           </tr>
         </thead>
         <tbody>
-          {sortPoints(slicing.points).map((point) => (
+          {pointPages.page.map((point) => (
             <tr key={point.run_id} className="border-b border-slate-900 align-top">
               <td className="px-3 py-2">{point.entry_name ?? '(removed entry)'}</td>
               <td className="px-3 py-2">
@@ -180,6 +185,7 @@ function Slicing(props: { slicing: SlicingOut }): React.JSX.Element {
           ))}
         </tbody>
       </table>
+      <Pager label="Point pages" {...pointPages.pager} />
     </article>
   )
 }
@@ -306,7 +312,9 @@ export function HoldoutSlicings(props: { sweepId: string; settled: boolean }): R
       ) : slicings.data === undefined ? null : slicings.data.length === 0 ? (
         <p className="text-sm text-slate-500">Not judged in pieces yet.</p>
       ) : (
-        slicings.data.map((slicing) => <Slicing key={slicing.id} slicing={slicing} />)
+        <PagedList items={slicings.data} limit={3} label="Judgement pages" className="space-y-4">
+          {(slicing) => <Slicing key={slicing.id} slicing={slicing} />}
+        </PagedList>
       )}
     </section>
   )

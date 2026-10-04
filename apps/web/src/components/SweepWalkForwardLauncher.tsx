@@ -7,6 +7,7 @@ import type { HoldoutRank, SweepOut } from '../api/types'
 import { floorPlaceholder } from '../sweep/rankFloor'
 
 import { RetestPrompt } from './WindowUses'
+import { PagedList } from './Pager'
 
 const METRICS: { value: HoldoutRank; label: string }[] = [
   { value: 'net_profit', label: 'Net profit' },
@@ -337,8 +338,8 @@ export function SweepWalkForwardLauncher(props: { sweep: SweepOut }): React.JSX.
       </button>
 
       {existing.data !== undefined && existing.data.length > 0 && (
-        <ul className="text-sm">
-          {existing.data.map((one) => (
+        <PagedList items={existing.data} limit={10} label="Walk-forward pages" as="ul" className="text-sm">
+          {(one) => (
             <li key={one.id}>
               <Link to={`/sweep-walkforwards/${one.id}`} className="text-sky-400 hover:text-sky-300">
                 {one.folds.length} folds from {one.start_year}, {one.train_years}y train /{' '}
@@ -346,8 +347,8 @@ export function SweepWalkForwardLauncher(props: { sweep: SweepOut }): React.JSX.
               </Link>{' '}
               <span className="text-slate-500">· {one.status}</span>
             </li>
-          ))}
-        </ul>
+          )}
+        </PagedList>
       )}
     </section>
   )

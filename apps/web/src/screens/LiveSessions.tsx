@@ -12,6 +12,8 @@ import type { LiveSession, LiveSessionDetail, SessionEvent } from '../api/types'
 import { useLiveSessionFeed } from '../api/useLiveSessionFeed'
 import type { FeedEvent } from '../api/useLiveSessionFeed'
 import { count, signedMoney } from '../format'
+import { Pager } from '../components/Pager'
+import { usePaged } from '../components/paging'
 
 function clock(value: string | null): string {
   return value === null ? '—' : new Date(value).toLocaleTimeString()
@@ -314,6 +316,7 @@ export function LiveSessions(): React.JSX.Element {
   const feed = useLiveSessionFeed(current)
   const detail = useLiveSession(current, feed.connected)
   const events = useSessionEvents(current, feed.connected)
+  const { page, pager } = usePaged(rows, 25)
 
   return (
     <div className="space-y-6">
@@ -337,7 +340,7 @@ export function LiveSessions(): React.JSX.Element {
               </tr>
             </thead>
             <tbody>
-              {rows.map((row) => (
+              {page.map((row) => (
                 <SessionRow
                   key={row.id}
                   session={row}
@@ -350,6 +353,7 @@ export function LiveSessions(): React.JSX.Element {
             </tbody>
           </table>
         )}
+        <Pager label="Session pages" {...pager} />
       </section>
 
       {detail.data !== undefined && (

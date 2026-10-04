@@ -4,6 +4,8 @@ import { useTradeSnapshot } from '../api/hooks'
 import type { Trade } from '../api/types'
 import { money, ratio, sign, signedMoney } from '../format'
 import { TradeSnapshot } from './TradeSnapshot'
+import { Pager } from './Pager'
+import { usePaged } from './paging'
 
 const netClass = { up: 'text-emerald-400', down: 'text-red-400', flat: 'text-slate-300' } as const
 
@@ -57,6 +59,9 @@ function SnapshotRow({
   )
 }
 
+/** Trades on one page of the table. */
+const TRADES_PER_PAGE = 50
+
 export function TradesTable({
   trades,
   backtestId,
@@ -76,6 +81,7 @@ export function TradesTable({
   // One open at a time. Several charts at once turns a table you scan into a page you scroll,
   // and the question being asked here is about one entry.
   const [openTrade, setOpenTrade] = useState<number | null>(null)
+  const { page, pager } = usePaged(trades, TRADES_PER_PAGE)
 
   if (trades.length === 0) {
     return <p className="text-sm text-slate-400">This run produced no trades.</p>
@@ -95,7 +101,7 @@ export function TradesTable({
           </tr>
         </thead>
         <tbody className="divide-y divide-slate-800">
-          {trades.map((trade) => {
+          {page.map((trade) => {
             const open = openTrade === trade.id
             return (
               <>
@@ -181,6 +187,9 @@ export function TradesTable({
           })}
         </tbody>
       </table>
+      <div className="p-2">
+        <Pager label="Trade pages" {...pager} />
+      </div>
     </div>
   )
 }

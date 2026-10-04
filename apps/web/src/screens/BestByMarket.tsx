@@ -14,7 +14,26 @@ import {
   NO_FILTERS,
 } from '../best/map'
 import { BestCellPanel, type ChosenCell } from '../components/BestCellPanel'
+import { Pager } from '../components/Pager'
+import { usePaged } from '../components/paging'
 import { count } from '../format'
+
+/** Symbol rows of the map on one page; a folded market is one row. */
+const MAP_ROWS_PER_PAGE = 30
+
+/** A page of rows back into its markets, in order, each with the symbols it shows on this page. */
+function groupByMarket(
+  rows: readonly { market: string; symbol: string | null }[],
+): { market: string; symbols: string[] }[] {
+  const groups: { market: string; symbols: string[] }[] = []
+  for (const row of rows) {
+    const last = groups.at(-1)
+    const group = last?.market === row.market ? last : { market: row.market, symbols: [] }
+    if (group !== last) groups.push(group)
+    if (row.symbol !== null) group.symbols.push(row.symbol)
+  }
+  return groups
+}
 
 /**
  * The best runs by market, setup and chart, across every sweep (his ask, 02/10).
@@ -37,6 +56,19 @@ export function BestByMarket(): React.JSX.Element {
   const cells = useMemo(() => map.data?.cells ?? [], [map.data])
   const layout = useMemo(() => layoutOf(cells, metric, filters), [cells, metric, filters])
   const options = useMemo(() => optionsOf(cells), [cells])
+  // ⚠️ Paged by row, a market folded counting as one (04/10): with hundreds of symbols the map was
+  // one table as tall as the catalogue. A page that starts inside a market repeats its heading.
+  const rows = useMemo(
+    () =>
+      layout.markets.flatMap(({ market, symbols }) =>
+        folded.includes(market)
+          ? [{ market, symbol: null }]
+          : symbols.map((symbol): { market: string; symbol: string | null } => ({ market, symbol })),
+      ),
+    [layout, folded],
+  )
+  const { page, pager } = usePaged(rows, MAP_ROWS_PER_PAGE)
+  const groups = groupByMarket(page)
 
   return (
     <div className="space-y-6">
@@ -153,8 +185,9 @@ export function BestByMarket(): React.JSX.Element {
                   ))}
                 </tr>
               </thead>
-              {layout.markets.map(({ market, symbols }) => {
+              {groups.map(({ market, symbols }) => {
                 const isFolded = folded.includes(market)
+                const all = layout.markets.find((one) => one.market === market)?.symbols ?? []
                 return (
                   <tbody key={market}>
                     <tr>
@@ -177,8 +210,8 @@ export function BestByMarket(): React.JSX.Element {
                         >
                           {isFolded ? '▸' : '▾'} {market}{' '}
                           <span className="font-normal text-slate-500">
-                            ({symbols.length} market
-                            {symbols.length === 1 ? '' : 's'})
+                            ({all.length} market
+                            {all.length === 1 ? '' : 's'})
                           </span>
                         </button>
                       </th>
@@ -221,6 +254,7 @@ export function BestByMarket(): React.JSX.Element {
               })}
             </table>
           </div>
+          <Pager label="Map pages" {...pager} />
           <Legend metric={metric} extent={layout.extent} />
         </div>
       )}

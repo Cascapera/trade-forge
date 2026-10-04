@@ -113,6 +113,21 @@ describe('RunLog', () => {
     expect(screen.getByText(/200 runs, newest first/i)).toBeInTheDocument()
   })
 
+  it('turns the page on the server, and a filter goes back to the first one', () => {
+    mockedPage.mockReturnValue({
+      isPending: false,
+      isError: false,
+      data: { total: 120, limit: 50, offset: 0, items: [listed({})] },
+    } as never)
+    renderWithProviders(<RunLog />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Next →' }))
+    expect(mockedPage).toHaveBeenLastCalledWith({ limit: 50, offset: 50 })
+
+    fireEvent.change(screen.getByLabelText('Status'), { target: { value: 'done' } })
+    expect(mockedPage).toHaveBeenLastCalledWith({ status: 'done', limit: 50, offset: 0 })
+  })
+
   it('says so plainly when no run matches the filters', () => {
     stubPage([])
     renderWithProviders(<RunLog />)
@@ -122,12 +137,12 @@ describe('RunLog', () => {
   it('asks the API only for the filters that were set', () => {
     stubPage([listed({})])
     renderWithProviders(<RunLog />)
-    expect(mockedPage).toHaveBeenCalledWith({})
+    expect(mockedPage).toHaveBeenCalledWith({ limit: 50, offset: 0 })
 
     fireEvent.change(screen.getByLabelText('Timeframe'), { target: { value: 'M15' } })
 
     // Only timeframe. An empty `symbol` would ask for runs whose symbol is '' and match nothing.
-    expect(mockedPage).toHaveBeenLastCalledWith({ timeframe: 'M15' })
+    expect(mockedPage).toHaveBeenLastCalledWith({ timeframe: 'M15', limit: 50, offset: 0 })
   })
 
   it('puts a ticked run on the chart once its curve arrives', () => {
@@ -221,7 +236,7 @@ describe('RunLog', () => {
     renderWithProviders(<RunLog />)
     fireEvent.change(screen.getByLabelText('Symbol'), { target: { value: 'EURUSD' } })
 
-    expect(mockedPage).toHaveBeenLastCalledWith({ symbol: 'EURUSD' })
+    expect(mockedPage).toHaveBeenLastCalledWith({ symbol: 'EURUSD', limit: 50, offset: 0 })
   })
 
   it('filters by status', () => {
@@ -230,7 +245,7 @@ describe('RunLog', () => {
 
     fireEvent.change(screen.getByLabelText('Status'), { target: { value: 'failed' } })
 
-    expect(mockedPage).toHaveBeenLastCalledWith({ status: 'failed' })
+    expect(mockedPage).toHaveBeenLastCalledWith({ status: 'failed', limit: 50, offset: 0 })
   })
 
   it('says a curve is on its way rather than showing an empty chart', () => {

@@ -1,9 +1,11 @@
 import { Link } from 'react-router-dom'
 
 import { isHoldoutSettled, useHoldout } from '../api/hooks'
-import type { HoldoutRank, HoldoutRow, HoldoutSide } from '../api/types'
+import type { HoldoutGroup, HoldoutRank, HoldoutRow, HoldoutSide } from '../api/types'
 import { percent } from '../format'
 import { MonteCarlo } from './MonteCarlo'
+import { Pager } from './Pager'
+import { usePaged } from './paging'
 import { HoldoutSlicings } from './HoldoutSlicings'
 import { WindowUseList } from './WindowUses'
 
@@ -151,6 +153,71 @@ export function HoldoutComparison(props: { sweepId: string }): React.JSX.Element
         </p>
       )}
 
+      <GroupTable groups={groups} />
+
+      <PointTable rows={sortRows(data.rows)} />
+
+      <HoldoutSlicings sweepId={data.id} settled={isHoldoutSettled(data)} />
+
+      <MonteCarlo sweepId={data.id} settled={isHoldoutSettled(data)} />
+    </section>
+  )
+}
+
+/** Every point of the test, 50 a page — a sweep holds thousands (04/10). */
+function PointTable(props: { rows: HoldoutRow[] }): React.JSX.Element {
+  const { page, pager } = usePaged(props.rows, 50)
+  return (
+    <>
+      <table className="w-full border-collapse text-left text-sm">
+        <caption className="mb-2 text-left font-semibold">Point by point</caption>
+        <thead>
+          <tr className="border-b border-slate-800 text-xs tracking-wide text-slate-500 uppercase">
+            <th scope="col" className="px-3 py-2">
+              Entry
+            </th>
+            <th scope="col" className="px-3 py-2">
+              Market
+            </th>
+            <th scope="col" className="px-3 py-2">
+              Point
+            </th>
+            <th scope="col" className="px-3 py-2">
+              Where chosen
+            </th>
+            <th scope="col" className="px-3 py-2">
+              Reserved window
+            </th>
+          </tr>
+        </thead>
+        <tbody>
+          {page.map((row) => (
+            <tr key={row.out_of_sample.run_id} className="border-b border-slate-900">
+              <td className="px-3 py-2">{row.entry_name ?? '(removed entry)'}</td>
+              <td className="px-3 py-2">{row.symbol}</td>
+              <td className="px-3 py-2 text-slate-300">{row.label}</td>
+              <td className="px-3 py-2">
+                <Result side={row.in_sample} />
+              </td>
+              <td className="px-3 py-2">
+                <Link to={`/results/${row.out_of_sample.run_id}`} className="hover:underline">
+                  <Result side={row.out_of_sample} />
+                </Link>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <Pager label="Point pages" {...pager} />
+    </>
+  )
+}
+
+/** The medians by entry and chart, 25 a page. */
+function GroupTable(props: { groups: HoldoutGroup[] }): React.JSX.Element {
+  const { page, pager } = usePaged(props.groups, 25)
+  return (
+    <>
       <table className="w-full border-collapse text-left text-sm">
         <caption className="mb-2 text-left font-semibold">By entry and chart</caption>
         <thead>
@@ -176,7 +243,7 @@ export function HoldoutComparison(props: { sweepId: string }): React.JSX.Element
           </tr>
         </thead>
         <tbody>
-          {groups.map((group) => (
+          {page.map((group) => (
             <tr
               key={`${group.entry_id}-${group.timeframe}`}
               className="border-b border-slate-900"
@@ -205,50 +272,7 @@ export function HoldoutComparison(props: { sweepId: string }): React.JSX.Element
           ))}
         </tbody>
       </table>
-
-      <table className="w-full border-collapse text-left text-sm">
-        <caption className="mb-2 text-left font-semibold">Point by point</caption>
-        <thead>
-          <tr className="border-b border-slate-800 text-xs tracking-wide text-slate-500 uppercase">
-            <th scope="col" className="px-3 py-2">
-              Entry
-            </th>
-            <th scope="col" className="px-3 py-2">
-              Market
-            </th>
-            <th scope="col" className="px-3 py-2">
-              Point
-            </th>
-            <th scope="col" className="px-3 py-2">
-              Where chosen
-            </th>
-            <th scope="col" className="px-3 py-2">
-              Reserved window
-            </th>
-          </tr>
-        </thead>
-        <tbody>
-          {sortRows(data.rows).map((row) => (
-            <tr key={row.out_of_sample.run_id} className="border-b border-slate-900">
-              <td className="px-3 py-2">{row.entry_name ?? '(removed entry)'}</td>
-              <td className="px-3 py-2">{row.symbol}</td>
-              <td className="px-3 py-2 text-slate-300">{row.label}</td>
-              <td className="px-3 py-2">
-                <Result side={row.in_sample} />
-              </td>
-              <td className="px-3 py-2">
-                <Link to={`/results/${row.out_of_sample.run_id}`} className="hover:underline">
-                  <Result side={row.out_of_sample} />
-                </Link>
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-
-      <HoldoutSlicings sweepId={data.id} settled={isHoldoutSettled(data)} />
-
-      <MonteCarlo sweepId={data.id} settled={isHoldoutSettled(data)} />
-    </section>
+      <Pager label="Group pages" {...pager} />
+    </>
   )
 }

@@ -4,7 +4,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { ApiError, api } from '../api/client'
 import type { Instrument, SweepTemplateOut, TemplateItem } from '../api/types'
-import { renderWithProviders } from '../test-utils'
+import { browsed, fakeBroker, renderWithProviders } from '../test-utils'
 
 import { TemplateQueue } from './TemplateQueue'
 
@@ -21,6 +21,8 @@ vi.mock('../api/client', async () => {
       resumeTemplate: vi.fn(),
       removeTemplateItem: vi.fn(),
       combineSweeps: vi.fn(),
+      getMarkets: vi.fn(),
+      browseSymbols: vi.fn(),
     },
   }
 })
@@ -87,6 +89,12 @@ beforeEach(() => {
   vi.clearAllMocks()
   mocked.getSweepTemplate.mockResolvedValue(template)
   mocked.listInstruments.mockResolvedValue(instruments)
+  const broker = fakeBroker([
+    browsed('AUDUSD', 'forex', '10.0000000000'),
+    browsed('XAUUSD', 'forex', null),
+  ])
+  mocked.getMarkets.mockImplementation(broker.markets)
+  mocked.browseSymbols.mockImplementation(broker.browse)
   mocked.queueMarkets.mockResolvedValue(template)
   mocked.pauseTemplate.mockResolvedValue({ ...template, paused: true })
   mocked.removeTemplateItem.mockResolvedValue(template)
@@ -134,8 +142,12 @@ describe('TemplateQueue', () => {
 
   it('prefills the measured spread and sends only what was typed', async () => {
     show()
-    fireEvent.click(await screen.findByLabelText('AUDUSD'))
-    fireEvent.click(screen.getByLabelText('XAUUSD'))
+    // Once the instruments are in: a market's spread is prefilled from them.
+    await screen.findByText(/2 collected so far/)
+    fireEvent.click(screen.getByRole('button', { name: 'Choose markets…' }))
+    fireEvent.click(await screen.findByLabelText(/^AUDUSD,/))
+    fireEvent.click(screen.getByLabelText(/^XAUUSD,/))
+    fireEvent.click(screen.getByRole('button', { name: 'Done' }))
 
     expect(screen.getByLabelText('spread of AUDUSD')).toHaveValue('10')
     expect(screen.getByLabelText('spread of XAUUSD')).toHaveValue('')
@@ -221,10 +233,14 @@ describe('TemplateQueue', () => {
     show()
 
     expect(await screen.findByText(/Nothing queued yet/)).toBeInTheDocument()
-    fireEvent.click(await screen.findByLabelText('AUDUSD'))
-    fireEvent.click(screen.getByLabelText('AUDUSD'))
+    await screen.findByText(/2 collected so far/)
+    fireEvent.click(screen.getByRole('button', { name: 'Choose markets…' }))
+    const audusd = await screen.findByLabelText(/^AUDUSD,/)
+    fireEvent.click(audusd)
+    fireEvent.click(audusd)
     expect(screen.queryByLabelText('spread of AUDUSD')).not.toBeInTheDocument()
-    fireEvent.click(screen.getByLabelText('AUDUSD'))
+    fireEvent.click(audusd)
+    fireEvent.click(screen.getByRole('button', { name: 'Done' }))
     fireEvent.change(screen.getByLabelText('commission of AUDUSD'), { target: { value: '7' } })
     fireEvent.change(screen.getByLabelText('swap short of AUDUSD'), { target: { value: '2' } })
     fireEvent.change(screen.getByLabelText('spread of AUDUSD'), { target: { value: '' } })

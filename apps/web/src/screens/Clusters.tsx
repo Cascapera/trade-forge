@@ -3,6 +3,8 @@ import { Link, useLocation, useNavigate } from 'react-router-dom'
 
 import { apiFailure } from '../api/failure'
 import { useClusters, useCreateCluster } from '../api/hooks'
+import { Pager, PagedList } from '../components/Pager'
+import { usePaged } from '../components/paging'
 import { percent } from '../format'
 
 /** A member as the form holds it: the run, what to call it, and a risk typed by hand or blank. */
@@ -68,6 +70,8 @@ export function Clusters(): React.JSX.Element {
   const [maxOpen, setMaxOpen] = useState('5')
   const [maxRisk, setMaxRisk] = useState('5')
   const [adding, setAdding] = useState('')
+  // A cluster of a whole reserved-window test arrives with hundreds of members (04/10).
+  const memberPages = usePaged(members, 50)
 
   const addingOk = UUID.test(adding.trim())
   const already = members.some((one) => one.backtest_id === adding.trim())
@@ -186,7 +190,7 @@ export function Clusters(): React.JSX.Element {
             </tr>
           </thead>
           <tbody>
-            {members.map((member) => (
+            {memberPages.page.map((member) => (
               <tr key={member.backtest_id} className="border-b border-slate-900">
                 <td className="px-3 py-2">
                   <Link to={`/results/${member.backtest_id}`} className="hover:underline">
@@ -228,6 +232,7 @@ export function Clusters(): React.JSX.Element {
             ))}
           </tbody>
         </table>
+        <Pager label="Member pages" {...memberPages.pager} />
 
         <div className="flex flex-wrap items-end gap-2 text-sm">
           <label className="flex flex-col gap-1">
@@ -282,8 +287,14 @@ export function Clusters(): React.JSX.Element {
         ) : clusters.data === undefined ? null : clusters.data.length === 0 ? (
           <p className="text-sm text-slate-500">No cluster yet.</p>
         ) : (
-          <ul className="space-y-1 text-sm">
-            {clusters.data.map((one) => (
+          <PagedList
+            items={clusters.data}
+            limit={20}
+            label="Cluster pages"
+            as="ul"
+            className="space-y-1 text-sm"
+          >
+            {(one) => (
               <li key={one.id}>
                 <Link to={`/clusters/${one.id}`} className="text-sky-400 hover:text-sky-300">
                   {one.name}
@@ -295,8 +306,8 @@ export function Clusters(): React.JSX.Element {
                     ` · deepest fall ${percent(one.max_drawdown_pct)}`}
                 </span>
               </li>
-            ))}
-          </ul>
+            )}
+          </PagedList>
         )}
       </div>
     </section>

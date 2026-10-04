@@ -1,3 +1,5 @@
+import { usePaged } from './paging'
+
 /**
  * Previous / next over a long list, by offset — the one pager every list on these screens uses
  * (04/10, his ask: "everything listed on every page paginated").
@@ -44,5 +46,27 @@ export function Pager(props: {
         Next →
       </button>
     </nav>
+  )
+}
+
+/**
+ * A list the screen holds whole, drawn a page at a time inside `as` (a `div` unless said), with
+ * its `Pager` below. A table pages with `usePaged` instead: its pager cannot sit in a `<tbody>`.
+ */
+export function PagedList<T>(props: {
+  items: readonly T[]
+  limit: number
+  label: string
+  as?: 'div' | 'ul'
+  className?: string
+  children: (item: T) => React.ReactNode
+}): React.JSX.Element {
+  const { page, pager } = usePaged(props.items, props.limit)
+  const List = props.as ?? 'div'
+  return (
+    <>
+      <List className={props.className}>{page.map(props.children)}</List>
+      <Pager label={props.label} {...pager} />
+    </>
   )
 }

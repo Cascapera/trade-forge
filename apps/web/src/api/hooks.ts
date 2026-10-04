@@ -333,8 +333,26 @@ export function useSaveStrategy() {
  * paging problem — one a person has to hunt through page by page is a catalogue that has
  * stopped being one.
  */
+/** Catalogue entries asked for per request — the API's own ceiling. */
+const CATALOG_PER_REQUEST = 200
+
+/**
+ * The whole shelf, read two hundred at a time (04/10): the API's first page of a hundred was the
+ * whole answer before, and an entry past it could not be found or swept. The screens page it.
+ */
+export async function wholeCatalog(): Promise<CatalogPage> {
+  const first = await api.listCatalog(CATALOG_PER_REQUEST, 0)
+  const items = [...first.items]
+  while (items.length < first.total) {
+    const next = await api.listCatalog(CATALOG_PER_REQUEST, items.length)
+    if (next.items.length === 0) break
+    items.push(...next.items)
+  }
+  return { ...first, items }
+}
+
 export function useCatalog() {
-  return useQuery<CatalogPage>({ queryKey: ['catalog'], queryFn: () => api.listCatalog() })
+  return useQuery<CatalogPage>({ queryKey: ['catalog'], queryFn: wholeCatalog })
 }
 
 /**
@@ -446,10 +464,29 @@ export function useEquityCurves(ids: readonly string[]) {
   })
 }
 
+/** Trades asked for per request — the API's own ceiling. */
+const TRADES_PER_REQUEST = 1000
+
+/**
+ * Every trade of a run, read a thousand at a time (04/10). The first page alone was the whole
+ * answer before, and a run of five years on M5 has thousands: the table and the chart's markers
+ * stopped at the hundredth trade without saying so. The table pages them on screen.
+ */
+export async function allTrades(id: string): Promise<TradesPage> {
+  const first = await api.getTrades(id, TRADES_PER_REQUEST, 0)
+  const items = [...first.items]
+  while (items.length < first.total) {
+    const next = await api.getTrades(id, TRADES_PER_REQUEST, items.length)
+    if (next.items.length === 0) break
+    items.push(...next.items)
+  }
+  return { ...first, limit: items.length, items }
+}
+
 export function useTrades(id: string | undefined, enabled: boolean) {
   return useQuery<TradesPage>({
     queryKey: ['trades', id],
-    queryFn: id !== undefined && enabled ? () => api.getTrades(id) : skipToken,
+    queryFn: id !== undefined && enabled ? () => allTrades(id) : skipToken,
   })
 }
 

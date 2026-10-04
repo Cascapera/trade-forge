@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react'
 
 import { useBacktests, useEquityCurves, useInstruments } from '../api/hooks'
-import type { BacktestFilters, BacktestStatus } from '../api/types'
+import type { BacktestFilters, BacktestListItem, BacktestStatus } from '../api/types'
 import {
   EMPTY_SEATS,
   MAX_COMPARED,
@@ -16,6 +16,10 @@ import { ComparisonChart } from '../components/ComparisonChart'
 import { RunTable } from '../components/RunTable'
 import { count } from '../format'
 import { TIMEFRAMES } from '../strategy/builder'
+import { Pager } from '../components/Pager'
+
+/** Runs on one page of the log. */
+const RUNS_PER_PAGE = 50
 
 const STATUSES: readonly BacktestStatus[] = ['queued', 'running', 'done', 'failed']
 
@@ -65,6 +69,10 @@ export function RunLog(): React.JSX.Element {
   const [timeframe, setTimeframe] = useState('')
   const [status, setStatus] = useState('')
   const [seats, setSeats] = useState(EMPTY_SEATS)
+  const [offset, setOffset] = useState(0)
+  // The runs ticked, kept as they were read: a tick survives turning the page (04/10), and the
+  // chart still has to name a run that is no longer on the page on screen.
+  const [ticked, setTicked] = useState<Record<string, BacktestListItem>>({})
 
   const filters: BacktestFilters = useMemo(() => {
     const next: BacktestFilters = {}
@@ -74,8 +82,10 @@ export function RunLog(): React.JSX.Element {
     if (s !== undefined) next.symbol = s
     if (t !== undefined) next.timeframe = t
     if (st !== undefined) next.status = st as BacktestStatus
+    next.limit = RUNS_PER_PAGE
+    next.offset = offset
     return next
-  }, [symbol, timeframe, status])
+  }, [symbol, timeframe, status, offset])
 
   const page = useBacktests(filters)
   const instruments = useInstruments()
@@ -86,11 +96,28 @@ export function RunLog(): React.JSX.Element {
   const { curves, isPending: curvesPending } = useEquityCurves(picked)
 
   const runs = useMemo(() => page.data?.items ?? [], [page.data])
-  const series = useMemo(() => buildSeries(seats, runs, curves), [seats, runs, curves])
-  const costless = useMemo(() => costlessAmong(seats, runs), [seats, runs])
+  const known = useMemo(() => {
+    const onPage = new Set(runs.map((run) => run.id))
+    return [...runs, ...Object.values(ticked).filter((run) => !onPage.has(run.id))]
+  }, [runs, ticked])
+  const series = useMemo(() => buildSeries(seats, known, curves), [seats, known, curves])
+  const costless = useMemo(() => costlessAmong(seats, known), [seats, known])
 
   function toggle(id: string): void {
     setSeats((current) => toggleSeat(current, id))
+    const run = runs.find((one) => one.id === id)
+    setTicked((current) => {
+      if (id in current) return Object.fromEntries(Object.entries(current).filter(([key]) => key !== id))
+      return run === undefined ? current : { ...current, [id]: run }
+    })
+  }
+
+  /** A filter changed: back to the first page, which is where the newest of the new set is. */
+  function filter(set: (value: string) => void): (value: string) => void {
+    return (value) => {
+      set(value)
+      setOffset(0)
+    }
   }
 
   if (page.isPending) {
@@ -117,11 +144,16 @@ export function RunLog(): React.JSX.Element {
           <Field
             label="Symbol"
             value={symbol}
-            onChange={setSymbol}
+            onChange={filter(setSymbol)}
             options={(instruments.data ?? []).map((one) => one.symbol)}
           />
-          <Field label="Timeframe" value={timeframe} onChange={setTimeframe} options={TIMEFRAMES} />
-          <Field label="Status" value={status} onChange={setStatus} options={STATUSES} />
+          <Field
+            label="Timeframe"
+            value={timeframe}
+            onChange={filter(setTimeframe)}
+            options={TIMEFRAMES}
+          />
+          <Field label="Status" value={status} onChange={filter(setStatus)} options={STATUSES} />
         </div>
       </div>
 
@@ -163,6 +195,13 @@ export function RunLog(): React.JSX.Element {
       ) : (
         <RunTable runs={runs} seats={seats} onToggle={toggle} />
       )}
+      <Pager
+        label="Run pages"
+        offset={offset}
+        limit={RUNS_PER_PAGE}
+        total={total}
+        onOffset={setOffset}
+      />
     </div>
   )
 }

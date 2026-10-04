@@ -13,6 +13,7 @@ answers in microseconds, and would stop working entirely whenever the terminal i
 which is the normal state of a machine somebody is building a strategy on.
 """
 
+from collections import Counter
 from typing import Annotated
 
 from fastapi import APIRouter, HTTPException, Query, status
@@ -20,14 +21,25 @@ from fastapi import APIRouter, HTTPException, Query, status
 from tradeforge_api.deps import QueueDep, SessionDep
 from tradeforge_api.queue import COLLECT_QUEUE, PROBE_HISTORY, SYNC_SYMBOLS
 from tradeforge_api.schemas import (
+    BrowsedSymbolOut,
     EnqueuedOut,
+    MarketOut,
+    MarketsOut,
     StorableText,
     Symbol,
+    SymbolBrowseOut,
     SymbolHistoryOut,
     SymbolSearchOut,
+    SymbolSnapshotOut,
     Timeframe,
 )
-from tradeforge_db.broker_symbols import DEFAULT_LIMIT, search_symbols, snapshot_taken_at
+from tradeforge_db.broker_symbols import (
+    DEFAULT_LIMIT,
+    MARKETS,
+    browse_symbols,
+    search_symbols,
+    snapshot_taken_at,
+)
 from tradeforge_db.symbol_history import read_history
 
 router = APIRouter(tags=["symbols"])
@@ -69,6 +81,71 @@ def search(
         symbols=search_symbols(session, q, limit=limit),
         server=None if taken is None else taken[0],
         synced_at=None if taken is None else taken[1],
+    )
+
+
+# One request's worth for "choose the whole market" — a sweep's own ceiling on markets.
+_MAX_BROWSE = 500
+
+
+@router.get("/symbols/markets", response_model=MarketsOut)
+def markets(session: SessionDep) -> MarketsOut:
+    """How many symbols the broker lists in each market — the browser's tabs (02/10)."""
+    listed = browse_symbols(session)
+    counts = Counter(one.market for one in listed)
+    collected = Counter(one.market for one in listed if one.match.catalogued)
+    taken = snapshot_taken_at(session)
+    return MarketsOut(
+        markets=[
+            MarketOut(key=key, label=label, count=counts[key], collected=collected[key])
+            for key, label in MARKETS
+        ],
+        snapshot=None if taken is None else SymbolSnapshotOut(server=taken[0], synced_at=taken[1]),
+    )
+
+
+@router.get("/symbols/browse", response_model=SymbolBrowseOut)
+def browse(  # noqa: PLR0913, PLR0917 — one query parameter per filter
+    session: SessionDep,
+    market: Annotated[str | None, Query(max_length=32)] = None,
+    q: Annotated[StorableText, Query(max_length=64)] = "",
+    collected: bool = False,
+    offset: Annotated[int, Query(ge=0, le=100_000)] = 0,
+    limit: Annotated[int, Query(ge=1, le=_MAX_BROWSE)] = DEFAULT_LIMIT,
+) -> SymbolBrowseOut:
+    """One page of the broker's symbols in `market` (all of them when left out) whose symbol or
+    description contains `q`, alphabetical — his ask (02/10): hundreds of symbols, chosen a
+    market at a time, never all on one screen. `collected` keeps only those with candles.
+
+    The ceiling on `limit` is a sweep's own: "choose the whole market" asks for every symbol of
+    it at once, and a screen still shows them a page at a time."""
+    needle = q.strip().lower()
+    found = [
+        one
+        for one in browse_symbols(session)
+        if (market is None or one.market == market)
+        and (not collected or one.match.catalogued)
+        and (
+            not needle
+            or needle in one.match.symbol.lower()
+            or needle in (one.match.description or "").lower()
+        )
+    ]
+    return SymbolBrowseOut(
+        total=len(found),
+        offset=offset,
+        limit=limit,
+        items=[
+            BrowsedSymbolOut(
+                symbol=one.match.symbol,
+                description=one.match.description,
+                path=one.match.path,
+                market=one.market,
+                catalogued=one.match.catalogued,
+                spread_points=one.spread_points,
+            )
+            for one in found[offset : offset + limit]
+        ],
     )
 
 

@@ -5,6 +5,8 @@ import { useCreateMonteCarlo, useMonteCarlos } from '../api/hooks'
 import type { CreateMonteCarloRequest, MonteCarloOut, MonteCarloPoint, Simulated } from '../api/types'
 import { percent } from '../format'
 import { type RankKey, rankingOf } from '../sweep/ranking'
+import { Pager, PagedList } from './Pager'
+import { usePaged } from './paging'
 
 const CHART_ORDER = ['M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1', 'W1']
 
@@ -129,6 +131,7 @@ function blockHeading(run: MonteCarloOut): string {
 
 function Resampling(props: { run: MonteCarloOut }): React.JSX.Element {
   const { run } = props
+  const { page, pager } = usePaged(sortPoints(run.points), 50)
   const which =
     run.ranking === undefined || run.ranking === null
       ? ''
@@ -167,11 +170,12 @@ function Resampling(props: { run: MonteCarloOut }): React.JSX.Element {
           </tr>
         </thead>
         <tbody>
-          {sortPoints(run.points).map((point) => (
+          {page.map((point) => (
             <Row key={point.run_id} point={point} />
           ))}
         </tbody>
       </table>
+      <Pager label="Point pages" {...pager} />
     </article>
   )
 }
@@ -325,7 +329,9 @@ export function MonteCarlo(props: {
       ) : runs.data === undefined ? null : runs.data.length === 0 ? (
         <p className="text-sm text-slate-500">Not resampled yet.</p>
       ) : (
-        runs.data.map((run) => <Resampling key={run.id} run={run} />)
+        <PagedList items={runs.data} limit={3} label="Resampling pages" className="space-y-4">
+          {(run) => <Resampling key={run.id} run={run} />}
+        </PagedList>
       )}
     </section>
   )

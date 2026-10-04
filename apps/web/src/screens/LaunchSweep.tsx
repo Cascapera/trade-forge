@@ -7,7 +7,7 @@ import { useMissingDataGate } from '../collect/gate'
 import { neverCollected, neverCollectedReason } from '../basket/settings'
 import { anythingToRun, pairsOf } from '../collect/missing'
 import { MissingDataPrompt } from '../components/MissingDataPrompt'
-import { Pager } from '../components/Pager'
+import { Pager, PagedList } from '../components/Pager'
 import { clampOffset, pageOf } from '../components/paging'
 import { SymbolPicker } from '../components/SymbolPicker'
 import { roughly } from '../format'
@@ -177,8 +177,14 @@ export function LaunchSweep(): React.JSX.Element {
               The shelf is empty. Put a strategy on it first, under a name you will recognise.
             </p>
           ) : (
-            <ul className="grid gap-2 sm:grid-cols-2">
-              {entries.map((entry) => (
+            <PagedList
+              items={entries}
+              limit={20}
+              label="Entry pages"
+              as="ul"
+              className="grid gap-2 sm:grid-cols-2"
+            >
+              {(entry) => (
                 <li key={entry.id}>
                   <label className="flex cursor-pointer items-start gap-2 rounded border border-slate-800 px-3 py-2 hover:border-slate-700">
                     <input
@@ -201,8 +207,8 @@ export function LaunchSweep(): React.JSX.Element {
                     </span>
                   </label>
                 </li>
-              ))}
-            </ul>
+              )}
+            </PagedList>
           )}
           {/* His call of 23/09, said where the entries are chosen because it changes what each of
               them runs: the target is measured, not set, unless the entry's grid names it. */}

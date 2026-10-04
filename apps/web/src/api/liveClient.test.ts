@@ -23,7 +23,7 @@ describe('live session endpoints', () => {
     // ⚠️ No `?status=`, not `?status=`. An empty filter asks the API for sessions whose status is
     // the empty string, which matches nothing; an absent one asks for all of them. The same
     // distinction the run log already had to learn.
-    expect(fetchMock).toHaveBeenCalledWith('/api/live-sessions', expect.anything())
+    expect(fetchMock).toHaveBeenCalledWith('/api/live-sessions?limit=200', expect.anything())
   })
 
   it('passes a status through when one is asked for', async () => {
@@ -32,7 +32,7 @@ describe('live session endpoints', () => {
 
     await api.listLiveSessions('running')
 
-    expect(fetchMock).toHaveBeenCalledWith('/api/live-sessions?status=running', expect.anything())
+    expect(fetchMock).toHaveBeenCalledWith('/api/live-sessions?status=running&limit=200', expect.anything())
   })
 
   it('reads one session', async () => {

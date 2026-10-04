@@ -1,7 +1,9 @@
 import { Link, useParams } from 'react-router-dom'
 
 import { useSweepWalkForward } from '../api/hooks'
-import type { SweepWalkForwardFold, WalkForwardStage } from '../api/types'
+import type { SweepWalkForwardFold, SweepWalkForwardOut, WalkForwardStage } from '../api/types'
+import { Pager } from '../components/Pager'
+import { usePaged } from '../components/paging'
 import { inR, percent } from '../format'
 
 const STAGE_LABEL: Record<WalkForwardStage, string> = {
@@ -145,6 +147,17 @@ export function SweepWalkForwardResult(): React.JSX.Element {
         </tbody>
       </table>
 
+      <GroupTable data={data} byCut={byCut} />
+    </section>
+  )
+}
+
+/** Out of sample by entry and chart, 25 groups a page. */
+function GroupTable(props: { data: SweepWalkForwardOut; byCut: boolean }): React.JSX.Element {
+  const { data, byCut } = props
+  const { page, pager } = usePaged(props.data.groups, 25)
+  return (
+    <>
       <table className="w-full border-collapse text-left text-sm">
         <caption className="mb-2 text-left font-semibold">
           Out of sample, by entry and chart — each fold&apos;s median
@@ -179,7 +192,7 @@ export function SweepWalkForwardResult(): React.JSX.Element {
               </td>
             </tr>
           ) : (
-            data.groups.map((group) => (
+            page.map((group) => (
               <tr key={`${group.entry_id}-${group.timeframe}`} className="border-b border-slate-900">
                 <td className="px-3 py-2">{group.entry_name ?? '(removed entry)'}</td>
                 <td className="px-3 py-2">{group.timeframe}</td>
@@ -209,6 +222,7 @@ export function SweepWalkForwardResult(): React.JSX.Element {
           )}
         </tbody>
       </table>
-    </section>
+      <Pager label="Group pages" {...pager} />
+    </>
   )
 }

@@ -22,6 +22,8 @@ import {
 } from '../collect/rows'
 import type { DraftRow } from '../collect/rows'
 import { MAX_BATCH_SYMBOLS } from '../collect/window'
+import { Pager } from '../components/Pager'
+import { usePaged } from '../components/paging'
 
 const ASSET_CLASSES: readonly AssetClass[] = ['forex', 'stock', 'index', 'future', 'crypto']
 
@@ -399,34 +401,38 @@ function reason(error: unknown): string {
 }
 
 function CollectionList(props: { rows: Collection[] }): React.JSX.Element | null {
+  const { page, pager } = usePaged(props.rows, 25)
   if (props.rows.length === 0) return null
 
   return (
-    <table className="w-full text-left text-xs">
-      <caption className="pb-2 text-left text-xs text-slate-400">Recent collections</caption>
-      <thead className="text-slate-400">
-        <tr>
-          <th className="py-1 font-normal">Symbol</th>
-          <th className="py-1 font-normal">Timeframe</th>
-          <th className="py-1 font-normal">Requested</th>
-          <th className="py-1 font-normal">State</th>
-          <th className="py-1 font-normal">Result</th>
-        </tr>
-      </thead>
-      <tbody>
-        {props.rows.map((row) => (
-          <tr key={row.id} className="border-t border-slate-800">
-            <td className="py-1 text-slate-200">{row.symbol}</td>
-            <td className="py-1 text-slate-300">{row.timeframe}</td>
-            <td className="py-1 text-slate-400">
-              {row.date_from.slice(0, 10)} → {row.date_to.slice(0, 10)}
-            </td>
-            <td className="py-1 text-slate-300">{state(row)}</td>
-            <td className="py-1 text-slate-400">{result(row)}</td>
+    <>
+      <table className="w-full text-left text-xs">
+        <caption className="pb-2 text-left text-xs text-slate-400">Recent collections</caption>
+        <thead className="text-slate-400">
+          <tr>
+            <th className="py-1 font-normal">Symbol</th>
+            <th className="py-1 font-normal">Timeframe</th>
+            <th className="py-1 font-normal">Requested</th>
+            <th className="py-1 font-normal">State</th>
+            <th className="py-1 font-normal">Result</th>
           </tr>
-        ))}
-      </tbody>
-    </table>
+        </thead>
+        <tbody>
+          {page.map((row) => (
+            <tr key={row.id} className="border-t border-slate-800">
+              <td className="py-1 text-slate-200">{row.symbol}</td>
+              <td className="py-1 text-slate-300">{row.timeframe}</td>
+              <td className="py-1 text-slate-400">
+                {row.date_from.slice(0, 10)} → {row.date_to.slice(0, 10)}
+              </td>
+              <td className="py-1 text-slate-300">{state(row)}</td>
+              <td className="py-1 text-slate-400">{result(row)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <Pager label="Collection pages" {...pager} />
+    </>
   )
 }
 

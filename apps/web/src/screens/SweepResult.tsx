@@ -26,6 +26,7 @@ import { SweepTargets } from '../components/TargetLadder'
 import { money } from '../format'
 import { settled, summarise, tally } from '../sweep/progress'
 import { RANKINGS, RUNS_PER_PAGE, type RankKey, rankingOf } from '../sweep/ranking'
+import { PagedList } from '../components/Pager'
 
 /** The calendar day of an ISO instant — the granularity a window is read at. */
 function day(iso: string): string {
@@ -282,8 +283,14 @@ export function SweepResult(): React.JSX.Element {
               Left out — no candles in this window for {data.skipped.length}{' '}
               {data.skipped.length === 1 ? 'pair' : 'pairs'}:
             </p>
-            <ul className="mt-1 space-y-0.5 text-xs text-amber-300/80">
-              {data.skipped.map((pair) => (
+            <PagedList
+              items={data.skipped}
+              limit={20}
+              label="Left-out pages"
+              as="ul"
+              className="mt-1 space-y-0.5 text-xs text-amber-300/80"
+            >
+              {(pair) => (
                 <li key={`${pair.symbol}-${pair.timeframe}`}>
                   <span className="font-medium">
                     {pair.symbol} {pair.timeframe}
@@ -295,8 +302,8 @@ export function SweepResult(): React.JSX.Element {
                       ? pair.covers
                       : `collected ${pair.covers}`}
                 </li>
-              ))}
-            </ul>
+              )}
+            </PagedList>
           </div>
         )}
         {/* The window was cut where the broker's intraday history is one bar a day stored as the
@@ -304,16 +311,22 @@ export function SweepResult(): React.JSX.Element {
         {(data.trimmed ?? []).length > 0 && (
           <div role="status" aria-label="cut to real bars" className="mt-2 text-sm text-amber-300">
             <p>Started later — before these dates the broker&apos;s history is one bar a day:</p>
-            <ul className="mt-1 space-y-0.5 text-xs text-amber-300/80">
-              {(data.trimmed ?? []).map((pair) => (
+            <PagedList
+              items={data.trimmed ?? []}
+              limit={20}
+              label="Started-later pages"
+              as="ul"
+              className="mt-1 space-y-0.5 text-xs text-amber-300/80"
+            >
+              {(pair) => (
                 <li key={`${pair.symbol}-${pair.timeframe}`}>
                   <span className="font-medium">
                     {pair.symbol} {pair.timeframe}
                   </span>{' '}
                   — from {pair.date_from.slice(0, 10)}
                 </li>
-              ))}
-            </ul>
+              )}
+            </PagedList>
           </div>
         )}
         <div className="mt-2">

@@ -6,6 +6,8 @@ import type { DashboardRatio, DashboardSlice, DashboardSweep, SweepDashboard as 
 import { count, percent, ratio, sign } from '../format'
 import { launchWindow, runsPerDay } from '../sweep/dashboard'
 import { summarise } from '../sweep/progress'
+import { Pager, PagedList } from '../components/Pager'
+import { usePaged } from '../components/paging'
 
 // The sweep page's poles: blue gains, red losses (see `StudyDispersion`). The neutral is a lighter
 // slate so it separates from the blue by lightness; checked with the dataviz validator on this
@@ -111,6 +113,7 @@ function SliceTable(props: {
   const head = 'px-3 py-2 text-right font-medium'
   const cell = 'px-3 py-2 text-right tabular-nums'
   const heading = useId()
+  const { page, pager } = usePaged(props.slices, 25)
   return (
     <section className="space-y-2">
       <h3 id={heading} className="font-medium">
@@ -136,7 +139,7 @@ function SliceTable(props: {
             </tr>
           </thead>
           <tbody className="divide-y divide-slate-800">
-            {props.slices.map((slice) => (
+            {page.map((slice) => (
               <tr key={slice.key}>
                 <th scope="row" className="px-3 py-2 text-left font-normal">
                   {slice.label ?? <span className="text-slate-500">Removed entry</span>}
@@ -172,6 +175,7 @@ function SliceTable(props: {
           </tbody>
         </table>
       </div>
+      <Pager label={`${props.caption} pages`} {...pager} />
     </section>
   )
 }
@@ -188,6 +192,8 @@ function launchedAt(iso: string): string {
 
 function Timeline({ sweeps }: { sweeps: DashboardSweep[] }): React.JSX.Element {
   const days = runsPerDay(sweeps)
+  const sweepPages = usePaged(sweeps, 25)
+  const dayPages = usePaged(days, 31)
   return (
     <section className="grid gap-6 lg:grid-cols-[3fr_1fr]">
       <div className="space-y-2">
@@ -208,7 +214,7 @@ function Timeline({ sweeps }: { sweeps: DashboardSweep[] }): React.JSX.Element {
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-800">
-              {sweeps.map((sweep) => (
+              {sweepPages.page.map((sweep) => (
                 <tr key={sweep.id}>
                   <td className="px-3 py-2 whitespace-nowrap">
                     <Link to={`/sweeps/${sweep.id}`} className="text-sky-400 hover:text-sky-300">
@@ -243,12 +249,13 @@ function Timeline({ sweeps }: { sweeps: DashboardSweep[] }): React.JSX.Element {
             </tbody>
           </table>
         </div>
+        <Pager label="Sweep pages" {...sweepPages.pager} />
       </div>
       <div className="space-y-2">
         <h3 className="font-medium">Runs launched per day</h3>
         <table className="w-full text-sm">
           <tbody className="divide-y divide-slate-800">
-            {days.map((one) => (
+            {dayPages.page.map((one) => (
               <tr key={one.day}>
                 <th scope="row" className="py-1.5 text-left font-normal text-slate-300">
                   {one.day}
@@ -258,6 +265,7 @@ function Timeline({ sweeps }: { sweeps: DashboardSweep[] }): React.JSX.Element {
             ))}
           </tbody>
         </table>
+        <Pager label="Day pages" {...dayPages.pager} />
       </div>
     </section>
   )
@@ -308,16 +316,22 @@ function Report({ body }: { body: Body }): React.JSX.Element {
             <p>
               Left out — no candles in the window, so no runs and no row in the tables below:
             </p>
-            <ul className="mt-1 space-y-0.5 text-xs text-amber-200/80">
-              {totals.left_out.map((pair) => (
+            <PagedList
+              items={totals.left_out}
+              limit={20}
+              label="Left-out pages"
+              as="ul"
+              className="mt-1 space-y-0.5 text-xs text-amber-200/80"
+            >
+              {(pair) => (
                 <li key={`${pair.symbol}-${pair.timeframe}`}>
                   <span className="font-medium">
                     {pair.symbol} {pair.timeframe}
                   </span>{' '}
                   — in {pair.sweeps === 1 ? '1 sweep' : `${String(pair.sweeps)} sweeps`}
                 </li>
-              ))}
-            </ul>
+              )}
+            </PagedList>
           </div>
         )}
       </section>

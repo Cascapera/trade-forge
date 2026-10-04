@@ -1,8 +1,10 @@
 import { useParams } from 'react-router-dom'
 
 import { useCluster } from '../api/hooks'
-import type { ClusterSkip } from '../api/types'
+import type { ClusterMember, ClusterSkip } from '../api/types'
 import { EquityCurve } from '../components/EquityCurve'
+import { Pager } from '../components/Pager'
+import { usePaged } from '../components/paging'
 import { money, percent } from '../format'
 
 const SKIP_LABEL: Record<ClusterSkip, string> = {
@@ -96,6 +98,16 @@ export function ClusterResult(): React.JSX.Element {
         </>
       )}
 
+      <MemberTable members={data.members} />
+    </section>
+  )
+}
+
+/** The cluster's members, 50 a page — a cluster of a whole test holds hundreds (04/10). */
+function MemberTable(props: { members: ClusterMember[] }): React.JSX.Element {
+  const { page, pager } = usePaged(props.members, 50)
+  return (
+    <>
       <table className="w-full border-collapse text-left text-sm">
         <caption className="mb-2 text-left font-semibold">Members</caption>
         <thead>
@@ -121,7 +133,7 @@ export function ClusterResult(): React.JSX.Element {
           </tr>
         </thead>
         <tbody>
-          {data.members.map((member) => {
+          {page.map((member) => {
             const skipped = Object.entries(member.skipped ?? {}).filter(([, many]) => many > 0)
             return (
               <tr key={member.backtest_id} className="border-b border-slate-900">
@@ -160,6 +172,7 @@ export function ClusterResult(): React.JSX.Element {
           })}
         </tbody>
       </table>
-    </section>
+      <Pager label="Member pages" {...pager} />
+    </>
   )
 }

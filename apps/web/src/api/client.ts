@@ -193,7 +193,8 @@ export const api = {
   // The shelf. Separate from `/strategies` because that endpoint answers "what documents exist",
   // which is a different question from "what is worth running" — and its names are generated
   // from the documents, so they are not labels anybody chose.
-  listCatalog: (): Promise<CatalogPage> => request('GET', '/catalog'),
+  listCatalog: (limit?: number, offset?: number): Promise<CatalogPage> =>
+    request('GET', `/catalog${query({ limit, offset })}`),
   createCatalogEntry: (body: CreateCatalogEntry): Promise<CatalogEntry> =>
     request('POST', '/catalog', body),
   // 204, so nothing comes back. The caller refetches the list rather than patching it in place:
@@ -323,7 +324,8 @@ export const api = {
   // Several finished runs replayed on one shared account (25/09). Replayed by the worker.
   createCluster: (payload: CreateClusterRequest): Promise<ClusterOut> =>
     request('POST', '/clusters', payload),
-  listClusters: (): Promise<ClusterListItem[]> => request('GET', '/clusters'),
+  // The API's ceiling (200), paged on the screen: the default 50 hid the oldest (04/10).
+  listClusters: (): Promise<ClusterListItem[]> => request('GET', '/clusters?limit=200'),
   getCluster: (id: string): Promise<ClusterOut> => request('GET', `/clusters/${id}`),
   // A finished test's points resampled, and kept (25/09). Runs nothing; takes seconds.
   createMonteCarlo: (id: string, payload: CreateMonteCarloRequest): Promise<MonteCarloOut> =>
@@ -361,7 +363,8 @@ export const api = {
   // something is wrong. The detail below is the one that asks Redis, and answers 503 rather than
   // guessing at the stop state.
   listLiveSessions: (status?: string): Promise<LiveSessionsPage> =>
-    request('GET', `/live-sessions${query({ status })}`),
+    // The API's ceiling, paged on screen: its default of 50 hid the older sessions (04/10).
+    request('GET', `/live-sessions${query({ status, limit: 200 })}`),
   getLiveSession: (id: string): Promise<LiveSessionDetail> =>
     request('GET', `/live-sessions/${id}`),
   listSessionEvents: (id: string, limit?: number): Promise<SessionEventsPage> =>

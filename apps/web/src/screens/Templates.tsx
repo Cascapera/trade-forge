@@ -4,6 +4,7 @@ import { Link, useNavigate } from 'react-router-dom'
 import { apiFailure } from '../api/failure'
 import { useCatalog, useCreateSweepTemplate, useSweepTemplates } from '../api/hooks'
 import { TIMEFRAMES } from '../strategy/builder'
+import { PagedList } from '../components/Pager'
 
 function toggle(list: readonly string[], value: string): string[] {
   return list.includes(value) ? list.filter((one) => one !== value) : [...list, value]
@@ -120,8 +121,13 @@ export function Templates(): React.JSX.Element {
 
         <fieldset className="space-y-2 text-sm">
           <legend className="text-slate-300">Entries</legend>
-          <div className="grid gap-1 sm:grid-cols-2">
-            {(catalog.data?.items ?? []).map((entry) => (
+          <PagedList
+            items={catalog.data?.items ?? []}
+            limit={20}
+            label="Entry pages"
+            className="grid gap-1 sm:grid-cols-2"
+          >
+            {(entry) => (
               <label key={entry.id} className="flex items-center gap-2">
                 <input
                   type="checkbox"
@@ -135,8 +141,8 @@ export function Templates(): React.JSX.Element {
                   {entry.points === 1 ? 'one point' : `${String(entry.points)} points`}
                 </span>
               </label>
-            ))}
-          </div>
+            )}
+          </PagedList>
         </fieldset>
 
         <fieldset className="flex flex-wrap gap-3 text-sm">
@@ -178,8 +184,14 @@ export function Templates(): React.JSX.Element {
         ) : templates.data === undefined ? null : templates.data.length === 0 ? (
           <p className="text-sm text-slate-500">No template yet.</p>
         ) : (
-          <ul className="space-y-1 text-sm">
-            {templates.data.map((one) => (
+          <PagedList
+            items={templates.data}
+            limit={20}
+            label="Template pages"
+            as="ul"
+            className="space-y-1 text-sm"
+          >
+            {(one) => (
               <li key={one.id}>
                 <Link to={`/templates/${one.id}`} className="text-sky-400 hover:text-sky-300">
                   {one.name}
@@ -192,8 +204,8 @@ export function Templates(): React.JSX.Element {
                   {one.paused && ' · paused'}
                 </span>
               </li>
-            ))}
-          </ul>
+            )}
+          </PagedList>
         )}
       </div>
     </section>

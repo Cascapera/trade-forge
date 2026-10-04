@@ -16,6 +16,10 @@ import { filterCatalogue, gridSummary } from '../strategy/catalogue'
 import { axesFrom, gridOf, type Axis } from '../study/settings'
 
 import { StrategyBuilder } from './StrategyBuilder'
+import { PagedList } from '../components/Pager'
+
+/** Shelf entries on one page. */
+const ENTRIES_PER_PAGE = 20
 
 const inputClass =
   'rounded border border-slate-700 bg-slate-900 px-2 py-1.5 text-sm text-slate-100 focus:border-sky-500 focus:outline-none'
@@ -149,8 +153,14 @@ export function StrategyCatalog(): React.JSX.Element {
       ) : rows.length === 0 ? (
         <p className="text-sm text-slate-400">No entry matches that.</p>
       ) : (
-        <ul className="flex flex-col gap-2">
-          {rows.map((entry) =>
+        <PagedList
+          items={rows}
+          limit={ENTRIES_PER_PAGE}
+          label="Entry pages"
+          as="ul"
+          className="flex flex-col gap-2"
+        >
+          {(entry) =>
             editing === entry.id ? (
               <li key={entry.id}>
                 <EditEntry
@@ -207,9 +217,9 @@ export function StrategyCatalog(): React.JSX.Element {
                   <RemoveEntry id={entry.id} name={entry.name} />
                 </div>
               </li>
-            ),
-          )}
-        </ul>
+            )
+          }
+        </PagedList>
       )}
     </section>
   )

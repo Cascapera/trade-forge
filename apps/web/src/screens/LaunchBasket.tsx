@@ -7,7 +7,7 @@ import {
   emptyBasketForm,
   launchFailure,
   toBasketRequest,
-  toggleSymbol,
+  MAX_SYMBOLS,
   neverCollected,
   neverCollectedReason,
   uncostedAmong,
@@ -117,8 +117,9 @@ export function LaunchBasket(): React.JSX.Element {
         <SymbolPicker
           instruments={instruments.data}
           chosen={form.symbols}
-          onToggle={(symbol) => {
-            edit(toggleSymbol(form, symbol))
+          max={MAX_SYMBOLS}
+          onChange={(symbols) => {
+            edit({ ...form, symbols })
           }}
         />
 
@@ -192,12 +193,13 @@ export function LaunchBasket(): React.JSX.Element {
           role="status"
           className="rounded border border-amber-800 bg-amber-950/40 p-4 text-sm text-amber-200"
         >
-          <strong>{uncosted.join(', ')}</strong>{' '}
-          {uncosted.length === 1 ? 'has' : 'have'} no measured spread, so{' '}
-          {uncosted.length === 1 ? 'that run' : 'those runs'} will charge nothing. That is not the
-          same as trading free — nobody has measured{' '}
+          <strong>{uncosted.join(', ')}</strong> {uncosted.length === 1 ? 'has' : 'have'} no
+          measured spread, so {uncosted.length === 1 ? 'that run' : 'those runs'} will charge
+          nothing. That is not the same as trading free — nobody has measured{' '}
           {uncosted.length === 1 ? 'it' : 'them'} yet — and{' '}
-          {uncosted.length === 1 ? 'its result is an upper bound' : 'their results are upper bounds'}
+          {uncosted.length === 1
+            ? 'its result is an upper bound'
+            : 'their results are upper bounds'}
           , not comparable with the markets in this basket that do pay a spread.
         </p>
       )}
@@ -214,7 +216,9 @@ export function LaunchBasket(): React.JSX.Element {
           launch(true)
         }}
         launching={create.isPending}
-        canRun={gate.missing === null || anythingToRun(pairsOf(form.symbols, [timeframe]), gate.missing)}
+        canRun={
+          gate.missing === null || anythingToRun(pairsOf(form.symbols, [timeframe]), gate.missing)
+        }
       />
 
       {create.isError && <p className="text-sm text-red-400">{launchFailure(create.error)}</p>}

@@ -3,6 +3,9 @@ import { render, type RenderResult } from '@testing-library/react'
 import type { ReactElement, ReactNode } from 'react'
 import { MemoryRouter } from 'react-router-dom'
 
+import type { api } from './api/client'
+import type { BrowsedSymbol, Markets, SymbolBrowse } from './api/types'
+
 // Render a component inside the providers it expects — a fresh React Query client (retries off,
 // so a mocked rejection surfaces at once) and a memory router at the given path. A route given as
 // an object also carries navigation `state`, the way `navigate(to, { state })` would.
@@ -35,5 +38,61 @@ export function renderWithProviders(
     rerender: (next: ReactNode) => {
       result.rerender(wrap(next))
     },
+  }
+}
+
+/**
+ * A broker's list as `/symbols/markets` and `/symbols/browse` serve it, for screens that open the
+ * market browser: filtered and paged the way the API does, so a test can page and search.
+ */
+export function fakeBroker(rows: readonly BrowsedSymbol[]): {
+  markets: () => Promise<Markets>
+  browse: (params: Parameters<typeof api.browseSymbols>[0]) => Promise<SymbolBrowse>
+} {
+  const keys = ['forex', 'crypto', 'indices', 'stocks_us', 'stocks_br', 'other']
+  return {
+    markets: () =>
+      Promise.resolve({
+        markets: keys.map((key) => ({
+          key,
+          label: key,
+          count: rows.filter((one) => one.market === key).length,
+          collected: rows.filter((one) => one.market === key && one.catalogued).length,
+        })),
+        snapshot: { server: 'Broker-Server', synced_at: '2026-10-02T12:00:00Z' },
+      }),
+    browse: ({ market, q = '', collected = false, offset = 0, limit = 25 }) => {
+      const needle = q.toLowerCase()
+      const found = rows.filter(
+        (one) =>
+          (market === undefined || one.market === market) &&
+          (!collected || one.catalogued) &&
+          (one.symbol.toLowerCase().includes(needle) ||
+            (one.description ?? '').toLowerCase().includes(needle)),
+      )
+      return Promise.resolve({
+        total: found.length,
+        offset,
+        limit,
+        items: found.slice(offset, offset + limit),
+      })
+    },
+  }
+}
+
+/** One row of `fakeBroker`'s list. */
+export function browsed(
+  symbol: string,
+  market: string,
+  spread: string | null,
+  catalogued = true,
+): BrowsedSymbol {
+  return {
+    symbol,
+    description: `${symbol} description`,
+    path: null,
+    market,
+    catalogued,
+    spread_points: spread,
   }
 }

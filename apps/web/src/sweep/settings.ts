@@ -60,27 +60,41 @@ export const emptySweepForm: SweepForm = {
 }
 
 /**
- * The form with this market ticked or unticked — and, when ticked, its costs started from the
- * spread the broker quoted when the symbols were synced, for the reader to correct. A market
- * already carrying typed costs keeps them.
+ * How many markets one sweep may name — the API's own ceiling (04/10). A whole market is the
+ * question now — every collected crypto, every Brazilian share — so it is not a basket's twenty.
  */
+export const MAX_SWEEP_SYMBOLS = 500
+
+/**
+ * The form choosing exactly `symbols` — and each newly chosen market's costs started from the
+ * spread the broker quoted when it was collected, for the reader to correct. A market already
+ * carrying typed costs keeps them; one unchosen keeps them too, so ticking it back is no retyping.
+ */
+export function chooseMarkets(
+  form: SweepForm,
+  symbols: readonly string[],
+  instruments: readonly Instrument[] | undefined,
+): SweepForm {
+  const quoted = new Map(instruments?.map((one) => [one.symbol, one.default_spread_points]))
+  const costs = { ...form.costs }
+  for (const symbol of symbols) {
+    if (symbol in costs) continue
+    const spread = quoted.get(symbol)
+    costs[symbol] = { ...NO_COSTS, spread: spread == null ? '' : String(Number(spread)) }
+  }
+  return { ...form, symbols: [...symbols], costs }
+}
+
+/** The form with this one market ticked or unticked — `chooseMarkets` for a single tick. */
 export function toggleMarket(
   form: SweepForm,
   symbol: string,
   instruments: readonly Instrument[] | undefined,
 ): SweepForm {
-  if (form.symbols.includes(symbol)) {
-    return { ...form, symbols: form.symbols.filter((one) => one !== symbol) }
-  }
-  const quoted = instruments?.find((one) => one.symbol === symbol)?.default_spread_points
-  const costs =
-    symbol in form.costs
-      ? form.costs
-      : {
-          ...form.costs,
-          [symbol]: { ...NO_COSTS, spread: quoted == null ? '' : String(Number(quoted)) },
-        }
-  return { ...form, symbols: [...form.symbols, symbol], costs }
+  const symbols = form.symbols.includes(symbol)
+    ? form.symbols.filter((one) => one !== symbol)
+    : [...form.symbols, symbol]
+  return chooseMarkets(form, symbols, instruments)
 }
 
 function costsOf(form: SweepForm, symbol: string): MarketCosts {
@@ -166,6 +180,9 @@ export function runCount(form: SweepForm, entries: readonly CatalogEntry[]): num
 export function whyNotLaunchable(form: SweepForm, entries: readonly CatalogEntry[]): string | null {
   if (form.entryIds.length === 0) return 'Choose at least one entry from the shelf.'
   if (form.symbols.length === 0) return 'Choose at least one market.'
+  if (form.symbols.length > MAX_SWEEP_SYMBOLS) {
+    return `Choose at most ${String(MAX_SWEEP_SYMBOLS)} markets.`
+  }
   if (form.timeframes.length === 0) return 'Choose at least one chart.'
   if (form.dateFrom === '' || form.dateTo === '') return 'Choose a period.'
   // ⚠️ `<=`, not `<`: the sweeps table refuses a window of zero duration with a CHECK, so a form

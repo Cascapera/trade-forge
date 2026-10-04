@@ -852,6 +852,39 @@ export interface SymbolSearch {
   snapshot: SymbolSnapshot | null
 }
 
+/** One tab of the market browser: how many symbols the broker lists there, and how many have candles. */
+export interface Market {
+  key: string
+  label: string
+  count: number
+  collected: number
+}
+
+export interface Markets {
+  markets: Market[]
+  snapshot: SymbolSnapshot | null
+}
+
+/** A broker symbol as the market browser lists it. */
+export interface BrowsedSymbol {
+  symbol: string
+  description: string | null
+  path: string | null
+  market: string
+  /** Whether it has candles. A sweep over one that has none collects it first. */
+  catalogued: boolean
+  /** The measured spread in ticks; `null` until the collector catalogued it. */
+  spread_points: string | null
+}
+
+/** One page of a market's symbols. */
+export interface SymbolBrowse {
+  total: number
+  offset: number
+  limit: number
+  items: BrowsedSymbol[]
+}
+
 /**
  * What a probe found about one (symbol, timeframe), and what bounded the answer.
  *
@@ -1079,8 +1112,23 @@ export interface KillSwitch {
 /** A frame off `WS /ws/live-sessions/{id}`. Four shapes, one `type`. */
 export type SessionFrame =
   | { type: 'state'; session: LiveSession }
-  | { type: 'fill'; client_id: string; at: string; symbol: string; price: string; volume: string; spread: string }
-  | { type: 'refusal'; client_id: string; at: string; reason: string; by_venue: boolean; retcode: number | null }
+  | {
+      type: 'fill'
+      client_id: string
+      at: string
+      symbol: string
+      price: string
+      volume: string
+      spread: string
+    }
+  | {
+      type: 'refusal'
+      client_id: string
+      at: string
+      reason: string
+      by_venue: boolean
+      retcode: number | null
+    }
   | { type: 'error'; detail: string }
 
 /**

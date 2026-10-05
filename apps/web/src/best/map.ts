@@ -8,6 +8,12 @@ export const METRICS: readonly { key: BestMetric; label: string }[] = [
   { key: 'net_r', label: 'Net R (total)' },
   { key: 'net_r_per_year', label: 'Net R per year' },
   { key: 'positive_years', label: 'Positive years' },
+  { key: 'return_pct', label: 'Return % (total)' },
+  { key: 'cagr', label: 'Return % per year (CAGR)' },
+  { key: 'profit_factor', label: 'Profit factor' },
+  { key: 'win_rate', label: 'Win rate' },
+  { key: 'sharpe', label: 'Sharpe' },
+  { key: 'worst_year_r', label: 'Worst year (R)' },
 ]
 
 /** Charts in the order a trader reads them, shortest first; one the list does not know goes last. */
@@ -50,9 +56,14 @@ export const NO_FILTERS: MapFilters = {
   timeframes: [],
 }
 
-/** Where a metric's scale is neutral: zero for R, half the years for the share of positive ones. */
+/**
+ * Where a metric's scale is neutral: zero for R, returns and Sharpe; half for the shares of
+ * positive years and of winning trades; one for a profit factor, where the gains pay the losses.
+ */
 export function neutralOf(metric: BestMetric): number {
-  return metric === 'positive_years' ? 0.5 : 0
+  if (metric === 'positive_years' || metric === 'win_rate') return 0.5
+  if (metric === 'profit_factor') return 1
+  return 0
 }
 
 /** A setup's name as a column heading — the catalogue's, or a short id for a removed entry. */
@@ -146,7 +157,9 @@ export function fillOf(cell: BestMapCell, metric: BestMetric, extent: number): s
 export function formatValue(value: string | null, metric: BestMetric, unbounded = false): string {
   if (unbounded) return '∞'
   if (value === null) return '—'
-  if (metric === 'positive_years') return percent(value, 0)
-  if (metric === 'recovery_r') return ratio(value, 1)
+  if (metric === 'positive_years' || metric === 'win_rate') return percent(value, 0)
+  if (metric === 'return_pct' || metric === 'cagr') return percent(value, 1)
+  if (metric === 'recovery_r' || metric === 'sharpe') return ratio(value, 1)
+  if (metric === 'profit_factor') return ratio(value, 2)
   return inR(value)
 }

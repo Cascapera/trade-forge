@@ -11,6 +11,7 @@ import {
   layoutOf,
   type MapFilters,
   METRICS,
+  neutralOf,
   NO_FILTERS,
 } from '../best/map'
 import { BestCellPanel, type ChosenCell } from '../components/BestCellPanel'
@@ -314,7 +315,7 @@ function Cell({
 
 /** The colours in the map's own numbers: one scale, both arms against the same extent. */
 function Legend({ metric, extent }: { metric: BestMetric; extent: number }): React.JSX.Element {
-  const neutral = metric === 'positive_years' ? 0.5 : 0
+  const neutral = neutralOf(metric)
   const low = String(neutral - extent)
   const high = String(neutral + extent)
   return (

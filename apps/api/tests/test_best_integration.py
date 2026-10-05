@@ -118,6 +118,58 @@ class TestTheMap:
         assert best("net_r") == run_of[5]
         assert best("recovery_r") == run_of[7]  # 20 / 2 beats 30 / 15
 
+    def test_the_account_measures_rank_in_the_database_too(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        """05/10: return %, CAGR, profit factor, win rate, Sharpe, worst year — each one decides."""
+        entry, _sweep, run_of = swept(client, session_factory, {5: "30", 7: "20"})
+        measures: dict[int, dict[str, Any]] = {
+            5: {
+                "net_profit": "1000",
+                "cagr": "0.02",
+                "profit_factor": "1.5",
+                "win_rate": "0.40",
+                "sharpe": "0.8",
+                "yearly_r": {"2023": "40", "2024": "-10"},
+            },
+            7: {
+                "net_profit": "3000",
+                "cagr": "0.05",
+                "profit_factor": "1.2",
+                "win_rate": "0.55",
+                "sharpe": "1.1",
+                "yearly_r": {"2023": "12", "2024": "8"},
+            },
+        }
+        with session_factory() as session:
+            for period, measure in measures.items():
+                run = session.get(Backtest, uuid.UUID(run_of[period]))
+                assert run is not None
+                assert run.metrics is not None
+                # The database holds the profit to its parts: net = gross profit + gross loss.
+                run.metrics.net_profit = Decimal(measure["net_profit"])
+                run.metrics.gross_profit = Decimal(measure["net_profit"]) + 500
+                run.metrics.gross_loss = Decimal(-500)
+                run.metrics.cagr = Decimal(measure["cagr"])
+                run.metrics.profit_factor = Decimal(measure["profit_factor"])
+                run.metrics.win_rate = Decimal(measure["win_rate"])
+                run.metrics.sharpe = Decimal(measure["sharpe"])
+                run.metrics.yearly_r = measure["yearly_r"]
+            session.commit()
+
+        def best(metric: str) -> tuple[str, Decimal]:
+            cells = client.get("/best/map", params={"metric": metric}).json()["cells"]
+            cell = next(one for one in cells if one["entry_id"] == entry)
+            return str(cell["run_id"]), Decimal(cell["value"])
+
+        assert best("return_pct") == (run_of[7], Decimal("0.3"))  # 3 000 over 10 000
+        assert best("cagr")[0] == run_of[7]
+        assert best("profit_factor")[0] == run_of[5]
+        assert best("win_rate")[0] == run_of[7]
+        assert best("sharpe")[0] == run_of[7]
+        # 30 R beats 20 R in total, but its worst year lost 10 R and the other's worst made 8.
+        assert best("worst_year_r") == (run_of[7], Decimal(8))
+
     def test_below_the_floor_only_when_every_run_is_asked(
         self, client: Any, session_factory: Callable[[], Session]
     ) -> None:

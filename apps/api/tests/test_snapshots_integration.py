@@ -136,18 +136,19 @@ class TestTheBestMapIsServedFromItsSnapshot:
         again = client.get("/best/map", params={"metric": "net_r", "every_run": True}).json()
         assert again == first
 
-    def test_a_refresh_computes_every_map_again_only_when_a_run_finished(
+    def test_a_refresh_computes_the_opened_maps_again_only_when_a_run_finished(
         self, client: Any, session_factory: Callable[[], Session]
     ) -> None:
         _sweep_id, runs = launched(client, points=1)
         measured(session_factory, runs[0], net_r="1")
         store = client.app.state.snapshots
+        # Opened once: the map it refreshes. Every other one is computed on its first opening.
+        client.get("/best/map", params={"metric": "net_r", "every_run": True})
 
         assert snapshots.refresh_best(session_factory, store, inline) is True
-        for metric in BestMetric:
-            for every_run in (False, True):
-                assert store.read_best(metric, every_run=every_run) is not None
         assert snapshots.refresh_best(session_factory, store, inline) is False
+        # ⚠️ Read without `read_best`, which would mark them opened.
+        assert store.read_since(BestMetric.SHARPE, every_run=False) is None
 
         _later, more = launched(client, points=1)
         measured(session_factory, more[0], net_r="2")

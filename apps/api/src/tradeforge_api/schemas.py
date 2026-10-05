@@ -3081,6 +3081,8 @@ class BestPointOut(BaseModel):
     win_rate: Decimal | None = None
     sharpe: Decimal | None = None
     worst_year_r: Decimal | None = None
+    positive_month_share: Decimal | None = None
+    """Months ending above zero R over months with a trade; none for a run before 05/10."""
     yearly_r: dict[str, Any]
     tests: list[BestTestOut]
     """Its reserved-window tests, oldest window first; empty for a point never validated."""

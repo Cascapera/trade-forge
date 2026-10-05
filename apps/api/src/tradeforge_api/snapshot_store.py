@@ -7,6 +7,7 @@ they were computed from, which says whether computing them again would change an
 last map instead of computing one on the first opening.
 """
 
+import datetime as dt
 from typing import Protocol
 
 from tradeforge_api.best import BestMetric
@@ -47,8 +48,16 @@ class SnapshotStore:
         self._client = client
 
     def read_best(self, metric: BestMetric, *, every_run: bool) -> BestMapOut | None:
-        raw = self._client.get(_key(metric, every_run=every_run))
+        """The kept map, and a note that it was asked for — what a refresh computes again."""
+        key = _key(metric, every_run=every_run)
+        self._client.set(f"{key}:read", dt.datetime.now(tz=dt.UTC).isoformat())
+        raw = self._client.get(key)
         return None if raw is None else BestMapOut.model_validate_json(str(raw))
+
+    def read_since(self, metric: BestMetric, *, every_run: bool) -> dt.datetime | None:
+        """When the map was last asked for, or `None` if never."""
+        raw = self._client.get(f"{_key(metric, every_run=every_run)}:read")
+        return None if raw is None else dt.datetime.fromisoformat(str(raw))
 
     def keep_best(self, made: BestMapOut) -> None:
         self._client.set(_key(made.metric, every_run=made.every_run), made.model_dump_json())

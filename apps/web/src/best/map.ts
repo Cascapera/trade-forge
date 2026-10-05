@@ -8,6 +8,8 @@ export const METRICS: readonly { key: BestMetric; label: string }[] = [
   { key: 'net_r', label: 'Net R (total)' },
   { key: 'net_r_per_year', label: 'Net R per year' },
   { key: 'positive_years', label: 'Positive years' },
+  // Recorded from 05/10 on: older runs have no months and stay out of this ranking.
+  { key: 'positive_months', label: 'Positive months (runs from 05/10)' },
   { key: 'return_pct', label: 'Return % (total)' },
   { key: 'cagr', label: 'Return % per year (CAGR)' },
   { key: 'profit_factor', label: 'Profit factor' },
@@ -61,7 +63,9 @@ export const NO_FILTERS: MapFilters = {
  * positive years and of winning trades; one for a profit factor, where the gains pay the losses.
  */
 export function neutralOf(metric: BestMetric): number {
-  if (metric === 'positive_years' || metric === 'win_rate') return 0.5
+  if (metric === 'positive_years' || metric === 'positive_months' || metric === 'win_rate') {
+    return 0.5
+  }
   if (metric === 'profit_factor') return 1
   return 0
 }
@@ -157,7 +161,9 @@ export function fillOf(cell: BestMapCell, metric: BestMetric, extent: number): s
 export function formatValue(value: string | null, metric: BestMetric, unbounded = false): string {
   if (unbounded) return '∞'
   if (value === null) return '—'
-  if (metric === 'positive_years' || metric === 'win_rate') return percent(value, 0)
+  if (metric === 'positive_years' || metric === 'positive_months' || metric === 'win_rate') {
+    return percent(value, 0)
+  }
   if (metric === 'return_pct' || metric === 'cagr') return percent(value, 1)
   if (metric === 'recovery_r' || metric === 'sharpe') return ratio(value, 1)
   if (metric === 'profit_factor') return ratio(value, 2)

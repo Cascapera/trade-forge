@@ -14,6 +14,8 @@ trade of every run.
 * **R per calendar year, and the share of years that ended positive** — stability: a run that made
   all of it in one year and gave some back in every other scores the same total as one that made
   a little every year.
+* **R per calendar month, and the share of months that ended positive** (05/10) — the same
+  question at the scale a person lives a strategy at: a year is one draw, a month twelve.
 
 ⚠️ **Computed while the trades are in memory, for every run.** A sweep's losing run keeps no
 trades (`retention`), so none of this could be computed later for exactly the runs a selection
@@ -36,6 +38,10 @@ _ZERO = Decimal(0)
 MIN_YEARS_FOR_SHARE = 2
 """A share of positive years needs at least this many years with a trade. One year is "100%" or
 "0%" on a single draw, which says nothing the total did not."""
+
+MIN_MONTHS_FOR_SHARE = 6
+"""A share of positive months needs at least this many months with a trade — half a year, for the
+reason `MIN_YEARS_FOR_SHARE` gives."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +67,10 @@ class RMetrics:
     """How many trades make each cell of `by_years` (01/10): a cut of whole years counts its trades
     from the same cells it sums its R from (`year_cut`), so a trade floor reads the cut and not the
     whole run."""
+    monthly_r: dict[str, Decimal]
+    """R per calendar month of entry, `"2019-03"`, for the months that had a trade (05/10)."""
+    positive_month_share: Decimal | None
+    """Months ending above zero R over months with a trade; `None` below `MIN_MONTHS_FOR_SHARE`."""
 
 
 def r_metrics(trades: Sequence[ClosedTrade]) -> RMetrics:
@@ -82,6 +92,7 @@ def r_metrics(trades: Sequence[ClosedTrade]) -> RMetrics:
     streak_r = _ZERO
     worst_streak_r = _ZERO
     yearly: dict[int, Decimal] = {}
+    monthly: dict[str, Decimal] = {}
     by_years: dict[int, dict[int, Decimal]] = {}
     trades_by_years: dict[int, dict[int, int]] = {}
 
@@ -101,6 +112,8 @@ def r_metrics(trades: Sequence[ClosedTrade]) -> RMetrics:
             streak_r = _ZERO
 
         yearly[entered.year] = yearly.get(entered.year, _ZERO) + r
+        month = f"{entered.year:04d}-{entered.month:02d}"
+        monthly[month] = monthly.get(month, _ZERO) + r
         exits = by_years.setdefault(entered.year, {})
         exits[left.year] = exits.get(left.year, _ZERO) + r
         counted = trades_by_years.setdefault(entered.year, {})
@@ -109,6 +122,11 @@ def r_metrics(trades: Sequence[ClosedTrade]) -> RMetrics:
     share = (
         Decimal(sum(1 for value in yearly.values() if value > _ZERO)) / Decimal(len(yearly))
         if len(yearly) >= MIN_YEARS_FOR_SHARE
+        else None
+    )
+    month_share = (
+        Decimal(sum(1 for value in monthly.values() if value > _ZERO)) / Decimal(len(monthly))
+        if len(monthly) >= MIN_MONTHS_FOR_SHARE
         else None
     )
     return RMetrics(
@@ -120,7 +138,9 @@ def r_metrics(trades: Sequence[ClosedTrade]) -> RMetrics:
         by_years=by_years,
         positive_year_share=share,
         trades_by_years=trades_by_years,
+        monthly_r=monthly,
+        positive_month_share=month_share,
     )
 
 
-__all__ = ["MIN_YEARS_FOR_SHARE", "RMetrics", "r_metrics"]
+__all__ = ["MIN_MONTHS_FOR_SHARE", "MIN_YEARS_FOR_SHARE", "RMetrics", "r_metrics"]

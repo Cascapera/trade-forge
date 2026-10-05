@@ -242,6 +242,8 @@ def _record_done(  # noqa: PLR0913 — one finished run and what it came to
     metrics_row.losing_streak_r = in_r.losing_streak_r
     metrics_row.positive_year_share = in_r.positive_year_share
     metrics_row.yearly_r = {str(year): str(r) for year, r in sorted(in_r.yearly_r.items())}
+    metrics_row.monthly_r = {month: str(r) for month, r in sorted(in_r.monthly_r.items())}
+    metrics_row.positive_month_share = in_r.positive_month_share
     metrics_row.r_by_years = {
         str(entered): {str(left): str(r) for left, r in sorted(exits.items())}
         for entered, exits in sorted(in_r.by_years.items())

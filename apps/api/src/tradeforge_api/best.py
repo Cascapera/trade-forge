@@ -30,6 +30,8 @@ class BestMetric(StrEnum):
     NET_R_PER_YEAR = "net_r_per_year"
     """Net R over the years of the run's own window, so windows of other lengths compare."""
     POSITIVE_YEARS = "positive_years"
+    POSITIVE_MONTHS = "positive_months"
+    """The share of months with a trade that ended above zero R — only runs recorded from 05/10."""
     RETURN_PCT = "return_pct"
     """The net profit over the starting capital — the account's own return, compounded."""
     CAGR = "cagr"
@@ -75,6 +77,8 @@ def score(  # noqa: PLR0911 — one answer per metric
         return net_r_per_year(metrics, date_from, date_to)
     if metric is BestMetric.POSITIVE_YEARS:
         return metrics.positive_year_share
+    if metric is BestMetric.POSITIVE_MONTHS:
+        return metrics.positive_month_share
     if metric is BestMetric.RETURN_PCT:
         return None if initial_capital <= 0 else metrics.net_profit / initial_capital
     if metric is BestMetric.CAGR:

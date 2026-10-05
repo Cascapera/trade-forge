@@ -144,6 +144,7 @@ def _value(metric: BestMetric) -> tuple[ColumnElement[Any], ColumnElement[bool]]
     else:
         value = {
             BestMetric.POSITIVE_YEARS: BacktestMetrics.positive_year_share,
+            BestMetric.POSITIVE_MONTHS: BacktestMetrics.positive_month_share,
             BestMetric.CAGR: BacktestMetrics.cagr,
             BestMetric.WIN_RATE: BacktestMetrics.win_rate,
             BestMetric.SHARPE: BacktestMetrics.sharpe,
@@ -366,6 +367,7 @@ def _point(
         sharpe=metrics.sharpe,
         worst_year_r=worst_year_r(metrics),
         positive_year_share=metrics.positive_year_share,
+        positive_month_share=metrics.positive_month_share,
         max_drawdown_r=metrics.max_drawdown_r,
         total_trades=metrics.total_trades,
         profit_factor=metrics.profit_factor,

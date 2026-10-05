@@ -6,7 +6,9 @@ lifespan and torn down with it — *unless* they were injected, which is the sea
 to run the whole HTTP surface against fakes, with no Postgres or Redis anywhere.
 """
 
+import asyncio
 from collections.abc import AsyncIterator, Callable
+from concurrent.futures import Executor
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 
@@ -42,7 +44,33 @@ from tradeforge_api.routers import (
     symbols,
     walkforwards,
 )
+from tradeforge_api.snapshot_store import InMemory, SnapshotStore
+from tradeforge_api.snapshots import child_pool, refresh_forever
 from tradeforge_db.session import create_db_engine, create_session_factory
+
+
+def _start_snapshots(
+    app: FastAPI, settings: Settings, *, refresh: bool
+) -> tuple["asyncio.Task[None] | None", Executor | None]:
+    """The heavy pages' snapshot store, and their background refresh (05/10) — only where the
+    app made its own connections: a test that injected them gets no loop reaching a database."""
+    if not hasattr(app.state, "snapshots"):
+        # ⚠️ Kept in Redis only beside a database this app opened. A test hands the app its own
+        # database but reaches the Redis of the system in use: a map kept there would replace the
+        # real one, and a test would read the map another test left.
+        if not refresh:
+            app.state.snapshots = SnapshotStore(InMemory())
+        else:
+            if getattr(app.state, "_redis_client", None) is None:
+                app.state._redis_client = Redis.from_url(settings.redis_url, decode_responses=True)
+            app.state.snapshots = SnapshotStore(app.state._redis_client)
+    if not refresh:
+        return None, None
+    pool = child_pool()
+    task = asyncio.create_task(
+        refresh_forever(app.state.session_factory, app.state.snapshots, pool)
+    )
+    return task, pool
 
 
 @asynccontextmanager
@@ -83,10 +111,15 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.stop_store = app.state._redis_client
     if not hasattr(app.state, "collector"):
         app.state.collector = Collector(app.state._redis_client)
+    refreshing, pool = _start_snapshots(app, settings, refresh=owns_engine)
 
     try:
         yield
     finally:
+        if refreshing is not None:
+            refreshing.cancel()
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
         if getattr(app.state, "_owns_pool", False):
             await app.state.arq_pool.aclose()
         if getattr(app.state, "_redis_client", None) is not None:

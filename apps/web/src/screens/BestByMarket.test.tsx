@@ -185,6 +185,14 @@ describe('BestByMarket', () => {
     expect(screen.getByRole('button', { name: /GOLD, MM9 H1/ })).toBeInTheDocument()
   })
 
+  it('says when the map it shows was computed', () => {
+    // 05/10: the map is the last one kept, computed again every few minutes.
+    map.mockReturnValue(answer({ ...MAP, as_of: '2026-10-05T11:00:00Z' }))
+    renderWithProviders(<BestByMarket />)
+
+    expect(screen.getByText(/^Updated \d\d\/\d\d \d\d:\d\d\.$/)).toBeInTheDocument()
+  })
+
   it('says it is loading, and says why the map could not be read', () => {
     map.mockReturnValue({ data: undefined, isPending: true, isError: false, error: null } as never)
     const { unmount } = renderWithProviders(<BestByMarket />)

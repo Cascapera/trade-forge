@@ -2732,6 +2732,9 @@ class SweepOut(BaseModel):
     """When the sweep was paused: its waiting runs are out of the queue until resumed (02/10)."""
     counts: SweepRunCounts | None = None
     """How many runs sit in each status — what a screen polls on, without the runs themselves."""
+    summary_as_of: dt.datetime | None = None
+    """When `entries` was computed (05/10): a large sweep's summary is the last one kept while it
+    runs, computed again every few minutes, never on the screen's poll."""
     entries: list[SweepEntryOut]
     """In the order the request listed the entries — which, from the launch screen, is the order
     they were **ticked**, not the order the shelf shows them in."""
@@ -3036,6 +3039,9 @@ class BestMapOut(BaseModel):
     engine_version: str
     """The engine whose runs were ranked: runs of an older one are left out."""
     cells: list[BestMapCell]
+    as_of: dt.datetime | None = None
+    """When the map was computed (05/10): it is served from the last one kept, computed again
+    every few minutes when runs have finished — ranking every run took 30 s an opening."""
 
 
 class BestTestOut(BaseModel):

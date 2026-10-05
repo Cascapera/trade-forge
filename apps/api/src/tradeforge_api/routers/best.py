@@ -17,6 +17,7 @@ Nothing here validates anything: each point carries what its reserved-window tes
 none was run.
 """
 
+import datetime as dt
 import uuid
 from collections.abc import Mapping, Sequence
 from decimal import Decimal
@@ -39,7 +40,7 @@ from sqlalchemy.sql import Subquery
 from sqlalchemy.types import Text
 
 from tradeforge_api.best import BestMetric, market_of, score
-from tradeforge_api.deps import SessionDep
+from tradeforge_api.deps import SessionDep, SnapshotsDep
 from tradeforge_api.holdout import Candidate, HoldoutRank, choose
 from tradeforge_api.ranking_floor import RANK_MIN_TRADES
 from tradeforge_api.routers.sweeps import entries_reader
@@ -131,9 +132,24 @@ def _value(metric: BestMetric) -> tuple[ColumnElement[Any], ColumnElement[bool]]
 @router.get("/best/map", response_model=BestMapOut)
 def best_map(
     session: SessionDep,
+    snapshots: SnapshotsDep,
     metric: BestMetric = BestMetric.RECOVERY_R,
     every_run: bool = False,
 ) -> BestMapOut:
+    """The best run of every (market, setup, chart), by `metric` — the last map kept (05/10).
+
+    ⚠️ **Served from a snapshot, computed off the request.** Ranking every finished run of every
+    sweep took 30 s an opening on 05/10, and grows with every sweep. `snapshots` computes the map
+    again every few minutes when runs have finished; this computes it only when none is kept."""
+    kept = snapshots.read_best(metric, every_run=every_run)
+    if kept is not None:
+        return kept
+    made = compute_best_map(session, metric, every_run=every_run)
+    snapshots.keep_best(made)
+    return made
+
+
+def compute_best_map(session: Session, metric: BestMetric, *, every_run: bool) -> BestMapOut:
     """The best run of every (market, setup, chart), by `metric` — one query, no trades read.
 
     Ties go to launch order (`created_at`, the strategy's name, the id), as a sweep's page."""
@@ -196,6 +212,7 @@ def best_map(
         metric=metric,
         every_run=every_run,
         engine_version=ENGINE_VERSION,
+        as_of=dt.datetime.now(tz=dt.UTC),
         cells=[
             BestMapCell(
                 market=market_of(row.path, row.asset_class),

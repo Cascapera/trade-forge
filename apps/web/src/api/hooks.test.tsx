@@ -32,6 +32,7 @@ import {
   isSettled,
   isHoldoutSettled,
   isTemplateSettled,
+  isSweepQuiet,
   isSweepSettled,
   isTerminal,
   useBasket,
@@ -152,6 +153,21 @@ describe('isHoldoutSettled', () => {
     expect(isHoldoutSettled(undefined)).toBe(false)
     expect(isHoldoutSettled(holdout('done', 'running'))).toBe(false)
     expect(isHoldoutSettled(holdout('done', 'failed'))).toBe(true)
+  })
+})
+
+describe('isSweepQuiet', () => {
+  it('is quiet once settled, and while paused even with runs still waiting', () => {
+    const body = (queued: number, paused: string | null) =>
+      ({
+        runs: [],
+        paused_at: paused,
+        counts: { total: 5, done: 5 - queued, running: 0, queued, failed: 0 },
+      }) as unknown as SweepOut
+    expect(isSweepQuiet(body(0, null))).toBe(true)
+    expect(isSweepQuiet(body(2, '2026-10-05T11:08:10Z'))).toBe(true)
+    expect(isSweepQuiet(body(2, null))).toBe(false)
+    expect(isSweepQuiet(undefined)).toBe(false)
   })
 })
 

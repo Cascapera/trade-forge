@@ -15,6 +15,7 @@ vi.mock('../api/hooks', async (importOriginal) => ({
   // The real `isSweepSettled`: it is a pure reading of the body, and a stub would let this screen
   // offer a test on a sweep still running without any test noticing.
   isSweepSettled: (await importOriginal<typeof import('../api/hooks')>()).isSweepSettled,
+  isSweepQuiet: (await importOriginal<typeof import('../api/hooks')>()).isSweepQuiet,
   useSweep: vi.fn(),
   useSweepRuns: vi.fn(),
   useEquityCurves: vi.fn(),
@@ -838,6 +839,28 @@ describe('SweepResult — read without its runs', () => {
     const asked = mockedRuns.mock.calls.map(([id, page, polling]) => [id, page.entryId, polling])
     expect(asked).toContainEqual(['sweep-1', ZETA.id, false])
     expect(asked).toContainEqual(['sweep-1', ALPHA.id, false])
+  })
+
+  it('stops asking while the sweep is paused, and says nothing is updating', () => {
+    // 05/10: a paused sweep of 563 thousand runs was asked for every few seconds for hours.
+    const paused = sweep({ paused_at: '2026-10-05T11:08:10Z' })
+    paused.runs[0]!.run.status = 'queued'
+    showing(paused)
+    renderWithProviders(<SweepResult />, '/sweeps/sweep-1')
+
+    const asked = mockedRuns.mock.calls.map(([, page, polling]) => [page.entryId, polling])
+    expect(asked).toContainEqual([ZETA.id, false])
+    expect(screen.queryByText(/updates on its own/)).not.toBeInTheDocument()
+  })
+
+  it('says when the summary of a sweep still running was computed', () => {
+    const busy = sweep({ summary_as_of: '2026-10-05T11:00:00Z' })
+    busy.runs[0]!.run.status = 'running'
+    showing(busy)
+
+    renderWithProviders(<SweepResult />)
+
+    expect(screen.getByText(/^Summary as of \d\d\/\d\d \d\d:\d\d\.$/)).toBeInTheDocument()
   })
 
   it('says so when an entry cannot read its runs', () => {

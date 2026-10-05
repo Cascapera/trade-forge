@@ -722,8 +722,17 @@ export function useSweep(id: string | undefined) {
   return useQuery<SweepOut>({
     queryKey: ['sweep', id],
     queryFn: id === undefined ? skipToken : () => api.getSweep(id, 'none'),
-    refetchInterval: (query) => (isSweepSettled(query.state.data) ? false : STUDY_POLL_MS),
+    refetchInterval: (query) => (isSweepQuiet(query.state.data) ? false : STUDY_POLL_MS),
   })
+}
+
+/**
+ * Whether nothing about this sweep will change until somebody acts: every run ended, or it is
+ * paused (05/10). A paused sweep's page polled on for hours — a sweep of 563 thousand runs, its
+ * summary 75 s a read — and the resume reads it again anyway (`usePauseSweep`).
+ */
+export function isSweepQuiet(sweep: SweepOut | undefined): boolean {
+  return isSweepSettled(sweep) || (sweep?.paused_at ?? null) !== null
 }
 
 /**

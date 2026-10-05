@@ -17,6 +17,7 @@ from tradeforge_api.config import Settings
 from tradeforge_api.kill_switch import KillSwitch
 from tradeforge_api.live.stop import StopStore
 from tradeforge_api.queue import JobQueue
+from tradeforge_api.snapshot_store import SnapshotStore
 
 
 def get_settings(request: Request) -> Settings:
@@ -59,3 +60,11 @@ QueueDep = Annotated[JobQueue, Depends(get_queue)]
 CollectorDep = Annotated[Collector, Depends(get_collector)]
 KillSwitchDep = Annotated[KillSwitch, Depends(get_kill_switch)]
 StopStoreDep = Annotated[StopStore, Depends(get_stop_store)]
+
+
+def get_snapshots(request: Request) -> SnapshotStore:
+    store: SnapshotStore = request.app.state.snapshots
+    return store
+
+
+SnapshotsDep = Annotated[SnapshotStore, Depends(get_snapshots)]

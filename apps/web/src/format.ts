@@ -3,7 +3,10 @@
 // on the backend. Kept out of the components so they can be tested directly.
 
 export function money(value: string): string {
-  return Number(value).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+  return Number(value).toLocaleString('en-US', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  })
 }
 
 export function signedMoney(value: string): string {
@@ -91,13 +94,15 @@ export function duration(iso: string | null): string {
   const first = parts.findIndex(([value]) => value > 0)
   // Every unit is zero: the duration is zero, which is a measurement and not an absence.
   if (first === -1) return '0s'
-  return parts
-    .slice(first, first + 2)
-    // The second unit only when it says something. The first is `> 0` by construction — it is
-    // where `findIndex` stopped — so it needs no exception of its own.
-    .filter(([value]) => value > 0)
-    .map(([value, unit]) => `${String(value)}${unit}`)
-    .join(' ')
+  return (
+    parts
+      .slice(first, first + 2)
+      // The second unit only when it says something. The first is `> 0` by construction — it is
+      // where `findIndex` stopped — so it needs no exception of its own.
+      .filter(([value]) => value > 0)
+      .map(([value, unit]) => `${String(value)}${unit}`)
+      .join(' ')
+  )
 }
 
 /**
@@ -116,4 +121,16 @@ export function roughly(seconds: number): string {
     return rest === 0 ? `about ${String(hours)} h` : `about ${String(hours)} h ${String(rest)} min`
   }
   return `about ${String(Math.round(hours / 24))} days`
+}
+
+/** When a snapshot was taken, in the reader's clock: `05/10 14:32` (05/10). */
+export function clock(iso: string): string {
+  return new Date(iso)
+    .toLocaleString('en-GB', {
+      day: '2-digit',
+      month: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+    })
+    .replace(',', '')
 }

@@ -1105,6 +1105,11 @@ class BacktestMetrics(Base):
     ruined_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
     # `{"2019": "3.25", ...}` — R per calendar year of entry, for the years that had a trade.
     yearly_r: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    # `{"2019-03": "1.5", ...}` — R per calendar month of entry, and the share of those months that
+    # ended above zero (rev_0049, 05/10). Null for every run recorded before; the share also for a
+    # run with fewer than six months with a trade (`r_metrics.MIN_MONTHS_FOR_SHARE`).
+    monthly_r: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    positive_month_share: Mapped[Decimal | None] = mapped_column(RATIO)
     # `{"2019": {"2019": "2.5", "2020": "-1"}, ...}` — R by year of entry, then year of exit
     # (ADR-0030, rev_0038): what a longer run gives a window of whole years. Null before 28/09.
     r_by_years: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
@@ -1151,6 +1156,14 @@ class BacktestMetrics(Base):
         ),
         CheckConstraint(
             "yearly_r IS NULL OR jsonb_typeof(yearly_r) = 'object'", name="yearly_r_is_an_object"
+        ),
+        CheckConstraint(
+            "monthly_r IS NULL OR jsonb_typeof(monthly_r) = 'object'",
+            name="monthly_r_is_an_object",
+        ),
+        CheckConstraint(
+            "positive_month_share IS NULL OR positive_month_share BETWEEN 0 AND 1",
+            name="positive_month_share_is_a_fraction",
         ),
         CheckConstraint(
             "r_by_years IS NULL OR jsonb_typeof(r_by_years) = 'object'",

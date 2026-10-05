@@ -140,6 +140,7 @@ from tradeforge_api.schemas import (
     WindowUseOut,
 )
 from tradeforge_api.slices import ClosedTrade, by_blocks, by_year, verdict
+from tradeforge_api.snapshots import in_child, summary_in_child
 from tradeforge_api.sweep import (
     SweepDocument,
     SweepError,
@@ -2717,9 +2718,24 @@ def _summary(
             ],
             _as_of(kept),
         )
+    if counts.total > SMALL_SWEEP:
+        # ⚠️ Never in the API, even the first time: computed here, its gigabytes stay with the
+        # API for every page after it (05/10: 7.4 GB after one opening). The child keeps it on the
+        # row, and the row is read back.
+        in_child(summary_in_child, str(sweep.id))
+        session.refresh(sweep)
+        kept = sweep.summary or {}
+        return (
+            counts,
+            [
+                SweepEntryOut.model_validate({**one, "entry_name": names.get(str(one["entry_id"]))})
+                for one in kept.get("entries", [])
+            ],
+            _as_of(kept),
+        )
     summaries = compute_summaries(session, sweep, names)
     computed_at = dt.datetime.now(tz=dt.UTC)
-    if settled or counts.total > SMALL_SWEEP:
+    if settled:
         keep_summary(session, sweep, counts, summaries, computed_at)
     return counts, summaries, computed_at
 

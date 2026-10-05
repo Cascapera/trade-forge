@@ -139,3 +139,52 @@ def test_the_trades_are_counted_in_the_same_cells_as_their_r() -> None:
     assert {entered: set(exits) for entered, exits in found.trades_by_years.items()} == {
         entered: set(exits) for entered, exits in found.by_years.items()
     }
+
+
+def month(m: int, d: int = 1) -> dt.datetime:
+    return dt.datetime(2021, m, d, 12, tzinfo=dt.UTC)
+
+
+def test_r_is_summed_per_month_of_entry_and_the_positive_months_shared() -> None:
+    """05/10: seven months with a trade; March has two that net -0.5. Positive: Jan, Feb, May,
+    Jun, Jul — five of seven."""
+    trades = [
+        trade(month(1), "2"),
+        trade(month(2), "1"),
+        trade(month(3, 2), "1"),
+        trade(month(3, 20), "-1.5"),
+        trade(month(4), "-1"),
+        trade(month(5), "0.5"),
+        trade(month(6), "3"),
+        trade(month(7), "1"),
+        trade(month(8), None),  # no stop, no R: not a month with a trade
+    ]
+
+    found = r_metrics(trades)
+
+    assert found.monthly_r == {
+        "2021-01": Decimal(2),
+        "2021-02": Decimal(1),
+        "2021-03": Decimal("-0.5"),
+        "2021-04": Decimal(-1),
+        "2021-05": Decimal("0.5"),
+        "2021-06": Decimal(3),
+        "2021-07": Decimal(1),
+    }
+    assert found.positive_month_share == Decimal(5) / Decimal(7)
+
+
+def test_too_few_months_have_no_share_rather_than_a_hundred_percent() -> None:
+    found = r_metrics([trade(month(m), "1") for m in range(1, 6)])
+
+    assert len(found.monthly_r) == 5
+    assert found.positive_month_share is None
+
+
+def test_a_month_that_ends_at_zero_is_not_positive() -> None:
+    trades = [trade(month(m), "1") for m in range(1, 6)] + [
+        trade(month(6, 2), "1"),
+        trade(month(6, 9), "-1"),
+    ]
+
+    assert r_metrics(trades).positive_month_share == Decimal(5) / Decimal(6)

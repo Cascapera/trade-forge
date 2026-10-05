@@ -1021,6 +1021,14 @@ def test_a_sweeps_run_below_the_floor_keeps_only_its_metrics(
         assert metrics["positive_year_share"] is None
         (only,) = metrics["yearly_r"].values()
         assert Decimal(only) == Decimal(metrics["net_r"])
+        # 05/10: the months too — one month with the trade, and no share below six months.
+        with session_factory() as session:
+            kept = session.get(BacktestMetrics, uuid.UUID(backtest_id))
+            assert kept is not None
+            assert kept.monthly_r is not None
+            (month,) = kept.monthly_r.values()
+            assert Decimal(month) == Decimal(metrics["net_r"])
+            assert kept.positive_month_share is None
 
         assert client.get(f"/backtests/{backtest_id}/trades").json()["items"] == []
         equity = client.get(f"/backtests/{backtest_id}/equity")

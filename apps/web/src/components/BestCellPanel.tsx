@@ -122,6 +122,7 @@ function Point({
           value={point.unbounded && metric === 'recovery_r' ? '∞' : ratio(point.recovery_r, 1)}
         />
         <Measure term="Years +" value={percent(point.positive_year_share, 0)} />
+        <Measure term="Months +" value={percent(point.positive_month_share ?? null, 0)} />
         <Measure
           term="DD"
           value={point.max_drawdown_r === null ? '—' : `${ratio(point.max_drawdown_r, 1)} R`}

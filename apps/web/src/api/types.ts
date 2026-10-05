@@ -1986,6 +1986,7 @@ export type BestMetric =
   | 'net_r'
   | 'net_r_per_year'
   | 'positive_years'
+  | 'positive_months'
   | 'return_pct'
   | 'cagr'
   | 'profit_factor'
@@ -2056,6 +2057,8 @@ export interface BestPointOut {
   win_rate?: string | null
   sharpe?: string | null
   worst_year_r?: string | null
+  /** Months ending above zero R; none for a run recorded before 05/10. */
+  positive_month_share?: string | null
   yearly_r: Record<string, string>
   /** Its reserved-window tests, oldest window first; empty for a point never validated. */
   tests: BestTestOut[]

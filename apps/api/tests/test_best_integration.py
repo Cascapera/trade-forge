@@ -130,6 +130,7 @@ class TestTheMap:
                 "profit_factor": "1.5",
                 "win_rate": "0.40",
                 "sharpe": "0.8",
+                "months": "0.70",
                 "yearly_r": {"2023": "40", "2024": "-10"},
             },
             7: {
@@ -138,6 +139,7 @@ class TestTheMap:
                 "profit_factor": "1.2",
                 "win_rate": "0.55",
                 "sharpe": "1.1",
+                "months": "0.55",
                 "yearly_r": {"2023": "12", "2024": "8"},
             },
         }
@@ -154,6 +156,7 @@ class TestTheMap:
                 run.metrics.profit_factor = Decimal(measure["profit_factor"])
                 run.metrics.win_rate = Decimal(measure["win_rate"])
                 run.metrics.sharpe = Decimal(measure["sharpe"])
+                run.metrics.positive_month_share = Decimal(measure["months"])
                 run.metrics.yearly_r = measure["yearly_r"]
             session.commit()
 
@@ -167,6 +170,7 @@ class TestTheMap:
         assert best("profit_factor")[0] == run_of[5]
         assert best("win_rate")[0] == run_of[7]
         assert best("sharpe")[0] == run_of[7]
+        assert best("positive_months")[0] == run_of[5]
         # 30 R beats 20 R in total, but its worst year lost 10 R and the other's worst made 8.
         assert best("worst_year_r") == (run_of[7], Decimal(8))
 

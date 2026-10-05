@@ -9,7 +9,9 @@ this module computes the next ones:
   sweep whose run counts moved since its last one (`routers.sweeps.SMALL_SWEEP`; a small one is
   computed on the request as before);
 * **the best-by-market maps** (`routers.best.compute_best_map`), every `BEST_EVERY`, when a run
-  has finished since the last ones were computed.
+  has finished since the last ones were computed — only the maps opened in the last `BEST_READ`:
+  ten metrics, each with and without the floor, are twenty queries of half a minute (05/10), and a
+  refresh of all of them would keep Postgres busy the whole time a sweep runs.
 
 ⚠️ **In a process of its own, one at a time, that ends after each computation.** Python keeps
 the memory a computation of several GB asked for; done in the API, every page after it would run
@@ -37,7 +39,8 @@ from tradeforge_db.session import create_db_engine, create_session_factory
 logger = logging.getLogger(__name__)
 
 SUMMARY_EVERY = dt.timedelta(minutes=2)
-BEST_EVERY = dt.timedelta(minutes=10)
+BEST_EVERY = dt.timedelta(minutes=30)
+BEST_READ = dt.timedelta(days=1)
 
 
 def child_pool() -> Executor:
@@ -83,6 +86,13 @@ def best_in_child(metric: str, every_run: bool) -> str:
 # --------------------------------------------------------------------------- #
 # What the parent decides.
 # --------------------------------------------------------------------------- #
+
+
+def in_child(fn: Callable[..., Any], *args: Any) -> Any:  # noqa: ANN401 — the call's result
+    """Run one computation in a process of its own and wait for it — for a request that has no
+    snapshot to serve yet (a large sweep opened before the loop reached it)."""
+    with child_pool() as pool:
+        return pool.submit(fn, *args).result()
 
 
 def stale_summaries(session: Session) -> list[uuid.UUID]:
@@ -146,16 +156,20 @@ def refresh_summaries(
 def refresh_best(
     session_factory: Callable[[], Session], store: SnapshotStore, run: Callable[..., Any]
 ) -> bool:
-    """Compute every map again if a run finished since the last ones; whether it did."""
+    """Compute again the maps opened in the last `BEST_READ` if a run finished since the last
+    ones; whether it did. A map nobody opened is computed on its first opening."""
     with session_factory() as session:
         fingerprint = runs_fingerprint(session)
     if fingerprint == store.best_fingerprint():
         return False
+    since = dt.datetime.now(tz=dt.UTC) - BEST_READ
     for metric in BestMetric:
         for every_run in (False, True):
-            store.keep_best(
-                BestMapOut.model_validate_json(run(best_in_child, metric.value, every_run))
-            )
+            read = store.read_since(metric, every_run=every_run)
+            if read is None or read < since:
+                continue
+            made = run(best_in_child, metric.value, every_run)
+            store.keep_best(BestMapOut.model_validate_json(made))
     store.keep_best_fingerprint(fingerprint)
     return True
 
@@ -188,6 +202,7 @@ __all__ = [
     "SUMMARY_EVERY",
     "best_in_child",
     "child_pool",
+    "in_child",
     "refresh_best",
     "refresh_forever",
     "refresh_summaries",

@@ -3075,6 +3075,12 @@ class BestPointOut(BaseModel):
     max_drawdown_r: Decimal | None
     total_trades: int
     profit_factor: Decimal | None
+    return_pct: Decimal | None = None
+    """The net profit over the starting capital (05/10)."""
+    cagr: Decimal | None = None
+    win_rate: Decimal | None = None
+    sharpe: Decimal | None = None
+    worst_year_r: Decimal | None = None
     yearly_r: dict[str, Any]
     tests: list[BestTestOut]
     """Its reserved-window tests, oldest window first; empty for a point never validated."""

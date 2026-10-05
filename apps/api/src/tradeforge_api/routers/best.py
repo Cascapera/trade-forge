@@ -33,15 +33,16 @@ from sqlalchemy import (
     extract,
     func,
     literal,
+    literal_column,
     select,
 )
 from sqlalchemy.orm import Session, defer, selectinload
 from sqlalchemy.sql import Subquery
 from sqlalchemy.types import Text
 
-from tradeforge_api.best import BestMetric, market_of, score
+from tradeforge_api.best import BestMetric, market_of, net_r_per_year, score, worst_year_r
 from tradeforge_api.deps import SessionDep, SnapshotsDep
-from tradeforge_api.holdout import Candidate, HoldoutRank, choose
+from tradeforge_api.holdout import Candidate, HoldoutRank, choose, recovery_r
 from tradeforge_api.ranking_floor import RANK_MIN_TRADES
 from tradeforge_api.routers.sweeps import entries_reader
 from tradeforge_api.runner import ENGINE_VERSION
@@ -124,8 +125,29 @@ def _value(metric: BestMetric) -> tuple[ColumnElement[Any], ColumnElement[bool]]
     elif metric is BestMetric.NET_R_PER_YEAR:
         seconds = extract("epoch", Backtest.date_to - Backtest.date_from)
         value = case((seconds > 0, cast(net, Float) / (seconds / _YEAR_SECONDS)), else_=None)
+    elif metric is BestMetric.RETURN_PCT:
+        capital = Backtest.initial_capital
+        value = case((capital > 0, BacktestMetrics.net_profit / capital), else_=None)
+    elif metric is BestMetric.PROFIT_FACTOR:
+        value = BacktestMetrics.profit_factor
+        no_bound = and_(
+            BacktestMetrics.profit_factor.is_(None),
+            BacktestMetrics.gross_profit > 0,
+            BacktestMetrics.gross_loss == 0,
+        )
+    elif metric is BestMetric.WORST_YEAR_R:
+        # The least of the run's years in R, read from the stored map in Postgres.
+        value = literal_column(
+            "(SELECT min(year.value::numeric) "
+            "FROM jsonb_each_text(backtest_metrics.yearly_r) AS year)"
+        )
     else:
-        value = BacktestMetrics.positive_year_share
+        value = {
+            BestMetric.POSITIVE_YEARS: BacktestMetrics.positive_year_share,
+            BestMetric.CAGR: BacktestMetrics.cagr,
+            BestMetric.WIN_RATE: BacktestMetrics.win_rate,
+            BestMetric.SHARPE: BacktestMetrics.sharpe,
+        }[metric]
     return value, no_bound
 
 
@@ -280,7 +302,7 @@ def best_cell(  # noqa: PLR0913 — query parameters; each is one part of the ce
 
     def valued(one: Candidate) -> Decimal | None:
         run = runs[one.order]
-        return score(metric, one.metrics, run.date_from, run.date_to)
+        return score(metric, one.metrics, run.date_from, run.date_to, run.initial_capital)
 
     chosen = choose(
         candidates,
@@ -321,7 +343,7 @@ def _point(
 ) -> BestPointOut:
     metrics = run.metrics
     assert metrics is not None, "a ranked run has metrics"  # noqa: S101 — filtered above
-    value = score(metric, metrics, run.date_from, run.date_to)
+    value = score(metric, metrics, run.date_from, run.date_to, run.initial_capital)
     label, values = labels.get((run.sweep_id, run.strategy_id), ("", {}))  # type: ignore[arg-type]
     return BestPointOut(
         run_id=run.id,
@@ -334,8 +356,15 @@ def _point(
         value=None if value is not None and value.is_infinite() else value,
         unbounded=value is not None and value.is_infinite(),
         net_r=metrics.net_r,
-        net_r_per_year=score(BestMetric.NET_R_PER_YEAR, metrics, run.date_from, run.date_to),
-        recovery_r=_finite(score(BestMetric.RECOVERY_R, metrics, run.date_from, run.date_to)),
+        net_r_per_year=net_r_per_year(metrics, run.date_from, run.date_to),
+        recovery_r=_finite(recovery_r(metrics)),
+        return_pct=score(
+            BestMetric.RETURN_PCT, metrics, run.date_from, run.date_to, run.initial_capital
+        ),
+        cagr=metrics.cagr,
+        win_rate=metrics.win_rate,
+        sharpe=metrics.sharpe,
+        worst_year_r=worst_year_r(metrics),
         positive_year_share=metrics.positive_year_share,
         max_drawdown_r=metrics.max_drawdown_r,
         total_trades=metrics.total_trades,

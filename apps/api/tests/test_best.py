@@ -11,6 +11,7 @@ from tradeforge_db.models import BacktestMetrics
 from tradeforge_engine.domain import AssetClass
 
 START = dt.datetime(2019, 1, 1, tzinfo=dt.UTC)
+CAPITAL = Decimal(10_000)
 
 
 def metrics(
@@ -18,6 +19,9 @@ def metrics(
 ) -> BacktestMetrics:
     return BacktestMetrics(
         total_trades=40,
+        net_profit=Decimal(0),
+        gross_profit=Decimal(0),
+        gross_loss=Decimal(0),
         net_r=None if net_r is None else Decimal(net_r),
         max_drawdown_r=None if drawdown is None else Decimal(drawdown),
         positive_year_share=None if share is None else Decimal(share),
@@ -41,10 +45,10 @@ class TestScore:
         one = metrics("20", drawdown="4", share="0.75")
         end = START.replace(year=2023)
 
-        assert score(BestMetric.NET_R, one, START, end) == Decimal(20)
-        assert score(BestMetric.RECOVERY_R, one, START, end) == Decimal(5)
-        assert score(BestMetric.POSITIVE_YEARS, one, START, end) == Decimal("0.75")
-        per_year = score(BestMetric.NET_R_PER_YEAR, one, START, end)
+        assert score(BestMetric.NET_R, one, START, end, CAPITAL) == Decimal(20)
+        assert score(BestMetric.RECOVERY_R, one, START, end, CAPITAL) == Decimal(5)
+        assert score(BestMetric.POSITIVE_YEARS, one, START, end, CAPITAL) == Decimal("0.75")
+        per_year = score(BestMetric.NET_R_PER_YEAR, one, START, end, CAPITAL)
         assert per_year is not None
         assert per_year == pytest.approx(Decimal(5), rel=Decimal("0.001"))
 
@@ -52,8 +56,48 @@ class TestScore:
         none = metrics(None, drawdown=None, share=None)
         end = START.replace(year=2023)
 
-        for metric in BestMetric:
-            assert score(metric, none, START, end) is None, metric
+        # The return in money is always recorded — every run has a net profit, zero or not.
+        for metric in set(BestMetric) - {BestMetric.RETURN_PCT}:
+            assert score(metric, none, START, end, CAPITAL) is None, metric
+
+    def test_the_account_measures_read_the_stored_metrics(self) -> None:
+        """05/10: return, CAGR, profit factor, win rate, Sharpe, worst year."""
+        end = START.replace(year=2023)
+        one = BacktestMetrics(
+            total_trades=40,
+            net_profit=Decimal(2_500),
+            gross_profit=Decimal(5_000),
+            gross_loss=Decimal(-2_500),
+            profit_factor=Decimal(2),
+            win_rate=Decimal("0.45"),
+            sharpe=Decimal("1.2"),
+            cagr=Decimal("0.06"),
+            yearly_r={"2019": "4.5", "2020": "-3.25", "2021": "1"},
+        )
+
+        assert score(BestMetric.RETURN_PCT, one, START, end, CAPITAL) == Decimal("0.25")
+        assert score(BestMetric.CAGR, one, START, end, CAPITAL) == Decimal("0.06")
+        assert score(BestMetric.PROFIT_FACTOR, one, START, end, CAPITAL) == Decimal(2)
+        assert score(BestMetric.WIN_RATE, one, START, end, CAPITAL) == Decimal("0.45")
+        assert score(BestMetric.SHARPE, one, START, end, CAPITAL) == Decimal("1.2")
+        assert score(BestMetric.WORST_YEAR_R, one, START, end, CAPITAL) == Decimal("-3.25")
+        assert score(BestMetric.RETURN_PCT, one, START, end, Decimal(0)) is None
+
+    def test_a_run_that_never_lost_has_an_unbounded_profit_factor(self) -> None:
+        """The engine stores no profit factor without a loss: ranked as missing, the cleanest
+        record would come last."""
+        clean = BacktestMetrics(
+            total_trades=3, gross_profit=Decimal(300), gross_loss=Decimal(0), profit_factor=None
+        )
+        flat = BacktestMetrics(
+            total_trades=0, gross_profit=Decimal(0), gross_loss=Decimal(0), profit_factor=None
+        )
+        end = START.replace(year=2023)
+
+        unbounded = score(BestMetric.PROFIT_FACTOR, clean, START, end, CAPITAL)
+        assert unbounded is not None
+        assert unbounded.is_infinite()
+        assert score(BestMetric.PROFIT_FACTOR, flat, START, end, CAPITAL) is None
 
     def test_no_window_is_no_r_per_year(self) -> None:
         assert net_r_per_year(metrics("10"), START, START) is None

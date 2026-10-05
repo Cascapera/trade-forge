@@ -127,6 +127,17 @@ function Point({
           value={point.max_drawdown_r === null ? '—' : `${ratio(point.max_drawdown_r, 1)} R`}
         />
         <Measure term="Trades" value={count(point.total_trades)} />
+        <Measure term="Return" value={percent(point.return_pct ?? null, 1)} />
+        <Measure term="CAGR" value={percent(point.cagr ?? null, 1)} />
+        <Measure
+          term="PF"
+          value={
+            point.unbounded && metric === 'profit_factor' ? '∞' : ratio(point.profit_factor, 2)
+          }
+        />
+        <Measure term="Win rate" value={percent(point.win_rate ?? null, 0)} />
+        <Measure term="Sharpe" value={ratio(point.sharpe ?? null, 1)} />
+        <Measure term="Worst year" value={inR(point.worst_year_r ?? null)} />
       </dl>
       <Years yearly={point.yearly_r} />
       <Tests point={point} />

@@ -22,7 +22,7 @@ _YEAR = Decimal(str(365.25 * 86_400))
 
 
 class BestMetric(StrEnum):
-    """What "best" means on the page — his four (02/10)."""
+    """What "best" means on the page — his four (02/10), and six more (05/10)."""
 
     RECOVERY_R = "recovery_r"
     """Net R over the deepest drawdown in R (`holdout.recovery_r`)."""
@@ -30,6 +30,16 @@ class BestMetric(StrEnum):
     NET_R_PER_YEAR = "net_r_per_year"
     """Net R over the years of the run's own window, so windows of other lengths compare."""
     POSITIVE_YEARS = "positive_years"
+    RETURN_PCT = "return_pct"
+    """The net profit over the starting capital — the account's own return, compounded."""
+    CAGR = "cagr"
+    """That return a year, compounded; none for a window under a year or an account at zero."""
+    PROFIT_FACTOR = "profit_factor"
+    """Gross profit over gross loss; unbounded for a run that won and never lost."""
+    WIN_RATE = "win_rate"
+    SHARPE = "sharpe"
+    WORST_YEAR_R = "worst_year_r"
+    """The run's worst calendar year in R — the higher, the milder its worst stretch."""
 
 
 def years_of(date_from: dt.datetime, date_to: dt.datetime) -> Decimal:
@@ -47,17 +57,51 @@ def net_r_per_year(
     return metrics.net_r / years
 
 
-def score(
-    metric: BestMetric, metrics: BacktestMetrics, date_from: dt.datetime, date_to: dt.datetime
+def score(  # noqa: PLR0911 — one answer per metric
+    metric: BestMetric,
+    metrics: BacktestMetrics,
+    date_from: dt.datetime,
+    date_to: dt.datetime,
+    initial_capital: Decimal,
 ) -> Decimal | None:
-    """The run's value under `metric`, or `None` when it has none — never ranked as zero."""
+    """The run's value under `metric`, or `None` when it has none — never ranked as zero.
+    Infinite for a value with no bound (a drawdown ratio with no drawdown, a profit factor with no
+    loss), which ranks above every finite one."""
     if metric is BestMetric.RECOVERY_R:
         return recovery_r(metrics)
     if metric is BestMetric.NET_R:
         return metrics.net_r
     if metric is BestMetric.NET_R_PER_YEAR:
         return net_r_per_year(metrics, date_from, date_to)
-    return metrics.positive_year_share
+    if metric is BestMetric.POSITIVE_YEARS:
+        return metrics.positive_year_share
+    if metric is BestMetric.RETURN_PCT:
+        return None if initial_capital <= 0 else metrics.net_profit / initial_capital
+    if metric is BestMetric.CAGR:
+        return metrics.cagr
+    if metric is BestMetric.PROFIT_FACTOR:
+        return profit_factor(metrics)
+    if metric is BestMetric.WIN_RATE:
+        return metrics.win_rate
+    if metric is BestMetric.SHARPE:
+        return metrics.sharpe
+    return worst_year_r(metrics)
+
+
+def profit_factor(metrics: BacktestMetrics) -> Decimal | None:
+    """The stored profit factor, or infinite for a run that won and never lost — the engine stores
+    none there, and ranking it as missing would put the cleanest record last."""
+    if metrics.profit_factor is not None:
+        return metrics.profit_factor
+    if metrics.gross_profit > 0 and metrics.gross_loss == 0:
+        return Decimal("Infinity")
+    return None
+
+
+def worst_year_r(metrics: BacktestMetrics) -> Decimal | None:
+    """The worst calendar year in R, or `None` for a run with no year recorded."""
+    years = [Decimal(str(one)) for one in (metrics.yearly_r or {}).values() if one is not None]
+    return min(years, default=None)
 
 
 _MARKET_OF_CLASS = {

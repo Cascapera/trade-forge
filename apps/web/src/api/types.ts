@@ -1981,7 +1981,17 @@ export interface SweepsPage {
 }
 
 /** What "best" means on the best-by-market page — his four (02/10). */
-export type BestMetric = 'recovery_r' | 'net_r' | 'net_r_per_year' | 'positive_years'
+export type BestMetric =
+  | 'recovery_r'
+  | 'net_r'
+  | 'net_r_per_year'
+  | 'positive_years'
+  | 'return_pct'
+  | 'cagr'
+  | 'profit_factor'
+  | 'win_rate'
+  | 'sharpe'
+  | 'worst_year_r'
 
 /** The best run of one (market, setup, chart) — a cell of `GET /best/map`. */
 export interface BestMapCell {
@@ -2040,6 +2050,12 @@ export interface BestPointOut {
   max_drawdown_r: string | null
   total_trades: number
   profit_factor: string | null
+  /** The net profit over the starting capital (05/10). Absent from a server before it. */
+  return_pct?: string | null
+  cagr?: string | null
+  win_rate?: string | null
+  sharpe?: string | null
+  worst_year_r?: string | null
   yearly_r: Record<string, string>
   /** Its reserved-window tests, oldest window first; empty for a point never validated. */
   tests: BestTestOut[]

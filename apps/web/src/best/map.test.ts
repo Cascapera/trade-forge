@@ -69,6 +69,10 @@ describe('the colour and the number', () => {
   it('is neutral at half the years for the share of positive years, at zero for R', () => {
     expect(neutralOf('positive_years')).toBe(0.5)
     expect(neutralOf('net_r')).toBe(0)
+    // 05/10: a profit factor of one is break-even; half the trades won is the coin.
+    expect(neutralOf('profit_factor')).toBe(1)
+    expect(neutralOf('win_rate')).toBe(0.5)
+    expect(neutralOf('return_pct')).toBe(0)
     expect(fillOf(cell({ value: '0.5' }), 'positive_years', 0.5)).toBe(fillFor(0, 0.5))
     expect(fillOf(cell({ value: '0' }), 'net_r', 3)).toBe(fillFor(0, 3))
   })
@@ -86,5 +90,11 @@ describe('the colour and the number', () => {
     expect(formatValue('3.14', 'recovery_r')).toBe('3.1')
     expect(formatValue('0.75', 'positive_years')).toBe('75%')
     expect(formatValue(null, 'net_r')).toBe('—')
+    expect(formatValue('0.253', 'return_pct')).toBe('25.3%')
+    expect(formatValue('0.061', 'cagr')).toBe('6.1%')
+    expect(formatValue('0.45', 'win_rate')).toBe('45%')
+    expect(formatValue('1.567', 'profit_factor')).toBe('1.57')
+    expect(formatValue('1.23', 'sharpe')).toBe('1.2')
+    expect(formatValue('-3.5', 'worst_year_r')).toBe('-3.50 R')
   })
 })

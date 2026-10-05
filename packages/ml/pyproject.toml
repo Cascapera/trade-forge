@@ -8,6 +8,9 @@ dependencies = [
     # The runs and their trades are read from the database the API writes.
     "tradeforge-db",
     "pyarrow>=18.1",
+    # The variables (ADR-0031, rule 1), from the collector's Parquet files, with numpy.
+    "tradeforge-engine",
+    "numpy>=2.0",
 ]
 
 [project.scripts]

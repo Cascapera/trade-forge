@@ -1275,12 +1275,12 @@ export interface CreatedSweep {
   runs: number
   /** Pairs left out for having no candles in the window — also kept on the sweep. */
   skipped: UncoveredMarket[]
-  /** Pairs whose runs start at their first year of real bars, later than the window asked
+  /** Pairs whose runs start at their first month of real bars, later than the window asked
    *  (02/10). Absent from a server before it. */
   trimmed?: TrimmedMarket[]
 }
 
-/** A pair whose runs start later than the sweep's window: at its first year of real bars — before
+/** A pair whose runs start later than the sweep's window: at its first month of real bars — before
  *  it, the broker's intraday history is one bar a day stored as the chart (02/10). */
 export interface TrimmedMarket {
   symbol: string
@@ -1840,7 +1840,7 @@ export interface SweepOut {
    *  ⚠️ `symbols` and `timeframes` are what was **asked**: read this before reading them as the
    *  space that was measured. */
   skipped: UncoveredMarket[]
-  /** Pairs whose runs start at their first year of real bars, later than the window (02/10).
+  /** Pairs whose runs start at their first month of real bars, later than the window (02/10).
    *  Absent from a server before it. */
   trimmed?: TrimmedMarket[]
   /** When the sweep was paused: its waiting runs are out of the queue until resumed (02/10). */

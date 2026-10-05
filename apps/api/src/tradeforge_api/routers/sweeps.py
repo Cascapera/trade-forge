@@ -245,8 +245,9 @@ def _real_starts(
     request: CreateSweep,
     uncovered: list[UncoveredMarket],
 ) -> tuple[dict[tuple[str, str], dt.datetime], list[UncoveredMarket]]:
-    """Each pair's runs start at its first year of real bars when the window reaches before it
-    (02/10), and a pair with no real bar in the window is skipped like one with none at all.
+    """Each pair's runs start at its first month of real bars when the window reaches before it
+    (02/10, by month since 05/10), and a pair with no real bar in the window is skipped like one
+    with none at all.
 
     ⚠️ **Cut, and said.** Before 2017-2018 this broker's intraday history of its metals, US indices
     and cryptos is one bar a day stored as the chart (`density`): a run over those years trades a
@@ -857,7 +858,7 @@ class _SweepWriter:
             # The document's timeframe and the run's are one value, read from one place — which
             # is what makes PR-238's equality rule unreachable here.
             "timeframe": doc.timeframe,
-            # ⚠️ From the first year of real bars when the window reaches before it (`density`).
+            # ⚠️ From the first month of real bars when the window reaches before it (`density`).
             "date_from": self._starts.get((symbol, doc.timeframe), self._request.date_from),
             "date_to": self._request.date_to,
             "initial_capital": self._request.initial_capital,

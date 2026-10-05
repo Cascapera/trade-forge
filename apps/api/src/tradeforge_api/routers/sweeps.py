@@ -2622,7 +2622,7 @@ def get_sweep(
     sweep = session.get(Sweep, sweep_id)
     if sweep is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="sweep not found")
-    counts, summaries = _summary(session, sweep)
+    counts, summaries, summary_as_of = _summary(session, sweep)
 
     out: list[SweepRunOut] = []
     if runs == "all":
@@ -2653,6 +2653,7 @@ def get_sweep(
         trimmed=[TrimmedMarket.model_validate(one) for one in sweep.trimmed],
         counts=counts,
         entries=summaries,
+        summary_as_of=summary_as_of,
         runs=out,
         skipped=[UncoveredMarket.model_validate(one) for one in sweep.skipped],
         failed_collections=failed_collections(session, Backtest.sweep_id.in_(scope_of(sweep))),
@@ -2677,8 +2678,18 @@ def _count_runs(session: Session, sweep: Sweep) -> SweepRunCounts:
     )
 
 
-def _summary(session: Session, sweep: Sweep) -> tuple[SweepRunCounts, list[SweepEntryOut]]:
-    """The run counts and each entry's summary — kept once every run has ended (25/09).
+# Runs a sweep's summary is computed for in the request when its counts moved (05/10). Below it a
+# summary takes a few seconds (6.5 s measured on 51 840 runs, 25/09); above it, the screen is served
+# the last one kept and `snapshots` computes the next one in a process of its own — 75 s and several
+# GB on 563 thousand runs, asked every few seconds by an open page, was the API at 14 GB.
+SMALL_SWEEP = 20_000
+
+
+def _summary(
+    session: Session, sweep: Sweep
+) -> tuple[SweepRunCounts, list[SweepEntryOut], dt.datetime | None]:
+    """The run counts, each entry's summary and when it was computed — kept once every run has
+    ended (25/09), and for a large sweep while it runs (05/10, `SMALL_SWEEP`).
 
     ⚠️ **Served from `sweeps.summary` only while the counts still match** the ones it was computed
     at, and only once nothing is queued or running. A run retried or deleted changes the counts,
@@ -2694,12 +2705,58 @@ def _summary(session: Session, sweep: Sweep) -> tuple[SweepRunCounts, list[Sweep
     settled = counts.queued == 0 and counts.running == 0
     names = _entry_names(session, sweep)
     kept = sweep.summary
-    if settled and kept is not None and kept.get("counts") == counts.model_dump(mode="json"):
-        return counts, [
-            SweepEntryOut.model_validate({**one, "entry_name": names.get(str(one["entry_id"]))})
-            for one in kept["entries"]
-        ]
+    current = kept is not None and kept.get("counts") == counts.model_dump(mode="json")
+    # ⚠️ A large sweep is served its last summary even when the counts moved: the next one is
+    # `snapshots`' to compute, and the screen says when this one was (`summary_as_of`).
+    if kept is not None and (current or counts.total > SMALL_SWEEP):
+        return (
+            counts,
+            [
+                SweepEntryOut.model_validate({**one, "entry_name": names.get(str(one["entry_id"]))})
+                for one in kept["entries"]
+            ],
+            _as_of(kept),
+        )
+    summaries = compute_summaries(session, sweep, names)
+    computed_at = dt.datetime.now(tz=dt.UTC)
+    if settled or counts.total > SMALL_SWEEP:
+        keep_summary(session, sweep, counts, summaries, computed_at)
+    return counts, summaries, computed_at
 
+
+def _as_of(kept: Mapping[str, Any]) -> dt.datetime | None:
+    computed = kept.get("computed_at")
+    return None if computed is None else dt.datetime.fromisoformat(str(computed))
+
+
+def keep_summary(
+    session: Session,
+    sweep: Sweep,
+    counts: SweepRunCounts,
+    summaries: Sequence[SweepEntryOut],
+    computed_at: dt.datetime,
+) -> None:
+    """Store a sweep's summary with the counts it was computed at, and when."""
+    sweep.summary = {
+        "counts": counts.model_dump(mode="json"),
+        "entries": [one.model_dump(mode="json") for one in summaries],
+        "computed_at": computed_at.isoformat(),
+    }
+    session.commit()
+
+
+def refresh_summary(session: Session, sweep: Sweep) -> None:
+    """Compute a sweep's summary now and keep it — what `snapshots` runs, in a process of its
+    own, for a large sweep whose counts moved since the last one."""
+    counts = _count_runs(session, sweep)
+    summaries = compute_summaries(session, sweep, _entry_names(session, sweep))
+    keep_summary(session, sweep, counts, summaries, dt.datetime.now(tz=dt.UTC))
+
+
+def compute_summaries(
+    session: Session, sweep: Sweep, names: Mapping[str, str | None]
+) -> list[SweepEntryOut]:
+    """Each entry's summary, from every run of the sweep — the heavy part of `_summary`."""
     coordinates, _followers = _points_of(session, sweep)
     points: dict[str, list[tuple[BacktestStatus, Decimal | None, str]]] = {
         one: [] for one in sweep.entry_ids
@@ -2730,7 +2787,7 @@ def _summary(session: Session, sweep: Sweep) -> tuple[SweepRunCounts, list[Sweep
         points[entry_id].append((state, net, label))
         ladders[entry_id].append((targets, label))
 
-    summaries = [
+    return [
         SweepEntryOut(
             entry_id=uuid.UUID(entry_id),
             entry_name=names.get(entry_id),
@@ -2739,13 +2796,6 @@ def _summary(session: Session, sweep: Sweep) -> tuple[SweepRunCounts, list[Sweep
         )
         for entry_id in sweep.entry_ids
     ]
-    if settled:
-        sweep.summary = {
-            "counts": counts.model_dump(mode="json"),
-            "entries": [one.model_dump(mode="json") for one in summaries],
-        }
-        session.commit()
-    return counts, summaries
 
 
 _SweepRows = list[tuple[Backtest, Strategy, Instrument]]

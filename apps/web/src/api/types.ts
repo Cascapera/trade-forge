@@ -1828,6 +1828,9 @@ export interface SweepOut {
   keep_all_trades?: boolean
   /** How many runs sit in each status — what the screen polls on (24/09). */
   counts?: SweepRunCounts | null
+  /** When `entries` was computed (05/10): a large sweep's summary is the last one kept while it
+   *  runs, computed again every few minutes. Absent from a server before it. */
+  summary_as_of?: string | null
   /** In the order the entries were asked for. */
   entries: SweepEntryOut[]
   /** Empty when read with `runs=none`, which is how the screen reads it: the runs come a page at a
@@ -2005,6 +2008,8 @@ export interface BestMapOut {
   every_run: boolean
   engine_version: string
   cells: BestMapCell[]
+  /** When the map was computed (05/10): the last one kept, computed again every few minutes. */
+  as_of?: string | null
 }
 
 /** One reserved-window test of a point. */

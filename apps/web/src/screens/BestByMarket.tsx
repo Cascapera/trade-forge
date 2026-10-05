@@ -16,7 +16,7 @@ import {
 import { BestCellPanel, type ChosenCell } from '../components/BestCellPanel'
 import { Pager } from '../components/Pager'
 import { usePaged } from '../components/paging'
-import { count } from '../format'
+import { clock, count } from '../format'
 
 /** Symbol rows of the map on one page; a folded market is one row. */
 const MAP_ROWS_PER_PAGE = 30
@@ -78,6 +78,9 @@ export function BestByMarket(): React.JSX.Element {
           Each setup&apos;s best run on each market and chart, across every sweep on engine{' '}
           {map.data?.engine_version ?? '…'}. In sample and not validated: a cell is the best of the
           runs it ranked, and part of being best is the luck of the search.
+          {map.data?.as_of != null && (
+            <span className="text-slate-500"> Updated {clock(map.data.as_of)}.</span>
+          )}
         </p>
       </header>
 

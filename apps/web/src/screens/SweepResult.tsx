@@ -2,7 +2,7 @@ import { useMemo, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 
 import { apiUrl } from '../api/client'
-import { isSweepSettled, useEquityCurves, useSweep, useSweepRuns } from '../api/hooks'
+import { isSweepQuiet, isSweepSettled, useEquityCurves, useSweep, useSweepRuns } from '../api/hooks'
 import type { BacktestListItem, SweepEntryOut } from '../api/types'
 import {
   EMPTY_SEATS,
@@ -23,7 +23,7 @@ import { SweepWalkForwardLauncher } from '../components/SweepWalkForwardLauncher
 import { RunTable } from '../components/RunTable'
 import { StudyDispersion } from '../components/StudyDispersion'
 import { SweepTargets } from '../components/TargetLadder'
-import { money } from '../format'
+import { clock, money } from '../format'
 import { settled, summarise, tally } from '../sweep/progress'
 import { RANKINGS, RUNS_PER_PAGE, type RankKey, rankingOf } from '../sweep/ranking'
 import { PagedList } from '../components/Pager'
@@ -386,8 +386,13 @@ export function SweepResult(): React.JSX.Element {
         className={`text-sm ${settled(counts) ? 'text-slate-400' : 'text-sky-300'}`}
       >
         {summarise(counts)}
-        {settled(counts) ? '' : ' — this updates on its own.'}
+        {isSweepQuiet(data) ? '' : ' — this updates on its own.'}
       </p>
+      {/* A large sweep's summary is the last one kept while it runs (05/10): said, so its numbers
+          never read as the ones of this instant. */}
+      {data.summary_as_of != null && !settled(counts) && (
+        <p className="text-xs text-slate-500">Summary as of {clock(data.summary_as_of)}.</p>
+      )}
       {id !== undefined && (
         <SweepPause sweepId={id} pausedAt={data.paused_at ?? null} counts={counts} />
       )}
@@ -433,7 +438,7 @@ export function SweepResult(): React.JSX.Element {
           onPage={(index) => {
             setPageOfEntry((current) => ({ ...current, [entry.entry_id]: index }))
           }}
-          polling={!settled(counts)}
+          polling={!isSweepQuiet(data)}
           seats={seats}
           onToggle={toggle}
           years={years}

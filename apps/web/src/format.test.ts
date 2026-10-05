@@ -1,4 +1,4 @@
-import { count, duration, money, percent, ratio, roughly, sign, signedMoney } from './format'
+import { clock, count, duration, money, percent, ratio, roughly, sign, signedMoney } from './format'
 
 describe('format', () => {
   it('renders money with two decimals and thousands separators', () => {
@@ -81,6 +81,12 @@ describe('format', () => {
     expect(duration('P')).toBe('—')
     expect(duration('2 days')).toBe('—')
     expect(duration('PT1H30')).toBe('—')
+  })
+})
+
+describe('clock', () => {
+  it('names the day and the minute, without the year or seconds', () => {
+    expect(clock('2026-10-05T11:00:00Z')).toMatch(/^\d\d\/\d\d \d\d:\d\d$/)
   })
 })
 

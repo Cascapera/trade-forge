@@ -26,7 +26,6 @@ Pure: candles and events in, variables out. `feature_export` reads and writes.
 from __future__ import annotations
 
 import datetime as dt
-from bisect import bisect_right
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -40,6 +39,33 @@ FEATURES_VERSION = 1
 version it was trained on (ADR-0031, rule 7)."""
 
 Floats = npt.NDArray[np.float64]
+Instants = npt.NDArray[np.int64]
+"""Bar opening times as UTC microseconds since the epoch — searched, never converted per bar."""
+
+STEP: dict[str, dt.timedelta] = {
+    "M1": dt.timedelta(minutes=1),
+    "M5": dt.timedelta(minutes=5),
+    "M15": dt.timedelta(minutes=15),
+    "M30": dt.timedelta(minutes=30),
+    "H1": dt.timedelta(hours=1),
+    "H4": dt.timedelta(hours=4),
+    "D1": dt.timedelta(days=1),
+    "W1": dt.timedelta(weeks=1),
+}
+"""How long a bar of each chart lasts — the collector's own table (`TIMEFRAME_STEP`), written here
+because a shared package may not import a deployable app (`tests/test_architecture.py`)."""
+
+_EPOCH = dt.datetime(1970, 1, 1, tzinfo=dt.UTC)
+
+
+def micros(instant: dt.datetime) -> int:
+    """A UTC instant as microseconds since the epoch."""
+    return (instant - _EPOCH) // dt.timedelta(microseconds=1)
+
+
+def instant(us: int) -> dt.datetime:
+    return _EPOCH + dt.timedelta(microseconds=us)
+
 
 LONGEST = 200
 """The longest look-back a variable reads (EMA 200): a decision bar with fewer bars before it has
@@ -118,7 +144,7 @@ def rsi(close: Floats, period: int = 14) -> Floats:
 class Market:
     """One chart's bars as arrays, and the series every variable reads, computed once."""
 
-    times: Sequence[dt.datetime]
+    times: Instants
     step: dt.timedelta
     open: Floats
     high: Floats
@@ -134,19 +160,43 @@ class Market:
 
     @classmethod
     def of(cls, candles: Sequence[Candle], step: dt.timedelta) -> Market:
+        """From the engine's bars — what a test builds."""
+
         def column(name: str) -> Floats:
             return np.array([float(getattr(bar, name)) for bar in candles], dtype=np.float64)
 
-        high, low, close = column("high"), column("low"), column("close")
+        return cls.from_arrays(
+            times=np.array([micros(bar.time) for bar in candles], dtype=np.int64),
+            step=step,
+            open_=column("open"),
+            high=column("high"),
+            low=column("low"),
+            close=column("close"),
+            volume=column("tick_volume"),
+        )
+
+    @classmethod
+    def from_arrays(  # noqa: PLR0913 — keyword-only; one per column of the bars
+        cls,
+        *,
+        times: Instants,
+        step: dt.timedelta,
+        open_: Floats,
+        high: Floats,
+        low: Floats,
+        close: Floats,
+        volume: Floats,
+    ) -> Market:
+        """From columns in time order — what is read from the collector's Parquet."""
         ranges = true_range(high, low, close)
         return cls(
-            times=[bar.time for bar in candles],
+            times=times,
             step=step,
-            open=column("open"),
+            open=open_,
             high=high,
             low=low,
             close=close,
-            volume=column("tick_volume"),
+            volume=volume,
             atr14=wilder(ranges, 14),
             atr100=wilder(ranges, 100),
             ema20=ema(close, 20),
@@ -158,7 +208,8 @@ class Market:
     def decision_bar(self, entry_time: dt.datetime) -> int | None:
         """The last bar closed by `entry_time` — its open plus one step at or before it — or
         `None` when the entry came before any bar had closed."""
-        index = bisect_right(self.times, entry_time - self.step) - 1
+        latest_open = micros(entry_time - self.step)
+        index = int(np.searchsorted(self.times, latest_open, side="right")) - 1
         return None if index < 0 else index
 
 
@@ -223,7 +274,7 @@ def features_at(
         return where if side == "long" else 1.0 - where
 
     recent_volume = market.volume[max(0, i - 19) : i + 1]
-    decided = market.times[i] + market.step
+    decided = instant(int(market.times[i])) + market.step
     return {
         "atr_pct": _ratio(atr, close),
         "atr_ratio": _ratio(atr, float(market.atr100[i])) if needs(100) else nan,
@@ -256,6 +307,7 @@ __all__ = [
     "FEATURES_VERSION",
     "FEATURE_NAMES",
     "LONGEST",
+    "STEP",
     "Market",
     "ema",
     "features_at",

@@ -1129,7 +1129,6 @@ source = { editable = "packages/ml" }
 dependencies = [
     { name = "numpy" },
     { name = "pyarrow" },
-    { name = "tradeforge-collector" },
     { name = "tradeforge-db" },
     { name = "tradeforge-engine" },
 ]
@@ -1138,7 +1137,6 @@ dependencies = [
 requires-dist = [
     { name = "numpy", specifier = ">=2.0" },
     { name = "pyarrow", specifier = ">=18.1" },
-    { name = "tradeforge-collector", editable = "apps/collector" },
     { name = "tradeforge-db", editable = "packages/db" },
     { name = "tradeforge-engine", editable = "packages/engine" },
 ]

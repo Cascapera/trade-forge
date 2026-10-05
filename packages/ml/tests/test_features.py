@@ -5,13 +5,15 @@ import math
 import random
 from dataclasses import replace
 from decimal import Decimal
+from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from tradeforge_engine.domain import Candle
-from tradeforge_ml.feature_export import features_table
+from tradeforge_ml.feature_export import features_table, read_market
 from tradeforge_ml.features import (
     FEATURE_NAMES,
     Market,
@@ -216,8 +218,9 @@ class TestTheTable:
             }
         )
 
+        market = Market.of(candles, H1)
         table, report = features_table(
-            events, lambda symbol, _timeframe: candles if symbol == "EURUSD" else []
+            events, lambda symbol, _timeframe: market if symbol == "EURUSD" else None
         )
 
         assert table.num_rows == 3
@@ -225,3 +228,31 @@ class TestTheTable:
         assert table.column("stop_atr").to_pylist()[1] is None
         assert table.column("stop_atr").to_pylist()[2] is not None
         assert (report.markets, report.without_bars, report.missing_markets) == (1, 1, ["NOPE H1"])
+
+
+def test_a_chart_is_read_from_the_collectors_layout_in_time_order(tmp_path: Path) -> None:
+    """The files the collector writes (`symbol=/timeframe=/year=`), years listed out of order."""
+    chart = tmp_path / "symbol=EURUSD" / "timeframe=H1"
+    candles = bars(walk(30))
+    for year, part in (("2025", candles[20:]), ("2024", candles[:20])):
+        (chart / f"year={year}").mkdir(parents=True)
+        pq.write_table(
+            pa.table(
+                {
+                    "time": pa.array([bar.time for bar in part], type=pa.timestamp("us", tz="UTC")),
+                    "open": [float(bar.open) for bar in part],
+                    "high": [float(bar.high) for bar in part],
+                    "low": [float(bar.low) for bar in part],
+                    "close": [float(bar.close) for bar in part],
+                    "tick_volume": [bar.tick_volume for bar in part],
+                }
+            ),
+            chart / f"year={year}" / "part.parquet",
+        )
+
+    read = read_market(tmp_path, "EURUSD", "H1")
+
+    assert read is not None
+    assert list(read.close) == [float(bar.close) for bar in candles]
+    assert read.decision_bar(T0 + 10 * H1) == 9
+    assert read_market(tmp_path, "GBPUSD", "H1") is None

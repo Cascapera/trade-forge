@@ -1,0 +1,265 @@
+"""What the market looked like when a setup entered — the variables a meta-label learns from
+(ADR-0031, rule 1).
+
+The event base says what a setup did and how it ended (`events`); this says, for each entry, what
+the chart showed at the **decision bar**: the last bar fully closed before the entry filled. Every
+variable is read from that bar and the bars before it, never from the bar the trade filled in or
+any after it — a test changes every later bar and finds nothing moved (`tests/test_features.py`).
+
+⚠️ **The decision bar is the last closed one, even for an order that rested.** A stop order placed
+bars earlier fills inside a bar; the latest moment a filter could still act on it is the close of
+the bar before, by cancelling the order there. So that bar, and not the one the order was placed
+on, is what the model sees — it may know more than the setup did, never more than a trader could.
+
+⚠️ **Oriented by the trade's side.** A variable that has a direction — distance to an average,
+a return, the position in a range — is multiplied by +1 for a long and -1 for a short, so "with
+the trend" reads the same for both and one model learns both sides.
+
+⚠️ **Three indicators written here, not a library's.** The EMA, Wilder's ATR and RSI are a dozen
+lines each and tested against values worked by hand; a library would bring its own warm-up rules
+and edge cases, unread. This is not a second copy of a strategy (`sdd.md` §5.3): the setup still
+decides every entry in the engine, and these only describe the market around it.
+
+Pure: candles and events in, variables out. `feature_export` reads and writes.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+from bisect import bisect_right
+from collections.abc import Sequence
+from dataclasses import dataclass
+
+import numpy as np
+import numpy.typing as npt
+
+from tradeforge_engine.domain import Candle
+
+FEATURES_VERSION = 1
+"""Bumped whenever a variable is added, removed or computed differently: a model records the
+version it was trained on (ADR-0031, rule 7)."""
+
+Floats = npt.NDArray[np.float64]
+
+LONGEST = 200
+"""The longest look-back a variable reads (EMA 200): a decision bar with fewer bars before it has
+no value for the variables that need them, never a value computed on too little."""
+
+STREAK_CAP = 10
+
+FEATURE_NAMES = (
+    "atr_pct",
+    "atr_ratio",
+    "bar_range_atr",
+    "stop_atr",
+    "ema20_dist_atr",
+    "ema50_dist_atr",
+    "ema200_dist_atr",
+    "ema50_slope_atr",
+    "ema_stack",
+    "ret1_atr",
+    "ret5_atr",
+    "ret20_atr",
+    "rsi14",
+    "range_pos20",
+    "range_pos100",
+    "body_ratio",
+    "streak",
+    "volume_ratio",
+    "hour_utc",
+    "weekday",
+    "month",
+    "bars_before",
+)
+"""The variables, in the order a row carries them."""
+
+
+def ema(values: Floats, period: int) -> Floats:
+    """The exponential average, `2 / (period + 1)`, seeded with the first value."""
+    alpha = 2.0 / (period + 1)
+    out = np.empty_like(values)
+    if len(values) == 0:
+        return out
+    out[0] = values[0]
+    for i in range(1, len(values)):
+        out[i] = out[i - 1] + alpha * (values[i] - out[i - 1])
+    return out
+
+
+def wilder(values: Floats, period: int) -> Floats:
+    """Wilder's smoothing — a running average with weight `1 / period` — seeded with the first."""
+    out = np.empty_like(values)
+    if len(values) == 0:
+        return out
+    out[0] = values[0]
+    for i in range(1, len(values)):
+        out[i] = out[i - 1] + (values[i] - out[i - 1]) / period
+    return out
+
+
+def true_range(high: Floats, low: Floats, close: Floats) -> Floats:
+    """The bar's range, stretched to the previous close when the market gapped."""
+    previous = np.concatenate(([close[0]], close[:-1])) if len(close) else close
+    return np.maximum(high - low, np.maximum(np.abs(high - previous), np.abs(low - previous)))
+
+
+def rsi(close: Floats, period: int = 14) -> Floats:
+    """Wilder's RSI, 0 to 100; 50 where nothing moved."""
+    change = np.diff(close, prepend=close[:1])
+    gain = wilder(np.maximum(change, 0.0), period)
+    loss = wilder(np.maximum(-change, 0.0), period)
+    total = gain + loss
+    with np.errstate(divide="ignore", invalid="ignore"):
+        # Clipped: the division can land a rounding above 100 when every move was a gain.
+        return np.clip(np.where(total > 0, 100.0 * gain / total, 50.0), 0.0, 100.0)
+
+
+@dataclass(frozen=True, slots=True)
+class Market:
+    """One chart's bars as arrays, and the series every variable reads, computed once."""
+
+    times: Sequence[dt.datetime]
+    step: dt.timedelta
+    open: Floats
+    high: Floats
+    low: Floats
+    close: Floats
+    volume: Floats
+    atr14: Floats
+    atr100: Floats
+    ema20: Floats
+    ema50: Floats
+    ema200: Floats
+    rsi14: Floats
+
+    @classmethod
+    def of(cls, candles: Sequence[Candle], step: dt.timedelta) -> Market:
+        def column(name: str) -> Floats:
+            return np.array([float(getattr(bar, name)) for bar in candles], dtype=np.float64)
+
+        high, low, close = column("high"), column("low"), column("close")
+        ranges = true_range(high, low, close)
+        return cls(
+            times=[bar.time for bar in candles],
+            step=step,
+            open=column("open"),
+            high=high,
+            low=low,
+            close=close,
+            volume=column("tick_volume"),
+            atr14=wilder(ranges, 14),
+            atr100=wilder(ranges, 100),
+            ema20=ema(close, 20),
+            ema50=ema(close, 50),
+            ema200=ema(close, 200),
+            rsi14=rsi(close),
+        )
+
+    def decision_bar(self, entry_time: dt.datetime) -> int | None:
+        """The last bar closed by `entry_time` — its open plus one step at or before it — or
+        `None` when the entry came before any bar had closed."""
+        index = bisect_right(self.times, entry_time - self.step) - 1
+        return None if index < 0 else index
+
+
+def _ratio(numerator: float, denominator: float) -> float:
+    return numerator / denominator if denominator > 0 else float("nan")
+
+
+def _position(close: float, highs: Floats, lows: Floats) -> float:
+    top, bottom = float(highs.max()), float(lows.min())
+    return _ratio(close - bottom, top - bottom)
+
+
+def features_at(
+    market: Market,
+    *,
+    entry_time: dt.datetime,
+    side: str,
+    entry_price: float,
+    stop_loss: float | None,
+) -> dict[str, float]:
+    """The variables of one entry, read at its decision bar. Every value is `nan` when there is no
+    decision bar; the ones that look back further than the bars there are, too."""
+    nan = float("nan")
+    i = market.decision_bar(entry_time)
+    if i is None:
+        return dict.fromkeys(FEATURE_NAMES, nan)
+    sign = 1.0 if side == "long" else -1.0
+    close = float(market.close[i])
+    atr = float(market.atr14[i])
+
+    def needs(bars: int) -> bool:
+        """Whether the decision bar has `bars` bars up to and including it."""
+        return i + 1 >= bars
+
+    enough = needs(LONGEST)
+    bar_range = float(market.high[i] - market.low[i])
+
+    def back(bars: int) -> float:
+        return sign * _ratio(close - float(market.close[i - bars]), atr) if i >= bars else nan
+
+    def distance(average: Floats) -> float:
+        return sign * _ratio(close - float(average[i]), atr)
+
+    streak = 0
+    j = i
+    while j >= 1 and streak < STREAK_CAP and sign * (market.close[j] - market.close[j - 1]) > 0:
+        streak += 1
+        j -= 1
+
+    stack = 0.0
+    if market.ema20[i] > market.ema50[i] > market.ema200[i]:
+        stack = 1.0
+    elif market.ema20[i] < market.ema50[i] < market.ema200[i]:
+        stack = -1.0
+
+    def position(bars: int) -> float:
+        if not needs(bars):
+            return nan
+        where = _position(
+            close, market.high[i + 1 - bars : i + 1], market.low[i + 1 - bars : i + 1]
+        )
+        return where if side == "long" else 1.0 - where
+
+    recent_volume = market.volume[max(0, i - 19) : i + 1]
+    decided = market.times[i] + market.step
+    return {
+        "atr_pct": _ratio(atr, close),
+        "atr_ratio": _ratio(atr, float(market.atr100[i])) if needs(100) else nan,
+        "bar_range_atr": _ratio(bar_range, atr),
+        "stop_atr": nan if stop_loss is None else _ratio(abs(entry_price - stop_loss), atr),
+        "ema20_dist_atr": distance(market.ema20) if needs(20) else nan,
+        "ema50_dist_atr": distance(market.ema50) if needs(50) else nan,
+        "ema200_dist_atr": distance(market.ema200) if enough else nan,
+        "ema50_slope_atr": (
+            sign * _ratio(float(market.ema50[i] - market.ema50[i - 10]), atr) if needs(60) else nan
+        ),
+        "ema_stack": sign * stack if enough else nan,
+        "ret1_atr": back(1),
+        "ret5_atr": back(5),
+        "ret20_atr": back(20),
+        "rsi14": float(market.rsi14[i]) if side == "long" else 100.0 - float(market.rsi14[i]),
+        "range_pos20": position(20),
+        "range_pos100": position(100),
+        "body_ratio": _ratio(abs(close - float(market.open[i])), bar_range),
+        "streak": float(streak),
+        "volume_ratio": _ratio(float(market.volume[i]), float(recent_volume.mean())),
+        "hour_utc": float(decided.hour),
+        "weekday": float(decided.weekday()),
+        "month": float(decided.month),
+        "bars_before": float(i + 1),
+    }
+
+
+__all__ = [
+    "FEATURES_VERSION",
+    "FEATURE_NAMES",
+    "LONGEST",
+    "Market",
+    "ema",
+    "features_at",
+    "rsi",
+    "true_range",
+    "wilder",
+]

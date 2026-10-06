@@ -121,4 +121,4 @@ __all__ = [
 # one only under the same version (`tradeforge_api.reuse`), so a fix that changes a trade and keeps
 # the number would hand back results the engine no longer gives. It sat at 0.1.0 from July to
 # 28/09 through many such fixes; nothing run under 0.1.0 is reused.
-__version__ = "0.5.0"
+__version__ = "0.6.0"

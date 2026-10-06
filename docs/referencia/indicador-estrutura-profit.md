@@ -18,16 +18,31 @@ Em 04/08/2026, sobre **3480 candles reais de AAPL H1** (2024-08-01 → 2026-07-3
 | **idênticos** (mesma barra, tipo e nível) | **88 de 88** |
 | só no indicador | 2 — as barras 1 e 2 |
 
-As duas diferenças são a **única desobediência deliberada**, descrita abaixo.
+As duas diferenças vinham da partida, descrita abaixo. Desde 05/10 (motor 0.6.0) a da barra 2 é
+emitida como no indicador; resta só a marca a 0,00 da barra 1, por desobediência deliberada.
 
-## A desobediência deliberada: o zero do Pascal
+## A desobediência deliberada: a marca no 0,00 do Pascal
 
 No Profit, variável não inicializada vale `0`. Então `Topo_Choch` começa em zero, o primeiro
-fechamento da série é "acima" dele, e o indicador marca `CHOCH` no nível **0,00** — e a barra
-seguinte marca o espelho. Num gráfico são duas marcas inofensivas na origem.
+fechamento da série é "acima" dele, e o indicador marca `CHOCH` no nível **0,00**. Essa marca faz
+um trabalho: vira a direção para alta (`DIR := 1`), planta `Fundo_Choch` na mínima da primeira
+barra e põe `Topo_Sobe` na máxima dela. Na barra seguinte, as barras que faltam no histórico valem
+zero, e um fechamento abaixo da mínima da primeira barra marca o espelho, num **preço real**.
 
-**Numa engine que abre ordem, são dois trades num nível que não é um preço.** Por isso uma âncora
-nunca plantada é `None` na transcrição, e não rompe nada até existir. Tudo o mais é literal.
+**Numa engine que abre ordem, a marca a 0,00 seria um trade num nível que não é um preço.** Por
+isso ela não é emitida: é a única desobediência. **Tudo o que ela faz é feito** (05/10, motor
+0.6.0), e a marca espelho da segunda barra é emitida como no indicador.
+
+⚠️ **Até a 0.5.0 a transcrição deixava a âncora vazia em vez de plantá-la.** Uma série que
+começava subindo e nunca voltava à primeira mínima não marcava nada, nunca: só uma BOS de baixa
+plantava a âncora de que a CHoCH de alta precisa. UsaTec H1 a partir de janeiro de 2017 ficou
+três anos sem uma única quebra (e todo setup de estrutura sem trade), enquanto as mesmas barras a
+partir de abril marcavam 482. Depois do conserto, as duas séries convergem: de 2018 em diante
+marcam as mesmas 190 e 177 quebras por ano.
+
+A direção interna (`_direction`, o `DIR`) e a tendência informada às estratégias (`trend`) ficam
+separadas: `trend` continua `None` até a primeira quebra **emitida**, para que nenhuma estratégia
+aja sobre a suposição inicial do indicador.
 
 ## A regra que motivou a transcrição
 

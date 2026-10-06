@@ -337,6 +337,20 @@ def _drive_from_bullish(
     return everything[len(BULLISH_START) :]
 
 
+def _drive_from_bearish(
+    strategy: StructureStrategy,
+    candles: list[Candle],
+    **kwargs: object,
+) -> list[list[Signal]]:
+    """`_drive_from_bullish`'s mirror: on a machine already in a downtrend (05/10).
+
+    A fresh machine starts as the Pascal does, its first bar turning the bias up, so a scenario
+    that falls from bar 0 opens with a CHoCH — not the BOS a bearish scenario is about."""
+    prefix = _mirror(BULLISH_START)
+    everything = _drive(strategy, [*prefix, *candles], **kwargs)  # type: ignore[arg-type]
+    return everything[len(prefix) :]
+
+
 # --------------------------------------------------------------------------- #
 # Where the order goes                                                          #
 # --------------------------------------------------------------------------- #
@@ -2760,7 +2774,7 @@ def test_the_bar_that_filled_does_not_credit_its_own_excursion() -> None:
 def test_a_short_is_conducted_by_the_mirror_of_the_same_rules() -> None:
     """The bearish mirror of the impulse: bar 9 confirms a bearish BOS, and the open short's
     first break in favour brings its stop to the entry price."""
-    signals = _drive(
+    signals = _drive_from_bearish(
         ageless_structure(qualifier=_Marked()),
         _mirror(_IMPULSE),
         position_on=frozenset({9}),

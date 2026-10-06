@@ -782,9 +782,11 @@ def test_the_short_side_spends_its_own_release() -> None:
     without: the supply release has to be the one shut by a sold zone's arming."""
     tail = _mirror([*STREAM, bar(90, open_="126", close="126")])
     # The mirror is not the demand run's twin bar for bar — the tick nudges in `_expand` step the
-    # same way on both — so the hourly structure marks seven zones before hour 89 here (one each
-    # on 30 and 44, five on 70), and hour 89's first and second are the eighth and ninth seen.
-    picks = {ARMS: 7, ARMS + 1: 8}
+    # same way on both, and since 05/10 the machine starts as the Pascal does, its first bar
+    # turning the bias up, so the falling run opens with a CHoCH that marks three demand zones on
+    # hour 26. Ten zones before hour 89 here (three on 26, one each on 30 and 44, five on 70), and
+    # hour 89's first and second are the eleventh and twelfth seen.
+    picks = {ARMS: 10, ARMS + 1: 11}
 
     plain = _drive(ageless_structure(qualifier=_Names(picks), allow_secondary=True), tail)
     assert [signal.kind for signal in plain[ARMS + 1]] == [SignalKind.CANCEL, SignalKind.ENTRY]

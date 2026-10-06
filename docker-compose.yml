@@ -33,6 +33,26 @@ services:
     # reads of a 175-thousand-run sweep failed with `DiskFull: could not resize shared memory
     # segment` while the workers ran. Takes effect when the container is recreated.
     shm_size: 1g
+    # ⚠️ **Memory sized for the machine, not the image's defaults** (06/10). With 128 MB of shared
+    # buffers and 4 MB per sort, a 42 GB database leaned entirely on the VM's page cache; with 16
+    # workers beside it the cache was squeezed, every count read the disk, the workers sat idle
+    # waiting on it and runs failed with `Cannot allocate memory`. Sized for the 43 GB the Docker
+    # VM has (`.wslconfig`): 6 GB of buffers leave room for the workers (~0.6 GB each) and the
+    # API. `random_page_cost` 1.1 because the disk is an SSD. Takes effect when recreated.
+    command:
+      - postgres
+      - -c
+      - shared_buffers=6GB
+      - -c
+      - effective_cache_size=20GB
+      - -c
+      - work_mem=32MB
+      - -c
+      - maintenance_work_mem=1GB
+      - -c
+      - max_wal_size=8GB
+      - -c
+      - random_page_cost=1.1
     environment:
       POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
       POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}

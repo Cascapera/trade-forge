@@ -146,7 +146,10 @@ services:
       context: .
       dockerfile: apps/api/Dockerfile
     image: tradeforge-api
-    command: ['arq', 'tradeforge_api.worker.WorkerSettings']
+    # Not `arq tradeforge_api.worker.WorkerSettings`: the same worker on `OneTripWorker`, which
+    # claims its next job in one round trip to Redis (`claim`, 06/10). The old command still
+    # works; from across the internet it idles ~15–30 s between batches.
+    command: ['python', '-m', 'tradeforge_api.worker_main']
     environment: *backend-env
     # One core per worker, and as many workers as TRADEFORGE_WORKERS asks for (23/09). A backtest
     # is synchronous CPU: one worker runs one at a time on one core, so the count is the speed and

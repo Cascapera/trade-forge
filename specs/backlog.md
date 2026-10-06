@@ -3020,3 +3020,11 @@ Dos ~399 mil runs `failed` dos últimos dois dias, quase todos foram cancelados 
 Pausando a d3249da1 (UsaTec, ~563 mil runs em lotes de 24), a API retirou 67 392 jobs e deixaram 19 296 lotes
 `batch-*` no Redis; os workers seguiram pegando. Removidos à mão. Provável: os ids de lote que a pausa recalcula
 (`jobs_for`) não batem com os do lançamento para parte dos lotes. Conferir antes de confiar na pausa de novo.
+
+## Parar um worker no meio de um lote deixa runs `failed` para sempre (06/10) — PENDENTE
+
+Trocando os workers da Contabo no meio da d3aabdc2 (SIGTERM, arq cancela o lote e diz "will be run again"),
+`process_batch` marcou os runs ainda não terminados como `failed` ("the batch was stopped: CancelledError()") —
+de propósito, para nenhum ficar `running` sem dono. Mas o lote devolvido pula `failed`, então os 259 runs não
+voltaram: foram recolocados à mão (status → queued + jobs próprios). Num cancelamento que o arq vai repetir, os
+runs deveriam voltar a `queued`, não `failed`; `failed` só quando é a última tentativa (timeout real).

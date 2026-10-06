@@ -6,6 +6,12 @@
     tradeforge-ml train <sweep-id> [--out data/ml] [--validation 2023-01-01:2025-01-01]
                        [--exclude 2020-03-01:2020-07-01 ...]
                                                       # the first meta-label, judged; files only
+    tradeforge-ml replay <sweep-id> [--out data/ml] [--ohlcv data/ohlcv] [--horizon 150]
+                         [--processes N]              # every proposal, traded alone
+                                                      #   -> sweep=<id>/independent-h150/
+
+`features` and `train` read the run-based base; `--base independent-h150` points them at the
+replayed one instead.
 
 Read-only on the database. Connects with the same `POSTGRES_*` settings as `tradeforge-db`;
 `features` reads only each instrument's point there, to put its spread in price.
@@ -25,6 +31,8 @@ from tradeforge_db.session import create_db_engine, create_session_factory
 from tradeforge_ml.export import export_sweep
 from tradeforge_ml.feature_export import write_features
 from tradeforge_ml.model import Split
+from tradeforge_ml.replay import HORIZON
+from tradeforge_ml.replay_export import jobs_of, write_independent
 from tradeforge_ml.train import train
 
 
@@ -48,18 +56,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     features.add_argument("sweep_id", type=uuid.UUID)
     features.add_argument("--out", type=Path, default=Path("data/ml"))
     features.add_argument("--ohlcv", type=Path, default=Path("data/ohlcv"))
+    features.add_argument("--base", default="")
     fit = commands.add_parser("train", help="fit the first meta-label and write its report")
     fit.add_argument("sweep_id", type=uuid.UUID)
     fit.add_argument("--out", type=Path, default=Path("data/ml"))
     fit.add_argument("--validation", type=span, default=span("2023-01-01:2025-01-01"))
     fit.add_argument("--exclude", type=span, action="append", default=[])
+    fit.add_argument("--base", default="")
+    again = commands.add_parser("replay", help="replay every proposal of the unmanaged runs")
+    again.add_argument("sweep_id", type=uuid.UUID)
+    again.add_argument("--out", type=Path, default=Path("data/ml"))
+    again.add_argument("--ohlcv", type=Path, default=Path("data/ohlcv"))
+    again.add_argument("--horizon", type=int, default=HORIZON)
+    again.add_argument("--processes", type=int, default=None)
     args = parser.parse_args(argv)
+    base = args.out / f"sweep={args.sweep_id}" / getattr(args, "base", "")
 
     if args.command == "train":
         start, end = args.validation
-        name, judged = train(
-            args.out / f"sweep={args.sweep_id}", Split(start, end, tuple(args.exclude))
-        )
+        name, judged = train(base, Split(start, end, tuple(args.exclude)))
         everything, half = judged.validation[0], judged.validation[2]
         print(
             f"{name}: validation AUC {judged.validation_auc:.3f}, "
@@ -68,6 +83,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     factory = create_session_factory(create_db_engine())
+    if args.command == "replay":
+        with factory() as session:
+            jobs = jobs_of(session, args.sweep_id)
+        replayed = write_independent(
+            jobs,
+            sweep_id=str(args.sweep_id),
+            out=args.out,
+            ohlcv=args.ohlcv,
+            horizon=args.horizon,
+            processes=args.processes,
+        )
+        print(
+            f"runs {replayed.runs}, charts {replayed.charts}, proposals {replayed.proposals}, "
+            f"events {replayed.events} ({replayed.events_disagreeing} disagreeing), "
+            f"exits {replayed.exits}"
+        )
+        return 0
     if args.command == "features":
         with factory() as session:
             points = {
@@ -76,7 +108,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     select(Instrument.symbol, Instrument.digits)
                 ).tuples()
             }
-        made = write_features(args.out / f"sweep={args.sweep_id}", args.ohlcv, points)
+        made = write_features(base, args.ohlcv, points)
         print(
             f"events {made.events}, charts {made.markets}, without bars {made.without_bars}"
             + (f" ({', '.join(made.missing_markets)})" if made.missing_markets else "")

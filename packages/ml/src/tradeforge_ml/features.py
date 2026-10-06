@@ -26,17 +26,22 @@ Pure: candles and events in, variables out. `feature_export` reads and writes.
 from __future__ import annotations
 
 import datetime as dt
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import numpy.typing as npt
 
 from tradeforge_engine.domain import Candle
 
-FEATURES_VERSION = 1
+FEATURES_VERSION = 2
 """Bumped whenever a variable is added, removed or computed differently: a model records the
-version it was trained on (ADR-0031, rule 7)."""
+version it was trained on (ADR-0031, rule 7).
+
+2 (06/10): the spread against its own recent past and against the stop, the trading sessions in
+their cities' clocks, and how far the market moved inside the session under way."""
 
 Floats = npt.NDArray[np.float64]
 Instants = npt.NDArray[np.int64]
@@ -73,6 +78,46 @@ no value for the variables that need them, never a value computed on too little.
 
 STREAK_CAP = 10
 
+SPREAD_LOOKBACK = 100
+"""Bars the spread is measured against (`spread_rel`): its median over them, the decision bar's
+included. Fewer than half of them with a spread recorded, and there is no value."""
+
+
+SATURDAY = 5
+"""`date.weekday()` of the first day no session opens on, in its own city."""
+
+
+@dataclass(frozen=True)
+class Session:
+    """A trading session in its own city's clock — so a summer and a winter day open at the same
+    local hour, which `hour_utc` cannot say: 13:00 UTC is New York's open half the year."""
+
+    name: str
+    zone: ZoneInfo
+    opens: dt.time
+    closes: dt.time
+
+    def opening(self, at: dt.datetime) -> dt.datetime | None:
+        """The UTC instant this session opened on `at`'s local day, when `at` falls inside it on a
+        weekday; otherwise `None`. Open at its opening instant, closed at its closing one."""
+        local = at.astimezone(self.zone)
+        if local.weekday() >= SATURDAY or not self.opens <= local.time() < self.closes:
+            return None
+        return dt.datetime.combine(local.date(), self.opens, tzinfo=self.zone).astimezone(dt.UTC)
+
+
+SESSIONS = (
+    Session("asia", ZoneInfo("Asia/Tokyo"), dt.time(9), dt.time(18)),
+    Session("london", ZoneInfo("Europe/London"), dt.time(8), dt.time(17)),
+    Session("ny", ZoneInfo("America/New_York"), dt.time(8), dt.time(17)),
+    Session("ny_cash", ZoneInfo("America/New_York"), dt.time(9, 30), dt.time(16)),
+)
+"""Forex's three sessions and New York's cash hours, when its stock indices trade for real."""
+
+SESSION_MOVE_LONGEST_STEP = dt.timedelta(hours=1)
+"""Above H1 a single bar straddles a session's opening, so how far the market moved since it
+cannot be read: on H4, D1 and W1 the session's move is empty. The flags still are not."""
+
 FEATURE_NAMES = (
     "atr_pct",
     "atr_ratio",
@@ -96,6 +141,13 @@ FEATURE_NAMES = (
     "weekday",
     "month",
     "bars_before",
+    "spread_rel",
+    "spread_stop",
+    *(f"session_{session.name}" for session in SESSIONS),
+    "session_ret_atr",
+    "session_range_atr",
+    "session_pos",
+    "session_minutes",
 )
 """The variables, in the order a row carries them."""
 
@@ -151,6 +203,10 @@ class Market:
     low: Floats
     close: Floats
     volume: Floats
+    spread: Floats
+    """In the broker's points, as the bar recorded it; `nan` where it recorded none (zero)."""
+    point: float | None
+    """What one point is in price (`10 ** -digits`), or `None` when the instrument is unknown."""
     atr14: Floats
     atr100: Floats
     ema20: Floats
@@ -159,7 +215,9 @@ class Market:
     rsi14: Floats
 
     @classmethod
-    def of(cls, candles: Sequence[Candle], step: dt.timedelta) -> Market:
+    def of(
+        cls, candles: Sequence[Candle], step: dt.timedelta, point: float | None = None
+    ) -> Market:
         """From the engine's bars — what a test builds."""
 
         def column(name: str) -> Floats:
@@ -173,6 +231,8 @@ class Market:
             low=column("low"),
             close=column("close"),
             volume=column("tick_volume"),
+            spread=column("spread"),
+            point=point,
         )
 
     @classmethod
@@ -186,9 +246,15 @@ class Market:
         low: Floats,
         close: Floats,
         volume: Floats,
+        spread: Floats | None = None,
+        point: float | None = None,
     ) -> Market:
         """From columns in time order — what is read from the collector's Parquet."""
         ranges = true_range(high, low, close)
+        recorded = np.full(len(close), np.nan) if spread is None else spread.astype(np.float64)
+        # A zero is a bar the broker recorded no spread for (GOLD and BTCUSD before 2017-18), not
+        # a free trade: read as one, it would teach that old bars cost nothing.
+        recorded[recorded <= 0] = np.nan
         return cls(
             times=times,
             step=step,
@@ -197,6 +263,8 @@ class Market:
             low=low,
             close=close,
             volume=volume,
+            spread=recorded,
+            point=point,
             atr14=wilder(ranges, 14),
             atr100=wilder(ranges, 100),
             ema20=ema(close, 20),
@@ -220,6 +288,56 @@ def _ratio(numerator: float, denominator: float) -> float:
 def _position(close: float, highs: Floats, lows: Floats) -> float:
     top, bottom = float(highs.max()), float(lows.min())
     return _ratio(close - bottom, top - bottom)
+
+
+def _spread(
+    market: Market, i: int, entry_price: float, stop_loss: float | None
+) -> dict[str, float]:
+    """The decision bar's spread against its own last `SPREAD_LOOKBACK` bars, and in price against
+    the stop. Never the spread in points itself: in this broker's history it moves in steps by year
+    (EURUSD 5 since 2017, Usa500 23 from 2018 to 2024), so a model would learn the year from it."""
+    nan = float("nan")
+    now = float(market.spread[i])
+    recent = market.spread[max(0, i + 1 - SPREAD_LOOKBACK) : i + 1]
+    recorded = recent[~np.isnan(recent)]
+    typical = float(np.median(recorded)) if len(recorded) * 2 >= SPREAD_LOOKBACK else nan
+    risk = nan if stop_loss is None else abs(entry_price - stop_loss)
+    return {
+        "spread_rel": _ratio(now, typical) if not math.isnan(typical) else nan,
+        "spread_stop": (
+            _ratio(now * market.point, risk) if market.point is not None and risk > 0 else nan
+        ),
+    }
+
+
+def _sessions(
+    market: Market, i: int, decided: dt.datetime, sign: float, atr: float
+) -> dict[str, float]:
+    """Which sessions the decision falls in, and the market inside the one that opened last.
+
+    The move is read from the session's first whole bar (the first opening at or after the
+    session's) to the decision bar: on H1, New York's cash hours (09:30) start at the 10:00 bar.
+    """
+    nan = float("nan")
+    openings = {session.name: session.opening(decided) for session in SESSIONS}
+    out = {f"session_{name}": float(at is not None) for name, at in openings.items()}
+    started = [at for at in openings.values() if at is not None]
+    move = dict.fromkeys(
+        ("session_ret_atr", "session_range_atr", "session_pos", "session_minutes"), nan
+    )
+    if not started or market.step > SESSION_MOVE_LONGEST_STEP:
+        return out | move
+    opened = max(started)
+    move["session_minutes"] = (decided - opened) / dt.timedelta(minutes=1)
+    first = int(np.searchsorted(market.times, micros(opened), side="left"))
+    if first <= i:
+        close = float(market.close[i])
+        highs, lows = market.high[first : i + 1], market.low[first : i + 1]
+        where = _position(close, highs, lows)
+        move["session_ret_atr"] = sign * _ratio(close - float(market.open[first]), atr)
+        move["session_range_atr"] = _ratio(float(highs.max() - lows.min()), atr)
+        move["session_pos"] = where if sign > 0 else 1.0 - where
+    return out | move
 
 
 def features_at(
@@ -300,6 +418,8 @@ def features_at(
         "weekday": float(decided.weekday()),
         "month": float(decided.month),
         "bars_before": float(i + 1),
+        **_spread(market, i, entry_price, stop_loss),
+        **_sessions(market, i, decided, sign, atr),
     }
 
 
@@ -307,8 +427,10 @@ __all__ = [
     "FEATURES_VERSION",
     "FEATURE_NAMES",
     "LONGEST",
+    "SESSIONS",
     "STEP",
     "Market",
+    "Session",
     "ema",
     "features_at",
     "rsi",

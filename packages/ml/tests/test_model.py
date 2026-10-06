@@ -4,6 +4,7 @@ import datetime as dt
 import json
 import math
 import re
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -22,12 +23,14 @@ from tradeforge_ml.model import (
     probabilities,
     rows_of,
     split,
+    with_target,
 )
 from tradeforge_ml.train import name_of, train
 
 UTC = dt.UTC
 PLAN = Split(dt.datetime(2023, 1, 1, tzinfo=UTC), dt.datetime(2025, 1, 1, tzinfo=UTC))
 SIGNAL = FEATURE_NAMES.index("ret5_atr")
+COST_R = 0.05
 
 
 def _us(instant: dt.datetime) -> int:
@@ -50,6 +53,9 @@ def synthetic(count: int, *, signal: bool, seed: int = 3) -> Rows:
         entry_us=entry,
         exit_us=entry + 3_600_000_000,
         r=np.where(won, 2.0, -1.0),
+        # A winner went at least as far as it made; a loser got part of the way, or none.
+        mfe_r=np.where(won, rng.uniform(2.0, 6.0, count), rng.uniform(0.0, 1.5, count)),
+        cost_r=np.full(count, COST_R),
     )
 
 
@@ -104,13 +110,8 @@ class TestTheModel:
         """Rule 5: what validation's trades did cannot change the model judged on them."""
         rows = synthetic(3000, signal=True)
         training, validation, _ = split(rows, PLAN)
-        flipped = Rows(
-            rows.features,
-            rows.timeframe,
-            rows.symbol,
-            rows.entry_us,
-            rows.exit_us,
-            np.where(rows.entry_us >= _us(PLAN.validation_from), -rows.r, rows.r),
+        flipped = replace(
+            rows, r=np.where(rows.entry_us >= _us(PLAN.validation_from), -rows.r, rows.r)
         )
         again, _, _ = split(flipped, PLAN)
 
@@ -120,14 +121,7 @@ class TestTheModel:
 
     def test_the_symbol_is_not_an_input(self) -> None:
         rows = synthetic(3000, signal=True)
-        renamed = Rows(
-            rows.features,
-            rows.timeframe,
-            np.full(len(rows.r), "NOPE", dtype=np.str_),
-            rows.entry_us,
-            rows.exit_us,
-            rows.r,
-        )
+        renamed = replace(rows, symbol=np.full(len(rows.r), "NOPE", dtype=np.str_))
         model = fit(rows)
 
         assert np.array_equal(probabilities(model, rows), probabilities(fit(renamed), renamed))
@@ -159,6 +153,11 @@ def _tables(rows: Rows) -> tuple[pa.Table, pa.Table]:
             **key,
             "exit_time": pa.array(rows.exit_us, type=pa.timestamp("us", tz="UTC")),
             "r_multiple": rows.r,
+            # Risk 0.1 a unit, and an exit that is the R plus what was paid: the cost comes back.
+            "entry_price": np.full(count, 1.0),
+            "stop_loss": np.full(count, 0.9),
+            "exit_price": 1.0 + (rows.r + rows.cost_r) * 0.1,
+            "mfe_r": rows.mfe_r,
         }
     )
     features = pa.table(
@@ -206,3 +205,56 @@ def test_a_span_is_two_days_the_second_after_the_first() -> None:
 
     assert (left, right) == (PLAN.validation_from, PLAN.validation_to)
     assert name_of(Split(left, right, ((left, right),))).endswith("-excl")
+
+
+class TestTargets:
+    def test_a_target_the_mfe_reached_closes_there_less_what_was_paid(self) -> None:
+        rows = synthetic(6, signal=False)
+        rows.r[:] = [-1.0, -1.0, 2.0, 0.4, -1.0, 3.5]
+        rows.mfe_r[:] = [0.5, 2.0, 4.0, 1.9, 0.0, 3.5]
+
+        assert with_target(rows, None) is rows.r
+        assert with_target(rows, 2.0).tolist() == pytest.approx(
+            [-1.0, 2.0 - COST_R, 2.0 - COST_R, 0.4, -1.0, 2.0 - COST_R]
+        )
+
+    def test_the_cost_in_r_is_read_back_from_the_files(self) -> None:
+        events, features = _tables(synthetic(40, signal=False))
+
+        joined = rows_of(events, features)
+
+        assert joined.cost_r == pytest.approx(np.full(40, COST_R))
+
+    def test_every_target_is_scored_for_validation_and_each_symbol(self) -> None:
+        _, report = evaluate(synthetic(4000, signal=True), PLAN)
+
+        assert list(report.targets) == ["as run", "1R", "2R", "3R", "5R"]
+        assert report.targets["as run"][0].mean_r == report.validation[0].mean_r
+        assert set(report.targets_by_symbol) == {"EURUSD", "GBPUSD"}
+        assert list(report.targets_by_symbol["EURUSD"]) == list(report.targets)
+
+
+class TestBoosting:
+    def test_it_finds_the_planted_signal_and_says_it_leans_on_it(self) -> None:
+        _, report = evaluate(synthetic(6000, signal=True), PLAN, "boosting")
+
+        assert report.kind == "boosting"
+        assert report.validation_auc is not None
+        assert report.validation_auc > 0.8
+        assert report.weights[0][0] == "ret5_atr"
+        assert report.weights[0][1] > 0.1
+
+    def test_it_reads_empty_values_without_filling_them(self) -> None:
+        rows = synthetic(3000, signal=True)
+        rows.features[:, SIGNAL][:500] = math.nan
+
+        probability = probabilities(fit(rows, "boosting"), rows)
+
+        assert not np.isnan(probability).any()
+
+
+def test_the_chart_is_an_input_by_name() -> None:
+    _, report = evaluate(synthetic(3000, signal=True), PLAN)
+
+    names = {name for name, _ in report.weights}
+    assert {"timeframe_M15", "timeframe_H1"} <= names

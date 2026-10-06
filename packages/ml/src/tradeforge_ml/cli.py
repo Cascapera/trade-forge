@@ -4,7 +4,7 @@
     tradeforge-ml features <sweep-id> [--out data/ml] [--ohlcv data/ohlcv]
                                                       # its variables, beside the events
     tradeforge-ml train <sweep-id> [--out data/ml] [--validation 2023-01-01:2025-01-01]
-                       [--exclude 2020-03-01:2020-07-01 ...]
+                       [--exclude 2020-03-01:2020-07-01 ...] [--model logistic|boosting]
                                                       # the first meta-label, judged; files only
     tradeforge-ml replay <sweep-id> [--out data/ml] [--ohlcv data/ohlcv] [--horizon 150]
                          [--processes N]              # every proposal, traded alone
@@ -61,6 +61,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     fit.add_argument("--validation", type=span, default=span("2023-01-01:2025-01-01"))
     fit.add_argument("--exclude", type=span, action="append", default=[])
     fit.add_argument("--base", default="")
+    fit.add_argument("--model", choices=("logistic", "boosting"), default="logistic")
     again = commands.add_parser("replay", help="replay every proposal of the unmanaged runs")
     again.add_argument("sweep_id", type=uuid.UUID)
     again.add_argument("--out", type=Path, default=Path("data/ml"))
@@ -77,7 +78,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         from tradeforge_ml.train import train  # noqa: PLC0415
 
         start, end = args.validation
-        name, judged = train(base, Split(start, end, tuple(args.exclude)))
+        name, judged = train(base, Split(start, end, tuple(args.exclude)), args.model)
         everything, half = judged.validation[0], judged.validation[2]
         print(
             f"{name}: validation AUC {judged.validation_auc:.3f}, "

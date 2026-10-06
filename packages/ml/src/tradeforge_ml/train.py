@@ -18,18 +18,18 @@ import pyarrow.parquet as pq
 import sklearn
 
 from tradeforge_ml.features import FEATURES_VERSION
-from tradeforge_ml.model import KEEP, SEED, Kept, Report, Split, evaluate, rows_of
+from tradeforge_ml.model import KEEP, SEED, TARGETS, Kept, Kind, Report, Split, evaluate, rows_of
 
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def name_of(plan: Split) -> str:
+def name_of(plan: Split, kind: Kind = "logistic") -> str:
     """`logistic-v2-val2023-2024`, and `-excl` when spans were left out of training."""
     last = (plan.validation_to - dt.timedelta(days=1)).year
     excluded = "-excl" if plan.excluded else ""
-    return f"logistic-v{FEATURES_VERSION}-val{plan.validation_from.year}-{last}{excluded}"
+    return f"{kind}-v{FEATURES_VERSION}-val{plan.validation_from.year}-{last}{excluded}"
 
 
 def _line(kept: Kept, everything: Kept) -> str:
@@ -76,24 +76,50 @@ def markdown(report: Report, name: str, manifest: dict[str, Any]) -> str:
         *_table("By year", report.by_year),
         *_table("By chart", report.by_timeframe),
         *_table("By symbol", report.by_symbol),
-        "## Weights (scaled inputs; positive raises the odds of a winner)",
+        "## Under a target (read off each trade's MFE)",
+        "",
+        "| target | mean R, all | best half | best 30% | won, best half |",
+        "|---|---|---|---|---|",
+        *(
+            f"| {name} | {every.mean_r:+.3f} | {half.mean_r:+.3f} | {third.mean_r:+.3f} "
+            f"| {half.win_rate:.1%} |"
+            for name, (every, half, third) in report.targets.items()
+        ),
+        "",
+        "## Best half of each symbol, under each target",
+        "",
+        "| symbol | " + " | ".join(report.targets) + " |",
+        "|---|" + "---|" * len(report.targets),
+        *(
+            f"| {symbol} | "
+            + " | ".join(f"{pair[1].mean_r:+.3f}" for pair in by_target.values())
+            + " |"
+            for symbol, by_target in report.targets_by_symbol.items()
+        ),
+        "",
+        (
+            "## Weights (scaled inputs; positive raises the odds of a winner)"
+            if report.kind == "logistic"
+            else "## What it leans on (AUC lost when the input is shuffled)"
+        ),
         "",
         "| input | weight |",
         "|---|---|",
-        *(f"| {name} | {weight:+.3f} |" for name, weight in report.weights),
+        *(f"| {name} | {weight:+.4f} |" for name, weight in report.weights),
         "",
     ]
     return "\n".join(lines)
 
 
-def train(sweep_dir: Path, plan: Split) -> tuple[str, Report]:
+def train(sweep_dir: Path, plan: Split, kind: Kind = "logistic") -> tuple[str, Report]:
     """Fit on `sweep_dir`'s events and variables, and write the report under `models/`."""
     events_path, features_path = sweep_dir / "events.parquet", sweep_dir / "features.parquet"
     rows = rows_of(pq.read_table(events_path), pq.read_table(features_path))
-    _, report = evaluate(rows, plan)
-    name = name_of(plan)
+    _, report = evaluate(rows, plan, kind)
+    name = name_of(plan, kind)
     manifest: dict[str, Any] = {
-        "model": "logistic regression",
+        "model": kind,
+        "targets_r": [target for target in TARGETS if target is not None],
         "seed": SEED,
         "features_version": FEATURES_VERSION,
         "sklearn": sklearn.__version__,

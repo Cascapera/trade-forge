@@ -1073,6 +1073,7 @@ dev = [
     { name = "pytest-cov" },
     { name = "ruff" },
     { name = "schemathesis" },
+    { name = "tradeforge-ml", extra = ["models"] },
 ]
 
 [package.metadata]
@@ -1096,6 +1097,7 @@ dev = [
     { name = "pytest-cov", specifier = ">=6.0" },
     { name = "ruff", specifier = ">=0.9" },
     { name = "schemathesis", specifier = ">=3.38" },
+    { name = "tradeforge-ml", extras = ["models"], editable = "packages/ml" },
 ]
 
 [[package]]
@@ -1210,21 +1212,26 @@ source = { editable = "packages/ml" }
 dependencies = [
     { name = "numpy" },
     { name = "pyarrow" },
-    { name = "scikit-learn" },
     { name = "tradeforge-db" },
     { name = "tradeforge-engine" },
     { name = "tzdata", marker = "sys_platform == 'win32'" },
+]
+
+[package.optional-dependencies]
+models = [
+    { name = "scikit-learn" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "numpy", specifier = ">=2.0" },
     { name = "pyarrow", specifier = ">=18.1" },
-    { name = "scikit-learn", specifier = ">=1.5" },
+    { name = "scikit-learn", marker = "extra == 'models'", specifier = ">=1.5" },
     { name = "tradeforge-db", editable = "packages/db" },
     { name = "tradeforge-engine", editable = "packages/engine" },
     { name = "tzdata", marker = "sys_platform == 'win32'", specifier = ">=2024.1" },
 ]
+provides-extras = ["models"]
 
 [[package]]
 name = "tradeforge-schema"

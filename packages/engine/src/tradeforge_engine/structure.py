@@ -252,15 +252,30 @@ class MarketStructure:
       the opposite anchor from whichever level is standing — the armed BOS if there is one, the
       running extreme if there is not.
 
-    **One deliberate departure from the Pascal.** There, an unset level is the number zero, so
-    the first close of a series is "above" the bullish anchor and fires a CHoCH at 0.00, and
-    the next bar fires its mirror. On a chart those two marks are harmless paint. In an engine
-    they are two orders on a level that is not a price, so an anchor that has never been planted
-    is `None` here and breaks nothing until it exists. Everything else is literal.
+    **The first bar starts the machine as the Pascal does, without its mark (05/10).** There, an
+    unset level is the number zero, so the first close of a series is "above" the bullish anchor
+    and fires a CHoCH at 0.00: the bias turns up, the bearish anchor lands on that bar's low, and
+    the machine is running. On a chart that mark is harmless paint; in an engine it is an order on
+    a level that is not a price, so it is not emitted — but everything it *does* is. And the second
+    bar reads the bar before it as zeros, as the Pascal does: rising is a higher high and a higher
+    low, falling cannot happen, and a close under the first bar's low is the mirror CHoCH, at a
+    real price, which *is* emitted.
+
+    ⚠️ **Why the effect and not only the mark.** Until 05/10 the anchor was simply left unset, and
+    a series that began in a climb that never came back to its first low could break nothing,
+    ever: a bearish BOS was the only way to plant the anchor a bullish CHoCH needs. UsaTec H1 from
+    January 2017 made no break in three years — and every structure setup on it no trade — while
+    the same bars from April made 482.
+
+    **The bias the machine runs on is not the bias it reports.** `_direction` is the Pascal's `DIR`
+    and turns up on the first bar; `trend` stays `None` until a break the machine emitted settles
+    one, because a strategy reading it must not act on the indicator's starting assumption.
     """
 
     def __init__(self) -> None:
         self._trend: Trend | None = None
+        # The Pascal's `DIR`: which branch reads the bar. -1 on a fresh series, as there.
+        self._direction = Trend.BEARISH
         self._previous: Candle | None = None
         self._before_previous: Candle | None = None
 
@@ -309,26 +324,48 @@ class MarketStructure:
         self._before_previous, self._previous = previous, candle
 
         self._advance_extremes(candle)
-        if previous is None or before is None:
-            # The counter-move rule reads three bars. Nothing can be armed before there are.
+        if previous is None:
+            self._start(candle)
             return None
 
-        rising = (
-            candle.high > previous.high
-            and candle.low > previous.low
-            and previous.high > before.high
-            and previous.low > before.low
-        )
-        falling = (
-            candle.high < previous.high
-            and candle.low < previous.low
-            and previous.high < before.high
-            and previous.low < before.low
-        )
+        if before is None:
+            # The second bar: the Pascal reads the bar before the previous one as zeros. A price is
+            # above zero, so rising is a higher high and a higher low, and falling cannot happen.
+            rising = candle.high > previous.high and candle.low > previous.low
+            falling = False
+        else:
+            rising = (
+                candle.high > previous.high
+                and candle.low > previous.low
+                and previous.high > before.high
+                and previous.low > before.low
+            )
+            falling = (
+                candle.high < previous.high
+                and candle.low < previous.low
+                and previous.high < before.high
+                and previous.low < before.low
+            )
 
-        if self._trend is Trend.BULLISH:
+        if self._direction is Trend.BULLISH:
             return self._on_bullish_bar(candle, rising=rising, falling=falling)
         return self._on_bearish_bar(candle, rising=rising, falling=falling)
+
+    def _start(self, candle: Candle) -> None:
+        """The first bar, as the Pascal runs it — its CHoCH at 0.00 done, not emitted.
+
+        The bearish branch arms and confirms nothing on a bar with no history, and its CHoCH test
+        reads an anchor of zero, which the first close is above: the bearish anchor lands on the
+        low so far, the high so far is this bar's, nothing is armed, and the bias turns up. The
+        bullish branch then runs on the same bar and finds nothing either: no history to arm on,
+        and no close can be under its own bar's low.
+        """
+        self._track_highest(candle, armed=False)
+        self._choch_down, self._choch_down_time = self._low_down, self._low_down_time
+        self._high_up, self._high_up_time = candle.high, candle.time
+        self._armed_high = self._armed_high_time = None
+        self._direction = Trend.BULLISH
+        self._track_lowest(candle, armed=False)
 
     # ----------------------------------------------------------------------- #
 
@@ -393,14 +430,14 @@ class MarketStructure:
             self._choch_up_time = reversal.origin_time
             self._low_down, self._low_down_time = candle.low, candle.time
             self._armed_low = self._armed_low_time = None
-            self._trend = Trend.BEARISH
+            self._trend = self._direction = Trend.BEARISH
             return reversal
         return confirmed
 
     def _on_bearish_bar(
         self, candle: Candle, *, rising: bool, falling: bool
     ) -> StructureBreak | None:
-        """The `DIR = -1` branch — the mirror, and also where a fresh series starts."""
+        """The `DIR = -1` branch — the mirror."""
         if rising and self._armed_low is None:
             self._armed_low, self._armed_low_time = self._low_down, self._low_down_time
             self._high_down = candle.high
@@ -442,7 +479,7 @@ class MarketStructure:
             self._choch_down_time = reversal.origin_time
             self._high_up, self._high_up_time = candle.high, candle.time
             self._armed_high = self._armed_high_time = None
-            self._trend = Trend.BULLISH
+            self._trend = self._direction = Trend.BULLISH
             return reversal
         return confirmed
 
@@ -502,7 +539,8 @@ class MarketStructure:
 
     @property
     def trend(self) -> Trend | None:
-        """The bias in force, or `None` before the first break settles one."""
+        """The bias in force, or `None` before the first emitted CHoCH settles one — never the
+        starting assumption the machine runs on (`_direction`)."""
         return self._trend
 
 

@@ -111,18 +111,20 @@ BULLISH_START = [
     bar(-2, open_="90", close="87", high="90", low="86"),  # close 87 < 88 -> bearish BOS
     bar(-1, open_="88", close="93", high="94", low="88"),  # close 93 > 92 -> bullish CHoCH
 ]
-"""The toll a rising scenario has to pay before `MarketStructure` can read it at all.
+"""A machine already in an uptrend, with the bias earned by a change of character.
 
-`MarketStructure` is a transcription of the author's indicator, and it starts where the indicator
-starts, at `DIR = -1`. So the only event a fresh machine can possibly report is a *bearish* BOS,
-and a scenario that rises from bar 0 never leaves the starting gate — it confirms nothing, marks
-no zone, and offers a setup nothing to qualify. That is not a bug to work around: an uptrend's
-structure is only meaningful once there is an uptrend, and the machine insists on being shown one.
+`MarketStructure` starts where the author's indicator starts: its first bar turns the bias up
+silently (the Pascal's CHoCH at 0.00, 05/10). A rising scenario can be read from bar 0 since then,
+but its first marks would be about how a series *starts* — not the uptrend structure the scenarios
+using this prefix are about — and `trend` stays `None` until an emitted break settles one.
 
-These eight bars are the shortest honest route into one: a bearish BOS on bar -2 (close 87 through
-the armed bottom of 88), then a bullish CHoCH on bar -1 (close 93 through the 92 the down-move
-came from). `test_the_bullish_start_is_a_bearish_bos_then_a_bullish_choch` pins exactly that, so
-this is a stated fact and not hidden state.
+These eight bars hand over an earned uptrend: bar -6 closes under bar -8's low, the mirror CHoCH
+down at 90; a bearish BOS on bar -2 (close 87 through the armed bottom of 88); then a bullish CHoCH
+on bar -1 (close 93 through the 92 the down-move came from).
+`test_the_bullish_start_is_a_bearish_choch_a_bearish_bos_then_a_bullish_choch` pins exactly that,
+so this is a stated fact and not hidden state. The state it leaves is the one it left before
+05/10, when it began with the BOS: the bearish anchor at 86, the running high at 94, nothing
+armed.
 
 Two properties make it safe to prepend to a scenario, and both are load-bearing:
 

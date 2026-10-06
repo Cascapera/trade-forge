@@ -391,17 +391,63 @@ def _breaks_from_bullish(candles: list[Candle]) -> list[tuple[int, StructureBrea
     return [(index, event) for index, event in _breaks([*BULLISH_START, *candles]) if index >= 0]
 
 
-def test_the_bullish_start_is_a_bearish_bos_then_a_bullish_choch() -> None:
+def _mirror(candles: list[Candle], axis: str = "200") -> list[Candle]:
+    """Reflect a sequence about a price: a high's mirror is a low, a rise's mirror a fall."""
+    pivot = Decimal(axis)
+    return [
+        Candle(
+            time=candle.time,
+            open=pivot - candle.open,
+            high=pivot - candle.low,
+            low=pivot - candle.high,
+            close=pivot - candle.close,
+            tick_volume=candle.tick_volume,
+        )
+        for candle in candles
+    ]
+
+
+BEARISH_START = _mirror(BULLISH_START)
+"""`BULLISH_START` reflected: a machine already in a downtrend, for the bearish scenarios.
+
+Needed since 05/10: a fresh machine starts as the Pascal does — its first bar turns the bias up —
+so a scenario that falls from bar 0 now opens with the mirror CHoCH at bar 1, as the indicator
+marks it, and no longer reads as a downtrend's own structure. Its licence is the mirror of the
+bullish one: arming a bearish BOS at its running low (106) needs `previous.low > before.low`,
+which for bar 0 of any scenario is 106 against 110 — false."""
+
+
+def _breaks_from_bearish(candles: list[Candle]) -> list[tuple[int, StructureBreak]]:
+    """`_breaks_from_bullish`'s mirror: on a machine already in a downtrend."""
+    return [(index, event) for index, event in _breaks([*BEARISH_START, *candles]) if index >= 0]
+
+
+def test_the_bullish_start_is_a_bearish_choch_a_bearish_bos_then_a_bullish_choch() -> None:
     """What the shared prefix does, stated once so the scenarios using it need not restate it.
 
-    It is also the shape of every fresh series, which is worth pinning for its own sake: the
-    machine begins at the indicator's `DIR = -1`, so the first thing it can mark is a bearish BOS,
-    and it takes a change of character to turn the bias up.
+    It is also the Pascal's own start, pinned for its own sake (05/10). The first bar turns the
+    bias up silently — the indicator's CHoCH at 0.00 — so bar -6 closing under that bar's low is
+    the mirror CHoCH at a real price, 90; then the bearish BOS, and the CHoCH that turns it up.
     """
     assert _breaks(BULLISH_START) == [
+        (-6, _choch(Trend.BEARISH, "90", -6, level_at=-8, origin="92", origin_at=-8)),
         (-2, _bos(Trend.BEARISH, "88", -2, level_at=-6, origin="92", origin_at=-4)),
         (-1, _choch(Trend.BULLISH, "92", -1, level_at=-4, origin="86", origin_at=-2)),
     ]
+
+
+def test_the_bearish_start_hands_over_a_downtrend() -> None:
+    """The mirror prefix ends where the bearish scenarios need it: bias down, nothing armed."""
+    structure = MarketStructure()
+    for candle in BEARISH_START:
+        structure.update(candle)
+
+    assert structure.trend is Trend.BEARISH
+    assert structure._armed_low is None
+    assert structure._choch_up == Decimal("114")
+    assert structure._low_down == Decimal("106")
+    # The mirror of the bullish licence's hand-copied `falling`: `rising` needs this, and it fails.
+    assert not BEARISH_START[-1].low > BEARISH_START[-2].low
 
 
 def test_the_bullish_start_hands_over_a_state_that_can_decide_nothing() -> None:
@@ -473,30 +519,86 @@ def test_structure_matches_the_hand_worked_example() -> None:
     ]
 
 
-def test_trend_is_none_until_the_first_choch() -> None:
-    """A bias has to be *earned*, and only a change of character earns one.
+def test_a_series_that_climbs_from_its_first_bar_still_breaks() -> None:
+    """05/10, the stall this start exists for: UsaTec H1 from January 2017 climbed and never came
+    back to its first low, and the machine — waiting for a bearish BOS to plant the anchor a bullish
+    CHoCH needs — made no break in three years. Started as the Pascal starts, the first bar turns
+    the bias up, and the climb's own pullbacks and breaks are read.
 
-    The indicator's `DIR` starts at -1, so a fresh series already leans bearish — but nothing has
-    happened yet to say so, and the bearish BOS on bar -2 merely confirms what was assumed.
-    Reporting `BEARISH` there would dress an untested default up as a reading of the market, and
-    a strategy gating on `trend is not None` would act on it. The bias becomes a fact on bar -1,
-    where the CHoCH turns it.
+    A staircase: two down-corrections arm the top, the next close above it is a bullish BOS, and
+    the low never returns to bar 0's 100."""
+    climb = [
+        bar(0, open_="101", close="102", high="103", low="100"),
+        bar(1, open_="104", close="106", high="107", low="103"),  # top 107
+        bar(2, open_="105", close="105", high="106", low="102"),  # correction 1
+        bar(3, open_="104", close="104", high="105", low="101"),  # correction 2 -> arms 107
+        bar(4, open_="105", close="108", high="109", low="104"),  # close 108 > 107 -> BOS up
+    ]
+    assert _breaks(climb) == [
+        (4, _bos(Trend.BULLISH, "107", 4, level_at=1, origin="101", origin_at=3)),
+    ]
+
+
+def test_the_first_bar_marks_nothing_and_the_second_can_mirror_it() -> None:
+    """The Pascal's two opening marks: its CHoCH at 0.00 on bar 0 is done but not emitted — it is
+    not a price — and a bar 1 closing under bar 0's low is the mirror CHoCH at that low, which is
+    a price, and is emitted."""
+    assert _breaks([bar(0, open_="100", close="101", high="102", low="99")]) == []
+    assert _breaks(
+        [
+            bar(0, open_="100", close="101", high="102", low="99"),
+            bar(1, open_="100", close="98", high="100", low="97"),  # close 98 < 99
+        ]
+    ) == [(1, _choch(Trend.BEARISH, "99", 1, level_at=0, origin="102", origin_at=0))]
+
+
+def test_nothing_can_arm_on_the_second_bar_by_falling() -> None:
+    """The Pascal reads the bar before the previous one as zero, and `Maxima[1] < Maxima[2]` is
+    then 10 < 0: false. So the second bar cannot arm the top, whatever it does — the engine
+    guardian's case (05/10): bar 1 falls below bar 0 without closing under its low, and bar 2
+    closes above the old top. With falling read on two bars, the top would arm on bar 1 and bar 2
+    would confirm a bullish BOS at 10 that no pair of correction bars ever earned."""
+    candles = [
+        bar(0, open_="7", close="8", high="10", low="5"),
+        bar(1, open_="8", close="6", high="9", low="4"),  # lower high and lower low; close 6 > 5
+        bar(2, open_="8", close="11", high="12", low="7"),  # close 11 > 10
+    ]
+    assert _breaks(candles) == []
+
+
+def test_trend_is_none_until_the_first_choch() -> None:
+    """A bias has to be *earned*, and only a change of character the machine emitted earns one.
+
+    The first bar turns the machine's own direction up — the Pascal's CHoCH at 0.00 — but nothing
+    has happened yet to say so. Reporting `BULLISH` there would dress the indicator's starting
+    assumption up as a reading of the market, and a strategy gating on `trend is not None` would
+    act on it. The bias becomes a fact on bar -6, where the first real CHoCH turns it down, and
+    turns again on bar -1.
     """
     structure = MarketStructure()
-    for candle in BULLISH_START[:-1]:  # everything up to and including the bearish BOS
+
+    # Read through a function: mypy narrows `structure.trend` on each assert and cannot know that
+    # `update` moves it, so asserting it twice would read as an impossible comparison.
+    def trend() -> Trend | None:
+        return structure.trend
+
+    for candle in BULLISH_START[:2]:  # the silent start, and the bar before the first CHoCH
         structure.update(candle)
-        assert structure.trend is None
-    structure.update(BULLISH_START[-1])
-    assert structure.trend is Trend.BULLISH
+        assert trend() is None
+    structure.update(BULLISH_START[2])
+    assert trend() is Trend.BEARISH
+    for candle in BULLISH_START[3:]:
+        structure.update(candle)
+    assert trend() is Trend.BULLISH
 
     # And a BOS in the trend's own direction leaves it alone: the golden's bullish BOS on bar 5
     # continues the bias the CHoCH settled rather than re-deciding it.
     for candle in _STRUCTURE_GOLDEN[:6]:
         structure.update(candle)
-    assert structure.trend is Trend.BULLISH
+    assert trend() is Trend.BULLISH
 
 
-def test_the_bearish_mirror_bootstraps_down_then_chochs_up() -> None:
+def test_the_bearish_mirror_breaks_down_then_chochs_up() -> None:
     """The symmetric case: a bearish BOS on bar 5 (close 89 below the 90 bottom, after two up
     correction bars), then a bullish CHoCH on bar 8 (close 104 above 103, the high the down-move
     defended)."""
@@ -511,7 +613,7 @@ def test_the_bearish_mirror_bootstraps_down_then_chochs_up() -> None:
         bar(7, open_="98", close="98", high="99", low="95"),  # correction
         bar(8, open_="104", close="104", high="105", low="100"),  # close 104 > 103 -> CHoCH up
     ]
-    assert _breaks(mirror) == [
+    assert _breaks_from_bearish(mirror) == [
         (5, _bos(Trend.BEARISH, "90", 5, level_at=1, origin="103", origin_at=3)),
         (8, _choch(Trend.BULLISH, "103", 8, level_at=3, origin="88", origin_at=5)),
     ]
@@ -667,11 +769,7 @@ def test_a_second_bos_raises_the_choch_anchor() -> None:
 
 
 def test_a_close_exactly_on_the_bottom_is_not_a_bearish_break() -> None:
-    """The mirror of `test_a_close_exactly_at_the_top_is_not_a_break`, and it needs no prefix.
-
-    A fresh machine already sits at the indicator's `DIR = -1`, so this is the one direction that
-    reads straight from bar 0 — which is also why it went untested: nothing about the scenario
-    looked broken, and the sell side simply had no strictness case of its own.
+    """The mirror of `test_a_close_exactly_at_the_top_is_not_a_break`, on the bearish prefix.
 
     A close landing exactly on the armed bottom is the everyday shape at a round number, which is
     precisely where the stops that would be swept are stacked. Accepting it opens a short, marks
@@ -684,7 +782,7 @@ def test_a_close_exactly_on_the_bottom_is_not_a_bearish_break() -> None:
         bar(3, open_="102", close="104", high="105", low="99"),  # up-correction 2 -> arms 95
         bar(4, open_="98", close="95", high="98", low="94"),  # close 95 == bottom, not below
     ]
-    assert _breaks(candles) == []
+    assert _breaks_from_bearish(candles) == []
 
 
 def test_a_close_exactly_on_a_choch_anchor_does_not_turn_the_bias() -> None:
@@ -707,7 +805,7 @@ def test_a_close_exactly_on_a_choch_anchor_does_not_turn_the_bias() -> None:
         (5, _bos(Trend.BULLISH, "105", 5, level_at=1, origin="96", origin_at=3))
     ]
 
-    # The mirror, on a fresh machine: a bearish BOS plants the bullish anchor at 103.
+    # The mirror, on the bearish prefix: a bearish BOS plants the bullish anchor at 103.
     on_the_up_anchor = [
         bar(0, open_="96", close="96", high="100", low="95"),
         bar(1, open_="91", close="91", high="99", low="90"),  # bottom 90
@@ -719,7 +817,7 @@ def test_a_close_exactly_on_a_choch_anchor_does_not_turn_the_bias() -> None:
         bar(7, open_="98", close="98", high="99", low="95"),
         bar(8, open_="100", close="103", high="104", low="100"),  # close 103 == anchor, not above
     ]
-    assert _breaks(on_the_up_anchor) == [
+    assert _breaks_from_bearish(on_the_up_anchor) == [
         (5, _bos(Trend.BEARISH, "90", 5, level_at=1, origin="103", origin_at=3))
     ]
 
@@ -746,7 +844,7 @@ def test_one_correction_bar_does_not_arm_a_bearish_bos() -> None:
         bar(2, open_="100", close="100", high="101", low="92"),  # a single up-correction bar
         bar(3, open_="89", close="89", high="94", low="88"),  # closes below 90 but unarmed
     ]
-    assert _breaks(candles) == []
+    assert _breaks_from_bearish(candles) == []
 
 
 def test_a_wick_through_the_bottom_without_a_close_is_no_bearish_bos() -> None:
@@ -758,7 +856,7 @@ def test_a_wick_through_the_bottom_without_a_close_is_no_bearish_bos() -> None:
         bar(3, open_="102", close="102", high="103", low="94"),  # up-correction 2 -> armed
         bar(4, open_="97", close="96", high="100", low="88"),  # low 88 < 90, close 96 > 90
     ]
-    assert _breaks(candles) == []
+    assert _breaks_from_bearish(candles) == []
 
 
 # --- liquidity pools: equal swings that stack the stops a sweep will hunt -------------------- #

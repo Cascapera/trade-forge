@@ -3,6 +3,7 @@
 import datetime as dt
 import json
 import math
+import re
 from pathlib import Path
 
 import numpy as np
@@ -89,6 +90,9 @@ class TestTheModel:
         assert third.mean_r > everything.mean_r + 0.5
         assert report.weights[0][0] == "ret5_atr"
         assert report.weights[0][1] > 0
+        # Every input by its name, the empty flags too: never the pipeline's `x31`.
+        assert not [name for name, _ in report.weights if re.search(r"x\d", name)]
+        assert any(name.startswith("empty: ") for name, _ in report.weights)
 
     def test_without_a_signal_it_ranks_no_better_than_a_coin(self) -> None:
         _, report = evaluate(synthetic(6000, signal=False), PLAN)

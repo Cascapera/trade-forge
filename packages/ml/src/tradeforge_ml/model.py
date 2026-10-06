@@ -203,7 +203,7 @@ def _auc(won: npt.NDArray[np.int64], probability: Floats) -> float | None:
     return float(roc_auc_score(won, probability)) if len(set(won.tolist())) > 1 else None
 
 
-_POSITION = re.compile(r"\bx(\d+)")
+_POSITION = re.compile(r"(?<![A-Za-z0-9])x(\d+)")
 """How the pipeline names its inputs: by position (`x23`, `missingindicator_x23`, `x32_M15`)."""
 
 

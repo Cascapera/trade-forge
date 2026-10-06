@@ -24,8 +24,6 @@ from tradeforge_db.models import Instrument
 from tradeforge_db.session import create_db_engine, create_session_factory
 from tradeforge_ml.export import export_sweep
 from tradeforge_ml.feature_export import write_features
-from tradeforge_ml.model import Split
-from tradeforge_ml.train import train
 
 
 def span(text: str) -> tuple[dt.datetime, dt.datetime]:
@@ -56,6 +54,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.command == "train":
+        # Here, not at the top: the models are an extra (`tradeforge-ml[models]`), absent from the
+        # images, and every other command must run without them.
+        from tradeforge_ml.model import Split  # noqa: PLC0415
+        from tradeforge_ml.train import train  # noqa: PLC0415
+
         start, end = args.validation
         name, judged = train(
             args.out / f"sweep={args.sweep_id}", Split(start, end, tuple(args.exclude))

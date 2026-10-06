@@ -198,7 +198,7 @@ Os nomes foram mantidos legíveis em inglês, mas o mapeamento é um para um:
 
 | Pascal | `MarketStructure` |
 |---|---|
-| `DIR` | `_trend` (`-1` → bearish/None, `1` → bullish) |
+| `DIR` | `_direction` (`-1` → bearish, `1` → bullish); `trend`, o que as estratégias leem, fica `None` até a primeira quebra emitida |
 | `Fundo_Desce` / `Topo_Desce` | `_low_down` / `_high_down` |
 | `Fundo_Sobe` / `Topo_Sobe` | `_low_up` / `_high_up` |
 | `Fundo_BOS` (0 = nenhum) | `_armed_low` (`None` = nenhum) |

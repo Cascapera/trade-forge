@@ -14,6 +14,7 @@ dependencies = [
     # The sessions are read in their cities' clocks (`zoneinfo`); Windows has no time zone
     # database of its own, so it comes as a package there.
     "tzdata>=2024.1; sys_platform == 'win32'",
+    "scikit-learn>=1.5",
 ]
 
 [project.scripts]

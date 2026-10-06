@@ -3,12 +3,16 @@
     tradeforge-ml export <sweep-id> [--out data/ml]   # the sweep's event base, in Parquet
     tradeforge-ml features <sweep-id> [--out data/ml] [--ohlcv data/ohlcv]
                                                       # its variables, beside the events
+    tradeforge-ml train <sweep-id> [--out data/ml] [--validation 2023-01-01:2025-01-01]
+                       [--exclude 2020-03-01:2020-07-01 ...]
+                                                      # the first meta-label, judged; files only
 
 Read-only on the database. Connects with the same `POSTGRES_*` settings as `tradeforge-db`;
 `features` reads only each instrument's point there, to put its spread in price.
 """
 
 import argparse
+import datetime as dt
 import sys
 import uuid
 from collections.abc import Sequence
@@ -20,6 +24,18 @@ from tradeforge_db.models import Instrument
 from tradeforge_db.session import create_db_engine, create_session_factory
 from tradeforge_ml.export import export_sweep
 from tradeforge_ml.feature_export import write_features
+from tradeforge_ml.model import Split
+from tradeforge_ml.train import train
+
+
+def span(text: str) -> tuple[dt.datetime, dt.datetime]:
+    """`2023-01-01:2025-01-01` — from the first day, up to but not including the second."""
+    left, right = (
+        dt.datetime.fromisoformat(part).replace(tzinfo=dt.UTC) for part in text.split(":")
+    )
+    if right <= left:
+        raise argparse.ArgumentTypeError(f"{text}: the end must come after the start")
+    return left, right
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -32,7 +48,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     features.add_argument("sweep_id", type=uuid.UUID)
     features.add_argument("--out", type=Path, default=Path("data/ml"))
     features.add_argument("--ohlcv", type=Path, default=Path("data/ohlcv"))
+    fit = commands.add_parser("train", help="fit the first meta-label and write its report")
+    fit.add_argument("sweep_id", type=uuid.UUID)
+    fit.add_argument("--out", type=Path, default=Path("data/ml"))
+    fit.add_argument("--validation", type=span, default=span("2023-01-01:2025-01-01"))
+    fit.add_argument("--exclude", type=span, action="append", default=[])
     args = parser.parse_args(argv)
+
+    if args.command == "train":
+        start, end = args.validation
+        name, judged = train(
+            args.out / f"sweep={args.sweep_id}", Split(start, end, tuple(args.exclude))
+        )
+        everything, half = judged.validation[0], judged.validation[2]
+        print(
+            f"{name}: validation AUC {judged.validation_auc:.3f}, "
+            f"mean R all {everything.mean_r:+.3f}, best half {half.mean_r:+.3f}"
+        )
+        return 0
 
     factory = create_session_factory(create_db_engine())
     if args.command == "features":

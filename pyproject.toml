@@ -43,6 +43,8 @@ tradeforge-schema = { workspace = true }
 
 [dependency-groups]
 dev = [
+    # The ML models (ADR-0031), kept out of the images' no-dev install: see packages/ml.
+    "tradeforge-ml[models]",
     # Property-based testing. AGENTS.md §6 requires it in the engine: the invariants there
     # ("the trades reconcile with the equity curve", "the same input gives the same output")
     # are universally quantified statements, and an example-based test can only ever check

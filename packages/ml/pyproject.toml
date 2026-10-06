@@ -14,8 +14,13 @@ dependencies = [
     # The sessions are read in their cities' clocks (`zoneinfo`); Windows has no time zone
     # database of its own, so it comes as a package there.
     "tzdata>=2024.1; sys_platform == 'win32'",
-    "scikit-learn>=1.5",
 ]
+
+[project.optional-dependencies]
+# The models (`model`, `train`) — out of the API's and the workers' images (ADR-0031): those
+# install this package for its event base and replay, and scikit-learn brings scipy, ~100 MB
+# no worker reads. The root's dev group installs it where models are trained and tested.
+models = ["scikit-learn>=1.5"]
 
 [project.scripts]
 tradeforge-ml = "tradeforge_ml.cli:main"

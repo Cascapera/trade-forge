@@ -556,8 +556,8 @@ def test_nothing_can_arm_on_the_second_bar_by_falling() -> None:
     """The Pascal reads the bar before the previous one as zero, and `Maxima[1] < Maxima[2]` is
     then 10 < 0: false. So the second bar cannot arm the top, whatever it does — the engine
     guardian's case (05/10): bar 1 falls below bar 0 without closing under its low, and bar 2
-    closes above the old top. With falling read on two bars, the top would arm on bar 1 and bar 2 would confirm
-    a bullish BOS at 10 that no pair of correction bars ever earned."""
+    closes above the old top. With falling read on two bars, the top would arm on bar 1 and bar 2
+    would confirm a bullish BOS at 10 that no pair of correction bars ever earned."""
     candles = [
         bar(0, open_="7", close="8", high="10", low="5"),
         bar(1, open_="8", close="6", high="9", low="4"),  # lower high and lower low; close 6 > 5

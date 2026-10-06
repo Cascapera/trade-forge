@@ -576,20 +576,26 @@ def test_trend_is_none_until_the_first_choch() -> None:
     turns again on bar -1.
     """
     structure = MarketStructure()
+
+    # Read through a function: mypy narrows `structure.trend` on each assert and cannot know that
+    # `update` moves it, so asserting it twice would read as an impossible comparison.
+    def trend() -> Trend | None:
+        return structure.trend
+
     for candle in BULLISH_START[:2]:  # the silent start, and the bar before the first CHoCH
         structure.update(candle)
-        assert structure.trend is None
+        assert trend() is None
     structure.update(BULLISH_START[2])
-    assert structure.trend is Trend.BEARISH
+    assert trend() is Trend.BEARISH
     for candle in BULLISH_START[3:]:
         structure.update(candle)
-    assert structure.trend is Trend.BULLISH
+    assert trend() is Trend.BULLISH
 
     # And a BOS in the trend's own direction leaves it alone: the golden's bullish BOS on bar 5
     # continues the bias the CHoCH settled rather than re-deciding it.
     for candle in _STRUCTURE_GOLDEN[:6]:
         structure.update(candle)
-    assert structure.trend is Trend.BULLISH
+    assert trend() is Trend.BULLISH
 
 
 def test_the_bearish_mirror_breaks_down_then_chochs_up() -> None:

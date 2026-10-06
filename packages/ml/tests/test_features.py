@@ -28,8 +28,16 @@ H1 = dt.timedelta(hours=1)
 T0 = dt.datetime(2024, 1, 1, tzinfo=dt.UTC)
 
 
-def bars(closes: list[float], *, spread: float = 0.5, start: dt.datetime = T0) -> list[Candle]:
-    """An H1 bar per close, its open the previous close and its range `spread` either side."""
+def bars(
+    closes: list[float],
+    *,
+    spread: float = 0.5,
+    start: dt.datetime = T0,
+    step: dt.timedelta = H1,
+    points: int = 0,
+) -> list[Candle]:
+    """A bar per close, its open the previous close and its range `spread` either side; `points`
+    the broker's spread each bar records (0: none recorded)."""
     out = []
     previous = closes[0]
     for n, close in enumerate(closes):
@@ -37,12 +45,13 @@ def bars(closes: list[float], *, spread: float = 0.5, start: dt.datetime = T0) -
         bottom = min(previous, close) - spread
         out.append(
             Candle(
-                time=start + n * H1,
+                time=start + n * step,
                 open=Decimal(str(previous)),
                 high=Decimal(str(top)),
                 low=Decimal(str(bottom)),
                 close=Decimal(str(close)),
                 tick_volume=100 + n,
+                spread=points,
             )
         )
         previous = close
@@ -112,9 +121,10 @@ class TestNoLookahead:
     @pytest.mark.parametrize("side", ["long", "short"])
     @pytest.mark.parametrize("decision", [210, 260, 349])
     def test_changing_every_later_bar_changes_nothing(self, side: str, decision: int) -> None:
-        candles = bars(walk(400))
-        entry = T0 + (decision + 1) * H1 + dt.timedelta(minutes=20)
         rng = random.Random(decision)  # noqa: S311 — a test's market, not a secret
+        # Spreads that vary, so one more bar would move their median.
+        candles = [replace(bar, spread=rng.randint(1, 50)) for bar in bars(walk(400))]
+        entry = T0 + (decision + 1) * H1 + dt.timedelta(minutes=20)
         altered = [
             bar
             if n <= decision
@@ -125,6 +135,7 @@ class TestNoLookahead:
                 low=Decimal(str(rng.uniform(0.1, 1))),
                 close=Decimal(str(rng.uniform(1, 500))),
                 tick_volume=rng.randint(1, 10_000),
+                spread=rng.randint(1, 500),
             )
             for n, bar in enumerate(candles)
         ]
@@ -245,14 +256,146 @@ def test_a_chart_is_read_from_the_collectors_layout_in_time_order(tmp_path: Path
                     "low": [float(bar.low) for bar in part],
                     "close": [float(bar.close) for bar in part],
                     "tick_volume": [bar.tick_volume for bar in part],
+                    "spread": pa.array([n % 7 for n in range(len(part))], type=pa.int32()),
                 }
             ),
             chart / f"year={year}" / "part.parquet",
         )
 
-    read = read_market(tmp_path, "EURUSD", "H1")
+    read = read_market(tmp_path, "EURUSD", "H1", point=0.0001)
 
     assert read is not None
     assert list(read.close) == [float(bar.close) for bar in candles]
+    # 2024's 20 bars then 2025's 10, each year's zeros read as none recorded.
+    expected = [float(n % 7) or math.nan for n in [*range(20), *range(10)]]
+    assert np.array_equal(read.spread, np.array(expected), equal_nan=True)
+    assert read.point == 0.0001
     assert read.decision_bar(T0 + 10 * H1) == 9
     assert read_market(tmp_path, "GBPUSD", "H1") is None
+
+
+M15 = dt.timedelta(minutes=15)
+
+
+def _at(market: Market, entry: dt.datetime, side: str = "long") -> dict[str, float]:
+    stop = 99.0 if side == "long" else 101.0
+    return features_at(market, entry_time=entry, side=side, entry_price=100.0, stop_loss=stop)
+
+
+class TestSpread:
+    """Against its own recent past and against the stop, never in points: in this broker's history
+    the points move in steps by year, so a model would read the year off them."""
+
+    def test_the_spread_is_read_against_its_median_and_in_price_against_the_stop(self) -> None:
+        candles = bars([100.0] * 150, points=5)
+        candles[140] = replace(candles[140], spread=15)  # the decision bar: three times the usual
+        market = Market.of(candles, H1, point=0.01)
+
+        values = _at(market, T0 + 141 * H1)
+
+        assert values["spread_rel"] == pytest.approx(3.0)
+        assert values["spread_stop"] == pytest.approx(15 * 0.01 / 1.0)  # stop 1.0 away
+
+    def test_a_bar_with_no_spread_recorded_is_empty_not_free(self) -> None:
+        market = Market.of(bars([100.0] * 150, points=0), H1, point=0.01)
+
+        values = _at(market, T0 + 141 * H1)
+
+        assert math.isnan(values["spread_rel"])
+        assert math.isnan(values["spread_stop"])
+
+    def test_with_fewer_than_half_the_bars_recorded_there_is_no_typical_spread(self) -> None:
+        candles = [
+            replace(bar, spread=5 if n >= 100 else 0) for n, bar in enumerate(bars([100.0] * 150))
+        ]  # 41 of the last 100 recorded
+        market = Market.of(candles, H1, point=0.01)
+
+        values = _at(market, T0 + 141 * H1)
+
+        assert math.isnan(values["spread_rel"])
+        assert values["spread_stop"] == pytest.approx(0.05)
+
+    def test_without_the_instruments_point_there_is_no_spread_in_price(self) -> None:
+        market = Market.of(bars([100.0] * 150, points=5), H1)
+
+        values = _at(market, T0 + 141 * H1)
+
+        assert values["spread_rel"] == pytest.approx(1.0)
+        assert math.isnan(values["spread_stop"])
+
+
+def _flags(values: dict[str, float]) -> dict[str, float]:
+    return {name: values[f"session_{name}"] for name in ("asia", "london", "ny", "ny_cash")}
+
+
+def _decided_at(moment: dt.datetime, step: dt.timedelta = M15) -> dict[str, float]:
+    """The variables of an entry whose decision bar closes at `moment`."""
+    market = Market.of(bars(walk(400), start=moment - 300 * step, step=step), step)
+    return _at(market, moment)
+
+
+class TestSessions:
+    """In each city's clock, so the same UTC hour is in New York's session in July and not in
+    January."""
+
+    def test_new_york_follows_its_own_summer_time(self) -> None:
+        january = _decided_at(dt.datetime(2024, 1, 10, 12, 30, tzinfo=dt.UTC))  # 07:30 EST
+        july = _decided_at(dt.datetime(2024, 7, 10, 12, 30, tzinfo=dt.UTC))  # 08:30 EDT
+
+        assert _flags(january) == {"asia": 0.0, "london": 1.0, "ny": 0.0, "ny_cash": 0.0}
+        assert _flags(july) == {"asia": 0.0, "london": 1.0, "ny": 1.0, "ny_cash": 0.0}
+
+    def test_a_session_is_open_at_its_opening_and_closed_at_its_closing(self) -> None:
+        cash_opens = _decided_at(dt.datetime(2024, 1, 10, 14, 30, tzinfo=dt.UTC))  # 09:30 EST
+        cash_closes = _decided_at(dt.datetime(2024, 1, 10, 21, 0, tzinfo=dt.UTC))  # 16:00 EST
+
+        assert cash_opens["session_ny_cash"] == 1.0
+        assert cash_closes["session_ny_cash"] == 0.0
+
+    def test_no_session_opens_on_a_weekend_in_its_own_city(self) -> None:
+        tokyo_monday = _decided_at(dt.datetime(2024, 1, 15, 1, 0, tzinfo=dt.UTC))  # 10:00 JST
+        tokyo_sunday = _decided_at(dt.datetime(2024, 1, 14, 1, 0, tzinfo=dt.UTC))  # 10:00 JST
+        saturday = _decided_at(dt.datetime(2024, 1, 13, 14, 0, tzinfo=dt.UTC))
+
+        assert _flags(tokyo_monday) == {"asia": 1.0, "london": 0.0, "ny": 0.0, "ny_cash": 0.0}
+        assert set(_flags(tokyo_sunday).values()) == {0.0}
+        assert set(_flags(saturday).values()) == {0.0}
+        assert math.isnan(saturday["session_minutes"])
+
+
+class TestSessionMove:
+    """The market inside the session that opened last, from its first whole bar to the decision."""
+
+    def test_the_move_is_read_from_the_last_opened_session_in_atrs_and_by_side(self) -> None:
+        # 10:00 EST on a Wednesday: London, New York and its cash hours are open; the cash hours
+        # opened last (14:30 UTC), two M15 bars ago.
+        decided = dt.datetime(2024, 1, 10, 15, 0, tzinfo=dt.UTC)
+        closes = [100.0] * 298 + [101.0, 103.0]
+        market = Market.of(bars(closes, start=decided - 300 * M15, step=M15), M15)
+        first = len(closes) - 2  # opens 14:30
+        atr = float(market.atr14[-1])
+
+        long, short = _at(market, decided), _at(market, decided, side="short")
+
+        assert long["session_minutes"] == 30.0
+        assert long["session_ret_atr"] == pytest.approx((103.0 - float(market.open[first])) / atr)
+        assert short["session_ret_atr"] == pytest.approx(-long["session_ret_atr"])
+        top = float(market.high[first:].max())
+        bottom = float(market.low[first:].min())
+        assert long["session_range_atr"] == pytest.approx((top - bottom) / atr)
+        assert long["session_pos"] == pytest.approx((103.0 - bottom) / (top - bottom))
+        assert short["session_pos"] == pytest.approx(1 - long["session_pos"])
+
+    def test_at_the_opening_itself_nothing_has_moved_yet(self) -> None:
+        values = _decided_at(dt.datetime(2024, 1, 10, 14, 30, tzinfo=dt.UTC))  # cash opens now
+
+        assert values["session_minutes"] == 0.0
+        assert math.isnan(values["session_ret_atr"])
+        assert math.isnan(values["session_pos"])
+
+    def test_above_h1_a_bar_straddles_the_opening_so_only_the_flags_are_read(self) -> None:
+        values = _decided_at(dt.datetime(2024, 1, 10, 16, 0, tzinfo=dt.UTC), dt.timedelta(hours=4))
+
+        assert values["session_ny"] == 1.0
+        for name in ("session_ret_atr", "session_range_atr", "session_pos", "session_minutes"):
+            assert math.isnan(values[name]), name

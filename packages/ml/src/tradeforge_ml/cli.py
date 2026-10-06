@@ -4,7 +4,8 @@
     tradeforge-ml features <sweep-id> [--out data/ml] [--ohlcv data/ohlcv]
                                                       # its variables, beside the events
 
-Read-only on the database. Connects with the same `POSTGRES_*` settings as `tradeforge-db`.
+Read-only on the database. Connects with the same `POSTGRES_*` settings as `tradeforge-db`;
+`features` reads only each instrument's point there, to put its spread in price.
 """
 
 import argparse
@@ -13,6 +14,9 @@ import uuid
 from collections.abc import Sequence
 from pathlib import Path
 
+from sqlalchemy import select
+
+from tradeforge_db.models import Instrument
 from tradeforge_db.session import create_db_engine, create_session_factory
 from tradeforge_ml.export import export_sweep
 from tradeforge_ml.feature_export import write_features
@@ -30,15 +34,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     features.add_argument("--ohlcv", type=Path, default=Path("data/ohlcv"))
     args = parser.parse_args(argv)
 
+    factory = create_session_factory(create_db_engine())
     if args.command == "features":
-        made = write_features(args.out / f"sweep={args.sweep_id}", args.ohlcv)
+        with factory() as session:
+            points = {
+                symbol: 10.0**-digits
+                for symbol, digits in session.execute(
+                    select(Instrument.symbol, Instrument.digits)
+                ).tuples()
+            }
+        made = write_features(args.out / f"sweep={args.sweep_id}", args.ohlcv, points)
         print(
             f"events {made.events}, charts {made.markets}, without bars {made.without_bars}"
             + (f" ({', '.join(made.missing_markets)})" if made.missing_markets else "")
         )
         return 0
 
-    factory = create_session_factory(create_db_engine())
     with factory() as session:
         report = export_sweep(session, args.sweep_id, args.out)
     print(

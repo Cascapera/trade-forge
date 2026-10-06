@@ -1131,6 +1131,7 @@ dependencies = [
     { name = "pyarrow" },
     { name = "tradeforge-db" },
     { name = "tradeforge-engine" },
+    { name = "tzdata", marker = "sys_platform == 'win32'" },
 ]
 
 [package.metadata]
@@ -1139,6 +1140,7 @@ requires-dist = [
     { name = "pyarrow", specifier = ">=18.1" },
     { name = "tradeforge-db", editable = "packages/db" },
     { name = "tradeforge-engine", editable = "packages/engine" },
+    { name = "tzdata", marker = "sys_platform == 'win32'", specifier = ">=2024.1" },
 ]
 
 [[package]]

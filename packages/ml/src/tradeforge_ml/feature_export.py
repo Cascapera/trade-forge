@@ -8,13 +8,16 @@ and chart straight into columns, and every event of that chart is read off the s
 ⚠️ **The files, not the collector's code.** A shared package may not import a deployable app
 (`tests/test_architecture.py`), so this reads the layout the collector writes and the database
 records as `datasets.parquet_path` — `symbol=<s>/timeframe=<t>/year=<y>/*.parquet`, with `time`,
-`open`, `high`, `low`, `close` and `tick_volume` — the collector's published contract.
+`open`, `high`, `low`, `close`, `tick_volume` and `spread` — the collector's published contract.
+
+What a point is in price (`10 ** -digits`) is the instrument's, in the database: the command reads
+it there (`points_of`) and hands it in, so this module still touches files only.
 """
 
 import datetime as dt
 import hashlib
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -46,13 +49,16 @@ MarketSource = Callable[[str, str], Market | None]
 """A chart's bars by (symbol, timeframe), or `None` when there are none on disk."""
 
 
-def read_market(ohlcv: Path, symbol: str, timeframe: str) -> Market | None:
-    """One chart's bars from the collector's Parquet, as columns in time order."""
+def read_market(
+    ohlcv: Path, symbol: str, timeframe: str, point: float | None = None
+) -> Market | None:
+    """One chart's bars from the collector's Parquet, as columns in time order; `point` what one
+    point of its spread is in price, when known."""
     directory = ohlcv / f"symbol={symbol}" / f"timeframe={timeframe}"
     if not directory.exists():
         return None
     table = ds.dataset(directory, format="parquet", partitioning="hive").to_table(
-        columns=["time", "open", "high", "low", "close", "tick_volume"]
+        columns=["time", "open", "high", "low", "close", "tick_volume", "spread"]
     )
     if table.num_rows == 0:
         return None
@@ -70,6 +76,8 @@ def read_market(ohlcv: Path, symbol: str, timeframe: str) -> Market | None:
         low=floats("low"),
         close=floats("close"),
         volume=floats("tick_volume"),
+        spread=floats("spread"),
+        point=point,
     )
 
 
@@ -117,11 +125,16 @@ def features_table(events: pa.Table, markets_of: MarketSource) -> tuple[pa.Table
     return pa.Table.from_pylist(out, schema=FEATURE_SCHEMA), report
 
 
-def write_features(sweep_dir: Path, ohlcv: Path) -> FeatureReport:
-    """Read `sweep_dir/events.parquet`, write `features.parquet` and `features.json` beside it."""
+def write_features(
+    sweep_dir: Path, ohlcv: Path, points: Mapping[str, float] | None = None
+) -> FeatureReport:
+    """Read `sweep_dir/events.parquet`, write `features.parquet` and `features.json` beside it.
+    `points` is each symbol's point in price; a symbol missing from it has no spread in price."""
     events = pq.read_table(sweep_dir / "events.parquet")
+    known = points or {}
     table, report = features_table(
-        events, lambda symbol, timeframe: read_market(ohlcv, symbol, timeframe)
+        events,
+        lambda symbol, timeframe: read_market(ohlcv, symbol, timeframe, known.get(symbol)),
     )
     pq.write_table(table, sweep_dir / "features.parquet", compression="zstd")
     manifest = {

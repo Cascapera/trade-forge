@@ -58,8 +58,10 @@ web e coletor continuam só na principal.
 6. **Conferir:** `docker compose -f docker-compose.worker.yml --env-file worker.env logs -f`
    mostra os runs sendo pegos. Na principal, o número de runs `running` sobe na varredura.
 
-**Parar:** `docker compose -f docker-compose.worker.yml --env-file worker.env down`. O run que
-estiver no meio é perdido e volta a rodar quando alguém pegar de novo, como na principal.
+**Parar:** `docker compose -f docker-compose.worker.yml --env-file worker.env down`. ⚠️ Com uma
+varredura rodando, os runs do lote que estava no meio e ainda não tinham terminado ficam `failed`
+("the batch was stopped") e **não** voltam sozinhos: o lote devolvido à fila pula os `failed`
+(06/10, 259 runs). Pare com a fila vazia, ou recoloque esses runs depois.
 
 ## Cuidados
 
@@ -75,3 +77,17 @@ estiver no meio é perdido e volta a rodar quando alguém pegar de novo, como na
   de novo; sem a cópia, ele roda com os candles antigos.
 - **Reconstruir a principal** com migração nova: pare os workers remotos antes e suba de novo
   depois do `git pull`, pelo mesmo motivo do motor.
+
+## Máquina longe (VPS, nuvem)
+
+Desde 06/10 o worker sobe com `python -m tradeforge_api.worker_main` (os dois composes já usam).
+É o mesmo worker do `arq tradeforge_api.worker.WorkerSettings`, mas pega o próximo lote em **uma**
+ida e volta ao Redis (`claim.py`). O arq testa um a um os lotes que os outros workers estão
+rodando — 3 a 4 idas e voltas cada — antes de achar um livre: aqui isso não aparece; da AWS
+(117 ms) eram ~15 s parados entre lotes de 75 s, da Contabo (210 ms) ~30 s entre lotes de 205 s.
+
+- O comando antigo continua funcionando (só mais lento de longe). Os dois usam a mesma marca de
+  "em andamento" no Redis, então máquinas atualizadas e não atualizadas dividem a fila sem rodar
+  o mesmo lote duas vezes — dá para atualizar uma de cada vez, com a fila vazia.
+- Fora do Docker (WSL1 na Contabo), o comando é o mesmo dentro do `.venv`:
+  `PYTHONUNBUFFERED=1 .venv/bin/python -m tradeforge_api.worker_main`.

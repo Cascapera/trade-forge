@@ -25,7 +25,10 @@ services:
     # ⚠️ Not `tradeforge-api`: run here by mistake on the main machine, a build under that name
     # would replace the image its own workers are recreated from.
     image: tradeforge-worker-remote
-    command: ['arq', 'tradeforge_api.worker.WorkerSettings']
+    # Not `arq tradeforge_api.worker.WorkerSettings`: the same worker on `OneTripWorker`, which
+    # claims its next job in one round trip to Redis (`claim`, 06/10). The old command still
+    # works; from across the internet it idles ~15–30 s between batches.
+    command: ['python', '-m', 'tradeforge_api.worker_main']
     environment:
       # The main machine, where Postgres and Redis are published (docker-compose.yml `ports:`).
       POSTGRES_HOST: ${TRADEFORGE_HOST:?set TRADEFORGE_HOST in worker.env — the main machine's IP}

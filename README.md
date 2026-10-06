@@ -120,7 +120,7 @@ uv run tradeforge-collector backfill EURUSD H1 2024-01-01 2024-12-31
 
 ```bash
 uv run uvicorn tradeforge_api.main:create_app --factory --port 8000   # the API
-uv run arq tradeforge_api.worker.WorkerSettings                       # the backtest worker
+uv run python -m tradeforge_api.worker_main                           # the backtest worker
 npm run dev -w @tradeforge/web                                        # the UI at :5173
 ```
 

@@ -1,6 +1,6 @@
 # ADR-0032 — Várias corretoras: um nome interno por ativo, a corretora e o ticker ao lado
 
-- **Status**: proposto
+- **Status**: aceito (08/10, por ele)
 - **Data**: 2026-10-08
 - **Contexto do PR**: pedido dele de 08/10 (ações dos EUA na Tradeview ao lado do forex na ActivTrades;
   ações do Brasil numa terceira corretora; sinais ao vivo dos três — `specs/sinais-discord-telegram.md`)

@@ -81,7 +81,8 @@ async def create(
         # `or ""` collapses two situations the caller cannot act on differently: the symbol is
         # not in the snapshot at all, or it is there with no path. Neither one decides a class.
         if item.asset_class is None
-        and asset_class_from_path(symbol_path(session, item.symbol) or "") is None
+        and asset_class_from_path(symbol_path(session, item.broker_symbol or item.symbol) or "")
+        is None
     ]
     if unclassifiable:
         raise HTTPException(
@@ -108,6 +109,7 @@ async def create(
         create_collection(
             session,
             symbol=item.symbol,
+            broker_symbol=item.broker_symbol,
             timeframe=line.timeframe,
             date_from=line.date_from,
             date_to=line.date_to,
@@ -125,7 +127,7 @@ async def create(
         await queue.enqueue_job(
             COLLECT_RANGE,
             str(collection.id),
-            _queue_name=collect_queue_for(session, collection.symbol),
+            _queue_name=collect_queue_for(session, collection.symbol, collection.broker_symbol),
         )
     return [CollectionOut.model_validate(collection) for collection in collections]
 

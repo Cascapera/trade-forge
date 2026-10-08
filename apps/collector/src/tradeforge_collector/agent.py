@@ -45,9 +45,14 @@ from sqlalchemy import select
 
 from tradeforge_collector.alive import Heartbeat
 from tradeforge_collector.collect import DatabaseJournal, run_collection
-from tradeforge_collector.source import SymbolInfo
+from tradeforge_collector.source import MarketDataSource, SymbolInfo, TickerSource
 from tradeforge_db.broker_symbols import BrokerSymbolEntry, replace_snapshot
-from tradeforge_db.brokers import UnknownBrokerError, broker_for_server, keeps_path
+from tradeforge_db.brokers import (
+    UnknownBrokerError,
+    broker_for_server,
+    broker_ticker,
+    keeps_path,
+)
 from tradeforge_db.collections import finish_collection, read_collection
 from tradeforge_db.models import BacktestStatus, Broker
 from tradeforge_db.session import create_db_engine, create_session_factory, session_scope
@@ -267,15 +272,24 @@ async def collect_range(_context: dict[str, Any], collection_id: str) -> int:
                 session.commit()
                 logger.warning("collection %s refused: %s", collection_id, refused)
                 return 0
+            # The broker's ticker when the internal name differs (ADR-0032): asked for by the
+            # request, or recorded on the instrument by an earlier collection — `WIN` is `WIN$`.
+            ticker = request.broker_symbol or broker_ticker(session, request.symbol)
+            asked: MarketDataSource = (
+                source
+                if ticker == request.symbol
+                else TickerSource(source, internal=request.symbol, ticker=ticker)
+            )
             try:
                 outcome = run_collection(
-                    source,
+                    asked,
                     DatabaseJournal(
                         session,
                         request.id,
                         root=root,
                         timeframe=request.timeframe,
                         broker_id=broker.id,
+                        broker_symbol=ticker,
                     ),
                     root=root,
                     symbol=request.symbol,

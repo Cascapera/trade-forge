@@ -22,6 +22,7 @@ __all__ = [
     "broker_for_server",
     "broker_slug_for_symbol",
     "broker_slugs",
+    "broker_ticker",
     "collect_queue",
     "keeps_path",
     "refuse_another_broker",
@@ -133,9 +134,19 @@ def broker_slugs(session: Session) -> list[str]:
     return list(session.scalars(select(Broker.slug).order_by(Broker.slug)))
 
 
-def broker_slug_for_symbol(session: Session, symbol: str) -> str | None:
+def broker_ticker(session: Session, symbol: str) -> str:
+    """What to ask the terminal for to collect `symbol`: its instrument's own ticker when it has
+    one that differs (`WIN` → `WIN$`, ADR-0032), else the name itself."""
+    ticker = session.scalars(
+        select(Instrument.broker_symbol).where(Instrument.symbol == symbol)
+    ).one_or_none()
+    return ticker or symbol
+
+
+def broker_slug_for_symbol(session: Session, symbol: str, ticker: str | None = None) -> str | None:
     """The broker a symbol is collected from: its instrument's, or — for a symbol not catalogued
-    yet — the broker whose terminal lists it (`broker_symbols.server`). `None` when neither says.
+    yet — the broker whose terminal lists it, or lists `ticker` when the internal name differs
+    (`broker_symbols.server`). `None` when neither says.
     """
     owner = session.scalars(
         select(Broker.slug)
@@ -147,5 +158,5 @@ def broker_slug_for_symbol(session: Session, symbol: str) -> str | None:
     return session.scalars(
         select(Broker.slug)
         .join(BrokerSymbol, BrokerSymbol.server == Broker.server)
-        .where(BrokerSymbol.symbol == symbol)
+        .where(BrokerSymbol.symbol == (ticker or symbol))
     ).first()

@@ -1399,6 +1399,9 @@ class CollectionItem(BaseModel):
     """
 
     symbol: Symbol
+    broker_symbol: Symbol | None = None
+    """The broker's ticker when the internal name differs (ADR-0032): `{"symbol": "WIN",
+    "broker_symbol": "WIN$"}`. Left out, the terminal is asked for `symbol` itself."""
     asset_class: AssetClass | None = None
     """⚠️ Optional, and its absence is **not** a default. It means "the symbol's tree path
     already says", which is true for 60 of this broker's 84 symbols. For the other 24 — filed
@@ -1548,6 +1551,7 @@ class CollectionOut(_Out):
 
     id: uuid.UUID
     symbol: str
+    broker_symbol: str | None = None
     timeframe: str
     date_from: dt.datetime
     date_to: dt.datetime

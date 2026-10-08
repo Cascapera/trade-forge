@@ -20,13 +20,13 @@ collector found convenient is a candle the engine would have to translate foreve
 """
 
 import datetime as dt
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from typing import Protocol
 
 from tradeforge_engine.domain import Candle, InstrumentSpec
 
-__all__ = ["Candle", "InstrumentSpec", "MarketDataSource", "SymbolInfo"]
+__all__ = ["Candle", "InstrumentSpec", "MarketDataSource", "SymbolInfo", "TickerSource"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,3 +98,36 @@ class MarketDataSource(Protocol):
         way to detect.
         """
         ...
+
+
+class TickerSource:
+    """A source asked by the broker's ticker and answering under the internal name (ADR-0032).
+
+    XP calls its continuous mini-index future `WIN$`; this system calls it `WIN`, because a `$`
+    is no name for a Parquet folder (pyarrow writes it `%24`) or a URL. Every request for
+    `internal` goes to the terminal as `ticker`, and the spec comes back renamed — so the bars,
+    the folder and the catalogue all carry the internal name, and nothing downstream knows.
+    """
+
+    def __init__(self, source: MarketDataSource, *, internal: str, ticker: str) -> None:
+        self._source = source
+        self._internal = internal
+        self._ticker = ticker
+
+    def _ask(self, symbol: str) -> str:
+        return self._ticker if symbol == self._internal else symbol
+
+    def instrument(self, symbol: str) -> InstrumentSpec:
+        """The ticker's spec under the internal name."""
+        spec = self._source.instrument(self._ask(symbol))
+        return replace(spec, symbol=symbol) if symbol == self._internal else spec
+
+    def spread_points(self, symbol: str) -> Decimal | None:
+        """The ticker's quoted spread."""
+        return self._source.spread_points(self._ask(symbol))
+
+    def candles(
+        self, symbol: str, timeframe: str, start: dt.datetime, end: dt.datetime
+    ) -> list[Candle]:
+        """The ticker's bars; a `Candle` carries no name, so nothing to rename."""
+        return self._source.candles(self._ask(symbol), timeframe, start, end)

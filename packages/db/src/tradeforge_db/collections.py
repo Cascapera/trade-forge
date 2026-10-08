@@ -34,6 +34,7 @@ def create_collection(  # noqa: PLR0913 — keyword-only; these are the columns 
     date_to: dt.datetime,
     asset_class: AssetClass | None,
     years_total: int,
+    broker_symbol: str | None = None,
 ) -> Collection:
     """Write the request down and return it, so the API has an id to answer 202 with.
 
@@ -43,6 +44,7 @@ def create_collection(  # noqa: PLR0913 — keyword-only; these are the columns 
     """
     collection = Collection(
         symbol=symbol,
+        broker_symbol=broker_symbol,
         timeframe=timeframe,
         date_from=date_from,
         date_to=date_to,

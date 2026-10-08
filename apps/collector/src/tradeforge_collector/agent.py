@@ -109,7 +109,7 @@ async def sync_symbols(_context: dict[str, Any]) -> int:
     # from Linux CI to check the job names line up (ADR-02).
     from tradeforge_collector.mt5_source import MT5Source  # noqa: PLC0415 — the ADR-02 boundary
 
-    source = MT5Source(server_offset=_stated_offset()).connect()
+    source = MT5Source(server_offset=_stated_offset(), path=_terminal_path()).connect()
     try:
         symbols = source.symbols()
         server = source.server()
@@ -145,7 +145,7 @@ async def probe_history(_context: dict[str, Any], symbol: str, timeframe: str) -
     """
     from tradeforge_collector.mt5_source import MT5Source  # noqa: PLC0415 — the ADR-02 boundary
 
-    source = MT5Source(server_offset=_stated_offset()).connect()
+    source = MT5Source(server_offset=_stated_offset(), path=_terminal_path()).connect()
     try:
         report = source.probe_history(symbol, timeframe)
     finally:
@@ -226,7 +226,9 @@ async def collect_range(_context: dict[str, Any], collection_id: str) -> int:
             # without an override those symbols cannot be catalogued at all.
             try:
                 source = MT5Source(
-                    server_offset=_stated_offset(), asset_class=request.asset_class
+                    server_offset=_stated_offset(),
+                    asset_class=request.asset_class,
+                    path=_terminal_path(),
                 ).connect()
             except ConnectionError as refused:
                 # ⚠️ **Written on the row, not only raised** (26/09). Raised alone, the row
@@ -304,7 +306,7 @@ async def start_heartbeat(context: dict[str, Any]) -> None:
         host=os.environ.get("REDIS_HOST", "localhost"),
         port=int(os.environ.get("REDIS_PORT", "6379")),
     )
-    heartbeat = Heartbeat(client)
+    heartbeat = Heartbeat(client, broker=os.environ.get(BROKER_ENV) or None)
     heartbeat.start()
     context["heartbeat"] = heartbeat
 
@@ -328,6 +330,27 @@ def data_root_from_env() -> Path:
     needs no environment at all.
     """
     return Path(os.environ.get("TRADEFORGE_DATA_DIR", "data/ohlcv"))
+
+
+BROKER_ENV = "TRADEFORGE_BROKER"
+TERMINAL_ENV = "TRADEFORGE_TERMINAL_PATH"
+OFFSET_ENV = "TRADEFORGE_SERVER_OFFSET"
+
+
+def serve_broker(slug: str, terminal_path: str | None, server_offset: dt.timedelta) -> None:
+    """Make this process one broker's agent (ADR-0032): its terminal and its clock, from the
+    `brokers` row, set where every job reads them — so no job can be handed another's."""
+    os.environ[BROKER_ENV] = slug
+    if terminal_path:
+        os.environ[TERMINAL_ENV] = terminal_path
+    else:
+        os.environ.pop(TERMINAL_ENV, None)
+    os.environ[OFFSET_ENV] = f"{server_offset / dt.timedelta(hours=1):+g}"
+
+
+def _terminal_path() -> str | None:
+    """The terminal this agent serves, or `None` for whichever MT5 answers."""
+    return os.environ.get(TERMINAL_ENV) or None
 
 
 def _stated_offset() -> dt.timedelta | None:

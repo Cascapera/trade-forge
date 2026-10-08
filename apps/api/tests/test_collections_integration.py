@@ -23,6 +23,7 @@ from tradeforge_api.main import create_app
 from tradeforge_api.queue import COLLECT_QUEUE, COLLECT_RANGE
 from tradeforge_api.schemas import MAX_COLLECTION_SYMBOLS
 from tradeforge_db.broker_symbols import BrokerSymbolEntry, replace_snapshot
+from tradeforge_db.brokers import collect_queue
 from tradeforge_db.collections import read_collection, recent_collections
 
 pytestmark = pytest.mark.integration
@@ -125,7 +126,9 @@ def test_a_collection_is_accepted_recorded_and_queued(
     assert body["years_done"] == 0
     assert body["candles"] is None
 
-    assert queue.jobs == [(COLLECT_RANGE, {"_queue_name": COLLECT_QUEUE})]
+    # The catalogue was photographed from Tradeview's server, so its agent is the one asked
+    # (ADR-0032): `collect.tradeview`, not the legacy queue.
+    assert queue.jobs == [(COLLECT_RANGE, {"_queue_name": collect_queue("tradeview")})]
     assert queue.args == [(body["id"],)], "the queue carries the row's id and nothing else"
 
 
@@ -548,3 +551,23 @@ def test_a_batch_past_the_work_ceiling_writes_nothing(
     assert response.status_code == 422
     assert count_collections(session_factory) == before
     assert queue.jobs == []
+
+
+def test_a_symbol_no_broker_claims_still_goes_to_the_legacy_queue(
+    session_factory: Callable[[], Session], client: TestClient, queue: _CapturingQueue
+) -> None:
+    """A catalogue from a server nobody registered: no broker's agent can be named, so the job
+    waits on the queue an agent started without a broker drains."""
+    with session_factory() as session:
+        replace_snapshot(
+            session,
+            [BrokerSymbolEntry(symbol="EURUSD", path=r"Forex\Majors\EURUSD")],
+            server="Unregistered-Server",
+            synced_at=SYNCED_AT,
+        )
+        session.commit()
+
+    response = client.post("/collections", json=a_request())
+
+    assert response.status_code == 202, response.text
+    assert queue.jobs == [(COLLECT_RANGE, {"_queue_name": COLLECT_QUEUE})]

@@ -12,9 +12,28 @@ import uuid
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from tradeforge_db.models import Broker, Instrument
+from tradeforge_db.models import Broker, BrokerSymbol, Instrument
 
-__all__ = ["BrokerChangedError", "UnknownBrokerError", "broker_for_server", "refuse_another_broker"]
+__all__ = [
+    "LEGACY_QUEUE",
+    "BrokerChangedError",
+    "UnknownBrokerError",
+    "broker_by_slug",
+    "broker_for_server",
+    "broker_slug_for_symbol",
+    "broker_slugs",
+    "collect_queue",
+    "refuse_another_broker",
+]
+
+LEGACY_QUEUE = "collect"
+"""The one queue there was before several brokers (ADR-0021): what an agent started without a
+broker drains, and where a symbol no broker claims is still sent."""
+
+
+def collect_queue(slug: str | None) -> str:
+    """The queue one broker's agent drains (ADR-0032): `collect.<slug>`, or the legacy one."""
+    return LEGACY_QUEUE if slug is None else f"{LEGACY_QUEUE}.{slug}"
 
 
 class UnknownBrokerError(LookupError):
@@ -85,3 +104,35 @@ def refuse_another_broker(session: Session, symbol: str, broker_id: uuid.UUID) -
     if recorded is not None:
         offered = session.scalars(select(Broker.slug).where(Broker.id == broker_id)).one()
         raise BrokerChangedError(symbol, recorded, offered)
+
+
+def broker_by_slug(session: Session, slug: str) -> Broker:
+    """The broker named `slug`, or `LookupError` naming the ones there are."""
+    found = session.scalars(select(Broker).where(Broker.slug == slug)).one_or_none()
+    if found is None:
+        known = ", ".join(broker_slugs(session)) or "none"
+        raise LookupError(f"no broker {slug!r}; registered: {known}")
+    return found
+
+
+def broker_slugs(session: Session) -> list[str]:
+    """Every registered broker's slug, in order."""
+    return list(session.scalars(select(Broker.slug).order_by(Broker.slug)))
+
+
+def broker_slug_for_symbol(session: Session, symbol: str) -> str | None:
+    """The broker a symbol is collected from: its instrument's, or — for a symbol not catalogued
+    yet — the broker whose terminal lists it (`broker_symbols.server`). `None` when neither says.
+    """
+    owner = session.scalars(
+        select(Broker.slug)
+        .join(Instrument, Instrument.broker_id == Broker.id)
+        .where(Instrument.symbol == symbol)
+    ).one_or_none()
+    if owner is not None:
+        return owner
+    return session.scalars(
+        select(Broker.slug)
+        .join(BrokerSymbol, BrokerSymbol.server == Broker.server)
+        .where(BrokerSymbol.symbol == symbol)
+    ).first()

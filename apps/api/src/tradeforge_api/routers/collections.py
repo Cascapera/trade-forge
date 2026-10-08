@@ -24,7 +24,7 @@ from fastapi import APIRouter, HTTPException, status
 from tradeforge_api.coverage import plan_for
 from tradeforge_api.deps import QueueDep, SessionDep
 from tradeforge_api.estimates import collection_rates, collection_time, planned_years
-from tradeforge_api.queue import COLLECT_QUEUE, COLLECT_RANGE
+from tradeforge_api.queue import COLLECT_RANGE, collect_queue_for
 from tradeforge_api.schemas import (
     CollectionOut,
     CreateCollectionRequest,
@@ -122,7 +122,11 @@ async def create(
     session.commit()
 
     for collection in collections:
-        await queue.enqueue_job(COLLECT_RANGE, str(collection.id), _queue_name=COLLECT_QUEUE)
+        await queue.enqueue_job(
+            COLLECT_RANGE,
+            str(collection.id),
+            _queue_name=collect_queue_for(session, collection.symbol),
+        )
     return [CollectionOut.model_validate(collection) for collection in collections]
 
 

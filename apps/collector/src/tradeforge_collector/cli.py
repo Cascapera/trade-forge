@@ -217,6 +217,14 @@ def _parser() -> argparse.ArgumentParser:
         metavar="SECONDS",
         help=f"how long a lost Redis may take to come back (default: {DEFAULT_GRACE:g})",
     )
+    agent.add_argument(
+        "--broker",
+        metavar="SLUG",
+        help=(
+            "serve one broker's queue (collect.<slug>) with its terminal and clock from the "
+            "brokers table (ADR-0032); without it, the legacy queue and TRADEFORGE_SERVER_OFFSET"
+        ),
+    )
 
     return parser
 
@@ -227,12 +235,27 @@ def _agent(args: argparse.Namespace) -> int:
     # the agent's database wiring.
     import asyncio  # noqa: PLC0415
 
-    from tradeforge_collector.agent import WorkerSettings  # noqa: PLC0415
+    from tradeforge_collector.agent import WorkerSettings, serve_broker  # noqa: PLC0415
     from tradeforge_collector.supervisor import serve  # noqa: PLC0415
+
+    worker_settings: type = WorkerSettings
+    if args.broker:
+        from tradeforge_db.brokers import broker_by_slug, collect_queue  # noqa: PLC0415
+
+        engine = create_db_engine()
+        try:
+            with session_scope(create_session_factory(engine)) as session:
+                broker = broker_by_slug(session, args.broker)
+                serve_broker(broker.slug, broker.terminal_path, broker.server_offset)
+                queue = collect_queue(broker.slug)
+        finally:
+            engine.dispose()
+        # The same settings, on this broker's queue: one terminal, one queue (ADR-0032).
+        worker_settings = type("BrokerWorkerSettings", (WorkerSettings,), {"queue_name": queue})
 
     try:
         # arq's settings type is structural; the agent's class matches it without naming it.
-        settings: WorkerSettingsType = cast("WorkerSettingsType", WorkerSettings)
+        settings: WorkerSettingsType = cast("WorkerSettingsType", worker_settings)
         return asyncio.run(
             serve(settings, redis_settings=WorkerSettings.redis_settings, grace=args.grace)
         )

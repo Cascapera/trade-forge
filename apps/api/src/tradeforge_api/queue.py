@@ -14,8 +14,10 @@ from typing import Protocol
 
 from arq.connections import RedisSettings
 from arq.constants import default_queue_name, in_progress_key_prefix, job_key_prefix
+from sqlalchemy.orm import Session
 
 from tradeforge_api.config import RedisConfig
+from tradeforge_db.brokers import LEGACY_QUEUE, broker_slug_for_symbol, collect_queue
 
 # The job name. The worker registers a coroutine under exactly this string (see `worker.py`),
 # and the router enqueues by it — a mismatch would enqueue jobs no worker ever claims.
@@ -82,7 +84,17 @@ on either side. The failure it prevents is silent by construction — the API re
 accepts the job, and it waits in a queue nobody is watching.
 """
 
-COLLECT_QUEUE = "collect"
+COLLECT_QUEUE = LEGACY_QUEUE
+"""The queue before several brokers (ADR-0021). A job for a symbol no broker claims still goes
+here; everything else goes to its broker's (`collect_queue_for`, ADR-0032)."""
+
+
+def collect_queue_for(session: Session, symbol: str) -> str:
+    """The queue of the agent that can collect `symbol`: its broker's (ADR-0032), or the legacy
+    one when no broker claims it yet."""
+    return collect_queue(broker_slug_for_symbol(session, symbol))
+
+
 """The queue only the host agent (`tradeforge-collector agent`) drains.
 
 Two queues rather than one, for two independent reasons and either would be enough:

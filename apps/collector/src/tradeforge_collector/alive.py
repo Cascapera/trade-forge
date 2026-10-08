@@ -35,10 +35,20 @@ EVERY_SECONDS = 30
 
 
 class Heartbeat:
-    """Renews `ALIVE_KEY` from a daemon thread until `stop()`."""
+    """Renews `ALIVE_KEY` — and the agent's own broker's key, when it serves one — from a daemon
+    thread until `stop()`.
 
-    def __init__(self, client: redis.Redis, *, every: float = EVERY_SECONDS) -> None:
+    ⚠️ With several agents (ADR-0032) the shared key says *somebody* is there to collect, which is
+    the question the API and the worker ask; `collector:alive:<broker>` says *which*. A clean stop
+    clears only its own broker's key: another agent may still be renewing the shared one.
+    """
+
+    def __init__(
+        self, client: redis.Redis, *, every: float = EVERY_SECONDS, broker: str | None = None
+    ) -> None:
         self._client = client
+        self._keys = (ALIVE_KEY,) if broker is None else (ALIVE_KEY, alive_key(broker))
+        self._own = ALIVE_KEY if broker is None else alive_key(broker)
         self._every = every
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="collector-alive", daemon=True)
@@ -50,23 +60,30 @@ class Heartbeat:
     def beat(self) -> None:
         """One renewal. A Redis that does not answer is logged and tried again next beat —
         the agent's own watchdog (`supervisor`) is what reacts to Redis being gone."""
+        now = dt.datetime.now(tz=dt.UTC).isoformat()
         try:
-            self._client.set(ALIVE_KEY, dt.datetime.now(tz=dt.UTC).isoformat(), ex=TTL_SECONDS)
+            for key in self._keys:
+                self._client.set(key, now, ex=TTL_SECONDS)
         except redis.RedisError as error:
-            logger.warning("could not renew %s: %s", ALIVE_KEY, error)
+            logger.warning("could not renew %s: %s", ", ".join(self._keys), error)
 
     def stop(self) -> None:
         self._stop.set()
         if self._thread.is_alive():
             self._thread.join(timeout=self._every)
         try:
-            self._client.delete(ALIVE_KEY)
+            self._client.delete(self._own)
         except redis.RedisError as error:
-            logger.warning("could not clear %s: %s", ALIVE_KEY, error)
+            logger.warning("could not clear %s: %s", self._own, error)
 
     def _run(self) -> None:
         while not self._stop.wait(self._every):
             self.beat()
 
 
-__all__ = ["ALIVE_KEY", "EVERY_SECONDS", "TTL_SECONDS", "Heartbeat"]
+def alive_key(broker: str) -> str:
+    """The key one broker's agent renews beside the shared one."""
+    return f"{ALIVE_KEY}:{broker}"
+
+
+__all__ = ["ALIVE_KEY", "EVERY_SECONDS", "TTL_SECONDS", "Heartbeat", "alive_key"]

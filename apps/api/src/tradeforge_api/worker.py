@@ -44,12 +44,12 @@ from tradeforge_api.collector import running as collector_running
 from tradeforge_api.config import RedisConfig, Settings
 from tradeforge_api.grid import coordinates, label_for, read_point
 from tradeforge_api.queue import (
-    COLLECT_QUEUE,
     COLLECT_RANGE,
     RUN_BACKTEST,
     RUN_CLUSTER,
     RUN_SWEEP_WALK_FORWARD,
     RUN_TEMPLATE_QUEUE,
+    collect_queue_for,
     progress_channel,
     redis_settings,
 )
@@ -1152,11 +1152,12 @@ async def run_template_queue(ctx: dict[str, Any], template_id: str) -> None:
             collect=collect,
             batch=ctx["settings"].tradeforge_batch,
         )
-        collection_ids = [str(one.id) for one in collections]
+        # Each download on its broker's queue (ADR-0032), named while the session is open.
+        downloads = [(str(one.id), collect_queue_for(session, one.symbol)) for one in collections]
     finally:
         session.close()
-    for collection_id in collection_ids:
-        await ctx["redis"].enqueue_job(COLLECT_RANGE, collection_id, _queue_name=COLLECT_QUEUE)
+    for collection_id, queue_name in downloads:
+        await ctx["redis"].enqueue_job(COLLECT_RANGE, collection_id, _queue_name=queue_name)
     await enqueue_runs(ctx["redis"], jobs)
     if pending:
         await ctx["redis"].enqueue_job(

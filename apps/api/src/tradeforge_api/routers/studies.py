@@ -37,7 +37,7 @@ from tradeforge_api.grid import (
     named,
     read_point,
 )
-from tradeforge_api.queue import COLLECT_QUEUE, COLLECT_RANGE, RUN_BACKTEST
+from tradeforge_api.queue import COLLECT_RANGE, RUN_BACKTEST, collect_queue_for
 from tradeforge_api.routers.backtests import list_item
 from tradeforge_api.routers.strategies import refusal_of, validate_document
 from tradeforge_api.runner import ENGINE_VERSION
@@ -445,7 +445,11 @@ async def create_study(
     # The downloads carry no job id, as the other launches' do not: re-sending them queues each
     # window again. The idempotency claim above is the runs' alone.
     for collection in collections:
-        await queue.enqueue_job(COLLECT_RANGE, str(collection.id), _queue_name=COLLECT_QUEUE)
+        await queue.enqueue_job(
+            COLLECT_RANGE,
+            str(collection.id),
+            _queue_name=collect_queue_for(session, collection.symbol),
+        )
     for run in runs:
         await queue.enqueue_job(RUN_BACKTEST, str(run.id), _job_id=str(run.id))
 

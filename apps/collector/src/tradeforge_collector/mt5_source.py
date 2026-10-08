@@ -95,7 +95,11 @@ class MT5Source:
         asset_class: AssetClass | None = None,
         server_offset: dt.timedelta | None = None,
         terminal: Any = None,  # noqa: ANN401 — MetaTrader5 ships no type stubs
+        path: str | None = None,
     ) -> None:
+        # Which terminal (ADR-0032): with several brokers' terminals installed side by side, the
+        # one whose `terminal64.exe` this is. `None` attaches to whichever MT5 will answer.
+        self._path = path
         # An override for symbols whose tree path says nothing useful.
         self._asset_class = asset_class
 
@@ -142,7 +146,7 @@ class MT5Source:
 
             mt5 = MetaTrader5
 
-        if not mt5.initialize():
+        if not (mt5.initialize(path=self._path) if self._path else mt5.initialize()):
             raise ConnectionError(f"MetaTrader 5 refused the connection: {mt5.last_error()}")
 
         self._mt5 = mt5

@@ -89,7 +89,7 @@ from tradeforge_api.montecarlo import (
     simulate,
     simulate_in_blocks,
 )
-from tradeforge_api.queue import COLLECT_QUEUE, COLLECT_RANGE, jobs_in_progress, withdraw_jobs
+from tradeforge_api.queue import COLLECT_RANGE, collect_queue_for, jobs_in_progress, withdraw_jobs
 from tradeforge_api.ranking_floor import RANK_MIN_TRADES
 from tradeforge_api.routers.backtests import failed_collections, list_item
 from tradeforge_api.routers.strategies import refusal_of
@@ -528,7 +528,11 @@ async def create_sweep(
     # re-sending them queues each window again, and a crash before one is sent leaves it
     # `queued` with its runs deferring until the queue has been silent for `WAIT_LIMIT`.
     for collection in collections:
-        await queue.enqueue_job(COLLECT_RANGE, str(collection.id), _queue_name=COLLECT_QUEUE)
+        await queue.enqueue_job(
+            COLLECT_RANGE,
+            str(collection.id),
+            _queue_name=collect_queue_for(session, collection.symbol),
+        )
     await enqueue_runs(queue, jobs)
 
     return CreatedSweep(

@@ -74,8 +74,8 @@ Entrou a 1.08452 às 15:12 (Brasília) · Stop 1.08210 · Alvo 1.08930
 
 - **Ativo, tempo gráfico, setup** (nome do catálogo + parâmetros principais), **direção**.
 - **Entrada** (e o tipo: stop ou limite), **stop**, **alvo**, **risco** em pontos/pips e em %.
-- **Alvo quando o setup não tem alvo** (muitos rodam sem): cada item da lista de monitoramento define o
-  alvo do aviso (ex.: 2R), escolhido por ele.
+- **Alvo:** sempre o alvo do setup monitorado. Quando o setup não tem alvo, o sinal avisa ao atingir
+  **5R**, ou o stop, ou a saída do próprio setup — o que vier primeiro (decisão dele, 08/10).
 - **Horário** de Brasília e da corretora.
 - **Imagem:** o retrato da entrada em PNG, desenhado igual ao `TradeSnapshot` (decisão dele: a imagem
   nossa, sem TradingView).
@@ -199,9 +199,10 @@ Os PRs 0–3 servem também para coletar e varrer as ações do Brasil e dos EUA
 - **Um canal só** para todos os mercados — um no Discord e um no Telegram.
 - **Sem edição:** cada evento é uma mensagem nova, com o número do sinal.
 - **Discord e Telegram**, os dois.
+- **Eventos postados:** ARMADO (ordem posicionada), ACIONADO, CANCELADO e ENCERRADO — este com o
+  resultado em R (ganho ou perda) ou "stop". O PERTO não é postado.
+- **Alvo:** o do setup monitorado; sem alvo no setup, avisa ao atingir 5R, ou o stop, ou a saída.
+- **Ações do Brasil:** XP, conta demo (`XPMT5-DEMO`); a real não traz histórico a mais (#411–#414).
+- **Horário:** 24 h — se o sistema está ligado e o setup dá sinal, posta. Sem janela de horário.
 
-**Ainda abertas:**
-1. **Quais eventos postar:** ARMADO + ACIONADO + CANCELADO? Também o resultado (ENCERRADO)? O PERTO?
-2. **Alvo do aviso** para setups sem alvo: fixo (ex.: 2R) ou por item?
-3. **Horários:** avisar 24 h ou só no horário das aulas/mercado?
-4. **Corretora/conta para ações do Brasil** (precisa de MT5 com B3).
+Todas as decisões do desenho estão tomadas.

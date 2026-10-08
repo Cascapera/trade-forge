@@ -19,6 +19,8 @@ from tradeforge_db.testing import truncate
 # makes the dependency between the tables visible where someone will read it.
 TABLES_CHILD_FIRST = (
     # ⚠️ First of all: it points at `backtests` and at `collections`, and both are emptied below.
+    # Points at `strategies`, `instruments` and `backtests`, all emptied below (signals PR 4).
+    "watch_items",
     "backtest_collections",
     # ⚠️ Append-only, and the only table here whose trigger has to be lifted to empty it
     # at all — see `tradeforge_db.testing.truncate`. Listed because a row left behind is

@@ -57,6 +57,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from tradeforge_api.live.heartbeat import session_heartbeat
 from tradeforge_api.live.promotion import promotion_for
 from tradeforge_api.live.recorder import LedgerView, LedgerWatch, TradeRecorder, record_bar
+from tradeforge_api.live.signals import NumberedSink, SignalBroker
 from tradeforge_api.live.splice import BarSource, splice
 from tradeforge_api.runner import (
     ENGINE_VERSION,
@@ -114,6 +115,9 @@ class SessionPlan:
     ⚠️ A default that fails **safe**. Every caller today means paper, and making it required
     would have each of them say so — which reads as tidier right up to the day a new caller is
     added and the value they have to remember is the dangerous one."""
+
+    no_target_r: Decimal = Decimal(5)
+    """SIGNAL only: a setup with no target closes its signal at this many R (his rule, 08/10)."""
 
     session_id: uuid.UUID | None = None
     """The id this session will have, when the caller needs to know it **before** it exists.
@@ -173,6 +177,7 @@ def run_session(  # noqa: PLR0913 — keyword-only; each names one seam of a ses
     venue: Venue | None = None,
     promotion_days: int = 5,
     now: Callable[[], dt.datetime] = _utcnow,
+    signals: NumberedSink | None = None,
 ) -> SessionOutcome:
     """Run one session until `stopping` says otherwise, and record everything it did.
 
@@ -201,6 +206,8 @@ def run_session(  # noqa: PLR0913 — keyword-only; each names one seam of a ses
     # ⚠️ Asked here too, and for the same reason the promotion gate is: a live session with no
     # venue to trade through is knowable now, and discovering it after the warm-up would spend
     # minutes to say so. The refusal itself is not a convenience — see `_broker_for`.
+    if plan.mode is SessionMode.SIGNAL and signals is None:
+        raise EngineError("refusing to start a signal session with nowhere to post its signals")
     if plan.mode is SessionMode.LIVE and venue is None:
         raise EngineError(
             "refusing to start a live session with no venue: without one this would run the "
@@ -284,6 +291,7 @@ def run_session(  # noqa: PLR0913 — keyword-only; each names one seam of a ses
         spec=spec,
         cost_model=build_cost_model(plan.cost_model),
         take_profit_rr=take_profit_rr(definition),
+        signals=signals,
     )
 
     # ⚠️ **Written before the hand-over, not after**, and in live that is the whole point of the
@@ -402,6 +410,7 @@ def _broker_for(  # noqa: PLR0913 — the plan, the seam, and the four facts a p
     spec: InstrumentSpec,
     cost_model: CostModel,
     take_profit_rr: Decimal | None,
+    signals: NumberedSink | None = None,
 ) -> Broker:
     """The broker the session itself will trade through. Paper is local; live is the venue.
 
@@ -425,11 +434,23 @@ def _broker_for(  # noqa: PLR0913 — the plan, the seam, and the four facts a p
     and the drift it finds is a signal precisely because the two are computed independently.
     """
     if plan.mode is not SessionMode.LIVE:
-        return BacktestBroker(
+        simulated = BacktestBroker(
             instrument=spec,
             initial_capital=plan.initial_capital,
             cost_model=cost_model,
             take_profit_rr=take_profit_rr,
+        )
+        if plan.mode is not SessionMode.SIGNAL:
+            return simulated
+        if signals is None:  # refused by `run_session` before the warm-up; kept for the same
+            raise EngineError("a signal session needs somewhere to post")  # reason as below
+        # Paper, exactly — the wrapper only watches (signals PR 5).
+        return SignalBroker(
+            simulated,
+            signals,
+            number=signals.number,
+            take_profit_rr=take_profit_rr,
+            no_target_r=plan.no_target_r,
         )
     if venue is None:
         # ⚠️ Unreachable through `run_session`, which refuses before the warm-up — and kept, on

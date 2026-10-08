@@ -582,7 +582,7 @@ def test_an_internal_name_is_collected_by_the_brokers_ticker(
         replace_snapshot(
             session,
             [BrokerSymbolEntry(symbol="WIN$", path=r"BMF\SERIES CONTINUAS\WIN$")],
-            server="XPMT5-DEMO",
+            server="XPMT5-PRD",
             synced_at=SYNCED_AT,
         )
         session.commit()

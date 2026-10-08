@@ -15,6 +15,8 @@ vi.mock('../api/hooks', () => ({
   useYearCut: () => ({ isPending: true, fetchStatus: 'fetching', isError: false, data: undefined }),
   // The strategy block at the top has its own test (`RunStrategy.test.tsx`); here it waits.
   useStrategy: () => ({ data: undefined }),
+  // The watch button has its own screen's test; here it only has to render.
+  useWatchBacktest: () => ({ mutate: vi.fn(), isPending: false, isSuccess: false, isError: false }),
 }))
 
 const navigate = vi.fn()

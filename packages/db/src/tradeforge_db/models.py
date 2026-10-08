@@ -2421,3 +2421,50 @@ class SweepTemplateItem(Base):
         CheckConstraint("jsonb_typeof(cost_model) = 'object'", name="item_costs_are_an_object"),
         Index("ix_sweep_template_items_template_id", "template_id", "position"),
     )
+
+
+class WatchItem(Base):
+    """One setup on one market that the signals follow live (signals PR 4).
+
+    Taken from a run that did well — a row of Best by market or of a sweep — and **copied**, not
+    referenced: the strategy (exact parameters), the market, the timeframe and the costs are this
+    row's own, so a run removed by the database clean-up leaves the item whole. The run stays as
+    where it came from, nothing more.
+
+    `no_target_r` is his rule of 08/10 for a setup that runs without a target: the signal is
+    closed at that many R, the stop, or the setup's own exit, whichever comes first. A setup with
+    a target uses its own.
+    """
+
+    __tablename__ = "watch_items"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    strategy_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("strategies.id", ondelete="RESTRICT"), nullable=False
+    )
+    instrument_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("instruments.id", ondelete="RESTRICT"), nullable=False
+    )
+    timeframe: Mapped[str] = mapped_column(TIMEFRAME, nullable=False)
+    cost_model: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    source_backtest_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("backtests.id", ondelete="SET NULL")
+    )
+    no_target_r: Mapped[Decimal] = mapped_column(RATIO, nullable=False, server_default=text("5"))
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
+    note: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[dt.datetime] = _created_at()
+
+    __table_args__ = (
+        CheckConstraint("no_target_r > 0", name="no_target_r_is_positive"),
+        CheckConstraint("jsonb_typeof(cost_model) = 'object'", name="watch_costs_are_an_object"),
+        # One live follow per setup and market: two would post every signal twice.
+        Index(
+            "uq_watch_items_active",
+            "strategy_id",
+            "instrument_id",
+            "timeframe",
+            unique=True,
+            postgresql_where=text("active"),
+        ),
+    )

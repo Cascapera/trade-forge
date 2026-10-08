@@ -19,6 +19,7 @@ import { RByYear } from '../components/RByYear'
 import { RunStrategy } from '../components/RunStrategy'
 import { RunTargets } from '../components/TargetLadder'
 import { TradesTable } from '../components/TradesTable'
+import { WatchThisRun } from '../components/WatchThisRun'
 
 const badge: Record<BacktestStatus, string> = {
   queued: 'bg-slate-700 text-slate-200',
@@ -211,6 +212,8 @@ export function Results(): React.JSX.Element {
           )}
         </div>
       )}
+
+      {run.status === 'done' && <WatchThisRun runId={run.id} />}
 
       {run.status === 'done' && run.metrics !== null && (
         <>

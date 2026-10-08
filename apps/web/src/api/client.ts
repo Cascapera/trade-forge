@@ -74,6 +74,8 @@ import type {
   Markets,
   TradesPage,
   WalkForwardOut,
+  WatchItem,
+  WatchItemPatch,
   YearCut,
 } from './types'
 
@@ -383,6 +385,14 @@ export const api = {
   // an endpoint that can un-kill is an endpoint a retry can un-kill. Releasing is
   // `redis-cli DEL executor:kill-switch`, from a shell, by somebody who has looked.
   engageKillSwitch: (): Promise<KillSwitch> => request('POST', '/executor/kill-switch'),
+
+  // The watchlist (signals PR 4): what the live signals follow, each item copied from a run.
+  listWatchItems: (): Promise<WatchItem[]> => request('GET', '/watchlist'),
+  watchBacktest: (backtestId: string): Promise<WatchItem> =>
+    request('POST', '/watchlist', { backtest_id: backtestId }),
+  changeWatchItem: (id: string, patch: WatchItemPatch): Promise<WatchItem> =>
+    request('PATCH', `/watchlist/${id}`, patch),
+  removeWatchItem: (id: string): Promise<null> => request('DELETE', `/watchlist/${id}`),
 }
 
 /**

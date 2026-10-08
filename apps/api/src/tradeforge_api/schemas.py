@@ -3165,3 +3165,38 @@ class SymbolBrowseOut(BaseModel):
     offset: int
     limit: int
     items: list[BrowsedSymbolOut]
+
+
+class WatchItemCreate(BaseModel):
+    """Follow what a finished run was (signals PR 4)."""
+
+    backtest_id: uuid.UUID
+    no_target_r: Decimal = Field(default=Decimal(5), gt=0, le=100)
+    """For a setup with no target: close the signal at this many R (his rule: 5)."""
+    note: StorableText | None = Field(default=None, max_length=500)
+
+
+class WatchItemPatch(BaseModel):
+    """Turn an item on or off, or change its R or note. Fields left out are kept."""
+
+    active: bool | None = None
+    no_target_r: Decimal | None = Field(default=None, gt=0, le=100)
+    note: StorableText | None = Field(default=None, max_length=500)
+
+
+class WatchItemOut(BaseModel):
+    """One followed setup on one market, with the names a screen shows."""
+
+    id: uuid.UUID
+    symbol: str
+    broker: str | None = None
+    """The broker whose live loop feeds it (ADR-0032); null for an instrument no broker claims."""
+    strategy_id: uuid.UUID
+    strategy_name: str
+    timeframe: str
+    no_target_r: Money
+    active: bool
+    note: str | None = None
+    source_backtest_id: uuid.UUID | None = None
+    """The run it was taken from; null once that run was cleaned away."""
+    created_at: dt.datetime

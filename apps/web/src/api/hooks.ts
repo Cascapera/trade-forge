@@ -82,6 +82,8 @@ import type {
   SweepsPage,
   TradesPage,
   WalkForwardOut,
+  WatchItem,
+  WatchItemPatch,
   YearCut,
 } from './types'
 
@@ -1265,6 +1267,44 @@ export function usePauseSweep(id: string) {
     mutationFn: (action) => (action === 'pause' ? api.pauseSweep(id) : api.resumeSweep(id)),
     onSuccess: () => {
       void client.invalidateQueries({ queryKey: ['sweep', id] })
+    },
+  })
+}
+
+/** What the live signals follow (signals PR 4). */
+export function useWatchItems() {
+  return useQuery<WatchItem[]>({ queryKey: ['watchlist'], queryFn: () => api.listWatchItems() })
+}
+
+/** Follow what a finished run was. A 409 means it is already followed. */
+export function useWatchBacktest() {
+  const client = useQueryClient()
+  return useMutation<WatchItem, Error, string>({
+    mutationFn: (backtestId: string) => api.watchBacktest(backtestId),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: ['watchlist'] })
+    },
+  })
+}
+
+/** Turn an item on or off, or change its R or note. */
+export function useChangeWatchItem() {
+  const client = useQueryClient()
+  return useMutation<WatchItem, Error, { id: string; patch: WatchItemPatch }>({
+    mutationFn: ({ id, patch }) => api.changeWatchItem(id, patch),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: ['watchlist'] })
+    },
+  })
+}
+
+/** Stop following an item for good. */
+export function useRemoveWatchItem() {
+  const client = useQueryClient()
+  return useMutation<null, Error, string>({
+    mutationFn: (id: string) => api.removeWatchItem(id),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: ['watchlist'] })
     },
   })
 }

@@ -2097,3 +2097,27 @@ export interface SweepPauseOut {
   /** Runs a resume found `running` with no worker holding any job, and queued again. */
   released?: number
 }
+
+/** One setup on one market that the live signals follow (signals PR 4), copied from a run. */
+export interface WatchItem {
+  id: string
+  symbol: string
+  /** The broker whose live loop feeds it; `null` for an instrument no broker claims. */
+  broker: string | null
+  strategy_id: string
+  strategy_name: string
+  timeframe: string
+  /** For a setup with no target: the signal closes at this many R (his rule: 5). */
+  no_target_r: string
+  active: boolean
+  note: string | null
+  /** The run it was taken from; `null` once that run was cleaned away. */
+  source_backtest_id: string | null
+  created_at: string
+}
+
+export interface WatchItemPatch {
+  active?: boolean
+  no_target_r?: string
+  note?: string
+}

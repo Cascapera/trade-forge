@@ -19,7 +19,7 @@ from typing import Annotated
 from fastapi import APIRouter, HTTPException, Query, status
 
 from tradeforge_api.deps import QueueDep, SessionDep
-from tradeforge_api.queue import COLLECT_QUEUE, PROBE_HISTORY, SYNC_SYMBOLS
+from tradeforge_api.queue import PROBE_HISTORY, SYNC_SYMBOLS, collect_queue_for
 from tradeforge_api.schemas import (
     BrowsedSymbolOut,
     EnqueuedOut,
@@ -40,6 +40,7 @@ from tradeforge_db.broker_symbols import (
     search_symbols,
     snapshot_taken_at,
 )
+from tradeforge_db.brokers import broker_slugs, collect_queue
 from tradeforge_db.symbol_history import read_history
 
 router = APIRouter(tags=["symbols"])
@@ -150,7 +151,7 @@ def browse(  # noqa: PLR0913, PLR0917 — one query parameter per filter
 
 
 @router.post("/symbols/sync", response_model=EnqueuedOut, status_code=status.HTTP_202_ACCEPTED)
-async def sync(queue: QueueDep) -> EnqueuedOut:
+async def sync(session: SessionDep, queue: QueueDep) -> EnqueuedOut:
     """Ask the host agent to photograph the broker's catalogue again. Returns immediately.
 
     `202`, not `200`, and the difference is honest rather than pedantic: this handler has no
@@ -172,7 +173,10 @@ async def sync(queue: QueueDep) -> EnqueuedOut:
     by disabling while the request is in flight; a queue trick that quietly stops working after
     the first success is not idempotence, it is a rate limit nobody asked for.
     """
-    await queue.enqueue_job(SYNC_SYMBOLS, _queue_name=COLLECT_QUEUE)
+    # ⚠️ **One job per broker** (ADR-0032): each agent photographs its own terminal, so each
+    # broker's queue gets one; the legacy queue too, for an agent started without a broker.
+    for slug in [None, *broker_slugs(session)]:
+        await queue.enqueue_job(SYNC_SYMBOLS, _queue_name=collect_queue(slug))
     return EnqueuedOut(job=SYNC_SYMBOLS)
 
 
@@ -196,12 +200,16 @@ def history(session: SessionDep, symbol: Symbol, timeframe: Timeframe) -> Symbol
 @router.post(
     "/symbols/{symbol}/probe", response_model=EnqueuedOut, status_code=status.HTTP_202_ACCEPTED
 )
-async def probe(queue: QueueDep, symbol: Symbol, timeframe: Timeframe) -> EnqueuedOut:
+async def probe(
+    session: SessionDep, queue: QueueDep, symbol: Symbol, timeframe: Timeframe
+) -> EnqueuedOut:
     """Ask the host agent to measure this series. Returns immediately.
 
     ⚠️ 202 is not politeness here, it is the measurement: a cold H4 took **207 seconds** on this
     broker, because the terminal downloads the history while answering. A handler that waited
     would hold a request open for three and a half minutes and time out somewhere in between.
     """
-    await queue.enqueue_job(PROBE_HISTORY, symbol, timeframe, _queue_name=COLLECT_QUEUE)
+    await queue.enqueue_job(
+        PROBE_HISTORY, symbol, timeframe, _queue_name=collect_queue_for(session, symbol)
+    )
     return EnqueuedOut(job=PROBE_HISTORY)

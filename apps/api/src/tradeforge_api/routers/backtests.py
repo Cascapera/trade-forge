@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session, defer, selectinload
 from tradeforge_api.config import Settings
 from tradeforge_api.coverage import describe, to_collect, uncovered_markets
 from tradeforge_api.deps import CollectorDep, QueueDep, SessionDep, SettingsDep
-from tradeforge_api.queue import COLLECT_QUEUE, COLLECT_RANGE, RUN_BACKTEST
+from tradeforge_api.queue import COLLECT_RANGE, RUN_BACKTEST, collect_queue_for
 from tradeforge_api.routers.strategies import assert_runnable_at
 from tradeforge_api.runner import ENGINE_VERSION, spec_for
 from tradeforge_api.schemas import (
@@ -354,7 +354,11 @@ async def create_backtest(
     session.refresh(backtest)
 
     for collection in collections:
-        await queue.enqueue_job(COLLECT_RANGE, str(collection.id), _queue_name=COLLECT_QUEUE)
+        await queue.enqueue_job(
+            COLLECT_RANGE,
+            str(collection.id),
+            _queue_name=collect_queue_for(session, collection.symbol),
+        )
     await queue.enqueue_job(RUN_BACKTEST, str(backtest.id))
     return backtest
 

@@ -5,7 +5,7 @@ from typing import Any
 
 import redis
 
-from tradeforge_collector.alive import ALIVE_KEY, TTL_SECONDS, Heartbeat
+from tradeforge_collector.alive import ALIVE_KEY, TTL_SECONDS, Heartbeat, alive_key
 
 
 class _Redis:
@@ -62,3 +62,15 @@ def test_a_redis_that_does_not_answer_does_not_stop_the_agent() -> None:
     beat = Heartbeat(_Redis(fails=True), every=60)  # type: ignore[arg-type]
     beat.start()
     beat.stop()
+
+
+def test_a_brokers_agent_renews_its_own_key_beside_the_shared_one() -> None:
+    """ADR-0032: the shared key answers "is anybody there?", the broker's says which; stopping
+    clears only its own — another broker's agent may still be renewing the shared key."""
+    client = _Redis()
+    beat = Heartbeat(client, every=60, broker="tradeview")  # type: ignore[arg-type]
+    beat.start()
+    beat.stop()
+
+    assert {name for name, _ in client.sets} == {ALIVE_KEY, alive_key("tradeview")}
+    assert client.deleted == [alive_key("tradeview")]

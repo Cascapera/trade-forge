@@ -8,10 +8,15 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from tradeforge_db.broker_symbols import BrokerSymbolEntry, replace_snapshot
 from tradeforge_db.brokers import (
     BrokerChangedError,
     UnknownBrokerError,
+    broker_by_slug,
     broker_for_server,
+    broker_slug_for_symbol,
+    broker_slugs,
+    collect_queue,
     refuse_another_broker,
 )
 from tradeforge_db.instruments import CatalogueEntry, upsert_instruments
@@ -19,6 +24,8 @@ from tradeforge_db.models import Broker, Instrument
 from tradeforge_engine.domain import AssetClass, InstrumentSpec
 
 pytestmark = pytest.mark.integration
+
+NOW = dt.datetime(2026, 10, 8, 12, 0, tzinfo=dt.UTC)
 
 
 def spec(symbol: str, *, offset_hours: int = 3) -> InstrumentSpec:
@@ -135,3 +142,39 @@ def test_a_broker_with_instruments_cannot_be_deleted(session: Session) -> None:
     session.delete(session.get(Broker, tradeview.id))
     with pytest.raises(IntegrityError):
         session.flush()
+
+
+def test_each_broker_has_its_own_queue_and_the_legacy_one_stays() -> None:
+    assert collect_queue("tradeview") == "collect.tradeview"
+    assert collect_queue(None) == "collect"
+
+
+def test_a_symbol_is_sent_to_its_instruments_broker_first(session: Session) -> None:
+    activtrades = broker_for_server(session, "ActivTradesCorp-Server")
+    upsert_instruments(
+        session, (CatalogueEntry(spec("EURUSD", offset_hours=2), None),), broker_id=activtrades.id
+    )
+    # Even though a Tradeview catalogue lists a symbol by that name too.
+    replace_snapshot(
+        session, [BrokerSymbolEntry(symbol="EURUSD")], server="Tradeview-Demo", synced_at=NOW
+    )
+
+    assert broker_slug_for_symbol(session, "EURUSD") == "activtrades"
+
+
+def test_a_symbol_not_catalogued_yet_goes_to_the_broker_whose_terminal_lists_it(
+    session: Session,
+) -> None:
+    replace_snapshot(
+        session, [BrokerSymbolEntry(symbol="MU")], server="Tradeview-Demo", synced_at=NOW
+    )
+
+    assert broker_slug_for_symbol(session, "MU") == "tradeview"
+    assert broker_slug_for_symbol(session, "NOWHERE") is None
+
+
+def test_a_slug_nobody_registered_names_the_ones_there_are(session: Session) -> None:
+    assert broker_by_slug(session, "tradeview").server == "Tradeview-Demo"
+    assert broker_slugs(session) == ["activtrades", "tradeview"]
+    with pytest.raises(LookupError, match="registered: activtrades, tradeview"):
+        broker_by_slug(session, "xp")

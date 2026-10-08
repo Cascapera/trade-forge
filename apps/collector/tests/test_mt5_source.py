@@ -986,3 +986,28 @@ def test_a_fixed_spread_instrument_gets_no_cost_floor() -> None:
         report = source.probe_history("EURUSD", "D1")
 
     assert report.first_measured_cost is None
+
+
+class _PathTerminal(_FakeTerminal):
+    """A terminal that records which `terminal64.exe` it was asked to attach to."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.paths: list[str | None] = []
+
+    def initialize(self, path: str | None = None) -> bool:
+        self.paths.append(path)
+        return True
+
+
+def test_a_terminal_path_names_which_installed_terminal_to_attach_to() -> None:
+    """ADR-0032: several brokers' terminals side by side — each agent attaches to its own."""
+    named, anyone = _PathTerminal(), _PathTerminal()
+
+    MT5Source(
+        terminal=named, server_offset=dt.timedelta(hours=3), path=r"C:\TV\terminal64.exe"
+    ).connect()
+    MT5Source(terminal=anyone, server_offset=dt.timedelta(hours=3)).connect()
+
+    assert named.paths == [r"C:\TV\terminal64.exe"]
+    assert anyone.paths == [None]

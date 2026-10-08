@@ -21,7 +21,7 @@ from sqlalchemy.orm import defer, selectinload
 
 from tradeforge_api.coverage import describe, to_collect, uncovered_markets
 from tradeforge_api.deps import CollectorDep, QueueDep, SessionDep
-from tradeforge_api.queue import COLLECT_QUEUE, COLLECT_RANGE, RUN_BACKTEST
+from tradeforge_api.queue import COLLECT_RANGE, RUN_BACKTEST, collect_queue_for
 from tradeforge_api.routers.backtests import failed_collections, list_item
 from tradeforge_api.routers.strategies import assert_runnable_at
 from tradeforge_api.runner import ENGINE_VERSION
@@ -214,7 +214,11 @@ async def create_basket(
     # fast enough to pick up a job before an uncommitted row is visible, and would then fail
     # looking up a backtest that does exist.
     for collection in collections:
-        await queue.enqueue_job(COLLECT_RANGE, str(collection.id), _queue_name=COLLECT_QUEUE)
+        await queue.enqueue_job(
+            COLLECT_RANGE,
+            str(collection.id),
+            _queue_name=collect_queue_for(session, collection.symbol),
+        )
     for run in runs:
         await queue.enqueue_job(RUN_BACKTEST, str(run.id))
 

@@ -155,3 +155,23 @@ class TestTheWorkerSettings:
         settings = agent.redis_settings_from_env()
 
         assert (settings.host, settings.port) == ("localhost", 6379)
+
+
+def test_a_brokers_agent_takes_its_terminal_and_clock_from_its_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ADR-0032: the clock comes from the `brokers` row, not from a variable somebody forgot."""
+    for name in (agent.BROKER_ENV, agent.TERMINAL_ENV, agent.OFFSET_ENV):
+        monkeypatch.delenv(name, raising=False)
+
+    agent.serve_broker("tradeview", r"C:\TV\terminal64.exe", dt.timedelta(hours=3))
+
+    assert agent._terminal_path() == r"C:\TV\terminal64.exe"
+    assert agent._stated_offset() == dt.timedelta(hours=3)
+
+    agent.serve_broker("activtrades", None, dt.timedelta(hours=2))
+
+    assert agent._terminal_path() is None
+    assert agent._stated_offset() == dt.timedelta(hours=2)
+    for name in (agent.BROKER_ENV, agent.TERMINAL_ENV, agent.OFFSET_ENV):
+        monkeypatch.delenv(name, raising=False)

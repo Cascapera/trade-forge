@@ -53,21 +53,47 @@ def test_a_snapshot_lands_whole(session: Session) -> None:
     assert (row.server, row.synced_at) == ("MetaQuotes-Demo", FIRST)
 
 
-def test_a_second_sync_replaces_rather_than_merges(session: Session) -> None:
-    """⚠️ The behaviour that makes switching brokers work, and the one an upsert would break.
+def test_a_second_sync_of_the_same_server_replaces_rather_than_merges(session: Session) -> None:
+    """⚠️ The behaviour an upsert would break: a symbol the broker stopped offering goes."""
+    replace_snapshot(session, entries("AAPL", "MSFT"), server="Broker", synced_at=FIRST)
 
-    This terminal really did go from 9550 symbols including AAPL to 84 of forex and CFDs.
-    Merging would leave the screen offering AAPL from an account that cannot trade it — and
-    the list would grow into the union of every broker ever connected, which nothing would
-    ever shrink.
-    """
-    replace_snapshot(session, entries("AAPL", "MSFT"), server="Old-Broker", synced_at=FIRST)
-
-    replace_snapshot(session, entries("EURUSD"), server="New-Broker", synced_at=LATER)
+    replace_snapshot(session, entries("EURUSD"), server="Broker", synced_at=LATER)
 
     remaining = session.scalars(select(BrokerSymbol.symbol)).all()
     assert list(remaining) == ["EURUSD"]
-    assert snapshot_taken_at(session) == ("New-Broker", LATER)
+    assert snapshot_taken_at(session) == ("Broker", LATER)
+
+
+def test_another_servers_symbols_stand(session: Session) -> None:
+    """⚠️ Two brokers side by side (08/10): forex at one, US shares at the other. Syncing the
+    second must not wipe the first — its list is what every collected instrument's market is
+    read from."""
+    replace_snapshot(session, entries("EURUSD", "GBPUSD"), server="Forex-Broker", synced_at=FIRST)
+
+    replace_snapshot(session, entries("AAPL", "MSFT"), server="Shares-Broker", synced_at=LATER)
+
+    rows = session.execute(select(BrokerSymbol.symbol, BrokerSymbol.server)).all()
+    assert sorted(rows) == [
+        ("AAPL", "Shares-Broker"),
+        ("EURUSD", "Forex-Broker"),
+        ("GBPUSD", "Forex-Broker"),
+        ("MSFT", "Shares-Broker"),
+    ]
+    assert snapshot_taken_at(session) == ("Shares-Broker", LATER)
+
+
+def test_a_name_another_server_owns_is_skipped_not_taken_over(session: Session) -> None:
+    """`GOLD` is the metal at ActivTrades and Barrick Gold's shares at Tradeview: the first
+    broker to list a name keeps it, and the second one's is left out rather than overwriting."""
+    replace_snapshot(session, entries("GOLD", "EURUSD"), server="Forex-Broker", synced_at=FIRST)
+
+    written = replace_snapshot(
+        session, entries("GOLD", "AAPL"), server="Shares-Broker", synced_at=LATER
+    )
+
+    assert written == 1
+    owner = session.scalars(select(BrokerSymbol.server).where(BrokerSymbol.symbol == "GOLD")).one()
+    assert owner == "Forex-Broker"
 
 
 def test_the_same_symbol_across_two_syncs_does_not_collide(session: Session) -> None:

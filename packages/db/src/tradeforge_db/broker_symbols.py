@@ -7,6 +7,7 @@ broker offers, and the process that serves the screen never has to know MetaTrad
 """
 
 import datetime as dt
+import logging
 import re
 from dataclasses import dataclass
 from decimal import Decimal
@@ -15,6 +16,11 @@ from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from tradeforge_db.models import BrokerSymbol, Instrument
+
+logger = logging.getLogger(__name__)
+
+NAMED = 20
+"""Skipped symbols a sync names in its log; the rest are counted."""
 
 __all__ = [
     "MARKETS",
@@ -58,12 +64,21 @@ def replace_snapshot(
     server: str | None,
     synced_at: dt.datetime,
 ) -> int:
-    """Make the table say exactly this, and nothing else. Returns how many rows it now holds.
+    """Make this server's part of the table say exactly this. Returns how many rows it wrote.
 
-    ⚠️ **A replace, not an upsert, and the difference is the feature.** Upserting would leave
-    behind every symbol the previous broker offered, so switching accounts would grow a list
-    that is the union of every broker ever connected — and the screen would keep offering AAPL
-    from an account that no longer has it. A snapshot that cannot shrink is not a snapshot.
+    ⚠️ **A replace per server, not an upsert, and not the whole table** (08/10). Upserting would
+    keep every symbol the broker stopped offering, so a snapshot that cannot shrink would not be
+    a snapshot. Replacing the *whole* table, as this did until 08/10, made the catalogue one
+    broker's: syncing a second broker (US shares at Tradeview beside forex at ActivTrades) wiped
+    the first one's list, and with it the market every collected instrument is classified by.
+    Each server now replaces only its own rows; the others stand.
+
+    ⚠️ **A symbol another server already owns is skipped, never taken over.** A name is one
+    instrument here — the candles' folder, the instrument, the market a screen shows all key on
+    it — and two brokers can mean two things by it: `GOLD` is the metal at ActivTrades and
+    Barrick Gold's shares at Tradeview. The first broker to list it keeps it; the skip is
+    logged. Telling them apart (the broker as part of an instrument's identity) is a larger
+    change than a sync.
 
     Deleting is safe here precisely because nothing references this table (see the model:
     `datasets` and `backtests` point at `instruments`, which this is deliberately not). If a
@@ -82,7 +97,21 @@ def replace_snapshot(
             "nothing to offer"
         )
 
-    session.execute(delete(BrokerSymbol))
+    session.execute(delete(BrokerSymbol).where(BrokerSymbol.server.is_not_distinct_from(server)))
+    owned = set(
+        session.scalars(
+            select(BrokerSymbol.symbol).where(BrokerSymbol.server.is_distinct_from(server))
+        )
+    )
+    skipped = sorted(entry.symbol for entry in entries if entry.symbol in owned)
+    if skipped:
+        logger.warning(
+            "%d symbols of %s already belong to another server and were skipped: %s",
+            len(skipped),
+            server or "an unnamed server",
+            ", ".join(skipped[:NAMED]) + (" ..." if len(skipped) > NAMED else ""),
+        )
+    kept = [entry for entry in entries if entry.symbol not in owned]
     session.add_all(
         [
             BrokerSymbol(
@@ -94,11 +123,11 @@ def replace_snapshot(
                 server=server,
                 synced_at=synced_at,
             )
-            for entry in entries
+            for entry in kept
         ]
     )
     session.flush()
-    return len(entries)
+    return len(kept)
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,13 +214,16 @@ def symbol_path(session: Session, symbol: str) -> str | None:
 
 
 def snapshot_taken_at(session: Session) -> tuple[str | None, dt.datetime] | None:
-    """The broker and the moment of the current snapshot, or `None` if there is not one.
+    """The broker and the moment of the latest snapshot, or `None` if there is not one.
 
-    Read off any row, because a replace writes them all in one transaction with one timestamp.
+    Read off the most recent row: a replace writes one server's rows in one transaction with one
+    timestamp, and with several servers the latest sync is the one worth naming.
     `None` is what tells the screen to say "never synced" rather than to show an empty list as
     though the broker offered nothing — the same distinction the replace refuses to blur.
     """
-    row = session.scalars(select(BrokerSymbol).limit(1)).first()
+    row = session.scalars(
+        select(BrokerSymbol).order_by(BrokerSymbol.synced_at.desc()).limit(1)
+    ).first()
     return None if row is None else (row.server, row.synced_at)
 
 

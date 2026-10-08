@@ -302,3 +302,72 @@ def test_a_sweep_s_points_move_to_rows_and_back_in_order(dsn: str) -> None:
         with engine.begin() as connection:
             connection.execute(text("DELETE FROM sweeps WHERE id = :id"), {"id": sweep_id})
         engine.dispose()
+
+
+@pytest.mark.usefixtures("_restore_head")
+def test_existing_instruments_are_tied_to_the_broker_they_were_collected_from(dsn: str) -> None:
+    """`rev_0050` (ADR-0032): shares collected at +3 h are Tradeview's, what was collected at +2 h
+    ActivTrades'; a row with no candles behind it (a seed) keeps no broker, and so does a clock
+    neither broker had."""
+    rows = {
+        "AAPL": ("stock", "3 hours", True, "tradeview"),
+        "EURUSD": ("forex", "2 hours", True, "activtrades"),
+        "SEEDED": ("stock", "3 hours", False, None),
+        "ODDCLOCK": ("forex", "0 hours", True, None),
+    }
+    ids = {symbol: uuid.uuid4() for symbol in rows}
+    engine = create_engine(dsn)
+    try:
+        downgrade("0049", dsn=dsn)
+        with engine.begin() as connection:
+            for symbol, (asset_class, clock, collected, _) in rows.items():
+                connection.execute(
+                    text(
+                        "INSERT INTO instruments (id, symbol, name, asset_class, currency_quote, "
+                        "tick_size, tick_value, contract_size, digits, server_offset) VALUES "
+                        "(:id, :symbol, :symbol, :class, 'USD', 0.01, 0.01, 1, 2, "
+                        "CAST(:clock AS interval))"
+                    ),
+                    {"id": ids[symbol], "symbol": symbol, "class": asset_class, "clock": clock},
+                )
+                if collected:
+                    connection.execute(
+                        text(
+                            "INSERT INTO datasets (id, instrument_id, timeframe, date_from, "
+                            "date_to, candle_count, parquet_path) VALUES (:id, :instrument, "
+                            "'H1', '2024-01-01', '2025-01-01', 1, 'x')"
+                        ),
+                        {"id": uuid.uuid4(), "instrument": ids[symbol]},
+                    )
+
+        upgrade("0050", dsn=dsn)
+        with engine.connect() as connection:
+            found: dict[str, str | None] = {
+                row[0]: row[1]
+                for row in connection.execute(
+                    text(
+                        "SELECT i.symbol, b.slug FROM instruments i "
+                        "LEFT JOIN brokers b ON b.id = i.broker_id WHERE i.id = ANY(:ids)"
+                    ),
+                    {"ids": list(ids.values())},
+                )
+            }
+            tickers: dict[str, str | None] = {
+                row[0]: row[1]
+                for row in connection.execute(
+                    text("SELECT symbol, broker_symbol FROM instruments WHERE id = ANY(:ids)"),
+                    {"ids": list(ids.values())},
+                )
+            }
+        assert found == {symbol: expected[3] for symbol, expected in rows.items()}
+        assert tickers == {"AAPL": "AAPL", "EURUSD": "EURUSD", "SEEDED": None, "ODDCLOCK": None}
+    finally:
+        with engine.begin() as connection:
+            connection.execute(
+                text("DELETE FROM datasets WHERE instrument_id = ANY(:ids)"),
+                {"ids": list(ids.values())},
+            )
+            connection.execute(
+                text("DELETE FROM instruments WHERE id = ANY(:ids)"), {"ids": list(ids.values())}
+            )
+        engine.dispose()

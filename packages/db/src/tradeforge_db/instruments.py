@@ -13,6 +13,7 @@ the path production uses.
 """
 
 import datetime as dt
+import uuid
 from dataclasses import asdict, dataclass
 from decimal import Decimal
 
@@ -20,6 +21,7 @@ from sqlalchemy import exists, func, select
 from sqlalchemy.dialects.postgresql import Insert, insert
 from sqlalchemy.orm import Session
 
+from tradeforge_db.brokers import refuse_another_broker
 from tradeforge_db.models import Dataset, Instrument
 from tradeforge_engine.domain import InstrumentSpec
 
@@ -120,6 +122,7 @@ def upsert_instruments(
     entries: tuple[CatalogueEntry | InstrumentSpec, ...],
     *,
     overwrite: bool = True,
+    broker_id: uuid.UUID | None = None,
 ) -> int:
     """Insert the instruments. Returns how many rows the database actually wrote.
 
@@ -152,18 +155,35 @@ def upsert_instruments(
     a dataset: `ClockChangedError` is raised instead, before anything is written (01/10,
     `refuse_a_new_clock`). The broker's clock is a fact about the bars on disk, not only about
     the symbol.
+
+    `broker_id`, when given, ties the rows to that broker with the symbol as its ticker
+    (ADR-0032), and `BrokerChangedError` refuses a symbol another broker already owns. Without it
+    — the seeds — the rows keep whatever broker they had.
     """
     if not entries:
         return 0
     if overwrite:
         for entry in entries:
-            refuse_a_new_clock(session, entry.spec if isinstance(entry, CatalogueEntry) else entry)
+            spec = entry.spec if isinstance(entry, CatalogueEntry) else entry
+            refuse_a_new_clock(session, spec)
+            if broker_id is not None:
+                refuse_another_broker(session, spec.symbol, broker_id)
 
     rows = [
         {
             **asdict(entry.spec if isinstance(entry, CatalogueEntry) else entry),
             "default_spread_points": (
                 entry.default_spread_points if isinstance(entry, CatalogueEntry) else None
+            ),
+            **(
+                {}
+                if broker_id is None
+                else {
+                    "broker_id": broker_id,
+                    "broker_symbol": (
+                        entry.spec if isinstance(entry, CatalogueEntry) else entry
+                    ).symbol,
+                }
             ),
         }
         for entry in entries
@@ -178,6 +198,13 @@ def upsert_instruments(
         index_elements=[Instrument.symbol],
         set_={
             **{column: statement.excluded[column] for column in _INSTRUMENT_UPDATABLE},
+            **(
+                {}
+                if broker_id is None
+                else {
+                    column: statement.excluded[column] for column in ("broker_id", "broker_symbol")
+                }
+            ),
             # Stamped here rather than left to the column's `onupdate`, which does not fire:
             # that hook belongs to the ORM's UPDATE, and this is a Core ON CONFLICT whose SET
             # clause is used exactly as written. Absent from it, the stamp keeps the value the

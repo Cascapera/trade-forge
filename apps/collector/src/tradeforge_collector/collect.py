@@ -321,12 +321,21 @@ class DatabaseJournal:
     """
 
     def __init__(
-        self, session: Session, collection_id: uuid.UUID, *, root: Path, timeframe: str
+        self,
+        session: Session,
+        collection_id: uuid.UUID,
+        *,
+        root: Path,
+        timeframe: str,
+        broker_id: uuid.UUID | None = None,
     ) -> None:
         self._session = session
         self._id = collection_id
         self._root = root
         self._timeframe = timeframe
+        self._broker_id = broker_id
+        """The broker the instrument is catalogued under (ADR-0032); `None` keeps whichever it
+        has — a journal built without a terminal behind it, as the tests do."""
 
     def started(self) -> None:
         start_collection(self._session, self._id, at=_now())
@@ -342,7 +351,9 @@ class DatabaseJournal:
         refuse_a_new_clock(self._session, spec)
 
     def catalogued(self, spec: InstrumentSpec, spread: Decimal | None, on_disk: Coverage) -> None:
-        upsert_instruments(self._session, (CatalogueEntry(spec, spread),))
+        upsert_instruments(
+            self._session, (CatalogueEntry(spec, spread),), broker_id=self._broker_id
+        )
         instrument_id = self._session.execute(
             select(Instrument.id).where(Instrument.symbol == spec.symbol)
         ).scalar_one()

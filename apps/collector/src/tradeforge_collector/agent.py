@@ -46,6 +46,7 @@ from tradeforge_collector.alive import Heartbeat
 from tradeforge_collector.collect import DatabaseJournal, run_collection
 from tradeforge_collector.source import SymbolInfo
 from tradeforge_db.broker_symbols import BrokerSymbolEntry, replace_snapshot
+from tradeforge_db.brokers import UnknownBrokerError, broker_for_server
 from tradeforge_db.collections import finish_collection, read_collection
 from tradeforge_db.models import BacktestStatus
 from tradeforge_db.session import create_db_engine, create_session_factory, session_scope
@@ -242,6 +243,22 @@ async def collect_range(_context: dict[str, Any], collection_id: str) -> int:
                 session.commit()
                 logger.warning("collection %s failed: %s", collection_id, refused)
                 return 0
+            # ⚠️ **Which broker, and at whose clock** (ADR-0032, 08/10). Several terminals now feed
+            # one database, and an agent started with one broker's clock while another's terminal
+            # is open would shift every bar it writes — the very slip this guard was written after.
+            try:
+                broker = broker_for_server(session, source.server())
+                stated = _stated_offset()
+                if stated is not None and stated != broker.server_offset:
+                    raise UnknownBrokerError.wrong_clock(broker.slug, broker.server_offset, stated)
+            except UnknownBrokerError as refused:
+                source.close()
+                finish_collection(
+                    session, request.id, at=dt.datetime.now(tz=dt.UTC), error=str(refused)
+                )
+                session.commit()
+                logger.warning("collection %s refused: %s", collection_id, refused)
+                return 0
             try:
                 outcome = run_collection(
                     source,
@@ -250,6 +267,7 @@ async def collect_range(_context: dict[str, Any], collection_id: str) -> int:
                         request.id,
                         root=root,
                         timeframe=request.timeframe,
+                        broker_id=broker.id,
                     ),
                     root=root,
                     symbol=request.symbol,

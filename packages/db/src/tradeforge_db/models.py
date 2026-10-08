@@ -251,6 +251,36 @@ def _created_at() -> Mapped[dt.datetime]:
 # --------------------------------------------------------------------------- #
 
 
+class Broker(Base):
+    """A broker this system collects from: one MT5 server, one terminal, one clock (ADR-0032).
+
+    ⚠️ **Several at once** (08/10): forex, metals, indices and crypto at ActivTrades, US shares at
+    Tradeview, Brazilian shares at a third. A broker is known by its MT5 **server** — the name a
+    terminal reports when logged in — and gets a short `slug` for queues and screens.
+
+    `server_offset` is the clock the broker's agent collects with, read from here rather than from
+    an environment variable somebody has to remember to change when switching terminals.
+    """
+
+    __tablename__ = "brokers"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    slug: Mapped[str] = mapped_column(String(32), nullable=False, unique=True)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    server: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    terminal_path: Mapped[str | None] = mapped_column(Text)
+    server_offset: Mapped[dt.timedelta] = mapped_column(Interval, nullable=False)
+    created_at: Mapped[dt.datetime] = _created_at()
+
+    __table_args__ = (
+        CheckConstraint("slug ~ '^[a-z0-9][a-z0-9-]*$'", name="slug_is_a_slug"),
+        CheckConstraint(
+            "server_offset BETWEEN interval '-14 hours' AND interval '14 hours'",
+            name="server_offset_is_a_clock",
+        ),
+    )
+
+
 class Instrument(Base):
     """A tradable symbol and the numbers needed to price a position in it.
 
@@ -267,6 +297,18 @@ class Instrument(Base):
     id: Mapped[uuid.UUID] = _uuid_pk()
 
     symbol: Mapped[str] = mapped_column(String(32), nullable=False, unique=True)
+    """The internal name every part of the system keys on — candles' folder, sweeps, screens,
+    streams (ADR-0032). Usually the broker's ticker; different only when two brokers use one
+    ticker for two things (`GOLD`: the metal at ActivTrades, Barrick Gold at Tradeview)."""
+
+    # Where it comes from and what that broker calls it (ADR-0032). Null on a row with no broker
+    # behind it — the seeds and the rows tests build by hand; the collector always states both.
+    # RESTRICT: a broker is not deleted while an instrument says it comes from there.
+    broker_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("brokers.id", ondelete="RESTRICT")
+    )
+    broker_symbol: Mapped[str | None] = mapped_column(String(32))
+
     name: Mapped[str] = mapped_column(String(128), nullable=False)
     asset_class: Mapped[AssetClass] = mapped_column(
         _enum(AssetClass, "asset_class"), nullable=False
@@ -346,6 +388,13 @@ class Instrument(Base):
         CheckConstraint(
             "server_offset BETWEEN interval '-14 hours' AND interval '14 hours'",
             name="server_offset_is_a_clock",
+        ),
+        # One broker's ticker is one instrument here (ADR-0032); the same ticker at two brokers
+        # is two rows, under two internal names.
+        UniqueConstraint("broker_id", "broker_symbol"),
+        # A ticker without a broker would name nothing.
+        CheckConstraint(
+            "broker_symbol IS NULL OR broker_id IS NOT NULL", name="broker_symbol_needs_a_broker"
         ),
     )
 

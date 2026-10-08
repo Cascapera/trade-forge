@@ -25,6 +25,11 @@ from tradeforge_db.broker_symbols import MARKETS, market_of
         (r"Acoes\PETR4.SA", "PETR4.SA", "stocks_br"),
         (r"Stocks\Brazil\VALE3", "VALE3", "stocks_br"),
         (r"Stocks\B3\ITUB4", "ITUB4", "stocks_br"),
+        # XP, as listed on 08/10: the cash market, the continuous futures, the index itself.
+        (r"BOVESPA\A VISTA\PETR4", "PETR4", "stocks_br"),
+        (r"BMF\SERIES CONTINUAS\WIN$N", "WIN$N", "futures"),
+        (r"BMF\SERIES CONTINUAS\BIT$N", "BIT$N", "futures"),
+        (r"BOVESPA\INDICES\IBOV", "IBOV", "indices"),
         (None, "WEIRD", "other"),
     ],
 )

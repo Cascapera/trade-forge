@@ -18,13 +18,26 @@ from tradeforge_engine.domain import AssetClass
         # is the same word with a noun after it. The only root added to the map, and the reason
         # is that it *names* the class rather than correlating with it.
         ("Crypto Currency\\BTCUSD", AssetClass.CRYPTO),
+        # XP (08/10): the root is the exchange, so the folder under it names the class.
+        ("BOVESPA\\A VISTA\\PETR4", AssetClass.STOCK),
+        ("BOVESPA\\INDICES\\IBOV", AssetClass.INDEX),
+        ("BMF\\SERIES CONTINUAS\\WIN$N", AssetClass.FUTURE),
     ],
 )
 def test_the_asset_class_is_read_from_the_symbol_tree(path: str, expected: AssetClass) -> None:
     assert asset_class_from_path(path) == expected
 
 
-@pytest.mark.parametrize("path", ["CFDs\\XAUUSD", "Metals\\XAGUSD", "CFD\\Exotic\\WHATEVER"])
+@pytest.mark.parametrize(
+    "path",
+    [
+        "CFDs\\XAUUSD",
+        "Metals\\XAGUSD",
+        "CFD\\Exotic\\WHATEVER",
+        # XP's options: under the same root as its shares, and not one of the five classes.
+        "BOVESPA\\OPCOES\\PETRJ300",
+    ],
+)
 def test_a_path_that_names_no_class_returns_none_instead_of_guessing(path: str) -> None:
     """⚠️ The two roots that hold 17 of this broker's 84 symbols, and neither has an answer.
 

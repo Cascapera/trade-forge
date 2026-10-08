@@ -271,7 +271,7 @@ def market_of(path: str | None, symbol: str) -> str:  # noqa: PLR0911 — one an
     name = symbol.lower()
     if "crypto" in text:
         return "crypto"
-    if "forward" in text or "future" in text:
+    if "forward" in text or "future" in text or "bmf" in words:
         return "futures"
     if "metal" in text:
         return "metals"
@@ -281,6 +281,8 @@ def market_of(path: str | None, symbol: str) -> str:  # noqa: PLR0911 — one an
         return "indices"
     if "forex" in text or "currenc" in text or words & {"fx", "majors", "minors", "exotics"}:
         return "forex"
+    if "bovespa" in words and "vista" in words:
+        return "stocks_br"  # XP: `BOVESPA\A VISTA\PETR4`, the cash market
     if "share" in text or "stock" in text or "equit" in text or _EXCHANGE_SUFFIX.search(name):
         if name.endswith((".us", ".usa")) or words & _US_WORDS:
             return "stocks_us"

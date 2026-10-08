@@ -62,6 +62,8 @@ class _FakeTerminal:
         self._rates = rates or []
         self.shutdown_called = False
         self.initialised = 0
+        # Which `terminal64.exe` each attach asked for; `None` is "whichever MT5 is open".
+        self.paths: list[str | None] = []
         self.selected: list[str] = []
         self.from_pos: list[tuple[str, int, int]] = []
         # Two symbols, one of them outside Market Watch — which is the ordinary state of a real
@@ -71,8 +73,9 @@ class _FakeTerminal:
             _SymbolInfo(name="AUDCAD", description="", path="", visible=False),
         ]
 
-    def initialize(self) -> bool:
+    def initialize(self, path: str | None = None) -> bool:
         self.initialised += 1
+        self.paths.append(path)
         return True
 
     def shutdown(self) -> None:
@@ -366,7 +369,7 @@ def test_a_reconnection_that_failed_leaves_a_source_the_loop_can_still_reach() -
     """
 
     class _WontComeBack(_FakeTerminal):
-        def initialize(self) -> bool:
+        def initialize(self, path: str | None = None) -> bool:
             self.initialised += 1
             return self.initialised == 1
 
@@ -463,7 +466,7 @@ def test_a_slice_across_1970_is_asked_from_1970() -> None:
 
 def test_a_terminal_that_refuses_the_connection_says_so() -> None:
     class _Refusing(_FakeTerminal):
-        def initialize(self) -> bool:
+        def initialize(self, path: str | None = None) -> bool:
             return False
 
     with pytest.raises(ConnectionError, match="refused"):
@@ -988,21 +991,9 @@ def test_a_fixed_spread_instrument_gets_no_cost_floor() -> None:
     assert report.first_measured_cost is None
 
 
-class _PathTerminal(_FakeTerminal):
-    """A terminal that records which `terminal64.exe` it was asked to attach to."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.paths: list[str | None] = []
-
-    def initialize(self, path: str | None = None) -> bool:
-        self.paths.append(path)
-        return True
-
-
 def test_a_terminal_path_names_which_installed_terminal_to_attach_to() -> None:
     """ADR-0032: several brokers' terminals side by side — each agent attaches to its own."""
-    named, anyone = _PathTerminal(), _PathTerminal()
+    named, anyone = _FakeTerminal(), _FakeTerminal()
 
     MT5Source(
         terminal=named, server_offset=dt.timedelta(hours=3), path=r"C:\TV\terminal64.exe"

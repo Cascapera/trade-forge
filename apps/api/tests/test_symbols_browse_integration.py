@@ -134,3 +134,35 @@ def test_a_whole_market_comes_in_one_request(
 
     assert len(whole["items"]) == 30
     assert client.get("/symbols/browse", params={"limit": 501}).status_code == 422
+
+
+def test_each_symbol_says_which_brokers_terminal_lists_it(
+    client: TestClient, session_factory: Callable[[], Session]
+) -> None:
+    """ADR-0032: two terminals' lists side by side, each line naming its broker."""
+    browsable(session_factory)
+    with session_factory() as session:
+        replace_snapshot(
+            session,
+            [BrokerSymbolEntry(symbol="NVDA", description="NVIDIA", path=r"Stocks\US")],
+            server="Tradeview-Demo",
+            synced_at=SYNCED_AT,
+        )
+        replace_snapshot(
+            session, [BrokerSymbolEntry(symbol="ZZZ")], server="Nobody-Demo", synced_at=SYNCED_AT
+        )
+        session.commit()
+
+    page = client.get("/symbols/browse", params={"limit": 500}).json()["items"]
+    browsed = {one["symbol"]: one["broker"] for one in page}
+
+    def searched(prefix: str) -> str | None:
+        found = client.get("/symbols/search", params={"q": prefix}).json()["symbols"]
+        return str(found[0]["broker"]) if found[0]["broker"] else None
+
+    assert (browsed["EURUSD"], browsed["NVDA"], browsed["ZZZ"]) == (
+        "activtrades",
+        "tradeview",
+        None,
+    )
+    assert (searched("btc"), searched("nvd"), searched("zz")) == ("activtrades", "tradeview", None)

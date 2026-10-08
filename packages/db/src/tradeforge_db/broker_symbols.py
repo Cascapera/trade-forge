@@ -15,7 +15,7 @@ from decimal import Decimal
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
-from tradeforge_db.models import BrokerSymbol, Instrument
+from tradeforge_db.models import Broker, BrokerSymbol, Instrument
 
 logger = logging.getLogger(__name__)
 
@@ -150,6 +150,9 @@ class SymbolMatch:
     digits: int | None
     visible: bool
     catalogued: bool
+    broker: str | None = None
+    """The slug of the broker whose terminal lists it (ADR-0032); `None` for a server nobody
+    registered."""
 
 
 def search_symbols(
@@ -180,8 +183,9 @@ def search_symbols(
     # Joined on `symbol` rather than on a foreign key, because there is none — see the model.
     # The overlap between the two tables is a coincidence of names, not a relation.
     statement = (
-        select(BrokerSymbol, Instrument.id)
+        select(BrokerSymbol, Instrument.id, Broker.slug)
         .outerjoin(Instrument, Instrument.symbol == BrokerSymbol.symbol)
+        .outerjoin(Broker, Broker.server == BrokerSymbol.server)
         .where(BrokerSymbol.symbol.istartswith(prefix, autoescape=True))
         .order_by(BrokerSymbol.symbol)
         .limit(limit)
@@ -194,8 +198,9 @@ def search_symbols(
             digits=row.digits,
             visible=row.visible,
             catalogued=instrument_id is not None,
+            broker=broker,
         )
-        for row, instrument_id in session.execute(statement)
+        for row, instrument_id, broker in session.execute(statement)
     ]
 
 
@@ -300,8 +305,9 @@ def browse_symbols(session: Session) -> list[BrowsedSymbol]:
     caller. A broker lists hundreds to a few thousand symbols: classified here once per request,
     in memory, because the market is read from words no column holds."""
     statement = (
-        select(BrokerSymbol, Instrument.id, Instrument.default_spread_points)
+        select(BrokerSymbol, Instrument.id, Instrument.default_spread_points, Broker.slug)
         .outerjoin(Instrument, Instrument.symbol == BrokerSymbol.symbol)
+        .outerjoin(Broker, Broker.server == BrokerSymbol.server)
         .order_by(BrokerSymbol.symbol)
     )
     return [
@@ -313,9 +319,10 @@ def browse_symbols(session: Session) -> list[BrowsedSymbol]:
                 digits=row.digits,
                 visible=row.visible,
                 catalogued=instrument_id is not None,
+                broker=broker,
             ),
             market=market_of(row.path, row.symbol),
             spread_points=spread,
         )
-        for row, instrument_id, spread in session.execute(statement)
+        for row, instrument_id, spread, broker in session.execute(statement)
     ]

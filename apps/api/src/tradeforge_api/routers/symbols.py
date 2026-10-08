@@ -143,6 +143,7 @@ def browse(  # noqa: PLR0913, PLR0917 — one query parameter per filter
                 market=one.market,
                 catalogued=one.match.catalogued,
                 spread_points=one.spread_points,
+                broker=one.match.broker,
             )
             for one in found[offset : offset + limit]
         ],

@@ -30,6 +30,10 @@ export interface Instrument {
    * for an unmeasured instrument, but says so rather than implying the number is a result.
    */
   default_spread_points: string | null
+  /** The broker it is collected from (ADR-0032); `null` for a seed no broker catalogued. */
+  broker?: string | null
+  /** That broker's own ticker — may differ from `symbol`, the internal name. */
+  broker_symbol?: string | null
 }
 
 export interface StrategyOut {
@@ -832,6 +836,8 @@ export interface BrokerSymbol {
    * particular window — only that the symbol has been catalogued at all.
    */
   catalogued: boolean
+  /** The broker whose terminal lists it (ADR-0032); `null` for a server nobody registered. */
+  broker?: string | null
 }
 
 /** Where the symbol list came from. `null` means nobody has ever synced this broker. */
@@ -875,6 +881,8 @@ export interface BrowsedSymbol {
   catalogued: boolean
   /** The measured spread in ticks; `null` until the collector catalogued it. */
   spread_points: string | null
+  /** The broker whose terminal lists it (ADR-0032); `null` for a server nobody registered. */
+  broker?: string | null
 }
 
 /** One page of a market's symbols. */

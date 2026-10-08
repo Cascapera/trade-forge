@@ -203,6 +203,6 @@ Os PRs 0–3 servem também para coletar e varrer as ações do Brasil e dos EUA
   resultado em R (ganho ou perda) ou "stop". O PERTO não é postado.
 - **Alvo:** o do setup monitorado; sem alvo no setup, avisa ao atingir 5R, ou o stop, ou a saída.
 - **Ações do Brasil:** XP, conta demo (`XPMT5-DEMO`); a real não traz histórico a mais (#411–#414).
+- **Horário:** 24 h — se o sistema está ligado e o setup dá sinal, posta. Sem janela de horário.
 
-**Ainda aberta:**
-1. **Horários:** avisar 24 h (com limite de mensagens por hora) ou só no horário das aulas/mercado?
+Todas as decisões do desenho estão tomadas.

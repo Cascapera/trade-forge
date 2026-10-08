@@ -62,6 +62,23 @@ class SnapshotStore:
     def keep_best(self, made: BestMapOut) -> None:
         self._client.set(_key(made.metric, every_run=made.every_run), made.model_dump_json())
 
+    def wake(self, metric: BestMetric, *, every_run: bool) -> None:
+        """Ask the next refresh tick to compute this map now (08/10): it was served stale."""
+        self._client.set(f"{_key(metric, every_run=every_run)}:wake", "1")
+
+    def woken(self) -> list[tuple[BestMetric, bool]]:
+        """The maps asked for again after a long sleep, waiting to be computed."""
+        return [
+            (metric, every_run)
+            for metric in BestMetric
+            for every_run in (False, True)
+            if self._client.get(f"{_key(metric, every_run=every_run)}:wake") == "1"
+        ]
+
+    def settle(self, metric: BestMetric, *, every_run: bool) -> None:
+        """The woken map was computed. An empty value, since `KeyValue` has no delete."""
+        self._client.set(f"{_key(metric, every_run=every_run)}:wake", "")
+
     def best_fingerprint(self) -> str | None:
         raw = self._client.get(f"{_PREFIX}:fingerprint")
         return None if raw is None else str(raw)

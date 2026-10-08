@@ -79,8 +79,15 @@ export function BestByMarket(): React.JSX.Element {
           Each setup&apos;s best run on each market and chart, across every sweep on engine{' '}
           {map.data?.engine_version ?? '…'}. In sample and not validated: a cell is the best of the
           runs it ranked, and part of being best is the luck of the search.
-          {map.data?.as_of != null && (
+          {map.data?.as_of != null && map.data.refreshing !== true && (
             <span className="text-slate-500"> Updated {clock(map.data.as_of)}.</span>
+          )}
+          {map.data?.as_of != null && map.data.refreshing === true && (
+            <span role="status" className="text-amber-300">
+              {' '}
+              Refreshing — showing the map of {clock(map.data.as_of)}; the current one arrives in a
+              few minutes.
+            </span>
           )}
         </p>
       </header>

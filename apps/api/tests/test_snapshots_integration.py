@@ -10,6 +10,7 @@ computes the next ones off the request.
 # them; each test then takes them as parameters, which ruff reads as redefining the import.
 # ruff: noqa: F811
 
+import datetime as dt
 import uuid
 from collections.abc import Callable
 from typing import Any
@@ -156,6 +157,33 @@ class TestTheBestMapIsServedFromItsSnapshot:
         refreshed = store.read_best(BestMetric.NET_R, every_run=True)
         assert refreshed is not None
         assert len(refreshed.cells) == 2
+
+    def test_a_map_nobody_opened_for_a_day_is_served_flagged_and_computed_at_once(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        """⚠️ **Regression (08/10): CHOCH BASE missing from Best.** The refresh only computes maps
+        opened in the last day, so one left alone longer is served as old as it got — a whole new
+        setup absent, and nothing saying so."""
+        _sweep_id, runs = launched(client, points=1)
+        measured(session_factory, runs[0], net_r="1")
+        params = {"metric": "net_r", "every_run": True}
+        client.get("/best/map", params=params)
+        store = client.app.state.snapshots
+        two_days_ago = dt.datetime.now(tz=dt.UTC) - dt.timedelta(days=2)
+        store._client.set("tradeforge:snapshot:best:net_r:every:read", two_days_ago.isoformat())
+        _later, more = launched(client, points=1)
+        measured(session_factory, more[0], net_r="2")
+
+        stale = client.get("/best/map", params=params).json()
+        assert stale["refreshing"] is True
+        assert len(stale["cells"]) == 1, "served the kept map rather than making them wait"
+        assert client.get("/best/map", params=params).json()["refreshing"] is True
+
+        assert snapshots.refresh_woken(store, inline) == 1
+        fresh = client.get("/best/map", params=params).json()
+        assert fresh["refreshing"] is False
+        assert len(fresh["cells"]) == 2
+        assert snapshots.refresh_woken(store, inline) == 0
 
 
 def test_the_child_process_computes_and_keeps_a_summary(

@@ -54,6 +54,7 @@ from tradeforge_api.schemas import (
     BestTestOut,
     Symbol,
 )
+from tradeforge_api.snapshots import BEST_READ
 from tradeforge_db.models import (
     Backtest,
     BacktestMetrics,
@@ -164,8 +165,17 @@ def best_map(
     ⚠️ **Served from a snapshot, computed off the request.** Ranking every finished run of every
     sweep took 30 s an opening on 05/10, and grows with every sweep. `snapshots` computes the map
     again every few minutes when runs have finished; this computes it only when none is kept."""
+    # ⚠️ Read **before** `read_best` marks it read: a map nobody opened for `BEST_READ` is one the
+    # refresh skipped, so what is kept may be days old (CHOCH BASE missing, 08/10). It is served —
+    # stale beats a three-minute wait — but flagged, and the refresh is asked to compute it now.
+    last_read = snapshots.read_since(metric, every_run=every_run)
     kept = snapshots.read_best(metric, every_run=every_run)
     if kept is not None:
+        if last_read is None or last_read < dt.datetime.now(tz=dt.UTC) - BEST_READ:
+            snapshots.wake(metric, every_run=every_run)
+            return kept.model_copy(update={"refreshing": True})
+        if (metric, every_run) in snapshots.woken():
+            return kept.model_copy(update={"refreshing": True})
         return kept
     made = compute_best_map(session, metric, every_run=every_run)
     snapshots.keep_best(made)

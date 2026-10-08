@@ -1241,7 +1241,8 @@ export function useBestMap(metric: BestMetric, everyRun: boolean) {
     queryKey: ['best-map', metric, everyRun],
     queryFn: () => api.getBestMap(metric, everyRun),
     placeholderData: (previous) => previous,
-    refetchInterval: 60_000,
+    // Sooner while a stale map is being computed again: about three minutes, not one more.
+    refetchInterval: (query) => (query.state.data?.refreshing === true ? 15_000 : 60_000),
   })
 }
 

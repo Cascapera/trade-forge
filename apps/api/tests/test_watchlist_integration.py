@@ -123,8 +123,9 @@ def test_an_item_can_be_changed_and_removed(
     assert (changed.json()["no_target_r"], changed.json()["note"]) == ("3.00000000", "x")
     assert client.patch(f"/watchlist/{item['id']}", json={"no_target_r": "0"}).status_code == 422
 
-    assert client.delete(f"/watchlist/{item['id']}").status_code == 204
-    assert client.delete(f"/watchlist/{item['id']}").status_code == 404
+    removed = client.delete(f"/watchlist/{item['id']}")
+    again = client.delete(f"/watchlist/{item['id']}")
+    assert (removed.status_code, again.status_code) == (204, 404)
     assert client.get("/watchlist").json() == []
 
 

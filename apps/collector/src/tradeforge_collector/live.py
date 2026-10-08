@@ -65,8 +65,10 @@ __all__ = [
     "CandlePublisher",
     "LiveSource",
     "Subscription",
+    "TickerLiveSource",
     "poll_once",
     "run",
+    "run_on_demand",
     "stream_name",
 ]
 
@@ -469,3 +471,112 @@ def _reconnect(source: LiveSource, subscriptions: Iterable[Subscription]) -> boo
         return False
     logger.info("reconnected")
     return True
+
+
+def _by_name(subscription: Subscription) -> tuple[str, str]:
+    return (subscription.symbol, subscription.timeframe)
+
+
+def run_on_demand(  # noqa: PLR0913 — the same seams as `run`, plus where the demand comes from
+    source: LiveSource,
+    publisher: CandlePublisher,
+    demand: Callable[[], Sequence[Subscription]],
+    *,
+    every: float,
+    polls: int | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+    backoff: Backoff = DEFAULT_BACKOFF,
+    max_backfill: int = DEFAULT_MAX_BACKFILL,
+) -> int:
+    """`run`, watching whatever `demand` answers each round instead of a fixed list (ADR-0032).
+
+    One broker's live loop: a pair asked for starts being watched on the next round — resumed
+    from its stream like a restart, so a pair asked for again after a pause gets its gap filled —
+    and a pair no longer asked for stops. Returns how many candles were published.
+
+    ⚠️ A pair the terminal refuses to select is set aside, not retried every five seconds, until
+    it drops out of the demand: a refusal is configuration (a ticker the account cannot see), and
+    hammering it would bury the log line that says so. A `ConnectionError` while selecting is the
+    feed, not the pair, and is retried like any other.
+    """
+    seen: dict[Subscription, dt.datetime] = {}
+    watching: set[Subscription] = set()
+    refused: set[Subscription] = set()
+    total = 0
+    failures = 0
+    polls_left = polls
+
+    while True:
+        last_round = polls_left is not None and polls_left <= 1
+        try:
+            asked = set(demand())
+            for gone in (watching | refused) - asked:
+                seen.pop(gone, None)
+                logger.info("%s %s: no longer asked for", gone.symbol, gone.timeframe)
+            watching &= asked
+            refused &= asked
+            for new in sorted(asked - watching - refused, key=_by_name):
+                _resume(publisher, (new,), seen)
+                try:
+                    source.subscribe(new.symbol)
+                except ConnectionError:
+                    raise
+                except Exception:
+                    logger.exception("%s %s: the terminal refused it", new.symbol, new.timeframe)
+                    refused.add(new)
+                    continue
+                watching.add(new)
+                logger.info("%s %s: now watched", new.symbol, new.timeframe)
+            published = poll_once(
+                source,
+                publisher,
+                sorted(watching, key=_by_name),
+                seen=seen,
+                max_backfill=max_backfill,
+            )
+        except ConnectionError as error:
+            if last_round:
+                raise
+            failures += 1
+            delay = backoff.delay(failures)
+            logger.warning(
+                "the terminal is not answering (%s); reconnecting in %.0fs (attempt %d)",
+                error,
+                delay,
+                failures,
+            )
+            sleep(delay)
+            _reconnect(source, watching)
+        else:
+            failures = 0
+            total += sum(len(bars) for bars in published.values())
+            if last_round:
+                break
+            sleep(every)
+
+        if polls_left is not None:
+            polls_left -= 1
+
+    return total
+
+
+class TickerLiveSource:
+    """A live source asked by the broker's ticker for an internal name (ADR-0032): `WIN` is
+    watched as `WIN$`. `tickers` is read on every call, so the loop can add pairs as they are
+    asked for; a symbol missing from it is asked for by its own name."""
+
+    def __init__(self, source: LiveSource, tickers: Mapping[str, str]) -> None:
+        self._source = source
+        self._tickers = tickers
+
+    def subscribe(self, symbol: str) -> None:
+        """Select the ticker."""
+        self._source.subscribe(self._tickers.get(symbol, symbol))
+
+    def recent_closed(self, symbol: str, timeframe: str, count: int) -> list[Candle]:
+        """The ticker's closed bars; a `Candle` carries no name."""
+        return self._source.recent_closed(self._tickers.get(symbol, symbol), timeframe, count)
+
+    def reconnect(self) -> None:
+        """Attach the terminal again."""
+        self._source.reconnect()

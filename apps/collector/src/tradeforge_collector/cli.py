@@ -30,7 +30,9 @@ from tradeforge_collector.live import (
     DEFAULT_MAX_BACKFILL,
     LiveSource,
     Subscription,
+    TickerLiveSource,
     run,
+    run_on_demand,
 )
 from tradeforge_collector.source import MarketDataSource
 from tradeforge_collector.synthetic import SyntheticSource
@@ -143,13 +145,21 @@ def _parser() -> argparse.ArgumentParser:
             "measured from the newest tick and a shut market freezes that measurement."
         ),
     )
-    live.add_argument("symbol")
+    live.add_argument("symbol", nargs="?", help="the symbol to watch; left out with --broker")
     live.add_argument(
         "timeframes",
-        nargs="+",
+        nargs="*",
         choices=sorted(TIMEFRAME_STEP),
         metavar="TIMEFRAME",
         help="one or more timeframes to watch on this symbol, e.g. M1 M5",
+    )
+    live.add_argument(
+        "--broker",
+        metavar="SLUG",
+        help=(
+            "watch whatever is asked of this broker (ADR-0032): its terminal and clock come from "
+            "the brokers table, and the pairs from live:wanted:<slug>, renewed by each session"
+        ),
     )
     live.add_argument(
         "--source",
@@ -322,6 +332,10 @@ def _live(args: argparse.Namespace) -> int:
 
     from tradeforge_collector.publisher import RedisCandlePublisher  # noqa: PLC0415
 
+    if args.broker:
+        return _live_broker(args)
+    if not args.symbol or not args.timeframes:
+        raise ValueError("name a symbol and at least one timeframe, or a --broker to serve")
     _refuse_unstamped_timeframes(args.timeframes)
 
     source = _source(args)
@@ -353,6 +367,69 @@ def _live(args: argparse.Namespace) -> int:
         logging.getLogger(__name__).info("stopped")
     finally:
         client.close()
+    return 0
+
+
+def _live_broker(args: argparse.Namespace) -> int:
+    """One broker's live loop: its own terminal, watching what sessions ask of it (ADR-0032).
+
+    A process apart from the collection agent on purpose: the agent attaches and detaches the
+    terminal around every job, and the live loop holds one connection for hours — a job closing
+    the shared connection under it would take the feed down mid-bar.
+    """
+    from redis import Redis  # noqa: PLC0415
+
+    from tradeforge_collector.demand import wanted  # noqa: PLC0415
+    from tradeforge_collector.mt5_source import MT5Source  # noqa: PLC0415 — ADR-02 boundary
+    from tradeforge_collector.publisher import RedisCandlePublisher  # noqa: PLC0415
+    from tradeforge_db.brokers import broker_by_slug, broker_ticker  # noqa: PLC0415
+
+    log = logging.getLogger(__name__)
+    engine = create_db_engine()
+    factory = create_session_factory(engine)
+    with session_scope(factory) as session:
+        broker = broker_by_slug(session, args.broker)
+        slug, path, offset = broker.slug, broker.terminal_path, broker.server_offset
+
+    terminal = MT5Source(server_offset=offset, path=path).connect()
+    tickers: dict[str, str] = {}
+    source = TickerLiveSource(terminal, tickers)
+    client = Redis(host=args.redis_host, port=args.redis_port, decode_responses=True)
+    publisher = RedisCandlePublisher(client)
+
+    def demand() -> list[Subscription]:
+        asked = []
+        for pair in wanted(client, slug):
+            if pair.timeframe in _UNSTAMPED_TIMEFRAMES:
+                log.warning(
+                    "%s %s asked for, not watched: %s",
+                    pair.symbol,
+                    pair.timeframe,
+                    _UNSTAMPED_TIMEFRAMES[pair.timeframe],
+                )
+                continue
+            if pair.symbol not in tickers:
+                with session_scope(factory) as session:
+                    tickers[pair.symbol] = broker_ticker(session, pair.symbol)
+            asked.append(pair)
+        return asked
+
+    log.info("watching what is asked of %s, polling every %.0fs", slug, args.every)
+    try:
+        run_on_demand(
+            source,
+            publisher,
+            demand,
+            every=args.every,
+            polls=1 if args.once else None,
+            max_backfill=args.max_backfill,
+        )
+    except KeyboardInterrupt:
+        log.info("stopped")
+    finally:
+        client.close()
+        terminal.close()
+        engine.dispose()
     return 0
 
 

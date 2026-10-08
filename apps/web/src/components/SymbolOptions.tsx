@@ -1,5 +1,6 @@
 import { useSyncSymbols } from '../api/hooks'
 import type { BrokerSymbol, SymbolSnapshot } from '../api/types'
+import { BrokerTag } from './BrokerTag'
 
 /**
  * The dropdown itself: one option per result, or the sentence that says why there are none.
@@ -45,6 +46,7 @@ export function SymbolOptions(props: {
           >
             <span className="font-mono text-slate-100">{found.symbol}</span>
             <span className="truncate text-xs text-slate-400">{found.description}</span>
+            <BrokerTag broker={found.broker} />
             {/* Marked when it is *not* runnable, rather than badging the one that is. The
                 exception is what a reader needs to notice. */}
             {!found.catalogued && (

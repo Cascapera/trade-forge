@@ -188,6 +188,11 @@ class InstrumentOut(_Out):
     # claim that trading it is free. The engine never reads this: costs reach a run as a
     # plugged-in `CostModel` (ADR-07), and this only decides what the screen offers first.
     default_spread_points: Money | None = None
+    # Where it is collected from (ADR-0032): the broker's slug and its own ticker, which may
+    # differ from `symbol` — the internal name — when two brokers use the same ticker. Both null
+    # for a row no broker catalogued (a seed).
+    broker: str | None = None
+    broker_symbol: str | None = None
 
 
 class BrokerSymbolOut(_Out):
@@ -213,6 +218,9 @@ class BrokerSymbolOut(_Out):
     # would find out which by clicking. Not a claim that candles exist for any particular range
     # — only that the symbol has been catalogued at all.
     catalogued: bool = False
+    # The broker whose terminal lists it (ADR-0032): two brokers can list the same ticker, and
+    # the screen says whose this one is. Null for a server nobody registered.
+    broker: str | None = None
 
     # ⚠️ `prop-decorator` is a mypy limitation, not a defect being silenced: mypy does not
     # support any decorator stacked on top of `@property`, and this is the workaround Pydantic's
@@ -3142,6 +3150,8 @@ class BrowsedSymbolOut(BaseModel):
     catalogued: bool
     """Whether the system has collected it: a launch over one that is not collects it first."""
     spread_points: Decimal | None = None
+    broker: str | None = None
+    """The broker whose terminal lists it (ADR-0032); null for a server nobody registered."""
 
 
 class SymbolBrowseOut(BaseModel):

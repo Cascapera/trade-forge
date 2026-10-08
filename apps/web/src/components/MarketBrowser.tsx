@@ -6,6 +6,7 @@ import { api } from '../api/client'
 import { useBrowseSymbols, useMarkets } from '../api/hooks'
 import type { BrowsedSymbol, Market } from '../api/types'
 import { browsedCost } from '../basket/settings'
+import { BrokerTag } from './BrokerTag'
 import { Pager } from './Pager'
 import { inputClass } from './symbolSearch'
 
@@ -353,6 +354,7 @@ function BrowseRows(props: {
               <span className="hidden min-w-0 grow truncate text-slate-400 sm:block">
                 {row.description}
               </span>
+              <BrokerTag broker={row.broker} />
               <span
                 className={`ml-auto shrink-0 text-xs ${
                   row.catalogued && row.spread_points !== null ? 'text-slate-400' : 'text-amber-300'

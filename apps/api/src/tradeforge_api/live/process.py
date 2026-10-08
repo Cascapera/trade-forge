@@ -117,6 +117,15 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
         default=None,
         help="signal only: the watchlist item this session follows, carried on every event",
     )
+    parser.add_argument(
+        "--session-id",
+        type=uuid.UUID,
+        default=None,
+        help=(
+            "the id this session will have — for a supervisor that has to be able to ask it to "
+            "stop (live-session:<id>:stop); minted here when left out"
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -140,7 +149,7 @@ def main(argv: list[str] | None = None) -> int:
     # ⚠️ **Minted here rather than inside `run_session`, and that is what makes the session
     # addressable.** A stop request names a session by id, so the predicate below has to know
     # the name before the session exists. See `SessionPlan.session_id`.
-    session_id = uuid.uuid4()
+    session_id = args.session_id or uuid.uuid4()
 
     # A signal to this process, **or** somebody asking this session to stop. The `or` is the
     # whole feature: `run_session` documents `stopping` as a predicate rather than an `Event`

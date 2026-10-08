@@ -232,7 +232,9 @@ def test_the_session_is_named_before_it_is_warmed() -> None:
     """
     source = inspect.getsource(main)
 
-    assert source.index("session_id = uuid.uuid4()") < source.index("stop_predicate("), (
+    # Given by a supervisor that must be able to ask it to stop (signals PR 5b), or minted here.
+    named = "session_id = args.session_id or uuid.uuid4()"
+    assert source.index(named) < source.index("stop_predicate("), (
         "the predicate is built before the session has a name"
     )
     assert "session_id=session_id" in source, "the plan no longer carries the minted id"

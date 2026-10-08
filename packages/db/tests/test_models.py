@@ -28,6 +28,8 @@ def ddl(name: str) -> str:
 
 EXPECTED_TABLES = {
     "instruments",
+    # The brokers collected from, several at once (rev_0050, ADR-0032).
+    "brokers",
     # Which collections a run is waiting for before it may start (rev_0019). A table rather than
     # a column, because one run can wait for several downloads.
     "backtest_collections",

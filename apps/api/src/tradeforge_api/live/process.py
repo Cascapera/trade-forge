@@ -27,7 +27,9 @@ from tradeforge_api.live.broker import MT5Broker
 from tradeforge_api.live.candle_stream import CandleStream
 from tradeforge_api.live.session import SessionPlan, Venue, reconcile_on_start, run_session
 from tradeforge_api.live.stop import stop_predicate
+from tradeforge_collector.demand import DemandLease
 from tradeforge_collector.live import Subscription
+from tradeforge_db.brokers import broker_slug_for_symbol
 from tradeforge_db.models import Instrument, SessionMode
 from tradeforge_db.session import create_db_engine, create_session_factory, session_scope
 from tradeforge_engine.domain import InstrumentSpec
@@ -144,6 +146,15 @@ def main(argv: list[str] | None = None) -> int:
             logger.error("no instrument with id %s", args.instrument)
             return 2
         subscription = Subscription(symbol=instrument.symbol, timeframe=args.timeframe)
+        broker = broker_slug_for_symbol(db, instrument.symbol)
+
+    # ⚠️ **Ask the broker's live loop for this pair, and keep asking while the session runs**
+    # (ADR-0032). Without it, somebody had to remember to start `collector live` on the right
+    # symbol, on the right terminal. An instrument no broker claims (a seed) is not asked for;
+    # its stream is fed, if at all, by a `collector live` started by hand, as before.
+    lease = None if broker is None else DemandLease(redis, broker, subscription).start()
+    if lease is None:
+        logger.warning("%s belongs to no broker: nothing will ask for its live bars", subscription)
     plan = SessionPlan(
         strategy_id=args.strategy,
         instrument_id=args.instrument,
@@ -173,6 +184,8 @@ def main(argv: list[str] | None = None) -> int:
             promotion_days=settings.live_promotion_days,
         )
     finally:
+        if lease is not None:
+            lease.stop()
         redis.close()
         engine.dispose()
 

@@ -7,9 +7,11 @@ cannot even be installed, and everything around the terminal call is ordinary co
 """
 
 import datetime as dt
+from typing import Any
 
 import pytest
 from arq.connections import RedisSettings
+from arq.worker import get_kwargs
 
 from tradeforge_collector import agent
 from tradeforge_collector.source import SymbolInfo
@@ -104,6 +106,17 @@ class TestTheStatedOffset:
 class TestTheWorkerSettings:
     def test_it_drains_its_own_queue(self) -> None:
         assert agent.WorkerSettings.queue_name == agent.COLLECT_QUEUE
+
+    def test_one_brokers_agent_keeps_every_setting_on_its_own_queue(self) -> None:
+        """⚠️ Read the way arq reads it — `get_kwargs` — because a subclass passed every other
+        check and then started a worker with no functions (ADR-0032)."""
+        # arq's own annotations are wrong (`dict[str, NameError]`, a base class nobody uses).
+        read: Any = get_kwargs
+        legacy = read(agent.WorkerSettings)
+        broker = read(agent.settings_on_queue("collect.tradeview"))
+
+        assert broker == {**legacy, "queue_name": "collect.tradeview"}
+        assert len(broker["functions"]) == 3
 
     def test_it_runs_exactly_one_job_at_a_time(self) -> None:
         """⚠️ **This is the whole answer to "do not overload the machine".**

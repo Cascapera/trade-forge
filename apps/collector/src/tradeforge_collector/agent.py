@@ -59,6 +59,7 @@ __all__ = [
     "data_root_from_env",
     "probe_history",
     "redis_settings_from_env",
+    "settings_on_queue",
     "sync_symbols",
 ]
 
@@ -405,3 +406,14 @@ class WorkerSettings:
 
     on_startup = start_heartbeat
     on_shutdown = stop_heartbeat
+
+
+def settings_on_queue(queue: str) -> type:
+    """`WorkerSettings` draining `queue` instead — one broker's agent (ADR-0032).
+
+    ⚠️ **Copied, not subclassed.** arq reads a settings class's own `__dict__` and never its
+    bases, so a subclass holding only `queue_name` starts a worker with no functions at all —
+    "at least one function or cron_job must be registered", found by starting the real agent.
+    """
+    own = {name: value for name, value in vars(WorkerSettings).items() if not name.startswith("__")}
+    return type("BrokerWorkerSettings", (), {**own, "queue_name": queue})

@@ -21,6 +21,7 @@ import { SweepDashboard } from './screens/SweepDashboard'
 import { SweepHistory } from './screens/SweepHistory'
 import { SweepResult } from './screens/SweepResult'
 import { WalkForwardResult } from './screens/WalkForwardResult'
+import { Watchlist } from './screens/Watchlist'
 import { useSession } from './store'
 
 function navClass({ isActive }: { isActive: boolean }): string {
@@ -127,6 +128,9 @@ export function App(): React.JSX.Element {
             <NavLink to="/live" className={navClass}>
               Live
             </NavLink>
+            <NavLink to="/watchlist" className={navClass}>
+              Watchlist
+            </NavLink>
             <NavLink to="/collect" className={navClass}>
               Collect
             </NavLink>
@@ -183,6 +187,7 @@ export function App(): React.JSX.Element {
             <Route path="/collect" element={<CollectSymbol />} />
             <Route path="/runs" element={<RunLog />} />
             <Route path="/live" element={<LiveSessions />} />
+            <Route path="/watchlist" element={<Watchlist />} />
             <Route path="/results/:id" element={<Results />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>

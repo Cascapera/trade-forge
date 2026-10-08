@@ -183,7 +183,7 @@ def test_a_slug_nobody_registered_names_the_ones_there_are(session: Session) -> 
 
 
 def test_xp_is_registered_on_brasilia_time_keeping_two_folders(session: Session) -> None:
-    xp = broker_for_server(session, "XPMT5-DEMO")
+    xp = broker_for_server(session, "XPMT5-PRD")
 
     assert (xp.slug, xp.server_offset) == ("xp", dt.timedelta(hours=-3))
     assert xp.catalogue_paths == [r"BOVESPA\A VISTA", r"BMF\SERIES CONTINUAS"]
@@ -215,10 +215,8 @@ def test_a_broker_without_folders_keeps_everything() -> None:
 
 def test_an_internal_name_keeps_the_brokers_ticker_beside_it(session: Session) -> None:
     """XP's `WIN$` is `WIN` here: a `$` is no name for a folder (ADR-0032)."""
-    xp = broker_for_server(session, "XPMT5-DEMO")
-    replace_snapshot(
-        session, [BrokerSymbolEntry(symbol="WIN$")], server="XPMT5-DEMO", synced_at=NOW
-    )
+    xp = broker_for_server(session, "XPMT5-PRD")
+    replace_snapshot(session, [BrokerSymbolEntry(symbol="WIN$")], server="XPMT5-PRD", synced_at=NOW)
 
     # Before it is catalogued, the ticker is what finds the broker.
     assert broker_slug_for_symbol(session, "WIN", "WIN$") == "xp"

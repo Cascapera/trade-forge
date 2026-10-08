@@ -39,6 +39,7 @@ dependencies = [
 [project.scripts]
 tradeforge-health = "tradeforge_api.cli:main"
 tradeforge-session = "tradeforge_api.live.process:main"
+tradeforge-signals = "tradeforge_api.live.supervisor:main"
 
 [build-system]
 requires = ["hatchling"]

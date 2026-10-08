@@ -89,10 +89,10 @@ COLLECT_QUEUE = LEGACY_QUEUE
 here; everything else goes to its broker's (`collect_queue_for`, ADR-0032)."""
 
 
-def collect_queue_for(session: Session, symbol: str) -> str:
+def collect_queue_for(session: Session, symbol: str, ticker: str | None = None) -> str:
     """The queue of the agent that can collect `symbol`: its broker's (ADR-0032), or the legacy
-    one when no broker claims it yet."""
-    return collect_queue(broker_slug_for_symbol(session, symbol))
+    one when no broker claims it yet. `ticker` is the broker's name for it when that differs."""
+    return collect_queue(broker_slug_for_symbol(session, symbol, ticker))
 
 
 """The queue only the host agent (`tradeforge-collector agent`) drains.

@@ -619,6 +619,9 @@ class Collection(Base):
     # none: a collection is *how a symbol gets into that table*. Requiring the row to exist
     # first would make the first collection of any new symbol impossible to record.
     symbol: Mapped[str] = mapped_column(String(32), nullable=False)
+    # The broker's ticker to ask the terminal for, when it is not `symbol` (ADR-0032): `WIN$`
+    # collected as `WIN`. Null asks for `symbol` itself — or the instrument's own ticker.
+    broker_symbol: Mapped[str | None] = mapped_column(String(32))
     timeframe: Mapped[str] = mapped_column(TIMEFRAME, nullable=False)
 
     date_from: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)

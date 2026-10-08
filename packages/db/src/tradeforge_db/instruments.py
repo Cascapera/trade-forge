@@ -48,6 +48,9 @@ class CatalogueEntry:
 
     spec: InstrumentSpec
     default_spread_points: Decimal | None = None
+    broker_symbol: str | None = None
+    """The broker's own ticker when it is not `spec.symbol`, the internal name (ADR-0032):
+    `WIN$` at XP is `WIN` here, because a `$` is no name for a folder or a URL."""
 
 
 class ClockChangedError(ValueError):
@@ -181,8 +184,10 @@ def upsert_instruments(
                 else {
                     "broker_id": broker_id,
                     "broker_symbol": (
-                        entry.spec if isinstance(entry, CatalogueEntry) else entry
-                    ).symbol,
+                        entry.broker_symbol or entry.spec.symbol
+                        if isinstance(entry, CatalogueEntry)
+                        else entry.symbol
+                    ),
                 }
             ),
         }

@@ -16,6 +16,7 @@ from tradeforge_db.brokers import (
     broker_for_server,
     broker_slug_for_symbol,
     broker_slugs,
+    broker_ticker,
     collect_queue,
     keeps_path,
     refuse_another_broker,
@@ -210,3 +211,25 @@ def test_a_broker_keeps_only_its_folders(path: str | None, kept: bool) -> None:
 def test_a_broker_without_folders_keeps_everything() -> None:
     assert keeps_path(None, r"BOVESPA\OPCOES\PETRJ300")
     assert keeps_path(None, None)
+
+
+def test_an_internal_name_keeps_the_brokers_ticker_beside_it(session: Session) -> None:
+    """XP's `WIN$` is `WIN` here: a `$` is no name for a folder (ADR-0032)."""
+    xp = broker_for_server(session, "XPMT5-DEMO")
+    replace_snapshot(
+        session, [BrokerSymbolEntry(symbol="WIN$")], server="XPMT5-DEMO", synced_at=NOW
+    )
+
+    # Before it is catalogued, the ticker is what finds the broker.
+    assert broker_slug_for_symbol(session, "WIN", "WIN$") == "xp"
+    assert broker_ticker(session, "WIN") == "WIN"
+
+    upsert_instruments(
+        session, (CatalogueEntry(spec("WIN", offset_hours=-3), None, "WIN$"),), broker_id=xp.id
+    )
+
+    row = session.scalars(select(Instrument).where(Instrument.symbol == "WIN")).one()
+    assert (row.broker_id, row.broker_symbol) == (xp.id, "WIN$")
+    # After, the instrument remembers it: a later collection of `WIN` asks for `WIN$`.
+    assert broker_ticker(session, "WIN") == "WIN$"
+    assert broker_slug_for_symbol(session, "WIN") == "xp"

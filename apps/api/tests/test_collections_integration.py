@@ -571,3 +571,27 @@ def test_a_symbol_no_broker_claims_still_goes_to_the_legacy_queue(
 
     assert response.status_code == 202, response.text
     assert queue.jobs == [(COLLECT_RANGE, {"_queue_name": COLLECT_QUEUE})]
+
+
+def test_an_internal_name_is_collected_by_the_brokers_ticker(
+    session_factory: Callable[[], Session], client: TestClient, queue: _CapturingQueue
+) -> None:
+    """`WIN` asked of XP's terminal as `WIN$` (ADR-0032): the ticker classifies and routes it,
+    and the row carries it to the agent."""
+    with session_factory() as session:
+        replace_snapshot(
+            session,
+            [BrokerSymbolEntry(symbol="WIN$", path=r"BMF\SERIES CONTINUAS\WIN$")],
+            server="XPMT5-DEMO",
+            synced_at=SYNCED_AT,
+        )
+        session.commit()
+
+    response = client.post(
+        "/collections", json=a_request(items=[{"symbol": "WIN", "broker_symbol": "WIN$"}])
+    )
+
+    assert response.status_code == 202, response.text
+    body = only(response.json())
+    assert (body["symbol"], body["broker_symbol"]) == ("WIN", "WIN$")
+    assert queue.jobs == [(COLLECT_RANGE, {"_queue_name": collect_queue("xp")})]

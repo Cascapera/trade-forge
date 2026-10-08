@@ -320,7 +320,7 @@ class DatabaseJournal:
     and a shared package importing an app fails `test_shared_packages_never_depend_on_apps`.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 — keyword-only; each names what the rows are written under
         self,
         session: Session,
         collection_id: uuid.UUID,
@@ -328,6 +328,7 @@ class DatabaseJournal:
         root: Path,
         timeframe: str,
         broker_id: uuid.UUID | None = None,
+        broker_symbol: str | None = None,
     ) -> None:
         self._session = session
         self._id = collection_id
@@ -336,6 +337,8 @@ class DatabaseJournal:
         self._broker_id = broker_id
         """The broker the instrument is catalogued under (ADR-0032); `None` keeps whichever it
         has — a journal built without a terminal behind it, as the tests do."""
+        self._broker_symbol = broker_symbol
+        """The ticker the terminal was asked for, when it is not the internal name."""
 
     def started(self) -> None:
         start_collection(self._session, self._id, at=_now())
@@ -352,7 +355,9 @@ class DatabaseJournal:
 
     def catalogued(self, spec: InstrumentSpec, spread: Decimal | None, on_disk: Coverage) -> None:
         upsert_instruments(
-            self._session, (CatalogueEntry(spec, spread),), broker_id=self._broker_id
+            self._session,
+            (CatalogueEntry(spec, spread, broker_symbol=self._broker_symbol),),
+            broker_id=self._broker_id,
         )
         instrument_id = self._session.execute(
             select(Instrument.id).where(Instrument.symbol == spec.symbol)

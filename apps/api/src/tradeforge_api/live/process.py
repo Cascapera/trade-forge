@@ -26,11 +26,12 @@ from tradeforge_api.config import Settings
 from tradeforge_api.live.broker import MT5Broker
 from tradeforge_api.live.candle_stream import CandleStream
 from tradeforge_api.live.session import SessionPlan, Venue, reconcile_on_start, run_session
+from tradeforge_api.live.signals import RedisSignalSink
 from tradeforge_api.live.stop import stop_predicate
 from tradeforge_collector.demand import DemandLease
 from tradeforge_collector.live import Subscription
 from tradeforge_db.brokers import broker_slug_for_symbol
-from tradeforge_db.models import Instrument, SessionMode
+from tradeforge_db.models import Instrument, SessionMode, Strategy
 from tradeforge_db.session import create_db_engine, create_session_factory, session_scope
 from tradeforge_engine.domain import InstrumentSpec
 from tradeforge_engine.protocols import Broker
@@ -99,7 +100,22 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
         type=SessionMode,
         choices=list(SessionMode),
         default=SessionMode.PAPER,
-        help="paper (default) trades a local ledger; live sends orders to the venue",
+        help=(
+            "paper (default) trades a local ledger; live sends orders to the venue; signal is "
+            "paper that posts its moments to signals.events"
+        ),
+    )
+    parser.add_argument(
+        "--no-target-r",
+        type=Decimal,
+        default=Decimal(5),
+        help="signal only: a setup with no target closes its signal at this many R (default 5)",
+    )
+    parser.add_argument(
+        "--watch-item",
+        type=uuid.UUID,
+        default=None,
+        help="signal only: the watchlist item this session follows, carried on every event",
     )
     return parser.parse_args(argv)
 
@@ -147,6 +163,25 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         subscription = Subscription(symbol=instrument.symbol, timeframe=args.timeframe)
         broker = broker_slug_for_symbol(db, instrument.symbol)
+        strategy = db.get(Strategy, args.strategy)
+        strategy_name = strategy.name if strategy is not None else str(args.strategy)
+
+    # The signals' context: what a message needs beside the event itself (signals PR 5).
+    signals = (
+        RedisSignalSink(
+            redis,
+            {
+                "session_id": str(session_id),
+                "watch_item_id": "" if args.watch_item is None else str(args.watch_item),
+                "strategy": strategy_name,
+                "timeframe": args.timeframe,
+                "broker": broker or "",
+                "no_target_r": str(args.no_target_r),
+            },
+        )
+        if args.mode is SessionMode.SIGNAL
+        else None
+    )
 
     # ⚠️ **Ask the broker's live loop for this pair, and keep asking while the session runs**
     # (ADR-0032). Without it, somebody had to remember to start `collector live` on the right
@@ -167,6 +202,7 @@ def main(argv: list[str] | None = None) -> int:
         ),
         mode=args.mode,
         session_id=session_id,
+        no_target_r=args.no_target_r,
     )
 
     try:
@@ -182,6 +218,7 @@ def main(argv: list[str] | None = None) -> int:
             # `LIVE_PROMOTION_DAYS` moved a number no code read. A configuration option nobody
             # consults is worse than none, because it is a promise on a page.
             promotion_days=settings.live_promotion_days,
+            signals=signals,
         )
     finally:
         if lease is not None:

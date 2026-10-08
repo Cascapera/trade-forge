@@ -143,6 +143,9 @@ class SessionMode(StrEnum):
 
     PAPER = "paper"
     LIVE = "live"
+    SIGNAL = "signal"
+    """Simulated exactly like paper, and its moments posted as signals (signals PR 5). Never a
+    venue, and never counted towards a live promotion: only paper days are watched days."""
 
 
 class OrderAuditStatus(StrEnum):

@@ -39,6 +39,11 @@ PATH_TO_ASSET_CLASS: dict[str, AssetClass] = {
     "futures": AssetClass.FUTURE,
     "crypto": AssetClass.CRYPTO,
     "crypto currency": AssetClass.CRYPTO,
+    # XP (08/10) files everything under two exchange roots, so the root alone names no class:
+    # `BOVESPA` holds shares, indices and 44 838 options. The folder under it does.
+    "bovespa\\a vista": AssetClass.STOCK,
+    "bovespa\\indices": AssetClass.INDEX,
+    "bmf\\series continuas": AssetClass.FUTURE,
 }
 
 
@@ -49,5 +54,5 @@ def asset_class_from_path(path: str) -> AssetClass | None:
     launching the run fills in, because they know what a `CFDs\\XAUUSD` is and no string does.
     Guessing here would put that same value in the column with nobody having decided it.
     """
-    head = path.replace("/", "\\").split("\\")[0].strip().lower()
-    return PATH_TO_ASSET_CLASS.get(head)
+    parts = [part.strip().lower() for part in path.replace("/", "\\").split("\\")]
+    return PATH_TO_ASSET_CLASS.get("\\".join(parts[:2])) or PATH_TO_ASSET_CLASS.get(parts[0])

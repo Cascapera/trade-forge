@@ -41,14 +41,15 @@ from typing import Any
 
 import redis
 from arq.connections import RedisSettings
+from sqlalchemy import select
 
 from tradeforge_collector.alive import Heartbeat
 from tradeforge_collector.collect import DatabaseJournal, run_collection
 from tradeforge_collector.source import SymbolInfo
 from tradeforge_db.broker_symbols import BrokerSymbolEntry, replace_snapshot
-from tradeforge_db.brokers import UnknownBrokerError, broker_for_server
+from tradeforge_db.brokers import UnknownBrokerError, broker_for_server, keeps_path
 from tradeforge_db.collections import finish_collection, read_collection
-from tradeforge_db.models import BacktestStatus
+from tradeforge_db.models import BacktestStatus, Broker
 from tradeforge_db.session import create_db_engine, create_session_factory, session_scope
 from tradeforge_db.symbol_history import HistoryProbe, upsert_history
 
@@ -120,9 +121,13 @@ async def sync_symbols(_context: dict[str, Any]) -> int:
     engine = create_db_engine()
     try:
         with session_scope(create_session_factory(engine)) as session:
+            # A registered broker may keep only some folders (ADR-0032): XP's options are 45 000
+            # symbols nobody here analyses. An unregistered server keeps everything, as before.
+            broker = session.scalars(select(Broker).where(Broker.server == server)).one_or_none()
+            paths = None if broker is None else broker.catalogue_paths
             count = replace_snapshot(
                 session,
-                [_entry(info) for info in symbols],
+                [_entry(info) for info in symbols if keeps_path(paths, info.path)],
                 server=server,
                 synced_at=dt.datetime.now(tz=dt.UTC),
             )

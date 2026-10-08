@@ -186,7 +186,7 @@ def test_pressing_sync_again_actually_enqueues_again(
     client.post("/symbols/sync")
 
     # One job per broker's agent and one for an agent started without a broker (ADR-0032).
-    per_press = ["collect", "collect.activtrades", "collect.tradeview"]
+    per_press = ["collect", "collect.activtrades", "collect.tradeview", "collect.xp"]
     sent = sorted(str(options["_queue_name"]) for _, options in queue.jobs)
     assert sent == sorted(per_press * 2)
     assert not any("_job_id" in options for _, options in queue.jobs)

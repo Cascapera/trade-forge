@@ -42,7 +42,7 @@ from sqlalchemy import (
     func,
     text,
 )
-from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from tradeforge_db.base import MONEY, PRICE, RATIO, VOLUME, Base
@@ -270,6 +270,9 @@ class Broker(Base):
     server: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
     terminal_path: Mapped[str | None] = mapped_column(Text)
     server_offset: Mapped[dt.timedelta] = mapped_column(Interval, nullable=False)
+    # The tree folders whose symbols a sync keeps (`BOVESPA\A VISTA`); null keeps them all. XP
+    # lists 51 644 symbols, 44 838 of them options nobody here analyses (08/10).
+    catalogue_paths: Mapped[list[str] | None] = mapped_column(ARRAY(Text))
     created_at: Mapped[dt.datetime] = _created_at()
 
     __table_args__ = (

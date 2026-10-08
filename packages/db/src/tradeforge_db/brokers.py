@@ -23,6 +23,7 @@ __all__ = [
     "broker_slug_for_symbol",
     "broker_slugs",
     "collect_queue",
+    "keeps_path",
     "refuse_another_broker",
 ]
 
@@ -75,6 +76,18 @@ class BrokerChangedError(ValueError):
             f"{symbol} comes from {recorded}, not {offered}: two brokers' tickers are two "
             "instruments here, under two internal names (ADR-0032)"
         )
+
+
+def keeps_path(catalogue_paths: list[str] | None, path: str | None) -> bool:
+    """Whether a sync keeps a symbol filed under `path`: no list keeps everything; otherwise the
+    path must be one of the folders or inside one, ignoring case and the slash's direction."""
+    if catalogue_paths is None:
+        return True
+    folder = (path or "").replace("/", "\\").lower()
+    return any(
+        folder == root or folder.startswith(root + "\\")
+        for root in (one.replace("/", "\\").rstrip("\\").lower() for one in catalogue_paths)
+    )
 
 
 def broker_for_server(session: Session, server: str | None) -> Broker:

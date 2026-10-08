@@ -17,6 +17,7 @@ from tradeforge_db.brokers import (
     broker_slug_for_symbol,
     broker_slugs,
     collect_queue,
+    keeps_path,
     refuse_another_broker,
 )
 from tradeforge_db.instruments import CatalogueEntry, upsert_instruments
@@ -175,6 +176,37 @@ def test_a_symbol_not_catalogued_yet_goes_to_the_broker_whose_terminal_lists_it(
 
 def test_a_slug_nobody_registered_names_the_ones_there_are(session: Session) -> None:
     assert broker_by_slug(session, "tradeview").server == "Tradeview-Demo"
-    assert broker_slugs(session) == ["activtrades", "tradeview"]
-    with pytest.raises(LookupError, match="registered: activtrades, tradeview"):
-        broker_by_slug(session, "xp")
+    assert broker_slugs(session) == ["activtrades", "tradeview", "xp"]
+    with pytest.raises(LookupError, match="registered: activtrades, tradeview, xp"):
+        broker_by_slug(session, "clear")
+
+
+def test_xp_is_registered_on_brasilia_time_keeping_two_folders(session: Session) -> None:
+    xp = broker_for_server(session, "XPMT5-DEMO")
+
+    assert (xp.slug, xp.server_offset) == ("xp", dt.timedelta(hours=-3))
+    assert xp.catalogue_paths == [r"BOVESPA\A VISTA", r"BMF\SERIES CONTINUAS"]
+    assert broker_by_slug(session, "activtrades").terminal_path == (
+        r"C:\Program Files\FOREXMetaTrader 5\terminal64.exe"
+    )
+    assert broker_by_slug(session, "tradeview").catalogue_paths is None
+
+
+@pytest.mark.parametrize(
+    ("path", "kept"),
+    [
+        (r"BOVESPA\A VISTA\PETR4", True),
+        (r"bmf\series continuas\WIN$N", True),
+        ("BMF/SERIES CONTINUAS/WDO$N", True),
+        (r"BOVESPA\OPCOES\PETRJ300", False),
+        (r"BOVESPA\A VISTAX\NOPE", False),  # a folder that merely starts with the same letters
+        (None, False),
+    ],
+)
+def test_a_broker_keeps_only_its_folders(path: str | None, kept: bool) -> None:
+    assert keeps_path([r"BOVESPA\A VISTA", "BMF\\SERIES CONTINUAS\\"], path) is kept
+
+
+def test_a_broker_without_folders_keeps_everything() -> None:
+    assert keeps_path(None, r"BOVESPA\OPCOES\PETRJ300")
+    assert keeps_path(None, None)

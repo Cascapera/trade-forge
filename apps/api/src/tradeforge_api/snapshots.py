@@ -153,6 +153,16 @@ def refresh_summaries(
     return stale
 
 
+def refresh_woken(store: SnapshotStore, run: Callable[..., Any]) -> int:
+    """Compute now the maps served stale since the last tick (08/10); how many it computed."""
+    woken = store.woken()
+    for metric, every_run in woken:
+        made = run(best_in_child, metric.value, every_run)
+        store.keep_best(BestMapOut.model_validate_json(made))
+        store.settle(metric, every_run=every_run)
+    return len(woken)
+
+
 def refresh_best(
     session_factory: Callable[[], Session], store: SnapshotStore, run: Callable[..., Any]
 ) -> bool:
@@ -190,6 +200,7 @@ async def refresh_forever(
         await asyncio.sleep(SUMMARY_EVERY.total_seconds())
         try:
             await asyncio.to_thread(refresh_summaries, session_factory, run)
+            await asyncio.to_thread(refresh_woken, store, run)
             if dt.datetime.now(tz=dt.UTC) >= best_due:
                 await asyncio.to_thread(refresh_best, session_factory, store, run)
                 best_due = dt.datetime.now(tz=dt.UTC) + BEST_EVERY
@@ -206,6 +217,7 @@ __all__ = [
     "refresh_best",
     "refresh_forever",
     "refresh_summaries",
+    "refresh_woken",
     "runs_fingerprint",
     "stale_summaries",
     "summary_in_child",

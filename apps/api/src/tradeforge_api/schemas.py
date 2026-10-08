@@ -3054,6 +3054,9 @@ class BestMapOut(BaseModel):
     as_of: dt.datetime | None = None
     """When the map was computed (05/10): it is served from the last one kept, computed again
     every few minutes when runs have finished — ranking every run took 30 s an opening."""
+    refreshing: bool = False
+    """This map had not been opened for a day, so nothing kept it current: it is `as_of` old and
+    being computed again now (08/10). The screen says so and asks again until it is not."""
 
 
 class BestTestOut(BaseModel):

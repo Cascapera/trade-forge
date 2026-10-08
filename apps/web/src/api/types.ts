@@ -2029,6 +2029,11 @@ export interface BestMapOut {
   cells: BestMapCell[]
   /** When the map was computed (05/10): the last one kept, computed again every few minutes. */
   as_of?: string | null
+  /**
+   * Nobody had opened this map for a day, so it is `as_of` old and being computed again now
+   * (08/10) — the screen says so and asks again sooner until it is fresh.
+   */
+  refreshing?: boolean
 }
 
 /** One reserved-window test of a point. */

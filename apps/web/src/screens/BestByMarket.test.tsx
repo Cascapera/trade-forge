@@ -193,6 +193,15 @@ describe('BestByMarket', () => {
     expect(screen.getByText(/^Updated \d\d\/\d\d \d\d:\d\d\.$/)).toBeInTheDocument()
   })
 
+  it('says a map left alone for a day is old and being computed again', () => {
+    // 08/10: CHOCH BASE was missing because the map shown was a day old, and nothing said so.
+    map.mockReturnValue(answer({ ...MAP, as_of: '2026-10-07T19:32:00Z', refreshing: true }))
+    renderWithProviders(<BestByMarket />)
+
+    expect(screen.getByRole('status')).toHaveTextContent(/Refreshing — showing the map of/)
+    expect(screen.queryByText(/^Updated /)).not.toBeInTheDocument()
+  })
+
   it('says it is loading, and says why the map could not be read', () => {
     map.mockReturnValue({ data: undefined, isPending: true, isError: false, error: null } as never)
     const { unmount } = renderWithProviders(<BestByMarket />)

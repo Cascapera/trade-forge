@@ -235,7 +235,11 @@ def _agent(args: argparse.Namespace) -> int:
     # the agent's database wiring.
     import asyncio  # noqa: PLC0415
 
-    from tradeforge_collector.agent import WorkerSettings, serve_broker  # noqa: PLC0415
+    from tradeforge_collector.agent import (  # noqa: PLC0415
+        WorkerSettings,
+        serve_broker,
+        settings_on_queue,
+    )
     from tradeforge_collector.supervisor import serve  # noqa: PLC0415
 
     worker_settings: type = WorkerSettings
@@ -251,7 +255,7 @@ def _agent(args: argparse.Namespace) -> int:
         finally:
             engine.dispose()
         # The same settings, on this broker's queue: one terminal, one queue (ADR-0032).
-        worker_settings = type("BrokerWorkerSettings", (WorkerSettings,), {"queue_name": queue})
+        worker_settings = settings_on_queue(queue)
 
     try:
         # arq's settings type is structural; the agent's class matches it without naming it.

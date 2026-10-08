@@ -342,20 +342,20 @@ def test_existing_instruments_are_tied_to_the_broker_they_were_collected_from(ds
 
         upgrade("0050", dsn=dsn)
         with engine.connect() as connection:
-            found = dict(
+            found: dict[str, str | None] = dict(
                 connection.execute(
                     text(
                         "SELECT i.symbol, b.slug FROM instruments i "
                         "LEFT JOIN brokers b ON b.id = i.broker_id WHERE i.id = ANY(:ids)"
                     ),
                     {"ids": list(ids.values())},
-                ).all()
+                ).tuples()
             )
-            tickers = dict(
+            tickers: dict[str, str | None] = dict(
                 connection.execute(
                     text("SELECT symbol, broker_symbol FROM instruments WHERE id = ANY(:ids)"),
                     {"ids": list(ids.values())},
-                ).all()
+                ).tuples()
             )
         assert found == {symbol: expected[3] for symbol, expected in rows.items()}
         assert tickers == {"AAPL": "AAPL", "EURUSD": "EURUSD", "SEEDED": None, "ODDCLOCK": None}

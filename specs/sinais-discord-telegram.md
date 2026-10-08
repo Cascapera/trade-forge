@@ -42,9 +42,9 @@ entrada se o preço chegar lá nas barras seguintes. Esse é o momento natural d
 | **CANCELADO** | o setup retirou a ordem (a virada acabou, o preço invalidou) | ⚪ "Cancelado" |
 | **ENCERRADO** *(opcional)* | stop, alvo ou saída do setup | 🔴/🟢 resultado em R — histórico transparente |
 
-No Discord e no Telegram a mensagem do ARMADO **é editada** a cada mudança de estado, em vez de mandar
-mensagens novas: o aluno vê um card só, que muda de 🟡 para 🟢 ou ⚪. (Webhook do Discord e
-`editMessageCaption` do Telegram permitem isso.)
+**Cada mudança de estado é uma mensagem nova** (decisão dele, 08/10), não uma edição da anterior: com
+vários sinais por dia, o aluno não teria de voltar no histórico para ver o que mudou. Para ligar as
+mensagens do mesmo sinal, todas levam o **número do sinal** (`#123`) e o horário em que ele foi armado.
 
 **Onde se pega o evento:** um *broker* que embrulha o de paper (`BacktestBroker`) e, a cada `submit`
 (ordem armada), `cancel`, e a cada *fill* devolvido pela barra, publica um evento num stream Redis
@@ -61,7 +61,15 @@ mensagens novas: o aluno vê um card só, que muda de 🟡 para 🟢 ou ⚪. (We
 Entrada: 1.08450 (ordem stop)   Stop: 1.08210   Alvo: 1.08930 (2R)
 Risco: 24 pips · Corretora: ActivTrades · Decidido às 14:00 (Brasília)
 [imagem: 50 barras + região + stop/alvo]
-⚠️ Material educacional — não é recomendação de investimento.
+⚠️ Conteúdo educacional. Não é recomendação de compra ou venda.
+```
+
+As mensagens seguintes do mesmo sinal:
+
+```
+🟢 ACIONOU — sinal #123 · EURUSD · H1 · CHOCH (compra) — armado às 14:00
+Entrou a 1.08452 às 15:12 (Brasília) · Stop 1.08210 · Alvo 1.08930
+⚠️ Conteúdo educacional. Não é recomendação de compra ou venda.
 ```
 
 - **Ativo, tempo gráfico, setup** (nome do catálogo + parâmetros principais), **direção**.
@@ -69,8 +77,9 @@ Risco: 24 pips · Corretora: ActivTrades · Decidido às 14:00 (Brasília)
 - **Alvo quando o setup não tem alvo** (muitos rodam sem): cada item da lista de monitoramento define o
   alvo do aviso (ex.: 2R), escolhido por ele.
 - **Horário** de Brasília e da corretora.
-- **Imagem:** o retrato da entrada em PNG, desenhado igual ao `TradeSnapshot`.
-- **Aviso legal fixo** (seção 8).
+- **Imagem:** o retrato da entrada em PNG, desenhado igual ao `TradeSnapshot` (decisão dele: a imagem
+  nossa, sem TradingView).
+- **Aviso fixo em toda mensagem:** *"Conteúdo educacional. Não é recomendação de compra ou venda."*
 
 ---
 
@@ -116,8 +125,9 @@ API e no executor.
 - **Sessão SIGNAL:** um terceiro modo da sessão ao vivo. Simula como paper (para saber quando acionou e
   quando encerrou), **nunca** fala com o executor, e não passa pelas salvaguardas do modo real porque não
   tem conta. Uma por item monitorado, iniciada pela lista (hoje só existe a linha de comando).
-- **Notificador:** um serviço pequeno que consome `signals.events`, desenha a imagem, envia, edita as
-  mensagens quando o estado muda e grava tudo em `signal_messages`. Envio **idempotente** (o mesmo evento
+- **Notificador:** um serviço pequeno que consome `signals.events`, desenha a imagem, envia **uma
+  mensagem nova por evento** para **um canal do Discord e um do Telegram** e grava tudo em
+  `signal_messages`. Envio **idempotente** (o mesmo evento
   nunca sai duas vezes), com nova tentativa e limite de frequência (Discord e Telegram bloqueiam excesso).
 - **Imagem (PNG):** três caminhos —
 
@@ -155,7 +165,7 @@ API e no executor.
 | 3 | Candles ao vivo sob demanda | o agente liga/desliga `live` pelos pares pedidos |
 | 4 | Lista de monitoramento | tabela + API + tela (escolher a partir de um run do Best by market ou da varredura) |
 | 5 | Sessão SIGNAL + eventos | modo novo, broker que publica, stream `signals.events`, teste contra o replay |
-| 6 | Notificador (texto) | Discord + Telegram, edição do card, idempotência, canal de teste |
+| 6 | Notificador (texto) | Discord + Telegram, uma mensagem por evento, número do sinal, idempotência, canal de teste |
 | 7 | Imagem | PNG do retrato pelo Playwright, anexada na mensagem |
 | 8 | Tela de sinais | histórico, estado de cada sinal, resultado em R, % de acerto por setup |
 
@@ -172,8 +182,8 @@ Os PRs 0–3 servem também para coletar e varrer as ações do Brasil e dos EUA
 - **Relógio:** cada corretora tem o seu (ActivTrades +2 h, Tradeview +3 h); a mensagem mostra Brasília.
 - **Terminal desconectado / mercado fechado:** a sessão já tem *heartbeat*; o notificador avisa **ele**
   (não os alunos) quando um feed para.
-- **Excesso de mensagens:** limite por canal e por item; opção de mandar só os ARMADOS dos itens
-  marcados como "alta prioridade".
+- **Excesso de mensagens:** com uma mensagem por evento e um canal só, o volume cresce rápido — limite
+  por canal e por item, e a opção de silenciar eventos (ex.: só ARMADO e ACIONADO).
 - **Sinal ≠ resultado do backtest:** o aviso de ARMADO sai antes do acionamento; muitos serão
   CANCELADOS. Mostrar isso no card evita frustração.
 - **Memória:** cada sessão ao vivo é um processo com o histórico em memória (~1–2 GB nos setups de
@@ -181,11 +191,17 @@ Os PRs 0–3 servem também para coletar e varrer as ações do Brasil e dos EUA
 
 ---
 
-## 9. Decisões que são dele
+## 9. Decisões
 
-1. **Quais eventos postar:** só ARMADO? ARMADO + ACIONADO + CANCELADO (editando o card)? Também o resultado?
+**Tomadas por ele em 08/10:**
+- **Imagem:** PNG do nosso retrato (`TradeSnapshot`); é um teste.
+- **Aviso fixo:** "Conteúdo educacional. Não é recomendação de compra ou venda."
+- **Um canal só** para todos os mercados — um no Discord e um no Telegram.
+- **Sem edição:** cada evento é uma mensagem nova, com o número do sinal.
+- **Discord e Telegram**, os dois.
+
+**Ainda abertas:**
+1. **Quais eventos postar:** ARMADO + ACIONADO + CANCELADO? Também o resultado (ENCERRADO)? O PERTO?
 2. **Alvo do aviso** para setups sem alvo: fixo (ex.: 2R) ou por item?
-3. **Canais:** um canal por mercado (forex / ações EUA / ações BR) ou um só?
-4. **Horários:** avisar 24 h ou só no horário das aulas/mercado?
-5. **Corretora/conta para ações do Brasil** (precisa de MT5 com B3).
-6. **Imagem:** o retrato igual ao app (recomendado) basta, ou quer outro estilo?
+3. **Horários:** avisar 24 h ou só no horário das aulas/mercado?
+4. **Corretora/conta para ações do Brasil** (precisa de MT5 com B3).

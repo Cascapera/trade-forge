@@ -83,10 +83,13 @@ class Picture(Protocol):
 
 
 class SignalKindOf(StrEnum):
-    """The four moments a signal is posted at."""
+    """The moments a signal is posted at."""
 
     ARMED = "armed"
     TRIGGERED = "triggered"
+    BREAKEVEN = "breakeven"
+    """The setup moved its stop to the entry or past it (09/10, his ask): the trader may do the
+    same with his own position. Said once per signal."""
     CANCELLED = "cancelled"
     CLOSED = "closed"
 
@@ -94,6 +97,7 @@ class SignalKindOf(StrEnum):
 _TITLES = {
     SignalKindOf.ARMED: "ARMADO",
     SignalKindOf.TRIGGERED: "ACIONADO",
+    SignalKindOf.BREAKEVEN: "BREAKEVEN",
     SignalKindOf.CANCELLED: "CANCELADO",
     SignalKindOf.CLOSED: "ENCERRADO",
 }
@@ -119,6 +123,8 @@ class SignalEvent:
     """`stop` or `limit` for a resting entry; `market` for one that filled at the next open."""
     exit_price: Decimal | None = None
     result_r: Decimal | None = None
+    moved_stop: Decimal | None = None
+    """Where a breakeven put the stop. `stop` stays the first one: it is what 1R is."""
     reason: str = ""
     image: bytes | None = field(default=None, repr=False)
     """The PNG posted with the event (signals PR 7); `None` when there is none or drawing failed."""
@@ -153,6 +159,8 @@ class _Open:
     done: bool = False
     snapshot: EntrySnapshot | None = None
     """What the setup drew when it decided — redrawn on every picture of this signal."""
+    protected: bool = False
+    """The breakeven was announced: a stop trailed further says nothing more."""
     """Closed for the signal (reached `no_target_r`) while the position runs on in the ledger."""
 
 
@@ -247,8 +255,32 @@ class SignalBroker:
     # --- untouched --------------------------------------------------------------------------
 
     def modify_stop(self, symbol: str, stop_loss: Decimal, decided_at: dt.datetime) -> bool:
-        """Pass through. A trailed stop changes no message: the signal keeps its initial risk."""
-        return self._inner.modify_stop(symbol, stop_loss, decided_at)
+        """Pass through; the first stop moved to the entry or past it is a **breakeven**.
+
+        Any later move says nothing, and the signal keeps its initial risk: R is measured
+        against the first stop whatever the stop is now."""
+        moved = self._inner.modify_stop(symbol, stop_loss, decided_at)
+        signal = self._book.open.get(symbol)
+        if not moved or signal is None or signal.done or signal.protected:
+            return moved
+        long = signal.side is Side.LONG
+        if (stop_loss >= signal.entry) if long else (stop_loss <= signal.entry):
+            signal.protected = True
+            self._post(
+                signal.snapshot,
+                SignalEvent(
+                    kind=SignalKindOf.BREAKEVEN,
+                    number=signal.number,
+                    symbol=symbol,
+                    side=signal.side,
+                    time=decided_at,
+                    entry=signal.entry,
+                    stop=signal.stop,
+                    target=signal.target,
+                    moved_stop=stop_loss,
+                ),
+            )
+        return moved
 
     def positions(self, symbol: str) -> Sequence[Position]:
         """Pass through."""
@@ -289,7 +321,7 @@ class SignalBroker:
                         bars,
                         title=f"{_TITLES[event.kind]} #{event.number} — {event.symbol}",
                         entry=event.entry,
-                        stop=event.stop,
+                        stop=event.moved_stop if event.moved_stop is not None else event.stop,
                         target=event.target,
                         snapshot=snapshot,
                         exit_price=event.exit_price,
@@ -454,6 +486,7 @@ class RedisSignalSink:
             "order_type": event.order_type or "",
             "exit_price": "" if event.exit_price is None else str(event.exit_price),
             "result_r": "" if event.result_r is None else str(event.result_r),
+            "moved_stop": "" if event.moved_stop is None else str(event.moved_stop),
             "reason": event.reason,
         }
         if event.image is not None:

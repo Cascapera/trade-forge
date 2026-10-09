@@ -154,3 +154,36 @@ def test_a_refusal_says_the_networks_own_reason() -> None:
 
     with pytest.raises(RuntimeError, match=r"telegram refused \(400\).*not enough rights"):
         telegram("TOKEN", "-1", fetch=fetch).post("oi")
+
+
+BREAKEVEN = {
+    **ARMED,
+    "kind": "breakeven",
+    "entry": "207055",
+    "stop": "206500",
+    "moved_stop": "207055.0",
+    "target": "208165",
+}
+
+
+def test_a_breakeven_says_where_the_stop_went_and_that_the_trader_may_follow() -> None:
+    text = format_message(BREAKEVEN)
+
+    assert text.splitlines()[0] == "🔵 BREAKEVEN #41 — WIN H1"
+    assert "Stop do setup movido para 207.055, na entrada (0x0)" in text
+    assert "Compra executada em 207.055" in text
+    assert "Alvo 208.165" in text
+    assert "Se quiser, ajuste o stop da sua posição" in text
+
+
+def test_a_breakeven_past_the_entry_says_so() -> None:
+    text = format_message({**BREAKEVEN, "moved_stop": "207100", "target": ""})
+
+    assert "Stop do setup movido para 207.100, além da entrada" in text
+    assert "Alvo" not in text
+
+
+def test_a_breakeven_with_a_price_it_cannot_read_is_not_called_zero_zero() -> None:
+    text = format_message({**BREAKEVEN, "moved_stop": "?"})
+
+    assert "além da entrada" in text

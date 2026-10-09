@@ -54,6 +54,7 @@ _BRASILIA = ZoneInfo("America/Sao_Paulo")
 _TITLE = {
     "armed": "🟡 ARMADO",
     "triggered": "🟢 ACIONADO",
+    "breakeven": "🔵 BREAKEVEN",
     "cancelled": "⚪ CANCELADO",
 }
 _SIDE = {"long": "Compra", "short": "Venda"}
@@ -79,6 +80,14 @@ def _r(raw: str | None) -> str:
     return f"{'+' if value > 0 else ''}{_number(str(value))}R"
 
 
+def _same(left: str | None, right: str | None) -> bool:
+    """Two prices written differently (`7803.8`, `7803.80`) that are one number."""
+    try:
+        return left is not None and right is not None and Decimal(left) == Decimal(right)
+    except InvalidOperation:
+        return False
+
+
 def _when(raw: str | None, timeframe: str) -> str:
     """When the event became true: the **close** of the candle that decided it (09/10).
 
@@ -93,6 +102,18 @@ def _when(raw: str | None, timeframe: str) -> str:
     except ValueError:
         return opened.strftime("%d/%m %H:%M") + " (Brasília)"
     return f"{closed:%d/%m %H:%M} (Brasília) · candle {timeframe} das {opened:%H:%M}"
+
+
+def _breakeven(fields: Mapping[str, str], side: str) -> list[str]:
+    """Where the setup put its stop, and the trader's cue to do the same (09/10)."""
+    moved, entry = fields.get("moved_stop"), fields.get("entry")
+    where = "na entrada (0x0)" if _same(moved, entry) else "além da entrada"
+    lines = [f"Stop do setup movido para {_number(moved)}, {where}"]
+    lines.append(f"{side} executada em {_number(entry)}")
+    if fields.get("target"):
+        lines.append(f"Alvo {_number(fields.get('target'))}")
+    lines.append("Se quiser, ajuste o stop da sua posição")
+    return lines
 
 
 def format_message(fields: Mapping[str, str]) -> str:
@@ -120,6 +141,8 @@ def format_message(fields: Mapping[str, str]) -> str:
         lines.append(f"{side} executada em {_number(fields.get('entry'))}")
     elif kind == "cancelled":
         lines.append(f"{side} em {_number(fields.get('entry'))} não foi executada")
+    elif kind == "breakeven":
+        lines.extend(_breakeven(fields, side))
     if kind in {"armed", "triggered"}:
         lines.append(f"Stop {_number(fields.get('stop'))}")
         if fields.get("target"):

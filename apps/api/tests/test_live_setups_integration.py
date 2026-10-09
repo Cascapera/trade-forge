@@ -186,6 +186,8 @@ def test_the_history_and_its_metrics_come_from_the_signals(
         for one in (
             event(setup, 1, "armed", entry="1000", stop="900", order_type="stop"),
             event(setup, 1, "triggered", entry="1000", stop="900"),
+            # A breakeven changes neither the status nor the first stop: that one is 1R.
+            event(setup, 1, "breakeven", entry="1000", stop="900", moved_stop="1000"),
             event(setup, 1, "closed", exit_price="1500", result_r="5"),
             event(setup, 2, "armed", entry="1100", stop="1000"),
             event(setup, 2, "triggered", entry="1100", stop="1000"),
@@ -208,6 +210,7 @@ def test_the_history_and_its_metrics_come_from_the_signals(
         (1, "closed"),
     ]
     assert history[3]["result_r"] == "5.00000000"
+    assert Decimal(history[3]["stop"]) == Decimal(900)
     assert history[1]["reason"] == "the setup withdrew it"
     assert (metrics["signals"], metrics["closed"], metrics["open"], metrics["cancelled"]) == (
         4,

@@ -46,7 +46,7 @@ one through. What it takes is a `Venue` — a callable handed the session id —
 import datetime as dt
 import logging
 import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -74,7 +74,7 @@ from tradeforge_db.session import session_scope
 from tradeforge_engine import BacktestBroker, PercentRiskManager, compile_strategy
 from tradeforge_engine.domain import Candle, InstrumentSpec, Refusal
 from tradeforge_engine.errors import EngineError
-from tradeforge_engine.loop import iter_run
+from tradeforge_engine.loop import BarOutcome, iter_run
 from tradeforge_engine.protocols import Broker, CostModel
 from tradeforge_engine.warmup import hand_over
 
@@ -169,6 +169,44 @@ def reconcile_on_start(factory: sessionmaker[Session]) -> list[uuid.UUID]:
     if marked:
         logger.warning("marked %d abandoned session(s) as failed: %s", len(marked), marked)
     return marked
+
+
+def _past_an_inherited_trade(  # noqa: PLR0913 — the cut, the mode, and what the trade runs on
+    candles: SplicedCandles,
+    *,
+    mode: SessionMode,
+    timeframe: str,
+    warm: Broker,
+    symbol: str,
+    run: Callable[[Iterator[Candle]], Iterator[BarOutcome]],
+    stopping: Callable[[], bool],
+) -> Iterator[Candle]:
+    """The session's live bars — after, for a signal session, the trade the warm-up was in.
+
+    Refuses first a hole between the disk and the live bars (`_refuse_a_hole`).
+
+    ⚠️ **A signal session does not refuse to open mid-trade (09/10).** On M5 with a 5R target the
+    setup is in a trade often, and refusing left a market with no signal at all for as long as
+    the trade lasted, retried on a back-off: Usa500 and UsaTec on the first day. The trade is
+    followed on the warm-up's own broker, **without a word to the channels** — nobody was shown
+    its entry — until it ends at its stop, its target or the setup's exit; then the hand-over
+    happens as it always did, onto a broker whose account the warm-up never touched.
+
+    Other modes are untouched: paper and live still refuse, because they would report a trade
+    they never took.
+    """
+    _refuse_a_hole(candles, symbol, timeframe)
+    stream = candles.live()
+    if mode is not SessionMode.SIGNAL or not warm.positions(symbol):
+        return stream
+    logger.info("%s: the warm-up ended in a trade; following it quietly until it ends", symbol)
+    for outcome in run(stream):
+        if not warm.positions(symbol):
+            logger.info("%s: the inherited trade ended on the %s bar", symbol, outcome.candle.time)
+            break
+        if stopping():
+            raise EngineError(f"{symbol}: stopped while following the trade the warm-up was in")
+    return stream
 
 
 def _refuse_a_hole(candles: SplicedCandles, symbol: str, timeframe: str) -> None:
@@ -283,7 +321,22 @@ def run_session(  # noqa: PLR0913 — keyword-only; each names one seam of a ses
     ):
         pass
 
-    _refuse_a_hole(candles, symbol, plan.timeframe)
+    stream = _past_an_inherited_trade(
+        candles,
+        mode=plan.mode,
+        timeframe=plan.timeframe,
+        warm=warm,
+        symbol=symbol,
+        run=lambda bars: iter_run(
+            candles=bars,
+            timeframe=timeframe,
+            instrument=spec,
+            strategy=compiled,
+            broker=warm,
+            risk=risk,
+        ),
+        stopping=stopping,
+    )
 
     # ⚠️ **`hand_over` asks this too, and this one decides whether a row is written.** The order
     # below is `open_session` *then* `hand_over`, so leaving the refusal to `hand_over` alone
@@ -375,7 +428,9 @@ def run_session(  # noqa: PLR0913 — keyword-only; each names one seam of a ses
             warm, live, symbol=symbol, bars=candles.warmed, risk=risk, instrument=spec
         )
         logger.info(
-            "warmed over %d bars, carried %d resting order(s), refused %d",
+            "%s %s: warmed over %d bars, carried %d resting order(s), refused %d",
+            symbol,
+            plan.timeframe,
             handover.bars,
             len(handover.carried),
             len(handover.refused),
@@ -390,7 +445,7 @@ def run_session(  # noqa: PLR0913 — keyword-only; each names one seam of a ses
             # again, and eventually sends a cancel for a name the venue never heard of. The
             # session logs `refused 2` while the strategy believes both are resting.
             for outcome in iter_run(
-                candles=candles.live(),
+                candles=stream,
                 timeframe=timeframe,
                 instrument=spec,
                 strategy=compiled,

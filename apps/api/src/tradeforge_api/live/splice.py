@@ -125,9 +125,9 @@ class SplicedCandles:
         """The last bars of the warm-up — what a signal's picture opens on (09/10)."""
 
         self.seam_gap: dt.timedelta | None = None
-        """Time from the last bar on disk to the first bar after it, once that bar is admitted —
-        `None` before, or when there was nothing on disk. A week here is a week of market the
-        strategy never saw: its averages carry on from where the disk stopped (09/10)."""
+        """The longest silence after the last bar on disk — at the seam, or inside the stream when
+        the live loop could not fill an outage — or `None` with nothing on disk. A week here is a
+        week of market the strategy never saw: its averages carry on across it (09/10)."""
 
         self.warmed = 0
         """Bars the warm-up actually drove the strategy over. What a session records."""
@@ -217,9 +217,11 @@ class SplicedCandles:
                 self.dropped,
             )
             return False
-        self._last_time = candle.time
-        if self.seam_gap is None and self._disk_end is not None and candle.time > self._disk_end:
-            self.seam_gap = candle.time - self._disk_end
+        previous, self._last_time = self._last_time, candle.time
+        if self._disk_end is not None and candle.time > self._disk_end:
+            since = self._disk_end if previous is None else max(previous, self._disk_end)
+            if self.seam_gap is None or candle.time - since > self.seam_gap:
+                self.seam_gap = candle.time - since
         return True
 
 

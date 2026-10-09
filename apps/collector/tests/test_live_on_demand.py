@@ -211,3 +211,22 @@ class TestCatchingUpFromTheDisk:
         )
 
         assert published_minutes(publisher) == [20]
+
+    def test_a_long_outage_resumed_from_the_stream_reaches_as_far_as_a_catch_up(self) -> None:
+        """A machine off for a week owes more than an outage: past `max_backfill`, the hole
+        stayed inside the stream and the session traded across it."""
+        source, publisher = FakeSource(), FakePublisher()
+        source.bars[("WIN", "M1")] = minutes(*range(30))
+        publisher.publish(self.WIN_M1, minutes(5)[0])
+
+        run_on_demand(
+            source,
+            publisher,
+            lambda: [self.WIN_M1],
+            every=0,
+            polls=1,
+            sleep=noop,
+            max_backfill=3,
+        )
+
+        assert published_minutes(publisher) == list(range(5, 30))

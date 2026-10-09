@@ -36,6 +36,7 @@ from tradeforge_api.routers import (
     executor,
     instruments,
     live_sessions,
+    live_setups,
     strategies,
     studies,
     sweep_templates,
@@ -43,7 +44,6 @@ from tradeforge_api.routers import (
     sweeps,
     symbols,
     walkforwards,
-    watchlist,
 )
 from tradeforge_api.snapshot_store import InMemory, SnapshotStore
 from tradeforge_api.snapshots import child_pool, refresh_forever
@@ -179,7 +179,7 @@ def create_app(  # noqa: PLR0913 — keyword-only seams, one per connection a te
     app.include_router(sweeps.router)
     app.include_router(walkforwards.router)
     app.include_router(clusters.router)
-    app.include_router(watchlist.router)
+    app.include_router(live_setups.router)
     app.include_router(ws.router)
 
     @app.get("/health", tags=["health"])

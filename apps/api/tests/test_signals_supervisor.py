@@ -3,7 +3,8 @@
 import uuid
 from decimal import Decimal
 
-from tradeforge_api.live.supervisor import Supervisor, Wanted, _Item, wanted_children
+from tradeforge_api.live.supervisor import Supervisor, Wanted, wanted_children
+from tradeforge_db.live_setups import FollowedPair
 
 
 class FakeChild:
@@ -110,9 +111,9 @@ def test_a_live_loop_no_longer_needed_is_killed_at_once() -> None:
     assert h.last("live:xp").terminated
 
 
-def item(broker: str | None = "xp", **fields: object) -> _Item:
+def item(broker: str | None = "xp", **fields: object) -> FollowedPair:
     values: dict[str, object] = {
-        "id": uuid.uuid4(),
+        "setup_id": uuid.uuid4(),
         "strategy_id": uuid.uuid4(),
         "instrument_id": uuid.uuid4(),
         "timeframe": "H1",
@@ -121,27 +122,27 @@ def item(broker: str | None = "xp", **fields: object) -> _Item:
         "broker": broker,
     }
     values.update(fields)
-    return _Item(**values)  # type: ignore[arg-type]
+    return FollowedPair(**values)  # type: ignore[arg-type]
 
 
 def test_each_item_is_a_signal_session_and_each_broker_one_live_loop() -> None:
     items = [item(), item(), item(broker="tradeview"), item(broker=None)]
-    ids: dict[uuid.UUID, uuid.UUID] = {}
+    ids: dict[tuple[uuid.UUID, uuid.UUID], uuid.UUID] = {}
 
     wanted = wanted_children(items, python="py", max_sessions=10, session_ids=ids)
 
     assert sorted(key for key in wanted if key.startswith("live:")) == ["live:tradeview", "live:xp"]
-    session = wanted[f"session:{items[0].id}"]
+    session = wanted[f"session:{items[0].setup_id}:{items[0].instrument_id}"]
     mode = session.argv.index("--mode")
     assert session.argv[mode + 1] == "signal"
     assert list(session.argv[-2:]) == ["--spread-points", "5"]
-    assert session.session_id == ids[items[0].id]
+    assert session.session_id == ids[items[0].setup_id, items[0].instrument_id]
 
 
 def test_the_same_items_want_the_same_children_on_every_tick() -> None:
     """An unchanged item must look unchanged, or it would be stopped and restarted each tick."""
     items = [item()]
-    ids: dict[uuid.UUID, uuid.UUID] = {}
+    ids: dict[tuple[uuid.UUID, uuid.UUID], uuid.UUID] = {}
 
     first = wanted_children(items, python="py", max_sessions=10, session_ids=ids)
     second = wanted_children(items, python="py", max_sessions=10, session_ids=ids)

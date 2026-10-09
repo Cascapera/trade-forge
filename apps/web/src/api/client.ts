@@ -74,8 +74,9 @@ import type {
   Markets,
   TradesPage,
   WalkForwardOut,
-  WatchItem,
-  WatchItemPatch,
+  LiveSetup,
+  LiveSetupPatch,
+  SignalRow,
   YearCut,
 } from './types'
 
@@ -386,13 +387,21 @@ export const api = {
   // `redis-cli DEL executor:kill-switch`, from a shell, by somebody who has looked.
   engageKillSwitch: (): Promise<KillSwitch> => request('POST', '/executor/kill-switch'),
 
-  // The watchlist (signals PR 4): what the live signals follow, each item copied from a run.
-  listWatchItems: (): Promise<WatchItem[]> => request('GET', '/watchlist'),
-  watchBacktest: (backtestId: string): Promise<WatchItem> =>
-    request('POST', '/watchlist', { backtest_id: backtestId }),
-  changeWatchItem: (id: string, patch: WatchItemPatch): Promise<WatchItem> =>
-    request('PATCH', `/watchlist/${id}`, patch),
-  removeWatchItem: (id: string): Promise<null> => request('DELETE', `/watchlist/${id}`),
+  // Live Signal (09/10): the setups the live signals follow, their markets and their history.
+  listLiveSetups: (): Promise<LiveSetup[]> => request('GET', '/live-setups'),
+  watchBacktest: (backtestId: string): Promise<LiveSetup> =>
+    request('POST', '/live-setups/from-run', { backtest_id: backtestId }),
+  changeLiveSetup: (id: string, patch: LiveSetupPatch): Promise<LiveSetup> =>
+    request('PATCH', `/live-setups/${id}`, patch),
+  removeLiveSetup: (id: string): Promise<null> => request('DELETE', `/live-setups/${id}`),
+  addLiveMarket: (id: string, instrumentId: string): Promise<LiveSetup> =>
+    request('POST', `/live-setups/${id}/markets`, { instrument_id: instrumentId }),
+  changeLiveMarket: (id: string, instrumentId: string, active: boolean): Promise<LiveSetup> =>
+    request('PATCH', `/live-setups/${id}/markets/${instrumentId}`, { active }),
+  removeLiveMarket: (id: string, instrumentId: string): Promise<LiveSetup> =>
+    request('DELETE', `/live-setups/${id}/markets/${instrumentId}`),
+  listLiveSignals: (id: string): Promise<SignalRow[]> =>
+    request('GET', `/live-setups/${id}/signals?limit=200`),
 }
 
 /**

@@ -17,6 +17,37 @@ vi.mock('../api/hooks', () => ({
   useEditLiveSetup: () => ({ mutate: vi.fn(), isPending: false, error: null }),
 }))
 
+// The pickers have their own tests; here each is a button per market that toggles it.
+vi.mock('../components/MarketBrowser', () => ({
+  MarketBrowser: (props: {
+    chosen: string[]
+    onChange: (next: string[]) => void
+    onClose: () => void
+  }) => (
+    <div>
+      {['BIT', 'WIN', 'ZZZ'].map((symbol) => (
+        <button
+          key={symbol}
+          type="button"
+          onClick={() => {
+            props.onChange(
+              props.chosen.includes(symbol)
+                ? props.chosen.filter((one) => one !== symbol)
+                : [...props.chosen, symbol],
+            )
+          }}
+        >
+          tick {symbol}
+        </button>
+      ))}
+      <button type="button" onClick={props.onClose}>
+        done
+      </button>
+    </div>
+  ),
+}))
+vi.mock('../components/SymbolPicker', () => ({ SymbolPicker: () => <div /> }))
+
 import { useChangeLive, useInstruments, useLiveSetups, useLiveSignals } from '../api/hooks'
 import { LiveSignals } from './LiveSignals'
 
@@ -81,7 +112,11 @@ function mount(setups: LiveSetup[]): ReturnType<typeof vi.fn> {
     error: null,
   } as never)
   vi.mocked(useInstruments).mockReturnValue({
-    data: [{ id: 'bit', symbol: 'BIT', broker: 'xp' }],
+    data: [
+      { id: 'bit', symbol: 'BIT', broker: 'xp' },
+      { id: 'win', symbol: 'WIN', broker: 'xp' },
+      { id: 'wdo', symbol: 'WDO', broker: 'xp' },
+    ],
   } as never)
   vi.mocked(useLiveSignals).mockReturnValue({
     data: [signal],
@@ -110,18 +145,23 @@ describe('LiveSignals', () => {
   it('adds, switches and drops markets', () => {
     const mutate = mount([setup])
 
-    fireEvent.change(screen.getByRole('combobox', { name: 'Market to add' }), {
-      target: { value: 'bit' },
-    })
-    fireEvent.click(screen.getByRole('button', { name: 'Add' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Add markets…' }))
+    fireEvent.click(screen.getByRole('button', { name: 'tick BIT' }))
+    fireEvent.click(screen.getByRole('button', { name: 'tick ZZZ' }))
+    fireEvent.click(screen.getByRole('button', { name: 'tick WIN' }))
+    fireEvent.click(screen.getByRole('button', { name: 'tick BIT' }))
+    fireEvent.click(screen.getByRole('button', { name: 'done' }))
     fireEvent.click(screen.getByRole('button', { name: 'WDO' }))
     fireEvent.click(screen.getByRole('button', { name: 'Drop WIN' }))
 
     expect(mutate.mock.calls.map((call: unknown[]) => call[0])).toEqual([
       { kind: 'add-market', id: 's1', instrumentId: 'bit' },
+      { kind: 'remove-market', id: 's1', instrumentId: 'win' },
+      { kind: 'remove-market', id: 's1', instrumentId: 'bit' },
       { kind: 'market', id: 's1', instrumentId: 'wdo', active: true },
       { kind: 'remove-market', id: 's1', instrumentId: 'win' },
     ])
+    expect(screen.queryByRole('button', { name: 'done' })).not.toBeInTheDocument()
   })
 
   it('opens the history of signals', () => {

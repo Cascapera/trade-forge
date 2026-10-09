@@ -8,12 +8,26 @@ import {
 import { useState } from 'react'
 
 import { useInstruments, useRegisterLiveSetup } from '../api/hooks'
+import type { Instrument } from '../api/types'
 import { TIMEFRAMES } from '../strategy/builder'
-import { BrokerTag } from './BrokerTag'
 import { switchedOn } from '../strategy/switchedOn'
+import { neverCollected, neverCollectedReason } from '../basket/settings'
 import { ParamField } from './ParamField'
+import { SymbolPicker } from './SymbolPicker'
 
 type Params = Record<string, unknown>
+
+/** The API's ceiling on one setup's markets (`LiveSetupNew.instrument_ids`). */
+export const MAX_MARKETS = 200
+
+/** The chosen names as instrument ids — a name is unique across brokers (ADR-0032). */
+function idsOf(symbols: readonly string[], instruments: readonly Instrument[]): string[] {
+  const byName = new Map(instruments.map((one) => [one.symbol, one.id]))
+  return symbols.flatMap((symbol) => {
+    const id = byName.get(symbol)
+    return id === undefined ? [] : [id]
+  })
+}
 
 const inputClass =
   'rounded border border-slate-700 bg-slate-900 px-2 py-1 text-sm text-slate-100 focus:border-sky-500 focus:outline-none'
@@ -44,15 +58,12 @@ export function NewLiveSetup(props: { onClose: () => void }): React.JSX.Element 
   const [rr, setRr] = useState<number | null>(2)
   const [percent, setPercent] = useState(1)
   const [noTargetR, setNoTargetR] = useState(5)
-  const [markets, setMarkets] = useState<ReadonlySet<string>>(new Set())
-  const [filter, setFilter] = useState('')
+  const [markets, setMarkets] = useState<string[]>([])
   const instruments = useInstruments()
   const register = useRegisterLiveSetup()
 
-  const shown = (instruments.data ?? []).filter((one) =>
-    one.symbol.toLowerCase().includes(filter.trim().toLowerCase()),
-  )
-  const ready = name.trim() !== '' && markets.size > 0
+  const missing = neverCollectedReason(neverCollected(markets, instruments.data))
+  const ready = name.trim() !== '' && markets.length > 0 && missing === null
 
   const save = (): void => {
     register.mutate(
@@ -68,7 +79,7 @@ export function NewLiveSetup(props: { onClose: () => void }): React.JSX.Element 
           risk: { sizing: { type: 'percent_risk', params: { percent } } },
         },
         timeframe,
-        instrument_ids: [...markets],
+        instrument_ids: idsOf(markets, instruments.data ?? []),
         no_target_r: String(noTargetR),
       },
       {
@@ -182,42 +193,13 @@ export function NewLiveSetup(props: { onClose: () => void }): React.JSX.Element 
         </label>
       </fieldset>
 
-      <fieldset className="space-y-2">
-        <legend className="text-xs text-slate-500">
-          Markets to follow ({String(markets.size)} chosen)
-        </legend>
-        <input
-          placeholder="filter…"
-          aria-label="Filter markets"
-          value={filter}
-          onChange={(event) => {
-            setFilter(event.target.value)
-          }}
-          className={`${inputClass} w-48`}
-        />
-        <div className="flex max-h-48 flex-wrap gap-2 overflow-y-auto">
-          {shown.map((one) => (
-            <label
-              key={one.id}
-              className="flex items-center gap-1 rounded border border-slate-800 px-2 py-0.5 text-sm"
-            >
-              <input
-                type="checkbox"
-                checked={markets.has(one.id)}
-                onChange={() => {
-                  const next = new Set(markets)
-                  if (next.has(one.id)) next.delete(one.id)
-                  else next.add(one.id)
-                  setMarkets(next)
-                }}
-                className="size-3 accent-sky-500"
-              />
-              <span className="font-mono">{one.symbol}</span>
-              <BrokerTag broker={one.broker} />
-            </label>
-          ))}
-        </div>
-      </fieldset>
+      <SymbolPicker
+        instruments={instruments.data}
+        chosen={markets}
+        onChange={setMarkets}
+        max={MAX_MARKETS}
+      />
+      {missing !== null && <p className="text-sm text-amber-300">{missing}</p>}
 
       {register.error && <p className="text-sm text-red-400">{register.error.message}</p>}
       <div className="flex gap-2">

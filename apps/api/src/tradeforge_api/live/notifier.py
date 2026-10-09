@@ -143,6 +143,13 @@ class Network(Protocol):
 
 Fetch = Callable[[urllib.request.Request], bytes]
 
+# ⚠️ A User-Agent of our own (08/10): Discord's edge refuses Python's default `Python-urllib/3.x`
+# with a 403, while the same request from curl is taken — measured on the first test post.
+_HEADERS = {
+    "Content-Type": "application/json",
+    "User-Agent": "TradeForge-Signals (https://github.com/Cascapera/trade-forge, 1.0)",
+}
+
 
 def _fetch(request: urllib.request.Request) -> bytes:
     with urllib.request.urlopen(request, timeout=20) as response:  # noqa: S310 — https only
@@ -172,14 +179,17 @@ class _Http:
         body = json.dumps(self.payload(text)).encode()
         for _attempt in range(5):
             request = urllib.request.Request(  # noqa: S310 — the URL is ours, https
-                self.url, data=body, headers={"Content-Type": "application/json"}, method="POST"
+                self.url, data=body, headers=_HEADERS, method="POST"
             )
             try:
                 self.fetch(request)
             except urllib.error.HTTPError as error:
                 wait = _retry_after(error)
                 if wait is None:
-                    raise
+                    # The network's own sentence, not only its code: "not enough rights to send
+                    # text messages to the chat" is what told us the bot needed posting rights.
+                    reason = error.read().decode(errors="replace")[:300]
+                    raise RuntimeError(f"{self.name} refused ({error.code}): {reason}") from error
                 logger.warning("%s rate limit; waiting %.1fs", self.name, wait)
                 self.sleep(wait)
             else:

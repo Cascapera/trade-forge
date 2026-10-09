@@ -132,3 +132,12 @@ def test_telegram_goes_to_the_chat_with_the_disclaimer_in_plain_text() -> None:
     assert body["chat_id"] == "-100123"
     assert body["text"].endswith(DISCLAIMER)
     assert not body["text"].endswith("_")
+
+
+def test_a_refusal_says_the_networks_own_reason() -> None:
+    def fetch(request: urllib.request.Request) -> bytes:
+        body = io.BytesIO(b'{"description":"not enough rights to send text messages"}')
+        raise urllib.error.HTTPError(request.full_url, 400, "Bad Request", {}, body)  # type: ignore[arg-type]
+
+    with pytest.raises(RuntimeError, match=r"telegram refused \(400\).*not enough rights"):
+        telegram("TOKEN", "-1", fetch=fetch).post("oi")

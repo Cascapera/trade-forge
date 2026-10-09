@@ -12,7 +12,7 @@ wrong database.
 
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from tradeforge_db.config import PostgresSettings
@@ -57,6 +57,12 @@ class Settings(PostgresSettings, RedisConfig):
     # more processes. Read here so the time estimates can divide by it — the same variable sets the
     # worker's replicas in docker-compose.yml, so the two cannot disagree.
     tradeforge_workers: int = Field(default=1, ge=1)
+
+    # Where the signals are posted (signals PR 6). Secrets: `.env` only, never the database or
+    # the repository, and `SecretStr` so no log or repr prints them. Empty: not this network.
+    discord_webhook_url: SecretStr = SecretStr("")
+    telegram_bot_token: SecretStr = SecretStr("")
+    telegram_chat_id: str = ""
 
     # Whether a sweep's launch cuts its runs into batches (ADR-0029, `batching`). ⚠️ Off while any
     # machine's workers predate `run_backtest_batch`: such a worker fails a batch job it takes and

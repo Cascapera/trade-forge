@@ -3,6 +3,7 @@
 import datetime as dt
 import json
 import urllib.parse
+import urllib.request
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any
@@ -191,3 +192,31 @@ def test_the_api_lists_and_serves_the_candle_files(api: TestClient) -> None:
 )
 def test_the_api_serves_nothing_but_candle_files(api: TestClient, path: str) -> None:
     assert api.get(f"/candle-files/{path}").status_code == 404
+
+
+def test_only_the_hourly_full_listing_may_take_long(monkeypatch: pytest.MonkeyPatch) -> None:
+    """23 s to list 6 156 files on 09/10: the sync may wait; a run never waits more than 15 s."""
+    import tradeforge_api.candle_sync as sync  # noqa: PLC0415
+
+    seen: list[float] = []
+
+    class _Response:
+        def __enter__(self) -> "_Response":
+            return self
+
+        def __exit__(self, *_: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return b"[]"
+
+    def opened(url: str, timeout: float) -> _Response:
+        seen.append(timeout)
+        return _Response()
+
+    monkeypatch.setattr(urllib.request, "urlopen", opened)
+    sync._get(f"{BASE}/candle-files")
+    sync._get(f"{BASE}/candle-files?symbol=WIN&timeframe=H1")
+    sync._get(f"{BASE}/candle-files/{WIN_2026}")
+
+    assert seen == [180, 15, 15]

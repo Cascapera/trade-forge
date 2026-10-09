@@ -12,6 +12,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, HTTPException, Query, status
 
 from tradeforge_api.deps import SessionDep
+from tradeforge_api.routers.strategies import assert_runnable_at, validate_document
 from tradeforge_api.schemas import (
     LiveMarketAdd,
     LiveMarketOut,
@@ -21,6 +22,7 @@ from tradeforge_api.schemas import (
     LiveSetupFromRun,
     LiveSetupOut,
     LiveSetupPatch,
+    LiveSetupVersion,
     SignalOut,
 )
 from tradeforge_db.live_setups import (
@@ -31,6 +33,7 @@ from tradeforge_db.live_setups import (
     delete_setup,
     follow_backtest,
     list_setups,
+    new_version,
     remove_market,
     set_market,
     setup_metrics,
@@ -167,6 +170,28 @@ def change(session: SessionDep, setup_id: uuid.UUID, request: LiveSetupPatch) ->
         raise HTTPException(status.HTTP_409_CONFLICT, str(clash)) from None
     except LookupError as missing:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(missing)) from None
+    return _answer(session, setup_id)
+
+
+@router.post(
+    "/live-setups/{setup_id}/version",
+    response_model=LiveSetupOut,
+    status_code=status.HTTP_201_CREATED,
+    responses={
+        **_NOT_FOUND,
+        status.HTTP_422_UNPROCESSABLE_CONTENT: {"description": "the edited strategy cannot run"},
+    },
+)
+def edited(session: SessionDep, setup_id: uuid.UUID, request: LiveSetupVersion) -> LiveSetupOut:
+    """Edit the setup's parameters: a new version of its strategy, which the setup now runs.
+
+    Validated exactly as a strategy saved from the builder, and at the setup's own timeframe."""
+    current = next((one for one in list_setups(session) if one.setup.id == setup_id), None)
+    if current is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"no live setup with id {setup_id}")
+    validate_document(request.definition)
+    assert_runnable_at(request.definition, current.setup.timeframe)
+    new_version(session, setup_id, request.definition)
     return _answer(session, setup_id)
 
 

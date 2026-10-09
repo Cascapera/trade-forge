@@ -400,6 +400,8 @@ export const api = {
     request('PATCH', `/live-setups/${id}/markets/${instrumentId}`, { active }),
   removeLiveMarket: (id: string, instrumentId: string): Promise<LiveSetup> =>
     request('DELETE', `/live-setups/${id}/markets/${instrumentId}`),
+  editLiveSetup: (id: string, definition: Record<string, unknown>): Promise<LiveSetup> =>
+    request('POST', `/live-setups/${id}/version`, { definition }),
   listLiveSignals: (id: string): Promise<SignalRow[]> =>
     request('GET', `/live-setups/${id}/signals?limit=200`),
 }

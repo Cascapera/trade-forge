@@ -229,7 +229,8 @@ def test_a_setup_removed_keeps_its_history(
         record_event(session, event(setup, 7, "armed", entry="1000", stop="900"))
         session.commit()
 
-    assert client.delete(f"/live-setups/{setup['id']}").status_code == 204
+    removed = client.delete(f"/live-setups/{setup['id']}")
+    assert removed.status_code == 204
     with session_factory() as session:
         from tradeforge_db.models import SignalRecord  # noqa: PLC0415
 

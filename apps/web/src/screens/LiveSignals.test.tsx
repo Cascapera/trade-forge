@@ -116,6 +116,55 @@ describe('LiveSignals', () => {
     expect(screen.getByText('+5.00R')).toBeInTheDocument()
   })
 
+  it('switches a setup on and off, and removes it', () => {
+    const mutate = mount([{ ...setup, active: false, source_backtest_id: null }])
+
+    expect(screen.queryByRole('link', { name: 'run it came from' })).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Turn on' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Remove CHOCH BASE' }))
+
+    expect(mutate.mock.calls.map((call: unknown[]) => call[0])).toEqual([
+      { kind: 'setup', id: 's1', patch: { active: true } },
+      { kind: 'remove-setup', id: 's1' },
+    ])
+  })
+
+  it('shows a setup with no result yet as dashes, and a sell still in trade', () => {
+    mount([
+      {
+        ...setup,
+        metrics: {
+          ...setup.metrics,
+          win_rate: null,
+          profit_factor: null,
+          average_r: null,
+          net_r: '-1',
+        },
+      },
+    ])
+    vi.mocked(useLiveSignals).mockReturnValue({
+      data: [{ ...signal, side: 'short', status: 'triggered', result_r: null, ended_at: null }],
+      isPending: false,
+    } as never)
+
+    fireEvent.click(screen.getByRole('button', { name: /Show the signals/ }))
+
+    expect(screen.getByText('-1.00R')).toBeInTheDocument()
+    expect(screen.getByText('sell')).toBeInTheDocument()
+    expect(screen.getByText('in trade')).toBeInTheDocument()
+  })
+
+  it('says when a setup has posted nothing yet, and while it loads', () => {
+    mount([setup])
+    vi.mocked(useLiveSignals).mockReturnValue({ data: [], isPending: false } as never)
+    fireEvent.click(screen.getByRole('button', { name: /Show the signals/ }))
+    expect(screen.getByText('No signal posted yet.')).toBeInTheDocument()
+
+    vi.mocked(useLiveSetups).mockReturnValue({ data: undefined, isPending: true } as never)
+    renderWithProviders(<LiveSignals />)
+    expect(screen.getByText('Loading…')).toBeInTheDocument()
+  })
+
   it('says when nothing is followed', () => {
     mount([])
     expect(screen.getByText('No setup is followed yet.')).toBeInTheDocument()

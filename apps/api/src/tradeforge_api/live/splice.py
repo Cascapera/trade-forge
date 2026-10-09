@@ -40,6 +40,7 @@ inside the backlog, or at the first bar that ever arrives — changes nothing.
 
 import datetime as dt
 import logging
+from collections import deque
 from collections.abc import Callable, Generator, Iterable, Iterator
 from itertools import chain
 from typing import Protocol
@@ -48,7 +49,11 @@ from tradeforge_engine.domain import Candle
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["BarSource", "SplicedCandles", "splice"]
+__all__ = ["RECENT_KEPT", "BarSource", "SplicedCandles", "splice"]
+
+RECENT_KEPT = 150
+"""Warm-up bars kept for the pictures: a signal triggered in a session's first minute would
+otherwise be drawn on the one bar it had seen live."""
 
 
 class BarSource(Protocol):
@@ -79,17 +84,25 @@ class SplicedCandles:
     __slots__ = (
         "_bars",
         "_closed_by",
+        "_disk_end",
         "_handed_over",
         "_held",
         "_last_time",
         "_live_started",
         "_timeframe",
         "dropped",
+        "recent",
+        "seam_gap",
         "warmed",
     )
 
     def __init__(
-        self, bars: Iterable[Candle], *, timeframe: dt.timedelta, opened_at: dt.datetime
+        self,
+        bars: Iterable[Candle],
+        *,
+        timeframe: dt.timedelta,
+        opened_at: dt.datetime,
+        disk_end: dt.datetime | None = None,
     ) -> None:
         if timeframe <= dt.timedelta(0):
             raise ValueError(f"timeframe must be positive, got {timeframe}")
@@ -106,6 +119,15 @@ class SplicedCandles:
         self._last_time: dt.datetime | None = None
         self._handed_over = False
         self._live_started = False
+        self._disk_end = disk_end
+
+        self.recent: deque[Candle] = deque(maxlen=RECENT_KEPT)
+        """The last bars of the warm-up — what a signal's picture opens on (09/10)."""
+
+        self.seam_gap: dt.timedelta | None = None
+        """Time from the last bar on disk to the first bar after it, once that bar is admitted —
+        `None` before, or when there was nothing on disk. A week here is a week of market the
+        strategy never saw: its averages carry on from where the disk stopped (09/10)."""
 
         self.warmed = 0
         """Bars the warm-up actually drove the strategy over. What a session records."""
@@ -125,6 +147,7 @@ class SplicedCandles:
                 break
             if self._admit(candle):
                 self.warmed += 1
+                self.recent.append(candle)
                 yield candle
         self._handed_over = True
 
@@ -195,6 +218,8 @@ class SplicedCandles:
             )
             return False
         self._last_time = candle.time
+        if self.seam_gap is None and self._disk_end is not None and candle.time > self._disk_end:
+            self.seam_gap = candle.time - self._disk_end
         return True
 
 
@@ -217,8 +242,10 @@ def splice(
     read list would put the read at the call site, before this function could sequence it.
     """
     source.ensure_group()
+    past = list(history())
     return SplicedCandles(
-        chain(history(), source.backlog(), source.candles()),
+        chain(past, source.backlog(), source.candles()),
         timeframe=timeframe,
         opened_at=opened_at,
+        disk_end=past[-1].time if past else None,
     )

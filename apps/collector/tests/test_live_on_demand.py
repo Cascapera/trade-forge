@@ -6,7 +6,7 @@ from collections.abc import Callable
 from tradeforge_collector.demand import DemandLease, demand_key, release, want, wanted
 from tradeforge_collector.live import Subscription, TickerLiveSource, run_on_demand
 
-from .test_live import FakePublisher, FakeSource, minutes, noop
+from .test_live import FakePublisher, FakeSource, minutes, noop, published_minutes
 
 WIN_M5 = Subscription("WIN", "M5")
 PETR4_M5 = Subscription("PETR4", "M5")
@@ -132,3 +132,82 @@ def test_an_internal_name_is_watched_as_the_brokers_ticker() -> None:
 
     assert source.subscribed == ["WIN$", "PETR4"]
     assert len(bars) == 2
+
+
+class TestCatchingUpFromTheDisk:
+    """09/10: a pair new to its stream started at today's bar, and a session warmed on a disk a
+    week behind read the hole as a move — the first live signal ever posted was that hole."""
+
+    WIN_M1 = Subscription("WIN", "M1")
+
+    def test_a_pair_new_to_its_stream_is_caught_up_from_the_last_bar_on_disk(self) -> None:
+        source, publisher = FakeSource(), FakePublisher()
+        source.bars[("WIN", "M1")] = minutes(*range(21))
+        disk_end = minutes(10)[0].time
+
+        run_on_demand(
+            source,
+            publisher,
+            lambda: [self.WIN_M1],
+            every=0,
+            polls=1,
+            sleep=noop,
+            on_disk=lambda _pair: disk_end,
+        )
+
+        assert published_minutes(publisher) == list(range(11, 21))
+
+    def test_only_what_came_after_the_disk_is_published_when_the_market_was_shut(self) -> None:
+        source, publisher = FakeSource(), FakePublisher()
+        # Shut from minute 3 to 14: asked by position, the fill reaches back past the disk.
+        source.bars[("WIN", "M1")] = minutes(0, 1, 2, *range(15, 21))
+
+        run_on_demand(
+            source,
+            publisher,
+            lambda: [self.WIN_M1],
+            every=0,
+            polls=1,
+            sleep=noop,
+            on_disk=lambda _pair: minutes(1)[0].time,
+        )
+
+        assert published_minutes(publisher) == [2, *range(15, 21)]
+
+    def test_a_pair_its_stream_already_knows_resumes_from_the_stream_not_the_disk(self) -> None:
+        source, publisher = FakeSource(), FakePublisher()
+        source.bars[("WIN", "M1")] = minutes(*range(21))
+        publisher.publish(self.WIN_M1, minutes(18)[0])
+        asked: list[Subscription] = []
+
+        def on_disk(pair: Subscription) -> None:
+            asked.append(pair)
+
+        run_on_demand(
+            source,
+            publisher,
+            lambda: [self.WIN_M1],
+            every=0,
+            polls=1,
+            sleep=noop,
+            on_disk=on_disk,
+        )
+
+        assert asked == []
+        assert published_minutes(publisher) == [18, 19, 20]
+
+    def test_nothing_on_disk_starts_at_the_newest_bar_as_before(self) -> None:
+        source, publisher = FakeSource(), FakePublisher()
+        source.bars[("WIN", "M1")] = minutes(*range(21))
+
+        run_on_demand(
+            source,
+            publisher,
+            lambda: [self.WIN_M1],
+            every=0,
+            polls=1,
+            sleep=noop,
+            on_disk=lambda _pair: None,
+        )
+
+        assert published_minutes(publisher) == [20]

@@ -13,10 +13,12 @@ from decimal import Decimal
 import pytest
 
 from tradeforge_api.live import CandleStream
-from tradeforge_api.live.splice import BarSource, SplicedCandles, splice
+from tradeforge_api.live.session import MAX_SEAM_GAP, _refuse_a_hole
+from tradeforge_api.live.splice import RECENT_KEPT, BarSource, SplicedCandles, splice
 from tradeforge_api.live.testing import FakeRedisStreams
 from tradeforge_collector.live import Subscription
 from tradeforge_engine.domain import Candle
+from tradeforge_engine.errors import EngineError
 
 HOUR = dt.timedelta(hours=1)
 START = dt.datetime(2026, 8, 25, 0, tzinfo=dt.UTC)
@@ -438,3 +440,66 @@ def test_a_bar_repeating_the_one_that_ended_the_warm_up_is_dropped() -> None:
     assert closes_of(candles.warmup()) == [0]
     assert closes_of(candles.live()) == [1, 2, 3]
     assert candles.dropped == 1
+
+
+# --------------------------------------------------------------------------------------------
+# The seam between the disk and the stream (09/10)
+# --------------------------------------------------------------------------------------------
+
+
+def test_the_seam_measures_the_hole_between_the_disk_and_the_stream() -> None:
+    """A week of M5 missing on 09/10 put today's bar straight after 02/10's, and the strategy
+    read the jump as a turn. The hole is what a session must be able to refuse."""
+    candles, _ = spliced(
+        history=[bar(0), bar(1)],
+        backlog=[bar(1), bar(30)],
+        live=[bar(31)],
+        opened_at=cut_after(30),
+    )
+
+    list(candles.warmup())
+
+    assert candles.seam_gap == 29 * HOUR
+
+
+def test_a_stream_that_carries_on_from_the_disk_has_a_seam_of_one_bar() -> None:
+    candles, _ = spliced(
+        history=[bar(0), bar(1)], backlog=[bar(2)], live=[bar(3)], opened_at=cut_after(2)
+    )
+
+    list(candles.warmup())
+
+    assert candles.seam_gap == HOUR
+
+
+def test_nothing_on_disk_has_no_seam() -> None:
+    candles, _ = spliced(history=[], backlog=[bar(0)], live=[bar(1)], opened_at=cut_after(0))
+
+    list(candles.warmup())
+
+    assert candles.seam_gap is None
+
+
+def test_the_last_warmed_bars_are_kept_for_the_pictures() -> None:
+    candles, _ = spliced(
+        history=[bar(index) for index in range(200)],
+        backlog=[],
+        live=[bar(200)],
+        opened_at=cut_after(199),
+    )
+
+    list(candles.warmup())
+
+    assert len(candles.recent) == RECENT_KEPT
+    assert candles.recent[-1] == bar(199)
+
+
+def test_a_session_refuses_a_hole_longer_than_a_long_weekend() -> None:
+    candles = SplicedCandles([], timeframe=HOUR, opened_at=cut_after(0))
+
+    candles.seam_gap = MAX_SEAM_GAP
+    _refuse_a_hole(candles, "Usa500", "M5")  # a weekend with a holiday: accepted
+
+    candles.seam_gap = MAX_SEAM_GAP + HOUR
+    with pytest.raises(EngineError, match="missing between the candles on disk"):
+        _refuse_a_hole(candles, "Usa500", "M5")

@@ -34,6 +34,7 @@ from redis.exceptions import ResponseError
 
 from tradeforge_api.config import Settings
 from tradeforge_api.live.signals import SIGNALS_STREAM
+from tradeforge_collector import step
 
 __all__ = [
     "DISCLAIMER",
@@ -78,11 +79,20 @@ def _r(raw: str | None) -> str:
     return f"{'+' if value > 0 else ''}{_number(str(value))}R"
 
 
-def _when(raw: str | None) -> str:
+def _when(raw: str | None, timeframe: str) -> str:
+    """When the event became true: the **close** of the candle that decided it (09/10).
+
+    An event is stamped with its candle's open, as every candle is — and "14:20" on a signal that
+    arrived at 14:30 read as a clock gone wrong. The close is when it was known; the open stays
+    beside it, because that is the candle the chart shows."""
     if not raw:
         return ""
-    moment = dt.datetime.fromisoformat(raw).astimezone(_BRASILIA)
-    return moment.strftime("%d/%m %H:%M") + " (Brasília)"
+    opened = dt.datetime.fromisoformat(raw).astimezone(_BRASILIA)
+    try:
+        closed = opened + step(timeframe)
+    except ValueError:
+        return opened.strftime("%d/%m %H:%M") + " (Brasília)"
+    return f"{closed:%d/%m %H:%M} (Brasília) · candle {timeframe} das {opened:%H:%M}"
 
 
 def format_message(fields: Mapping[str, str]) -> str:
@@ -124,7 +134,7 @@ def format_message(fields: Mapping[str, str]) -> str:
         lines.append(f"Resultado: {_r(fields.get('result_r'))}")
     if kind == "cancelled" and fields.get("reason"):
         lines.append(f"Motivo: {fields['reason']}")
-    when = _when(fields.get("time"))
+    when = _when(fields.get("time"), fields.get("timeframe", ""))
     if when:
         lines.append(when)
     lines.append("")

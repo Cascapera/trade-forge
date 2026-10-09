@@ -161,3 +161,32 @@ def test_each_signal_gets_its_own_number() -> None:
     signals.submit(armed_long(client_id="c2"))
 
     assert [number for _, number in kinds(sink)] == [41, 41, 42]
+
+
+def test_a_picture_opens_on_the_warm_up_bars_not_on_the_one_seen_live() -> None:
+    """09/10: the first ACIONADO ever posted was drawn on one candle — the session had just
+    opened, and the bars it warmed over were never handed to the wrapper."""
+    drawn: list[int] = []
+
+    def picture(candles: object, **_: object) -> bytes:
+        drawn.append(len(list(candles)))  # type: ignore[call-overload]
+        return b"png"
+
+    sink = Sink()
+    inner = BacktestBroker(instrument=WIN, initial_capital=Decimal(100_000))
+    signals = SignalBroker(
+        inner,
+        sink,
+        number=sink.number,
+        take_profit_rr=None,
+        no_target_r=Decimal(5),
+        picture=picture,
+        recent=[bar(-index, 950, 990) for index in range(30, 0, -1)],
+    )
+    signals.submit(armed_long())
+    signals.on_bar(bar(1, 950, 1010))  # filled: the picture of the trigger
+
+    triggered = sink.events[-1]
+    assert triggered.kind is SignalKindOf.TRIGGERED
+    assert triggered.image == b"png"
+    assert drawn[-1] == 31

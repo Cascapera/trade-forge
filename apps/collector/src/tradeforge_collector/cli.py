@@ -205,6 +205,12 @@ def _parser() -> argparse.ArgumentParser:
             f"quietly — repair it with a backfill"
         ),
     )
+    live.add_argument(
+        "--data-dir",
+        type=Path,
+        default=DEFAULT_DATA_DIR,
+        help="the collected candles: a pair new to its stream is caught up from their last bar",
+    )
     live.add_argument("--redis-host", default=os.environ.get("REDIS_HOST", "localhost"))
     live.add_argument("--redis-port", type=int, default=int(os.environ.get("REDIS_PORT", "6379")))
 
@@ -370,6 +376,14 @@ def _live(args: argparse.Namespace) -> int:
     return 0
 
 
+def _stored_until(root: Path, pair: Subscription) -> dt.datetime | None:
+    """The last bar collected for this pair, or `None` when nothing was."""
+    from tradeforge_collector.storage import coverage  # noqa: PLC0415 — pyarrow, only when live
+
+    stored = coverage(root, pair.symbol, pair.timeframe)
+    return None if stored is None else stored.date_to
+
+
 def _live_broker(args: argparse.Namespace) -> int:
     """One broker's live loop: its own terminal, watching what sessions ask of it (ADR-0032).
 
@@ -423,6 +437,7 @@ def _live_broker(args: argparse.Namespace) -> int:
             every=args.every,
             polls=1 if args.once else None,
             max_backfill=args.max_backfill,
+            on_disk=lambda pair: _stored_until(args.data_dir, pair),
         )
     except KeyboardInterrupt:
         log.info("stopped")

@@ -10,7 +10,13 @@ import pytest
 from tradeforge_api.live.notifier import discord, telegram
 from tradeforge_api.live.signal_image import render_signal_png
 from tradeforge_api.live.signals import SignalKindOf
-from tradeforge_engine.domain import Candle, EntrySnapshot, SnapshotRegion
+from tradeforge_engine.domain import (
+    Candle,
+    EntrySnapshot,
+    SnapshotPoint,
+    SnapshotRegion,
+    SnapshotSeries,
+)
 
 from .test_signals import STEP, T0, armed_long, bar, broker
 
@@ -151,3 +157,30 @@ def test_the_time_axis_reads_brasilia() -> None:
     bars = [bar(i, 900, 1000) for i in range(3)]
     assert bars[0].time.tzinfo == dt.UTC
     assert render_signal_png(bars, title="t", entry=None, stop=None, target=None).startswith(PNG)
+
+
+def test_a_curve_is_drawn_only_over_the_bars_shown(monkeypatch: pytest.MonkeyPatch) -> None:
+    """09/10: an average's readings from before the first bar drawn all landed on the left
+    edge — a vertical stroke that stretched the scale a hundred points away from the price."""
+    import matplotlib.axes  # noqa: PLC0415
+
+    plotted: list[list[float]] = []
+    real_plot = matplotlib.axes.Axes.plot
+
+    def plot(self: Any, xs: list[float], *rest: Any, **fields: Any) -> Any:
+        plotted.append(list(xs))
+        return real_plot(self, xs, *rest, **fields)
+
+    monkeypatch.setattr(matplotlib.axes.Axes, "plot", plot)
+    bars = candles(10)
+    earlier = [SnapshotPoint(time=T0 - (5 - i) * STEP, value=Decimal(700)) for i in range(5)]
+    shown = [SnapshotPoint(time=one.time, value=one.close) for one in bars]
+    snapshot = EntrySnapshot(
+        bars=tuple(bars),
+        decided_at=bars[-1].time,
+        series=(SnapshotSeries(label="average", points=(*earlier, *shown)),),
+    )
+
+    render_signal_png(bars, title="x", entry=None, stop=None, target=None, snapshot=snapshot)
+
+    assert plotted == [[float(i) for i in range(10)]]

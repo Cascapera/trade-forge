@@ -22,6 +22,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
@@ -136,22 +137,19 @@ class Network(Protocol):
 
     name: str
 
-    def post(self, text: str) -> None:
-        """Post it, or raise. A rate limit is waited out inside."""
+    def post(self, text: str, image: bytes | None = None) -> None:
+        """Post it — with the picture when there is one — or raise. Rate limits are waited out."""
 
 
 Fetch = Callable[[urllib.request.Request], bytes]
 
 # ⚠️ A User-Agent of our own (08/10): Discord's edge refuses Python's default `Python-urllib/3.x`
 # with a 403, while the same request from curl is taken — measured on the first test post.
-_HEADERS = {
-    "Content-Type": "application/json",
-    "User-Agent": "TradeForge-Signals (https://github.com/Cascapera/trade-forge, 1.0)",
-}
+_AGENT = "TradeForge-Signals (https://github.com/Cascapera/trade-forge, 1.0)"
 
 
 def _fetch(request: urllib.request.Request) -> bytes:
-    with urllib.request.urlopen(request, timeout=20) as response:  # noqa: S310 — https only
+    with urllib.request.urlopen(request, timeout=30) as response:  # noqa: S310 — https only
         return bytes(response.read())
 
 
@@ -166,20 +164,50 @@ def _retry_after(error: urllib.error.HTTPError) -> float | None:
     return float(seconds)
 
 
+def _multipart(fields: Mapping[str, str], file_field: str, image: bytes) -> tuple[bytes, str]:
+    """A form with text fields and one PNG — what both networks take a picture as."""
+    boundary = f"tradeforge{uuid.uuid4().hex}"
+    crlf = "\r\n"
+    parts: list[bytes] = []
+    for name, value in fields.items():
+        head = f'--{boundary}{crlf}Content-Disposition: form-data; name="{name}"{crlf}{crlf}'
+        parts.append(f"{head}{value}{crlf}".encode())
+    head = (
+        f'--{boundary}{crlf}Content-Disposition: form-data; name="{file_field}"; '
+        f'filename="signal.png"{crlf}Content-Type: image/png{crlf}{crlf}'
+    )
+    parts.append(head.encode() + image + crlf.encode())
+    parts.append(f"--{boundary}--{crlf}".encode())
+    return b"".join(parts), f"multipart/form-data; boundary={boundary}"
+
+
 @dataclass(slots=True)
 class _Http:
     name: str
-    url: str
-    payload: Callable[[str], dict[str, object]]
+    text_url: str
+    image_url: str
+    text: Callable[[str], dict[str, object]]
+    """The JSON body of a message without a picture."""
+    form: Callable[[str], dict[str, str]]
+    """The form fields of a message with one."""
+    file_field: str
     fetch: Fetch | None = None
     """A test's stand-in for the HTTP call; `None` is the real one."""
     sleep: Callable[[float], None] = time.sleep
 
-    def post(self, text: str) -> None:
-        body = json.dumps(self.payload(text)).encode()
+    def post(self, text: str, image: bytes | None = None) -> None:
+        if image is None:
+            url, body = self.text_url, json.dumps(self.text(text)).encode()
+            kind = "application/json"
+        else:
+            url = self.image_url
+            body, kind = _multipart(self.form(text), self.file_field, image)
         for _attempt in range(5):
             request = urllib.request.Request(  # noqa: S310 — the URL is ours, https
-                self.url, data=body, headers=_HEADERS, method="POST"
+                url,
+                data=body,
+                headers={"Content-Type": kind, "User-Agent": _AGENT},
+                method="POST",
             )
             try:
                 (self.fetch or _fetch)(request)
@@ -198,25 +226,33 @@ class _Http:
 
 
 def discord(webhook_url: str, **seams: object) -> Network:
-    """A Discord channel's webhook."""
+    """A Discord channel's webhook; a picture is attached to the same message."""
     return _Http(
         "discord",
         webhook_url,
+        webhook_url,
         lambda text: {"content": text},  # `_..._` is italic in Discord's markdown
+        lambda text: {"payload_json": json.dumps({"content": text})},
+        "files[0]",
         **seams,  # type: ignore[arg-type]
     )
 
 
 def telegram(token: str, chat_id: str, **seams: object) -> Network:
-    """A Telegram chat or channel, through the bot."""
+    """A Telegram chat or channel, through the bot; a picture goes as a photo with the text as
+    its caption (the messages stay well under the caption's 1024 characters)."""
+    base = f"https://api.telegram.org/bot{token}"
+
+    def plain(text: str) -> str:
+        return text.replace("_" + DISCLAIMER + "_", DISCLAIMER)
+
     return _Http(
         "telegram",
-        f"https://api.telegram.org/bot{token}/sendMessage",
-        lambda text: {
-            "chat_id": chat_id,
-            "text": text.replace("_" + DISCLAIMER + "_", DISCLAIMER),
-            "disable_web_page_preview": True,
-        },
+        f"{base}/sendMessage",
+        f"{base}/sendPhoto",
+        lambda text: {"chat_id": chat_id, "text": plain(text), "disable_web_page_preview": True},
+        lambda text: {"chat_id": chat_id, "caption": plain(text)},
+        "photo",
         **seams,  # type: ignore[arg-type]
     )
 
@@ -232,7 +268,11 @@ class _Store(Protocol):
 
 
 def deliver(
-    entry_id: str, fields: Mapping[str, str], networks: Sequence[Network], store: _Store
+    entry_id: str,
+    fields: Mapping[str, str],
+    networks: Sequence[Network],
+    store: _Store,
+    image: bytes | None = None,
 ) -> None:
     """Post one entry to every network that does not have it yet. Raises if any refused — the
     caller then leaves the entry unacknowledged, and the next read tries the rest again."""
@@ -243,7 +283,7 @@ def deliver(
         if not store.set(key, "1", ex=_POSTED_TTL, nx=True):
             continue  # this network already has it
         try:
-            network.post(text)
+            network.post(text, image)
         except Exception:
             store.delete(key)
             logger.exception("posting %s to %s failed", entry_id, network.name)
@@ -300,6 +340,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     redis = Redis.from_url(settings.redis_url, decode_responses=True)
+    # The pictures are bytes: read through a client that does not decode replies.
+    pictures = Redis.from_url(settings.redis_url)
     try:
         redis.xgroup_create(
             SIGNALS_STREAM, GROUP, id="0" if args.from_start else "$", mkstream=True
@@ -322,7 +364,8 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             for entry_id, fields in entries:
                 try:
-                    deliver(entry_id, fields, networks, redis)
+                    image = pictures.get(fields["image_key"]) if "image_key" in fields else None
+                    deliver(entry_id, fields, networks, redis, cast("bytes | None", image))
                 except Exception:  # noqa: BLE001 - any failure keeps the entry for another try
                     logger.warning("entry %s kept for another try", entry_id)
                     time.sleep(10)
@@ -333,6 +376,7 @@ def main(argv: list[str] | None = None) -> int:
         logger.info("stopped")
     finally:
         redis.close()
+        pictures.close()
     return 0
 
 

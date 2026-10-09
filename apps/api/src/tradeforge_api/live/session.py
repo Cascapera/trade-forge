@@ -444,13 +444,17 @@ def _broker_for(  # noqa: PLR0913 — the plan, the seam, and the four facts a p
             return simulated
         if signals is None:  # refused by `run_session` before the warm-up; kept for the same
             raise EngineError("a signal session needs somewhere to post")  # reason as below
-        # Paper, exactly — the wrapper only watches (signals PR 5).
+        # Imported here: only a signal session draws, and matplotlib is heavy to load.
+        from tradeforge_api.live.signal_image import render_signal_png  # noqa: PLC0415
+
+        # Paper, exactly — the wrapper only watches (signals PR 5), and draws (PR 7).
         return SignalBroker(
             simulated,
             signals,
             number=signals.number,
             take_profit_rr=take_profit_rr,
             no_target_r=plan.no_target_r,
+            picture=render_signal_png,
         )
     if venue is None:
         # ⚠️ Unreachable through `run_session`, which refuses before the warm-up — and kept, on

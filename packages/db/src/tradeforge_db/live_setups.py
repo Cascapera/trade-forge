@@ -7,11 +7,11 @@ kept one row per number (`SignalRecord`), and its metrics — in R only, his cal
 
 import datetime as dt
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
 
-from sqlalchemy import select
+from sqlalchemy import Select, select
 from sqlalchemy.orm import Session, selectinload
 
 from tradeforge_db.models import (
@@ -28,6 +28,7 @@ from tradeforge_db.models import (
 __all__ = [
     "AlreadyFollowedError",
     "FollowedPair",
+    "OpenSignal",
     "SetupMetrics",
     "SetupView",
     "add_market",
@@ -38,6 +39,8 @@ __all__ = [
     "followed_pairs",
     "list_setups",
     "new_version",
+    "open_signal",
+    "orphan_signals",
     "record_event",
     "remove_market",
     "set_market",
@@ -453,6 +456,91 @@ def record_event(session: Session, fields: Mapping[str, str]) -> SignalRecord:
         row.reason = fields.get("reason") or None
     session.flush()
     return row
+
+
+@dataclass(frozen=True, slots=True)
+class OpenSignal:
+    """A signal still armed or in a trade, with everything its next message needs."""
+
+    number: int
+    status: str
+    symbol: str
+    timeframe: str
+    side: str
+    entry: Decimal | None
+    stop: Decimal | None
+    target: Decimal | None
+    armed_at: dt.datetime | None
+    triggered_at: dt.datetime | None
+    session_id: uuid.UUID | None
+    setup_id: uuid.UUID | None
+    strategy_id: uuid.UUID | None
+    instrument_id: uuid.UUID | None
+    strategy: str
+    broker: str | None
+    no_target_r: Decimal | None
+
+
+_OPEN = ("armed", "triggered")
+
+
+# The outer joins make each of the three nullable; the column types say otherwise.
+_OpenRow = tuple[SignalRecord, str, str, Decimal]
+
+
+def _open_signals() -> Select[_OpenRow]:
+    return (
+        select(SignalRecord, Strategy.name, Broker.slug, LiveSetup.no_target_r)
+        .outerjoin(Strategy, Strategy.id == SignalRecord.strategy_id)
+        .outerjoin(Instrument, Instrument.id == SignalRecord.instrument_id)
+        .outerjoin(Broker, Broker.id == Instrument.broker_id)
+        .outerjoin(LiveSetup, LiveSetup.id == SignalRecord.setup_id)
+        .where(SignalRecord.status.in_(_OPEN))
+        .order_by(SignalRecord.number)
+    )
+
+
+def _as_open(
+    row: SignalRecord, strategy: str | None, broker: str | None, no_target_r: Decimal | None
+) -> OpenSignal:
+    return OpenSignal(
+        number=row.number,
+        status=row.status,
+        symbol=row.symbol,
+        timeframe=row.timeframe,
+        side=row.side,
+        entry=row.entry,
+        stop=row.stop,
+        target=row.target,
+        armed_at=row.armed_at,
+        triggered_at=row.triggered_at,
+        session_id=row.session_id,
+        setup_id=row.setup_id,
+        strategy_id=row.strategy_id,
+        instrument_id=row.instrument_id,
+        strategy=strategy or "",
+        broker=broker,
+        no_target_r=no_target_r,
+    )
+
+
+def orphan_signals(session: Session, alive: Collection[uuid.UUID]) -> list[OpenSignal]:
+    """The signals still armed or in a trade whose session is not one of `alive` (09/10).
+
+    Nobody is watching them any more — a restart, the machine switched off, a setup turned off —
+    and without somebody to, a signal stays open on the channel and on the screen for ever."""
+    statement = _open_signals()
+    if alive:
+        statement = statement.where(
+            (SignalRecord.session_id.is_(None)) | (SignalRecord.session_id.not_in(list(alive)))
+        )
+    return [_as_open(*row) for row in session.execute(statement)]
+
+
+def open_signal(session: Session, number: int) -> OpenSignal | None:
+    """Signal `number` if it is still armed or in a trade."""
+    found = session.execute(_open_signals().where(SignalRecord.number == number)).first()
+    return None if found is None else _as_open(*found)
 
 
 def signals_of(

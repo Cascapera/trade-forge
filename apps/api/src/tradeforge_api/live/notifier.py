@@ -116,48 +116,73 @@ def _breakeven(fields: Mapping[str, str], side: str) -> list[str]:
     return lines
 
 
+def _title(kind: str, fields: Mapping[str, str], *, annulled: bool) -> str:
+    if annulled:
+        return "⚪ ANULADO"
+    if kind == "closed":
+        result = fields.get("result_r", "")
+        return "✅ ENCERRADO" if result and Decimal(result) > 0 else "❌ ENCERRADO"
+    return _TITLE.get(kind, kind.upper())
+
+
+def _levels(fields: Mapping[str, str]) -> list[str]:
+    lines = [f"Stop {_number(fields.get('stop'))}"]
+    if fields.get("target"):
+        lines.append(f"Alvo {_number(fields.get('target'))}")
+    else:
+        reach = _number(fields.get("no_target_r") or "5")
+        lines.append(f"Sem alvo: encerra em {reach}R, no stop ou na saída do setup")
+    return lines
+
+
+def _annulled(fields: Mapping[str, str]) -> list[str]:
+    return [
+        f"Sinal anulado: {fields.get('reason') or 'sem motivo informado'}",
+        "Desconsidere este sinal",
+    ]
+
+
+def _body(kind: str, fields: Mapping[str, str]) -> list[str]:
+    """The lines between the heading and the time: what happened, at which prices."""
+    side = _SIDE.get(fields.get("side", ""), fields.get("side", ""))
+    entry = _number(fields.get("entry"))
+    if kind == "armed":
+        order = _ORDER.get(fields.get("order_type", ""), fields.get("order_type", ""))
+        return [f"{side} ({order}) em {entry}", *_levels(fields)]
+    if kind == "triggered":
+        return [f"{side} executada em {entry}", *_levels(fields)]
+    if kind == "breakeven":
+        return _breakeven(fields, side)
+    if kind == "closed":
+        return [
+            f"Entrada {entry} → saída {_number(fields.get('exit_price'))}",
+            f"Resultado: {_r(fields.get('result_r'))}",
+        ]
+    if kind == "cancelled":
+        lines = [f"{side} em {entry} não foi executada"]
+        if fields.get("reason"):
+            lines.append(f"Motivo: {fields['reason']}")
+        return lines
+    return []
+
+
 def format_message(fields: Mapping[str, str]) -> str:
     """The message for one event, in Portuguese, ending with the disclaimer."""
     kind = fields.get("kind", "")
-    number = fields.get("number", "?")
+    annulled = kind == "cancelled" and bool(fields.get("annulled"))
     head = f"{fields.get('symbol', '?')} {fields.get('timeframe', '')}".strip()
     setup = fields.get("strategy", "")
     broker = fields.get("broker", "")
-    side = _SIDE.get(fields.get("side", ""), fields.get("side", ""))
-    order = _ORDER.get(fields.get("order_type", ""), fields.get("order_type", ""))
 
-    if kind == "closed":
-        result = fields.get("result_r", "")
-        win = bool(result) and Decimal(result) > 0
-        title = "✅ ENCERRADO" if win else "❌ ENCERRADO"
-    else:
-        title = _TITLE.get(kind, kind.upper())
-
-    lines = [f"{title} #{number} — {head}"]
+    lines = [f"{_title(kind, fields, annulled=annulled)} #{fields.get('number', '?')} — {head}"]
     lines.append(" · ".join(part for part in (setup, broker) if part))
-    if kind == "armed":
-        lines.append(f"{side} ({order}) em {_number(fields.get('entry'))}")
-    elif kind == "triggered":
-        lines.append(f"{side} executada em {_number(fields.get('entry'))}")
-    elif kind == "cancelled":
-        lines.append(f"{side} em {_number(fields.get('entry'))} não foi executada")
-    elif kind == "breakeven":
-        lines.extend(_breakeven(fields, side))
-    if kind in {"armed", "triggered"}:
-        lines.append(f"Stop {_number(fields.get('stop'))}")
-        if fields.get("target"):
-            lines.append(f"Alvo {_number(fields.get('target'))}")
-        else:
-            reach = _number(fields.get("no_target_r") or "5")
-            lines.append(f"Sem alvo: encerra em {reach}R, no stop ou na saída do setup")
-    if kind == "closed":
-        lines.append(
-            f"Entrada {_number(fields.get('entry'))} → saída {_number(fields.get('exit_price'))}"
-        )
-        lines.append(f"Resultado: {_r(fields.get('result_r'))}")
-    if kind == "cancelled" and fields.get("reason"):
-        lines.append(f"Motivo: {fields['reason']}")
-    when = _when(fields.get("time"), fields.get("timeframe", ""))
+    lines.extend(_annulled(fields) if annulled else _body(kind, fields))
+    if fields.get("note"):
+        lines.append(f"_{fields['note']}_")
+    # A time from the clock, not a bar's (an annulment, an order nobody watches any more): no
+    # candle to name beside it.
+    wall = fields.get("clock") == "wall"
+    when = _when(fields.get("time"), "" if wall else fields.get("timeframe", ""))
     if when:
         lines.append(when)
     lines.append("")

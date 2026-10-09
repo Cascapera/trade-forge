@@ -61,6 +61,7 @@ from tradeforge_collector.timeframes import step
 
 __all__ = [
     "DEFAULT_MAX_BACKFILL",
+    "DEFAULT_MAX_CATCH_UP",
     "Backoff",
     "CandlePublisher",
     "LiveSource",
@@ -79,6 +80,12 @@ logger = logging.getLogger(__name__)
 # real. 500 covers a full trading day of M1 and any plausible outage of a slower timeframe;
 # past that the honest repair is a backfill, and the loop says so instead of pretending.
 DEFAULT_MAX_BACKFILL = 500
+
+# How many bars the first fill of a pair may ask for, when it starts from the last bar on disk
+# rather than from the stream (09/10). The disk can be weeks behind — the collection jobs fill it,
+# not this loop — and a session that warmed on it trades the hole as if it were a move: 20 000 bars
+# is ten weeks of M5, read in one call.
+DEFAULT_MAX_CATCH_UP = 20_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -316,7 +323,9 @@ def _closed_since(
         return latest
 
     _warn_if_short(subscription, filled=filled, last=last, bar=bar)
-    return filled
+    # Asked by position, so it reaches back past `last` whenever the market was shut for part of
+    # the hole: only what came after is owed.
+    return [candle for candle in filled if candle.time > last]
 
 
 def _warn_if_short(
@@ -487,8 +496,14 @@ def run_on_demand(  # noqa: PLR0913 — the same seams as `run`, plus where the 
     sleep: Callable[[float], None] = time.sleep,
     backoff: Backoff = DEFAULT_BACKOFF,
     max_backfill: int = DEFAULT_MAX_BACKFILL,
+    on_disk: Callable[[Subscription], dt.datetime | None] | None = None,
+    max_catch_up: int = DEFAULT_MAX_CATCH_UP,
 ) -> int:
     """`run`, watching whatever `demand` answers each round instead of a fixed list (ADR-0032).
+
+    A pair whose stream holds nothing yet starts from `on_disk` — the last bar the collection
+    stored — and is caught up from there at once, up to `max_catch_up` bars (09/10). Without it a
+    session warms on the disk, receives today's bar next, and reads the hole as a move.
 
     One broker's live loop: a pair asked for starts being watched on the next round — resumed
     from its stream like a restart, so a pair asked for again after a pause gets its gap filled —
@@ -517,6 +532,7 @@ def run_on_demand(  # noqa: PLR0913 — the same seams as `run`, plus where the 
             refused &= asked
             for new in sorted(asked - watching - refused, key=_by_name):
                 _resume(publisher, (new,), seen)
+                stored = None if new in seen or on_disk is None else on_disk(new)
                 try:
                     source.subscribe(new.symbol)
                 except ConnectionError:
@@ -527,6 +543,20 @@ def run_on_demand(  # noqa: PLR0913 — the same seams as `run`, plus where the 
                     continue
                 watching.add(new)
                 logger.info("%s %s: now watched", new.symbol, new.timeframe)
+                if stored is not None:
+                    seen[new] = stored
+                    logger.info(
+                        "%s %s: catching up from the last bar on disk, %s",
+                        new.symbol,
+                        new.timeframe,
+                        stored,
+                    )
+                    total += sum(
+                        len(bars)
+                        for bars in poll_once(
+                            source, publisher, (new,), seen=seen, max_backfill=max_catch_up
+                        ).values()
+                    )
             published = poll_once(
                 source,
                 publisher,

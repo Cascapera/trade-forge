@@ -46,7 +46,7 @@ one through. What it takes is a `Venue` — a callable handed the session id —
 import datetime as dt
 import logging
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -58,7 +58,7 @@ from tradeforge_api.live.heartbeat import session_heartbeat
 from tradeforge_api.live.promotion import promotion_for
 from tradeforge_api.live.recorder import LedgerView, LedgerWatch, TradeRecorder, record_bar
 from tradeforge_api.live.signals import NumberedSink, SignalBroker
-from tradeforge_api.live.splice import BarSource, splice
+from tradeforge_api.live.splice import BarSource, SplicedCandles, splice
 from tradeforge_api.runner import (
     ENGINE_VERSION,
     build_cost_model,
@@ -72,13 +72,17 @@ from tradeforge_db.live_sessions import finish_session, open_session, reconcile_
 from tradeforge_db.models import Instrument, LiveSession, SessionMode, Strategy
 from tradeforge_db.session import session_scope
 from tradeforge_engine import BacktestBroker, PercentRiskManager, compile_strategy
-from tradeforge_engine.domain import InstrumentSpec, Refusal
+from tradeforge_engine.domain import Candle, InstrumentSpec, Refusal
 from tradeforge_engine.errors import EngineError
 from tradeforge_engine.loop import iter_run
 from tradeforge_engine.protocols import Broker, CostModel
 from tradeforge_engine.warmup import hand_over
 
 logger = logging.getLogger(__name__)
+
+MAX_SEAM_GAP = dt.timedelta(days=4)
+"""The longest silence between the disk and the stream a session accepts: a weekend with a holiday
+on either side, and nothing a market that was open could explain."""
 
 __all__ = ["SessionOutcome", "SessionPlan", "Venue", "reconcile_on_start", "run_session"]
 
@@ -165,6 +169,21 @@ def reconcile_on_start(factory: sessionmaker[Session]) -> list[uuid.UUID]:
     if marked:
         logger.warning("marked %d abandoned session(s) as failed: %s", len(marked), marked)
     return marked
+
+
+def _refuse_a_hole(candles: SplicedCandles, symbol: str, timeframe: str) -> None:
+    """Refuse to open over a hole between the candles on disk and the live stream.
+
+    ⚠️ The live loop fills it from the terminal; when it could not, the strategy's averages run
+    straight from the last bar on disk into today's, and the first "turn" it sees is the hole
+    itself — the first live signal ever posted (Usa500, a week of M5 missing, 09/10) was exactly
+    that.
+    """
+    if candles.seam_gap is not None and candles.seam_gap > MAX_SEAM_GAP:
+        raise EngineError(
+            f"refusing to open: {candles.seam_gap} of {symbol} {timeframe} missing between "
+            "the candles on disk and the live stream; collect the series again, then restart"
+        )
 
 
 def run_session(  # noqa: PLR0913 — keyword-only; each names one seam of a session
@@ -264,6 +283,8 @@ def run_session(  # noqa: PLR0913 — keyword-only; each names one seam of a ses
     ):
         pass
 
+    _refuse_a_hole(candles, symbol, plan.timeframe)
+
     # ⚠️ **`hand_over` asks this too, and this one decides whether a row is written.** The order
     # below is `open_session` *then* `hand_over`, so leaving the refusal to `hand_over` alone
     # would leave a `running` row behind for a session that never opened. `hand_over` keeps its
@@ -292,6 +313,7 @@ def run_session(  # noqa: PLR0913 — keyword-only; each names one seam of a ses
         cost_model=build_cost_model(plan.cost_model),
         take_profit_rr=take_profit_rr(definition),
         signals=signals,
+        recent=tuple(candles.recent),
     )
 
     # ⚠️ **Written before the hand-over, not after**, and in live that is the whole point of the
@@ -411,6 +433,7 @@ def _broker_for(  # noqa: PLR0913 — the plan, the seam, and the four facts a p
     cost_model: CostModel,
     take_profit_rr: Decimal | None,
     signals: NumberedSink | None = None,
+    recent: Sequence[Candle] = (),
 ) -> Broker:
     """The broker the session itself will trade through. Paper is local; live is the venue.
 
@@ -455,6 +478,7 @@ def _broker_for(  # noqa: PLR0913 — the plan, the seam, and the four facts a p
             take_profit_rr=take_profit_rr,
             no_target_r=plan.no_target_r,
             picture=render_signal_png,
+            recent=recent,
         )
     if venue is None:
         # ⚠️ Unreachable through `run_session`, which refuses before the warm-up — and kept, on

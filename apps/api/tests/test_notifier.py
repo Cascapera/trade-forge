@@ -33,8 +33,19 @@ def test_an_armed_signal_says_where_it_waits_and_how_it_ends() -> None:
     assert "Compra (stop) em 207.055" in text
     assert "Stop 206.500" in text
     assert "Sem alvo: encerra em 5R, no stop ou na saída do setup" in text
-    assert "08/10 16:00 (Brasília)" in text
+    assert "08/10 17:00 (Brasília) · candle H1 das 16:00" in text
     assert text.endswith(f"_{DISCLAIMER}_")
+
+
+def test_the_time_is_the_close_of_the_candle_that_decided() -> None:
+    """09/10: "14:20" on a signal that arrived at 14:30 read as a wrong clock — it was the open."""
+    text = format_message({**ARMED, "timeframe": "M5", "time": "2026-10-09T17:20:00+00:00"})
+    assert "09/10 14:25 (Brasília) · candle M5 das 14:20" in text
+
+
+def test_a_timeframe_it_cannot_read_falls_back_to_the_stamp() -> None:
+    text = format_message({**ARMED, "timeframe": "", "time": "2026-10-09T17:20:00+00:00"})
+    assert "09/10 14:20 (Brasília)" in text
 
 
 def test_a_target_is_shown_when_the_setup_has_one() -> None:

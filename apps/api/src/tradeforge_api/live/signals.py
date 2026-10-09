@@ -23,7 +23,7 @@ import datetime as dt
 import logging
 import uuid
 from collections import deque
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import StrEnum
@@ -176,6 +176,7 @@ class SignalBroker:
         take_profit_rr: Decimal | None,
         no_target_r: Decimal,
         picture: Picture | None = None,
+        recent: Iterable[Candle] = (),
     ) -> None:
         self._inner = inner
         self._sink = sink
@@ -184,7 +185,8 @@ class SignalBroker:
         self._no_target_r = no_target_r
         self._book = _Book()
         self._picture = picture
-        self._bars: deque[Candle] = deque(maxlen=_BARS_KEPT)
+        # Opened on the warm-up's last bars, so the first picture is not drawn on one candle.
+        self._bars: deque[Candle] = deque(recent, maxlen=_BARS_KEPT)
 
     # --- the four moments -------------------------------------------------------------------
 

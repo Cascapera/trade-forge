@@ -86,10 +86,13 @@ def render_signal_png(  # noqa: PLR0913 — what a picture of a signal shows, ea
                 )
             )
         for index, series in enumerate(snapshot.series):
-            if series.points:
+            # ⚠️ Only the points over the bars drawn: earlier ones would all land on the left
+            # edge — a vertical stroke that stretches the scale far from the price (09/10).
+            points = [point for point in series.points if point.time >= instants[0]]
+            if points:
                 axes.plot(
-                    [at(point.time) for point in series.points],
-                    [_f(point.value) for point in series.points],
+                    [at(point.time) for point in points],
+                    [_f(point.value) for point in points],
                     color=_CURVES[index % len(_CURVES)],
                     linewidth=1.1,
                     label=series.label,

@@ -79,11 +79,13 @@ class Network:
         self.name = name
         self.fails = fails
         self.posted: list[str] = []
+        self.images: list[bytes | None] = []
 
-    def post(self, text: str) -> None:
+    def post(self, text: str, image: bytes | None = None) -> None:
         if self.fails:
             raise RuntimeError("down")
         self.posted.append(text)
+        self.images.append(image)
 
 
 def test_a_network_that_already_has_an_entry_does_not_get_it_again() -> None:

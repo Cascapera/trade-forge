@@ -18,7 +18,11 @@ reading "#41 triggered" can find "#41 armed" above it. Messages are never edited
 number is the thread.
 """
 
+import dataclasses
 import datetime as dt
+import logging
+import uuid
+from collections import deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -31,6 +35,7 @@ from tradeforge_engine.domain import (
     AccountState,
     Candle,
     ClosedTrade,
+    EntrySnapshot,
     Fill,
     OrderRequest,
     OrderResult,
@@ -54,6 +59,29 @@ __all__ = [
 ]
 
 
+logger = logging.getLogger(__name__)
+
+_BARS_KEPT = 150
+"""How many closed bars a picture after the decision shows — enough to see the setup form."""
+
+
+class Picture(Protocol):
+    """Draws an event's PNG (`signal_image.render_signal_png`); a fake in tests."""
+
+    def __call__(  # noqa: PLR0913 — the same keywords as the renderer
+        self,
+        candles: Sequence[Candle],
+        *,
+        title: str,
+        entry: Decimal | None,
+        stop: Decimal | None,
+        target: Decimal | None,
+        snapshot: EntrySnapshot | None = None,
+        exit_price: Decimal | None = None,
+    ) -> bytes:
+        """The PNG."""
+
+
 class SignalKindOf(StrEnum):
     """The four moments a signal is posted at."""
 
@@ -61,6 +89,15 @@ class SignalKindOf(StrEnum):
     TRIGGERED = "triggered"
     CANCELLED = "cancelled"
     CLOSED = "closed"
+
+
+_TITLES = {
+    SignalKindOf.ARMED: "ARMADO",
+    SignalKindOf.TRIGGERED: "ACIONADO",
+    SignalKindOf.CANCELLED: "CANCELADO",
+    SignalKindOf.CLOSED: "ENCERRADO",
+}
+"""A picture's title — the message's own word, without the emoji the chart font cannot draw."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +120,8 @@ class SignalEvent:
     exit_price: Decimal | None = None
     result_r: Decimal | None = None
     reason: str = ""
+    image: bytes | None = field(default=None, repr=False)
+    """The PNG posted with the event (signals PR 7); `None` when there is none or drawing failed."""
 
 
 class SignalSink(Protocol):
@@ -112,6 +151,8 @@ class _Open:
     target: Decimal | None
     since: dt.datetime
     done: bool = False
+    snapshot: EntrySnapshot | None = None
+    """What the setup drew when it decided — redrawn on every picture of this signal."""
     """Closed for the signal (reached `no_target_r`) while the position runs on in the ledger."""
 
 
@@ -126,7 +167,7 @@ class _Book:
 class SignalBroker:
     """A `Broker` that is `inner` exactly, and reports the four moments to `sink`."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 — the broker, where events go, and what a message needs
         self,
         inner: Broker,
         sink: SignalSink,
@@ -134,6 +175,7 @@ class SignalBroker:
         number: Callable[[], int],
         take_profit_rr: Decimal | None,
         no_target_r: Decimal,
+        picture: Picture | None = None,
     ) -> None:
         self._inner = inner
         self._sink = sink
@@ -141,6 +183,8 @@ class SignalBroker:
         self._rr = take_profit_rr
         self._no_target_r = no_target_r
         self._book = _Book()
+        self._picture = picture
+        self._bars: deque[Candle] = deque(maxlen=_BARS_KEPT)
 
     # --- the four moments -------------------------------------------------------------------
 
@@ -151,7 +195,8 @@ class SignalBroker:
         if result.accepted and order.client_id is not None and level is not None:
             number = self._number()
             self._book.resting[order.client_id] = (number, order)
-            self._sink.emit(
+            self._post(
+                order.snapshot,
                 SignalEvent(
                     kind=SignalKindOf.ARMED,
                     number=number,
@@ -163,7 +208,7 @@ class SignalBroker:
                     target=self._target(order, level),
                     order_type="stop" if order.stop_price is not None else "limit",
                     reason=order.reason,
-                )
+                ),
             )
         return result
 
@@ -186,6 +231,7 @@ class SignalBroker:
         """Pass through; then entries filled are **triggered**, trades ended are **closed**, and a
         target-less signal that reached `no_target_r` is closed for the channel."""
         fills = self._inner.on_bar(candle)
+        self._bars.append(candle)
         for fill in fills:
             if fill.order.intent is SignalKind.ENTRY:
                 self._triggered(fill)
@@ -224,12 +270,41 @@ class SignalBroker:
         risk = abs(entry - order.stop_loss)
         return entry + risk * self._rr if order.side is Side.LONG else entry - risk * self._rr
 
+    def _post(self, snapshot: EntrySnapshot | None, event: SignalEvent) -> None:
+        """Hand the event on, with its picture when one can be drawn.
+
+        ⚠️ A picture that fails is logged and the event goes without it: a signal posted as text
+        beats a session that stopped over a chart."""
+        if self._picture is not None and event.kind is not SignalKindOf.CANCELLED:
+            bars = (
+                snapshot.bars
+                if event.kind is SignalKindOf.ARMED and snapshot is not None and snapshot.bars
+                else tuple(self._bars)
+            )
+            if bars:
+                try:
+                    image = self._picture(
+                        bars,
+                        title=f"{_TITLES[event.kind]} #{event.number} — {event.symbol}",
+                        entry=event.entry,
+                        stop=event.stop,
+                        target=event.target,
+                        snapshot=snapshot,
+                        exit_price=event.exit_price,
+                    )
+                except Exception:
+                    logger.exception("could not draw signal #%s; posting it without", event.number)
+                else:
+                    event = dataclasses.replace(event, image=image)
+        self._sink.emit(event)
+
     def _withdrawn(self, client_id: str, *, reason: str, time: dt.datetime | None) -> None:
         found = self._book.resting.pop(client_id, None)
         if found is None:
             return
         number, order = found
-        self._sink.emit(
+        self._post(
+            None,
             SignalEvent(
                 kind=SignalKindOf.CANCELLED,
                 number=number,
@@ -239,7 +314,7 @@ class SignalBroker:
                 entry=order.stop_price if order.stop_price is not None else order.limit_price,
                 stop=order.stop_loss,
                 reason=reason,
-            )
+            ),
         )
 
     def _triggered(self, fill: Fill) -> None:
@@ -256,8 +331,10 @@ class SignalBroker:
             stop=order.stop_loss,
             target=target,
             since=fill.time,
+            snapshot=order.snapshot,
         )
-        self._sink.emit(
+        self._post(
+            order.snapshot,
             SignalEvent(
                 kind=SignalKindOf.TRIGGERED,
                 number=number,
@@ -275,14 +352,15 @@ class SignalBroker:
                     else "market"
                 ),
                 reason=order.reason,
-            )
+            ),
         )
 
     def _closed(self, trade: ClosedTrade) -> None:
         signal = self._book.open.pop(trade.symbol, None)
         if signal is None or signal.done:
             return
-        self._sink.emit(
+        self._post(
+            signal.snapshot,
             SignalEvent(
                 kind=SignalKindOf.CLOSED,
                 number=signal.number,
@@ -295,7 +373,7 @@ class SignalBroker:
                 exit_price=trade.exit_price,
                 result_r=trade.r_multiple,
                 reason=trade.reason,
-            )
+            ),
         )
 
     def _reached_r(self, candle: Candle) -> None:
@@ -313,7 +391,8 @@ class SignalBroker:
             if not hit:
                 continue
             signal.done = True
-            self._sink.emit(
+            self._post(
+                signal.snapshot,
                 SignalEvent(
                     kind=SignalKindOf.CLOSED,
                     number=signal.number,
@@ -325,7 +404,7 @@ class SignalBroker:
                     exit_price=level,
                     result_r=self._no_target_r,
                     reason=f"reached {self._no_target_r:g}R with no target",
-                )
+                ),
             )
 
 
@@ -333,6 +412,11 @@ SIGNALS_STREAM = "signals.events"
 """The stream the notifier reads (signals PR 6). One stream for every session: one channel."""
 
 SIGNAL_NUMBER_KEY = "signals:number"
+
+SIGNAL_IMAGE_PREFIX = "signals:image:"
+"""Where an event's PNG waits for the notifier, named by the entry's `image_key`."""
+
+IMAGE_TTL = 2 * 24 * 3600
 """The counter a signal's number is drawn from — shared, so numbers never repeat across sessions."""
 
 
@@ -343,8 +427,10 @@ class RedisSignalSink:
     timeframe, the broker, the session and watch item ids. Strings, because a stream holds strings.
     """
 
-    def __init__(self, client: Redis, context: dict[str, str]) -> None:
+    def __init__(self, client: Redis, context: dict[str, str], images: Redis | None = None) -> None:
         self._client = client
+        # PNG bytes need a client that does not decode replies; the stream's one decodes them.
+        self._images = images if images is not None else client
         self._context = dict(context)
 
     def number(self) -> int:
@@ -368,6 +454,12 @@ class RedisSignalSink:
             "result_r": "" if event.result_r is None else str(event.result_r),
             "reason": event.reason,
         }
+        if event.image is not None:
+            # Beside the stream, not in it: 45 KB a picture in an entry kept 100 000 deep would
+            # be gigabytes. Two days is long past any notifier catching up.
+            key = f"{SIGNAL_IMAGE_PREFIX}{uuid.uuid4().hex}"
+            self._images.set(key, event.image, ex=IMAGE_TTL)
+            fields["image_key"] = key
         self._client.xadd(
             SIGNALS_STREAM,
             {key: value for key, value in fields.items() if value != ""},

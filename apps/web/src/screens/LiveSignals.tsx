@@ -4,6 +4,7 @@ import { Link } from 'react-router-dom'
 import { useChangeLive, useInstruments, useLiveSetups, useLiveSignals } from '../api/hooks'
 import type { LiveMetrics, LiveSetup, SignalRow } from '../api/types'
 import { BrokerTag } from '../components/BrokerTag'
+import { SetupEditor } from '../components/SetupEditor'
 
 /**
  * Live Signal (09/10): the setups the live signals follow, the markets each one is on, and what
@@ -38,6 +39,7 @@ function SetupCard(props: { setup: LiveSetup }): React.JSX.Element {
   const { setup } = props
   const change = useChangeLive()
   const [history, setHistory] = useState(false)
+  const [editing, setEditing] = useState(false)
   const busy = change.isPending
 
   return (
@@ -61,6 +63,16 @@ function SetupCard(props: { setup: LiveSetup }): React.JSX.Element {
         <span className="ml-auto flex gap-2">
           <button
             type="button"
+            onClick={() => {
+              setEditing(!editing)
+            }}
+            aria-expanded={editing}
+            className="rounded border border-slate-700 px-2 text-xs hover:bg-slate-800"
+          >
+            Edit
+          </button>
+          <button
+            type="button"
             disabled={busy}
             onClick={() => {
               change.mutate({ kind: 'setup', id: setup.id, patch: { active: !setup.active } })
@@ -82,6 +94,15 @@ function SetupCard(props: { setup: LiveSetup }): React.JSX.Element {
           </button>
         </span>
       </header>
+
+      {editing && (
+        <SetupEditor
+          setup={setup}
+          onClose={() => {
+            setEditing(false)
+          }}
+        />
+      )}
 
       <Metrics metrics={setup.metrics} />
 

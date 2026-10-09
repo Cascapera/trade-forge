@@ -1324,6 +1324,17 @@ export function useChangeLive() {
   })
 }
 
+/** Edit a setup's parameters: a new version of its strategy, which the setup then runs. */
+export function useEditLiveSetup() {
+  const client = useQueryClient()
+  return useMutation<LiveSetup, Error, { id: string; definition: Record<string, unknown> }>({
+    mutationFn: ({ id, definition }) => api.editLiveSetup(id, definition),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: ['live-setups'] })
+    },
+  })
+}
+
 /** One setup's signals, newest first — fetched only while its history is open. */
 export function useLiveSignals(setupId: string | undefined) {
   return useQuery<SignalRow[]>({

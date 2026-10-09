@@ -3198,6 +3198,12 @@ class LiveSetupPatch(BaseModel):
     note: StorableText | None = Field(default=None, max_length=500)
 
 
+class LiveSetupVersion(BaseModel):
+    """The setup's strategy, edited: becomes a new version, and the setup runs it (09/10)."""
+
+    definition: dict[str, Any]
+
+
 class LiveMarketAdd(BaseModel):
     instrument_id: uuid.UUID
 

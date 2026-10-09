@@ -237,3 +237,68 @@ def test_a_setup_removed_keeps_its_history(
         kept = session.query(SignalRecord).filter_by(number=7).one()
         assert kept.setup_id is None
         assert kept.symbol == "WIN"
+
+
+CHOCH: dict[str, Any] = {
+    "schema_version": "1.0",
+    "name": "CHOCH BASE edit test",
+    "timeframe": "H1",
+    "setup": {
+        "type": "structure_choch",
+        "params": {
+            "htf": None,
+            "side": "long",
+            "gift_stop": "gift",
+            "entry_point": "edge",
+            "htf_regions": "any",
+            "stop_buffer": 0.15,
+            "volume_filter": False,
+            "breakeven_at_r": None,
+            "allow_secondary": True,
+            "min_bars_to_touch": 7,
+            "htf_allow_secondary": True,
+        },
+    },
+    "exit": {"take_profit": {"type": "risk_multiple", "params": {"rr": 3}}},
+    "risk": {"sizing": {"type": "percent_risk", "params": {"percent": 1}}},
+}
+
+
+def test_editing_a_setup_runs_a_new_version_and_keeps_the_old_one_in_history(
+    client: TestClient, session_factory: Callable[[], Session]
+) -> None:
+    run, first = a_run(session_factory)
+    setup = client.post("/live-setups/from-run", json={"backtest_id": str(run)}).json()
+    with session_factory() as session:
+        record_event(session, event(setup, 9, "armed", entry="1000", stop="900"))
+        session.commit()
+    edited = {**CHOCH, "setup": {**CHOCH["setup"], "params": {**CHOCH["setup"]["params"]}}}
+    edited["setup"]["params"]["side"] = "both"
+
+    response = client.post(f"/live-setups/{setup['id']}/version", json={"definition": edited})
+    again = client.post(f"/live-setups/{setup['id']}/version", json={"definition": edited})
+
+    assert response.status_code == 201, response.text
+    assert again.status_code == 201, "edited twice from versions of one name: no collision"
+    second = response.json()["strategy_id"]
+    assert second != str(first)
+    with session_factory() as session:
+        new = session.get(Strategy, uuid.UUID(second))
+        assert new is not None
+        assert new.parent_version_id == first
+        assert new.definition["setup"]["params"]["side"] == "both"
+    [old_signal] = client.get(f"/live-setups/{setup['id']}/signals").json()
+    assert old_signal["strategy_id"] == str(first), "a posted signal keeps its version"
+
+
+def test_an_edit_that_cannot_run_is_refused_and_changes_nothing(
+    client: TestClient, session_factory: Callable[[], Session]
+) -> None:
+    run, first = a_run(session_factory)
+    setup = client.post("/live-setups/from-run", json={"backtest_id": str(run)}).json()
+    broken = {**CHOCH, "setup": {**CHOCH["setup"], "params": {"side": "sideways"}}}
+
+    response = client.post(f"/live-setups/{setup['id']}/version", json={"definition": broken})
+
+    assert response.status_code == 422
+    assert client.get("/live-setups").json()[0]["strategy_id"] == str(first)

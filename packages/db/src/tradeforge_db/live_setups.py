@@ -36,6 +36,7 @@ __all__ = [
     "follow_backtest",
     "followed_pairs",
     "list_setups",
+    "new_version",
     "record_event",
     "remove_market",
     "set_market",
@@ -243,6 +244,40 @@ def update_setup(  # noqa: PLR0913 — keyword-only; each one thing a setup can 
         setup.no_target_r = no_target_r
     if note is not None:
         setup.note = note or None
+    session.flush()
+    return setup
+
+
+def new_version(
+    session: Session, setup_id: uuid.UUID, definition: Mapping[str, object]
+) -> LiveSetup:
+    """Edit the setup (09/10): a new version of its strategy, and the setup pointed at it.
+
+    ⚠️ **Never the strategy in place** (AGENTS §5.5): the signals already posted keep the version
+    they came from, so a history can be read before and after an edit. The version number is the
+    next free one for that name, not merely parent + 1 — a strategy edited twice from the same
+    parent would otherwise collide with itself.
+
+    The caller validates the document; this only records it. Every market of the setup switches
+    to the new version at once: the supervisor sees a different strategy and restarts its sessions.
+    """
+    setup = _setup(session, setup_id)
+    parent = session.get(Strategy, setup.strategy_id)
+    if parent is None:
+        raise LookupError(f"the strategy behind setup {setup_id} is gone")
+    document = dict(definition)
+    name = str(document.get("name") or parent.name)
+    latest = session.scalars(
+        select(Strategy.version).where(Strategy.name == name).order_by(Strategy.version.desc())
+    ).first()
+    successor = Strategy(
+        definition=document,
+        version=(latest or parent.version) + 1,
+        parent_version_id=parent.id,
+    )
+    session.add(successor)
+    session.flush()
+    setup.strategy_id = successor.id
     session.flush()
     return setup
 

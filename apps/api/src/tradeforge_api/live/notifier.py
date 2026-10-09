@@ -138,7 +138,6 @@ class Network(Protocol):
 
     def post(self, text: str) -> None:
         """Post it, or raise. A rate limit is waited out inside."""
-        ...
 
 
 Fetch = Callable[[urllib.request.Request], bytes]
@@ -172,7 +171,8 @@ class _Http:
     name: str
     url: str
     payload: Callable[[str], dict[str, object]]
-    fetch: Fetch = _fetch
+    fetch: Fetch | None = None
+    """A test's stand-in for the HTTP call; `None` is the real one."""
     sleep: Callable[[float], None] = time.sleep
 
     def post(self, text: str) -> None:
@@ -182,7 +182,7 @@ class _Http:
                 self.url, data=body, headers=_HEADERS, method="POST"
             )
             try:
-                self.fetch(request)
+                (self.fetch or _fetch)(request)
             except urllib.error.HTTPError as error:
                 wait = _retry_after(error)
                 if wait is None:
@@ -222,9 +222,13 @@ def telegram(token: str, chat_id: str, **seams: object) -> Network:
 
 
 class _Store(Protocol):
-    def set(self, name: str, value: str, *, ex: int | None = None, nx: bool = False) -> object: ...
+    """What `deliver` needs of Redis: a key set only if absent, and a delete."""
 
-    def delete(self, *names: str) -> object: ...
+    def set(self, name: str, value: str, *, ex: int | None = None, nx: bool = False) -> object:
+        """Set `name` (only if absent with `nx`), expiring in `ex` seconds."""
+
+    def delete(self, *names: str) -> object:
+        """Remove these keys."""
 
 
 def deliver(

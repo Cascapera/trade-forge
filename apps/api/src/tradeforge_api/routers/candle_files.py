@@ -6,14 +6,13 @@ else, is refused. See `candle_sync` for who asks and when.
 """
 
 import re
-from pathlib import Path
 from typing import Annotated
 
 from fastapi import APIRouter, HTTPException, Query, status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from tradeforge_api.config import Settings
+from tradeforge_api.deps import SettingsDep
 
 router = APIRouter(tags=["candle-files"])
 
@@ -28,17 +27,14 @@ class CandleFileOut(BaseModel):
     """Seconds since the epoch — what a copy compares to tell it is stale."""
 
 
-def _root() -> Path:
-    return Settings().parquet_root
-
-
 @router.get("/candle-files", response_model=list[CandleFileOut])
 def listed(
+    settings: SettingsDep,
     symbol: Annotated[str | None, Query(max_length=32, pattern=r"^[^/\\]+$")] = None,
     timeframe: Annotated[str | None, Query(max_length=3, pattern=r"^[A-Z0-9]+$")] = None,
 ) -> list[CandleFileOut]:
     """Every candle file, or one series' files, with its size and modification time."""
-    root = _root()
+    root = settings.parquet_root
     pattern = f"symbol={symbol or '*'}/timeframe={timeframe or '*'}/year=*/*.parquet"
     found = []
     for file in sorted(root.glob(pattern)):
@@ -54,11 +50,11 @@ def listed(
     response_class=FileResponse,
     responses={status.HTTP_404_NOT_FOUND: {"description": "no such candle file"}},
 )
-def served(path: str) -> FileResponse:
+def served(settings: SettingsDep, path: str) -> FileResponse:
     """One candle file, as bytes."""
     if not _LAYOUT.match(path):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "not a candle file")
-    root = _root().resolve()
+    root = settings.parquet_root.resolve()
     file = (root / path).resolve()
     if root not in file.parents or not file.is_file():
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no such candle file")

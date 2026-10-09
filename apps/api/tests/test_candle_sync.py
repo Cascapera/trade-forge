@@ -155,13 +155,13 @@ def test_the_main_machine_being_away_leaves_the_run_on_its_own_disk(tmp_path: Pa
 
 
 @pytest.fixture
-def api(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
-    monkeypatch.setenv("PARQUET_ROOT", str(tmp_path))
+def api(tmp_path: Path) -> Iterator[TestClient]:
     for path, data in ((PETR4_2024, b"x" * 10), (WIN_2026, b"y" * 3)):
         (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
         (tmp_path / path).write_bytes(data)
     (tmp_path / "notes.txt").write_text("not a candle")
-    app: Any = create_app(settings=Settings())
+    settings = Settings(postgres_password="no connection is opened here", parquet_root=tmp_path)
+    app: Any = create_app(settings=settings, session_factory=lambda: None)  # type: ignore[arg-type,return-value]
     with TestClient(app) as client:
         yield client
 

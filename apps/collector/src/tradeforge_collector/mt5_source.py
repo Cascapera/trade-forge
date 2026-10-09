@@ -347,6 +347,19 @@ class MT5Source:
             )
             return None
 
+        if info.spread < 0:
+            # Measured 09/10 on XP's B3 shares before the open: -2097 points on AXIA3, -986 on
+            # ITUB4 — the auction's crossed book, ask below bid. A negative spread is no cost
+            # anybody pays, and the catalogue refuses it (CHECK >= 0), which failed 52 whole
+            # downloads over a field nothing is blocked on. Unmeasured is the truthful answer.
+            logger.warning(
+                "%s: broker reports a negative spread (%s points) — a crossed book, not a "
+                "cost. Not catalogued; re-run while the market trades.",
+                symbol,
+                info.spread,
+            )
+            return None
+
         ticks = Decimal(int(info.spread)) * point / tick_size
         logger.info(
             "%s: spread %s points of %s = %s ticks of %s (%s)",

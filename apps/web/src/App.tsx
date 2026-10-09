@@ -160,7 +160,9 @@ export function App(): React.JSX.Element {
           own box instead widens this column, and the page scrolls sideways as a whole — which is
           the one thing the run log's `overflow-x-auto` exists to prevent. */}
       <main className="min-w-0 flex-1 px-8 py-8">
-        <div className="mx-auto max-w-5xl">
+        {/* 80rem, not 64 (09/10): the run tables need the width a wide screen has, and 64rem left
+            half of it empty while the table scrolled sideways. */}
+        <div className="mx-auto max-w-7xl">
           <Routes>
             <Route path="/" element={<LaunchBacktest />} />
             {/* A saved strategy opens where strategies are built: the catalogue, with the builder

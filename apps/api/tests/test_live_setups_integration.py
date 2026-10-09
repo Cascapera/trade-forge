@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 from tradeforge_api.config import Settings
 from tradeforge_api.main import create_app
 from tradeforge_db.brokers import broker_for_server
-from tradeforge_db.live_setups import followed_pairs, record_event
+from tradeforge_db.live_setups import followed_pairs, open_signal, orphan_signals, record_event
 from tradeforge_db.models import Backtest, BacktestStatus, Instrument, Strategy
 from tradeforge_engine.domain import AssetClass
 
@@ -349,3 +349,34 @@ def test_a_setup_that_cannot_run_leaves_no_strategy_behind(
     with session_factory() as session:
         assert session.query(Strategy).count() == before
     assert client.get("/live-setups").json() == []
+
+
+def test_the_orphans_are_the_open_signals_of_no_session_alive(
+    client: TestClient, session_factory: Callable[[], Session]
+) -> None:
+    """09/10: #1 and #2 stayed open for good once the sessions that posted them had stopped."""
+    run, _ = a_run(session_factory)
+    setup = client.post("/live-setups/from-run", json={"backtest_id": str(run)}).json()
+    alive, gone = uuid.uuid4(), uuid.uuid4()
+    with session_factory() as session:
+        for one in (
+            event(setup, 1, "triggered", entry="1000", stop="900", session_id=str(gone)),
+            event(setup, 2, "armed", entry="1100", stop="1000", session_id=str(gone)),
+            event(setup, 3, "triggered", entry="1200", stop="1100", session_id=str(alive)),
+            event(setup, 4, "closed", result_r="1", session_id=str(gone)),
+        ):
+            record_event(session, one)
+        session.commit()
+
+        orphans = orphan_signals(session, {alive})
+        nobody = orphan_signals(session, set())
+        first = open_signal(session, 1)
+        closed = open_signal(session, 4)
+
+    assert [(one.number, one.status) for one in orphans] == [(1, "triggered"), (2, "armed")]
+    assert [one.number for one in nobody] == [1, 2, 3]
+    assert first is not None
+    assert (first.entry, first.stop, first.timeframe) == (Decimal(1000), Decimal(900), "H1")
+    assert first.strategy, "the setup's name, for the message"
+    assert first.no_target_r == Decimal(5)
+    assert closed is None

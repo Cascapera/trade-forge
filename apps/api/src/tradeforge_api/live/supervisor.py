@@ -23,7 +23,7 @@ import subprocess
 import sys
 import time
 import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
@@ -34,6 +34,7 @@ from redis.exceptions import ResponseError
 from sqlalchemy.orm import Session, sessionmaker
 
 from tradeforge_api.config import Settings
+from tradeforge_api.live.orphans import OrphanWatch, annul, orphan_brokers, resolve_orphans
 from tradeforge_api.live.signals import SIGNALS_STREAM
 from tradeforge_api.live.stop import request_stop
 from tradeforge_db.live_setups import FollowedPair, followed_pairs, record_event
@@ -173,12 +174,14 @@ def wanted_children(
     python: str,
     max_sessions: int,
     session_ids: dict[tuple[uuid.UUID, uuid.UUID], uuid.UUID],
+    also_brokers: Collection[str] = (),
 ) -> dict[str, Wanted]:
     """What should run for these (setup, market) pairs: the first `max_sessions` sessions, and a
-    live loop for each broker they need. `session_ids` keeps one id per pair across ticks, so an
-    unchanged pair is recognised as the session already running rather than as a new one."""
+    live loop for each broker they need — and for `also_brokers`, whose orphans still need bars.
+    `session_ids` keeps one id per pair across ticks, so an unchanged pair is recognised as the
+    session already running rather than as a new one."""
     wanted: dict[str, Wanted] = {}
-    brokers: set[str] = set()
+    brokers: set[str] = set(also_brokers)
     for item in items[:max_sessions]:
         pair = (item.setup_id, item.instrument_id)
         session_id = session_ids.setdefault(pair, uuid.uuid4())
@@ -220,6 +223,31 @@ def wanted_children(
     return wanted
 
 
+def forget_the_stopped(
+    session_ids: dict[tuple[uuid.UUID, uuid.UUID], uuid.UUID], running: Collection[str]
+) -> None:
+    """Drop the id of every pair whose session is not running, so its next launch has its own.
+
+    ⚠️ **One id per launch, not per pair (09/10).** A session relaunched after a crash under the
+    same id would claim what the dead one posted, and its armed and open signals would never be
+    seen as orphans — nobody watching them, the channel and the screen showing them open."""
+    for pair in list(session_ids):
+        if f"session:{pair[0]}:{pair[1]}" not in running:
+            del session_ids[pair]
+
+
+def alive_sessions(supervisor: Supervisor) -> set[uuid.UUID]:
+    """The ids of the sessions running now: a signal from any other has nobody watching it.
+
+    One being stopped still counts until it exits — it watches its signals to the last bar, and
+    two voices on one signal would post its end twice."""
+    return {
+        one.wanted.session_id
+        for one in supervisor.running.values()
+        if one.wanted.session_id is not None
+    }
+
+
 def _parse(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="tradeforge-signals",
@@ -235,6 +263,13 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--logs", type=Path, default=Path("data/logs/signals"), help="one log file per child"
     )
+    parser.add_argument(
+        "--annul",
+        type=int,
+        metavar="NUMBER",
+        help="withdraw signal NUMBER from the channels and the metrics, then exit",
+    )
+    parser.add_argument("--reason", default="", help="why, posted with --annul")
     return parser.parse_args(argv)
 
 
@@ -246,6 +281,10 @@ def main(argv: list[str] | None = None) -> int:
     engine = create_db_engine(settings.sqlalchemy_dsn)
     factory = create_session_factory(engine)
     redis = Redis.from_url(settings.redis_url, decode_responses=True)
+    if args.annul is not None:
+        done = annul(redis, factory, args.annul, args.reason or "sinal anulado")
+        logger.info("signal #%d %s", args.annul, "annulled" if done else "is not open: unchanged")
+        return 0 if done else 1
     args.logs.mkdir(parents=True, exist_ok=True)
 
     def launch(one: Wanted) -> Child:
@@ -258,6 +297,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     session_ids: dict[tuple[uuid.UUID, uuid.UUID], uuid.UUID] = {}
     consumer = f"recorder-{uuid.uuid4().hex[:8]}"
+    orphans = OrphanWatch()
     logger.info(
         "supervising signals every %.0fs, at most %d sessions", args.every, args.max_sessions
     )
@@ -265,16 +305,19 @@ def main(argv: list[str] | None = None) -> int:
         while True:
             with session_scope(factory) as session:
                 items = followed_pairs(session)
+            forget_the_stopped(session_ids, supervisor.running)
             supervisor.tick(
                 wanted_children(
                     items,
                     python=sys.executable,
                     max_sessions=args.max_sessions,
                     session_ids=session_ids,
+                    also_brokers=orphan_brokers(factory, alive_sessions(supervisor)),
                 )
             )
             try:
                 record_signals(redis, factory, consumer)
+                resolve_orphans(redis, factory, alive_sessions(supervisor), orphans)
             except Exception:
                 logger.exception("recording the signals failed; retrying next tick")
             time.sleep(args.every)

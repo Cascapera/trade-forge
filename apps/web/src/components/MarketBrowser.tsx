@@ -332,7 +332,7 @@ function BrowseRows(props: {
         const blocked = !picked && full
         const cost = browsedCost(row)
         return (
-          <li key={row.symbol}>
+          <li key={`${row.broker ?? ''}:${row.ticker ?? row.symbol}`}>
             <label
               className={`flex items-center gap-3 px-3 py-2 text-sm ${
                 picked ? 'bg-sky-950/40' : 'hover:bg-slate-900/60'
@@ -350,7 +350,13 @@ function BrowseRows(props: {
                 title={blocked ? `Already at ${String(max)} markets — untick one first` : undefined}
                 className="size-4 accent-sky-500 disabled:opacity-30"
               />
-              <span className="w-28 shrink-0 font-mono font-medium">{row.symbol}</span>
+              <span className="w-28 shrink-0 font-mono font-medium">
+                {row.symbol}
+                {/* The broker's own ticker, when the system names it otherwise (WIN for WIN$). */}
+                {row.ticker && row.ticker !== row.symbol && (
+                  <span className="ml-1 text-xs font-normal text-slate-500">{row.ticker}</span>
+                )}
+              </span>
               <span className="hidden min-w-0 grow truncate text-slate-400 sm:block">
                 {row.description}
               </span>

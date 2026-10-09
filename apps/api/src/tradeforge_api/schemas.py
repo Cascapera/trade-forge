@@ -221,6 +221,9 @@ class BrokerSymbolOut(_Out):
     # The broker whose terminal lists it (ADR-0032): two brokers can list the same ticker, and
     # the screen says whose this one is. Null for a server nobody registered.
     broker: str | None = None
+    name: str | None = None
+    """The system's name for it once collected from this broker — `WIN` for `WIN$` (ADR-0032).
+    What a launch screen chooses; the collect screen keeps `symbol`, the terminal's ticker."""
 
     # ⚠️ `prop-decorator` is a mypy limitation, not a defect being silenced: mypy does not
     # support any decorator stacked on top of `@property`, and this is the workaround Pydantic's
@@ -3151,6 +3154,9 @@ class MarketsOut(BaseModel):
 
 class BrowsedSymbolOut(BaseModel):
     symbol: str
+    """What a run is launched over: the system's name once collected (`WIN`), else the ticker."""
+    ticker: str | None = None
+    """The broker's own ticker (`WIN$`) — shown beside `symbol` when the two differ."""
     description: str | None = None
     path: str | None = None
     market: str

@@ -129,6 +129,7 @@ def browse(  # noqa: PLR0913, PLR0917 — one query parameter per filter
         and (
             not needle
             or needle in one.match.symbol.lower()
+            or needle in (one.match.name or "").lower()
             or needle in (one.match.description or "").lower()
         )
     ]
@@ -138,7 +139,8 @@ def browse(  # noqa: PLR0913, PLR0917 — one query parameter per filter
         limit=limit,
         items=[
             BrowsedSymbolOut(
-                symbol=one.match.symbol,
+                symbol=one.match.name or one.match.symbol,
+                ticker=one.match.symbol,
                 description=one.match.description,
                 path=one.match.path,
                 market=one.market,

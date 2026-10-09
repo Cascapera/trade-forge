@@ -163,4 +163,33 @@ describe('SymbolPicker', () => {
     expect(onChange).not.toHaveBeenCalled()
     expect(screen.getByText(/already at 20 markets/i)).toBeInTheDocument()
   })
+
+  it('chooses a ticker found by search under the name it was collected as (09/10)', async () => {
+    vi.mocked(api.searchSymbols).mockResolvedValue({
+      symbols: [
+        {
+          symbol: 'DOL$',
+          description: 'DOLAR COMERCIAL FUTURO',
+          path: 'BMF/SERIES CONTINUAS/DOL$',
+          digits: 3,
+          visible: true,
+          asset_class_from_path: 'future',
+          catalogued: true,
+          name: 'DOL',
+        },
+      ],
+      snapshot: null,
+    })
+    const onChange = vi.fn()
+    renderWithProviders(
+      <SymbolPicker instruments={catalogue} chosen={['EURUSD']} onChange={onChange} max={20} />,
+    )
+
+    fireEvent.change(screen.getByRole('combobox', { name: /find any market/i }), {
+      target: { value: 'dol' },
+    })
+    fireEvent.mouseDown(await screen.findByRole('option', { name: /DOL\$/ }))
+
+    expect(onChange).toHaveBeenCalledWith(['EURUSD', 'DOL'])
+  })
 })

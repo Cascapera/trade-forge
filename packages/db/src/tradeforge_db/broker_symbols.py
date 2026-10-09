@@ -12,7 +12,7 @@ import re
 from dataclasses import dataclass
 from decimal import Decimal
 
-from sqlalchemy import delete, select
+from sqlalchemy import ColumnElement, and_, delete, func, or_, select
 from sqlalchemy.orm import Session
 
 from tradeforge_db.models import Broker, BrokerSymbol, Instrument
@@ -153,6 +153,27 @@ class SymbolMatch:
     broker: str | None = None
     """The slug of the broker whose terminal lists it (ADR-0032); `None` for a server nobody
     registered."""
+    name: str | None = None
+    """The system's own name for it when it was collected from this broker — `WIN` for the
+    broker's `WIN$` (ADR-0032). What a run is launched over; `None` until it is collected."""
+
+
+def _collected_from(listed: type[BrokerSymbol]) -> ColumnElement[bool]:
+    """The instrument collected from this broker's ticker (09/10).
+
+    ⚠️ **By the broker and its ticker, not by name.** Joined on the name, `WIN$`, `DOL$` and
+    `WDO$` never matched the `WIN`, `DOL` and `WDO` they were collected as (ADR-0032), so the
+    futures tab showed none of them collected and hid them; and two brokers listing `EURUSD`
+    both claimed the one collected from either. An instrument with no ticker of its own was
+    asked for by its name; one with no broker at all predates ADR-0032 and still matches by
+    name, on every terminal, as it always did."""
+    return or_(
+        and_(
+            Instrument.broker_id == Broker.id,
+            func.coalesce(Instrument.broker_symbol, Instrument.symbol) == listed.symbol,
+        ),
+        and_(Instrument.broker_id.is_(None), Instrument.symbol == listed.symbol),
+    )
 
 
 def search_symbols(
@@ -183,9 +204,9 @@ def search_symbols(
     # Joined on `symbol` rather than on a foreign key, because there is none — see the model.
     # The overlap between the two tables is a coincidence of names, not a relation.
     statement = (
-        select(BrokerSymbol, Instrument.id, Broker.slug)
-        .outerjoin(Instrument, Instrument.symbol == BrokerSymbol.symbol)
+        select(BrokerSymbol, Instrument.symbol, Broker.slug)
         .outerjoin(Broker, Broker.server == BrokerSymbol.server)
+        .outerjoin(Instrument, _collected_from(BrokerSymbol))
         .where(BrokerSymbol.symbol.istartswith(prefix, autoescape=True))
         .order_by(BrokerSymbol.symbol)
         .limit(limit)
@@ -197,10 +218,11 @@ def search_symbols(
             path=row.path,
             digits=row.digits,
             visible=row.visible,
-            catalogued=instrument_id is not None,
+            catalogued=name is not None,
             broker=broker,
+            name=name,
         )
-        for row, instrument_id, broker in session.execute(statement)
+        for row, name, broker in session.execute(statement)
     ]
 
 
@@ -307,9 +329,9 @@ def browse_symbols(session: Session) -> list[BrowsedSymbol]:
     caller. A broker lists hundreds to a few thousand symbols: classified here once per request,
     in memory, because the market is read from words no column holds."""
     statement = (
-        select(BrokerSymbol, Instrument.id, Instrument.default_spread_points, Broker.slug)
-        .outerjoin(Instrument, Instrument.symbol == BrokerSymbol.symbol)
+        select(BrokerSymbol, Instrument.symbol, Instrument.default_spread_points, Broker.slug)
         .outerjoin(Broker, Broker.server == BrokerSymbol.server)
+        .outerjoin(Instrument, _collected_from(BrokerSymbol))
         .order_by(BrokerSymbol.symbol)
     )
     return [
@@ -320,11 +342,12 @@ def browse_symbols(session: Session) -> list[BrowsedSymbol]:
                 path=row.path,
                 digits=row.digits,
                 visible=row.visible,
-                catalogued=instrument_id is not None,
+                catalogued=name is not None,
                 broker=broker,
+                name=name,
             ),
             market=market_of(row.path, row.symbol),
             spread_points=spread,
         )
-        for row, instrument_id, spread, broker in session.execute(statement)
+        for row, name, spread, broker in session.execute(statement)
     ]

@@ -12,13 +12,13 @@ candle. Planning the missing part for collection is `collection_plan`'s question
 
 import datetime as dt
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from tradeforge_api.collection_plan import Window, missing_windows
 from tradeforge_api.schemas import PlannedCollection, PlannedWindow, UncoveredMarket
 from tradeforge_collector import step
-from tradeforge_db.models import BrokerSymbol, Dataset, Instrument, SymbolHistory
+from tradeforge_db.models import Broker, BrokerSymbol, Dataset, Instrument, SymbolHistory
 
 
 def uncovered_markets(
@@ -151,9 +151,7 @@ def plan_for(
     # The snapshot is `symbols_get()` in full, not the Market Watch: absent from it is absent from
     # the broker.
     synced = session.scalar(select(BrokerSymbol.id).limit(1)) is not None
-    listed = set(
-        session.scalars(select(BrokerSymbol.symbol).where(BrokerSymbol.symbol.in_(symbols)))
-    )
+    listed = _listed(session, list(symbols))
 
     out: list[PlannedCollection] = []
     for symbol in symbols:
@@ -188,6 +186,45 @@ def plan_for(
                     at_broker=(symbol in listed) if synced else None,
                 )
             )
+    return out
+
+
+def _listed(session: Session, symbols: list[str]) -> set[str]:
+    """Which of `symbols` their broker lists (09/10).
+
+    ⚠️ **By the ticker of the broker each was collected from, not by its name.** WIN and WDO are
+    `WIN$` and `WDO$` at XP (ADR-0032): asked by name, no list had them, so a sweep over WIN on M5
+    skipped the pair as "not at the broker" — while BIT went through only because a US fund
+    called BIT happens to be on Tradeview's list. A market never collected is still asked by its
+    name, on every list; one whose broker was never synced is not refused for it."""
+    tickers = {
+        symbol: (ticker, server)
+        for symbol, ticker, server in session.execute(
+            select(
+                Instrument.symbol,
+                func.coalesce(Instrument.broker_symbol, Instrument.symbol),
+                Broker.server,
+            )
+            .join(Broker, Broker.id == Instrument.broker_id)
+            .where(Instrument.symbol.in_(symbols))
+        )
+    }
+    asked = {tickers[symbol][0] if symbol in tickers else symbol for symbol in symbols}
+    rows = {
+        (ticker, server)
+        for ticker, server in session.execute(
+            select(BrokerSymbol.symbol, BrokerSymbol.server).where(BrokerSymbol.symbol.in_(asked))
+        )
+    }
+    synced_servers = set(session.scalars(select(BrokerSymbol.server).distinct()))
+    out: set[str] = set()
+    for symbol in symbols:
+        if symbol in tickers:
+            ticker, server = tickers[symbol]
+            if (ticker, server) in rows or server not in synced_servers:
+                out.add(symbol)
+        elif any(ticker == symbol for ticker, _ in rows):
+            out.add(symbol)
     return out
 
 

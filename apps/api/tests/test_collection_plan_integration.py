@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 from tradeforge_api.config import Settings
 from tradeforge_api.main import create_app
 from tradeforge_db.broker_symbols import BrokerSymbolEntry, replace_snapshot
+from tradeforge_db.brokers import broker_for_server
 from tradeforge_db.models import Collection, Dataset, Instrument
 from tradeforge_db.symbol_history import HistoryProbe, upsert_history
 from tradeforge_engine.domain import AssetClass
@@ -363,4 +364,50 @@ class TestWhetherTheBrokerHasIt:
         assert {one["symbol"]: one["at_broker"] for one in plan} == {
             "EURUSD": False,
             "GBPUSD": True,
+        }
+
+    def test_a_market_is_found_by_the_ticker_of_the_broker_it_came_from(
+        self, client: TestClient, session_factory: Callable[[], Session]
+    ) -> None:
+        """09/10: WIN and WDO are `WIN$` and `WDO$` at XP. Asked by name, a sweep over WIN on M5
+        skipped it as "not at the broker", and BIT went through only because a US fund called
+        BIT is on Tradeview's list."""
+        with session_factory() as session:
+            replace_snapshot(
+                session,
+                [BrokerSymbolEntry(symbol="WIN$"), BrokerSymbolEntry(symbol="BIT$")],
+                server="XPMT5-DEMO",
+                synced_at=at(2026, 10, 9),
+            )
+            replace_snapshot(
+                session,
+                [BrokerSymbolEntry(symbol="BIT"), BrokerSymbolEntry(symbol="EURUSD")],
+                server="Tradeview-Demo",
+                synced_at=at(2026, 10, 9),
+            )
+            xp = broker_for_server(session, "XPMT5-DEMO")
+            for symbol, ticker in (("WIN", "WIN$"), ("WDO", "WDO$")):
+                session.add(
+                    Instrument(
+                        symbol=symbol,
+                        name=symbol,
+                        asset_class=AssetClass.FUTURE,
+                        currency_quote="BRL",
+                        tick_size=Decimal(1),
+                        tick_value=Decimal("0.2"),
+                        contract_size=Decimal(1),
+                        digits=0,
+                        broker_id=xp.id,
+                        broker_symbol=ticker,
+                    )
+                )
+            session.commit()
+
+        plan = a_plan(client, symbols=["WIN", "WDO", "EURUSD", "NOPE"]).json()
+
+        assert {one["symbol"]: one["at_broker"] for one in plan} == {
+            "WIN": True,  # WIN$ at XP
+            "WDO": False,  # XP lists no WDO$ here
+            "EURUSD": True,  # never collected: asked by its name, on every list
+            "NOPE": False,
         }

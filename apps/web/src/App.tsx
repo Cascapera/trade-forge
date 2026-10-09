@@ -14,6 +14,7 @@ import { Templates } from './screens/Templates'
 import { SweepWalkForwardResult } from './screens/SweepWalkForwardResult'
 import { LaunchSweep } from './screens/LaunchSweep'
 import { LiveSessions } from './screens/LiveSessions'
+import { LiveSignals } from './screens/LiveSignals'
 import { RunLog } from './screens/RunLog'
 import { StrategyCatalog } from './screens/StrategyCatalog'
 import { StudyResult } from './screens/StudyResult'
@@ -21,7 +22,6 @@ import { SweepDashboard } from './screens/SweepDashboard'
 import { SweepHistory } from './screens/SweepHistory'
 import { SweepResult } from './screens/SweepResult'
 import { WalkForwardResult } from './screens/WalkForwardResult'
-import { Watchlist } from './screens/Watchlist'
 import { useSession } from './store'
 
 function navClass({ isActive }: { isActive: boolean }): string {
@@ -81,6 +81,9 @@ export function App(): React.JSX.Element {
             <NavLink to="/" end className={navClass}>
               New backtest
             </NavLink>
+            <NavLink to="/live-signals" className={navClass}>
+              Live Signal
+            </NavLink>
           </Group>
           {/* One strategy over several markets — whether it travels, which no single run can
               answer. And the same question turned inward: vary the strategy's own parameters, and
@@ -127,9 +130,6 @@ export function App(): React.JSX.Element {
           <Group title="Markets">
             <NavLink to="/live" className={navClass}>
               Live
-            </NavLink>
-            <NavLink to="/watchlist" className={navClass}>
-              Watchlist
             </NavLink>
             <NavLink to="/collect" className={navClass}>
               Collect
@@ -189,7 +189,7 @@ export function App(): React.JSX.Element {
             <Route path="/collect" element={<CollectSymbol />} />
             <Route path="/runs" element={<RunLog />} />
             <Route path="/live" element={<LiveSessions />} />
-            <Route path="/watchlist" element={<Watchlist />} />
+            <Route path="/live-signals" element={<LiveSignals />} />
             <Route path="/results/:id" element={<Results />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>

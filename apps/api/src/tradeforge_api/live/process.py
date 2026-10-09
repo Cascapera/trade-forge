@@ -112,10 +112,10 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
         help="signal only: a setup with no target closes its signal at this many R (default 5)",
     )
     parser.add_argument(
-        "--watch-item",
+        "--live-setup",
         type=uuid.UUID,
         default=None,
-        help="signal only: the watchlist item this session follows, carried on every event",
+        help="signal only: the live setup this session follows, carried on every event",
     )
     parser.add_argument(
         "--session-id",
@@ -181,7 +181,9 @@ def main(argv: list[str] | None = None) -> int:
             redis,
             {
                 "session_id": str(session_id),
-                "watch_item_id": "" if args.watch_item is None else str(args.watch_item),
+                "setup_id": "" if args.live_setup is None else str(args.live_setup),
+                "strategy_id": str(args.strategy),
+                "instrument_id": str(args.instrument),
                 "strategy": strategy_name,
                 "timeframe": args.timeframe,
                 "broker": broker or "",

@@ -2103,12 +2103,33 @@ export interface SweepPauseOut {
   released?: number
 }
 
-/** One setup on one market that the live signals follow (signals PR 4), copied from a run. */
-export interface WatchItem {
-  id: string
+/** One market a live setup follows — on or off on its own. */
+export interface LiveMarket {
+  instrument_id: string
   symbol: string
-  /** The broker whose live loop feeds it; `null` for an instrument no broker claims. */
   broker: string | null
+  active: boolean
+}
+
+/** A setup's history summed up, in R only (09/10). */
+export interface LiveMetrics {
+  signals: number
+  closed: number
+  open: number
+  cancelled: number
+  wins: number
+  win_rate: string | null
+  net_r: string
+  average_r: string | null
+  profit_factor: string | null
+  max_drawdown_r: string
+  r_by_month: Record<string, string>
+}
+
+/** One setup the live signals follow, on the markets under it (09/10). */
+export interface LiveSetup {
+  id: string
+  name: string
   strategy_id: string
   strategy_name: string
   timeframe: string
@@ -2116,13 +2137,36 @@ export interface WatchItem {
   no_target_r: string
   active: boolean
   note: string | null
-  /** The run it was taken from; `null` once that run was cleaned away. */
+  /** The run it was taken from; `null` once that run was cleaned away, or registered by hand. */
   source_backtest_id: string | null
   created_at: string
+  markets: LiveMarket[]
+  metrics: LiveMetrics
 }
 
-export interface WatchItemPatch {
+export interface LiveSetupPatch {
+  name?: string
   active?: boolean
   no_target_r?: string
   note?: string
+}
+
+/** One signal of a setup's history. */
+export interface SignalRow {
+  number: number
+  symbol: string
+  timeframe: string
+  side: 'long' | 'short'
+  status: 'armed' | 'triggered' | 'cancelled' | 'closed'
+  order_type: string | null
+  entry: string | null
+  stop: string | null
+  target: string | null
+  exit_price: string | null
+  result_r: string | null
+  reason: string | null
+  armed_at: string | null
+  triggered_at: string | null
+  ended_at: string | null
+  strategy_id: string | null
 }

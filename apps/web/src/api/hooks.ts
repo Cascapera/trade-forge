@@ -82,8 +82,9 @@ import type {
   SweepsPage,
   TradesPage,
   WalkForwardOut,
-  WatchItem,
-  WatchItemPatch,
+  LiveSetup,
+  LiveSetupPatch,
+  SignalRow,
   YearCut,
 } from './types'
 
@@ -1272,40 +1273,62 @@ export function usePauseSweep(id: string) {
   })
 }
 
-/** What the live signals follow (signals PR 4). */
-export function useWatchItems() {
-  return useQuery<WatchItem[]>({ queryKey: ['watchlist'], queryFn: () => api.listWatchItems() })
+/** The setups the live signals follow (09/10). Polled: a signal's history grows by itself. */
+export function useLiveSetups() {
+  return useQuery<LiveSetup[]>({
+    queryKey: ['live-setups'],
+    queryFn: () => api.listLiveSetups(),
+    refetchInterval: 30_000,
+  })
 }
 
-/** Follow what a finished run was. A 409 means it is already followed. */
+/** Follow what a finished run was. A setup of the same strategy and chart gains its market. */
 export function useWatchBacktest() {
   const client = useQueryClient()
-  return useMutation<WatchItem, Error, string>({
+  return useMutation<LiveSetup, Error, string>({
     mutationFn: (backtestId: string) => api.watchBacktest(backtestId),
     onSuccess: () => {
-      void client.invalidateQueries({ queryKey: ['watchlist'] })
+      void client.invalidateQueries({ queryKey: ['live-setups'] })
     },
   })
 }
 
-/** Turn an item on or off, or change its R or note. */
-export function useChangeWatchItem() {
+type LiveChange =
+  | { kind: 'setup'; id: string; patch: LiveSetupPatch }
+  | { kind: 'remove-setup'; id: string }
+  | { kind: 'add-market'; id: string; instrumentId: string }
+  | { kind: 'market'; id: string; instrumentId: string; active: boolean }
+  | { kind: 'remove-market'; id: string; instrumentId: string }
+
+/** Every change a live setup takes, through one mutation so the screen has one busy flag. */
+export function useChangeLive() {
   const client = useQueryClient()
-  return useMutation<WatchItem, Error, { id: string; patch: WatchItemPatch }>({
-    mutationFn: ({ id, patch }) => api.changeWatchItem(id, patch),
+  return useMutation<LiveSetup | null, Error, LiveChange>({
+    mutationFn: (change) => {
+      switch (change.kind) {
+        case 'setup':
+          return api.changeLiveSetup(change.id, change.patch)
+        case 'remove-setup':
+          return api.removeLiveSetup(change.id)
+        case 'add-market':
+          return api.addLiveMarket(change.id, change.instrumentId)
+        case 'market':
+          return api.changeLiveMarket(change.id, change.instrumentId, change.active)
+        case 'remove-market':
+          return api.removeLiveMarket(change.id, change.instrumentId)
+      }
+    },
     onSuccess: () => {
-      void client.invalidateQueries({ queryKey: ['watchlist'] })
+      void client.invalidateQueries({ queryKey: ['live-setups'] })
     },
   })
 }
 
-/** Stop following an item for good. */
-export function useRemoveWatchItem() {
-  const client = useQueryClient()
-  return useMutation<null, Error, string>({
-    mutationFn: (id: string) => api.removeWatchItem(id),
-    onSuccess: () => {
-      void client.invalidateQueries({ queryKey: ['watchlist'] })
-    },
+/** One setup's signals, newest first — fetched only while its history is open. */
+export function useLiveSignals(setupId: string | undefined) {
+  return useQuery<SignalRow[]>({
+    queryKey: ['live-signals', setupId],
+    queryFn: setupId === undefined ? skipToken : () => api.listLiveSignals(setupId),
+    refetchInterval: 30_000,
   })
 }

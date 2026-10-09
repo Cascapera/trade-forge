@@ -2426,48 +2426,110 @@ class SweepTemplateItem(Base):
     )
 
 
-class WatchItem(Base):
-    """One setup on one market that the signals follow live (signals PR 4).
+class LiveSetup(Base):
+    """One setup the live signals follow, on the markets listed under it (09/10).
 
-    Taken from a run that did well — a row of Best by market or of a sweep — and **copied**, not
-    referenced: the strategy (exact parameters), the market, the timeframe and the costs are this
-    row's own, so a run removed by the database clean-up leaves the item whole. The run stays as
-    where it came from, nothing more.
+    His ask: a setup is chosen once — from a run that did well, or registered by hand — and its
+    markets are added or dropped at any time. One timeframe per setup; another timeframe is
+    another setup. The strategy, timeframe and costs are this row's own copy, so a run cleaned
+    away later leaves the setup whole.
 
-    `no_target_r` is his rule of 08/10 for a setup that runs without a target: the signal is
-    closed at that many R, the stop, or the setup's own exit, whichever comes first. A setup with
-    a target uses its own.
+    `no_target_r` is his rule of 08/10 for a setup without a target: the signal closes at that
+    many R, the stop, or the setup's own exit, whichever comes first.
+
+    Editing the setup's parameters makes a **new strategy version** (strategies are immutable,
+    AGENTS §5.5) and points `strategy_id` at it; each signal keeps the version it came from.
     """
 
-    __tablename__ = "watch_items"
+    __tablename__ = "live_setups"
 
     id: Mapped[uuid.UUID] = _uuid_pk()
+    name: Mapped[str] = mapped_column(Text, nullable=False)
     strategy_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("strategies.id", ondelete="RESTRICT"), nullable=False
+    )
+    timeframe: Mapped[str] = mapped_column(TIMEFRAME, nullable=False)
+    cost_model: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    no_target_r: Mapped[Decimal] = mapped_column(RATIO, nullable=False, server_default=text("5"))
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
+    note: Mapped[str | None] = mapped_column(Text)
+    source_backtest_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("backtests.id", ondelete="SET NULL")
+    )
+    created_at: Mapped[dt.datetime] = _created_at()
+
+    markets: Mapped[list[LiveSetupMarket]] = relationship(
+        back_populates="setup", cascade="all, delete-orphan", order_by="LiveSetupMarket.created_at"
+    )
+
+    __table_args__ = (
+        CheckConstraint("no_target_r > 0", name="no_target_r_is_positive"),
+        CheckConstraint("jsonb_typeof(cost_model) = 'object'", name="setup_costs_are_an_object"),
+        CheckConstraint("length(name) > 0", name="setup_has_a_name"),
+    )
+
+
+class LiveSetupMarket(Base):
+    """One market a live setup follows — on or off on its own."""
+
+    __tablename__ = "live_setup_markets"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    setup_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("live_setups.id", ondelete="CASCADE"), nullable=False
     )
     instrument_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("instruments.id", ondelete="RESTRICT"), nullable=False
     )
-    timeframe: Mapped[str] = mapped_column(TIMEFRAME, nullable=False)
-    cost_model: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
-    source_backtest_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("backtests.id", ondelete="SET NULL")
-    )
-    no_target_r: Mapped[Decimal] = mapped_column(RATIO, nullable=False, server_default=text("5"))
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
-    note: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[dt.datetime] = _created_at()
 
+    setup: Mapped[LiveSetup] = relationship(back_populates="markets")
+
+    __table_args__ = (UniqueConstraint("setup_id", "instrument_id"),)
+
+
+class SignalRecord(Base):
+    """One signal's life, as the live signals posted it (09/10) — the setup's history.
+
+    Written by the recorder from `signals.events`, one row per signal **number**, updated as the
+    signal moves: armed → triggered → closed, or armed → cancelled. Its own copy of what it was —
+    strategy version, market, timeframe — so the history outlives a setup deleted or edited.
+    """
+
+    __tablename__ = "signals"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    number: Mapped[int] = mapped_column(Integer, nullable=False, unique=True)
+    setup_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("live_setups.id", ondelete="SET NULL"), index=True
+    )
+    strategy_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("strategies.id", ondelete="SET NULL")
+    )
+    instrument_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("instruments.id", ondelete="SET NULL")
+    )
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False)
+    timeframe: Mapped[str] = mapped_column(TIMEFRAME, nullable=False)
+    side: Mapped[str] = mapped_column(String(8), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    order_type: Mapped[str | None] = mapped_column(String(16))
+    entry: Mapped[Decimal | None] = mapped_column(PRICE)
+    stop: Mapped[Decimal | None] = mapped_column(PRICE)
+    target: Mapped[Decimal | None] = mapped_column(PRICE)
+    exit_price: Mapped[Decimal | None] = mapped_column(PRICE)
+    result_r: Mapped[Decimal | None] = mapped_column(RATIO)
+    reason: Mapped[str | None] = mapped_column(Text)
+    armed_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    triggered_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    ended_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    session_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+
     __table_args__ = (
-        CheckConstraint("no_target_r > 0", name="no_target_r_is_positive"),
-        CheckConstraint("jsonb_typeof(cost_model) = 'object'", name="watch_costs_are_an_object"),
-        # One live follow per setup and market: two would post every signal twice.
-        Index(
-            "uq_watch_items_active",
-            "strategy_id",
-            "instrument_id",
-            "timeframe",
-            unique=True,
-            postgresql_where=text("active"),
+        CheckConstraint(
+            "status IN ('armed', 'triggered', 'cancelled', 'closed')", name="signal_status"
         ),
+        CheckConstraint("side IN ('long', 'short')", name="signal_side"),
+        Index("ix_signals_setup_id_number", "setup_id", "number"),
     )

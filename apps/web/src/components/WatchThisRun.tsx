@@ -23,8 +23,8 @@ export function WatchThisRun(props: { runId: string }): React.JSX.Element {
       {watch.isSuccess && (
         <span className="text-slate-400">
           Watched —{' '}
-          <Link to="/watchlist" className="underline">
-            see the watchlist
+          <Link to="/live-signals" className="underline">
+            see Live Signal
           </Link>
         </span>
       )}

@@ -3170,30 +3170,70 @@ class SymbolBrowseOut(BaseModel):
     items: list[BrowsedSymbolOut]
 
 
-class WatchItemCreate(BaseModel):
-    """Follow what a finished run was (signals PR 4)."""
+class LiveSetupFromRun(BaseModel):
+    """Follow what a finished run was (09/10). A setup already following its strategy and
+    timeframe gains the run's market instead."""
 
     backtest_id: uuid.UUID
     no_target_r: Decimal = Field(default=Decimal(5), gt=0, le=100)
-    """For a setup with no target: close the signal at this many R (his rule: 5)."""
-    note: StorableText | None = Field(default=None, max_length=500)
 
 
-class WatchItemPatch(BaseModel):
-    """Turn an item on or off, or change its R or note. Fields left out are kept."""
+class LiveSetupCreate(BaseModel):
+    """A setup registered by hand: a strategy version, one timeframe, the markets it follows."""
 
+    strategy_id: uuid.UUID
+    timeframe: Timeframe
+    instrument_ids: list[uuid.UUID] = Field(min_length=1, max_length=200)
+    name: StorableText | None = Field(default=None, max_length=200)
+    cost_model: dict[str, Any] = Field(default_factory=lambda: {"type": "none"})
+    no_target_r: Decimal = Field(default=Decimal(5), gt=0, le=100)
+
+
+class LiveSetupPatch(BaseModel):
+    """Rename it, switch it on or off, change its no-target R or note. Left out is kept."""
+
+    name: StorableText | None = Field(default=None, min_length=1, max_length=200)
     active: bool | None = None
     no_target_r: Decimal | None = Field(default=None, gt=0, le=100)
     note: StorableText | None = Field(default=None, max_length=500)
 
 
-class WatchItemOut(BaseModel):
-    """One followed setup on one market, with the names a screen shows."""
+class LiveMarketAdd(BaseModel):
+    instrument_id: uuid.UUID
 
-    id: uuid.UUID
+
+class LiveMarketPatch(BaseModel):
+    active: bool
+
+
+class LiveMarketOut(BaseModel):
+    instrument_id: uuid.UUID
     symbol: str
     broker: str | None = None
-    """The broker whose live loop feeds it (ADR-0032); null for an instrument no broker claims."""
+    active: bool
+
+
+class LiveMetricsOut(BaseModel):
+    """A setup's history summed up, in R only (his call, 09/10)."""
+
+    signals: int
+    closed: int
+    open: int
+    cancelled: int
+    wins: int
+    win_rate: Money | None = None
+    net_r: Money
+    average_r: Money | None = None
+    profit_factor: Money | None = None
+    max_drawdown_r: Money
+    r_by_month: dict[str, Money] = Field(default_factory=dict)
+
+
+class LiveSetupOut(BaseModel):
+    """One followed setup: what it runs, where, and what it has posted."""
+
+    id: uuid.UUID
+    name: str
     strategy_id: uuid.UUID
     strategy_name: str
     timeframe: str
@@ -3201,5 +3241,27 @@ class WatchItemOut(BaseModel):
     active: bool
     note: str | None = None
     source_backtest_id: uuid.UUID | None = None
-    """The run it was taken from; null once that run was cleaned away."""
     created_at: dt.datetime
+    markets: list[LiveMarketOut]
+    metrics: LiveMetricsOut
+
+
+class SignalOut(_Out):
+    """One signal of a setup's history."""
+
+    number: int
+    symbol: str
+    timeframe: str
+    side: str
+    status: str
+    order_type: str | None = None
+    entry: Money | None = None
+    stop: Money | None = None
+    target: Money | None = None
+    exit_price: Money | None = None
+    result_r: Money | None = None
+    reason: str | None = None
+    armed_at: dt.datetime | None = None
+    triggered_at: dt.datetime | None = None
+    ended_at: dt.datetime | None = None
+    strategy_id: uuid.UUID | None = None

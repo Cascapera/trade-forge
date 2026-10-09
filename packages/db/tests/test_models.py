@@ -27,7 +27,9 @@ def ddl(name: str) -> str:
 
 
 EXPECTED_TABLES = {
-    "watch_items",
+    "live_setups",
+    "live_setup_markets",
+    "signals",
     "instruments",
     # The brokers collected from, several at once (rev_0050, ADR-0032).
     "brokers",

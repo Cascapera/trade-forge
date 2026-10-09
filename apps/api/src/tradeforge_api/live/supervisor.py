@@ -2,7 +2,7 @@
 
 Every `every` seconds it compares what *should* run with what *does*, and closes the gap:
 
-* one `tradeforge-session --mode signal` per active item of the watchlist, capped at
+* one `tradeforge-session --mode signal` per followed (setup, market) pair, capped at
   `max_sessions` — a structure setup's session holds its history in memory, 1-2 GB each;
 * one `tradeforge-collector live --broker <slug>` per broker that has an active item, so the bars
   those sessions ask for (`live:wanted:<slug>`) are actually read from a terminal.
@@ -27,20 +27,24 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, cast
 
 from redis import Redis
-from sqlalchemy import select
-from sqlalchemy.orm import Session
+from redis.exceptions import ResponseError
+from sqlalchemy.orm import Session, sessionmaker
 
 from tradeforge_api.config import Settings
+from tradeforge_api.live.signals import SIGNALS_STREAM
 from tradeforge_api.live.stop import request_stop
-from tradeforge_db.models import Broker, Instrument, WatchItem
+from tradeforge_db.live_setups import FollowedPair, followed_pairs, record_event
 from tradeforge_db.session import create_db_engine, create_session_factory, session_scope
 
 __all__ = ["Child", "Supervisor", "Wanted", "main", "wanted_children"]
 
 logger = logging.getLogger(__name__)
+
+RECORDER = "recorder"
+"""The consumer group that writes the signals' history (09/10)."""
 
 SESSION_CAPITAL = Decimal(10_000)
 """A signal session's ledger. Its size moves no signal: R is the unit every message speaks in."""
@@ -141,53 +145,43 @@ class Supervisor:
             self._stop(key, running, now)
 
 
-@dataclass(frozen=True, slots=True)
-class _Item:
-    id: uuid.UUID
-    strategy_id: uuid.UUID
-    instrument_id: uuid.UUID
-    timeframe: str
-    cost_model: Mapping[str, object]
-    no_target_r: Decimal
-    broker: str | None
+def record_signals(redis: Redis, factory: sessionmaker[Session], consumer: str) -> int:
+    """Fold the new `signals.events` entries into the history (09/10); how many it read.
 
-
-def _active_items(session: Session) -> list[_Item]:
-    statement = (
-        select(WatchItem, Broker.slug)
-        .join(Instrument, Instrument.id == WatchItem.instrument_id)
-        .outerjoin(Broker, Broker.id == Instrument.broker_id)
-        .where(WatchItem.active)
-        .order_by(WatchItem.created_at, WatchItem.id)
+    Its own consumer group, `recorder`, beside the notifier's: each reads every entry, and an
+    entry is acknowledged only once its row is written, so a crash re-reads rather than loses."""
+    try:
+        redis.xgroup_create(SIGNALS_STREAM, RECORDER, id="0", mkstream=True)
+    except ResponseError as exists:
+        if "BUSYGROUP" not in str(exists):
+            raise
+    read = cast(
+        "list[tuple[str, list[tuple[str, dict[str, str]]]]]",
+        redis.xreadgroup(RECORDER, consumer, {SIGNALS_STREAM: ">"}, count=200),
     )
-    return [
-        _Item(
-            id=item.id,
-            strategy_id=item.strategy_id,
-            instrument_id=item.instrument_id,
-            timeframe=item.timeframe,
-            cost_model=dict(item.cost_model),
-            no_target_r=item.no_target_r,
-            broker=slug,
-        )
-        for item, slug in session.execute(statement)
-    ]
+    entries = read[0][1] if read else []
+    for entry_id, fields in entries:
+        with session_scope(factory) as session:
+            record_event(session, fields)
+        redis.xack(SIGNALS_STREAM, RECORDER, entry_id)
+    return len(entries)
 
 
 def wanted_children(
-    items: Sequence[_Item],
+    items: Sequence[FollowedPair],
     *,
     python: str,
     max_sessions: int,
-    session_ids: dict[uuid.UUID, uuid.UUID],
+    session_ids: dict[tuple[uuid.UUID, uuid.UUID], uuid.UUID],
 ) -> dict[str, Wanted]:
-    """What should run for these items: the first `max_sessions` sessions, and a live loop for
-    each broker they need. `session_ids` keeps one id per item across ticks, so an unchanged item
-    is recognised as the session already running rather than as a new one."""
+    """What should run for these (setup, market) pairs: the first `max_sessions` sessions, and a
+    live loop for each broker they need. `session_ids` keeps one id per pair across ticks, so an
+    unchanged pair is recognised as the session already running rather than as a new one."""
     wanted: dict[str, Wanted] = {}
     brokers: set[str] = set()
     for item in items[:max_sessions]:
-        session_id = session_ids.setdefault(item.id, uuid.uuid4())
+        pair = (item.setup_id, item.instrument_id)
+        session_id = session_ids.setdefault(pair, uuid.uuid4())
         argv = [
             python,
             "-m",
@@ -204,14 +198,15 @@ def wanted_children(
             "signal",
             "--no-target-r",
             str(item.no_target_r),
-            "--watch-item",
-            str(item.id),
+            "--live-setup",
+            str(item.setup_id),
             "--session-id",
             str(session_id),
         ]
         if item.cost_model.get("type") == "spread" and "spread_points" in item.cost_model:
             argv += ["--spread-points", str(item.cost_model["spread_points"])]
-        wanted[f"session:{item.id}"] = Wanted(f"session:{item.id}", tuple(argv), session_id)
+        key = f"session:{item.setup_id}:{item.instrument_id}"
+        wanted[key] = Wanted(key, tuple(argv), session_id)
         if item.broker is not None:
             brokers.add(item.broker)
     for slug in sorted(brokers):
@@ -228,7 +223,7 @@ def wanted_children(
 def _parse(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="tradeforge-signals",
-        description="Keep one SIGNAL session per active watch item running, and its live loops.",
+        description="Keep one SIGNAL session per followed setup and market, and its live loops.",
     )
     parser.add_argument("--every", type=float, default=15.0, help="seconds between checks")
     parser.add_argument(
@@ -261,14 +256,15 @@ def main(argv: list[str] | None = None) -> int:
         launch=launch,
         ask_to_stop=lambda session_id: request_stop(redis, session_id, now=dt.datetime.now(dt.UTC)),
     )
-    session_ids: dict[uuid.UUID, uuid.UUID] = {}
+    session_ids: dict[tuple[uuid.UUID, uuid.UUID], uuid.UUID] = {}
+    consumer = f"recorder-{uuid.uuid4().hex[:8]}"
     logger.info(
         "supervising signals every %.0fs, at most %d sessions", args.every, args.max_sessions
     )
     try:
         while True:
             with session_scope(factory) as session:
-                items = _active_items(session)
+                items = followed_pairs(session)
             supervisor.tick(
                 wanted_children(
                     items,
@@ -277,6 +273,10 @@ def main(argv: list[str] | None = None) -> int:
                     session_ids=session_ids,
                 )
             )
+            try:
+                record_signals(redis, factory, consumer)
+            except Exception:
+                logger.exception("recording the signals failed; retrying next tick")
             time.sleep(args.every)
     except KeyboardInterrupt:
         logger.info("stopping every child")

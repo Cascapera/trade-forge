@@ -11,9 +11,9 @@
 # main machine's Docker was built from before building here.
 #
 # ⚠️ **The candles are read from this machine's disk**, into each worker's memory once per series
-# (`candle_cache`), then reused for every run after it. Copy `data/ohlcv` over and point
-# TRADEFORGE_CANDLES at it; copy again after a collection on the main machine — a worker notices
-# the files changed and reads them again.
+# (`candle_cache`), then reused for every run after it. They arrive by themselves (09/10):
+# `candle-sync` pulls what is new from the main machine's API every hour, and a worker asked for a
+# series it lacks fetches it first (`candle_sync`). With the main machine off, both just wait.
 
 name: tradeforge-remote
 
@@ -39,12 +39,33 @@ services:
       REDIS_HOST: ${TRADEFORGE_HOST}
       REDIS_PORT: ${REDIS_PORT:-6379}
       PARQUET_ROOT: /data/ohlcv
+      # Where a missing series is fetched from: the main machine's API (`candle_sync`, 09/10).
+      TRADEFORGE_CANDLES_URL: http://${TRADEFORGE_HOST}:${TRADEFORGE_API_PORT:-8000}
     # One core per worker, as on the main machine: a backtest is synchronous CPU, one at a time.
     deploy:
       replicas: ${TRADEFORGE_WORKERS:-1}
       resources:
         limits:
           cpus: '1'
+    # Writable since 09/10: a worker saves the series it fetched, for every run after it.
     volumes:
-      - ${TRADEFORGE_CANDLES:-./data/ohlcv}:/data/ohlcv:ro
+      - ${TRADEFORGE_CANDLES:-./data/ohlcv}:/data/ohlcv
+    restart: unless-stopped
+
+  # Every hour, pull what is new or changed on the main machine (`candle_sync`, 09/10).
+  candle-sync:
+    image: tradeforge-worker-remote
+    depends_on: [worker]
+    command:
+      - python
+      - -m
+      - tradeforge_api.candle_sync
+      - --url
+      - http://${TRADEFORGE_HOST}:${TRADEFORGE_API_PORT:-8000}
+      - --root
+      - /data/ohlcv
+      - --every
+      - '3600'
+    volumes:
+      - ${TRADEFORGE_CANDLES:-./data/ohlcv}:/data/ohlcv
     restart: unless-stopped

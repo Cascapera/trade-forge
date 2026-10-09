@@ -8,6 +8,29 @@ vi.mock('../api/hooks', () => ({
   useRegisterLiveSetup: vi.fn(),
 }))
 
+// The picker has its own tests; here it is a button per market that toggles it.
+vi.mock('./SymbolPicker', () => ({
+  SymbolPicker: (props: { chosen: string[]; onChange: (next: string[]) => void }) => (
+    <div>
+      {['WIN', 'EURUSD', 'NEVER'].map((symbol) => (
+        <button
+          key={symbol}
+          type="button"
+          onClick={() => {
+            props.onChange(
+              props.chosen.includes(symbol)
+                ? props.chosen.filter((one) => one !== symbol)
+                : [...props.chosen, symbol],
+            )
+          }}
+        >
+          pick {symbol}
+        </button>
+      ))}
+    </div>
+  ),
+}))
+
 import { useInstruments, useRegisterLiveSetup } from '../api/hooks'
 import { NewLiveSetup } from './NewLiveSetup'
 
@@ -56,7 +79,7 @@ describe('NewLiveSetup', () => {
       target: { value: 'WIN H1 test' },
     })
     expect(start).toBeDisabled()
-    fireEvent.click(screen.getByRole('checkbox', { name: /WIN/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'pick WIN' }))
     expect(start).toBeEnabled()
   })
 
@@ -69,7 +92,7 @@ describe('NewLiveSetup', () => {
     fireEvent.change(screen.getByLabelText('Chart'), {
       target: { value: 'M15' },
     })
-    fireEvent.click(screen.getByRole('checkbox', { name: /WIN/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'pick WIN' }))
     fireEvent.click(screen.getByRole('button', { name: 'Start live' }))
 
     const body = sent(mutate)
@@ -84,7 +107,16 @@ describe('NewLiveSetup', () => {
     })
   })
 
-  it('resets the parameters when the setup changes, and filters the markets', () => {
+  it('refuses a market never collected', () => {
+    mount()
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'x' } })
+    fireEvent.click(screen.getByRole('button', { name: 'pick NEVER' }))
+
+    expect(screen.getByText(/NEVER/, { selector: 'p' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Start live' })).toBeDisabled()
+  })
+
+  it('resets the parameters when the setup changes', () => {
     const mutate = mount()
     const other = SETUP_TYPES.find((one) => one !== SETUP_TYPES[0])
     if (other !== undefined) {
@@ -92,13 +124,8 @@ describe('NewLiveSetup', () => {
         target: { value: other },
       })
     }
-    fireEvent.change(screen.getByLabelText('Filter markets'), {
-      target: { value: 'eur' },
-    })
-    expect(screen.queryByRole('checkbox', { name: /WIN/ })).not.toBeInTheDocument()
-
     fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'x' } })
-    fireEvent.click(screen.getByRole('checkbox', { name: /EURUSD/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'pick EURUSD' }))
     fireEvent.click(screen.getByRole('button', { name: 'Start live' }))
 
     expect(sent(mutate).definition.setup.type).toBe(other ?? SETUP_TYPES[0])
@@ -114,9 +141,9 @@ describe('NewLiveSetup', () => {
       target: { value: '3' },
     })
     fireEvent.click(screen.getByLabelText('take profit (R) off'))
-    fireEvent.click(screen.getByRole('checkbox', { name: /WIN/ }))
-    fireEvent.click(screen.getByRole('checkbox', { name: /EURUSD/ }))
-    fireEvent.click(screen.getByRole('checkbox', { name: /WIN/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'pick WIN' }))
+    fireEvent.click(screen.getByRole('button', { name: 'pick EURUSD' }))
+    fireEvent.click(screen.getByRole('button', { name: 'pick WIN' }))
     fireEvent.click(screen.getByRole('button', { name: 'Start live' }))
 
     const body = sent(mutate)

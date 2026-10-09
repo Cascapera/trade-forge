@@ -4,7 +4,8 @@ import { Link } from 'react-router-dom'
 import { useChangeLive, useInstruments, useLiveSetups, useLiveSignals } from '../api/hooks'
 import type { LiveMetrics, LiveSetup, SignalRow } from '../api/types'
 import { BrokerTag } from '../components/BrokerTag'
-import { NewLiveSetup } from '../components/NewLiveSetup'
+import { MarketBrowser } from '../components/MarketBrowser'
+import { MAX_MARKETS, NewLiveSetup } from '../components/NewLiveSetup'
 import { SetupEditor } from '../components/SetupEditor'
 
 /**
@@ -187,9 +188,31 @@ function Markets(props: {
 }): React.JSX.Element {
   const { setup, busy, change } = props
   const instruments = useInstruments()
-  const [adding, setAdding] = useState('')
-  const followed = new Set(setup.markets.map((market) => market.instrument_id))
-  const choices = (instruments.data ?? []).filter((one) => !followed.has(one.id))
+  const [browsing, setBrowsing] = useState(false)
+  // ⚠️ While the browser is open its ticks are kept here: the next tick must be compared with the
+  // last one, not with a list the server has not sent back yet.
+  const [ticked, setTicked] = useState<string[] | null>(null)
+  const chosen = ticked ?? setup.markets.map((market) => market.symbol)
+
+  /** The browser's ticks as calls: a new tick follows the market, an untick drops it. */
+  const apply = (next: string[]): void => {
+    const now = new Set(chosen)
+    const wanted = new Set(next)
+    const byName = new Map((instruments.data ?? []).map((one) => [one.symbol, one.id]))
+    for (const symbol of next) {
+      const instrumentId = byName.get(symbol)
+      if (!now.has(symbol) && instrumentId !== undefined) {
+        change.mutate({ kind: 'add-market', id: setup.id, instrumentId })
+      }
+    }
+    for (const symbol of chosen) {
+      const instrumentId = byName.get(symbol)
+      if (!wanted.has(symbol) && instrumentId !== undefined) {
+        change.mutate({ kind: 'remove-market', id: setup.id, instrumentId })
+      }
+    }
+    setTicked(next.filter((symbol) => byName.has(symbol)))
+  }
 
   return (
     <div className="flex flex-wrap items-center gap-2">
@@ -234,37 +257,27 @@ function Markets(props: {
           </button>
         </span>
       ))}
-      <select
-        value={adding}
-        onChange={(event) => {
-          setAdding(event.target.value)
-        }}
-        aria-label="Market to add"
-        className="rounded border border-slate-700 bg-slate-900 px-2 py-0.5 text-sm"
-      >
-        <option value="">add a market…</option>
-        {choices.map((one) => (
-          <option key={one.id} value={one.id}>
-            {one.symbol}
-            {one.broker ? ` (${one.broker})` : ''}
-          </option>
-        ))}
-      </select>
       <button
         type="button"
-        disabled={busy || adding === ''}
+        disabled={busy}
         onClick={() => {
-          change.mutate({
-            kind: 'add-market',
-            id: setup.id,
-            instrumentId: adding,
-          })
-          setAdding('')
+          setBrowsing(true)
         }}
-        className="rounded border border-slate-700 px-2 text-xs hover:bg-slate-800 disabled:opacity-40"
+        className="rounded border border-sky-700 px-2 py-0.5 text-xs text-sky-100 hover:border-sky-500 disabled:opacity-40"
       >
-        Add
+        Add markets…
       </button>
+      {browsing && (
+        <MarketBrowser
+          chosen={chosen}
+          max={MAX_MARKETS}
+          onChange={apply}
+          onClose={() => {
+            setBrowsing(false)
+            setTicked(null)
+          }}
+        />
+      )}
     </div>
   )
 }

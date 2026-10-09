@@ -25,6 +25,7 @@ from __future__ import annotations
 import contextlib
 import datetime as dt
 import json
+import os
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from decimal import Decimal
@@ -39,6 +40,8 @@ from sqlalchemy.orm import Session
 
 from tradeforge_api.batching import enqueue_runs
 from tradeforge_api.candle_cache import CandleCache, CandleReader, read_window
+from tradeforge_api.candle_sync import URL_ENV as CANDLES_URL_ENV
+from tradeforge_api.candle_sync import FetchingReader
 from tradeforge_api.cluster_job import process_cluster
 from tradeforge_api.collector import running as collector_running
 from tradeforge_api.config import RedisConfig, Settings
@@ -1171,8 +1174,12 @@ async def startup(ctx: dict[str, Any]) -> None:
     ctx["settings"] = settings
     ctx["engine"] = engine
     ctx["session_factory"] = create_session_factory(engine)
-    # One per worker process, for as long as it lives (`candle_cache`).
-    ctx["candles"] = CandleCache()
+    # One per worker process, for as long as it lives (`candle_cache`). On a machine other than
+    # the main one, a series it lacks is fetched from the main API first (`candle_sync`, 09/10).
+    url = os.environ.get(CANDLES_URL_ENV)
+    ctx["candles"] = CandleCache(
+        reader=read_candles if not url else FetchingReader(read_candles, url)
+    )
 
 
 async def shutdown(ctx: dict[str, Any]) -> None:

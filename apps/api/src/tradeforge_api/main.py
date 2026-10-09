@@ -30,6 +30,7 @@ from tradeforge_api.routers import (
     backtests,
     baskets,
     best,
+    candle_files,
     catalog,
     clusters,
     collections,
@@ -163,6 +164,7 @@ def create_app(  # noqa: PLR0913 — keyword-only seams, one per connection a te
         app.state.collector = collector
 
     app.include_router(instruments.router)
+    app.include_router(candle_files.router)
     app.include_router(best.router)
     app.include_router(symbols.router)
     app.include_router(collections.router)

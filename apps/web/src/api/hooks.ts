@@ -83,6 +83,7 @@ import type {
   TradesPage,
   WalkForwardOut,
   LiveSetup,
+  LiveSetupNew,
   LiveSetupPatch,
   SignalRow,
   YearCut,
@@ -101,7 +102,10 @@ export function isTerminal(status: BacktestStatus | undefined): boolean {
 }
 
 export function useInstruments() {
-  return useQuery<Instrument[]>({ queryKey: ['instruments'], queryFn: api.listInstruments })
+  return useQuery<Instrument[]>({
+    queryKey: ['instruments'],
+    queryFn: api.listInstruments,
+  })
 }
 
 /**
@@ -355,7 +359,10 @@ export async function wholeCatalog(): Promise<CatalogPage> {
 }
 
 export function useCatalog() {
-  return useQuery<CatalogPage>({ queryKey: ['catalog'], queryFn: wholeCatalog })
+  return useQuery<CatalogPage>({
+    queryKey: ['catalog'],
+    queryFn: wholeCatalog,
+  })
 }
 
 /**
@@ -644,7 +651,11 @@ export function useStudyPreview(
     queryFn: asked
       ? async () => ({
           grid,
-          preview: await api.previewStudy({ strategy_id: strategyId, grid, timeframe }),
+          preview: await api.previewStudy({
+            strategy_id: strategyId,
+            grid,
+            timeframe,
+          }),
         })
       : skipToken,
   })
@@ -907,14 +918,19 @@ export function useCreateSweepWalkForward(sweepId: string) {
   return useMutation<CreatedSweepWalkForward, Error, CreateSweepWalkForwardRequest>({
     mutationFn: (payload) => api.createSweepWalkForward(sweepId, payload),
     onSuccess: () => {
-      void client.invalidateQueries({ queryKey: ['sweep-walkforwards', sweepId] })
+      void client.invalidateQueries({
+        queryKey: ['sweep-walkforwards', sweepId],
+      })
     },
   })
 }
 
 /** The latest clusters first. */
 export function useClusters() {
-  return useQuery<ClusterListItem[]>({ queryKey: ['clusters'], queryFn: api.listClusters })
+  return useQuery<ClusterListItem[]>({
+    queryKey: ['clusters'],
+    queryFn: api.listClusters,
+  })
 }
 
 /** One cluster, polled until its replay has ended. */
@@ -1318,6 +1334,17 @@ export function useChangeLive() {
           return api.removeLiveMarket(change.id, change.instrumentId)
       }
     },
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: ['live-setups'] })
+    },
+  })
+}
+
+/** Register a setup from scratch — its strategy, chart and markets — and start following it. */
+export function useRegisterLiveSetup() {
+  const client = useQueryClient()
+  return useMutation<LiveSetup, Error, LiveSetupNew>({
+    mutationFn: (body) => api.registerLiveSetup(body),
     onSuccess: () => {
       void client.invalidateQueries({ queryKey: ['live-setups'] })
     },

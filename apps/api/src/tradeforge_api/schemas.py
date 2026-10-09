@@ -3189,6 +3189,16 @@ class LiveSetupCreate(BaseModel):
     no_target_r: Decimal = Field(default=Decimal(5), gt=0, le=100)
 
 
+class LiveSetupNew(BaseModel):
+    """A setup registered from scratch (09/10): a strategy document, its chart and its markets."""
+
+    definition: dict[str, Any]
+    timeframe: Timeframe
+    instrument_ids: list[uuid.UUID] = Field(min_length=1, max_length=200)
+    cost_model: dict[str, Any] = Field(default_factory=lambda: {"type": "none"})
+    no_target_r: Decimal = Field(default=Decimal(5), gt=0, le=100)
+
+
 class LiveSetupPatch(BaseModel):
     """Rename it, switch it on or off, change its no-target R or note. Left out is kept."""
 

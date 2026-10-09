@@ -4,6 +4,7 @@ import { Link } from 'react-router-dom'
 import { useChangeLive, useInstruments, useLiveSetups, useLiveSignals } from '../api/hooks'
 import type { LiveMetrics, LiveSetup, SignalRow } from '../api/types'
 import { BrokerTag } from '../components/BrokerTag'
+import { NewLiveSetup } from '../components/NewLiveSetup'
 import { SetupEditor } from '../components/SetupEditor'
 
 /**
@@ -14,6 +15,7 @@ import { SetupEditor } from '../components/SetupEditor'
 export function LiveSignals(): React.JSX.Element {
   const setups = useLiveSetups()
   const rows = setups.data ?? []
+  const [creating, setCreating] = useState(false)
   return (
     <section className="space-y-4">
       <header className="space-y-1">
@@ -23,7 +25,25 @@ export function LiveSignals(): React.JSX.Element {
           drop its markets here. A setup without a target closes its signal at the R shown, the
           stop, or its own exit.
         </p>
+        {!creating && (
+          <button
+            type="button"
+            onClick={() => {
+              setCreating(true)
+            }}
+            className="rounded bg-emerald-800 px-3 py-1 text-sm text-white hover:bg-emerald-700"
+          >
+            New setup
+          </button>
+        )}
       </header>
+      {creating && (
+        <NewLiveSetup
+          onClose={() => {
+            setCreating(false)
+          }}
+        />
+      )}
       {rows.length === 0 ? (
         <p className="text-sm text-slate-500">
           {setups.isPending ? 'Loading…' : 'No setup is followed yet.'}
@@ -75,7 +95,11 @@ function SetupCard(props: { setup: LiveSetup }): React.JSX.Element {
             type="button"
             disabled={busy}
             onClick={() => {
-              change.mutate({ kind: 'setup', id: setup.id, patch: { active: !setup.active } })
+              change.mutate({
+                kind: 'setup',
+                id: setup.id,
+                patch: { active: !setup.active },
+              })
             }}
             className="rounded border border-slate-700 px-2 text-xs hover:bg-slate-800 disabled:opacity-40"
           >
@@ -139,7 +163,10 @@ function Metrics(props: { metrics: LiveMetrics }): React.JSX.Element {
     ['Profit factor', m.profit_factor === null ? '—' : Number(m.profit_factor).toFixed(2)],
     ['Average', r(m.average_r)],
     ['Max drawdown', `${Number(m.max_drawdown_r).toFixed(2)}R`],
-    ['Closed / open / cancelled', `${String(m.closed)} / ${String(m.open)} / ${String(m.cancelled)}`],
+    [
+      'Closed / open / cancelled',
+      `${String(m.closed)} / ${String(m.open)} / ${String(m.cancelled)}`,
+    ],
   ]
   return (
     <dl className="grid grid-cols-2 gap-x-6 gap-y-1 text-sm sm:grid-cols-3 lg:grid-cols-6">
@@ -194,7 +221,11 @@ function Markets(props: {
             type="button"
             disabled={busy}
             onClick={() => {
-              change.mutate({ kind: 'remove-market', id: setup.id, instrumentId: market.instrument_id })
+              change.mutate({
+                kind: 'remove-market',
+                id: setup.id,
+                instrumentId: market.instrument_id,
+              })
             }}
             aria-label={`Drop ${market.symbol}`}
             className="text-slate-500 hover:text-red-300"
@@ -223,7 +254,11 @@ function Markets(props: {
         type="button"
         disabled={busy || adding === ''}
         onClick={() => {
-          change.mutate({ kind: 'add-market', id: setup.id, instrumentId: adding })
+          change.mutate({
+            kind: 'add-market',
+            id: setup.id,
+            instrumentId: adding,
+          })
           setAdding('')
         }}
         className="rounded border border-slate-700 px-2 text-xs hover:bg-slate-800 disabled:opacity-40"

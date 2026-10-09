@@ -75,6 +75,7 @@ import type {
   TradesPage,
   WalkForwardOut,
   LiveSetup,
+  LiveSetupNew,
   LiveSetupPatch,
   SignalRow,
   YearCut,
@@ -395,11 +396,15 @@ export const api = {
     request('PATCH', `/live-setups/${id}`, patch),
   removeLiveSetup: (id: string): Promise<null> => request('DELETE', `/live-setups/${id}`),
   addLiveMarket: (id: string, instrumentId: string): Promise<LiveSetup> =>
-    request('POST', `/live-setups/${id}/markets`, { instrument_id: instrumentId }),
+    request('POST', `/live-setups/${id}/markets`, {
+      instrument_id: instrumentId,
+    }),
   changeLiveMarket: (id: string, instrumentId: string, active: boolean): Promise<LiveSetup> =>
     request('PATCH', `/live-setups/${id}/markets/${instrumentId}`, { active }),
   removeLiveMarket: (id: string, instrumentId: string): Promise<LiveSetup> =>
     request('DELETE', `/live-setups/${id}/markets/${instrumentId}`),
+  registerLiveSetup: (body: LiveSetupNew): Promise<LiveSetup> =>
+    request('POST', '/live-setups/new', body),
   editLiveSetup: (id: string, definition: Record<string, unknown>): Promise<LiveSetup> =>
     request('POST', `/live-setups/${id}/version`, { definition }),
   listLiveSignals: (id: string): Promise<SignalRow[]> =>

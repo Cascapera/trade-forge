@@ -20,6 +20,7 @@ from tradeforge_api.schemas import (
     LiveMetricsOut,
     LiveSetupCreate,
     LiveSetupFromRun,
+    LiveSetupNew,
     LiveSetupOut,
     LiveSetupPatch,
     LiveSetupVersion,
@@ -30,6 +31,7 @@ from tradeforge_db.live_setups import (
     SetupView,
     add_market,
     create_setup,
+    create_with_strategy,
     delete_setup,
     follow_backtest,
     list_setups,
@@ -145,6 +147,37 @@ def create(session: SessionDep, request: LiveSetupCreate) -> LiveSetupOut:
             cost_model=request.cost_model,
             instrument_ids=request.instrument_ids,
             name=request.name,
+            no_target_r=request.no_target_r,
+        )
+    except AlreadyFollowedError as clash:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(clash)) from None
+    except LookupError as missing:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(missing)) from None
+    return _answer(session, setup.id)
+
+
+@router.post(
+    "/live-setups/new",
+    response_model=LiveSetupOut,
+    status_code=status.HTTP_201_CREATED,
+    responses={
+        **_BOTH,
+        status.HTTP_422_UNPROCESSABLE_CONTENT: {"description": "the strategy cannot run"},
+    },
+)
+def registered(session: SessionDep, request: LiveSetupNew) -> LiveSetupOut:
+    """Register a setup from scratch — its strategy and its markets — and start following it.
+
+    Validated exactly as a strategy saved from the builder, at the chart chosen here."""
+    validate_document(request.definition)
+    assert_runnable_at(request.definition, request.timeframe)
+    try:
+        setup = create_with_strategy(
+            session,
+            definition=request.definition,
+            timeframe=request.timeframe,
+            instrument_ids=request.instrument_ids,
+            cost_model=request.cost_model,
             no_target_r=request.no_target_r,
         )
     except AlreadyFollowedError as clash:

@@ -9,14 +9,17 @@ nothing behind — no exception, no log, just an equity curve that is quietly wr
 import datetime as dt
 from collections.abc import Iterator
 from decimal import Decimal
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
 from tradeforge_api.live import CandleStream
-from tradeforge_api.live.session import MAX_SEAM_GAP, _refuse_a_hole
+from tradeforge_api.live.session import MAX_SEAM_GAP, _past_an_inherited_trade, _refuse_a_hole
 from tradeforge_api.live.splice import RECENT_KEPT, BarSource, SplicedCandles, splice
 from tradeforge_api.live.testing import FakeRedisStreams
 from tradeforge_collector.live import Subscription
+from tradeforge_db.models import SessionMode
 from tradeforge_engine.domain import Candle
 from tradeforge_engine.errors import EngineError
 
@@ -503,3 +506,88 @@ def test_a_session_refuses_a_hole_longer_than_a_long_weekend() -> None:
     candles.seam_gap = MAX_SEAM_GAP + HOUR
     with pytest.raises(EngineError, match="missing between the candles on disk"):
         _refuse_a_hole(candles, "Usa500", "M5")
+
+
+def test_a_hole_inside_the_stream_is_measured_too() -> None:
+    """A machine off for longer than the live loop can fill leaves the hole after the seam."""
+    candles, _ = spliced(
+        history=[bar(0), bar(1)],
+        backlog=[bar(2), bar(3), bar(40)],
+        live=[bar(41)],
+        opened_at=cut_after(40),
+    )
+
+    list(candles.warmup())
+
+    assert candles.seam_gap == 37 * HOUR
+
+
+# --------------------------------------------------------------------------------------------
+# A signal session opened mid-trade (09/10)
+# --------------------------------------------------------------------------------------------
+
+
+class Holding:
+    """A broker that holds a position for `bars` more bars, then is flat."""
+
+    def __init__(self, bars: int) -> None:
+        self.left = bars
+
+    def positions(self, _symbol: str) -> list[object]:
+        return [object()] if self.left > 0 else []
+
+
+def follow(
+    holding: Holding, stopping: bool = False, *, mode: SessionMode = SessionMode.SIGNAL
+) -> tuple[Iterator[Candle], list[int]]:
+    candles, _ = spliced(
+        history=[bar(0)],
+        backlog=[],
+        live=[bar(index) for index in range(1, 6)],
+        opened_at=cut_after(0),
+    )
+    list(candles.warmup())
+    seen: list[int] = []
+
+    def run(bars: Iterator[Candle]) -> Iterator[Any]:
+        for one in bars:
+            seen.append(round((one.time - START) / HOUR))
+            holding.left -= 1
+            yield SimpleNamespace(candle=one)
+
+    stream = _past_an_inherited_trade(
+        candles,
+        mode=mode,
+        timeframe="H1",
+        warm=holding,  # type: ignore[arg-type]
+        symbol="Usa500",
+        run=run,
+        stopping=lambda: stopping,
+    )
+    return stream, seen
+
+
+def test_a_signal_session_follows_the_inherited_trade_quietly_until_it_ends() -> None:
+    stream, followed = follow(Holding(2))
+
+    assert followed == [1, 2]
+    assert closes_of(stream) == [3, 4, 5], "the session's own bars start after the trade"
+
+
+def test_a_session_that_was_flat_starts_at_once() -> None:
+    stream, followed = follow(Holding(0))
+
+    assert followed == []
+    assert closes_of(stream) == [1, 2, 3, 4, 5]
+
+
+def test_paper_still_refuses_mid_trade_further_on() -> None:
+    stream, followed = follow(Holding(2), mode=SessionMode.PAPER)
+
+    assert followed == [], "only a signal session follows a trade it did not announce"
+    assert closes_of(stream) == [1, 2, 3, 4, 5]
+
+
+def test_a_stop_while_following_ends_the_session() -> None:
+    with pytest.raises(EngineError, match="stopped while following"):
+        follow(Holding(3), stopping=True)

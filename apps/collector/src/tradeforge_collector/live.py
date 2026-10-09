@@ -551,6 +551,9 @@ def run_on_demand(  # noqa: PLR0913 — the same seams as `run`, plus where the 
                         new.timeframe,
                         stored,
                     )
+                if new in seen:
+                    # Caught up as far as a first fill may reach, from the disk or from the
+                    # stream: a machine switched off for a week owes more than an outage does.
                     total += sum(
                         len(bars)
                         for bars in poll_once(

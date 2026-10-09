@@ -174,14 +174,16 @@ function MarketSearch(props: {
   const { debounced, results, snapshot } = useSymbolResults(text)
 
   const pick = (found: BrokerSymbol): void => {
-    if (full && !chosen.includes(found.symbol)) {
+    // A launch names a market by the system's name once collected: WIN, not the broker's WIN$.
+    const name = found.name ?? found.symbol
+    if (full && !chosen.includes(name)) {
       setRefused(true)
       return
     }
     setRefused(false)
     setText('')
     setOpen(false)
-    onToggle(found.symbol)
+    onToggle(name)
   }
 
   const { highlighted, setHighlighted, onKeyDown } = useListboxKeys({
@@ -226,7 +228,7 @@ function MarketSearch(props: {
           snapshot={snapshot}
           onPick={pick}
           badge={(found) =>
-            chosen.includes(found.symbol) ? (
+            chosen.includes(found.name ?? found.symbol) ? (
               <span className="shrink-0 rounded bg-sky-900/60 px-1 text-[10px] text-sky-200">
                 chosen
               </span>

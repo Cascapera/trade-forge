@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
 from tradeforge_db.broker_symbols import BrokerSymbolEntry, replace_snapshot
+from tradeforge_db.brokers import broker_for_server
 from tradeforge_db.models import Instrument
 from tradeforge_engine.domain import AssetClass
 
@@ -166,3 +167,56 @@ def test_each_symbol_says_which_brokers_terminal_lists_it(
         None,
     )
     assert (searched("btc"), searched("nvd"), searched("zz")) == ("activtrades", "tradeview", None)
+
+
+def test_a_market_collected_under_its_own_name_is_listed_by_it(
+    client: TestClient, session_factory: Callable[[], Session]
+) -> None:
+    """09/10: WIN$, DOL$ and WDO$ were collected as WIN, DOL and WDO (ADR-0032), and the
+    futures tab, matching by name, showed none of them collected — and hid them."""
+    browsable(session_factory)
+    with session_factory() as session:
+        replace_snapshot(
+            session,
+            [
+                BrokerSymbolEntry(
+                    symbol="DOL$",
+                    description="DOLAR COMERCIAL FUTURO - Ajuste Proporcional",
+                    path=r"BMF\SERIES CONTINUAS\DOL$",
+                ),
+                BrokerSymbolEntry(symbol="EURUSD", description="Euro", path=r"Forex\Majors"),
+            ],
+            server="XPMT5-DEMO",
+            synced_at=SYNCED_AT,
+        )
+        xp = broker_for_server(session, "XPMT5-DEMO")
+        activtrades = broker_for_server(session, "ActivTradesCorp-Server")
+        for symbol, ticker, broker in (("DOL", "DOL$", xp), ("EURUSD", "EURUSD", activtrades)):
+            session.add(
+                Instrument(
+                    symbol=symbol,
+                    name=symbol,
+                    asset_class=AssetClass.FUTURE,
+                    currency_quote="BRL",
+                    tick_size=Decimal("0.001"),
+                    tick_value=Decimal("0.05"),
+                    contract_size=Decimal(1),
+                    digits=3,
+                    broker_id=broker.id,
+                    broker_symbol=ticker,
+                )
+            )
+        session.commit()
+
+    page = client.get("/symbols/browse", params={"collected": True, "limit": 500}).json()
+    found = client.get("/symbols/search", params={"q": "DOL$"}).json()["symbols"]
+    by_name = client.get(
+        "/symbols/browse", params={"q": "dol", "market": "futures", "collected": True}
+    ).json()
+
+    assert sorted((one["symbol"], one["ticker"], one["broker"]) for one in page["items"]) == [
+        ("DOL", "DOL$", "xp"),
+        ("EURUSD", "EURUSD", "activtrades"),
+    ], "XP's EURUSD is not the one collected from ActivTrades"
+    assert (found[0]["symbol"], found[0]["name"], found[0]["catalogued"]) == ("DOL$", "DOL", True)
+    assert [one["symbol"] for one in by_name["items"]] == ["DOL"]

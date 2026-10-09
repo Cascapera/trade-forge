@@ -838,6 +838,9 @@ export interface BrokerSymbol {
   catalogued: boolean
   /** The broker whose terminal lists it (ADR-0032); `null` for a server nobody registered. */
   broker?: string | null
+  /** The system's name once collected from this broker — WIN for WIN$ (ADR-0032). A launch
+   *  chooses this; the collect screen keeps `symbol`, the terminal's ticker. */
+  name?: string | null
 }
 
 /** Where the symbol list came from. `null` means nobody has ever synced this broker. */
@@ -873,7 +876,10 @@ export interface Markets {
 
 /** A broker symbol as the market browser lists it. */
 export interface BrowsedSymbol {
+  /** What a run is launched over: the system's name once collected (WIN), else the ticker. */
   symbol: string
+  /** The broker's own ticker (WIN$), shown beside `symbol` when the two differ. */
+  ticker?: string | null
   description: string | null
   path: string | null
   market: string

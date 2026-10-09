@@ -182,4 +182,17 @@ describe('browsedCost', () => {
     expect(browsedCost(browsed('B', 'forex', null))).toBe('no spread measured')
     expect(browsedCost(browsed('C', 'forex', '3', false))).toBe('never collected')
   })
+
+  it('lists a market by the name it was collected as, its ticker beside (09/10)', async () => {
+    // WIN$, DOL$, WDO$ are collected as WIN, DOL, WDO: the launch takes the name, not the ticker.
+    const broker = fakeBroker([{ ...browsed('WIN', 'indices', '5'), ticker: 'WIN$' }])
+    vi.mocked(api.getMarkets).mockImplementation(broker.markets)
+    vi.mocked(api.browseSymbols).mockImplementation(broker.browse)
+    renderWithProviders(<Harness />)
+
+    fireEvent.click(await screen.findByRole('checkbox', { name: 'WIN, 5 ticks' }))
+
+    expect(screen.getByText('WIN$')).toBeInTheDocument()
+    expect(chosen()).toBe('WIN')
+  })
 })

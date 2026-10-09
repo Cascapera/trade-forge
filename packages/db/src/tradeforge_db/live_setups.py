@@ -32,6 +32,7 @@ __all__ = [
     "SetupView",
     "add_market",
     "create_setup",
+    "create_with_strategy",
     "delete_setup",
     "follow_backtest",
     "followed_pairs",
@@ -139,6 +140,45 @@ def create_setup(  # noqa: PLR0913 — what a setup is, each its own field
     session.add(setup)
     session.flush()
     return setup
+
+
+def create_with_strategy(  # noqa: PLR0913 — what a setup registered from scratch is
+    session: Session,
+    *,
+    definition: Mapping[str, object],
+    timeframe: str,
+    instrument_ids: Sequence[uuid.UUID],
+    cost_model: Mapping[str, object],
+    no_target_r: Decimal = Decimal(5),
+) -> LiveSetup:
+    """A setup registered from scratch (09/10): its strategy saved, and the setup made, in one
+    transaction — a strategy without its setup is never left behind by a refusal.
+
+    The caller validates the document. A name used before becomes that strategy's next version
+    rather than a refused duplicate."""
+    document = dict(definition)
+    name = str(document.get("name") or "live setup")
+    # A lineage starts at version 1 (the table's own check): a name used before continues its
+    # newest version as the parent.
+    latest = session.scalars(
+        select(Strategy).where(Strategy.name == name).order_by(Strategy.version.desc())
+    ).first()
+    strategy = Strategy(
+        definition=document,
+        version=1 if latest is None else latest.version + 1,
+        parent_version_id=None if latest is None else latest.id,
+    )
+    session.add(strategy)
+    session.flush()
+    return create_setup(
+        session,
+        strategy_id=strategy.id,
+        timeframe=timeframe,
+        cost_model=cost_model,
+        instrument_ids=instrument_ids,
+        name=name,
+        no_target_r=no_target_r,
+    )
 
 
 def follow_backtest(

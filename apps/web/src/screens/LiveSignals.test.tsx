@@ -8,6 +8,13 @@ vi.mock('../api/hooks', () => ({
   useChangeLive: vi.fn(),
   useInstruments: vi.fn(),
   useLiveSignals: vi.fn(),
+  useRegisterLiveSetup: () => ({
+    mutate: vi.fn(),
+    isPending: false,
+    error: null,
+  }),
+  useStrategy: () => ({ data: undefined }),
+  useEditLiveSetup: () => ({ mutate: vi.fn(), isPending: false, error: null }),
 }))
 
 import { useChangeLive, useInstruments, useLiveSetups, useLiveSignals } from '../api/hooks'
@@ -64,12 +71,22 @@ const signal: SignalRow = {
 
 function mount(setups: LiveSetup[]): ReturnType<typeof vi.fn> {
   const mutate = vi.fn()
-  vi.mocked(useLiveSetups).mockReturnValue({ data: setups, isPending: false } as never)
-  vi.mocked(useChangeLive).mockReturnValue({ mutate, isPending: false, error: null } as never)
+  vi.mocked(useLiveSetups).mockReturnValue({
+    data: setups,
+    isPending: false,
+  } as never)
+  vi.mocked(useChangeLive).mockReturnValue({
+    mutate,
+    isPending: false,
+    error: null,
+  } as never)
   vi.mocked(useInstruments).mockReturnValue({
     data: [{ id: 'bit', symbol: 'BIT', broker: 'xp' }],
   } as never)
-  vi.mocked(useLiveSignals).mockReturnValue({ data: [signal], isPending: false } as never)
+  vi.mocked(useLiveSignals).mockReturnValue({
+    data: [signal],
+    isPending: false,
+  } as never)
   renderWithProviders(<LiveSignals />)
   return mutate
 }
@@ -143,7 +160,15 @@ describe('LiveSignals', () => {
       },
     ])
     vi.mocked(useLiveSignals).mockReturnValue({
-      data: [{ ...signal, side: 'short', status: 'triggered', result_r: null, ended_at: null }],
+      data: [
+        {
+          ...signal,
+          side: 'short',
+          status: 'triggered',
+          result_r: null,
+          ended_at: null,
+        },
+      ],
       isPending: false,
     } as never)
 
@@ -156,13 +181,31 @@ describe('LiveSignals', () => {
 
   it('says when a setup has posted nothing yet, and while it loads', () => {
     mount([setup])
-    vi.mocked(useLiveSignals).mockReturnValue({ data: [], isPending: false } as never)
+    vi.mocked(useLiveSignals).mockReturnValue({
+      data: [],
+      isPending: false,
+    } as never)
     fireEvent.click(screen.getByRole('button', { name: /Show the signals/ }))
     expect(screen.getByText('No signal posted yet.')).toBeInTheDocument()
 
-    vi.mocked(useLiveSetups).mockReturnValue({ data: undefined, isPending: true } as never)
+    vi.mocked(useLiveSetups).mockReturnValue({
+      data: undefined,
+      isPending: true,
+    } as never)
     renderWithProviders(<LiveSignals />)
     expect(screen.getByText('Loading…')).toBeInTheDocument()
+  })
+
+  it('opens the form for a new setup, and the editor of one', () => {
+    mount([setup])
+
+    fireEvent.click(screen.getByRole('button', { name: 'New setup' }))
+    expect(screen.getByRole('heading', { name: 'New setup' })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    expect(screen.getByRole('button', { name: 'New setup' })).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Edit' }))
+    expect(screen.getByText('Loading the setup…')).toBeInTheDocument()
   })
 
   it('says when nothing is followed', () => {

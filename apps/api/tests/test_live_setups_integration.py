@@ -302,3 +302,47 @@ def test_an_edit_that_cannot_run_is_refused_and_changes_nothing(
 
     assert response.status_code == 422
     assert client.get("/live-setups").json()[0]["strategy_id"] == str(first)
+
+
+def test_a_setup_registered_from_scratch_saves_its_strategy_and_follows_its_markets(
+    client: TestClient, session_factory: Callable[[], Session]
+) -> None:
+    with session_factory() as session:
+        win, wdo = instrument(session, "WIN"), instrument(session, "WDO")
+        session.commit()
+    body = {"definition": CHOCH, "timeframe": "H1", "instrument_ids": [str(win), str(wdo)]}
+
+    first = client.post("/live-setups/new", json=body)
+    again = client.post(
+        "/live-setups/new", json={**body, "timeframe": "H4", "definition": {**CHOCH}}
+    )
+
+    assert first.status_code == 201, first.text
+    setup = first.json()
+    assert (setup["name"], setup["timeframe"], setup["active"]) == (CHOCH["name"], "H1", True)
+    assert [m["symbol"] for m in setup["markets"]] == ["WIN", "WDO"]
+    with session_factory() as session:
+        saved = session.get(Strategy, uuid.UUID(setup["strategy_id"]))
+        assert saved is not None
+        assert saved.definition["setup"]["type"] == "structure_choch"
+    assert again.status_code == 201, "the same name again is its next version, not a refusal"
+
+
+def test_a_setup_that_cannot_run_leaves_no_strategy_behind(
+    client: TestClient, session_factory: Callable[[], Session]
+) -> None:
+    with session_factory() as session:
+        win = instrument(session, "WIN")
+        before = session.query(Strategy).count()
+        session.commit()
+    broken = {**CHOCH, "setup": {"type": "structure_choch", "params": {"side": "sideways"}}}
+
+    response = client.post(
+        "/live-setups/new",
+        json={"definition": broken, "timeframe": "H1", "instrument_ids": [str(win)]},
+    )
+
+    assert response.status_code == 422
+    with session_factory() as session:
+        assert session.query(Strategy).count() == before
+    assert client.get("/live-setups").json() == []

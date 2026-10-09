@@ -2144,6 +2144,14 @@ export interface LiveSetup {
   metrics: LiveMetrics
 }
 
+/** A setup registered from scratch: its strategy document, its chart and its markets. */
+export interface LiveSetupNew {
+  definition: Record<string, unknown>
+  timeframe: string
+  instrument_ids: string[]
+  no_target_r?: string
+}
+
 export interface LiveSetupPatch {
   name?: string
   active?: boolean

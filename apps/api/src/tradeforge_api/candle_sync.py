@@ -54,10 +54,19 @@ class RemoteFile:
 Fetch = Callable[[str], bytes]
 
 
+_FULL_LISTING_TIMEOUT = 180
+"""The hourly sync's whole listing: measured 23 s for 6 156 files on 09/10 — the main machine's
+Docker reads its Windows disk slowly — and it only grows. Nothing waits on it but the sync."""
+
+_TIMEOUT = 15
+"""A file, or one series' listing: what a run waits on. With the main machine switched off, a run
+waits this long at most before going on with its own disk (his point, 09/10)."""
+
+
 def _get(url: str) -> bytes:
-    # 15 s: with the main machine switched off, a run waits this long at most before going on
-    # with its own disk (his point, 09/10) — not the minute a default would cost.
-    with urllib.request.urlopen(url, timeout=15) as response:  # noqa: S310 — our own API
+    full_listing = urllib.parse.urlparse(url).path.endswith("/candle-files") and "?" not in url
+    timeout = _FULL_LISTING_TIMEOUT if full_listing else _TIMEOUT
+    with urllib.request.urlopen(url, timeout=timeout) as response:  # noqa: S310 — our own API
         return bytes(response.read())
 
 

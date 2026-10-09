@@ -321,6 +321,18 @@ def test_a_spread_read_after_the_close_is_not_catalogued() -> None:
         assert source.spread_points("EURUSD") is None
 
 
+def test_a_negative_spread_is_not_catalogued() -> None:
+    """XP's B3 shares before the open, 09/10: ask below bid in the auction (-2097 points on
+    AXIA3). The catalogue's CHECK refuses it, and refusing failed the whole download."""
+
+    class _Crossed(_FakeTerminal):
+        def symbol_info(self, symbol: str) -> _SymbolInfo | None:
+            return _SymbolInfo(name=symbol, spread=-2097)
+
+    with MT5Source(terminal=_Crossed(), server_offset=SERVER_OFFSET) as source:
+        assert source.spread_points("AXIA3") is None
+
+
 def test_a_live_quote_is_catalogued_even_though_the_symbol_is_quiet() -> None:
     """The other half: a gap of a couple of minutes is a thin market, not a shut one.
 

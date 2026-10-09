@@ -29,8 +29,9 @@ const KEPT = {
 const toneClass = { up: 'text-emerald-400', down: 'text-red-400', flat: 'text-slate-100' } as const
 
 /** Up to this many years a run's R by year is a column per year; past it, a row of small bars —
- *  eleven signed numbers per row read as a wall (01/10). */
-export const MAX_YEAR_COLUMNS = 8
+ *  eleven signed numbers per row read as a wall (01/10), and eight columns pushed the table past
+ *  the page into a sideways scroll that hid them (09/10). */
+export const MAX_YEAR_COLUMNS = 4
 
 /** An R figure in a cell under an "R" header: `+1.25`, `-0.50`. The sign is the marker. */
 function signedR(value: string): string {
@@ -66,14 +67,11 @@ export function RunTable(props: {
   const yearColumns = years.length === 0 ? 0 : asBars ? 1 : years.length
 
   return (
-    // Twelve columns will not fit a narrow window, so the table scrolls inside its own box. The
-    // page itself never scrolls sideways.
+    // ⚠️ No minimum width (09/10): one forced the table past the page, so every sweep showed a
+    // sideways scroll and its years sat off-screen. The table fits the page and its cells wrap;
+    // the box still scrolls, inside itself, on a window too narrow even for that.
     <div className="overflow-x-auto rounded-lg border border-slate-800">
-      <table
-        className="w-full min-w-[68rem] border-collapse text-left text-sm"
-        // Each year column widens the table rather than squeezing the twelve before it.
-        style={yearColumns === 0 ? undefined : { minWidth: `${String(68 + yearColumns * 4.5)}rem` }}
-      >
+      <table className="w-full border-collapse text-left text-sm">
         <thead>
           <tr className="border-b border-slate-800 text-xs tracking-wide text-slate-500 uppercase">
             <th scope="col" className="px-3 py-2" />
@@ -112,28 +110,28 @@ export function RunTable(props: {
             <th scope="col" className="px-3 py-2">
               Status
             </th>
-            <th scope="col" className="border-l border-slate-800 px-3 py-2 text-right">
+            <th scope="col" className="border-l border-slate-800 px-2 py-2 text-right">
               Net P&L
             </th>
-            <th scope="col" className="px-3 py-2 text-right">
+            <th scope="col" className="px-2 py-2 text-right">
               Trades
             </th>
-            <th scope="col" className="px-3 py-2 text-right">
+            <th scope="col" className="px-2 py-2 text-right">
               Max DD
             </th>
-            <th scope="col" className="border-l border-slate-800 px-3 py-2 text-right">
+            <th scope="col" className="border-l border-slate-800 px-2 py-2 text-right">
               Profit factor
             </th>
-            <th scope="col" className="px-3 py-2 text-right">
+            <th scope="col" className="px-2 py-2 text-right">
               Win rate
             </th>
-            <th scope="col" className="px-3 py-2 text-right">
+            <th scope="col" className="px-2 py-2 text-right">
               Payoff
             </th>
-            <th scope="col" className="border-l border-slate-800 px-3 py-2 text-right">
+            <th scope="col" className="border-l border-slate-800 px-2 py-2 text-right">
               Sharpe
             </th>
-            <th scope="col" className="px-3 py-2 text-right">
+            <th scope="col" className="px-2 py-2 text-right">
               Sortino
             </th>
             <th scope="col" className="border-l border-slate-800 px-3 py-2">
@@ -212,7 +210,7 @@ export function RunTable(props: {
                   <Link to={`/results/${run.id}`} className="font-medium text-sky-400 hover:text-sky-300">
                     {run.symbol} {run.timeframe}
                   </Link>
-                  <div className="text-xs text-slate-400">
+                  <div className="max-w-[18rem] break-words text-xs text-slate-400">
                     {run.strategy_name} v{run.strategy_version} · {day(run.date_from)} →{' '}
                     {day(run.date_to)}
                   </div>
@@ -237,34 +235,34 @@ export function RunTable(props: {
                   </span>
                 </td>
                 <td
-                  className={`border-l border-slate-800 px-3 py-2 text-right tabular-nums ${
+                  className={`border-l border-slate-800 px-2 py-2 text-right tabular-nums ${
                     metrics === null ? 'text-slate-100' : toneClass[sign(metrics.net_profit)]
                   }`}
                 >
                   {metrics === null ? '—' : signedMoney(metrics.net_profit)}
                 </td>
-                <td className="px-3 py-2 text-right tabular-nums">
+                <td className="px-2 py-2 text-right tabular-nums">
                   {metrics === null ? '—' : count(metrics.total_trades)}
                 </td>
-                <td className="px-3 py-2 text-right tabular-nums">
+                <td className="px-2 py-2 text-right tabular-nums">
                   {metrics === null ? '—' : percent(metrics.max_drawdown_pct)}
                 </td>
-                <td className="border-l border-slate-800 px-3 py-2 text-right tabular-nums">
+                <td className="border-l border-slate-800 px-2 py-2 text-right tabular-nums">
                   {metrics === null ? '—' : ratio(metrics.profit_factor)}
                 </td>
-                <td className="px-3 py-2 text-right tabular-nums">
+                <td className="px-2 py-2 text-right tabular-nums">
                   {metrics === null ? '—' : percent(metrics.win_rate)}
                 </td>
-                <td className="px-3 py-2 text-right tabular-nums">
+                <td className="px-2 py-2 text-right tabular-nums">
                   {metrics === null ? '—' : ratio(metrics.payoff)}
                 </td>
-                <td className="border-l border-slate-800 px-3 py-2 text-right tabular-nums">
+                <td className="border-l border-slate-800 px-2 py-2 text-right tabular-nums">
                   {metrics === null ? '—' : ratio(metrics.sharpe)}
                 </td>
-                <td className="px-3 py-2 text-right tabular-nums">
+                <td className="px-2 py-2 text-right tabular-nums">
                   {metrics === null ? '—' : ratio(metrics.sortino)}
                 </td>
-                <td className="border-l border-slate-800 px-3 py-2 text-xs text-slate-400">
+                <td className="max-w-[8rem] break-words border-l border-slate-800 px-2 py-2 text-xs text-slate-400">
                   {costLabel(run.cost_model)}
                 </td>
                 {yearColumns > 0 && <YearCells years={years} asBars={asBars} yearly={metrics?.yearly_r} />}
@@ -319,7 +317,7 @@ function YearCells(props: {
             ·
           </td>
         ) : (
-          <td key={year} className={`${edge} px-3 py-2 text-right tabular-nums`}>
+          <td key={year} className={`${edge} px-2 py-2 text-right tabular-nums`}>
             {signedR(r)}
           </td>
         )

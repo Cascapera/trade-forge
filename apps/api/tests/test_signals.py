@@ -3,7 +3,7 @@
 import datetime as dt
 from decimal import Decimal
 
-from tradeforge_api.live.signals import SignalBroker, SignalEvent, SignalKindOf
+from tradeforge_api.live.signals import RedisSignalSink, SignalBroker, SignalEvent, SignalKindOf
 from tradeforge_engine.backtest_broker import BacktestBroker
 from tradeforge_engine.domain import (
     AssetClass,
@@ -190,3 +190,83 @@ def test_a_picture_opens_on_the_warm_up_bars_not_on_the_one_seen_live() -> None:
     assert triggered.kind is SignalKindOf.TRIGGERED
     assert triggered.image == b"png"
     assert drawn[-1] == 31
+
+
+def test_a_stop_moved_to_the_entry_is_a_breakeven_said_once() -> None:
+    """09/10, his ask: when the setup protects the trade, the trader may do the same."""
+    signals, sink = broker()
+    signals.submit(armed_long())
+    signals.on_bar(bar(1, 950, 1010))  # filled at 1000
+    assert signals.modify_stop("WIN", Decimal(950), T0 + 2 * STEP)  # closer, not there yet
+    assert signals.modify_stop("WIN", Decimal(1000), T0 + 3 * STEP)  # at the entry
+    assert signals.modify_stop("WIN", Decimal(1020), T0 + 4 * STEP)  # trailed on: nothing new
+
+    assert kinds(sink) == [
+        (SignalKindOf.ARMED, 41),
+        (SignalKindOf.TRIGGERED, 41),
+        (SignalKindOf.BREAKEVEN, 41),
+    ]
+    breakeven = sink.events[-1]
+    assert (breakeven.moved_stop, breakeven.stop, breakeven.time) == (
+        Decimal(1000),
+        Decimal(900),
+        T0 + 3 * STEP,
+    ), "the first stop stays: it is what 1R is"
+
+
+def test_a_short_protected_past_its_entry_is_a_breakeven_too() -> None:
+    signals, sink = broker()
+    signals.submit(armed_long(side=Side.SHORT, stop_price=Decimal(1000), stop_loss=Decimal(1100)))
+    signals.on_bar(bar(1, 990, 1050))  # filled at 1000
+    signals.modify_stop("WIN", Decimal(990), T0 + 2 * STEP)
+
+    assert sink.events[-1].kind is SignalKindOf.BREAKEVEN
+    assert sink.events[-1].moved_stop == Decimal(990)
+
+
+def test_a_stop_moved_with_no_signal_open_says_nothing() -> None:
+    signals, sink = broker()
+
+    assert not signals.modify_stop("WIN", Decimal(1000), T0)
+    assert sink.events == []
+
+
+class Streams:
+    """The two calls `RedisSignalSink` makes, remembered."""
+
+    def __init__(self) -> None:
+        self.entries: list[dict[str, str]] = []
+        self.images: dict[str, bytes] = {}
+
+    def xadd(self, _name: str, fields: dict[str, str], **_: object) -> str:
+        self.entries.append(fields)
+        return "1-0"
+
+    def set(self, key: str, value: bytes, **_: object) -> bool:
+        self.images[key] = value
+        return True
+
+
+def test_a_breakeven_reaches_the_stream_with_where_the_stop_went() -> None:
+    streams = Streams()
+    sink = RedisSignalSink(streams, {"setup_id": "s1"})  # type: ignore[arg-type]
+
+    sink.emit(
+        SignalEvent(
+            kind=SignalKindOf.BREAKEVEN,
+            number=7,
+            symbol="WIN",
+            side=Side.LONG,
+            time=T0,
+            entry=Decimal(1000),
+            stop=Decimal(900),
+            moved_stop=Decimal(1000),
+            image=b"png",
+        )
+    )
+
+    [entry] = streams.entries
+    assert entry["kind"] == "breakeven"
+    assert (entry["stop"], entry["moved_stop"]) == ("900", "1000")
+    assert "target" not in entry, "an empty value is left out"
+    assert streams.images[entry["image_key"]] == b"png"

@@ -475,6 +475,39 @@ def test_a_stream_that_carries_on_from_the_disk_has_a_seam_of_one_bar() -> None:
     assert candles.seam_gap == HOUR
 
 
+def test_history_is_walked_as_the_warm_up_goes_not_collected_first() -> None:
+    """⚠️ The memory a live session keeps for life (12/10). `list(history())` held every bar on
+    disk as an object at once — 662 thousand on Usa500 M5 — and the process never gave that
+    memory back. A warm-up that has used one bar must have pulled one bar."""
+    pulled: list[int] = []
+
+    def history() -> Iterator[Candle]:
+        for index in range(100):
+            pulled.append(index)
+            yield bar(index)
+
+    source = FakeSource(backlog=[], live=[])
+    candles = splice(source, history=history, timeframe=HOUR, opened_at=cut_after(99))
+
+    warm = candles.warmup()
+    next(warm)
+
+    assert pulled == [0], f"history was collected before the warm-up used it: {len(pulled)} bars"
+
+
+def test_the_seam_is_the_same_when_history_arrives_as_a_generator() -> None:
+    """The instant of the last bar on disk used to be read off the end of the list. Walked, it
+    is noted bar by bar — and must still be that last bar when the backlog starts."""
+    source = FakeSource(backlog=[bar(1), bar(30)], live=[bar(31)])
+    candles = splice(
+        source, history=lambda: iter([bar(0), bar(1)]), timeframe=HOUR, opened_at=cut_after(30)
+    )
+
+    list(candles.warmup())
+
+    assert candles.seam_gap == 29 * HOUR
+
+
 def test_nothing_on_disk_has_no_seam() -> None:
     candles, _ = spliced(history=[], backlog=[bar(0)], live=[bar(1)], opened_at=cut_after(0))
 
@@ -549,7 +582,8 @@ def follow(
     list(candles.warmup())
     seen: list[int] = []
 
-    def run(bars: Iterator[Candle]) -> Iterator[Any]:
+    def run(bars: Iterator[Candle], broker: object) -> Iterator[Any]:
+        assert broker is holding, "the trade was not followed on the warm-up's broker"
         for one in bars:
             seen.append(round((one.time - START) / HOUR))
             holding.left -= 1

@@ -242,12 +242,27 @@ def splice(
 
     `history` is a **callable**, not an iterable, for exactly that reason: passing the already
     read list would put the read at the call site, before this function could sequence it.
+
+    ⚠️ **History is walked, not collected (12/10).** It used to be `list(history())`, so a live
+    session held every bar on disk as an object at once — 662 thousand on Usa500 M5, ~360 MB —
+    and a process does not give that memory back once it is freed. Handed a generator
+    (`iter_candles`), the warm-up now pulls the bars as it goes. The one thing the list was
+    for, the instant of the last bar on disk, is noted bar by bar instead: by the time the
+    first backlog bar is admitted the history is exhausted, so the note is that last bar —
+    the same `disk_end` the list gave — and no history bar can ever sit after it.
     """
     source.ensure_group()
-    past = list(history())
-    return SplicedCandles(
-        chain(past, source.backlog(), source.candles()),
+    past = history()
+    spliced: SplicedCandles
+
+    def from_disk() -> Iterator[Candle]:
+        for candle in past:
+            spliced._disk_end = candle.time
+            yield candle
+
+    spliced = SplicedCandles(
+        chain(from_disk(), source.backlog(), source.candles()),
         timeframe=timeframe,
         opened_at=opened_at,
-        disk_end=past[-1].time if past else None,
     )
+    return spliced

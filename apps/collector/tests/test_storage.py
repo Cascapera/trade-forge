@@ -4,6 +4,7 @@ import datetime as dt
 from decimal import Decimal
 from pathlib import Path
 
+import pyarrow as pa
 import pyarrow.dataset as pads
 import pytest
 
@@ -11,6 +12,7 @@ from tradeforge_collector.source import Candle
 from tradeforge_collector.storage import (
     OHLCV_SCHEMA,
     dataset_path,
+    iter_candles,
     normalise,
     read_candles,
     read_times,
@@ -232,6 +234,69 @@ def test_the_instants_come_back_sorted_and_in_utc(tmp_path: Path) -> None:
 
 def test_asking_for_the_instants_of_nothing_is_empty_not_an_error(tmp_path: Path) -> None:
     assert read_times(tmp_path, "NOPE", "H1") == []
+
+
+# --------------------------------------------------------------------------- #
+# Reading a slice at a time (a live session's warm-up, 12/10)                   #
+# --------------------------------------------------------------------------- #
+
+
+def test_the_sliced_reader_hands_back_exactly_the_bars_of_the_whole_one(tmp_path: Path) -> None:
+    """⚠️ The warm-up is where a live session must see what its backtest saw (AGENTS.md §5.2).
+    Slices smaller than the series, and bars written out of order across two years, so a slice
+    edge or a year directory listed out of turn would show up as a bar missing, doubled or moved.
+    """
+    written = [*_DAYS[3:], *_DAYS[:3], dt.datetime(2023, 12, 29, 9, tzinfo=dt.UTC)]
+    write_candles(tmp_path, "EURUSD", "D1", [a_candle(day, close="1.10700") for day in written])
+
+    sliced = list(iter_candles(tmp_path, "EURUSD", "D1", rows_per_slice=2))
+
+    assert sliced == read_candles(tmp_path, "EURUSD", "D1")
+    assert [candle.time for candle in sliced] == sorted(written)
+
+
+def test_the_sliced_reader_keeps_the_same_window(tmp_path: Path) -> None:
+    _five_days(tmp_path)
+
+    window = iter_candles(tmp_path, "EURUSD", "D1", start=_DAYS[1], end=_DAYS[3], rows_per_slice=1)
+
+    assert [candle.time for candle in window] == [_DAYS[1], _DAYS[2], _DAYS[3]]
+
+
+def test_the_sliced_reader_reads_nothing_until_the_first_bar_is_asked_for(tmp_path: Path) -> None:
+    """A caller that sequences the read — `splice` creates its consumer group first — must be
+    able to build the reader early. Bars written after the call and before the first `next()`
+    are there, which only holds if the call itself touched no file."""
+    reader = iter_candles(tmp_path, "EURUSD", "D1")
+    _five_days(tmp_path)
+
+    assert [candle.time for candle in reader] == _DAYS
+
+
+def test_the_sliced_reader_asks_arrow_for_memory_back_only_once_the_table_is_gone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """⚠️ A release asked while anything still holds the table gives nothing back, and what was
+    not given back stays in Arrow's cache for the life of the session. The loop's last slice is
+    such a holder: it shares the table's buffers (12/10, found writing the lesson)."""
+    _five_days(tmp_path)
+    before = pa.total_allocated_bytes()
+    held_when_released: list[int] = []
+    pool = pa.default_memory_pool()
+
+    class Watched:
+        def release_unused(self) -> None:
+            held_when_released.append(pa.total_allocated_bytes())
+            pool.release_unused()
+
+    monkeypatch.setattr(pa, "default_memory_pool", Watched)
+
+    assert len(list(iter_candles(tmp_path, "EURUSD", "D1", rows_per_slice=2))) == len(_DAYS)
+    assert held_when_released == [before], "the table was still alive when Arrow was asked"
+
+
+def test_slicing_a_series_that_was_never_collected_is_empty_not_an_error(tmp_path: Path) -> None:
+    assert list(iter_candles(tmp_path, "NOPE", "H1")) == []
 
 
 def test_writing_nothing_is_an_error_not_a_silent_no_op(tmp_path: Path) -> None:

@@ -67,7 +67,7 @@ from tradeforge_api.runner import (
     take_profit_rr,
     timeframe_refusal,
 )
-from tradeforge_collector import read_candles, step
+from tradeforge_collector import iter_candles, step
 from tradeforge_db.live_sessions import finish_session, open_session, reconcile_stale
 from tradeforge_db.models import Instrument, LiveSession, SessionMode, Strategy
 from tradeforge_db.session import session_scope
@@ -76,6 +76,7 @@ from tradeforge_engine.domain import Candle, InstrumentSpec, Refusal
 from tradeforge_engine.errors import EngineError
 from tradeforge_engine.loop import BarOutcome, iter_run
 from tradeforge_engine.protocols import Broker, CostModel
+from tradeforge_engine.protocols import Strategy as CompiledStrategy
 from tradeforge_engine.warmup import hand_over
 
 logger = logging.getLogger(__name__)
@@ -171,6 +172,39 @@ def reconcile_on_start(factory: sessionmaker[Session]) -> list[uuid.UUID]:
     return marked
 
 
+def _replay_history(  # noqa: PLR0913 — keyword-only; what a backtest of the history needs
+    candles: SplicedCandles,
+    *,
+    plan: SessionPlan,
+    spec: InstrumentSpec,
+    definition: Mapping[str, Any],
+    strategy: CompiledStrategy,
+    risk: PercentRiskManager,
+) -> BacktestBroker:
+    """The warm-up: the history walked once through `strategy`, on a broker of its own.
+
+    ⚠️ **History is always replayed against a `BacktestBroker`, in both modes.** Warm-up is a
+    backtest whose ledger is thrown away (ADR-0023), and replaying it against a venue would put
+    months of decided-in-hindsight orders on a real account in the first seconds of a session.
+    """
+    warm = BacktestBroker(
+        instrument=spec,
+        initial_capital=plan.initial_capital,
+        cost_model=build_cost_model(plan.cost_model),
+        take_profit_rr=take_profit_rr(definition),
+    )
+    for _outcome in iter_run(
+        candles=candles.warmup(),
+        timeframe=step(plan.timeframe),
+        instrument=spec,
+        strategy=strategy,
+        broker=warm,
+        risk=risk,
+    ):
+        pass
+    return warm
+
+
 def _past_an_inherited_trade(  # noqa: PLR0913 — the cut, the mode, and what the trade runs on
     candles: SplicedCandles,
     *,
@@ -178,7 +212,7 @@ def _past_an_inherited_trade(  # noqa: PLR0913 — the cut, the mode, and what t
     timeframe: str,
     warm: Broker,
     symbol: str,
-    run: Callable[[Iterator[Candle]], Iterator[BarOutcome]],
+    run: Callable[[Iterator[Candle], Broker], Iterator[BarOutcome]],
     stopping: Callable[[], bool],
 ) -> Iterator[Candle]:
     """The session's live bars — after, for a signal session, the trade the warm-up was in.
@@ -200,7 +234,7 @@ def _past_an_inherited_trade(  # noqa: PLR0913 — the cut, the mode, and what t
     if mode is not SessionMode.SIGNAL or not warm.positions(symbol):
         return stream
     logger.info("%s: the warm-up ended in a trade; following it quietly until it ends", symbol)
-    for outcome in run(stream):
+    for outcome in run(stream, warm):
         if not warm.positions(symbol):
             logger.info("%s: the inherited trade ended on the %s bar", symbol, outcome.candle.time)
             break
@@ -293,33 +327,17 @@ def run_session(  # noqa: PLR0913 — keyword-only; each names one seam of a ses
     timeframe = step(plan.timeframe)
     candles = splice(
         source,
-        history=lambda: read_candles(parquet_root, symbol, plan.timeframe),
+        history=lambda: iter_candles(parquet_root, symbol, plan.timeframe),
         timeframe=timeframe,
         opened_at=opened_at,
     )
 
-    # ⚠️ **History is always replayed against a `BacktestBroker`, in both modes.** Warm-up is a
-    # backtest whose ledger is thrown away (ADR-0023), and replaying it against a venue would put
-    # months of decided-in-hindsight orders on a real account in the first seconds of a session.
-    warm = BacktestBroker(
-        instrument=spec,
-        initial_capital=plan.initial_capital,
-        cost_model=build_cost_model(plan.cost_model),
-        take_profit_rr=take_profit_rr(definition),
-    )
     risk = PercentRiskManager(percent=risk_percent(definition))
     # The bars above close on the instrument's clock (30/09), the one its candles are stored on.
     compiled = compile_strategy(definition, server_offset=spec.server_offset)
-
-    for _outcome in iter_run(
-        candles=candles.warmup(),
-        timeframe=timeframe,
-        instrument=spec,
-        strategy=compiled,
-        broker=warm,
-        risk=risk,
-    ):
-        pass
+    warm = _replay_history(
+        candles, plan=plan, spec=spec, definition=definition, strategy=compiled, risk=risk
+    )
 
     stream = _past_an_inherited_trade(
         candles,
@@ -327,12 +345,12 @@ def run_session(  # noqa: PLR0913 — keyword-only; each names one seam of a ses
         timeframe=plan.timeframe,
         warm=warm,
         symbol=symbol,
-        run=lambda bars: iter_run(
+        run=lambda bars, broker: iter_run(
             candles=bars,
             timeframe=timeframe,
             instrument=spec,
             strategy=compiled,
-            broker=warm,
+            broker=broker,
             risk=risk,
         ),
         stopping=stopping,
@@ -435,6 +453,13 @@ def run_session(  # noqa: PLR0913 — keyword-only; each names one seam of a ses
             len(handover.carried),
             len(handover.refused),
         )
+        # ⚠️ **Let the warm-up's broker go (12/10).** Its job ended with the hand-over, and this
+        # frame lives as long as the session, so keeping the name kept the broker — its whole
+        # book of warm-up trades — for days. Measured: ~20 MB on USDJPY M5 (2 179 warm-up
+        # trades), ~140 MB on Usa500 M5 while the history was still read as one list (its
+        # objects pinned the memory the freed bars had used). Nothing below may reach it: the
+        # session trades through `live`.
+        del warm
 
         try:
             # ⚠️ **`refusals=` is the whole of PR-304-B-D-2b, and dropping it is silent.** The

@@ -22,6 +22,7 @@ import datetime as dt
 from collections.abc import Iterator
 from dataclasses import dataclass
 from decimal import Decimal
+from itertools import chain
 from pathlib import Path
 from typing import Any
 
@@ -177,9 +178,13 @@ def iter_candles(  # noqa: PLR0913 — `read_candles`' window, plus the slice si
     if table is None:
         return
     try:
-        for piece in table.to_batches(max_chunksize=rows_per_slice):
-            for row in piece.to_pylist():
-                yield _candle(row)
+        # ⚠️ **No name for the slices.** A slice shares the table's buffers, and a loop variable
+        # outlives its loop: the last slice would still hold the whole table when the pool is
+        # asked below, and the release would find nothing to give back (12/10).
+        for row in chain.from_iterable(
+            piece.to_pylist() for piece in table.to_batches(max_chunksize=rows_per_slice)
+        ):
+            yield _candle(row)
     finally:
         del table
         pa.default_memory_pool().release_unused()

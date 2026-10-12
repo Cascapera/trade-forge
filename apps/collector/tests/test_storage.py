@@ -4,6 +4,7 @@ import datetime as dt
 from decimal import Decimal
 from pathlib import Path
 
+import pyarrow as pa
 import pyarrow.dataset as pads
 import pytest
 
@@ -270,6 +271,28 @@ def test_the_sliced_reader_reads_nothing_until_the_first_bar_is_asked_for(tmp_pa
     _five_days(tmp_path)
 
     assert [candle.time for candle in reader] == _DAYS
+
+
+def test_the_sliced_reader_asks_arrow_for_memory_back_only_once_the_table_is_gone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """⚠️ A release asked while anything still holds the table gives nothing back, and what was
+    not given back stays in Arrow's cache for the life of the session. The loop's last slice is
+    such a holder: it shares the table's buffers (12/10, found writing the lesson)."""
+    _five_days(tmp_path)
+    before = pa.total_allocated_bytes()
+    held_when_released: list[int] = []
+    pool = pa.default_memory_pool()
+
+    class Watched:
+        def release_unused(self) -> None:
+            held_when_released.append(pa.total_allocated_bytes())
+            pool.release_unused()
+
+    monkeypatch.setattr(pa, "default_memory_pool", Watched)
+
+    assert len(list(iter_candles(tmp_path, "EURUSD", "D1", rows_per_slice=2))) == len(_DAYS)
+    assert held_when_released == [before], "the table was still alive when Arrow was asked"
 
 
 def test_slicing_a_series_that_was_never_collected_is_empty_not_an_error(tmp_path: Path) -> None:

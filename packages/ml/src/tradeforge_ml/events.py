@@ -11,6 +11,7 @@ Pure: no database, no files. `export` reads and writes; this decides.
 """
 
 from collections.abc import Iterable, Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
@@ -28,6 +29,24 @@ def is_unmanaged(definition: Mapping[str, Any]) -> bool:
     params = setup.get("params") if isinstance(setup, Mapping) else None
     breakeven = params.get("breakeven_at_r") if isinstance(params, Mapping) else None
     return target is None and breakeven is None
+
+
+def without_management(definition: Mapping[str, Any]) -> dict[str, Any]:
+    """The document with its target and breakeven taken off — what the run's unmanaged sibling
+    carries, the axes of `EXIT_PATHS` set to nothing and every other field untouched (12/10).
+
+    A copy: the caller's document, often a run's own, is not changed. A document that names no
+    target or no breakeven keeps naming none, so an unmanaged one comes back equal to itself.
+    """
+    document = deepcopy(dict(definition))
+    exit_block = document.get("exit")
+    if isinstance(exit_block, dict) and "take_profit" in exit_block:
+        exit_block["take_profit"] = None
+    setup = document.get("setup")
+    params = setup.get("params") if isinstance(setup, dict) else None
+    if isinstance(params, dict) and "breakeven_at_r" in params:
+        params["breakeven_at_r"] = None
+    return document
 
 
 def entry_configuration(coordinates: Mapping[str, Any]) -> dict[str, Any]:
@@ -159,4 +178,5 @@ __all__ = [
     "entry_configuration",
     "is_unmanaged",
     "reconciles",
+    "without_management",
 ]

@@ -2,8 +2,10 @@
 
 import datetime as dt
 import json
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pyarrow as pa
@@ -17,7 +19,15 @@ from tradeforge_engine.strategy import compile_strategy
 from tradeforge_engine.testing import ARMS_A_RESTING_LIMIT, EURUSD, HOUR, FixedRisk
 from tradeforge_ml.export import EVENT_SCHEMA
 from tradeforge_ml.replay import costs_from, replay
-from tradeforge_ml.replay_export import WARM_BARS, Job, _window, candles_of, write_independent
+from tradeforge_ml.replay_export import (
+    WARM_BARS,
+    Job,
+    _window,
+    candles_of,
+    choose_jobs,
+    replay_job,
+    write_independent,
+)
 
 BARS = list(ARMS_A_RESTING_LIMIT)
 """175 measured EURUSD H1 bars (the engine's own test market)."""
@@ -207,3 +217,124 @@ def test_the_spread_costs_the_same_r_on_every_proposal() -> None:
         assert trade.costs == pytest.approx(Decimal(10) * EURUSD.tick_value)  # half in, half out
         assert trade.r_multiple == pytest.approx(trade.net_pnl / risk, rel=Decimal("1e-6"))
         assert trade.entry_time - BARS[0].time >= dt.timedelta(0)
+
+
+# --------------------------------------------------------------------------------------------
+# One run per entry, managed or not (12/10)
+# --------------------------------------------------------------------------------------------
+
+SPEC = {"symbol": "EURUSD", "name": "Euro", "asset_class": "forex", "currency_quote": "USD",
+        "currency_base": "EUR", "tick_size": str(EURUSD.tick_size),
+        "tick_value": str(EURUSD.tick_value), "contract_size": str(EURUSD.contract_size),
+        "digits": 5, "exchange": None}  # fmt: skip
+
+
+def managed(kind: str, rr: float | None, breakeven: float | None) -> dict[str, Any]:
+    """`document(kind)` with a target and a breakeven, as a grid with those axes writes it."""
+    doc = document(kind)
+    if rr is not None:
+        doc["exit"]["take_profit"] = {"type": "risk_multiple", "params": {"rr": rr}}
+    doc["setup"]["params"]["breakeven_at_r"] = breakeven
+    return doc
+
+
+def row(  # noqa: PLR0913 — one per column of the query a test varies
+    run_id: str,
+    *,
+    rr: float | None,
+    breakeven: float | None,
+    period: int = 9,
+    symbol: str = "EURUSD",
+    timeframe: str = "H1",
+) -> SimpleNamespace:
+    """A row of `jobs_of`'s query: a run, its document and its point's coordinates."""
+    doc = managed("mme9_turn", rr, breakeven)
+    doc["setup"]["params"]["period"] = period
+    return SimpleNamespace(
+        id=run_id,
+        entry_id="mm9",
+        symbol=symbol,
+        timeframe=timeframe,
+        coordinates={
+            "setup.params.period": period,
+            "exit.take_profit.params.rr": rr,
+            "setup.params.breakeven_at_r": breakeven,
+            "timeframe": timeframe,
+        },
+        definition=doc,
+        instrument_spec=SPEC,
+        cost_model=COSTS,
+        date_from=BARS[0].time,
+        date_to=BARS[-1].time,
+    )
+
+
+def test_a_grid_with_no_unmanaged_point_still_gives_each_entry_once() -> None:
+    """⚠️ Every CHOCH and CONTINUATION grid of 08/10 to 11/10: targets of 3, 5, 7 or 10R and a
+    breakeven or none, never "no target". Those sweeps had nothing to replay."""
+    rows = [
+        row(f"{period}-{rr}-{be}", rr=rr, breakeven=be, period=period)
+        for period in (9, 21)
+        for rr in (3, 5)
+        for be in (None, 2)
+    ]
+
+    jobs = choose_jobs(rows)
+
+    assert [job.configuration["setup.params.period"] for job in jobs] == [9, 21]
+    for job in jobs:
+        assert job.definition["exit"]["take_profit"] is None, "the target reached the replay"
+        assert job.definition["setup"]["params"]["breakeven_at_r"] is None
+
+
+def test_the_unmanaged_run_stands_for_its_entry_wherever_it_comes() -> None:
+    """A base written before this one replayed the unmanaged runs: their entries must come from
+    the very same runs, even when a managed sibling is read first."""
+    jobs = choose_jobs(
+        [
+            row("managed-a", rr=3, breakeven=2),
+            row("unmanaged", rr=None, breakeven=None),
+            row("managed-b", rr=5, breakeven=None),
+        ]
+    )
+
+    assert [job.run_id for job in jobs] == ["unmanaged"]
+
+
+def test_each_chart_and_each_row_once() -> None:
+    jobs = choose_jobs(
+        [
+            row("h1", rr=3, breakeven=None),
+            row("h1", rr=3, breakeven=None),  # the query's join can repeat a run
+            row("m15", rr=3, breakeven=None, timeframe="M15"),
+            row("gbp", rr=3, breakeven=None, symbol="GBPUSD"),
+        ]
+    )
+
+    assert sorted(job.run_id for job in jobs) == ["gbp", "h1", "m15"]
+
+
+@pytest.mark.parametrize("kind", sorted(PARAMS))
+def test_a_managed_run_replays_to_exactly_its_unmanaged_siblings_entries(kind: str) -> None:
+    """The claim the choice rests on, on the real setups and real bars: a run managed with a 3R
+    target and a 1R breakeven, standing for its entry, gives the same proposals, to the trade,
+    as the unmanaged run of the same entry would."""
+
+    def job(definition: dict[str, Any]) -> Job:
+        (chosen,) = choose_jobs(
+            [
+                SimpleNamespace(
+                    **{**vars(row("r", rr=None, breakeven=None)), "definition": definition}
+                )
+            ]
+        )
+        return chosen
+
+    unmanaged = replay_job(job(document(kind)), BARS, horizon=20)
+    standing_in = replay_job(job(managed(kind, rr=3, breakeven=1)), BARS, horizon=20)
+    # And without taking it off: the replay never lets a target or a breakeven reach a trade.
+    kept_on = replace(job(document(kind)), definition=managed(kind, rr=3, breakeven=1))
+
+    assert unmanaged, "the scenario proposes nothing; it cannot compare anything"
+    assert standing_in == unmanaged
+    assert replay_job(kept_on, BARS, horizon=20) == unmanaged

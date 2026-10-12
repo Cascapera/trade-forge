@@ -10,6 +10,7 @@ from tradeforge_ml.events import (
     entry_configuration,
     is_unmanaged,
     reconciles,
+    without_management,
 )
 
 T0 = dt.datetime(2024, 3, 1, 10, tzinfo=dt.UTC)
@@ -132,3 +133,30 @@ class TestReconciles:
     def test_a_run_with_no_r_reconciles_only_with_trades_with_no_r(self) -> None:
         assert reconciles([a_trade(r_multiple=None)], total_trades=1, net_r=None)
         assert not reconciles([a_trade()], total_trades=1, net_r=None)
+
+
+def test_taking_the_management_off_leaves_the_unmanaged_document() -> None:
+    """The target and the breakeven set to nothing, every other field as it was, and the run's
+    own document untouched — it may be the one a caller still holds (12/10)."""
+    run_document: dict[str, Any] = {
+        "exit": {"take_profit": {"type": "risk_multiple", "params": {"rr": 3}}},
+        "setup": {"type": "structure_choch", "params": {"breakeven_at_r": 2, "max_bos": 2}},
+        "timeframe": "M15",
+    }
+
+    taken_off = without_management(run_document)
+
+    assert is_unmanaged(taken_off)
+    assert taken_off == {
+        "exit": {"take_profit": None},
+        "setup": {"type": "structure_choch", "params": {"breakeven_at_r": None, "max_bos": 2}},
+        "timeframe": "M15",
+    }
+    assert run_document["exit"]["take_profit"] is not None, "the caller's document was changed"
+    assert run_document["setup"]["params"]["breakeven_at_r"] == 2
+
+
+def test_an_unmanaged_document_comes_back_equal_to_itself() -> None:
+    document: dict[str, Any] = {"exit": {"take_profit": None}, "setup": {"params": {"period": 9}}}
+
+    assert without_management(document) == document

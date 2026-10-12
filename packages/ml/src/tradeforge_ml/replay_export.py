@@ -1,11 +1,11 @@
-"""Write a sweep's independent event base: every proposal of its unmanaged runs, replayed flat and
-traded alone (`replay`), as `out/sweep=<id>/independent-h<horizon>/events.parquet` — the same
+"""Write a sweep's independent event base: every proposal of every entry it tried, replayed flat
+and traded alone (`replay`), as `out/sweep=<id>/independent-h<horizon>/events.parquet` — the same
 columns as the run-based base (`export.EVENT_SCHEMA`), so `features` and `train` read it as they
 read that one.
 
-Read-only on the database: each unmanaged run gives its document, its instrument, its costs and
-its window; the bars come from the collector's Parquet. A chart's bars are read once and every run
-of that chart is replayed over them, the charts spread over processes.
+Read-only on the database: one run per entry (`choose_jobs`) gives its document, its instrument,
+its costs and its window; the bars come from the collector's Parquet. A chart's bars are read once
+and every run of that chart is replayed over them, the charts spread over processes.
 
 ⚠️ **Warm-up: `WARM_BARS` before the run's first day, not the run's own warm-up.** That one lives
 in the API (`warm_window`), which a shared package may not import; a thousand bars settle the
@@ -22,7 +22,7 @@ import os
 import uuid
 from bisect import bisect_left, bisect_right
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass, field
@@ -37,7 +37,13 @@ from sqlalchemy.orm import Session
 from tradeforge_db.models import Backtest, BacktestStatus, Instrument, Strategy, SweepPoint
 from tradeforge_engine.domain import Candle
 from tradeforge_engine.strategy import compile_strategy
-from tradeforge_ml.events import TradeRecord, distinct_entries, entry_configuration, is_unmanaged
+from tradeforge_ml.events import (
+    TradeRecord,
+    distinct_entries,
+    entry_configuration,
+    is_unmanaged,
+    without_management,
+)
 from tradeforge_ml.export import EVENT_SCHEMA, _event_table
 from tradeforge_ml.replay import HORIZON, costs_from, instrument_from, replay, swap_from
 
@@ -49,7 +55,8 @@ FORMAT_VERSION = 1
 
 @dataclass(frozen=True)
 class Job:
-    """One unmanaged run, as much of it as a replay needs — picklable, for a process."""
+    """One entry of a sweep, as much of the run standing for it as a replay needs — picklable, for
+    a process. `definition` is that run's document with its management taken off."""
 
     run_id: str
     entry_id: str
@@ -81,7 +88,7 @@ def _spec_document(row: Any) -> dict[str, Any]:  # noqa: ANN401 — a result row
 
 
 def jobs_of(session: Session, sweep_id: uuid.UUID) -> list[Job]:
-    """The sweep's finished unmanaged runs, one job each."""
+    """The sweep's finished runs, one job per entry (`choose_jobs`)."""
     rows = session.execute(
         select(
             Backtest.id,
@@ -116,17 +123,50 @@ def jobs_of(session: Session, sweep_id: uuid.UUID) -> list[Job]:
         .where(Backtest.sweep_id == sweep_id, Backtest.status == BacktestStatus.DONE)
         .order_by(Instrument.symbol, Backtest.timeframe, SweepPoint.entry_id, Backtest.created_at)
     )
-    jobs: dict[str, Job] = {}
+    return choose_jobs(rows)
+
+
+def choose_jobs(rows: Iterable[Any]) -> list[Job]:
+    """One job per entry the sweep tried — the same setup, chart and window — whatever target and
+    breakeven its runs managed it with (12/10).
+
+    The replay trades every proposal with its initial stop and a time barrier only (`replay`): a
+    run's target and breakeven never reach it, and the targets are scored afterwards from each
+    trade's excursion. So the runs that differ only in management are one entry replayed many
+    times over — and a grid with no unmanaged point left nothing at all to replay: every CHOCH and
+    CONTINUATION grid of 08/10 to 11/10 had targets of 3, 5, 7 or 10R and no "none".
+
+    ⚠️ **The run that stands for an entry is its unmanaged one when the grid has it**, so the
+    entries a base already had are replayed from the very runs they were before; otherwise the
+    first one, with its management taken off (`without_management`) — the document its unmanaged
+    sibling would have carried. `run_id` names that run either way.
+    """
+    jobs: dict[tuple[str, ...], Job] = {}
+    stand_ins: set[tuple[str, ...]] = set()
     for row in rows:
-        if str(row.id) in jobs or not is_unmanaged(row.definition):
+        configuration = entry_configuration(dict(row.coordinates))
+        entry = (
+            str(row.entry_id),
+            row.symbol,
+            row.timeframe,
+            json.dumps(configuration, sort_keys=True, default=str),
+            row.date_from.isoformat(),
+            row.date_to.isoformat(),
+        )
+        unmanaged = is_unmanaged(row.definition)
+        if entry in jobs and not (unmanaged and entry in stand_ins):
             continue
-        jobs[str(row.id)] = Job(
+        if unmanaged:
+            stand_ins.discard(entry)
+        else:
+            stand_ins.add(entry)
+        jobs[entry] = Job(
             run_id=str(row.id),
             entry_id=row.entry_id,
             symbol=row.symbol,
             timeframe=row.timeframe,
-            configuration=entry_configuration(dict(row.coordinates)),
-            definition=dict(row.definition),
+            configuration=configuration,
+            definition=without_management(row.definition),
             instrument=dict(row.instrument_spec or _spec_document(row)),
             costs=dict(row.cost_model),
             date_from=row.date_from,
@@ -290,6 +330,7 @@ __all__ = [
     "Job",
     "ReplayReport",
     "candles_of",
+    "choose_jobs",
     "jobs_of",
     "replay_job",
     "write_independent",

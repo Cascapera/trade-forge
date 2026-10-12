@@ -170,7 +170,14 @@ def runs_of(session: Session, sweep_id: uuid.UUID) -> Iterator[RunInfo]:
             & SweepPoint.same_as.is_(None),
         )
         .where(Backtest.sweep_id == sweep_id, Backtest.status == BacktestStatus.DONE)
-        .order_by(SweepPoint.entry_id, Instrument.symbol, Backtest.timeframe, Backtest.created_at)
+        # `Backtest.id` last: `created_at` ties across a whole sweep (12/10, `replay_export`).
+        .order_by(
+            SweepPoint.entry_id,
+            Instrument.symbol,
+            Backtest.timeframe,
+            Backtest.created_at,
+            Backtest.id,
+        )
         .execution_options(yield_per=2000)
     )
     seen: set[uuid.UUID] = set()

@@ -121,7 +121,16 @@ def jobs_of(session: Session, sweep_id: uuid.UUID) -> list[Job]:
             & SweepPoint.same_as.is_(None),
         )
         .where(Backtest.sweep_id == sweep_id, Backtest.status == BacktestStatus.DONE)
-        .order_by(Instrument.symbol, Backtest.timeframe, SweepPoint.entry_id, Backtest.created_at)
+        # ⚠️ `Backtest.id` last (12/10): a sweep writes all its runs in one transaction, so
+        # `created_at` ties across the whole sweep, and the order — which run stands for an entry,
+        # whose outcome a shared entry keeps — was the query plan's to choose.
+        .order_by(
+            Instrument.symbol,
+            Backtest.timeframe,
+            SweepPoint.entry_id,
+            Backtest.created_at,
+            Backtest.id,
+        )
     )
     return choose_jobs(rows)
 

@@ -19,9 +19,11 @@ approximation it never asked for and cannot undo.
 """
 
 import datetime as dt
+from collections.abc import Iterator
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -135,9 +137,66 @@ def read_candles(
     are never opened, and the rows inside the boundary files are never decoded into Python
     objects. Filtering afterwards would build every `Candle` first and throw most away.
     """
+    table = _sorted_table(root, symbol, timeframe, start=start, end=end)
+    if table is None:
+        return []
+    return [_candle(row) for row in table.to_pylist()]
+
+
+ROWS_PER_SLICE = 20_000
+"""How many bars `iter_candles` turns into Python objects at a time: a few MB, against the
+hundreds that a whole M5 series costs as objects."""
+
+
+def iter_candles(  # noqa: PLR0913 — `read_candles`' window, plus the slice size
+    root: Path,
+    symbol: str,
+    timeframe: str,
+    *,
+    start: dt.datetime | None = None,
+    end: dt.datetime | None = None,
+    rows_per_slice: int = ROWS_PER_SLICE,
+) -> Iterator[Candle]:
+    """`read_candles`, the same bars in the same order, built one slice at a time (12/10).
+
+    For a reader that walks the bars once and keeps none of them — a live session's warm-up.
+    `read_candles` builds every row as a dict and every bar as a `Candle` before the first is
+    used: on Usa500 M5 (662 thousand bars) that is ~360 MB of objects at once and a peak of
+    ~930 MB, and freeing them afterwards does not hand the memory back to the system — the
+    process stays at ~640 MB for the rest of its life. Here only the Arrow table (columnar,
+    ~50 MB) and one slice of objects exist at a time: peak ~340 MB.
+
+    ⚠️ **A generator: nothing is read until the first bar is asked for.** That is what a caller
+    sequencing the read wants (`splice` creates its consumer group first), and it means a
+    missing series is an empty iteration, not an error at the call.
+
+    When the walk ends, Arrow's memory pool is asked to give back what it no longer uses — it
+    otherwise keeps it (~110 MB measured) for allocations that will never come.
+    """
+    table = _sorted_table(root, symbol, timeframe, start=start, end=end)
+    if table is None:
+        return
+    try:
+        for piece in table.to_batches(max_chunksize=rows_per_slice):
+            for row in piece.to_pylist():
+                yield _candle(row)
+    finally:
+        del table
+        pa.default_memory_pool().release_unused()
+
+
+def _sorted_table(
+    root: Path,
+    symbol: str,
+    timeframe: str,
+    *,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+) -> pa.Table | None:
+    """The series' rows inside the window, sorted by time — `None` when it was never collected."""
     directory = Path(dataset_path(root, symbol, timeframe))
     if not directory.exists():
-        return []
+        return None
 
     window = None
     if start is not None:
@@ -147,22 +206,20 @@ def read_candles(
         window = upper if window is None else window & upper
 
     table = ds.dataset(directory, format="parquet", partitioning="hive").to_table(filter=window)
-    table = table.sort_by("time")
+    return table.sort_by("time")
 
-    rows = table.to_pylist()
-    return [
-        Candle(
-            time=_as_utc(row["time"]),
-            open=row["open"],
-            high=row["high"],
-            low=row["low"],
-            close=row["close"],
-            tick_volume=row["tick_volume"],
-            spread=row["spread"],
-            real_volume=row["real_volume"],
-        )
-        for row in rows
-    ]
+
+def _candle(row: dict[str, Any]) -> Candle:
+    return Candle(
+        time=_as_utc(row["time"]),
+        open=row["open"],
+        high=row["high"],
+        low=row["low"],
+        close=row["close"],
+        tick_volume=row["tick_volume"],
+        spread=row["spread"],
+        real_volume=row["real_volume"],
+    )
 
 
 def read_times(

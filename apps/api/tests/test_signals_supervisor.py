@@ -3,7 +3,7 @@
 import uuid
 from decimal import Decimal
 
-from tradeforge_api.live.supervisor import Supervisor, Wanted, wanted_children
+from tradeforge_api.live.supervisor import Supervisor, Wanted, child_environment, wanted_children
 from tradeforge_db.live_setups import FollowedPair
 
 
@@ -156,3 +156,16 @@ def test_sessions_beyond_the_cap_wait() -> None:
     wanted = wanted_children(items, python="py", max_sessions=3, session_ids={})
 
     assert sum(key.startswith("session:") for key in wanted) == 3
+
+
+def test_children_start_with_numpy_held_to_one_thread() -> None:
+    """~740 MB of committed memory per process for buffers no session uses (12/10): with
+    sixteen sessions, the machine ran out of memory to lend while most of it sat reserved."""
+    env = child_environment({"PATH": "C:/bin"})
+
+    assert env["OPENBLAS_NUM_THREADS"] == "1"
+    assert env["PATH"] == "C:/bin", "the child lost the supervisor's own environment"
+
+
+def test_an_operator_setting_the_threads_on_purpose_keeps_it() -> None:
+    assert child_environment({"OPENBLAS_NUM_THREADS": "4"})["OPENBLAS_NUM_THREADS"] == "4"

@@ -10,12 +10,14 @@ different candle source**, and the order the pieces go in is what makes the reco
 """
 
 import datetime as dt
+import gc
 import threading
 import uuid
+import weakref
 from collections.abc import Callable, Iterator
 from decimal import Decimal
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 from sqlalchemy import select
@@ -190,6 +192,46 @@ def test_the_warm_up_ledger_is_thrown_away(
     assert all(trade.entry_time >= cut for trade in recorded), (
         "a trade from the warm-up was written to the session's ledger"
     )
+
+
+def test_the_warm_up_broker_is_let_go_once_it_has_handed_over(
+    session_factory: Callable[[], Session],
+    plan: SessionPlan,
+    parquet_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """⚠️ A session lives for days, and its frame used to keep the warm-up's broker — its whole
+    book of warm-up trades — for all of them (12/10). Checked on every live bar, where it would
+    leak: by then nothing may hold it."""
+    made: list[weakref.ref[BacktestBroker]] = []
+
+    class Counted(BacktestBroker):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            made.append(weakref.ref(self))
+
+    monkeypatch.setattr("tradeforge_api.live.session.BacktestBroker", Counted)
+    history, live_bars, cut = split_at(CUT)
+    warm_alive: list[bool] = []
+
+    def stopping() -> bool:
+        gc.collect()
+        warm_alive.append(made[0]() is not None)
+        return False
+
+    outcome = run_session(
+        factory=factory_of(session_factory),
+        source=ListSource(history, live_bars),
+        plan=plan,
+        parquet_root=parquet_root,
+        stopping=stopping,
+        now=lambda: cut,
+    )
+
+    assert outcome.error is None
+    assert len(made) == 2, "expected the warm-up's broker and the paper session's own"
+    assert len(warm_alive) == len(live_bars), "the check did not run on every live bar"
+    assert not any(warm_alive), "the warm-up's broker was still held during the live bars"
 
 
 def test_a_session_asked_to_stop_finishes_the_bar_and_stops(

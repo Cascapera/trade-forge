@@ -19,6 +19,7 @@ Runs on the Windows host beside the collectors: the live loops need MetaTrader.
 import argparse
 import datetime as dt
 import logging
+import os
 import subprocess
 import sys
 import time
@@ -49,6 +50,19 @@ RECORDER = "recorder"
 
 SESSION_CAPITAL = Decimal(10_000)
 """A signal session's ledger. Its size moves no signal: R is the unit every message speaks in."""
+
+CHILD_ENVIRONMENT = {"OPENBLAS_NUM_THREADS": "1"}
+"""Set for every child unless the supervisor's own environment already names it (12/10).
+
+numpy's OpenBLAS reserves its buffers for every core when it is imported — ~740 MB of committed
+memory per process here, 82 MB with one thread — and a session never multiplies a matrix. With
+sixteen sessions that was ~15 GB the machine could not lend to anything else."""
+
+
+def child_environment(environ: Mapping[str, str]) -> dict[str, str]:
+    """The environment a session or a live loop starts with: this one, plus `CHILD_ENVIRONMENT`
+    where it says nothing — an operator who sets the variable on purpose keeps their value."""
+    return {**CHILD_ENVIRONMENT, **environ}
 
 
 class Child(Protocol):
@@ -289,7 +303,9 @@ def main(argv: list[str] | None = None) -> int:
 
     def launch(one: Wanted) -> Child:
         log = (args.logs / f"{one.key.replace(':', '-')}.log").open("a", encoding="utf-8")
-        return subprocess.Popen(one.argv, stdout=log, stderr=subprocess.STDOUT)  # noqa: S603
+        return subprocess.Popen(  # noqa: S603
+            one.argv, stdout=log, stderr=subprocess.STDOUT, env=child_environment(os.environ)
+        )
 
     supervisor = Supervisor(
         launch=launch,

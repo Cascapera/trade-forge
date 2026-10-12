@@ -15,6 +15,7 @@ from tradeforge_collector.gaps import Gap, anomalies, find_gaps, format_report
 from tradeforge_collector.source import Candle, InstrumentSpec, MarketDataSource
 from tradeforge_collector.storage import (
     OHLCV_SCHEMA,
+    iter_candles,
     read_candles,
     read_times,
     write_candles,
@@ -36,6 +37,7 @@ __all__ = [
     "backfill",
     "find_gaps",
     "format_report",
+    "iter_candles",
     "read_candles",
     "read_times",
     "step",

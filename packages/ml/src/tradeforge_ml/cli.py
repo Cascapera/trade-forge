@@ -62,7 +62,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     fit.add_argument("--exclude", type=span, action="append", default=[])
     fit.add_argument("--base", default="")
     fit.add_argument("--model", choices=("logistic", "boosting"), default="logistic")
-    again = commands.add_parser("replay", help="replay every proposal of the unmanaged runs")
+    again = commands.add_parser("replay", help="replay every entry the sweep tried")
     again.add_argument("sweep_id", type=uuid.UUID)
     again.add_argument("--out", type=Path, default=Path("data/ml"))
     again.add_argument("--ohlcv", type=Path, default=Path("data/ohlcv"))

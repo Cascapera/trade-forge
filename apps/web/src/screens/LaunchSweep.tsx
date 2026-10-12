@@ -398,10 +398,11 @@ export function LaunchSweep(): React.JSX.Element {
             }}
           />
           <span>
-            Keep every trade (for ML)
+            Keep every trade (for the run pages)
             <span className="block text-xs text-slate-500">
-              Every run keeps its trades, won or lost, so a model can learn from the losers too.
-              Off, only the runs that pass the bar keep them. Takes more space: use it on a few
+              Every run keeps its trades, won or lost, to open them on the run&apos;s page. Off,
+              only the runs that pass the bar keep them. Machine learning does not need it: its
+              base is replayed from the runs and the candles. Takes more space: use it on a few
               configurations over many markets, not on a whole grid.
             </span>
           </span>

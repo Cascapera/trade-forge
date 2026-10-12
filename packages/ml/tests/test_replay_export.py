@@ -336,5 +336,8 @@ def test_a_managed_run_replays_to_exactly_its_unmanaged_siblings_entries(kind: s
     kept_on = replace(job(document(kind)), definition=managed(kind, rr=3, breakeven=1))
 
     assert unmanaged, "the scenario proposes nothing; it cannot compare anything"
+    assert any(trade.mfe_r is not None and trade.mfe_r >= 3 for trade in unmanaged), (
+        "no trade reaches the 3R target: the comparison could not see a target applied"
+    )
     assert standing_in == unmanaged
     assert replay_job(kept_on, BARS, horizon=20) == unmanaged

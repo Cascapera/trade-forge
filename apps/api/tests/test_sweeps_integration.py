@@ -33,6 +33,7 @@ from sqlalchemy import Engine, event, select
 from sqlalchemy.orm import Session
 
 from tradeforge_api import ranking_floor
+from tradeforge_api.batching import SWEEP_JOB_EXPIRES
 from tradeforge_api.cluster_job import process_cluster
 from tradeforge_api.config import Settings
 from tradeforge_api.deps import get_queue
@@ -1285,7 +1286,10 @@ class TestCollectingWhatASweepIsMissing:
         assert [options for _, _, options in collects] == [{"_queue_name": COLLECT_QUEUE}]
         assert len(runs) == 6
         # ⚠️ The idempotency claim survives the new jobs beside it.
-        assert all(options == {"_job_id": args[0]} for _, args, options in runs)
+        assert all(
+            options == {"_job_id": args[0], "_expires": SWEEP_JOB_EXPIRES}
+            for _, args, options in runs
+        )
 
     def test_a_market_covered_in_part_waits_for_its_gap(
         self, client: Any, session: Session

@@ -159,7 +159,7 @@ def test_an_orphans_broker_keeps_its_live_loop_with_no_setup_on_it() -> None:
     }
 
 
-def test_a_market_process_is_asked_through_every_session_it_carries_and_logs_per_market() -> None:
+def test_a_market_process_is_asked_through_every_session_it_carries() -> None:
     fleet = Fleet(python="py", clock=lambda: 0.0)
     one = item(timeframe="M5")
     two = item(timeframe="M5", instrument_id=one.instrument_id)
@@ -170,7 +170,7 @@ def test_a_market_process_is_asked_through_every_session_it_carries_and_logs_per
     wanted = as_wanted(launch)
 
     assert set(wanted.session_ids) == set(launch.sessions.values())
-    assert wanted.log == f"market-{one.instrument_id}-M5"
+    assert wanted.log == "", "its own log, named after its key: never shared with another"
     assert as_wanted(launch) == wanted, "the same process must look the same on every round"
 
 

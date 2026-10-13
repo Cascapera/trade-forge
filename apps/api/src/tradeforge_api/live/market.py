@@ -27,7 +27,7 @@ import logging
 import sys
 import threading
 import uuid
-from collections.abc import Callable, Collection, Iterable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from decimal import Decimal
 from pathlib import Path
 
@@ -115,6 +115,7 @@ class Market:
         self.outcomes: list[SessionOutcome] = []
         self.failures = 0
         """Sessions that ended on an error — refused, failed in the warm-up, or failed live."""
+        self._warming: list[SessionLife] = []
         self._live: list[SessionLife] = []
         self._following: dict[uuid.UUID, tuple[SessionLife, InheritedTrade]] = {}
         self._candles: SplicedCandles | None = None
@@ -150,8 +151,9 @@ class Market:
             timeframe=first.timeframe,
             opened_at=opened_at,
         )
-        self._report("warming", lives)
-        warming = self._warm(lives, candles)
+        self._warming = list(lives)
+        self._report()
+        warming = self._warm(candles)
         # The hole is the market's, not a session's: every one of them would read it.
         refuse_a_hole(candles, first.symbol, first.plan.timeframe)
         stream = candles.live()
@@ -204,16 +206,17 @@ class Market:
             return None
         return SessionLife(prepared, factory=self._factory, signals=sink, now=self._now)
 
-    def _warm(self, lives: list[SessionLife], candles: SplicedCandles) -> list[SessionLife]:
+    def _warm(self, candles: SplicedCandles) -> list[SessionLife]:
         """The history read once, each bar handed to every session still warming."""
-        warming = list(lives)
         for index, candle in enumerate(candles.warmup(), start=1):
-            for life in list(warming):
+            for life in list(self._warming):
                 if not self._guarded(life, life.warm_bar, candle):
-                    warming.remove(life)
+                    self._warming.remove(life)
             if index % REPORT_EVERY_WARM_BARS == 0:
-                self._report("warming", warming)
-        return [life for life in warming if self._guarded(life, life.end_warmup)]
+                self._report()
+        warmed = [life for life in self._warming if self._guarded(life, life.end_warmup)]
+        self._warming = []
+        return warmed
 
     def _bar(self, candle: Candle) -> None:
         """One live bar for everybody: the open sessions first, then those following a trade.
@@ -257,17 +260,24 @@ class Market:
             return
         self._live.append(life)
 
-    def _report(self, phase: str | None = None, sessions: Iterable[SessionLife] = ()) -> None:
-        """Tell the supervisor what this process carries: `sessions` while warming, every one
-        live or following its inherited trade after. Never fatal — a supervisor that cannot be
-        told goes on believing the last thing it heard until that lapses, and the sessions trade."""
-        carried = list(sessions) or [
+    def _report(self) -> None:
+        """Tell the supervisor what this process carries: every session warming, live, or
+        following the trade its warm-up ended in. Never fatal — a supervisor that cannot be told
+        goes on believing the last thing it heard until that lapses, and the sessions trade.
+
+        ⚠️ **The warming ones count** (13/10, found while writing the lesson, before it ever ran).
+        The stream asks whether to stop before its first read, inside the warm-up — and the word
+        sent from there named nobody, which the fleet reads as every session gone without being
+        asked: failed, launched again elsewhere, while the first ones went on warming.
+        """
+        carried = [
+            *self._warming,
             *self._live,
             *(life for life, _trade in self._following.values()),
         ]
         try:
             self._publish(
-                phase or ("live" if self._candles is not None else "warming"),
+                "live" if self._candles is not None else "warming",
                 [life.session_id for life in carried],
             )
         except Exception:  # noqa: BLE001 — see the docstring

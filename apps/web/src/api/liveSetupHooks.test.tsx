@@ -14,6 +14,8 @@ vi.mock('./client', () => ({
     changeLiveMarket: vi.fn(),
     removeLiveMarket: vi.fn(),
     listLiveSignals: vi.fn(),
+    listLiveMarkets: vi.fn(),
+    restartMarket: vi.fn(),
   },
 }))
 
@@ -21,16 +23,19 @@ import { api } from './client'
 import {
   useChangeLive,
   useEditLiveSetup,
+  useLiveMarkets,
   useLiveSetups,
   useLiveSignals,
   useRegisterLiveSetup,
+  useRestartMarket,
   useWatchBacktest,
 } from './hooks'
 
-function wrapper(): (props: { children: ReactNode }) => React.JSX.Element {
-  const client = new QueryClient({
+function wrapper(
+  client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
-  })
+  }),
+): (props: { children: ReactNode }) => React.JSX.Element {
   return ({ children }) => <QueryClientProvider client={client}>{children}</QueryClientProvider>
 }
 
@@ -133,5 +138,52 @@ describe('live setup hooks', () => {
     expect(api.addLiveMarket).toHaveBeenCalledWith('s', 'i')
     expect(api.changeLiveMarket).toHaveBeenCalledWith('s', 'i', true)
     expect(api.removeLiveMarket).toHaveBeenCalledWith('s', 'i')
+  })
+
+  it('reads the setups by asset, and asks for one market to restart', async () => {
+    vi.mocked(api.listLiveMarkets).mockResolvedValue({
+      supervisor: { alive: true, at: null, reachable: true },
+      assets: [],
+    })
+    vi.mocked(api.restartMarket).mockResolvedValue({ requested: true })
+
+    const markets = renderHook(() => useLiveMarkets(), { wrapper: wrapper() })
+    const restart = renderHook(() => useRestartMarket(), { wrapper: wrapper() })
+    await waitFor(() => {
+      expect(markets.result.current.isSuccess).toBe(true)
+    })
+    await act(async () => {
+      await restart.result.current.mutateAsync({ instrument_id: 'i', timeframe: 'M5' })
+    })
+
+    expect(api.restartMarket).toHaveBeenCalledWith({ instrument_id: 'i', timeframe: 'M5' })
+  })
+
+  it('reads both views again after a change, and the markets after a restart', async () => {
+    vi.mocked(api.changeLiveMarket).mockResolvedValue(null as never)
+    vi.mocked(api.restartMarket).mockResolvedValue({ requested: true })
+    const client = new QueryClient()
+    const invalidate = vi.spyOn(client, 'invalidateQueries')
+
+    const change = renderHook(() => useChangeLive(), { wrapper: wrapper(client) })
+    const restart = renderHook(() => useRestartMarket(), { wrapper: wrapper(client) })
+    await act(async () => {
+      await change.result.current.mutateAsync({
+        kind: 'market',
+        id: 's',
+        instrumentId: 'i',
+        active: false,
+      })
+    })
+    expect(invalidate.mock.calls.map((call) => call[0])).toEqual([
+      { queryKey: ['live-setups'] },
+      { queryKey: ['live-markets'] },
+    ])
+
+    invalidate.mockClear()
+    await act(async () => {
+      await restart.result.current.mutateAsync({ instrument_id: 'i', timeframe: 'M5' })
+    })
+    expect(invalidate.mock.calls.map((call) => call[0])).toEqual([{ queryKey: ['live-markets'] }])
   })
 })

@@ -3,7 +3,14 @@
 // a backtest is asynchronous, so the query *polls* until the run reaches a terminal status, then
 // stops on its own. That is the whole point of the 202-plus-poll contract the API exposes.
 
-import { skipToken, useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query'
+import {
+  type QueryClient,
+  skipToken,
+  useMutation,
+  useQueries,
+  useQuery,
+  useQueryClient,
+} from '@tanstack/react-query'
 import type { Strategy } from '@tradeforge/schema'
 import { useEffect, useRef } from 'react'
 
@@ -82,9 +89,11 @@ import type {
   SweepsPage,
   TradesPage,
   WalkForwardOut,
+  LiveMarketsOut,
   LiveSetup,
   LiveSetupNew,
   LiveSetupPatch,
+  RestartMarketRequest,
   SignalRow,
   YearCut,
 } from './types'
@@ -1298,13 +1307,19 @@ export function useLiveSetups() {
   })
 }
 
+/** Both readings of the live setups, by setup and by asset, read again after any change. */
+function refreshLive(client: QueryClient): void {
+  void client.invalidateQueries({ queryKey: ['live-setups'] })
+  void client.invalidateQueries({ queryKey: ['live-markets'] })
+}
+
 /** Follow what a finished run was. A setup of the same strategy and chart gains its market. */
 export function useWatchBacktest() {
   const client = useQueryClient()
   return useMutation<LiveSetup, Error, string>({
     mutationFn: (backtestId: string) => api.watchBacktest(backtestId),
     onSuccess: () => {
-      void client.invalidateQueries({ queryKey: ['live-setups'] })
+      refreshLive(client)
     },
   })
 }
@@ -1335,7 +1350,7 @@ export function useChangeLive() {
       }
     },
     onSuccess: () => {
-      void client.invalidateQueries({ queryKey: ['live-setups'] })
+      refreshLive(client)
     },
   })
 }
@@ -1346,7 +1361,7 @@ export function useRegisterLiveSetup() {
   return useMutation<LiveSetup, Error, LiveSetupNew>({
     mutationFn: (body) => api.registerLiveSetup(body),
     onSuccess: () => {
-      void client.invalidateQueries({ queryKey: ['live-setups'] })
+      refreshLive(client)
     },
   })
 }
@@ -1357,7 +1372,7 @@ export function useEditLiveSetup() {
   return useMutation<LiveSetup, Error, { id: string; definition: Record<string, unknown> }>({
     mutationFn: ({ id, definition }) => api.editLiveSetup(id, definition),
     onSuccess: () => {
-      void client.invalidateQueries({ queryKey: ['live-setups'] })
+      refreshLive(client)
     },
   })
 }
@@ -1368,5 +1383,26 @@ export function useLiveSignals(setupId: string | undefined) {
     queryKey: ['live-signals', setupId],
     queryFn: setupId === undefined ? skipToken : () => api.listLiveSignals(setupId),
     refetchInterval: 30_000,
+  })
+}
+
+/** The setups by asset (ADR-0033). Polled twice as often as the setups: the supervisor takes a
+ *  restart within its next round (≤ 15 s), and the screen should see it land. */
+export function useLiveMarkets() {
+  return useQuery<LiveMarketsOut>({
+    queryKey: ['live-markets'],
+    queryFn: () => api.listLiveMarkets(),
+    refetchInterval: 15_000,
+  })
+}
+
+/** Ask the supervisor to restart one market's sessions together, in one process. */
+export function useRestartMarket() {
+  const client = useQueryClient()
+  return useMutation<{ requested: boolean }, Error, RestartMarketRequest>({
+    mutationFn: (body) => api.restartMarket(body),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: ['live-markets'] })
+    },
   })
 }

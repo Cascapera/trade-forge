@@ -2184,3 +2184,78 @@ export interface SignalRow {
   ended_at: string | null
   strategy_id: string | null
 }
+
+/** Whether the signals supervisor is supervising, as its own last word says (ADR-0033). */
+export interface SupervisorOut {
+  /** It spoke within its last few rounds. `false`: nobody restarts a session that fails. */
+  alive: boolean
+  at: string | null
+  /** `false` when Redis could not be read, so nothing is known either way. */
+  reachable: boolean
+}
+
+/** One process of a market: what it last said and how many sessions it carries. */
+export interface MarketProcessOut {
+  key: string
+  /** `null` when it has not said anything readable yet. */
+  phase: 'warming' | 'live' | null
+  heard_at: string | null
+  sessions: number
+}
+
+/** What the supervisor says of one setup's session on one market; `off` when switched off. */
+export type LiveSessionState =
+  | 'running'
+  | 'warming'
+  | 'starting'
+  | 'stopping'
+  | 'waiting'
+  | 'off'
+  | 'unknown'
+
+/** One setup on one market: its switch, its session's state, what is under way, its record. */
+export interface LiveMarketSetupOut {
+  setup_id: string
+  name: string
+  strategy_name: string
+  setup_active: boolean
+  /** This market's own switch on the setup. */
+  active: boolean
+  no_target_r: string
+  state: LiveSessionState
+  /** Seconds before a session that failed is tried again (`state` is `waiting`). */
+  retry_in: number | null
+  /** Signals still armed or in a trade, oldest first. */
+  under_way: SignalRow[]
+  /** This setup's record on this market alone. */
+  metrics: LiveMetrics
+}
+
+/** One market — an instrument on a timeframe — and the processes that run it. */
+export interface LiveTimeframeOut {
+  timeframe: string
+  /** Usually one; two or more while a setup added since the last restart still runs apart. */
+  processes: MarketProcessOut[]
+  restarting: boolean
+  setups: LiveMarketSetupOut[]
+}
+
+/** An instrument and its markets, one per timeframe. */
+export interface LiveAssetOut {
+  instrument_id: string
+  symbol: string
+  broker: string | null
+  timeframes: LiveTimeframeOut[]
+}
+
+/** The signals screen by asset (ADR-0033): the supervisor's word, then every asset followed. */
+export interface LiveMarketsOut {
+  supervisor: SupervisorOut
+  assets: LiveAssetOut[]
+}
+
+/** Restart one market's sessions together, in one process. */
+export interface RestartMarketRequest {
+  instrument_id: string
+  timeframe: string
+}

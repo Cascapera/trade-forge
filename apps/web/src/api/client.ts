@@ -74,9 +74,11 @@ import type {
   Markets,
   TradesPage,
   WalkForwardOut,
+  LiveMarketsOut,
   LiveSetup,
   LiveSetupNew,
   LiveSetupPatch,
+  RestartMarketRequest,
   SignalRow,
   YearCut,
 } from './types'
@@ -409,6 +411,13 @@ export const api = {
     request('POST', `/live-setups/${id}/version`, { definition }),
   listLiveSignals: (id: string): Promise<SignalRow[]> =>
     request('GET', `/live-setups/${id}/signals?limit=200`),
+  // The same setups by asset, the way the sessions run (ADR-0033): asset → timeframe → setups,
+  // with the supervisor's own word on what runs where.
+  listLiveMarkets: (): Promise<LiveMarketsOut> => request('GET', '/live-markets'),
+  // ⚠️ Asks the supervisor, through Redis, to stop every session of one market and start them
+  // again together: the signals armed there are cancelled on the channel. 503 without Redis.
+  restartMarket: (body: RestartMarketRequest): Promise<{ requested: boolean }> =>
+    request('POST', '/live-markets/restart', body),
 }
 
 /**

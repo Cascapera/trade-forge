@@ -47,6 +47,7 @@ import datetime as dt
 import logging
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import ExitStack, suppress
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -77,7 +78,7 @@ from tradeforge_engine.errors import EngineError
 from tradeforge_engine.loop import BarOutcome, iter_run
 from tradeforge_engine.protocols import Broker, CostModel
 from tradeforge_engine.protocols import Strategy as CompiledStrategy
-from tradeforge_engine.warmup import hand_over
+from tradeforge_engine.warmup import HandOver, hand_over
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +86,20 @@ MAX_SEAM_GAP = dt.timedelta(days=4)
 """The longest silence between the disk and the stream a session accepts: a weekend with a holiday
 on either side, and nothing a market that was open could explain."""
 
-__all__ = ["SessionOutcome", "SessionPlan", "Venue", "reconcile_on_start", "run_session"]
+__all__ = [
+    "InheritedTrade",
+    "Prepared",
+    "SessionLife",
+    "SessionOutcome",
+    "SessionPlan",
+    # `Venue` is left out on purpose: it is a `type` alias (PEP 695), which CodeQL cannot see and
+    # reports as an undefined export (13/10). Imported by name, as `live.process` does, it needs no
+    # listing here.
+    "prepare",
+    "reconcile_on_start",
+    "refuse_a_hole",
+    "run_session",
+]
 
 type Venue = Callable[[uuid.UUID, InstrumentSpec], Broker]
 """Builds the broker a **live** session trades through, ready to use.
@@ -172,119 +186,33 @@ def reconcile_on_start(factory: sessionmaker[Session]) -> list[uuid.UUID]:
     return marked
 
 
-def _replay_history(  # noqa: PLR0913 — keyword-only; what a backtest of the history needs
-    candles: SplicedCandles,
-    *,
-    plan: SessionPlan,
-    spec: InstrumentSpec,
-    definition: Mapping[str, Any],
-    strategy: CompiledStrategy,
-    risk: PercentRiskManager,
-) -> BacktestBroker:
-    """The warm-up: the history walked once through `strategy`, on a broker of its own.
+@dataclass(frozen=True, slots=True)
+class Prepared:
+    """A plan checked and resolved against the database, before a single bar is read."""
 
-    ⚠️ **History is always replayed against a `BacktestBroker`, in both modes.** Warm-up is a
-    backtest whose ledger is thrown away (ADR-0023), and replaying it against a venue would put
-    months of decided-in-hindsight orders on a real account in the first seconds of a session.
-    """
-    warm = BacktestBroker(
-        instrument=spec,
-        initial_capital=plan.initial_capital,
-        cost_model=build_cost_model(plan.cost_model),
-        take_profit_rr=take_profit_rr(definition),
-    )
-    for _outcome in iter_run(
-        candles=candles.warmup(),
-        timeframe=step(plan.timeframe),
-        instrument=spec,
-        strategy=strategy,
-        broker=warm,
-        risk=risk,
-    ):
-        pass
-    return warm
+    plan: SessionPlan
+    spec: InstrumentSpec
+    symbol: str
+    definition: Mapping[str, Any]
+    strategy: CompiledStrategy
+    risk: PercentRiskManager
+    timeframe: dt.timedelta
 
 
-def _past_an_inherited_trade(  # noqa: PLR0913 — the cut, the mode, and what the trade runs on
-    candles: SplicedCandles,
-    *,
-    mode: SessionMode,
-    timeframe: str,
-    warm: Broker,
-    symbol: str,
-    run: Callable[[Iterator[Candle], Broker], Iterator[BarOutcome]],
-    stopping: Callable[[], bool],
-) -> Iterator[Candle]:
-    """The session's live bars — after, for a signal session, the trade the warm-up was in.
-
-    Refuses first a hole between the disk and the live bars (`_refuse_a_hole`).
-
-    ⚠️ **A signal session does not refuse to open mid-trade (09/10).** On M5 with a 5R target the
-    setup is in a trade often, and refusing left a market with no signal at all for as long as
-    the trade lasted, retried on a back-off: Usa500 and UsaTec on the first day. The trade is
-    followed on the warm-up's own broker, **without a word to the channels** — nobody was shown
-    its entry — until it ends at its stop, its target or the setup's exit; then the hand-over
-    happens as it always did, onto a broker whose account the warm-up never touched.
-
-    Other modes are untouched: paper and live still refuse, because they would report a trade
-    they never took.
-    """
-    _refuse_a_hole(candles, symbol, timeframe)
-    stream = candles.live()
-    if mode is not SessionMode.SIGNAL or not warm.positions(symbol):
-        return stream
-    logger.info("%s: the warm-up ended in a trade; following it quietly until it ends", symbol)
-    for outcome in run(stream, warm):
-        if not warm.positions(symbol):
-            logger.info("%s: the inherited trade ended on the %s bar", symbol, outcome.candle.time)
-            break
-        if stopping():
-            raise EngineError(f"{symbol}: stopped while following the trade the warm-up was in")
-    return stream
-
-
-def _refuse_a_hole(candles: SplicedCandles, symbol: str, timeframe: str) -> None:
-    """Refuse to open over a hole between the candles on disk and the live stream.
-
-    ⚠️ The live loop fills it from the terminal; when it could not, the strategy's averages run
-    straight from the last bar on disk into today's, and the first "turn" it sees is the hole
-    itself — the first live signal ever posted (Usa500, a week of M5 missing, 09/10) was exactly
-    that.
-    """
-    if candles.seam_gap is not None and candles.seam_gap > MAX_SEAM_GAP:
-        raise EngineError(
-            f"refusing to open: {candles.seam_gap} of {symbol} {timeframe} missing between "
-            "the candles on disk and the live stream; collect the series again, then restart"
-        )
-
-
-def run_session(  # noqa: PLR0913 — keyword-only; each names one seam of a session
-    *,
+def prepare(
     factory: sessionmaker[Session],
-    source: BarSource,
     plan: SessionPlan,
-    parquet_root: Path,
-    stopping: Callable[[], bool],
-    venue: Venue | None = None,
-    promotion_days: int = 5,
-    now: Callable[[], dt.datetime] = _utcnow,
-    signals: NumberedSink | None = None,
-) -> SessionOutcome:
-    """Run one session until `stopping` says otherwise, and record everything it did.
+    *,
+    venue: Venue | None,
+    signals: NumberedSink | None,
+    promotion_days: int,
+) -> Prepared:
+    """Every refusal that is knowable before the warm-up, then the strategy compiled.
 
-    Returns rather than raises on a strategy that blows up mid-session: the row is marked
-    `failed` with the reason, because a live session ending badly is a *result* to record, not a
-    crash to propagate — the same doctrine the backtest worker follows.
-
-    ⚠️ **A refusal to start does raise.** A warm-up that cannot run, a hand-over that lands
-    mid-position, a missing instrument, a venue that will not have this session: none of those
-    produce a session, so none of them produce a row to mark. `open_session`'s docstring says the
-    same thing from the other side.
-
-    `venue` is consulted only when `plan.mode` is live, and is then required — see `_broker_for`.
+    Raises on the first one. Nothing has been read or written yet, so there is nothing to undo —
+    which is the reason all of these come first: each of them would otherwise spend a warm-up of
+    minutes to say something that was true at the first line.
     """
-    opened_at = now()
-
     with session_scope(factory) as db:
         # ⚠️ **Before the warm-up, not after.** Warming a live session takes minutes — 38 987 bars
         # on the last real run — and refusing it at the end would spend all of that to say a thing
@@ -317,134 +245,301 @@ def run_session(  # noqa: PLR0913 — keyword-only; each names one seam of a ses
     # `htf` filter a disagreement can leave the filter silently copying the chart
     # (`runner.timeframe_refusal`) — and a live session is the one place where that is not a
     # report to throw away but orders on an account.
-    #
-    # Before the warm-up, which reads months of candles: discovering it afterwards would spend
-    # minutes to say something that was true at the first line of this function.
     refusal = timeframe_refusal(definition, plan.timeframe)
     if refusal is not None:
         raise EngineError(f"refusing to start a session at {plan.timeframe}: {refusal}")
 
-    timeframe = step(plan.timeframe)
-    candles = splice(
-        source,
-        history=lambda: iter_candles(parquet_root, symbol, plan.timeframe),
-        timeframe=timeframe,
-        opened_at=opened_at,
-    )
-
-    risk = PercentRiskManager(percent=risk_percent(definition))
-    # The bars above close on the instrument's clock (30/09), the one its candles are stored on.
-    compiled = compile_strategy(definition, server_offset=spec.server_offset)
-    warm = _replay_history(
-        candles, plan=plan, spec=spec, definition=definition, strategy=compiled, risk=risk
-    )
-
-    stream = _past_an_inherited_trade(
-        candles,
-        mode=plan.mode,
-        timeframe=plan.timeframe,
-        warm=warm,
-        symbol=symbol,
-        run=lambda bars, broker: iter_run(
-            candles=bars,
-            timeframe=timeframe,
-            instrument=spec,
-            strategy=compiled,
-            broker=broker,
-            risk=risk,
-        ),
-        stopping=stopping,
-    )
-
-    # ⚠️ **`hand_over` asks this too, and this one decides whether a row is written.** The order
-    # below is `open_session` *then* `hand_over`, so leaving the refusal to `hand_over` alone
-    # would leave a `running` row behind for a session that never opened. `hand_over` keeps its
-    # own guard because it is that function's invariant and it has other callers; delete this one
-    # and the session opens a row before finding out — which is the failure a test pins.
-    if warm.positions(symbol):
-        raise EngineError(
-            f"warm-up ended with an open position in {symbol}; a session cannot open mid-trade. "
-            "Seed a window that ends flat, or start once the strategy is out."
-        )
-
-    # ⚠️ **The id is minted before the row exists.** See the module docstring: `MT5Broker` is
-    # built with it, and `hand_over` submits — so an id that only appeared with the row would put
-    # this session's first orders into `order_audit` under a session that was not yet on file.
-    #
-    # ⚠️ And earlier still when the caller supplies one, because "before the row" is not early
-    # enough for everybody: a stop request is addressed by id, so whoever builds the stopping
-    # predicate needs the name before this function starts. `is None` rather than `or`, because
-    # the fallback must trigger on *absence* and nothing else.
-    session_id = plan.session_id if plan.session_id is not None else uuid.uuid4()
-    live = _broker_for(
-        plan,
-        venue,
-        session_id=session_id,
+    return Prepared(
+        plan=plan,
         spec=spec,
-        cost_model=build_cost_model(plan.cost_model),
-        take_profit_rr=take_profit_rr(definition),
-        signals=signals,
-        recent=tuple(candles.recent),
+        symbol=symbol,
+        definition=definition,
+        # The bars close on the instrument's clock (30/09), the one its candles are stored on.
+        strategy=compile_strategy(definition, server_offset=spec.server_offset),
+        risk=PercentRiskManager(percent=risk_percent(definition)),
+        timeframe=step(plan.timeframe),
     )
 
-    # ⚠️ **Written before the hand-over, not after**, and in live that is the whole point of the
-    # ordering. `hand_over` re-submits what the warm-up left resting — measured at 35% to 73% of
-    # bars — and in live those go to the venue. A row opened afterwards would mean the riskiest
-    # orders a session ever places are the ones whose audit rows have no session to point at.
-    #
-    # `candles.warmed` rather than `handover.bars`: they are the same number — `hand_over` is
-    # handed the one and returns it as the other — and only one of them exists yet.
-    with session_scope(factory) as db:
-        open_session(
-            db,
-            strategy_id=plan.strategy_id,
-            instrument_id=plan.instrument_id,
-            timeframe=plan.timeframe,
-            initial_capital=plan.initial_capital,
-            cost_model=dict(plan.cost_model),
-            engine_version=ENGINE_VERSION,
-            mode=plan.mode,
-            warmup_bars=candles.warmed,
-            at=opened_at,
-            session_id=session_id,
+
+class _OneBar:
+    """The one bar a run pulls next, handed in from outside — `engine.batch`'s `_Feed`.
+
+    `iter_run` pulls its candles; this lets a caller **push** them instead: set `bar`, then ask the
+    run for its next outcome. That is what lets one reading of a market drive several sessions
+    (ADR-0033), each through the very `iter_run` it would run alone. A bar nobody set ends the run,
+    exactly as the end of a list ends a `for`.
+    """
+
+    __slots__ = ("bar",)
+
+    def __init__(self) -> None:
+        self.bar: Candle | None = None
+
+    def __iter__(self) -> "_OneBar":
+        return self
+
+    def __next__(self) -> Candle:
+        if self.bar is None:
+            raise StopIteration
+        bar, self.bar = self.bar, None
+        return bar
+
+
+type InheritedRun = Callable[[Iterator[Candle], Broker], Iterator[BarOutcome]]
+"""How a session runs the bars of the trade its warm-up ended in: on the warm-up's broker."""
+
+
+class InheritedTrade:
+    """The trade a SIGNAL session's warm-up ended in, followed a bar at a time (09/10).
+
+    ⚠️ **A signal session does not refuse to open mid-trade.** On M5 with a 5R target the setup is
+    in a trade often, and refusing left a market with no signal at all for as long as the trade
+    lasted, retried on a back-off: Usa500 and UsaTec on the first day. The trade is followed on the
+    warm-up's own broker, **without a word to the channels** — nobody was shown its entry — until
+    it ends at its stop, its target or the setup's exit; then the hand-over happens as it always
+    did, onto a broker whose account the warm-up never touched.
+
+    Bars are pushed, one per `follow`, so a market's process can follow one session's trade while
+    the others beside it are already live (ADR-0033).
+    """
+
+    def __init__(self, run: InheritedRun, warm: Broker, symbol: str) -> None:
+        self._bar = _OneBar()
+        self._outcomes = run(self._bar, warm)
+        self._warm = warm
+        self._symbol = symbol
+
+    def follow(self, candle: Candle) -> bool:
+        """Take one bar of the trade. `True` while it is still open."""
+        self._bar.bar = candle
+        outcome = next(self._outcomes)
+        if self._warm.positions(self._symbol):
+            return True
+        logger.info(
+            "%s: the inherited trade ended on the %s bar", self._symbol, outcome.candle.time
+        )
+        return False
+
+
+def _past_an_inherited_trade(  # noqa: PLR0913 — the cut, the mode, and what the trade runs on
+    candles: SplicedCandles,
+    *,
+    mode: SessionMode,
+    timeframe: str,
+    warm: Broker,
+    symbol: str,
+    run: InheritedRun,
+    stopping: Callable[[], bool],
+) -> Iterator[Candle]:
+    """The session's live bars — after, for a signal session, the trade the warm-up was in.
+
+    Refuses first a hole between the disk and the live bars (`refuse_a_hole`). Other modes than
+    signal are untouched: paper and live still refuse further on, because they would report a
+    trade they never took. See `InheritedTrade` for why a signal session does not.
+    """
+    refuse_a_hole(candles, symbol, timeframe)
+    stream = candles.live()
+    if mode is not SessionMode.SIGNAL or not warm.positions(symbol):
+        return stream
+    logger.info("%s: the warm-up ended in a trade; following it quietly until it ends", symbol)
+    trade = InheritedTrade(run, warm, symbol)
+    for candle in stream:
+        if not trade.follow(candle):
+            break
+        if stopping():
+            raise EngineError(f"{symbol}: stopped while following the trade the warm-up was in")
+    return stream
+
+
+def refuse_a_hole(candles: SplicedCandles, symbol: str, timeframe: str) -> None:
+    """Refuse to open over a hole between the candles on disk and the live stream.
+
+    ⚠️ The live loop fills it from the terminal; when it could not, the strategy's averages run
+    straight from the last bar on disk into today's, and the first "turn" it sees is the hole
+    itself — the first live signal ever posted (Usa500, a week of M5 missing, 09/10) was exactly
+    that.
+    """
+    if candles.seam_gap is not None and candles.seam_gap > MAX_SEAM_GAP:
+        raise EngineError(
+            f"refusing to open: {candles.seam_gap} of {symbol} {timeframe} missing between "
+            "the candles on disk and the live stream; collect the series again, then restart"
         )
 
-    bars = 0
-    failure: str | None = None
-    watch = LedgerWatch(symbol)
-    recorder = TradeRecorder(session_id, plan.instrument_id)
 
-    # ⚠️ **The beat opens before the hand-over, not after it, and that ordering is a live bug
-    # this cost an account to find.** Measured on the demo on 2026-08-28: a session warmed over
-    # 39 204 bars, opened its row, and `hand_over` put its limit on the wire — and the executor
-    # refused it, because `session_is_alive` saw `heartbeat_at` NULL and fell back to
-    # `started_at`, which is stamped *before* the warm-up. 700 s of "silence" against a 60 s
-    # limit. Three correct decisions summing to a session declared dead in the instant it first
-    # acts, and it gets **worse the more history a session warms over**.
-    #
-    # So the heartbeat now covers every moment the session acts, not just the moments it trades.
-    # The other end is unchanged and still matters: it stops before the row is finished, because
-    # a beat landing after `stopped_at` would leave a stopped row claiming it was heard from
-    # afterwards.
-    #
-    # ⚠️ The session hands over its own clock. Two clocks in one session is not a test artefact:
-    # `stopped_at` and `heartbeat_at` are compared by anyone reading the row, and a beat stamped
-    # from a different source than the stop can land after it.
-    with session_heartbeat(factory, session_id, now=now) as beating:
-        # ⚠️ **How the ordering above fails if it fails.** `Heartbeat.start()` beats on this
-        # thread and swallows what that beat raises, so "the heartbeat is open" is not by itself
-        # "the row says so" — a database that refused this one write would put us straight back
-        # in the failure above, silently, with the strategy believing it armed an order the
-        # venue was never allowed to hear about. A refusal to start, like every other one here.
-        if not beating.beats:
+class SessionLife:
+    """One session, a bar at a time: warm up, open, trade, finish (ADR-0033).
+
+    `run_session` drives one of these alone; `live.market` drives several side by side, one bar
+    read once and handed to each. **The order of a session's steps, and every reason for it, is
+    written here once** — whoever drives it only decides where the bars come from.
+
+    Pushed rather than pulled (`_OneBar`): the caller hands each bar in. A session alone and a
+    session among others of its market therefore run the same `iter_run`, over the same bars.
+    """
+
+    def __init__(
+        self,
+        prepared: Prepared,
+        *,
+        factory: sessionmaker[Session],
+        venue: Venue | None = None,
+        signals: NumberedSink | None = None,
+        now: Callable[[], dt.datetime] = _utcnow,
+    ) -> None:
+        self.prepared = prepared
+        self._factory = factory
+        self._venue = venue
+        self._signals = signals
+        self._now = now
+        plan = prepared.plan
+        # ⚠️ **The id is minted before the row exists.** `MT5Broker` is built with it, and
+        # `hand_over` submits — so an id that only appeared with the row would put this session's
+        # first orders into `order_audit` under a session that was not yet on file. And earlier
+        # still when the caller supplies one: a stop request is addressed by id, so whoever builds
+        # the stopping predicate needs the name before the session starts. `is None` rather than
+        # `or`, because the fallback must trigger on *absence* and nothing else.
+        self.session_id = plan.session_id if plan.session_id is not None else uuid.uuid4()
+        self.bars = 0
+        # ⚠️ **History is always replayed against a `BacktestBroker`, in every mode.** Warm-up is a
+        # backtest whose ledger is thrown away (ADR-0023), and replaying it against a venue would
+        # put months of decided-in-hindsight orders on a real account in the first seconds.
+        self._warm: BacktestBroker | None = BacktestBroker(
+            instrument=prepared.spec,
+            initial_capital=plan.initial_capital,
+            cost_model=build_cost_model(plan.cost_model),
+            take_profit_rr=take_profit_rr(prepared.definition),
+        )
+        self._bar = _OneBar()
+        self._warming: Iterator[BarOutcome] | None = self.inherited_run(self._bar, self._warm)
+        self._live: Iterator[BarOutcome] | None = None
+        self._broker: Broker | None = None
+        self._handover: HandOver | None = None
+        self._beat = ExitStack()
+        self._watch = LedgerWatch(prepared.symbol)
+        self._recorder = TradeRecorder(self.session_id, plan.instrument_id)
+
+    @property
+    def warm(self) -> BacktestBroker:
+        """The warm-up's broker, until the hand-over lets it go."""
+        if self._warm is None:
+            raise RuntimeError("the warm-up's broker was let go at the hand-over")
+        return self._warm
+
+    def inherited_run(self, bars: Iterator[Candle], broker: Broker) -> Iterator[BarOutcome]:
+        """This session's strategy over `bars`, on `broker` — the warm-up's, both for the history
+        and for the trade the history ended in."""
+        prepared = self.prepared
+        return iter_run(
+            candles=bars,
+            timeframe=prepared.timeframe,
+            instrument=prepared.spec,
+            strategy=prepared.strategy,
+            broker=broker,
+            risk=prepared.risk,
+        )
+
+    def warm_bar(self, candle: Candle) -> None:
+        """One bar of history, through the strategy, on the warm-up's broker."""
+        if self._warming is None:
+            raise RuntimeError("the warm-up is over")
+        self._bar.bar = candle
+        next(self._warming)
+
+    def end_warmup(self) -> None:
+        """Take the warm-up past its last bar, as a `for` over the history would (`run_batch`)."""
+        if self._warming is not None:
+            with suppress(StopIteration):
+                next(self._warming)
+        self._warming = None
+
+    def inherited_trade(self) -> InheritedTrade | None:
+        """The trade a SIGNAL session's warm-up ended in, to follow before it opens; `None` when
+        it ended flat, or when the session is not a signal one (those refuse in `open`)."""
+        symbol = self.prepared.symbol
+        if self.prepared.plan.mode is not SessionMode.SIGNAL or not self.warm.positions(symbol):
+            return None
+        logger.info("%s: the warm-up ended in a trade; following it quietly until it ends", symbol)
+        return InheritedTrade(self.inherited_run, self.warm, symbol)
+
+    def open(self, *, warmed: int, recent: Sequence[Candle], opened_at: dt.datetime) -> None:
+        """Build the session's broker, write its row, start its heartbeat, hand over.
+
+        Raises on a refusal; once the row is written, a refusal leaves it `running` for
+        `reconcile_stale` to settle — the same as a process that died there.
+        """
+        plan, spec, symbol = self.prepared.plan, self.prepared.spec, self.prepared.symbol
+        warm = self.warm
+        # ⚠️ **`hand_over` asks this too, and this one decides whether a row is written.** The
+        # order below is `open_session` *then* `hand_over`, so leaving the refusal to `hand_over`
+        # alone would leave a `running` row behind for a session that never opened. `hand_over`
+        # keeps its own guard because it is that function's invariant and it has other callers;
+        # delete this one and the session opens a row before finding out — which a test pins.
+        if warm.positions(symbol):
             raise EngineError(
-                "refusing to hand over: the session could not write its first heartbeat, so the "
-                "executor would refuse every order it places as coming from a silent session"
+                f"warm-up ended with an open position in {symbol}; a session cannot open "
+                "mid-trade. Seed a window that ends flat, or start once the strategy is out."
+            )
+        live = _broker_for(
+            plan,
+            self._venue,
+            session_id=self.session_id,
+            spec=spec,
+            cost_model=build_cost_model(plan.cost_model),
+            take_profit_rr=take_profit_rr(self.prepared.definition),
+            signals=self._signals,
+            recent=tuple(recent),
+        )
+
+        # ⚠️ **Written before the hand-over, not after**, and in live that is the whole point of
+        # the ordering. `hand_over` re-submits what the warm-up left resting — measured at 35% to
+        # 73% of bars — and in live those go to the venue. A row opened afterwards would mean the
+        # riskiest orders a session ever places are the ones whose audit rows have no session.
+        with session_scope(self._factory) as db:
+            open_session(
+                db,
+                strategy_id=plan.strategy_id,
+                instrument_id=plan.instrument_id,
+                timeframe=plan.timeframe,
+                initial_capital=plan.initial_capital,
+                cost_model=dict(plan.cost_model),
+                engine_version=ENGINE_VERSION,
+                mode=plan.mode,
+                warmup_bars=warmed,
+                at=opened_at,
+                session_id=self.session_id,
             )
 
-        handover = hand_over(
-            warm, live, symbol=symbol, bars=candles.warmed, risk=risk, instrument=spec
+        # ⚠️ **The beat opens before the hand-over, not after it, and that ordering is a live bug
+        # this cost an account to find.** Measured on the demo on 2026-08-28: a session warmed
+        # over 39 204 bars, opened its row, and `hand_over` put its limit on the wire — and the
+        # executor refused it, because `session_is_alive` saw `heartbeat_at` NULL and fell back to
+        # `started_at`, which is stamped *before* the warm-up. 700 s of "silence" against a 60 s
+        # limit. So the heartbeat covers every moment the session acts, not just the moments it
+        # trades — and it stops before the row is finished (`finish`), because a beat landing
+        # after `stopped_at` would leave a stopped row claiming it was heard from afterwards.
+        #
+        # ⚠️ The session hands over its own clock. `stopped_at` and `heartbeat_at` are compared by
+        # anyone reading the row, and a beat stamped from another clock can land after the stop.
+        beating = self._beat.enter_context(
+            session_heartbeat(self._factory, self.session_id, now=self._now)
         )
+        try:
+            # ⚠️ **How the ordering above fails if it fails.** `Heartbeat.start()` beats on this
+            # thread and swallows what that beat raises, so "the heartbeat is open" is not by
+            # itself "the row says so" — a database that refused this one write would put us
+            # straight back in the failure above, silently.
+            if not beating.beats:
+                raise EngineError(
+                    "refusing to hand over: the session could not write its first heartbeat, so "
+                    "the executor would refuse every order it places as coming from a silent "
+                    "session"
+                )
+            handover = hand_over(
+                warm, live, symbol=symbol, bars=warmed, risk=self.prepared.risk, instrument=spec
+            )
+        except BaseException:
+            self._beat.close()
+            raise
         logger.info(
             "%s %s: warmed over %d bars, carried %d resting order(s), refused %d",
             symbol,
@@ -454,54 +549,135 @@ def run_session(  # noqa: PLR0913 — keyword-only; each names one seam of a ses
             len(handover.refused),
         )
         # ⚠️ **Let the warm-up's broker go (12/10).** Its job ended with the hand-over, and this
-        # frame lives as long as the session, so keeping the name kept the broker — its whole
-        # book of warm-up trades — for days. Measured: ~20 MB on USDJPY M5 (2 179 warm-up
-        # trades), ~140 MB on Usa500 M5 while the history was still read as one list (its
-        # objects pinned the memory the freed bars had used). Nothing below may reach it: the
-        # session trades through `live`.
-        del warm
+        # session lives for days, so keeping it kept its whole book of warm-up trades. Measured:
+        # ~20 MB on USDJPY M5 (2 179 warm-up trades), ~140 MB on Usa500 M5 while the history was
+        # still read as one list. Nothing below may reach it: the session trades through `live`.
+        self._warm = None
+        self._handover = handover
+        self._broker = live
+        # ⚠️ **`refusals=` is the whole of PR-304-B-D-2b, and dropping it is silent.** The warm-up
+        # and the live bars are two loops around one strategy object, and the gap between them is
+        # the only place an order can be refused with no bar running to report it. The strategy
+        # marked that order placed when it emitted the signal; without this argument it holds the
+        # name for the rest of the session, never offers the zone again, and eventually sends a
+        # cancel for a name the venue never heard of.
+        self._live = iter_run(
+            candles=self._bar,
+            timeframe=self.prepared.timeframe,
+            instrument=spec,
+            strategy=self.prepared.strategy,
+            broker=live,
+            risk=self.prepared.risk,
+            refusals=handover.refused,
+        )
 
+    def live_bar(self, candle: Candle) -> None:
+        """One live bar: through the strategy on the session's own broker, then recorded."""
+        if self._live is None or self._broker is None:
+            raise RuntimeError("the session has not opened")
+        self._bar.bar = candle
+        outcome = next(self._live)
+        _persist(
+            self._factory,
+            watch=self._watch,
+            recorder=self._recorder,
+            broker=self._broker,
+            at=outcome.candle.time,
+        )
+        self.bars += 1
+
+    def end_live(self) -> None:
+        """Take the session past its last bar, for a stream that ended rather than was stopped."""
+        if self._live is not None:
+            with suppress(StopIteration):
+                next(self._live)
+
+    def close(self) -> None:
+        """Stop the heartbeat. Safe to call more than once; `finish` calls it first."""
+        self._beat.close()
+
+    def finish(self, error: str | None = None) -> SessionOutcome:
+        """Stop the heartbeat, then mark the row: `stopped`, or `failed` with `error`."""
+        if self._handover is None:
+            raise RuntimeError("the session has not opened")
+        self.close()
+        with session_scope(self._factory) as db:
+            finish_session(db, self.session_id, at=self._now(), error=error)
+        return SessionOutcome(
+            session_id=self.session_id,
+            warmup_bars=self._handover.bars,
+            bars=self.bars,
+            refused_orders=self._handover.refused,
+            error=error,
+        )
+
+
+def run_session(  # noqa: PLR0913 — keyword-only; each names one seam of a session
+    *,
+    factory: sessionmaker[Session],
+    source: BarSource,
+    plan: SessionPlan,
+    parquet_root: Path,
+    stopping: Callable[[], bool],
+    venue: Venue | None = None,
+    promotion_days: int = 5,
+    now: Callable[[], dt.datetime] = _utcnow,
+    signals: NumberedSink | None = None,
+) -> SessionOutcome:
+    """Run one session until `stopping` says otherwise, and record everything it did.
+
+    Returns rather than raises on a strategy that blows up mid-session: the row is marked
+    `failed` with the reason, because a live session ending badly is a *result* to record, not a
+    crash to propagate — the same doctrine the backtest worker follows.
+
+    ⚠️ **A refusal to start does raise.** A warm-up that cannot run, a hand-over that lands
+    mid-position, a missing instrument, a venue that will not have this session: none of those
+    produce a session, so none of them produce a row to mark. `open_session`'s docstring says the
+    same thing from the other side.
+
+    `venue` is consulted only when `plan.mode` is live, and is then required — see `_broker_for`.
+    The steps themselves are `SessionLife`'s; this drives one session alone, pulling its bars
+    from `source`.
+    """
+    opened_at = now()
+    prepared = prepare(factory, plan, venue=venue, signals=signals, promotion_days=promotion_days)
+    candles = splice(
+        source,
+        history=lambda: iter_candles(parquet_root, prepared.symbol, plan.timeframe),
+        timeframe=prepared.timeframe,
+        opened_at=opened_at,
+    )
+    life = SessionLife(prepared, factory=factory, venue=venue, signals=signals, now=now)
+    try:
+        for candle in candles.warmup():
+            life.warm_bar(candle)
+        life.end_warmup()
+        stream = _past_an_inherited_trade(
+            candles,
+            mode=plan.mode,
+            timeframe=plan.timeframe,
+            warm=life.warm,
+            symbol=prepared.symbol,
+            run=life.inherited_run,
+            stopping=stopping,
+        )
+        # `candles.warmed` rather than the hand-over's own count: they are the same number —
+        # `hand_over` is handed the one and returns it as the other — and only one exists yet.
+        life.open(warmed=candles.warmed, recent=candles.recent, opened_at=opened_at)
+        failure: str | None = None
         try:
-            # ⚠️ **`refusals=` is the whole of PR-304-B-D-2b, and dropping it is silent.** The
-            # warm-up and the live bars are two loops around one strategy object, and the gap
-            # between them is the only place an order can be refused with no bar running to
-            # report it. `compiled` marked that order placed when it emitted the signal; without
-            # this argument it holds the name for the rest of the session, never offers the zone
-            # again, and eventually sends a cancel for a name the venue never heard of. The
-            # session logs `refused 2` while the strategy believes both are resting.
-            for outcome in iter_run(
-                candles=stream,
-                timeframe=timeframe,
-                instrument=spec,
-                strategy=compiled,
-                broker=live,
-                risk=risk,
-                refusals=handover.refused,
-            ):
-                _persist(
-                    factory,
-                    watch=watch,
-                    recorder=recorder,
-                    broker=live,
-                    at=outcome.candle.time,
-                )
-                bars += 1
+            for candle in stream:
+                life.live_bar(candle)
                 if stopping():
                     break
+            else:
+                life.end_live()
         except Exception as exc:  # a failed session is a recorded result, not a crash
             failure = f"{type(exc).__name__}: {exc}"
-            logger.exception("session %s failed after %d bars", session_id, bars)
-
-    with session_scope(factory) as db:
-        finish_session(db, session_id, at=now(), error=failure)
-
-    return SessionOutcome(
-        session_id=session_id,
-        warmup_bars=handover.bars,
-        bars=bars,
-        refused_orders=handover.refused,
-        error=failure,
-    )
+            logger.exception("session %s failed after %d bars", life.session_id, life.bars)
+        return life.finish(failure)
+    finally:
+        life.close()
 
 
 def _broker_for(  # noqa: PLR0913 — the plan, the seam, and the four facts a paper broker needs

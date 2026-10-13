@@ -15,7 +15,7 @@ from typing import Any
 import pytest
 
 from tradeforge_api.live import CandleStream
-from tradeforge_api.live.session import MAX_SEAM_GAP, _past_an_inherited_trade, _refuse_a_hole
+from tradeforge_api.live.session import MAX_SEAM_GAP, _past_an_inherited_trade, refuse_a_hole
 from tradeforge_api.live.splice import RECENT_KEPT, BarSource, SplicedCandles, splice
 from tradeforge_api.live.testing import FakeRedisStreams
 from tradeforge_collector.live import Subscription
@@ -534,11 +534,11 @@ def test_a_session_refuses_a_hole_longer_than_a_long_weekend() -> None:
     candles = SplicedCandles([], timeframe=HOUR, opened_at=cut_after(0))
 
     candles.seam_gap = MAX_SEAM_GAP
-    _refuse_a_hole(candles, "Usa500", "M5")  # a weekend with a holiday: accepted
+    refuse_a_hole(candles, "Usa500", "M5")  # a weekend with a holiday: accepted
 
     candles.seam_gap = MAX_SEAM_GAP + HOUR
     with pytest.raises(EngineError, match="missing between the candles on disk"):
-        _refuse_a_hole(candles, "Usa500", "M5")
+        refuse_a_hole(candles, "Usa500", "M5")
 
 
 def test_a_hole_inside_the_stream_is_measured_too() -> None:

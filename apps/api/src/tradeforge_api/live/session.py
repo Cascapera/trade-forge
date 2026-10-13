@@ -92,7 +92,9 @@ __all__ = [
     "SessionLife",
     "SessionOutcome",
     "SessionPlan",
-    "Venue",
+    # `Venue` is left out on purpose: it is a `type` alias (PEP 695), which CodeQL cannot see and
+    # reports as an undefined export (13/10). Imported by name, as `live.process` does, it needs no
+    # listing here.
     "prepare",
     "reconcile_on_start",
     "refuse_a_hole",

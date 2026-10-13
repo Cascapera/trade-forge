@@ -164,12 +164,16 @@ um setup.
 ### O que o supervisor passa a saber
 
 - `wanted` passa a ser montado por mercado. A chave do processo vira o mercado mais a lista dos
-  membros que ele carrega, e cada membro guarda o seu id de sessão (um id por lançamento, como hoje,
-  em `forget_the_stopped`).
+  membros que ele carrega, e cada membro guarda o seu id de sessão (um id por lançamento, como
+  antes).
 - **Quem está vivo é contado por membro, não por processo.** Um membro que falhou dentro de um
   processo vivo não pode contar como vivo, senão os sinais dele nunca seriam tratados como órfãos.
-  O supervisor lê isso nas linhas de `live_sessions`, que já registram status e batimento por
-  sessão.
+  Cada processo de mercado publica no Redis a fase e as sessões que ainda carrega
+  (`signals:market:<processo>`, válida por 180 s), a cada leitura do stream e a cada barra; uma
+  sessão que some dessa lista sem ter sido pedida falhou. *Corrigido em 13/10, na implementação
+  (#446): a primeira versão deste ADR dizia que o supervisor leria as linhas de `live_sessions`,
+  mas uma sessão ainda aquecendo não tem linha, e "aquecendo" ficaria igual a "morreu antes de
+  abrir".*
 - `--max-sessions` continua contando **sessões** (setup × mercado), que é como ele pensa nos sinais.
   O padrão pode subir depois da medição em produção.
 - Um log por processo de mercado, com o setup em cada linha, no lugar de um log por sessão.

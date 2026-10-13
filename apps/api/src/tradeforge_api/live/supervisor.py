@@ -64,12 +64,17 @@ __all__ = [
     "main",
     "supervise_round",
     "take_restarts",
+    "within_cap",
 ]
 
 logger = logging.getLogger(__name__)
 
 RECORDER = "recorder"
-"""The consumer group that writes the signals' history (09/10)."""
+"""The consumer group that writes the signals' history (09/10) — and its one consumer's name.
+
+⚠️ **One name, not one per start (13/10).** A consumer's unacknowledged entries are offered only
+to that consumer again; each supervisor used to read as `recorder-<random>`, so what a dead one
+had taken and not written stayed pending under a name nobody would use again."""
 
 CHILD_ENVIRONMENT = {"OPENBLAS_NUM_THREADS": "1"}
 """Set for every child unless the supervisor's own environment already names it (12/10).
@@ -253,26 +258,83 @@ def supervise_round(
     return True
 
 
-def record_signals(redis: Redis, factory: sessionmaker[Session], consumer: str) -> int:
-    """Fold the new `signals.events` entries into the history (09/10); how many it read.
+def record_signals(redis: Redis, factory: sessionmaker[Session], consumer: str = RECORDER) -> int:
+    """Fold `signals.events` entries into the history (09/10); how many it read.
 
     Its own consumer group, `recorder`, beside the notifier's: each reads every entry, and an
-    entry is acknowledged only once its row is written, so a crash re-reads rather than loses."""
+    entry is acknowledged only once its row is written, so a crash re-reads rather than loses.
+
+    ⚠️ **What it took and did not write comes first (13/10).** A round that failed half way —
+    the database gone after three rows of twenty — left the other seventeen delivered and not
+    acknowledged, and a read of `>` (never delivered) offers them to nobody: they stayed out of the
+    history for good. Its own pending entries (`0`) are read before the new ones, as the
+    notifier's are. Folding one twice is harmless: `record_event` folds an event already seen
+    into the same row.
+    """
     try:
         redis.xgroup_create(SIGNALS_STREAM, RECORDER, id="0", mkstream=True)
     except ResponseError as exists:
         if "BUSYGROUP" not in str(exists):
             raise
-    read = cast(
-        "list[tuple[str, list[tuple[str, dict[str, str]]]]]",
-        redis.xreadgroup(RECORDER, consumer, {SIGNALS_STREAM: ">"}, count=200),
-    )
-    entries = read[0][1] if read else []
+    entries = _entries(redis.xreadgroup(RECORDER, consumer, {SIGNALS_STREAM: "0"}, count=200))
+    if not entries:
+        entries = _entries(redis.xreadgroup(RECORDER, consumer, {SIGNALS_STREAM: ">"}, count=200))
     for entry_id, fields in entries:
-        with session_scope(factory) as session:
-            record_event(session, fields)
+        try:
+            if fields:  # an entry trimmed off the stream while pending comes back empty
+                with session_scope(factory) as session:
+                    record_event(session, fields)
+        except (KeyError, ValueError, ArithmeticError) as malformed:
+            # ⚠️ Skipped, not left pending: read first on every round, an entry that can never
+            # be written would keep every later one out of the history. A database that is down
+            # raises something else, and that one is left to lose the round and come back.
+            logger.warning(
+                "signals.events %s cannot be recorded (%r); skipped", entry_id, malformed
+            )
         redis.xack(SIGNALS_STREAM, RECORDER, entry_id)
     return len(entries)
+
+
+def _entries(read: object) -> list[tuple[str, dict[str, str]]]:
+    found = cast("list[tuple[str, list[tuple[str, dict[str, str]]]]]", read)
+    return found[0][1] if found else []
+
+
+def within_cap(
+    items: Sequence[FollowedPair], *, carried: Collection[tuple[uuid.UUID, uuid.UUID]], cap: int
+) -> tuple[list[FollowedPair], list[FollowedPair]]:
+    """The pairs that may run under `--max-sessions`, and those left waiting.
+
+    ⚠️ **Those already running first (13/10).** The pairs come in the order they were followed, so
+    a market added to an old setup sorts before a newer setup's — and cut at the cap, the newcomer
+    used to push out a session already running: asked to stop, its armed signals cancelled on the
+    channel, for a pair that only had to wait. Running ones keep their place; the rest queue.
+    """
+    running = [item for item in items if (item.setup_id, item.instrument_id) in carried]
+    others = [item for item in items if (item.setup_id, item.instrument_id) not in carried]
+    ordered = running + others
+    return ordered[:cap], ordered[cap:]
+
+
+def _note_the_cap(
+    said: list[tuple[uuid.UUID, uuid.UUID]],
+    waiting: Sequence[FollowedPair],
+    *,
+    followed: int,
+    cap: int,
+) -> None:
+    """Warn when who waits for room under `--max-sessions` changes — not every round."""
+    cut = [(item.setup_id, item.instrument_id) for item in waiting]
+    if cut == said:
+        return
+    if cut:
+        logger.warning(
+            "%d sessions followed, %d may run (--max-sessions): %d wait for room",
+            followed,
+            cap,
+            len(cut),
+        )
+    said[:] = cut
 
 
 def as_wanted(launch: Launch) -> Wanted:
@@ -372,13 +434,16 @@ def main(argv: list[str] | None = None) -> int:
 
     supervisor = Supervisor(launch=launch, ask_to_stop=ask)
     fleet = Fleet(python=sys.executable, clock=time.monotonic)
-    consumer = f"recorder-{uuid.uuid4().hex[:8]}"
     orphans = OrphanWatch()
     heard: dict[str, MarketState | None] = {}
 
+    left_out: list[tuple[uuid.UUID, uuid.UUID]] = []
+
     def wanted_now() -> dict[str, Wanted]:
         with session_scope(factory) as session:
-            items = followed_pairs(session)[: args.max_sessions]
+            followed = followed_pairs(session)
+        items, waiting = within_cap(followed, carried=fleet.carried(), cap=args.max_sessions)
+        _note_the_cap(left_out, waiting, followed=len(followed), cap=args.max_sessions)
         fleet.exited(supervisor.poll())
         heard.clear()
         heard.update(heard_from(redis, list(fleet.processes)))
@@ -399,7 +464,7 @@ def main(argv: list[str] | None = None) -> int:
     def housekeeping() -> None:
         state = fleet.describe(heard, at=dt.datetime.now(dt.UTC))
         redis.set(SUPERVISOR_STATE_KEY, json.dumps(state), ex=max(60, round(3 * args.every)))
-        record_signals(redis, factory, consumer)
+        record_signals(redis, factory)
         resolve_orphans(redis, factory, fleet.alive(), orphans)
 
     outage = Outage(logger)

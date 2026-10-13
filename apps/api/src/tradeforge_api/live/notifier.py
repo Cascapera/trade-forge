@@ -444,9 +444,10 @@ def serve_once(  # noqa: PLR0913 — `read_and_post`'s arguments, and the outage
     and the next one starts again from this consumer's own unacknowledged entries; nothing a read
     took is lost, because an entry is acknowledged only once every network has it.
 
-    ⚠️ **A group that is gone is created again from now, not from the start.** It is gone when
-    Redis came back without its data, and `0` would post every signal still on the stream a
-    second time. Any other refusal from Redis is a bug and is left to raise.
+    ⚠️ **A group that is gone is created again from now, not from the start.** Gone with Redis's
+    data, the stream went with it and either answer posts nothing; gone alone — deleted by hand,
+    the stream still there — `0` would post every signal on it a second time. `$` is right in
+    both. Any other refusal from Redis is a bug and is left to raise.
     """
     try:
         cursor = read_and_post(

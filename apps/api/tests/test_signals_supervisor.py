@@ -1,5 +1,6 @@
 """The signals supervisor: what should run, against what does (signals PR 5b)."""
 
+import contextlib
 import json
 import logging
 import uuid
@@ -19,8 +20,10 @@ from tradeforge_api.live.supervisor import (
     child_environment,
     heard_from,
     live_loops,
+    record_signals,
     supervise_round,
     take_restarts,
+    within_cap,
 )
 from tradeforge_db.live_setups import FollowedPair
 
@@ -360,3 +363,107 @@ def test_a_restart_request_is_taken_once() -> None:
 
     assert first == [MarketKey(instrument, "M5")]
     assert second == []
+
+
+# --------------------------------------------------------------------------- the signals' history
+
+
+class Events:
+    """`signals.events` with one consumer group: `>` hands out what was never delivered, `0` what
+    this consumer was handed and never acknowledged."""
+
+    def __init__(self, entries: list[tuple[str, dict[str, str]]]) -> None:
+        self.entries = entries
+        self.delivered: dict[str, dict[str, str]] = {}
+        self.acked: list[str] = []
+        self.cursors: list[str] = []
+
+    def xgroup_create(
+        self,
+        name: str,
+        groupname: str,
+        id: str = "$",  # noqa: A002 — redis-py's own name for it
+        mkstream: bool = False,
+    ) -> bool:
+        return True
+
+    def xreadgroup(
+        self, groupname: str, consumername: str, streams: dict[str, str], count: int = 10
+    ) -> list[tuple[str, list[tuple[str, dict[str, str]]]]]:
+        cursor = next(iter(streams.values()))
+        self.cursors.append(cursor)
+        if cursor == "0":
+            found = [(i, f) for i, f in self.delivered.items() if i not in self.acked]
+        else:
+            found = [(i, f) for i, f in self.entries if i not in self.delivered][:count]
+            self.delivered.update(found)
+        return [("signals.events", found)] if found else []
+
+    def xack(self, name: str, groupname: str, *ids: str) -> int:
+        self.acked.extend(ids)
+        return len(ids)
+
+
+def recording(monkeypatch: pytest.MonkeyPatch, *, down_after: int | None = None) -> list[str]:
+    """What reaches the history; the database goes away after `down_after` rows."""
+    written: list[str] = []
+
+    def record(_session: object, fields: dict[str, str]) -> None:
+        if down_after is not None and len(written) >= down_after:
+            raise OperationalError("INSERT", {}, Exception("connection refused"))
+        written.append(fields["number"])
+
+    monkeypatch.setattr("tradeforge_api.live.supervisor.record_event", record)
+    monkeypatch.setattr(
+        "tradeforge_api.live.supervisor.session_scope", lambda _factory: contextlib.nullcontext()
+    )
+    return written
+
+
+def entry(number: int) -> tuple[str, dict[str, str]]:
+    return (f"{number}-0", {"number": str(number), "kind": "armed"})
+
+
+def test_what_a_round_took_and_did_not_write_is_written_by_the_next(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A database gone half way used to leave the rest delivered, unacknowledged and never read
+    again — a read of `>` offers only what was never delivered."""
+    events = Events([entry(1), entry(2), entry(3)])
+    written = recording(monkeypatch, down_after=1)
+
+    with pytest.raises(OperationalError):
+        record_signals(events, factory=None)  # type: ignore[arg-type]
+    monkeypatch.setattr(
+        "tradeforge_api.live.supervisor.record_event", lambda _s, f: written.append(f["number"])
+    )
+    record_signals(events, factory=None)  # type: ignore[arg-type]
+
+    assert written == ["1", "2", "3"], "in order, the pending ones first"
+    assert events.acked == ["1-0", "2-0", "3-0"]
+
+
+def test_an_entry_that_can_never_be_written_is_skipped_and_holds_nothing_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    broken = ("2-0", {"kind": "armed"})  # no number
+    events = Events([entry(1), broken, entry(3)])
+    written = recording(monkeypatch)
+
+    record_signals(events, factory=None)  # type: ignore[arg-type]
+
+    assert written == ["1", "3"]
+    assert events.acked == ["1-0", "2-0", "3-0"]
+
+
+def test_under_the_cap_a_session_running_keeps_its_place_and_a_newcomer_waits() -> None:
+    """A market added to an old setup sorts first; cut at the cap, it used to push out a session
+    already running — its armed signals cancelled for a pair that only had to wait."""
+    old_setup_new_market, running_a, running_b = item(), item(), item()
+    followed = [old_setup_new_market, running_a, running_b]
+    carried = {(one.setup_id, one.instrument_id) for one in (running_a, running_b)}
+
+    may_run, waiting = within_cap(followed, carried=carried, cap=2)
+
+    assert may_run == [running_a, running_b]
+    assert waiting == [old_setup_new_market]

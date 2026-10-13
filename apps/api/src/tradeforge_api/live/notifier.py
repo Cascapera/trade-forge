@@ -24,24 +24,29 @@ import urllib.error
 import urllib.request
 import uuid
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Protocol, cast
 from zoneinfo import ZoneInfo
 
 from redis import Redis
-from redis.exceptions import ResponseError
+from redis.exceptions import RedisError, ResponseError
 
 from tradeforge_api.config import Settings
+from tradeforge_api.live.outage import Outage
 from tradeforge_api.live.signals import SIGNALS_STREAM
 from tradeforge_collector import step
 
 __all__ = [
     "DISCLAIMER",
     "Network",
+    "create_group",
     "deliver",
     "format_message",
     "main",
+    "read_and_post",
+    "serve_once",
 ]
 
 logger = logging.getLogger(__name__)
@@ -382,6 +387,85 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+OUTAGE_PAUSE = 5.0
+"""Seconds between two tries while Redis does not answer."""
+
+
+def create_group(redis: Redis, *, from_start: bool) -> None:
+    """The notifier's consumer group on `signals.events`, unless it is there already."""
+    try:
+        redis.xgroup_create(SIGNALS_STREAM, GROUP, id="0" if from_start else "$", mkstream=True)
+    except ResponseError as exists:
+        if "BUSYGROUP" not in str(exists):
+            raise
+
+
+def read_and_post(  # noqa: PLR0913 — two clients, the networks, and where this read starts
+    redis: Redis,
+    pictures: Redis,
+    networks: Sequence[Network],
+    *,
+    consumer: str,
+    pending: str,
+    sleep: Callable[[float], None] = time.sleep,
+) -> str:
+    """One read of the stream and the posts it brings. Returns where the next read starts:
+    `0` (this consumer's own unacknowledged entries) until those run out, then `>` (new ones)."""
+    read = cast(
+        "list[tuple[str, list[tuple[str, dict[str, str]]]]]",
+        redis.xreadgroup(GROUP, consumer, {SIGNALS_STREAM: pending}, count=20, block=5000),
+    )
+    entries = read[0][1] if read else []
+    if pending == "0" and not entries:
+        return ">"
+    for entry_id, fields in entries:
+        try:
+            image = pictures.get(fields["image_key"]) if "image_key" in fields else None
+            deliver(entry_id, fields, networks, redis, cast("bytes | None", image))
+        except Exception:  # noqa: BLE001 - any failure keeps the entry for another try
+            logger.warning("entry %s kept for another try", entry_id)
+            sleep(10)
+            return "0"
+        redis.xack(SIGNALS_STREAM, GROUP, entry_id)
+    return pending
+
+
+def serve_once(  # noqa: PLR0913 — `read_and_post`'s arguments, and the outage it reports to
+    redis: Redis,
+    pictures: Redis,
+    networks: Sequence[Network],
+    *,
+    consumer: str,
+    pending: str,
+    outage: Outage,
+    sleep: Callable[[float], None] = time.sleep,
+) -> str:
+    """`read_and_post`, outliving Redis (13/10). A read that Redis does not answer is waited out
+    and the next one starts again from this consumer's own unacknowledged entries; nothing a read
+    took is lost, because an entry is acknowledged only once every network has it.
+
+    ⚠️ **A group that is gone is created again from now, not from the start.** It is gone when
+    Redis came back without its data, and `0` would post every signal still on the stream a
+    second time. Any other refusal from Redis is a bug and is left to raise.
+    """
+    try:
+        cursor = read_and_post(
+            redis, pictures, networks, consumer=consumer, pending=pending, sleep=sleep
+        )
+    except RedisError as error:
+        lost_group = isinstance(error, ResponseError)
+        if lost_group and "NOGROUP" not in str(error):
+            raise
+        outage.lost("reading signals.events")
+        sleep(OUTAGE_PAUSE)
+        if lost_group:
+            with suppress(RedisError):
+                create_group(redis, from_start=False)
+        return "0"
+    outage.back()
+    return cursor
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run until interrupted."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -400,36 +484,22 @@ def main(argv: list[str] | None = None) -> int:
     redis = Redis.from_url(settings.redis_url, decode_responses=True)
     # The pictures are bytes: read through a client that does not decode replies.
     pictures = Redis.from_url(settings.redis_url)
-    try:
-        redis.xgroup_create(
-            SIGNALS_STREAM, GROUP, id="0" if args.from_start else "$", mkstream=True
-        )
-    except ResponseError as exists:
-        if "BUSYGROUP" not in str(exists):
-            raise
+    outage = Outage(logger)
+    while True:  # a notifier started before Redis waits for it rather than dying (13/10)
+        try:
+            create_group(redis, from_start=args.from_start)
+            break
+        except RedisError:
+            outage.lost("creating the notifier's group on signals.events")
+            time.sleep(OUTAGE_PAUSE)
     consumer = f"notifier-{os.getpid()}"
     logger.info("posting signals to %s", ", ".join(network.name for network in networks))
     pending = "0"  # first our own unacknowledged entries, then new ones
     try:
         while True:
-            read = cast(
-                "list[tuple[str, list[tuple[str, dict[str, str]]]]]",
-                redis.xreadgroup(GROUP, consumer, {SIGNALS_STREAM: pending}, count=20, block=5000),
+            pending = serve_once(
+                redis, pictures, networks, consumer=consumer, pending=pending, outage=outage
             )
-            entries = read[0][1] if read else []
-            if pending == "0" and not entries:
-                pending = ">"
-                continue
-            for entry_id, fields in entries:
-                try:
-                    image = pictures.get(fields["image_key"]) if "image_key" in fields else None
-                    deliver(entry_id, fields, networks, redis, cast("bytes | None", image))
-                except Exception:  # noqa: BLE001 - any failure keeps the entry for another try
-                    logger.warning("entry %s kept for another try", entry_id)
-                    time.sleep(10)
-                    pending = "0"
-                    break
-                redis.xack(SIGNALS_STREAM, GROUP, entry_id)
     except KeyboardInterrupt:
         logger.info("stopped")
     finally:

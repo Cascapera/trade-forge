@@ -253,6 +253,10 @@ class Fleet:
             if any(pair not in process.asked for pair in process.sessions)
         }
 
+    def carried(self) -> set[Pair]:
+        """The (setup, instrument) pairs some process carries now."""
+        return {pair for process in self.processes.values() for pair in process.sessions}
+
     def alive(self) -> set[uuid.UUID]:
         """The sessions running now. One asked to stop counts until it leaves: it watches its
         signals to its last bar, and two voices on one signal would post its end twice."""

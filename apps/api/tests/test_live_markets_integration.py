@@ -11,10 +11,12 @@ from redis.exceptions import ConnectionError as RedisConnectionError
 from sqlalchemy.orm import Session
 
 from tradeforge_api.config import Settings
+from tradeforge_api.kill_switch import KillSwitch
 from tradeforge_api.live.fleet import SUPERVISOR_STATE_KEY, restart_key
 from tradeforge_api.main import create_app
 from tradeforge_db.live_setups import record_event
 
+from .collector_fakes import running
 from .test_live_setups_integration import a_run
 
 pytestmark = pytest.mark.integration
@@ -223,3 +225,22 @@ def test_a_redis_that_cannot_be_read_is_said_and_nothing_is_guessed(
         "/live-markets/restart", json={"instrument_id": str(uuid.uuid4()), "timeframe": "H1"}
     )
     assert restart.status_code == 503
+
+
+def test_an_app_with_every_redis_store_injected_starts(
+    session_factory: Callable[[], Session], store: Store
+) -> None:
+    """With all four injected there is no Redis client of the app's own; a default computed from
+    one anyway (`getattr(state, name, client)`) failed the start of exactly this app."""
+    app: Any = create_app(
+        settings=Settings(),
+        session_factory=session_factory,
+        arq_pool=object(),  # type: ignore[arg-type]
+        kill_switch=KillSwitch(store),  # type: ignore[arg-type]
+        stop_store=store,  # type: ignore[arg-type]
+        collector=running(),
+        signals_store=store,  # type: ignore[arg-type]
+    )
+
+    with TestClient(app) as opened:
+        assert opened.get("/live-markets").status_code == 200

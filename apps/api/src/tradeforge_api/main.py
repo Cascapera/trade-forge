@@ -36,6 +36,7 @@ from tradeforge_api.routers import (
     collections,
     executor,
     instruments,
+    live_markets,
     live_sessions,
     live_setups,
     strategies,
@@ -46,6 +47,7 @@ from tradeforge_api.routers import (
     symbols,
     walkforwards,
 )
+from tradeforge_api.routers.live_markets import SignalsStore
 from tradeforge_api.snapshot_store import InMemory, SnapshotStore
 from tradeforge_api.snapshots import child_pool, refresh_forever
 from tradeforge_db.session import create_db_engine, create_session_factory
@@ -95,6 +97,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         hasattr(app.state, "kill_switch")
         and hasattr(app.state, "stop_store")
         and hasattr(app.state, "collector")
+        and hasattr(app.state, "signals_store")
     ):
         # ⚠️ A client of its own rather than the arq pool, and the reason is not tidiness. The
         # pool is async and arq's; these are read and written by plain handlers, and an emergency
@@ -113,6 +116,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.stop_store = app.state._redis_client
     if not hasattr(app.state, "collector"):
         app.state.collector = Collector(app.state._redis_client)
+    app.state.signals_store = getattr(app.state, "signals_store", app.state._redis_client)
     refreshing, pool = _start_snapshots(app, settings, refresh=owns_engine)
 
     try:
@@ -138,6 +142,7 @@ def create_app(  # noqa: PLR0913 — keyword-only seams, one per connection a te
     kill_switch: KillSwitch | None = None,
     stop_store: StopStore | None = None,
     collector: Collector | None = None,
+    signals_store: SignalsStore | None = None,
 ) -> FastAPI:
     """Build the app. Pass `session_factory`/`arq_pool`/`kill_switch` to bypass the real
     connections.
@@ -162,6 +167,8 @@ def create_app(  # noqa: PLR0913 — keyword-only seams, one per connection a te
         app.state.stop_store = stop_store
     if collector is not None:
         app.state.collector = collector
+    if signals_store is not None:
+        app.state.signals_store = signals_store
 
     app.include_router(instruments.router)
     app.include_router(candle_files.router)
@@ -173,6 +180,7 @@ def create_app(  # noqa: PLR0913 — keyword-only seams, one per connection a te
     app.include_router(backtests.router)
     app.include_router(executor.router)
     app.include_router(live_sessions.router)
+    app.include_router(live_markets.router)
     app.include_router(baskets.router)
     app.include_router(studies.router)
     # Before `sweeps`: `/sweeps/{id}/walkforward` must not be read by a broader sweeps path.

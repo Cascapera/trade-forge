@@ -78,22 +78,39 @@ def runs_in(jobs: Sequence[Sequence[uuid.UUID]]) -> int:
     return sum(len(job) for job in jobs)
 
 
+SWEEP_JOB_EXPIRES = dt.timedelta(days=60)
+"""How long a sweep's job may wait in the queue before arq gives up on it.
+
+⚠️ **arq's own default is one day after queueing (13/10).** A sweep queues every run at launch, and
+95d51a72 — 2.6 million runs at ~14 thousand an hour, a week of work — had its 2.3 million waiting
+jobs expire together 24 hours after its launch: the workers spent the next hours discarding them,
+and the sweep stood still with its runs `queued` in the table and nothing in the queue. Sixty days
+is longer than any sweep this project has run; one that waits longer is better cancelled."""
+
+
 async def enqueue_runs(queue: JobQueue, jobs: Sequence[Sequence[uuid.UUID | str]]) -> None:
     """Queue each job: a run alone as `run_backtest`, a batch as `run_backtest_batch`.
 
     ⚠️ **Job ids derived from the runs**, as they always were: re-sending a launch's jobs after a
     crash queues nothing twice. A batch is named by its first run, which no other batch holds.
+
+    Each job waits up to `SWEEP_JOB_EXPIRES` for a worker, not arq's one day.
     """
     for job in jobs:
         ids = [str(run_id) for run_id in job]
         if len(ids) == 1:
-            await queue.enqueue_job(RUN_BACKTEST, ids[0], _job_id=ids[0])
+            await queue.enqueue_job(
+                RUN_BACKTEST, ids[0], _job_id=ids[0], _expires=SWEEP_JOB_EXPIRES
+            )
         else:
-            await queue.enqueue_job(RUN_BACKTEST_BATCH, ids, _job_id=f"batch-{ids[0]}")
+            await queue.enqueue_job(
+                RUN_BACKTEST_BATCH, ids, _job_id=f"batch-{ids[0]}", _expires=SWEEP_JOB_EXPIRES
+            )
 
 
 __all__ = [
     "BATCH_SIZE",
+    "SWEEP_JOB_EXPIRES",
     "BatchKey",
     "Batcher",
     "batch_key",

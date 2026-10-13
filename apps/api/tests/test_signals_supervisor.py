@@ -1,17 +1,23 @@
 """The signals supervisor: what should run, against what does (signals PR 5b)."""
 
 import contextlib
+import datetime as dt
 import json
 import logging
 import uuid
-from collections.abc import Iterator
 from decimal import Decimal
 
 import pytest
 from redis.exceptions import ConnectionError as RedisConnectionError
 from sqlalchemy.exc import OperationalError
 
-from tradeforge_api.live.fleet import Fleet, MarketKey, market_state_key, restart_key
+from tradeforge_api.live.fleet import (
+    RESTARTS_KEY,
+    Fleet,
+    MarketKey,
+    market_state_key,
+    restart_field,
+)
 from tradeforge_api.live.outage import Outage
 from tradeforge_api.live.supervisor import (
     Supervisor,
@@ -326,18 +332,20 @@ def test_an_outage_is_said_once_with_its_traceback_then_counted_then_ended(
 class Said:
     """The few Redis calls the supervisor reads the fleet's news with."""
 
-    def __init__(self, values: dict[str, str]) -> None:
+    def __init__(self, values: dict[str, str], restarts: dict[str, str] | None = None) -> None:
         self.values = dict(values)
+        self.restarts = dict(restarts or {})
 
     def mget(self, keys: list[str]) -> list[str | None]:
         return [self.values.get(key) for key in keys]
 
-    def scan_iter(self, match: str) -> Iterator[str]:
-        prefix = match.removesuffix("*")
-        return iter([key for key in list(self.values) if key.startswith(prefix)])
+    def hgetall(self, name: str) -> dict[str, str]:
+        assert name == RESTARTS_KEY
+        return dict(self.restarts)
 
-    def delete(self, key: str) -> int:
-        return 1 if self.values.pop(key, None) is not None else 0
+    def hdel(self, name: str, *fields: str) -> int:
+        assert name == RESTARTS_KEY
+        return sum(1 for one in fields if self.restarts.pop(one, None) is not None)
 
 
 def test_what_each_market_process_said_is_read_and_silence_is_none() -> None:
@@ -354,15 +362,29 @@ def test_what_each_market_process_said_is_read_and_silence_is_none() -> None:
     assert heard["market:b"] is None
 
 
-def test_a_restart_request_is_taken_once() -> None:
-    instrument = uuid.uuid4()
-    redis = Said({restart_key(instrument, "M5"): "1", "signals:restart:garbage": "1"})
+NOW = dt.datetime(2026, 10, 13, 21, 0, tzinfo=dt.UTC)
 
-    first = take_restarts(redis)  # type: ignore[arg-type]
-    second = take_restarts(redis)  # type: ignore[arg-type]
 
-    assert first == [MarketKey(instrument, "M5")]
+def test_a_restart_request_is_taken_once_and_a_stale_or_garbled_one_is_dropped() -> None:
+    """One hash read each round, not a SCAN of the whole keyspace: 68 s once a sweep's 2.3 M jobs
+    were in Redis, every round over a minute and the supervisor's word lapsing (13/10)."""
+    fresh, stale = uuid.uuid4(), uuid.uuid4()
+    redis = Said(
+        {},
+        {
+            restart_field(fresh, "M5"): (NOW - dt.timedelta(minutes=1)).isoformat(),
+            restart_field(stale, "M5"): (NOW - dt.timedelta(minutes=11)).isoformat(),
+            "garbage": NOW.isoformat(),
+            restart_field(fresh, "M15"): "not a time",
+        },
+    )
+
+    first = take_restarts(redis, now=NOW)  # type: ignore[arg-type]
+    second = take_restarts(redis, now=NOW)  # type: ignore[arg-type]
+
+    assert first == [MarketKey(fresh, "M5")]
     assert second == []
+    assert redis.restarts == {}, "every request read is consumed, obeyed or not"
 
 
 # --------------------------------------------------------------------------- the signals' history

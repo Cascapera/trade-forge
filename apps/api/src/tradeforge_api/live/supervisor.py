@@ -37,7 +37,8 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from tradeforge_api.config import Settings
 from tradeforge_api.live.fleet import (
-    RESTART_PREFIX,
+    RESTART_TTL,
+    RESTARTS_KEY,
     SUPERVISOR_STATE_KEY,
     Fleet,
     Launch,
@@ -45,7 +46,7 @@ from tradeforge_api.live.fleet import (
     MarketState,
     market_state_key,
     parse_market_state,
-    parse_restart_key,
+    parse_restart_field,
 )
 from tradeforge_api.live.orphans import OrphanWatch, annul, orphan_brokers, resolve_orphans
 from tradeforge_api.live.outage import Outage
@@ -373,12 +374,27 @@ def heard_from(redis: Redis, keys: Sequence[str]) -> dict[str, MarketState | Non
     return {key: parse_market_state(value) for key, value in zip(keys, raw, strict=True)}
 
 
-def take_restarts(redis: Redis) -> list[MarketKey]:
-    """The markets the screen asked to restart, each request consumed as it is read."""
+def take_restarts(redis: Redis, *, now: dt.datetime) -> list[MarketKey]:
+    """The markets the screen asked to restart (`RESTARTS_KEY`), each request consumed as it is
+    read, and one older than `RESTART_TTL` dropped unobeyed.
+
+    Only the fields read are deleted, so a request made between the read and the delete is taken
+    on the next round rather than lost."""
+    asked = cast("dict[str, str]", redis.hgetall(RESTARTS_KEY))
+    if not asked:
+        return []
+    redis.hdel(RESTARTS_KEY, *asked)
     markets = []
-    for key in cast("list[str]", list(redis.scan_iter(match=f"{RESTART_PREFIX}*"))):
-        if redis.delete(key) and (market := parse_restart_key(key)) is not None:
-            markets.append(market)
+    for name, at in asked.items():
+        market = parse_restart_field(name)
+        try:
+            when = dt.datetime.fromisoformat(at)
+        except ValueError:
+            when = None
+        if market is None or when is None or now - when > RESTART_TTL:
+            logger.warning("restart request %s (asked %s) dropped: unreadable or stale", name, at)
+            continue
+        markets.append(market)
     return markets
 
 
@@ -448,7 +464,10 @@ def main(argv: list[str] | None = None) -> int:
         heard.clear()
         heard.update(heard_from(redis, list(fleet.processes)))
         for launched in fleet.reconcile(
-            items, heard=heard, restart=take_restarts(redis), ask_to_stop=ask
+            items,
+            heard=heard,
+            restart=take_restarts(redis, now=dt.datetime.now(dt.UTC)),
+            ask_to_stop=ask,
         ):
             logger.info("%s: launching %d session(s)", launched.key, len(launched.sessions))
         wanted = {key: as_wanted(kept) for key, kept in fleet.kept().items()}

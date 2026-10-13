@@ -21,10 +21,10 @@ from typing import Annotated, Any, Protocol, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from redis.exceptions import RedisError
-from redis.typing import EncodableT, ExpiryT, KeyT, ResponseT
+from redis.typing import KeyT, ResponseT
 
 from tradeforge_api.deps import SessionDep
-from tradeforge_api.live.fleet import SUPERVISOR_STATE_KEY, restart_key
+from tradeforge_api.live.fleet import RESTARTS_KEY, SUPERVISOR_STATE_KEY, restart_field
 from tradeforge_api.schemas import (
     LiveAssetOut,
     LiveMarketSetupOut,
@@ -44,17 +44,13 @@ __all__ = ["SignalsStore", "router"]
 
 router = APIRouter(tags=["live-markets"])
 
-RESTART_TTL = 600
-"""Seconds a restart request waits for the supervisor; one that was down longer is not obeyed
-when it comes back, on a click somebody made ten minutes earlier."""
-
 
 class SignalsStore(Protocol):
     """The two Redis calls this screen makes, in redis-py's own vocabulary (see `StopStore`)."""
 
     def get(self, name: KeyT) -> ResponseT: ...
 
-    def set(self, name: KeyT, value: EncodableT, ex: ExpiryT | None = None) -> ResponseT: ...
+    def hset(self, name: str, key: str, value: str) -> ResponseT: ...
 
 
 def get_signals_store(request: Request) -> SignalsStore:
@@ -131,16 +127,17 @@ def markets(session: SessionDep, store: SignalsStoreDep) -> LiveMarketsOut:
 
 @router.post("/live-markets/restart", status_code=status.HTTP_202_ACCEPTED)
 def restart(request: RestartMarketRequest, store: SignalsStoreDep) -> dict[str, bool]:
-    """Ask the supervisor to restart one market's sessions together (taken within one round).
+    """Ask the supervisor to restart one market's sessions together (taken within one round; a
+    request it has not taken within `fleet.RESTART_TTL` is dropped).
 
     ⚠️ Every signal armed on that market is cancelled on the channel and every one in a trade is
     then followed by price (`live/orphans.py`): the screen says how many before it asks.
     """
     try:
-        store.set(
-            restart_key(request.instrument_id, request.timeframe),
+        store.hset(
+            RESTARTS_KEY,
+            restart_field(request.instrument_id, request.timeframe),
             dt.datetime.now(dt.UTC).isoformat(),
-            ex=RESTART_TTL,
         )
     except RedisError as error:
         raise HTTPException(

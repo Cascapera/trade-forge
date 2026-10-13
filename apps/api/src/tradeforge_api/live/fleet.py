@@ -31,7 +31,8 @@ from tradeforge_db.live_setups import FollowedPair
 
 __all__ = [
     "MARKET_STATE_TTL",
-    "RESTART_PREFIX",
+    "RESTARTS_KEY",
+    "RESTART_TTL",
     "SUPERVISOR_STATE_KEY",
     "Fleet",
     "Launch",
@@ -41,8 +42,8 @@ __all__ = [
     # as an undefined export. Imported by name, it needs no listing.
     "market_state_key",
     "parse_market_state",
-    "parse_restart_key",
-    "restart_key",
+    "parse_restart_field",
+    "restart_field",
 ]
 
 type Pair = tuple[uuid.UUID, uuid.UUID]
@@ -58,7 +59,18 @@ MARKET_STATE_TTL = 180
 SUPERVISOR_STATE_KEY = "signals:supervisor"
 """The supervisor's own word, every round: what runs where. Lapsed means nobody supervises."""
 
-RESTART_PREFIX = "signals:restart:"
+RESTARTS_KEY = "signals:restarts"
+"""The screen's restart requests: one hash, a field per market (`restart_field`) valued with when it
+was asked.
+
+⚠️ **One key, not one key per request (13/10).** Requests used to be keys of their own, found each
+round with a SCAN of the whole keyspace — instant while Redis held a few thousand keys, 68 s once
+a sweep's 2.3 million jobs were back in it: every round took over a minute, and the supervisor's
+word lapsed in the middle of each, so the screen read it as stopped."""
+
+RESTART_TTL = dt.timedelta(minutes=10)
+"""How long a request is obeyed: a supervisor that was down longer does not act, when it comes
+back, on a click somebody made ten minutes earlier."""
 
 
 def market_state_key(process: str) -> str:
@@ -66,9 +78,9 @@ def market_state_key(process: str) -> str:
     return f"signals:market:{process}"
 
 
-def restart_key(instrument_id: uuid.UUID, timeframe: str) -> str:
-    """Where the screen asks for a market to be restarted."""
-    return f"{RESTART_PREFIX}{instrument_id}:{timeframe}"
+def restart_field(instrument_id: uuid.UUID, timeframe: str) -> str:
+    """A market's field in `RESTARTS_KEY`."""
+    return f"{instrument_id}:{timeframe}"
 
 
 @dataclass(frozen=True, slots=True, order=True)
@@ -79,11 +91,9 @@ class MarketKey:
     timeframe: str
 
 
-def parse_restart_key(key: str) -> "MarketKey | None":
-    """The market a restart request names; `None` for a key that is not one."""
-    if not key.startswith(RESTART_PREFIX):
-        return None
-    instrument, _, timeframe = key.removeprefix(RESTART_PREFIX).partition(":")
+def parse_restart_field(field: str) -> "MarketKey | None":
+    """The market a restart request names; `None` for a field that is not one."""
+    instrument, _, timeframe = field.partition(":")
     try:
         return MarketKey(uuid.UUID(instrument), timeframe) if timeframe else None
     except ValueError:

@@ -1,5 +1,6 @@
 """The signals screen by asset, over real Postgres and a Redis double (ADR-0033)."""
 
+import datetime as dt
 import json
 import uuid
 from collections.abc import Callable, Iterator
@@ -12,7 +13,7 @@ from sqlalchemy.orm import Session
 
 from tradeforge_api.config import Settings
 from tradeforge_api.kill_switch import KillSwitch
-from tradeforge_api.live.fleet import SUPERVISOR_STATE_KEY, restart_key
+from tradeforge_api.live.fleet import RESTARTS_KEY, SUPERVISOR_STATE_KEY, restart_field
 from tradeforge_api.main import create_app
 from tradeforge_db.live_setups import record_event
 
@@ -27,7 +28,7 @@ class Store:
 
     def __init__(self) -> None:
         self.keys: dict[str, str] = {}
-        self.expiries: dict[str, Any] = {}
+        self.hashes: dict[str, dict[str, str]] = {}
         self.down = False
 
     def get(self, name: str) -> str | None:
@@ -35,12 +36,11 @@ class Store:
             raise RedisConnectionError("Error 10061 connecting to localhost:6379")
         return self.keys.get(name)
 
-    def set(self, name: str, value: str, ex: Any = None) -> bool:
+    def hset(self, name: str, key: str, value: str) -> int:
         if self.down:
             raise RedisConnectionError("Error 10061 connecting to localhost:6379")
-        self.keys[name] = value
-        self.expiries[name] = ex
-        return True
+        self.hashes.setdefault(name, {})[key] = value
+        return 1
 
 
 @pytest.fixture
@@ -195,7 +195,7 @@ def test_a_market_switched_off_is_off_whatever_the_supervisor_says(
     assert (row["active"], row["state"]) == (False, "off")
 
 
-def test_restart_asks_the_supervisor_through_redis_for_ten_minutes(
+def test_restart_asks_the_supervisor_through_one_hash_with_when_it_was_asked(
     client: TestClient, session_factory: Callable[[], Session], store: Store
 ) -> None:
     setup = follow(client, session_factory, "WIN")
@@ -206,8 +206,8 @@ def test_restart_asks_the_supervisor_through_redis_for_ten_minutes(
     )
 
     assert response.status_code == 202, response.text
-    assert restart_key(win, "H1") in store.keys
-    assert store.expiries[restart_key(win, "H1")] == 600
+    asked = store.hashes[RESTARTS_KEY][restart_field(win, "H1")]
+    assert dt.datetime.fromisoformat(asked).tzinfo is not None
 
 
 def test_a_redis_that_cannot_be_read_is_said_and_nothing_is_guessed(

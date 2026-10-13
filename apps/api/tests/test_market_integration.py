@@ -327,3 +327,36 @@ def test_a_market_is_one_instrument_on_one_timeframe_of_signal_sessions(
         market([dataclasses.replace(one, mode=SessionMode.PAPER)])
     with pytest.raises(ValueError, match="needs its id"):
         market([dataclasses.replace(one, session_id=None)])
+
+
+def test_a_market_asked_during_its_warm_up_whether_it_is_done_is_not(
+    session: Session,
+    session_factory: Callable[[], Session],
+    plan: SessionPlan,
+    parquet_root: Path,
+) -> None:
+    """The stream asks before its first read — inside the warm-up, which reads one bar past the
+    cut to find it — when no session has opened yet. "Nobody left" is not "nobody yet": answered
+    yes, the market would end before its first live bar."""
+    history, live_bars, cut = split_at(CUT)
+    golden = signal_plan(plan)
+    market = Market(
+        factory=factory_of(session_factory),
+        plans=[golden],
+        parquet_root=parquet_root,
+        signals_for=lambda _one: Sink(),
+        signalled=lambda: False,
+        asked_to_stop=lambda _session_id: False,
+        now=lambda: cut,
+    )
+    answers: list[bool] = []
+
+    class Asking(ListSource):
+        def candles(self) -> Iterator[Candle]:
+            answers.append(market.should_stop())  # as `CandleStream` does, before reading
+            yield from live_bars
+
+    (outcome,) = market.run(Asking(history, live_bars))
+
+    assert answers == [False]
+    assert outcome.bars == len(live_bars)

@@ -1,20 +1,26 @@
 """The signals supervisor: what should run, against what does (signals PR 5b)."""
 
+import json
 import logging
 import uuid
+from collections.abc import Iterator
 from decimal import Decimal
 
 import pytest
 from redis.exceptions import ConnectionError as RedisConnectionError
 from sqlalchemy.exc import OperationalError
 
+from tradeforge_api.live.fleet import Fleet, MarketKey, market_state_key, restart_key
 from tradeforge_api.live.outage import Outage
 from tradeforge_api.live.supervisor import (
     Supervisor,
     Wanted,
+    as_wanted,
     child_environment,
+    heard_from,
+    live_loops,
     supervise_round,
-    wanted_children,
+    take_restarts,
 )
 from tradeforge_db.live_setups import FollowedPair
 
@@ -51,7 +57,7 @@ class Harness:
 
 
 SESSION_ID = uuid.uuid4()
-SESSION = Wanted("session:a", ("python", "session"), SESSION_ID)
+SESSION = Wanted("session:a", ("python", "session"), (SESSION_ID,))
 LIVE = Wanted("live:xp", ("python", "live"))
 
 
@@ -137,37 +143,48 @@ def item(broker: str | None = "xp", **fields: object) -> FollowedPair:
     return FollowedPair(**values)  # type: ignore[arg-type]
 
 
-def test_each_item_is_a_signal_session_and_each_broker_one_live_loop() -> None:
+def test_each_broker_an_item_needs_gets_one_live_loop() -> None:
     items = [item(), item(), item(broker="tradeview"), item(broker=None)]
-    ids: dict[tuple[uuid.UUID, uuid.UUID], uuid.UUID] = {}
 
-    wanted = wanted_children(items, python="py", max_sessions=10, session_ids=ids)
+    wanted = live_loops(items, python="py")
 
-    assert sorted(key for key in wanted if key.startswith("live:")) == ["live:tradeview", "live:xp"]
-    session = wanted[f"session:{items[0].setup_id}:{items[0].instrument_id}"]
-    mode = session.argv.index("--mode")
-    assert session.argv[mode + 1] == "signal"
-    assert list(session.argv[-2:]) == ["--spread-points", "5"]
-    assert session.session_id == ids[items[0].setup_id, items[0].instrument_id]
+    assert sorted(wanted) == ["live:tradeview", "live:xp"]
+    assert wanted["live:xp"].session_ids == (), "a live loop is killed, not asked"
 
 
-def test_the_same_items_want_the_same_children_on_every_tick() -> None:
-    """An unchanged item must look unchanged, or it would be stopped and restarted each tick."""
-    items = [item()]
-    ids: dict[tuple[uuid.UUID, uuid.UUID], uuid.UUID] = {}
-
-    first = wanted_children(items, python="py", max_sessions=10, session_ids=ids)
-    second = wanted_children(items, python="py", max_sessions=10, session_ids=ids)
-
-    assert first == second
+def test_an_orphans_broker_keeps_its_live_loop_with_no_setup_on_it() -> None:
+    assert set(live_loops([item()], python="py", also_brokers={"activtrades"})) == {
+        "live:xp",
+        "live:activtrades",
+    }
 
 
-def test_sessions_beyond_the_cap_wait() -> None:
-    items = [item() for _ in range(5)]
+def test_a_market_process_is_asked_through_every_session_it_carries_and_logs_per_market() -> None:
+    fleet = Fleet(python="py", clock=lambda: 0.0)
+    one = item(timeframe="M5")
+    two = item(timeframe="M5", instrument_id=one.instrument_id)
+    (launch,) = fleet.reconcile(
+        [one, two], heard={}, restart=(), ask_to_stop=lambda _session_id: None
+    )
 
-    wanted = wanted_children(items, python="py", max_sessions=3, session_ids={})
+    wanted = as_wanted(launch)
 
-    assert sum(key.startswith("session:") for key in wanted) == 3
+    assert set(wanted.session_ids) == set(launch.sessions.values())
+    assert wanted.log == f"market-{one.instrument_id}-M5"
+    assert as_wanted(launch) == wanted, "the same process must look the same on every round"
+
+
+def test_a_child_seen_ending_by_tick_is_still_handed_out_by_the_next_poll() -> None:
+    """Otherwise a process ending between a round's poll and its tick was noticed by nobody
+    keeping the fleet's book, and the next round asked for it again with the same session ids."""
+    h = Harness()
+    h.supervisor.tick({SESSION.key: SESSION})
+    h.last("session:a").code = 1
+
+    h.supervisor.tick({SESSION.key: SESSION})
+
+    assert h.supervisor.poll() == {"session:a": 1}
+    assert h.supervisor.poll() == {}
 
 
 def test_children_start_with_numpy_held_to_one_thread() -> None:
@@ -270,7 +287,8 @@ def test_a_stop_request_redis_did_not_take_is_asked_again_and_the_grace_starts_t
 
 def test_on_exit_one_session_that_cannot_be_asked_does_not_keep_the_others_from_it() -> None:
     h = Harness()
-    other = Wanted("session:b", ("python", "session"), uuid.uuid4())
+    other_id = uuid.uuid4()
+    other = Wanted("session:b", ("python", "session"), (other_id,))
     h.supervisor.tick({SESSION.key: SESSION, other.key: other})
 
     def ask(session_id: uuid.UUID) -> None:
@@ -281,7 +299,7 @@ def test_on_exit_one_session_that_cannot_be_asked_does_not_keep_the_others_from_
     h.supervisor.ask_to_stop = ask
     h.supervisor.stop_all()
 
-    assert h.asked == [other.session_id]
+    assert h.asked == [other_id]
 
 
 def test_an_outage_is_said_once_with_its_traceback_then_counted_then_ended(
@@ -297,3 +315,48 @@ def test_an_outage_is_said_once_with_its_traceback_then_counted_then_ended(
     said = [(r.levelname, r.exc_info is not None) for r in caplog.records if r.name == OUTAGE.name]
     assert said == [("ERROR", True), ("WARNING", False), ("WARNING", False), ("INFO", False)]
     assert caplog.records[-1].getMessage() == "back after 3 lost round(s)"
+
+
+# --------------------------------------------------------------------------- what Redis says
+
+
+class Said:
+    """The few Redis calls the supervisor reads the fleet's news with."""
+
+    def __init__(self, values: dict[str, str]) -> None:
+        self.values = dict(values)
+
+    def mget(self, keys: list[str]) -> list[str | None]:
+        return [self.values.get(key) for key in keys]
+
+    def scan_iter(self, match: str) -> Iterator[str]:
+        prefix = match.removesuffix("*")
+        return iter([key for key in list(self.values) if key.startswith(prefix)])
+
+    def delete(self, key: str) -> int:
+        return 1 if self.values.pop(key, None) is not None else 0
+
+
+def test_what_each_market_process_said_is_read_and_silence_is_none() -> None:
+    session_id = uuid.uuid4()
+    redis = Said(
+        {market_state_key("market:a"): json.dumps({"phase": "live", "sessions": [str(session_id)]})}
+    )
+
+    heard = heard_from(redis, ["market:a", "market:b"])  # type: ignore[arg-type]
+
+    state = heard["market:a"]
+    assert state is not None
+    assert state.sessions == {session_id}
+    assert heard["market:b"] is None
+
+
+def test_a_restart_request_is_taken_once() -> None:
+    instrument = uuid.uuid4()
+    redis = Said({restart_key(instrument, "M5"): "1", "signals:restart:garbage": "1"})
+
+    first = take_restarts(redis)  # type: ignore[arg-type]
+    second = take_restarts(redis)  # type: ignore[arg-type]
+
+    assert first == [MarketKey(instrument, "M5")]
+    assert second == []

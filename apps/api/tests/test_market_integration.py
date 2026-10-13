@@ -360,3 +360,73 @@ def test_a_market_asked_during_its_warm_up_whether_it_is_done_is_not(
 
     assert answers == [False]
     assert outcome.bars == len(live_bars)
+
+
+def test_the_market_tells_the_supervisor_what_it_carries(
+    session: Session,
+    session_factory: Callable[[], Session],
+    plan: SessionPlan,
+    other: Strategy,
+    parquet_root: Path,
+) -> None:
+    """What the fleet counts sessions by: one that left without being asked has failed."""
+    history, live_bars, cut = split_at(CUT)
+    golden, leaving = signal_plan(plan), signal_plan(plan, other)
+    assert golden.session_id is not None
+    assert leaving.session_id is not None
+    said: list[tuple[str, frozenset[uuid.UUID]]] = []
+    asked: set[uuid.UUID] = set()
+    market = Market(
+        factory=factory_of(session_factory),
+        plans=[golden, leaving],
+        parquet_root=parquet_root,
+        signals_for=lambda _one: Sink(),
+        signalled=lambda: False,
+        asked_to_stop=lambda session_id: session_id in asked,
+        now=lambda: cut,
+        publish=lambda phase, sessions: said.append((phase, frozenset(sessions))),
+    )
+
+    class Asking(ListSource):
+        def candles(self) -> Iterator[Candle]:
+            for index, candle in enumerate(live_bars):
+                if index == 2:
+                    asked.add(leaving.session_id)  # type: ignore[arg-type]
+                yield candle
+
+    market.run(Asking(history, live_bars))
+
+    both = frozenset({golden.session_id, leaving.session_id})
+    assert said[0] == ("warming", both)
+    assert said[1] == ("live", both)
+    assert ("live", frozenset({golden.session_id})) in said
+    assert said[-1] == ("live", frozenset({golden.session_id}))
+
+
+def test_a_market_that_cannot_tell_the_supervisor_still_trades(
+    session: Session,
+    session_factory: Callable[[], Session],
+    plan: SessionPlan,
+    parquet_root: Path,
+) -> None:
+    history, live_bars, cut = split_at(CUT)
+    golden = signal_plan(plan)
+
+    def redis_down(_phase: str, _sessions: object) -> None:
+        raise ConnectionError("Error 10061 connecting to localhost:6379")
+
+    market = Market(
+        factory=factory_of(session_factory),
+        plans=[golden],
+        parquet_root=parquet_root,
+        signals_for=lambda _one: Sink(),
+        signalled=lambda: False,
+        asked_to_stop=lambda _session_id: False,
+        now=lambda: cut,
+        publish=redis_down,
+    )
+
+    (outcome,) = market.run(ListSource(history, live_bars))
+
+    assert outcome.error is None
+    assert outcome.bars == len(live_bars)

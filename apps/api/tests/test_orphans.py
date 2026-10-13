@@ -13,14 +13,8 @@ from tradeforge_api.live import orphans
 from tradeforge_api.live.notifier import format_message
 from tradeforge_api.live.orphans import ORPHAN_NOTE, OrphanWatch, annul, orphan_brokers
 from tradeforge_api.live.signals import SIGNALS_STREAM
-from tradeforge_api.live.supervisor import (
-    Supervisor,
-    Wanted,
-    alive_sessions,
-    forget_the_stopped,
-    wanted_children,
-)
-from tradeforge_db.live_setups import FollowedPair, OpenSignal
+from tradeforge_api.live.supervisor import Supervisor, Wanted
+from tradeforge_db.live_setups import OpenSignal
 
 T0 = dt.datetime(2026, 10, 9, 18, 45, tzinfo=dt.UTC)
 M5 = dt.timedelta(minutes=5)
@@ -269,44 +263,18 @@ class Child:
     def kill(self) -> None: ...
 
 
-def test_a_pair_whose_session_stopped_gets_a_new_id_on_its_next_launch() -> None:
-    """One id per launch: a relaunched session must not claim what the dead one posted."""
-    running_pair, stopped_pair = (uuid.uuid4(), uuid.uuid4()), (uuid.uuid4(), uuid.uuid4())
-    ids = {running_pair: uuid.uuid4(), stopped_pair: uuid.uuid4()}
-
-    forget_the_stopped(ids, {f"session:{running_pair[0]}:{running_pair[1]}"})
-
-    assert list(ids) == [running_pair]
-
-
-def test_the_sessions_alive_are_those_running_even_while_stopping() -> None:
+def test_a_stopped_process_s_sessions_are_asked_again_by_every_id_it_carried() -> None:
+    """The supervisor asks a market process to stop through each session it carries."""
     one, two = uuid.uuid4(), uuid.uuid4()
-    supervisor = Supervisor(launch=lambda _wanted: Child(), ask_to_stop=lambda _id: None)
+    asked: list[uuid.UUID] = []
+    supervisor = Supervisor(launch=lambda _wanted: Child(), ask_to_stop=asked.append)
     supervisor.tick(
         {
-            "session:a": Wanted("session:a", ("x",), one),
-            "session:b": Wanted("session:b", ("y",), two),
+            "market:a": Wanted("market:a", ("x",), (one, two)),
             "live:xp": Wanted("live:xp", ("z",)),
         }
     )
-    supervisor.tick({"session:a": Wanted("session:a", ("x",), one)})  # b asked to stop
 
-    assert alive_sessions(supervisor) == {one, two}
+    supervisor.tick({"live:xp": Wanted("live:xp", ("z",))})
 
-
-def test_an_orphans_broker_keeps_its_live_loop_with_no_setup_on_it() -> None:
-    pair = FollowedPair(
-        setup_id=uuid.uuid4(),
-        strategy_id=uuid.uuid4(),
-        instrument_id=uuid.uuid4(),
-        timeframe="M5",
-        cost_model={},
-        no_target_r=Decimal(5),
-        broker="xp",
-    )
-
-    wanted = wanted_children(
-        [pair], python="py", max_sessions=10, session_ids={}, also_brokers={"activtrades"}
-    )
-
-    assert {"live:xp", "live:activtrades"} <= set(wanted)
+    assert asked == [one, two]

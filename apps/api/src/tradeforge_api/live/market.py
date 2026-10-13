@@ -7,6 +7,10 @@ and each bar is handed to every session in turn, instead of every session readin
 and the same stream in a process of its own. Measured on the live setups (13/10): WIN M5, four
 setups, 386 MB committed against 1 420 MB apart; trades and balances identical, setup by setup.
 
+**It tells the supervisor what it carries** (`live.fleet.market_state_key`): its phase and the
+sessions still in it, on every stream read and every bar, so a session that left without being
+asked is seen as failed and launched again on its own.
+
 **One session's failure is that session's alone**, as in `engine.batch`: a setup that raises is
 recorded `failed` with its reason and leaves the market, and the others go on. A failure of what
 they all share — the stream, the disk, the hole between them — ends every one of them, because
@@ -23,7 +27,7 @@ import logging
 import sys
 import threading
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Iterable, Sequence
 from decimal import Decimal
 from pathlib import Path
 
@@ -32,6 +36,8 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from tradeforge_api.config import Settings
 from tradeforge_api.live.candle_stream import CandleStream
+from tradeforge_api.live.fleet import MARKET_STATE_TTL, market_state_key
+from tradeforge_api.live.outage import Outage
 from tradeforge_api.live.process import stop_on_signals
 from tradeforge_api.live.session import (
     InheritedTrade,
@@ -59,8 +65,16 @@ logger = logging.getLogger(__name__)
 __all__ = ["Market", "main"]
 
 
+REPORT_EVERY_WARM_BARS = 20_000
+"""How often a warm-up that takes minutes says it is still alive and what it is warming."""
+
+
 def _utcnow() -> dt.datetime:
     return dt.datetime.now(dt.UTC)
+
+
+def _say_nothing(_phase: str, _sessions: Collection[uuid.UUID]) -> None:
+    """For a market nobody supervises (a test, a process started by hand without `--key`)."""
 
 
 class Market:
@@ -77,6 +91,7 @@ class Market:
         asked_to_stop: Callable[[uuid.UUID], bool],
         now: Callable[[], dt.datetime] = _utcnow,
         promotion_days: int = 5,
+        publish: Callable[[str, Collection[uuid.UUID]], None] = _say_nothing,
     ) -> None:
         if not plans:
             raise ValueError("a market needs at least one session")
@@ -95,6 +110,8 @@ class Market:
         self._asked_to_stop = asked_to_stop
         self._now = now
         self._promotion_days = promotion_days
+        self._publish = publish
+        self._telling = Outage(logger)
         self.outcomes: list[SessionOutcome] = []
         self.failures = 0
         """Sessions that ended on an error — refused, failed in the warm-up, or failed live."""
@@ -117,6 +134,7 @@ class Market:
         one setup turned off long before.
         """
         self._settle_stops()
+        self._report()
         return self._signalled() or (self._candles is not None and self.sessions == 0)
 
     def run(self, source: BarSource) -> list[SessionOutcome]:
@@ -132,6 +150,7 @@ class Market:
             timeframe=first.timeframe,
             opened_at=opened_at,
         )
+        self._report("warming", lives)
         warming = self._warm(lives, candles)
         # The hole is the market's, not a session's: every one of them would read it.
         refuse_a_hole(candles, first.symbol, first.plan.timeframe)
@@ -143,12 +162,14 @@ class Market:
                 self._open(life)
             else:
                 self._following[life.session_id] = (life, trade)
+        self._report()
 
         failure: str | None = None
         try:
             for candle in stream:
                 self._bar(candle)
                 self._settle_stops()
+                self._report()
                 if self._signalled() or self.sessions == 0:
                     break
             else:
@@ -186,10 +207,12 @@ class Market:
     def _warm(self, lives: list[SessionLife], candles: SplicedCandles) -> list[SessionLife]:
         """The history read once, each bar handed to every session still warming."""
         warming = list(lives)
-        for candle in candles.warmup():
+        for index, candle in enumerate(candles.warmup(), start=1):
             for life in list(warming):
                 if not self._guarded(life, life.warm_bar, candle):
                     warming.remove(life)
+            if index % REPORT_EVERY_WARM_BARS == 0:
+                self._report("warming", warming)
         return [life for life in warming if self._guarded(life, life.end_warmup)]
 
     def _bar(self, candle: Candle) -> None:
@@ -233,6 +256,24 @@ class Market:
             self.failures += 1
             return
         self._live.append(life)
+
+    def _report(self, phase: str | None = None, sessions: Iterable[SessionLife] = ()) -> None:
+        """Tell the supervisor what this process carries: `sessions` while warming, every one
+        live or following its inherited trade after. Never fatal — a supervisor that cannot be
+        told goes on believing the last thing it heard until that lapses, and the sessions trade."""
+        carried = list(sessions) or [
+            *self._live,
+            *(life for life, _trade in self._following.values()),
+        ]
+        try:
+            self._publish(
+                phase or ("live" if self._candles is not None else "warming"),
+                [life.session_id for life in carried],
+            )
+        except Exception:  # noqa: BLE001 — see the docstring
+            self._telling.lost("telling the supervisor what this market carries")
+        else:
+            self._telling.back()
 
     def _settle_stops(self) -> None:
         """Finish every session somebody asked to stop (`live-session:<id>:stop`)."""
@@ -290,6 +331,11 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="tradeforge-market",
         description="Run every signal session of one market (instrument + timeframe) together.",
+    )
+    parser.add_argument(
+        "--key",
+        default=None,
+        help="the supervisor's name for this process; tells it nothing without",
     )
     parser.add_argument("--instrument", required=True, type=uuid.UUID, help="instrument id")
     parser.add_argument("--timeframe", required=True, help="e.g. M5")
@@ -362,6 +408,16 @@ def main(argv: list[str] | None = None) -> int:
             },
         )
 
+    def publish(phase: str, sessions: Collection[uuid.UUID]) -> None:
+        if args.key is None:
+            return
+        word = {
+            "phase": phase,
+            "sessions": [str(one) for one in sessions],
+            "at": dt.datetime.now(dt.UTC).isoformat(),
+        }
+        redis.set(market_state_key(args.key), json.dumps(word), ex=MARKET_STATE_TTL)
+
     market = Market(
         factory=factory,
         plans=plans,
@@ -370,6 +426,7 @@ def main(argv: list[str] | None = None) -> int:
         signalled=stopping.is_set,
         asked_to_stop=lambda session_id: stop_requested(redis, session_id),
         promotion_days=settings.live_promotion_days,
+        publish=publish,
     )
     # One consumer group for the market: every session reads the bars this one group is handed.
     source = CandleStream(

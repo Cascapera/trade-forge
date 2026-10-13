@@ -204,7 +204,9 @@ def test_the_base_holds_each_distinct_entry_of_the_unmanaged_runs_once(
     assert sorted(by_hour) == [1, 5, 9]  # the managed point's trade at 01:00 is not another one
     shared = by_hour[1]
     assert shared["n_configurations"] == 2
-    assert json.loads(shared["configurations"]) == [
+    # In run-id order (#439), and these ids are drawn at random: the content is the claim here.
+    configurations = json.loads(shared["configurations"])
+    assert sorted(configurations, key=lambda one: one["setup.params.long_average_period"]) == [
         {"setup.params.long_average_period": 100},
         {"setup.params.long_average_period": 200},
     ]

@@ -82,6 +82,25 @@ describe('live session endpoints', () => {
   })
 })
 
+describe('live market endpoints', () => {
+  it('reads the setups by asset, and asks for one market to restart', async () => {
+    const fetchMock = mockFetch(202, { requested: true })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await api.listLiveMarkets()
+    await expect(api.restartMarket({ instrument_id: 'i1', timeframe: 'M5' })).resolves.toEqual({
+      requested: true,
+    })
+
+    expect(fetchMock).toHaveBeenNthCalledWith(1, '/api/live-markets', { method: 'GET' })
+    expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/live-markets/restart', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ instrument_id: 'i1', timeframe: 'M5' }),
+    })
+  })
+})
+
 describe('socketUrl', () => {
   it('turns the API prefix into a ws:// address', () => {
     vi.stubGlobal('location', new URL('http://localhost:5173/live'))

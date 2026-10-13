@@ -3287,3 +3287,83 @@ class SignalOut(_Out):
     triggered_at: dt.datetime | None = None
     ended_at: dt.datetime | None = None
     strategy_id: uuid.UUID | None = None
+
+
+# --------------------------------------------------------------------------- signals by market
+
+
+class SupervisorOut(BaseModel):
+    """Whether the signals supervisor is supervising, as its own last word says (ADR-0033)."""
+
+    alive: bool
+    """It spoke within its last few rounds. `False`: nobody restarts a session that fails."""
+    at: dt.datetime | None = None
+    reachable: bool = True
+    """`False` when Redis could not be read, so nothing is known either way."""
+
+
+class MarketProcessOut(BaseModel):
+    """One process of a market: what it last said and how many sessions it carries."""
+
+    key: str
+    phase: str | None = None
+    """`warming`, `live`, or `None` when it has not said anything readable yet."""
+    heard_at: dt.datetime | None = None
+    sessions: int
+
+
+LiveSessionState = Literal[
+    "running", "warming", "starting", "stopping", "waiting", "off", "unknown"
+]
+
+
+class LiveMarketSetupOut(BaseModel):
+    """One setup on one market: its switch, its session's state, what is under way, its record."""
+
+    setup_id: uuid.UUID
+    name: str
+    strategy_name: str
+    setup_active: bool
+    active: bool
+    """This market's own switch on the setup."""
+    no_target_r: Money
+    state: LiveSessionState
+    retry_in: int | None = None
+    """Seconds before a session that failed is tried again (`state` is `waiting`)."""
+    under_way: list[SignalOut]
+    """Signals still armed or in a trade, oldest first."""
+    metrics: LiveMetricsOut
+    """This setup's record on this market alone."""
+
+
+class LiveTimeframeOut(BaseModel):
+    """One market — an instrument on a timeframe — and the processes that run it."""
+
+    timeframe: str
+    processes: list[MarketProcessOut]
+    """Usually one; two or more while a setup added since the last restart still runs apart."""
+    restarting: bool
+    setups: list[LiveMarketSetupOut]
+
+
+class LiveAssetOut(BaseModel):
+    """An instrument and its markets, one per timeframe."""
+
+    instrument_id: uuid.UUID
+    symbol: str
+    broker: str | None = None
+    timeframes: list[LiveTimeframeOut]
+
+
+class LiveMarketsOut(BaseModel):
+    """The signals screen by asset: the supervisor's word, then every asset followed."""
+
+    supervisor: SupervisorOut
+    assets: list[LiveAssetOut]
+
+
+class RestartMarketRequest(BaseModel):
+    """Restart one market's sessions together, in one process."""
+
+    instrument_id: uuid.UUID
+    timeframe: Timeframe

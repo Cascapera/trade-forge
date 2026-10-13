@@ -46,6 +46,7 @@ __all__ = [
     "set_market",
     "setup_metrics",
     "signals_of",
+    "signals_under_way",
     "update_setup",
 ]
 
@@ -558,6 +559,21 @@ def signals_of(
     )
 
 
+def signals_under_way(
+    session: Session,
+) -> dict[tuple[uuid.UUID, uuid.UUID], list[SignalRecord]]:
+    """Every signal still armed or in a trade, by (setup, instrument), oldest first."""
+    found: dict[tuple[uuid.UUID, uuid.UUID], list[SignalRecord]] = {}
+    for record in session.scalars(
+        select(SignalRecord)
+        .where(SignalRecord.status.in_(("armed", "triggered")))
+        .order_by(SignalRecord.number)
+    ):
+        if record.setup_id is not None and record.instrument_id is not None:
+            found.setdefault((record.setup_id, record.instrument_id), []).append(record)
+    return found
+
+
 @dataclass(frozen=True, slots=True)
 class SetupMetrics:
     """What a setup's closed signals add up to, in R."""
@@ -575,13 +591,19 @@ class SetupMetrics:
     r_by_month: dict[str, Decimal] = field(default_factory=dict)
 
 
-def setup_metrics(session: Session, setup_id: uuid.UUID) -> SetupMetrics:
-    """The setup's history summed up, in R, from its signals in the order they closed."""
-    rows = session.execute(
+def setup_metrics(
+    session: Session, setup_id: uuid.UUID, *, instrument_id: uuid.UUID | None = None
+) -> SetupMetrics:
+    """The setup's history summed up, in R, from its signals in the order they closed — on every
+    market, or on `instrument_id` alone (the signals screen by asset, ADR-0033)."""
+    statement = (
         select(SignalRecord.status, SignalRecord.result_r, SignalRecord.ended_at)
         .where(SignalRecord.setup_id == setup_id)
         .order_by(SignalRecord.ended_at.nulls_last(), SignalRecord.number)
-    ).all()
+    )
+    if instrument_id is not None:
+        statement = statement.where(SignalRecord.instrument_id == instrument_id)
+    rows = session.execute(statement).all()
     results = [r for status, r, _ in rows if status == "closed" and r is not None]
     gains = sum((r for r in results if r > 0), Decimal(0))
     losses = -sum((r for r in results if r < 0), Decimal(0))

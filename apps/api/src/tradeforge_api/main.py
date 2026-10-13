@@ -36,6 +36,7 @@ from tradeforge_api.routers import (
     collections,
     executor,
     instruments,
+    live_markets,
     live_sessions,
     live_setups,
     strategies,
@@ -46,6 +47,7 @@ from tradeforge_api.routers import (
     symbols,
     walkforwards,
 )
+from tradeforge_api.routers.live_markets import SignalsStore
 from tradeforge_api.snapshot_store import InMemory, SnapshotStore
 from tradeforge_api.snapshots import child_pool, refresh_forever
 from tradeforge_db.session import create_db_engine, create_session_factory
@@ -75,26 +77,19 @@ def _start_snapshots(
     return task, pool
 
 
-@asynccontextmanager
-async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Create only what was not injected, and dispose only what we created."""
-    settings: Settings = app.state.settings
-    owns_engine = False
+def _redis_stores(app: FastAPI, settings: Settings) -> None:
+    """The stores a test can replace — kill switch, stop requests, collector, signals — on one
+    Redis client of their own, made only when one of them was not injected.
 
-    if not hasattr(app.state, "session_factory"):
-        engine = create_db_engine(settings.sqlalchemy_dsn)
-        app.state.session_factory = create_session_factory(engine)
-        app.state._engine = engine
-        owns_engine = True
-
-    if not hasattr(app.state, "arq_pool"):
-        app.state.arq_pool = await create_pool(redis_settings(settings))
-        app.state._owns_pool = True
-
+    ⚠️ **Each default assigned behind its own check, never `getattr(state, name, client)`**: the
+    default of a `getattr` is evaluated first, and with all four injected there is no client to
+    evaluate — the app would fail to start for exactly the test that replaced everything.
+    """
     if not (
         hasattr(app.state, "kill_switch")
         and hasattr(app.state, "stop_store")
         and hasattr(app.state, "collector")
+        and hasattr(app.state, "signals_store")
     ):
         # ⚠️ A client of its own rather than the arq pool, and the reason is not tidiness. The
         # pool is async and arq's; these are read and written by plain handlers, and an emergency
@@ -113,6 +108,27 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.stop_store = app.state._redis_client
     if not hasattr(app.state, "collector"):
         app.state.collector = Collector(app.state._redis_client)
+    if not hasattr(app.state, "signals_store"):
+        app.state.signals_store = app.state._redis_client
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Create only what was not injected, and dispose only what we created."""
+    settings: Settings = app.state.settings
+    owns_engine = False
+
+    if not hasattr(app.state, "session_factory"):
+        engine = create_db_engine(settings.sqlalchemy_dsn)
+        app.state.session_factory = create_session_factory(engine)
+        app.state._engine = engine
+        owns_engine = True
+
+    if not hasattr(app.state, "arq_pool"):
+        app.state.arq_pool = await create_pool(redis_settings(settings))
+        app.state._owns_pool = True
+
+    _redis_stores(app, settings)
     refreshing, pool = _start_snapshots(app, settings, refresh=owns_engine)
 
     try:
@@ -138,6 +154,7 @@ def create_app(  # noqa: PLR0913 — keyword-only seams, one per connection a te
     kill_switch: KillSwitch | None = None,
     stop_store: StopStore | None = None,
     collector: Collector | None = None,
+    signals_store: SignalsStore | None = None,
 ) -> FastAPI:
     """Build the app. Pass `session_factory`/`arq_pool`/`kill_switch` to bypass the real
     connections.
@@ -162,6 +179,8 @@ def create_app(  # noqa: PLR0913 — keyword-only seams, one per connection a te
         app.state.stop_store = stop_store
     if collector is not None:
         app.state.collector = collector
+    if signals_store is not None:
+        app.state.signals_store = signals_store
 
     app.include_router(instruments.router)
     app.include_router(candle_files.router)
@@ -173,6 +192,7 @@ def create_app(  # noqa: PLR0913 — keyword-only seams, one per connection a te
     app.include_router(backtests.router)
     app.include_router(executor.router)
     app.include_router(live_sessions.router)
+    app.include_router(live_markets.router)
     app.include_router(baskets.router)
     app.include_router(studies.router)
     # Before `sweeps`: `/sweeps/{id}/walkforward` must not be read by a broader sweeps path.

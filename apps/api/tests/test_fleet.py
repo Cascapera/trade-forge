@@ -14,8 +14,8 @@ from tradeforge_api.live.fleet import (
     MarketKey,
     MarketState,
     parse_market_state,
-    parse_restart_key,
-    restart_key,
+    parse_restart_field,
+    restart_field,
 )
 from tradeforge_db.live_setups import FollowedPair
 
@@ -252,5 +252,6 @@ def test_a_market_process_word_and_a_restart_request_read_back() -> None:
     assert state.sessions == {session_id}
     assert parse_market_state(None) is None
     assert parse_market_state("{not json") is None
-    assert parse_restart_key(restart_key(WIN, "M15")) == MarketKey(WIN, "M15")
-    assert parse_restart_key("signals:restart:not-an-id:M5") is None
+    assert parse_restart_field(restart_field(WIN, "M15")) == MarketKey(WIN, "M15")
+    assert parse_restart_field("not-an-id:M5") is None
+    assert parse_restart_field(str(WIN)) is None

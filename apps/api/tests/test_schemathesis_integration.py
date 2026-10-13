@@ -74,6 +74,10 @@ class _FakeSwitchStore:
         self.keys[str(name)] = str(value)
         return True
 
+    def hset(self, name: Any, key: Any, value: Any) -> int:
+        self.keys[f"{name}:{key}"] = str(value)
+        return 1
+
 
 @pytest.fixture
 def api_schema(session_factory: Callable[[], Session], settings: Settings, tmp_path: Path) -> Any:

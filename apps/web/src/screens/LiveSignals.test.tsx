@@ -481,9 +481,48 @@ describe('LiveSignals by asset', () => {
     vi.mocked(useLiveSetups).mockReturnValue({ data: [setup], isPending: false } as never)
     renderWithProviders(<LiveSignals />)
 
-    expect(screen.getAllByRole('region', { name: 'WIN H1' })[1]).not.toHaveTextContent(
-      'Add setup…',
-    )
+    const h1 = screen.getAllByRole('region', { name: 'WIN H1' })[1]
+    expect(h1).not.toHaveTextContent('Add setup…')
+    // Said rather than hidden: an empty space read as the control missing (13/10).
+    expect(h1).toHaveTextContent('Every H1 setup is already on WIN')
+  })
+
+  it('removes a setup from this asset after saying what that does to its signals', () => {
+    const { mutate } = mountByAsset(markets)
+    const m5 = market('WIN M5')
+
+    fireEvent.click(m5.getAllByRole('button', { name: 'Remove from WIN' })[0]!)
+
+    expect(
+      m5.getByText(/CHOCH - 5 MIN stops following WIN; it stays on its other assets\./),
+    ).toBeInTheDocument()
+    expect(
+      m5.getByText(
+        '1 armed signal will be cancelled on the channel; 1 in a trade will be followed by price.',
+      ),
+    ).toBeInTheDocument()
+    fireEvent.click(m5.getByRole('button', { name: 'Yes, remove from WIN' }))
+    expect(mutate.mock.calls.map((call: unknown[]) => call[0])).toEqual([
+      { kind: 'remove-market', id: 'm5a', instrumentId: 'win' },
+    ])
+  })
+
+  it('deletes a setup from every asset only once confirmed, and can be kept', () => {
+    const { mutate } = mountByAsset(markets)
+    const m5 = market('WIN M5')
+
+    fireEvent.click(m5.getAllByRole('button', { name: 'Delete setup' })[1]!)
+    expect(m5.getByText(/CONTINUATION is deleted from every asset it follows/)).toBeInTheDocument()
+    expect(m5.getByText('No signal is under way here, so none is touched.')).toBeInTheDocument()
+    fireEvent.click(m5.getByRole('button', { name: 'Keep it' }))
+    expect(m5.queryByRole('button', { name: 'Yes, delete CONTINUATION' })).not.toBeInTheDocument()
+    expect(mutate).not.toHaveBeenCalled()
+
+    fireEvent.click(m5.getAllByRole('button', { name: 'Delete setup' })[1]!)
+    fireEvent.click(m5.getByRole('button', { name: 'Yes, delete CONTINUATION' }))
+    expect(mutate.mock.calls.map((call: unknown[]) => call[0])).toEqual([
+      { kind: 'remove-setup', id: 'm5b' },
+    ])
   })
 
   it('says what a restart does to the signals under way, then asks for it', () => {

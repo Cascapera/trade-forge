@@ -387,6 +387,9 @@ function SetupOnMarket(props: {
 }): React.JSX.Element {
   const { asset, row, change } = props
   const [history, setHistory] = useState(false)
+  // Which destructive action is waiting for its confirmation, if any.
+  const [asking, setAsking] = useState<'remove' | 'delete' | null>(null)
+  const { armed, inTrade } = underWay([row])
   return (
     <li
       className={`space-y-1 border-t border-slate-800 pt-2 text-sm ${
@@ -437,16 +440,84 @@ function SetupOnMarket(props: {
           ))}
         </ul>
       )}
-      <button
-        type="button"
-        onClick={() => {
-          setHistory(!history)
-        }}
-        className="text-xs text-sky-400 hover:text-sky-300"
-        aria-expanded={history}
-      >
-        {history ? 'Hide the history' : 'History'}
-      </button>
+      <div className="flex flex-wrap gap-3">
+        <button
+          type="button"
+          onClick={() => {
+            setHistory(!history)
+          }}
+          className="text-xs text-sky-400 hover:text-sky-300"
+          aria-expanded={history}
+        >
+          {history ? 'Hide the history' : 'History'}
+        </button>
+        <button
+          type="button"
+          disabled={change.isPending}
+          onClick={() => {
+            setAsking('remove')
+          }}
+          className="text-xs text-red-300 hover:text-red-200 disabled:opacity-40"
+        >
+          Remove from {asset.symbol}
+        </button>
+        <button
+          type="button"
+          disabled={change.isPending}
+          onClick={() => {
+            setAsking('delete')
+          }}
+          className="text-xs text-red-300 hover:text-red-200 disabled:opacity-40"
+        >
+          Delete setup
+        </button>
+      </div>
+      {asking !== null && (
+        <div className="space-y-2 rounded border border-red-900 bg-slate-900 p-3 text-sm">
+          <p className="text-slate-300">
+            {asking === 'remove'
+              ? `${row.name} stops following ${asset.symbol}; it stays on its other assets.`
+              : `${row.name} is deleted from every asset it follows; its signals' history is kept.`}{' '}
+            <strong className="text-amber-200">{consequence(armed, inTrade)}</strong>
+          </p>
+          <div className="flex gap-2">
+            <button
+              type="button"
+              disabled={change.isPending}
+              onClick={() => {
+                change.mutate(
+                  asking === 'remove'
+                    ? {
+                        kind: 'remove-market',
+                        id: row.setup_id,
+                        instrumentId: asset.instrument_id,
+                      }
+                    : { kind: 'remove-setup', id: row.setup_id },
+                  {
+                    onSuccess: () => {
+                      setAsking(null)
+                    },
+                  },
+                )
+              }}
+              className="rounded bg-red-800 px-2 py-1 text-xs text-white disabled:bg-slate-700"
+            >
+              {asking === 'remove'
+                ? `Yes, remove from ${asset.symbol}`
+                : `Yes, delete ${row.name}`}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setAsking(null)
+              }}
+              className="text-xs text-slate-500 hover:text-slate-300"
+            >
+              Keep it
+            </button>
+          </div>
+        </div>
+      )}
       {history && <History setupId={row.setup_id} symbol={asset.symbol} />}
     </li>
   )
@@ -481,13 +552,20 @@ function AddSetup(props: {
   market: LiveTimeframeOut
   setups: LiveSetup[]
   change: ReturnType<typeof useChangeLive>
-}): React.JSX.Element | null {
+}): React.JSX.Element {
   const { asset, market, change } = props
   const here = new Set(market.setups.map((row) => row.setup_id))
   const candidates = props.setups.filter(
     (setup) => setup.timeframe === market.timeframe && !here.has(setup.id),
   )
-  if (candidates.length === 0) return null
+  if (candidates.length === 0) {
+    return (
+      <p className="text-xs text-slate-500">
+        Every {market.timeframe} setup is already on {asset.symbol} — a new one comes from “Watch
+        this setup live” on a run, or “New setup”.
+      </p>
+    )
+  }
   return (
     <select
       aria-label={`Add a setup to ${asset.symbol} ${market.timeframe}`}

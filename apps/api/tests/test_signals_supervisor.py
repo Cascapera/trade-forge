@@ -1,9 +1,21 @@
 """The signals supervisor: what should run, against what does (signals PR 5b)."""
 
+import logging
 import uuid
 from decimal import Decimal
 
-from tradeforge_api.live.supervisor import Supervisor, Wanted, child_environment, wanted_children
+import pytest
+from redis.exceptions import ConnectionError as RedisConnectionError
+from sqlalchemy.exc import OperationalError
+
+from tradeforge_api.live.outage import Outage
+from tradeforge_api.live.supervisor import (
+    Supervisor,
+    Wanted,
+    child_environment,
+    supervise_round,
+    wanted_children,
+)
 from tradeforge_db.live_setups import FollowedPair
 
 
@@ -169,3 +181,119 @@ def test_children_start_with_numpy_held_to_one_thread() -> None:
 
 def test_an_operator_setting_the_threads_on_purpose_keeps_it() -> None:
     assert child_environment({"OPENBLAS_NUM_THREADS": "4"})["OPENBLAS_NUM_THREADS"] == "4"
+
+
+# --------------------------------------------------------------------------- outages
+
+OUTAGE = logging.getLogger("tests.outage")
+
+
+def unreachable() -> dict[str, Wanted]:
+    raise OperationalError("SELECT 1", {}, Exception("connection refused"))
+
+
+def nothing() -> None:
+    pass
+
+
+def test_an_unreachable_database_skips_the_round_and_touches_no_child() -> None:
+    """12/10: a `wsl --shutdown` took Postgres away for minutes. A round that cannot read what
+    should run must not read it as "nothing": that would ask every session to stop and kill
+    every live loop because the database blinked."""
+    h = Harness()
+    h.supervisor.tick({SESSION.key: SESSION, LIVE.key: LIVE})
+
+    ran = supervise_round(
+        h.supervisor, wanted=unreachable, housekeeping=nothing, outage=Outage(OUTAGE)
+    )
+
+    assert ran is False
+    assert h.asked == []
+    assert not h.last("session:a").terminated
+    assert not h.last("live:xp").terminated
+    assert set(h.supervisor.running) == {"session:a", "live:xp"}
+
+
+def test_the_round_after_an_outage_starts_what_is_wanted() -> None:
+    h = Harness()
+    outage = Outage(OUTAGE)
+    supervise_round(h.supervisor, wanted=unreachable, housekeeping=nothing, outage=outage)
+
+    ran = supervise_round(
+        h.supervisor, wanted=lambda: {SESSION.key: SESSION}, housekeeping=nothing, outage=outage
+    )
+
+    assert ran is True
+    assert len(h.children["session:a"]) == 1
+    assert outage.rounds == 0
+
+
+def test_a_recording_that_fails_loses_the_round_but_not_the_reconciliation() -> None:
+    h = Harness()
+
+    def redis_down() -> None:
+        raise RedisConnectionError("Error 10061 connecting to localhost:6379")
+
+    ran = supervise_round(
+        h.supervisor,
+        wanted=lambda: {SESSION.key: SESSION},
+        housekeeping=redis_down,
+        outage=Outage(OUTAGE),
+    )
+
+    assert ran is False
+    assert len(h.children["session:a"]) == 1, "the children were reconciled before it failed"
+
+
+def test_a_stop_request_redis_did_not_take_is_asked_again_and_the_grace_starts_then() -> None:
+    """With the mark set before the ask, the ask lost to a Redis outage was never repeated, and
+    the session was killed when the grace ran out — its row left `running`, reported as a crash."""
+    h = Harness()
+    h.supervisor.tick({SESSION.key: SESSION})
+    down = True
+
+    def ask(session_id: uuid.UUID) -> None:
+        if down:
+            raise RedisConnectionError("Error 10061 connecting to localhost:6379")
+        h.asked.append(session_id)
+
+    h.supervisor.ask_to_stop = ask
+    with pytest.raises(RedisConnectionError):
+        h.supervisor.tick({})
+    down = False
+    h.now = 61  # past the 60 s grace, counted from a mark the failed ask must not have set
+    h.supervisor.tick({})
+
+    assert h.asked == [SESSION_ID]
+    assert not h.last("session:a").terminated
+
+
+def test_on_exit_one_session_that_cannot_be_asked_does_not_keep_the_others_from_it() -> None:
+    h = Harness()
+    other = Wanted("session:b", ("python", "session"), uuid.uuid4())
+    h.supervisor.tick({SESSION.key: SESSION, other.key: other})
+
+    def ask(session_id: uuid.UUID) -> None:
+        if session_id == SESSION_ID:
+            raise RedisConnectionError("Error 10061 connecting to localhost:6379")
+        h.asked.append(session_id)
+
+    h.supervisor.ask_to_stop = ask
+    h.supervisor.stop_all()
+
+    assert h.asked == [other.session_id]
+
+
+def test_an_outage_is_said_once_with_its_traceback_then_counted_then_ended(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    h = Harness()
+    outage = Outage(OUTAGE)
+    with caplog.at_level(logging.INFO, logger=OUTAGE.name):
+        for _ in range(3):
+            supervise_round(h.supervisor, wanted=unreachable, housekeeping=nothing, outage=outage)
+        supervise_round(h.supervisor, wanted=dict, housekeeping=nothing, outage=outage)
+
+    said = [(r.levelname, r.exc_info is not None) for r in caplog.records if r.name == OUTAGE.name]
+    assert said == [("ERROR", True), ("WARNING", False), ("WARNING", False), ("INFO", False)]
+    assert caplog.records[-1].getMessage() == "back after 3 lost round(s)"

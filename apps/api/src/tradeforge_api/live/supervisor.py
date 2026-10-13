@@ -36,12 +36,13 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from tradeforge_api.config import Settings
 from tradeforge_api.live.orphans import OrphanWatch, annul, orphan_brokers, resolve_orphans
+from tradeforge_api.live.outage import Outage
 from tradeforge_api.live.signals import SIGNALS_STREAM
 from tradeforge_api.live.stop import request_stop
 from tradeforge_db.live_setups import FollowedPair, followed_pairs, record_event
 from tradeforge_db.session import create_db_engine, create_session_factory, session_scope
 
-__all__ = ["Child", "Supervisor", "Wanted", "main", "wanted_children"]
+__all__ = ["Child", "Supervisor", "Wanted", "main", "supervise_round", "wanted_children"]
 
 logger = logging.getLogger(__name__)
 
@@ -144,20 +145,69 @@ class Supervisor:
 
     def _stop(self, key: str, running: _Running, now: float) -> None:
         if running.stopping_since is None:
-            running.stopping_since = now
             if running.wanted.session_id is not None:
+                # ⚠️ **Asked first, marked after (13/10).** The ask is a Redis write, and with
+                # the mark first a Redis that was down at that instant left a session marked as
+                # asked that never heard it — killed when the grace ran out, its row left
+                # `running` and later reported as a crash. Marked after, a failed ask raises out
+                # of the round and is simply asked again on the next one.
                 self.ask_to_stop(running.wanted.session_id)
+                running.stopping_since = now
                 logger.info("%s asked to stop", key)
                 return
+            running.stopping_since = now
         if running.wanted.session_id is None or now - running.stopping_since >= self.grace:
             running.child.terminate()
             logger.info("%s terminated", key)
 
     def stop_all(self) -> None:
-        """On the supervisor's own exit: ask every session to stop, kill the live loops."""
+        """On the supervisor's own exit: ask every session to stop, kill the live loops.
+
+        One child that cannot be asked (Redis gone) does not keep the others from hearing it."""
         now = self.clock()
         for key, running in self.running.items():
-            self._stop(key, running, now)
+            try:
+                self._stop(key, running, now)
+            except Exception:
+                logger.exception("%s could not be asked to stop; left running", key)
+
+
+def supervise_round(
+    supervisor: Supervisor,
+    *,
+    wanted: Callable[[], Mapping[str, Wanted]],
+    housekeeping: Callable[[], None],
+    outage: Outage,
+) -> bool:
+    """One round: read what should run, reconcile the children, then record. `False` if lost.
+
+    ⚠️ **What should run is read before anything is touched, and a failed read skips the round
+    whole** (13/10). An unreachable database is not "nothing is followed": ticking with an empty
+    set would ask every session to stop and kill every live loop, because the database blinked.
+    The children are left exactly as they are until the read answers again.
+
+    Every failure is caught, whatever its type. This process's one job is to outlive whatever
+    the sessions depend on — a lost round costs fifteen seconds, a dead supervisor costs every
+    signal until somebody notices (12/10: a `wsl --shutdown` took Postgres and Redis down for a
+    few minutes and the signals never came back by themselves).
+    """
+    try:
+        want = wanted()
+    except Exception:  # noqa: BLE001 — see the docstring: the supervisor must outlive it
+        outage.lost("reading what should run")
+        return False
+    try:
+        supervisor.tick(want)
+    except Exception:  # noqa: BLE001
+        outage.lost("reconciling the children")
+        return False
+    try:
+        housekeeping()
+    except Exception:  # noqa: BLE001
+        outage.lost("recording the signals")
+        return False
+    outage.back()
+    return True
 
 
 def record_signals(redis: Redis, factory: sessionmaker[Session], consumer: str) -> int:
@@ -314,28 +364,30 @@ def main(argv: list[str] | None = None) -> int:
     session_ids: dict[tuple[uuid.UUID, uuid.UUID], uuid.UUID] = {}
     consumer = f"recorder-{uuid.uuid4().hex[:8]}"
     orphans = OrphanWatch()
+
+    def wanted_now() -> dict[str, Wanted]:
+        with session_scope(factory) as session:
+            items = followed_pairs(session)
+        forget_the_stopped(session_ids, supervisor.running)
+        return wanted_children(
+            items,
+            python=sys.executable,
+            max_sessions=args.max_sessions,
+            session_ids=session_ids,
+            also_brokers=orphan_brokers(factory, alive_sessions(supervisor)),
+        )
+
+    def housekeeping() -> None:
+        record_signals(redis, factory, consumer)
+        resolve_orphans(redis, factory, alive_sessions(supervisor), orphans)
+
+    outage = Outage(logger)
     logger.info(
         "supervising signals every %.0fs, at most %d sessions", args.every, args.max_sessions
     )
     try:
         while True:
-            with session_scope(factory) as session:
-                items = followed_pairs(session)
-            forget_the_stopped(session_ids, supervisor.running)
-            supervisor.tick(
-                wanted_children(
-                    items,
-                    python=sys.executable,
-                    max_sessions=args.max_sessions,
-                    session_ids=session_ids,
-                    also_brokers=orphan_brokers(factory, alive_sessions(supervisor)),
-                )
-            )
-            try:
-                record_signals(redis, factory, consumer)
-                resolve_orphans(redis, factory, alive_sessions(supervisor), orphans)
-            except Exception:
-                logger.exception("recording the signals failed; retrying next tick")
+            supervise_round(supervisor, wanted=wanted_now, housekeeping=housekeeping, outage=outage)
             time.sleep(args.every)
     except KeyboardInterrupt:
         logger.info("stopping every child")

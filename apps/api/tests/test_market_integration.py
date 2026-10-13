@@ -430,3 +430,40 @@ def test_a_market_that_cannot_tell_the_supervisor_still_trades(
 
     assert outcome.error is None
     assert outcome.bars == len(live_bars)
+
+
+def test_a_market_asked_inside_its_warm_up_names_the_sessions_it_is_warming(
+    session: Session,
+    session_factory: Callable[[], Session],
+    plan: SessionPlan,
+    other: Strategy,
+    parquet_root: Path,
+) -> None:
+    """The stream asks before its first read, inside the warm-up. A word sent from there naming
+    nobody is read by the fleet as every session gone unasked — failed, launched again elsewhere,
+    while the first ones went on (found before it ever ran, 13/10)."""
+    history, live_bars, cut = split_at(CUT)
+    golden, near = signal_plan(plan), signal_plan(plan, other)
+    said: list[tuple[str, frozenset[uuid.UUID]]] = []
+    market = Market(
+        factory=factory_of(session_factory),
+        plans=[golden, near],
+        parquet_root=parquet_root,
+        signals_for=lambda _one: Sink(),
+        signalled=lambda: False,
+        asked_to_stop=lambda _session_id: False,
+        now=lambda: cut,
+        publish=lambda phase, sessions: said.append((phase, frozenset(sessions))),
+    )
+
+    class Asking(ListSource):
+        def candles(self) -> Iterator[Candle]:
+            market.should_stop()  # as `CandleStream` does, before reading
+            yield from live_bars
+
+    market.run(Asking(history, live_bars))
+
+    both = frozenset({golden.session_id, near.session_id})
+    warming = [sessions for phase, sessions in said if phase == "warming"]
+    assert warming, "the warm-up said nothing"
+    assert all(sessions == both for sessions in warming), said

@@ -103,7 +103,7 @@ class Wanted:
     session_ids: tuple[uuid.UUID, ...] = ()
     """The sessions it carries, so each can be asked to stop; none for a live loop, killed."""
     log: str = ""
-    """Its log file's name, without the extension; the key when empty."""
+    """Its log file's name, without the extension; the key (`:` as `-`) when empty."""
 
 
 @dataclass(slots=True)
@@ -276,14 +276,13 @@ def record_signals(redis: Redis, factory: sessionmaker[Session], consumer: str) 
 
 
 def as_wanted(launch: Launch) -> Wanted:
-    """A market process as the supervisor runs it: one log per market, appended across launches."""
-    market = launch.market
-    return Wanted(
-        launch.key,
-        launch.argv,
-        tuple(launch.sessions.values()),
-        log=f"market-{market.instrument_id}-{market.timeframe}",
-    )
+    """A market process as the supervisor runs it, logging to a file of its own.
+
+    ⚠️ **Its own file, not its market's** (13/10). Two processes of one market run side by side
+    while a setup added since the last restart runs apart, and on Windows two processes appending
+    to one file write over each other — measured: 200 of 400 lines left.
+    """
+    return Wanted(launch.key, launch.argv, tuple(launch.sessions.values()))
 
 
 def live_loops(
@@ -335,7 +334,7 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
         "session beside others of its market ~10-30 MB more)",
     )
     parser.add_argument(
-        "--logs", type=Path, default=Path("data/logs/signals"), help="one log file per market"
+        "--logs", type=Path, default=Path("data/logs/signals"), help="one log file per process"
     )
     parser.add_argument(
         "--annul",

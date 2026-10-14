@@ -247,7 +247,8 @@ def test_a_signal_whose_setup_was_deleted_before_it_was_recorded_is_recorded_wit
     every round what it could not write, would never have got past it."""
     run, _ = a_run(session_factory)
     setup = client.post("/live-setups/from-run", json={"backtest_id": str(run)}).json()
-    assert client.delete(f"/live-setups/{setup['id']}").status_code == 204
+    deleted = client.delete(f"/live-setups/{setup['id']}")
+    assert deleted.status_code == 204
 
     with session_factory() as session:
         record_event(session, event(setup, 8, "armed", entry="1000", stop="900", no_target_r="5"))
@@ -266,7 +267,8 @@ def test_a_trade_whose_setup_was_deleted_still_closes_at_its_no_target_r(
     orphan watch would have followed the trade to its stop alone."""
     run, _ = a_run(session_factory)
     setup = client.post("/live-setups/from-run", json={"backtest_id": str(run)}).json()
-    assert client.patch(f"/live-setups/{setup['id']}", json={"no_target_r": "3"}).status_code == 200
+    changed = client.patch(f"/live-setups/{setup['id']}", json={"no_target_r": "3"})
+    assert changed.status_code == 200
     gone = uuid.uuid4()
     with session_factory() as session:
         record_event(
@@ -283,7 +285,8 @@ def test_a_trade_whose_setup_was_deleted_still_closes_at_its_no_target_r(
         )
         session.commit()
 
-    assert client.delete(f"/live-setups/{setup['id']}").status_code == 204
+    deleted = client.delete(f"/live-setups/{setup['id']}")
+    assert deleted.status_code == 204
     with session_factory() as session:
         (orphan,) = orphan_signals(session, set())
 

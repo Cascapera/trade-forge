@@ -3028,3 +3028,19 @@ Trocando os workers da Contabo no meio da d3aabdc2 (SIGTERM, arq cancela o lote 
 de propósito, para nenhum ficar `running` sem dono. Mas o lote devolvido pula `failed`, então os 259 runs não
 voltaram: foram recolocados à mão (status → queued + jobs próprios). Num cancelamento que o arq vai repetir, os
 runs deveriam voltar a `queued`, não `failed`; `failed` só quando é a última tentativa (timeout real).
+
+## Desdobramentos de ações (14/10, ADR-0034) — o que ficou para depois
+
+- **Proventos nas ações americanas.** Só desdobramento é ajustado; o dividendo é um gap real no preço do CFD e a
+  corretora credita/debita o ajuste na posição. O backtest não credita nada. Pequeno em setups curtos; medir antes.
+- **XP ajusta por proventos, e o ajuste muda a cada provento novo.** A série inteira é reescalada pela corretora:
+  recoletar só o ano corrente depois de um provento deixa um degrau na virada do ano entre o arquivo antigo e o
+  novo. Antes de recoletar ações BR, recoletar a série toda (ou detectar o degrau). E os preços antigos não são os
+  negociados (PETR4 out/2021: R$ 8,53 contra ~R$ 28) — custo fixo por ordem em R$, tick e números redondos
+  ficam distorcidos no passado.
+- **Contínuos da B3 (WIN$, WDO$).** Conferir se a rolagem deixa salto na série contínua da XP (o detector só olha
+  ações).
+- **Tick ruim no bruto:** NVDA M15 tem um salto de +54% numa vela de 2018-12-27 20:45 que não é desdobramento.
+  Um detector de velas absurdas (fora de N ATR do vizinho) na coleta.
+- **Refazer o que foi calculado com os dados sem ajuste:** varreduras de ações EUA (92fdba03, d1118475, eac59511 e
+  outras), as bases de ML delas e as telas de melhores. Decisão dele.

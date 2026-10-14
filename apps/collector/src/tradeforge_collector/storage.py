@@ -19,7 +19,8 @@ approximation it never asked for and cannot undo.
 """
 
 import datetime as dt
-from collections.abc import Iterator
+import json
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from decimal import Decimal
 from itertools import chain
@@ -57,6 +58,14 @@ OHLCV_SCHEMA = pa.schema(
 
 PARTITION_KEYS = ["symbol", "timeframe", "year"]
 
+SPLITS_KEY = b"tradeforge.splits"
+"""The file metadata key listing the share splits its bars were adjusted for (14/10)."""
+
+
+def symbol_path(root: Path, symbol: str) -> Path:
+    """The directory that holds every timeframe of one symbol."""
+    return root / f"symbol={symbol}"
+
 
 def dataset_path(root: Path, symbol: str, timeframe: str) -> str:
     """The directory that holds one symbol's bars at one timeframe.
@@ -64,7 +73,7 @@ def dataset_path(root: Path, symbol: str, timeframe: str) -> str:
     This is what goes into `datasets.parquet_path`: a *directory*, not a file. The
     year partitions underneath it come and go as the backfill is re-run.
     """
-    return (root / f"symbol={symbol}" / f"timeframe={timeframe}").as_posix()
+    return (symbol_path(root, symbol) / f"timeframe={timeframe}").as_posix()
 
 
 def to_table(symbol: str, timeframe: str, candles: list[Candle]) -> pa.Table:
@@ -87,7 +96,14 @@ def to_table(symbol: str, timeframe: str, candles: list[Candle]) -> pa.Table:
     )
 
 
-def write_candles(root: Path, symbol: str, timeframe: str, candles: list[Candle]) -> str:
+def write_candles(
+    root: Path,
+    symbol: str,
+    timeframe: str,
+    candles: list[Candle],
+    *,
+    splits: Iterable[str] = (),
+) -> str:
     """Write the bars, replacing whatever those partitions held before.
 
     `delete_matching` is what makes a re-backfill idempotent: the year directories this
@@ -95,13 +111,21 @@ def write_candles(root: Path, symbol: str, timeframe: str, candles: list[Candle]
     appending a second, duplicate copy of it. Years this run does not touch are left
     alone — re-fetching 2024 must not delete the 2023 you already have.
 
+    `splits` are the share splits these bars have already been adjusted for (14/10), written
+    into every file's metadata so a later adjustment knows not to divide them again — see
+    `tradeforge_collector.splits`. None, and the files carry no stamp: raw.
+
     Returns the dataset directory, for the catalogue to record.
     """
     if not candles:
         raise ValueError(f"no candles to write for {symbol} {timeframe}")
 
+    table = to_table(symbol, timeframe, candles)
+    if stamp := sorted(set(splits)):
+        table = table.replace_schema_metadata({SPLITS_KEY: json.dumps(stamp)})
+
     ds.write_dataset(
-        to_table(symbol, timeframe, candles),
+        table,
         base_dir=root,
         format="parquet",
         partitioning=ds.partitioning(

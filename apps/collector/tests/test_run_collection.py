@@ -15,6 +15,7 @@ import pytest
 
 from tradeforge_collector.collect import CollectionOutcome, Coverage, run_collection
 from tradeforge_collector.source import MarketDataSource
+from tradeforge_collector.splits import Split
 from tradeforge_collector.synthetic import SyntheticSource
 from tradeforge_engine.domain import Candle, InstrumentSpec
 
@@ -28,6 +29,7 @@ class SpyJournal:
     """Every entry the run made, in order. A list is enough to assert a state machine."""
 
     entries: list[str] = field(default_factory=list)
+    splits: tuple[Split, ...] = ()
     catalogued_coverage: Coverage | None = None
     catalogued_spread: Decimal | None = None
     finished_candles: int | None = None
@@ -42,6 +44,9 @@ class SpyJournal:
 
     def same_clock(self, spec: InstrumentSpec) -> None:
         """Every clock agrees here; the refusal is `tradeforge_db`'s, tested against Postgres."""
+
+    def splits_for(self, symbol: str) -> tuple[Split, ...]:
+        return self.splits
 
     def catalogued(self, spec: InstrumentSpec, spread: Decimal | None, on_disk: Coverage) -> None:
         self.entries.append(f"catalogued {spec.symbol}")

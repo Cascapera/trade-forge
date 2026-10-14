@@ -348,6 +348,13 @@ class Instrument(Base):
     # reconcile. Storing the raw MT5 number would leave that conversion to every reader.
     default_spread_points: Mapped[Decimal | None] = mapped_column(PRICE)
 
+    # The step a price is quoted in at the venue, when it is not the series' own tick (14/10):
+    # XP's `WIN$` is a continuous future adjusted by a ratio at each roll, so its prices fall on
+    # any point (tick 1) while every contract trades in steps of 5. A signal's levels are put on
+    # this step before anybody reads them (`SignalBroker`); the engine never sees it. NULL — the
+    # series' tick is the step, as for every instrument quoted as it trades.
+    price_step: Mapped[Decimal | None] = mapped_column(PRICE)
+
     # How far the broker's server clock runs ahead of the stored candles' UTC — the number the
     # collector shifted every bar by, and so where this market's day and every bar above the
     # chart begin (`InstrumentSpec.server_offset`, his rule of 30/09). A fact about the data, which
@@ -391,6 +398,7 @@ class Instrument(Base):
             "default_spread_points IS NULL OR default_spread_points >= 0",
             name="default_spread_points_non_negative",
         ),
+        CheckConstraint("price_step IS NULL OR price_step > 0", name="price_step_positive"),
         # A clock is a timezone: within fourteen hours of UTC (`MAX_SERVER_OFFSET`).
         CheckConstraint(
             "server_offset BETWEEN interval '-14 hours' AND interval '14 hours'",

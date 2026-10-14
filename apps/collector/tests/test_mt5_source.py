@@ -366,6 +366,23 @@ def test_a_series_with_no_book_has_no_spread_to_catalogue() -> None:
         assert source.spread_points("WIN$") is None
 
 
+class _ContinuousFuture(_FakeTerminal):
+    """XP, 14/10: `WIN$` adjusted at each roll quotes a tick of 1; `WIN$N`, unadjusted, of 5."""
+
+    def symbol_info(self, symbol: str) -> _SymbolInfo | None:
+        ticks = {"WIN$": 1.0, "WIN$N": 5.0, "WDO$": 0.001}
+        if symbol not in ticks:
+            return super().symbol_info(symbol)
+        return _SymbolInfo(name=symbol, trade_tick_size=ticks[symbol], point=ticks[symbol])
+
+
+def test_a_continuous_future_trades_in_the_step_of_its_unadjusted_series() -> None:
+    with MT5Source(terminal=_ContinuousFuture(), server_offset=SERVER_OFFSET) as source:
+        assert source.price_step("WIN$") == Decimal(5)
+        assert source.price_step("WDO$") is None, "no unadjusted sibling: the tick is the step"
+        assert source.price_step("EURUSD") is None, "not a continuous series"
+
+
 def test_a_negative_spread_is_not_catalogued() -> None:
     """XP's B3 shares before the open, 09/10: ask below bid in the auction (-2097 points on
     AXIA3). The catalogue's CHECK refuses it, and refusing failed the whole download."""

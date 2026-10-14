@@ -387,6 +387,25 @@ class MT5Source:
         )
         return ticks
 
+    def price_step(self, symbol: str) -> Decimal | None:
+        """The step `symbol`'s prices trade in at the venue, when it is not the series' own tick.
+
+        Measured 14/10 on XP: `WIN$` is the mini-index future made continuous by adjusting the
+        past by a ratio at each roll, so its prices fall on any point and the terminal reports a
+        tick of 1 — while every contract, and the same series without adjustment (`WIN$N`),
+        trades in steps of 5; `WDO$` is 0.001 against 0.5. A level on the adjusted series is not
+        a price anybody can type. XP names the unadjusted series by appending `N`; a symbol with
+        no such sibling, or whose sibling agrees, has its tick as its step (`None`).
+        """
+        if not symbol.endswith("$"):
+            return None
+        mt5 = self._require_connection()
+        own, unadjusted = mt5.symbol_info(symbol), mt5.symbol_info(f"{symbol}N")
+        if own is None or unadjusted is None or unadjusted.trade_tick_size <= 0:
+            return None
+        step = Decimal(str(unadjusted.trade_tick_size))
+        return None if step == Decimal(str(own.trade_tick_size)) else step
+
     def _quote_age(self, mt5: Any, symbol: str) -> dt.timedelta | None:  # noqa: ANN401 — no stubs
         """How long ago this symbol last quoted, in real time, or `None` if it never has.
 

@@ -22,11 +22,19 @@ collector found convenient is a candle the engine would have to translate foreve
 import datetime as dt
 from dataclasses import dataclass, replace
 from decimal import Decimal
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from tradeforge_engine.domain import Candle, InstrumentSpec
 
-__all__ = ["Candle", "InstrumentSpec", "MarketDataSource", "SymbolInfo", "TickerSource"]
+__all__ = [
+    "Candle",
+    "InstrumentSpec",
+    "MarketDataSource",
+    "QuotesAPriceStep",
+    "SymbolInfo",
+    "TickerSource",
+    "price_step_of",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,6 +108,20 @@ class MarketDataSource(Protocol):
         ...
 
 
+@runtime_checkable
+class QuotesAPriceStep(Protocol):
+    """A source that knows when a series' prices fall on a finer tick than its venue trades in."""
+
+    def price_step(self, symbol: str) -> Decimal | None:
+        """The venue's step for `symbol`, when it is not the series' tick; else `None`."""
+        ...
+
+
+def price_step_of(source: object, symbol: str) -> Decimal | None:
+    """`source.price_step(symbol)` when the source can say — only MT5 can — else `None`."""
+    return source.price_step(symbol) if isinstance(source, QuotesAPriceStep) else None
+
+
 class TickerSource:
     """A source asked by the broker's ticker and answering under the internal name (ADR-0032).
 
@@ -125,6 +147,10 @@ class TickerSource:
     def spread_points(self, symbol: str) -> Decimal | None:
         """The ticker's quoted spread."""
         return self._source.spread_points(self._ask(symbol))
+
+    def price_step(self, symbol: str) -> Decimal | None:
+        """The ticker's step at the venue, when its source can say."""
+        return price_step_of(self._source, self._ask(symbol))
 
     def candles(
         self, symbol: str, timeframe: str, start: dt.datetime, end: dt.datetime

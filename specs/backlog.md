@@ -3077,6 +3077,9 @@ runs deveriam voltar a `queued`, não `failed`; `failed` só quando é a última
   meio R do setup e meio R de um stop 2× é recusada no 1×, e a grade só cobre as entradas da base.
 - **O stop multiplicado não é arredondado ao tick.** O motor aceita qualquer preço, e a diferença é menor
   que um tick. Para levar a célula escolhida ao ao vivo, ela precisa do passo do contrato (`on_the_step`).
-- **O relatório da grade e o modelo por célula** são os próximos PRs: a melhor célula fixa por setup e
-  mercado, escolhida nos anos de treino e julgada na validação, com drawdown e a maior sequência de
-  perdas; depois, o modelo que estima o R esperado de cada célula por entrada.
+- ~~**O relatório da grade**~~ FEITO no PR-463 (`tradeforge-ml grid`). Falta **o modelo por célula**:
+  estimar, por entrada, o R esperado de cada stop × alvo e ficar com o melhor, ou pular. Ele precisa
+  bater a melhor regra fixa do relatório na validação, e só depois ver o ano reservado.
+- **O drawdown das regras soma mercados que rodam juntos.** O relatório soma todos os trades da base
+  numa conta só, em ordem de fechamento. É a conta de quem opera todos os mercados com o mesmo risco
+  por trade, sem limite de posições abertas. Uma conta real teria limite de exposição.

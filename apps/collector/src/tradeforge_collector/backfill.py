@@ -108,17 +108,11 @@ def backfill(  # noqa: PLR0913 — all keyword-only, and each one names a real a
     refuse_unless_the_bars_split(
         candles, splits, timeframe=timeframe, where=f"{symbol} {timeframe}"
     )
-    # A week a split falls inside is rebuilt from that week's daily bars, adjusted the same way.
-    daily = [
-        bar
-        for start_of, end_of in straddled(candles, splits, timeframe)
-        for bar in source.candles(symbol, "D1", start_of, end_of - _JUST_BEFORE)
-    ]
     parquet_path = write_candles(
         root,
         symbol,
         timeframe,
-        adjust(candles, splits, timeframe=timeframe, daily=adjust(daily, splits, timeframe="D1")),
+        adjusted(source, symbol, timeframe, candles, splits),
         splits=(split.key for split in splits),
     )
     gaps = find_gaps([candle.time for candle in candles], step(timeframe))
@@ -139,6 +133,23 @@ def backfill(  # noqa: PLR0913 — all keyword-only, and each one names a real a
 
     logger.info("backfilled %s %s: %d candles, %d gaps", symbol, timeframe, len(candles), len(gaps))
     return report
+
+
+def adjusted(
+    source: MarketDataSource,
+    symbol: str,
+    timeframe: str,
+    candles: list[Candle],
+    splits: Sequence[Split],
+) -> list[Candle]:
+    """Raw bars as the disk holds them: adjusted for `splits`, a week a split falls inside
+    rebuilt from that week's daily bars, adjusted the same way."""
+    daily = [
+        bar
+        for start_of, end_of in straddled(candles, splits, timeframe)
+        for bar in source.candles(symbol, "D1", start_of, end_of - _JUST_BEFORE)
+    ]
+    return adjust(candles, splits, timeframe=timeframe, daily=adjust(daily, splits, timeframe="D1"))
 
 
 def _catalogue(session: Session, report: BackfillReport) -> None:

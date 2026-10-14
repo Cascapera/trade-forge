@@ -13,10 +13,17 @@ from pathlib import Path
 
 import pytest
 
-from tradeforge_collector.collect import CollectionOutcome, Coverage, run_collection
+from tradeforge_collector.collect import (
+    CollectionOutcome,
+    Coverage,
+    RescaledBeyondReachError,
+    run_collection,
+)
 from tradeforge_collector.source import MarketDataSource
 from tradeforge_collector.splits import Split
+from tradeforge_collector.storage import read_candles
 from tradeforge_collector.synthetic import SyntheticSource
+from tradeforge_collector.timeframes import step
 from tradeforge_engine.domain import Candle, InstrumentSpec
 
 
@@ -41,6 +48,9 @@ class SpyJournal:
 
     def year_done(self, years_done: int) -> None:
         self.entries.append(f"year {years_done}")
+
+    def widened(self, years_total: int) -> None:
+        self.entries.append(f"widened {years_total}")
 
     def same_clock(self, spec: InstrumentSpec) -> None:
         """Every clock agrees here; the refusal is `tradeforge_db`'s, tested against Postgres."""
@@ -499,3 +509,144 @@ def test_a_source_that_breaks_closes_the_row_as_failed_with_the_reason(tmp_path:
 
     assert spy.entries == ["started", "year 1", "failed"]
     assert spy.failure == "the collection of EURUSD H1 stopped: the terminal went away"
+
+
+# --------------------------------------------------------------------------------------------
+# A broker that rewrites the past (14/10)
+# --------------------------------------------------------------------------------------------
+
+
+class Anchored:
+    """A market whose every bar is a function of its time alone, times `factor` — as a broker's
+    is: asked twice, from two windows, the same bar comes back the same, until the broker rescales
+    the series (`factor`, XP's `WIN$` on 14/10: 1.0213). Nothing before `listed`.
+
+    ⚠️ `SyntheticSource` cannot play this part: its walk starts again at every window it is asked
+    for, so the same bar differs between two requests and nothing could be told apart."""
+
+    def __init__(self, factor: str = "1", *, listed: dt.datetime | None = None) -> None:
+        self._factor = Decimal(factor)
+        self._listed = listed
+        self.asked: list[tuple[dt.datetime, dt.datetime]] = []
+
+    def instrument(self, symbol: str) -> InstrumentSpec:
+        return SyntheticSource().instrument(symbol)
+
+    def spread_points(self, symbol: str) -> Decimal | None:
+        return None
+
+    def candles(
+        self, symbol: str, timeframe: str, start: dt.datetime, end: dt.datetime
+    ) -> list[Candle]:
+        self.asked.append((start, end))
+        bar = step(timeframe)
+        moment, found = start, []
+        while moment <= end:
+            if moment.weekday() < 5 and (self._listed is None or moment >= self._listed):
+                found.append(self._at(moment))
+            moment += bar
+        if not found:
+            raise LookupError(f"nothing for {symbol} {timeframe} between {start} and {end}")
+        return found
+
+    def _at(self, moment: dt.datetime) -> Candle:
+        hours = int(moment.timestamp()) // 3600
+        price = (Decimal("1.1") + Decimal(hours % 500) / 10_000) * self._factor
+        close = price.quantize(Decimal("0.00001"))
+        return Candle(
+            time=moment,
+            open=close,
+            high=close + Decimal("0.0005"),
+            low=close - Decimal("0.0005"),
+            close=close,
+            tick_volume=100,
+            spread=1,
+        )
+
+
+def close_at(root: Path, moment: dt.datetime) -> Decimal:
+    (bar,) = read_candles(root, "EURUSD", "H1", start=moment, end=moment)
+    return bar.close
+
+
+IN_2024 = dt.datetime(2024, 3, 5, 14, tzinfo=dt.UTC)
+
+
+def test_a_rescaled_series_is_collected_again_whole(tmp_path: Path) -> None:
+    """The roll of 14/10: 2024 is on disk, the broker moved its whole past up 2.1 %, and 2025 is
+    asked for. Collected alone, 2025 would sit 2.1 % above 2024 — a step the market never made."""
+    run_collection(
+        Anchored(), SpyJournal(), root=tmp_path, symbol="EURUSD", timeframe="H1",
+        date_from=utc(2024), date_to=utc(2024, 12, 31),
+    )  # fmt: skip
+    before = close_at(tmp_path, IN_2024)
+    spy = SpyJournal()
+
+    outcome = run_collection(
+        Anchored("1.0213"), spy, root=tmp_path, symbol="EURUSD", timeframe="H1",
+        date_from=utc(2025), date_to=utc(2025, 12, 31),
+    )  # fmt: skip
+
+    assert spy.entries[:2] == ["started", "widened 2"]
+    assert outcome.slices_total == 2
+    assert close_at(tmp_path, IN_2024) == (before * Decimal("1.0213")).quantize(Decimal("0.00001"))
+
+
+def test_an_unchanged_series_is_collected_as_asked(tmp_path: Path) -> None:
+    run_collection(
+        Anchored(), SpyJournal(), root=tmp_path, symbol="EURUSD", timeframe="H1",
+        date_from=utc(2024), date_to=utc(2024, 12, 31),
+    )  # fmt: skip
+    spy = SpyJournal()
+
+    outcome = run_collection(
+        Anchored(), spy, root=tmp_path, symbol="EURUSD", timeframe="H1",
+        date_from=utc(2025), date_to=utc(2025, 12, 31),
+    )  # fmt: skip
+
+    assert not any(entry.startswith("widened") for entry in spy.entries)
+    assert outcome.slices_total == 1
+
+
+def test_a_broker_that_no_longer_serves_the_oldest_years_writes_nothing(tmp_path: Path) -> None:
+    """Rescaled, and the broker's history now starts in mid-2024: collecting what it serves would
+    leave 2023 in the old scale under the new one. Refused before a single file is touched."""
+    run_collection(
+        Anchored(), SpyJournal(), root=tmp_path, symbol="EURUSD", timeframe="H1",
+        date_from=utc(2023), date_to=utc(2024, 12, 31),
+    )  # fmt: skip
+    before = close_at(tmp_path, IN_2024)
+    spy = SpyJournal()
+
+    with pytest.raises(RescaledBeyondReachError):
+        run_collection(
+            Anchored("1.0213", listed=utc(2024, 6)), spy, root=tmp_path, symbol="EURUSD",
+            timeframe="H1", date_from=utc(2025), date_to=utc(2025, 12, 31),
+        )  # fmt: skip
+
+    assert spy.entries == ["started", "failed"]
+    assert spy.failure is not None
+    assert "no longer serves the oldest on disk, from 2023-01-02" in spy.failure
+    assert close_at(tmp_path, IN_2024) == before
+    assert not (tmp_path / "symbol=EURUSD" / "timeframe=H1" / "year=2025").exists()
+
+
+def test_the_comparison_is_made_at_the_newest_bars_on_disk_whatever_was_asked(
+    tmp_path: Path,
+) -> None:
+    """A request for the year after the disk shares no bar with it — the case that would lay the
+    new scale right beside the old — so the broker is asked for the disk's own last bars."""
+    run_collection(
+        Anchored(), SpyJournal(), root=tmp_path, symbol="EURUSD", timeframe="H1",
+        date_from=utc(2024), date_to=utc(2024, 12, 31),
+    )  # fmt: skip
+    source = Anchored()
+
+    run_collection(
+        source, SpyJournal(), root=tmp_path, symbol="EURUSD", timeframe="H1",
+        date_from=utc(2025), date_to=utc(2025, 12, 31),
+    )  # fmt: skip
+
+    first_start, first_end = source.asked[0]
+    assert first_end == dt.datetime(2024, 12, 31, tzinfo=dt.UTC)
+    assert first_end - first_start == step("H1") * 200

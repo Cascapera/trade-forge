@@ -66,6 +66,9 @@ class _FakeTerminal:
         self.paths: list[str | None] = []
         self.selected: list[str] = []
         self.from_pos: list[tuple[str, int, int]] = []
+        # The bar at position 0, still forming; `None` when the fake states none. The history in
+        # `rates` is closed bars only, as a terminal's is from position 1 back.
+        self.forming: dict[str, Any] | None = None
         # Two symbols, one of them outside Market Watch — which is the ordinary state of a real
         # terminal (measured: 74 of 84) and the case a `visible` filter would silently hide.
         self.catalogue = [
@@ -99,6 +102,8 @@ class _FakeTerminal:
         # Position 0 is the bar still forming, so a caller asking from position 1 gets the
         # closed ones — which is exactly what the fake's history is.
         self.from_pos.append((symbol, start_pos, count))
+        if start_pos == 0 and count == 1:
+            return None if self.forming is None else [self.forming]
         return self._rates[-count:] if self._rates else None
 
     def last_error(self) -> tuple[int, str]:
@@ -122,7 +127,9 @@ class _FakeTerminal:
         # what that clock is. Subtracting the age is what lets a subclass go quiet:
         # a symbol that has not traded, or a market that has closed.
         server_now = dt.datetime.now(tz=dt.UTC) + SERVER_OFFSET - self.last_tick_age(symbol)
-        return type("Tick", (), {"time": int(server_now.timestamp())})()
+        return type(
+            "Tick", (), {"time": int(server_now.timestamp()), "bid": 1.10513, "ask": 1.10525}
+        )()
 
     def copy_rates_range(
         self, _symbol: str, _timeframe: int, _start: dt.datetime, _end: dt.datetime
@@ -319,6 +326,44 @@ def test_a_spread_read_after_the_close_is_not_catalogued() -> None:
     """
     with MT5Source(terminal=_MarketShut(), server_offset=SERVER_OFFSET) as source:
         assert source.spread_points("EURUSD") is None
+
+
+def test_the_bar_still_forming_is_not_returned() -> None:
+    """⚠️ 14/10: a range reaching the present came back with the bar still forming, written to
+    disk with its close of the moment for ever. Position 0 is that bar, as the terminal says."""
+    terminal = _FakeTerminal(rates=[a_rate(server_hour=15), a_rate(server_hour=16)])
+    terminal.forming = a_rate(server_hour=16)
+
+    with MT5Source(terminal=terminal) as source:
+        candles = source.candles("EURUSD", "H1", UTC_NOON, UTC_NOON + dt.timedelta(days=1))
+
+    assert [candle.time.hour for candle in candles] == [12]
+
+
+def test_a_range_that_ends_before_the_forming_bar_keeps_every_bar() -> None:
+    terminal = _FakeTerminal(rates=[a_rate(server_hour=15), a_rate(server_hour=16)])
+    terminal.forming = a_rate(server_hour=20)
+
+    with MT5Source(terminal=terminal) as source:
+        candles = source.candles("EURUSD", "H1", UTC_NOON, UTC_NOON + dt.timedelta(days=1))
+
+    assert [candle.time.hour for candle in candles] == [12, 13]
+
+
+def test_a_series_with_no_book_has_no_spread_to_catalogue() -> None:
+    """⚠️ XP's `WIN$`, 14/10: a continuous future quotes a last price and no book — bid and ask
+    0, spread 0. Catalogued, the zero erased the 5 ticks measured on the contract."""
+
+    class _NoBook(_FakeTerminal):
+        def symbol_info(self, symbol: str) -> _SymbolInfo | None:
+            return _SymbolInfo(name=symbol, spread=0)
+
+        def symbol_info_tick(self, symbol: str) -> Any:
+            tick = super().symbol_info_tick(symbol)
+            return type("Tick", (), {"time": tick.time, "bid": 0.0, "ask": 0.0})()
+
+    with MT5Source(terminal=_NoBook(), server_offset=SERVER_OFFSET) as source:
+        assert source.spread_points("WIN$") is None
 
 
 def test_a_negative_spread_is_not_catalogued() -> None:

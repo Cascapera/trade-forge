@@ -22,6 +22,7 @@ from tradeforge_db.collections import (
     read_collection,
     record_progress,
     start_collection,
+    widen_collection,
 )
 from tradeforge_db.models import BacktestStatus, Collection
 from tradeforge_engine.domain import AssetClass
@@ -127,6 +128,15 @@ class TestTheTransitions:
 
         assert row.years_done == 2
 
+    def test_widening_raises_the_year_count_to_reach(self) -> None:
+        """The broker rescaled the series: every year on disk is collected again (14/10)."""
+        row = a_row(years_total=1)
+        session: Any = FakeSession(row)
+
+        widen_collection(session, row.id, years_total=4)
+
+        assert row.years_total == 4
+
     def test_finishing_without_an_error_is_done(self) -> None:
         row = a_row(status=BacktestStatus.RUNNING)
         session: Any = FakeSession(row)
@@ -174,6 +184,7 @@ class TestARowThatIsGone:
         [
             lambda session, key: start_collection(session, key, at=NOW),
             lambda session, key: record_progress(session, key, years_done=1),
+            lambda session, key: widen_collection(session, key, years_total=2),
             lambda session, key: finish_collection(session, key, at=NOW, candles=1, gaps=0),
             lambda session, key: finish_collection(session, key, at=NOW, error="gone"),
         ],

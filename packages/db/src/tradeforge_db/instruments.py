@@ -202,7 +202,21 @@ def upsert_instruments(
     statement = statement.on_conflict_do_update(
         index_elements=[Instrument.symbol],
         set_={
-            **{column: statement.excluded[column] for column in _INSTRUMENT_UPDATABLE},
+            **{
+                column: statement.excluded[column]
+                for column in _INSTRUMENT_UPDATABLE
+                if column != "default_spread_points"
+            },
+            # ⚠️ **A reading with no spread keeps the one measured** (14/10). An empty reading
+            # used to overwrite it, on the reasoning that a broker which stopped quoting has
+            # stopped. But the source answers `None` far more often for other reasons — the
+            # market is shut (its closing spread is refused), the series has no book (XP's
+            # `WIN$`) — and each of those wiped a measurement: any collection run after hours
+            # emptied the catalogue's spreads, and a replay that charges them then refuses the
+            # market. A new measurement still replaces the old one.
+            "default_spread_points": func.coalesce(
+                statement.excluded.default_spread_points, Instrument.default_spread_points
+            ),
             **(
                 {}
                 if broker_id is None

@@ -347,6 +347,21 @@ class MT5Source:
             )
             return None
 
+        book = mt5.symbol_info_tick(symbol)
+        if book is not None and (book.bid <= 0 or book.ask <= 0):
+            # Measured 14/10 on XP's continuous futures: `WIN$` and `WDO$` are series built from
+            # the contracts and quote a last price with no book — bid and ask 0, spread 0. A zero
+            # there is no cost anybody pays, it is the absence of a quote; catalogued, it erased
+            # the 5 ticks measured on WINZ26 the same afternoon. The contract has the book.
+            logger.warning(
+                "%s: no book (bid %s, ask %s) — a series with no quotes of its own, such as a "
+                "continuous future. Not catalogued; measure the spread on the contract.",
+                symbol,
+                book.bid,
+                book.ask,
+            )
+            return None
+
         if info.spread < 0:
             # Measured 09/10 on XP's B3 shares before the open: -2097 points on AXIA3, -986 on
             # ITUB4 — the auction's crossed book, ask below bid. A negative spread is no cost
@@ -409,16 +424,28 @@ class MT5Source:
             raise LookupError(
                 f"MT5 holds nothing for {symbol} {timeframe} before {EARLIEST_ASKABLE.year}"
             )
+        constant = self._timeframe_constant(mt5, timeframe)
         rates = mt5.copy_rates_range(
             symbol,
-            self._timeframe_constant(mt5, timeframe),
+            constant,
             _naive(max(start + self._offset, EARLIEST_ASKABLE)),
             _naive(end + self._offset),
         )
         if rates is None:
             raise LookupError(f"MT5 returned no rates for {symbol} {timeframe}: {mt5.last_error()}")
 
-        return [self._candle(rate, spec.digits) for rate in rates]
+        # ⚠️ **The range includes the bar still forming** whenever it reaches the present, and the
+        # protocol promises closed bars only. Written to disk, that bar kept its close of the
+        # moment of the download for ever: a live session warming on the disk then dropped the
+        # finished bar from the stream as a repeat of it (14/10, WIN M5 15:15). Position 0 is the
+        # forming bar — the terminal says which, as the live loop asks it (`recent_closed`).
+        forming = mt5.copy_rates_from_pos(symbol, constant, 0, 1)
+        opened = None if forming is None or not len(forming) else int(forming[0]["time"])
+        return [
+            self._candle(rate, spec.digits)
+            for rate in rates
+            if opened is None or int(rate["time"]) < opened
+        ]
 
     def recent_closed(self, symbol: str, timeframe: str, count: int) -> list[Candle]:
         """The last `count` bars that closed — asked for by **position**, never from a clock.

@@ -32,13 +32,25 @@ from typing import Protocol
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from tradeforge_collector.backfill import BackfillReport, backfill
+from tradeforge_collector.backfill import BackfillReport, adjusted, backfill
 from tradeforge_collector.gaps import find_gaps
+from tradeforge_collector.rescale import SAMPLE, Comparison, compare
 from tradeforge_collector.source import MarketDataSource
 from tradeforge_collector.splits import Split
-from tradeforge_collector.storage import Coverage, coverage, dataset_path, read_times
+from tradeforge_collector.storage import (
+    Coverage,
+    coverage,
+    dataset_path,
+    read_candles,
+    read_times,
+)
 from tradeforge_collector.timeframes import step
-from tradeforge_db.collections import finish_collection, record_progress, start_collection
+from tradeforge_db.collections import (
+    finish_collection,
+    record_progress,
+    start_collection,
+    widen_collection,
+)
 from tradeforge_db.instruments import (
     CatalogueEntry,
     refuse_a_new_clock,
@@ -56,6 +68,7 @@ __all__ = [
     "CollectionOutcome",
     "Coverage",
     "DatabaseJournal",
+    "RescaledBeyondReachError",
     "run_collection",
     "year_slices",
 ]
@@ -151,6 +164,11 @@ class CollectionJournal(Protocol):
         """One more slice is on disk — or was found empty, which is also done."""
         ...
 
+    def widened(self, years_total: int) -> None:
+        """The broker rescaled the series, so every year on disk is being collected again: the
+        count of years the screen shows grows to `years_total` (`rescale`, 14/10)."""
+        ...
+
     def same_clock(self, spec: InstrumentSpec) -> None:
         """Raise if `spec` reads the broker's clock differently from data already collected.
 
@@ -202,6 +220,15 @@ def run_collection(  # noqa: PLR0913 — keyword-only; each names a real axis of
     journal.started()
 
     try:
+        # Asked once: a split recorded halfway through would leave the years before it raw.
+        splits = journal.splits_for(symbol)
+        whole = _whole_series_if_rescaled(
+            source, root=root, symbol=symbol, timeframe=timeframe, splits=splits
+        )
+        if whole is not None:
+            date_from, date_to = min(date_from, whole.date_from), max(date_to, whole.date_to)
+            slices = year_slices(date_from, date_to)
+            journal.widened(len(slices))
         return _collect(
             source,
             journal,
@@ -209,6 +236,7 @@ def run_collection(  # noqa: PLR0913 — keyword-only; each names a real axis of
             symbol=symbol,
             timeframe=timeframe,
             slices=slices,
+            splits=splits,
             date_from=date_from,
             date_to=date_to,
         )
@@ -225,6 +253,7 @@ def _collect(  # noqa: PLR0913 — keyword-only; the same axes as `run_collectio
     symbol: str,
     timeframe: str,
     slices: list[tuple[dt.datetime, dt.datetime]],
+    splits: tuple[Split, ...],
     date_from: dt.datetime,
     date_to: dt.datetime,
 ) -> CollectionOutcome:
@@ -236,8 +265,6 @@ def _collect(  # noqa: PLR0913 — keyword-only; the same axes as `run_collectio
     # to move one and leave the rest agreeing with each other about the wrong thing.
     # A report is small (counts, a path, two instants), so holding one per year costs nothing.
     reports: list[BackfillReport] = []
-    # Asked once: a split recorded halfway through would leave the years before it raw.
-    splits = journal.splits_for(symbol)
 
     for done, (slice_from, slice_to) in enumerate(slices, start=1):
         try:
@@ -295,6 +322,106 @@ def _collect(  # noqa: PLR0913 — keyword-only; the same axes as `run_collectio
         gaps=_count_gaps(root, symbol, timeframe, on_disk.date_from, on_disk.date_to),
     )
     return outcome
+
+
+class RescaledBeyondReachError(ValueError):
+    """The broker rewrote the series and no longer serves the oldest years on disk: collecting
+    what it does serve would leave those years in the old scale, a step the market never made."""
+
+
+def _whole_series_if_rescaled(
+    source: MarketDataSource,
+    *,
+    root: Path,
+    symbol: str,
+    timeframe: str,
+    splits: tuple[Split, ...],
+) -> Coverage | None:
+    """What is on disk, when the broker's series no longer matches it and all of it has to be
+    collected again; `None` when it matches, or when there is nothing to compare (`rescale`).
+
+    ⚠️ Compared at the **newest** bars on disk whatever the request asks: a collection of the
+    year after them would share no bar with the disk and lay the new scale right beside the old.
+    And when the series was rescaled, the **oldest** bars are asked too — a broker that no longer
+    serves them refuses the collection before a byte is written (`RescaledBeyondReachError`).
+    """
+    on_disk = coverage(root, symbol, timeframe)
+    if on_disk is None:
+        return None
+    span = step(timeframe) * SAMPLE
+    newest = _against_the_broker(
+        source,
+        root=root,
+        symbol=symbol,
+        timeframe=timeframe,
+        splits=splits,
+        start=on_disk.date_to - span,
+        end=on_disk.date_to,
+    )
+    if not newest.rescaled:
+        if not newest.conclusive:
+            logger.info(
+                "%s %s: %d bar(s) to compare with the broker, too few to tell a rescale",
+                symbol,
+                timeframe,
+                newest.matched,
+            )
+        elif newest.differs:
+            logger.warning(
+                "%s %s: the broker's bars differ from the ones on disk, but not by one factor "
+                "(median %.4f, spread %.4f) — not a rescale; collecting as asked",
+                symbol,
+                timeframe,
+                newest.ratio,
+                newest.dispersion,
+            )
+        return None
+    oldest = _against_the_broker(
+        source,
+        root=root,
+        symbol=symbol,
+        timeframe=timeframe,
+        splits=splits,
+        start=on_disk.date_from,
+        end=on_disk.date_from + span,
+    )
+    if not oldest.conclusive:
+        raise RescaledBeyondReachError(
+            f"the broker rescaled {symbol} {timeframe} (its bars are now {newest.ratio:.4f} times "
+            f"the ones on disk) and no longer serves the oldest on disk, from "
+            f"{on_disk.date_from.date()}: collecting the rest would leave a step in the series, "
+            "so nothing was written — collect it whole from where the broker starts, after "
+            "moving the old files aside"
+        )
+    logger.warning(
+        "%s %s: the broker's bars are %.4f times the ones on disk (a roll or a dividend "
+        "rescaled the series); collecting every year on disk again, %s to %s",
+        symbol,
+        timeframe,
+        newest.ratio,
+        on_disk.date_from.date(),
+        on_disk.date_to.date(),
+    )
+    return on_disk
+
+
+def _against_the_broker(  # noqa: PLR0913 — the pair, where its files are, and the window
+    source: MarketDataSource,
+    *,
+    root: Path,
+    symbol: str,
+    timeframe: str,
+    splits: tuple[Split, ...],
+    start: dt.datetime,
+    end: dt.datetime,
+) -> Comparison:
+    """The disk's bars in `[start, end]` against the broker's, asked again and adjusted alike."""
+    stored = read_candles(root, symbol, timeframe, start=start, end=end)
+    try:
+        fresh = source.candles(symbol, timeframe, start, end)
+    except LookupError:
+        return Comparison(matched=0, ratio=1.0)
+    return compare(stored, adjusted(source, symbol, timeframe, fresh, splits))
 
 
 def _count_gaps(
@@ -355,6 +482,10 @@ class DatabaseJournal:
 
     def year_done(self, years_done: int) -> None:
         record_progress(self._session, self._id, years_done=years_done)
+        self._session.commit()
+
+    def widened(self, years_total: int) -> None:
+        widen_collection(self._session, self._id, years_total=years_total)
         self._session.commit()
 
     def same_clock(self, spec: InstrumentSpec) -> None:

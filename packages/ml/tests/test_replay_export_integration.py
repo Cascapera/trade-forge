@@ -73,6 +73,7 @@ def test_the_run_standing_for_an_entry_does_not_depend_on_the_query_plan(
         tick_value=Decimal("1"),
         contract_size=Decimal("100000"),
         digits=5,
+        default_spread_points=Decimal(9),
     )
     sweep = Sweep(
         entry_ids=["e1"],
@@ -123,4 +124,6 @@ def test_the_run_standing_for_an_entry_does_not_depend_on_the_query_plan(
     (job,) = jobs_of(session, sweep.id)
 
     assert job.run_id == str(uuid.UUID(int=1))
+    assert job.spread_ticks is not None
+    assert Decimal(job.spread_ticks) == 9
     assert job.definition["exit"] == {"take_profit": None}

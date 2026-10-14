@@ -11,9 +11,16 @@ from tradeforge_engine.costs import (
     ProportionalSpreadCostModel,
     SpreadCostModel,
 )
-from tradeforge_engine.domain import Candle, Side, Signal, SignalKind
+from tradeforge_engine.domain import AssetClass, Candle, Side, Signal, SignalKind
 from tradeforge_engine.testing import EURUSD, ScriptedStrategy, entry, falling, rising
-from tradeforge_ml.replay import Proposal, costs_from, instrument_from, replay, swap_from
+from tradeforge_ml.replay import (
+    Proposal,
+    costs_from,
+    instrument_from,
+    measured_costs,
+    replay,
+    swap_from,
+)
 
 
 def _run(
@@ -154,6 +161,58 @@ class TestTheRunsDocuments:
         spec = instrument_from(kept)
         assert spec.tick_size == Decimal("0.00001")
         assert spec.server_offset == dt.timedelta(hours=3)
+
+
+class TestTheMeasuredCosts:
+    """What a label charges since 14/10: the market's measured spread, whatever the sweep was."""
+
+    def test_the_markets_spread_replaces_the_runs_and_its_commission_and_swap_stay(self) -> None:
+        typed = {
+            "type": "spread_commission",
+            "spread_points": "642",  # ENGI11's in sweep d2faf8dc, against 1 measured
+            "commission_per_unit": "7",
+            "swap": {"long_per_lot": "-6.86", "short_per_lot": "0.86"},
+        }
+
+        model = measured_costs(
+            typed, spread_ticks=Decimal(1), asset_class=AssetClass.FOREX, last_close=Decimal(30)
+        )
+
+        assert model == {
+            "type": "spread_commission",
+            "spread_points": "1",
+            "commission_per_unit": "7",
+            "swap": {"long_per_lot": "-6.86", "short_per_lot": "0.86"},
+        }
+        assert isinstance(costs_from(model), CombinedCostModel)
+        assert swap_from(model) is not None
+
+    def test_a_run_charged_nothing_pays_the_spread_all_the_same(self) -> None:
+        model = measured_costs(
+            {"type": "none"},
+            spread_ticks=Decimal(100),
+            asset_class=AssetClass.INDEX,
+            last_close=Decimal(6700),
+        )
+
+        assert model == {
+            "type": "spread_commission",
+            "spread_points": "100",
+            "commission_per_unit": "0",
+        }
+
+    @pytest.mark.parametrize("asset_class", [AssetClass.STOCK, AssetClass.CRYPTO])
+    def test_a_share_and_a_crypto_pay_it_at_the_charts_last_price(
+        self, asset_class: AssetClass
+    ) -> None:
+        model = measured_costs(
+            {"type": "none"},
+            spread_ticks=Decimal(2),
+            asset_class=asset_class,
+            last_close=Decimal("223.44"),
+        )
+
+        assert model["spread_reference_price"] == "223.44"
 
 
 def test_a_stop_hit_on_the_entry_bar_hands_the_setup_its_entry_alone() -> None:

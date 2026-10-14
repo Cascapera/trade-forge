@@ -3,6 +3,8 @@
     tradeforge-collector backfill EURUSD H1 2024-01-01 2024-12-31
     tradeforge-collector backfill EURUSD H1 2024-01-01 2024-12-31 --source mt5
     tradeforge-collector agent
+    tradeforge-collector splits detect
+    tradeforge-collector splits add AMZN 2022-06-06 20:1
 
 `--source mock` is the default, and that is a deliberate choice: the command a new
 contributor runs first must work on their machine, on Linux, with no broker account.
@@ -35,14 +37,24 @@ from tradeforge_collector.live import (
     run_on_demand,
 )
 from tradeforge_collector.source import MarketDataSource
+from tradeforge_collector.splits import (
+    Split,
+    bring_up_to_date,
+    find_candidates,
+    observed_gap,
+    refuse_unless_the_bars_split,
+)
+from tradeforge_collector.storage import read_candles
 from tradeforge_collector.synthetic import SyntheticSource
 from tradeforge_collector.timeframes import TIMEFRAME_STEP
 from tradeforge_db.instruments import CatalogueEntry, upsert_instruments
 from tradeforge_db.session import create_db_engine, create_session_factory, session_scope
+from tradeforge_db.splits import record_split, splits_of, stock_markets
 from tradeforge_engine.domain import AssetClass
 
 if TYPE_CHECKING:
     from arq.typing import WorkerSettingsType
+    from sqlalchemy.orm import Session, sessionmaker
 
 DEFAULT_DATA_DIR = Path("data/ohlcv")
 
@@ -53,6 +65,22 @@ def _date(value: str) -> dt.datetime:
         return dt.datetime.strptime(value, "%Y-%m-%d").replace(tzinfo=dt.UTC)
     except ValueError:
         raise argparse.ArgumentTypeError(f"expected YYYY-MM-DD, got {value!r}") from None
+
+
+def _day(value: str) -> dt.date:
+    """A day, with no clock: a split's day is the broker's, converted where it is used."""
+    try:
+        return dt.date.fromisoformat(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected YYYY-MM-DD, got {value!r}") from None
+
+
+def _ratio(value: str) -> tuple[int, int]:
+    """`20:1` — shares after the split for shares before it. `1:10` is a reverse split."""
+    after, colon, before = value.partition(":")
+    if colon and after.isdigit() and before.isdigit() and int(after) > 0 and int(before) > 0:
+        return int(after), int(before)
+    raise argparse.ArgumentTypeError(f"expected AFTER:BEFORE like 20:1 or 1:10, got {value!r}")
 
 
 def _hours(value: str) -> dt.timedelta:
@@ -132,6 +160,30 @@ def _parser() -> argparse.ArgumentParser:
             "market is exactly what corrupts the measured one"
         ),
     )
+
+    # Share splits (14/10): Tradeview sends US shares' history unadjusted. See `splits.py`.
+    splits = commands.add_parser(
+        "splits", help="record share splits and adjust the stored bars for them"
+    )
+    actions = splits.add_subparsers(dest="action", required=True)
+    detect = actions.add_parser(
+        "detect", help="list daily gaps that look like a split nobody recorded (writes nothing)"
+    )
+    detect.add_argument("symbols", nargs="*", metavar="SYMBOL", help="default: every share")
+    detect.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
+    add = actions.add_parser("add", help="record a split and adjust the stored bars for it")
+    add.add_argument("symbol")
+    add.add_argument(
+        "effective_on", type=_day, metavar="YYYY-MM-DD", help="first day at the new price"
+    )
+    add.add_argument("ratio", type=_ratio, metavar="AFTER:BEFORE", help="20:1, 1:10, 11:10")
+    add.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
+    apply = actions.add_parser(
+        "apply",
+        help="adjust the stored bars for the splits already recorded (safe to run again)",
+    )
+    apply.add_argument("symbols", nargs="+", metavar="SYMBOL")
+    apply.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
 
     # The loop the whole of phase 3 hangs from. It has no natural end, so it is a command that
     # is expected to be killed — see `_live` for why Ctrl-C is a clean exit here.
@@ -525,6 +577,76 @@ def _backfill(args: argparse.Namespace) -> int:
     return 0
 
 
+def _splits(args: argparse.Namespace) -> int:
+    engine = create_db_engine()
+    try:
+        factory = create_session_factory(engine)
+        if args.action == "detect":
+            return _detect_splits(factory, args.data_dir, args.symbols)
+        if args.action == "apply":
+            return _apply_splits(factory, args.data_dir, args.symbols)
+        after, before = args.ratio
+        with session_scope(factory) as session:
+            record = record_split(
+                session, args.symbol, args.effective_on, shares_after=after, shares_before=before
+            )
+            _refuse_a_split_the_bars_do_not_show(args.data_dir, args.symbol, Split.of(record))
+        # ⚠️ Committed before the files are rewritten, not after: a rewrite that stops halfway is
+        # finished by `splits apply`, and that needs the split recorded to know what to do.
+        print(f"recorded {args.symbol} {args.effective_on} {after}:{before}")
+        return _apply_splits(factory, args.data_dir, [args.symbol])
+    finally:
+        engine.dispose()
+
+
+def _detect_splits(factory: "sessionmaker[Session]", data_dir: Path, symbols: Sequence[str]) -> int:
+    with session_scope(factory) as session:
+        markets = [m for m in stock_markets(session) if not symbols or m.symbol in symbols]
+        recorded = {
+            m.symbol: {r.effective_on for r in splits_of(session, m.symbol)} for m in markets
+        }
+    found = 0
+    for market in markets:
+        daily = read_candles(data_dir, market.symbol, "D1")
+        for candidate in find_candidates(daily, market.server_offset):
+            if candidate.effective_on in recorded[market.symbol]:
+                continue
+            found += 1
+            ratio = f"{candidate.shares_after}:{candidate.shares_before}"
+            print(
+                f"{market.symbol} {candidate.effective_on} {ratio} "
+                f"(open/close {candidate.observed:.4f}) -> tradeforge-collector splits add "
+                f"{market.symbol} {candidate.effective_on} {ratio}"
+            )
+    print(f"{found} unrecorded split(s) in {len(markets)} share(s)")
+    return 0
+
+
+def _refuse_a_split_the_bars_do_not_show(data_dir: Path, symbol: str, split: Split) -> None:
+    """Only a gap on disk shows the stored bars are still raw on that day (see `splits.py`)."""
+    daily = read_candles(data_dir, symbol, "D1")
+    if observed_gap(daily, split.effective_at, "D1") is None:
+        raise ValueError(
+            f"{symbol} has no daily bars on both sides of {split.key}: nothing to check the split "
+            "against, so it is not recorded"
+        )
+    refuse_unless_the_bars_split(daily, [split], timeframe="D1", where=symbol)
+
+
+def _apply_splits(factory: "sessionmaker[Session]", data_dir: Path, symbols: Sequence[str]) -> int:
+    for symbol in symbols:
+        with session_scope(factory) as session:
+            splits = tuple(map(Split.of, splits_of(session, symbol)))
+        if not splits:
+            print(f"{symbol}: no split recorded")
+            continue
+        rewritten = bring_up_to_date(data_dir, symbol, splits)
+        for part in rewritten:
+            print(f"{symbol} {part.timeframe} {part.year}: {part.candles} bars adjusted")
+        print(f"{symbol}: {len(splits)} split(s), {len(rewritten)} year file(s) rewritten")
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Dispatch a subcommand and return a shell exit code."""
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -536,6 +658,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "live": _live,
             "backfill": _backfill,
             "agent": _agent,
+            "splits": _splits,
         }
         return commands[args.command](args)
     except (LookupError, ValueError, ConnectionError) as error:

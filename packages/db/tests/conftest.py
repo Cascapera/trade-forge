@@ -50,6 +50,8 @@ TABLES_CHILD_FIRST = (
     "catalog_entries",
     "strategies",
     "datasets",
+    # Before `instruments`, which it points at with a RESTRICT foreign key (rev_0059).
+    "stock_splits",
     "instruments",
     # ⚠️ Not a child of anything, and listed anyway. `broker_symbols` deliberately has no
     # foreign key — that is what lets a sync replace it wholesale — so no CASCADE reaches it

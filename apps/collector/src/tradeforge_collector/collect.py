@@ -35,6 +35,7 @@ from sqlalchemy.orm import Session
 from tradeforge_collector.backfill import BackfillReport, backfill
 from tradeforge_collector.gaps import find_gaps
 from tradeforge_collector.source import MarketDataSource
+from tradeforge_collector.splits import Split
 from tradeforge_collector.storage import Coverage, coverage, dataset_path, read_times
 from tradeforge_collector.timeframes import step
 from tradeforge_db.collections import finish_collection, record_progress, start_collection
@@ -45,6 +46,7 @@ from tradeforge_db.instruments import (
     upsert_instruments,
 )
 from tradeforge_db.models import Instrument
+from tradeforge_db.splits import splits_of
 from tradeforge_engine.domain import InstrumentSpec
 
 logger = logging.getLogger(__name__)
@@ -158,6 +160,10 @@ class CollectionJournal(Protocol):
         """
         ...
 
+    def splits_for(self, symbol: str) -> tuple[Split, ...]:
+        """The share splits recorded for `symbol`, which every slice is written adjusted for."""
+        ...
+
     def catalogued(self, spec: InstrumentSpec, spread: Decimal | None, on_disk: Coverage) -> None:
         """The instrument and what the files now hold, for the rest of the system to find."""
         ...
@@ -230,6 +236,8 @@ def _collect(  # noqa: PLR0913 — keyword-only; the same axes as `run_collectio
     # to move one and leave the rest agreeing with each other about the wrong thing.
     # A report is small (counts, a path, two instants), so holding one per year costs nothing.
     reports: list[BackfillReport] = []
+    # Asked once: a split recorded halfway through would leave the years before it raw.
+    splits = journal.splits_for(symbol)
 
     for done, (slice_from, slice_to) in enumerate(slices, start=1):
         try:
@@ -242,6 +250,7 @@ def _collect(  # noqa: PLR0913 — keyword-only; the same axes as `run_collectio
                 end=slice_to,
                 session=None,
                 before_write=journal.same_clock,
+                splits=splits,
             )
         except LookupError:
             # ⚠️ An empty year is ordinary and must not fail the request. A symbol listed in
@@ -352,6 +361,9 @@ class DatabaseJournal:
         # ⚠️ `ClockChangedError` is a `ValueError`: it passes the empty-year handler, and
         # `run_collection` writes its sentence — the offset to type — on the collection's row.
         refuse_a_new_clock(self._session, spec)
+
+    def splits_for(self, symbol: str) -> tuple[Split, ...]:
+        return tuple(map(Split.of, splits_of(self._session, symbol)))
 
     def catalogued(self, spec: InstrumentSpec, spread: Decimal | None, on_disk: Coverage) -> None:
         upsert_instruments(

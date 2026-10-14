@@ -29,6 +29,7 @@ from sqlalchemy import (
     Boolean,
     CheckConstraint,
     Computed,
+    Date,
     DateTime,
     Enum,
     ForeignKey,
@@ -590,6 +591,53 @@ class Dataset(Base):
         _timeframe_check(),
         CheckConstraint("date_to >= date_from", name="date_range"),
         CheckConstraint("candle_count >= 0", name="candle_count_non_negative"),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Stock splits — the events a share's stored history is adjusted for            #
+# --------------------------------------------------------------------------- #
+
+
+class StockSplit(Base):
+    """A share split (or reverse split, or bonus issue) its stored bars are adjusted for.
+
+    ⚠️ **Why this exists (14/10).** Tradeview hands over US shares' history *unadjusted*: on
+    AMZN's 20-for-1 of June 2022 its price falls from 2 446 to 125 between two bars, and a position
+    held across it took a -500 R "loss" that never happened. Eleven of these across nine shares
+    were found by the gap they leave. The collector divides every bar before `effective_on` by the
+    ratio when it writes them, so every reader — the engine, the ML features, the charts, the
+    workers on other machines — sees one continuous series and none of them has to know.
+
+    ⚠️ **Only for a broker that sends raw history.** XP's Brazilian shares come already adjusted
+    (splits *and* dividends); registering one of their splits would divide the history twice. The
+    collector refuses a split its own bars show no gap for.
+
+    `shares_after` for `shares_before`: 20 for 1 is a split, 1 for 10 a reverse split, 11 for 10 a
+    10 % bonus issue. Kept as two integers, not one decimal, because a 3-for-1 is not a decimal.
+    """
+
+    __tablename__ = "stock_splits"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    # RESTRICT, as `datasets`: the split describes bars on disk, and the instrument is not
+    # deleted while a record of how its files were rewritten still points at it.
+    instrument_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("instruments.id", ondelete="RESTRICT"), nullable=False
+    )
+    effective_on: Mapped[dt.date] = mapped_column(Date, nullable=False)
+    """The first trading day at the new price (the ex-date), on the broker's server clock — the
+    day whose daily bar opens at the new price. Every bar before that day's midnight is adjusted."""
+    shares_after: Mapped[int] = mapped_column(Integer, nullable=False)
+    shares_before: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[dt.datetime] = _created_at()
+
+    __table_args__ = (
+        # One event per share per day: two would be the same split told twice.
+        UniqueConstraint("instrument_id", "effective_on"),
+        CheckConstraint("shares_after > 0 AND shares_before > 0", name="split_shares_positive"),
+        # N for N changes nothing — a row that would adjust by one is a typo.
+        CheckConstraint("shares_after <> shares_before", name="split_changes_the_count"),
     )
 
 

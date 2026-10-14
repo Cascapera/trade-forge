@@ -3056,3 +3056,18 @@ runs deveriam voltar a `queued`, não `failed`; `failed` só quando é a última
   mais fiel.
 - **A comissão das ações BR e dos futuros B3 não está no catálogo.** O rótulo cobra a do run, e quase
   todas rodaram com 0.
+
+## Série reescalada pela corretora (14/10) — o que ficou para depois
+
+- **A sessão ao vivo ainda não percebe a rolagem sozinha.** A coleta agora não deixa degrau no disco, mas
+  uma sessão que atravessa o vencimento (o WDO vence todo mês) recebe as velas novas na escala nova sobre o
+  histórico velho que tem na memória. PR B: o publicador relê as velas anteriores a cada vela nova; a sessão
+  compara as velas repetidas do disco e do stream ao aquecer; o supervisor para o ativo, recoleta e reinicia.
+- **Sinais no tick do contrato.** A série ajustada (`WIN$`, tick 1) gera stop como 210 072, que não é
+  múltiplo de 5. PR C: arredondar entrada, stop e alvo ao tick do contrato.
+- **Os anos que a corretora não entrega mais.** Reescalada a série, a coleta recusa se a corretora não serve
+  os anos mais antigos em disco (escreveria um degrau). Hoje é decisão à mão: mover os arquivos antigos e
+  coletar do começo da corretora. Daria para reescalar os anos antigos pela razão medida.
+- **A imagem da API ainda tem a regra antiga do spread** (uma leitura vazia apagava o medido) até o próximo
+  build da API.
+

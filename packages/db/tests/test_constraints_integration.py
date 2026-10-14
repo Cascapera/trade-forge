@@ -642,13 +642,13 @@ def test_a_source_with_nothing_to_say_writes_null_rather_than_zero(session: Sess
 def test_a_measured_spread_survives_a_later_backfill_that_knows_nothing(
     session: Session,
 ) -> None:
-    """⚠️ It does not — and this test exists to make that visible rather than surprising.
+    """⚠️ It does, since 14/10 — and this test used to prove the opposite.
 
-    `default_spread_points` is in the updatable set, so a catalogue run from a source that
-    cannot quote a spread overwrites a measured one with NULL. That is the correct reading
-    of an upsert whose whole job is to converge on what the source currently says: a broker
-    that stopped quoting a spread has genuinely stopped, and silently keeping yesterday's
-    number would be the catalogue asserting something nobody told it.
+    It read an empty spread as "the broker stopped quoting", so an upsert converging on what the
+    source says wrote NULL over a measurement. But the source answers `None` far more often for
+    other reasons: the market is shut and its closing spread is refused, or the series has no
+    book (XP's `WIN$`). Each of those wiped a measured spread — every collection after hours
+    emptied the catalogue, and the ML replay that charges it then refused the market.
     """
     spec = INSTRUMENT_SEEDS[0]
     upsert_instruments(session, (CatalogueEntry(spec, Decimal("12")),))
@@ -656,8 +656,13 @@ def test_a_measured_spread_survives_a_later_backfill_that_knows_nothing(
 
     upsert_instruments(session, (spec,))
     session.commit()
+    assert session.query(Instrument.default_spread_points).scalar() == Decimal("12")
 
-    assert session.query(Instrument.default_spread_points).scalar() is None
+    upsert_instruments(session, (CatalogueEntry(spec, Decimal("9")),))
+    session.commit()
+    assert session.query(Instrument.default_spread_points).scalar() == Decimal("9"), (
+        "a new measurement still replaces the old one"
+    )
 
 
 def test_a_zero_spread_is_allowed_but_a_negative_one_is_refused(session: Session) -> None:

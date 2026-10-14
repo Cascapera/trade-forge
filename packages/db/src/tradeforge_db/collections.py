@@ -22,6 +22,7 @@ __all__ = [
     "recent_collections",
     "record_progress",
     "start_collection",
+    "widen_collection",
 ]
 
 
@@ -83,6 +84,15 @@ def record_progress(session: Session, collection_id: uuid.UUID, *, years_done: i
     if collection is None:
         return
     collection.years_done = years_done
+
+
+def widen_collection(session: Session, collection_id: uuid.UUID, *, years_total: int) -> None:
+    """Say the collection now covers `years_total` years: the broker rescaled the series, and
+    every year on disk is collected again so the files stay in one scale (14/10)."""
+    collection = session.get(Collection, collection_id)
+    if collection is None:
+        return
+    collection.years_total = years_total
 
 
 def finish_collection(  # noqa: PLR0913 — keyword-only; the outcome has this many parts

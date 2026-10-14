@@ -11,7 +11,7 @@ from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
 
-from sqlalchemy import Select, select
+from sqlalchemy import Select, func, select
 from sqlalchemy.orm import Session, selectinload
 
 from tradeforge_db.models import (
@@ -414,6 +414,19 @@ def _decimal(raw: str | None) -> Decimal | None:
     return Decimal(raw) if raw else None
 
 
+def _still_there(
+    session: Session, model: type[LiveSetup | Strategy | Instrument], raw: str | None
+) -> uuid.UUID | None:
+    """`raw` as an id, if that row is still there; `None` for one deleted since.
+
+    ⚠️ **Deleted between the signal and its recording (13/10).** A setup deleted while one of its
+    signals waited on the stream made the insert break its foreign key — and the recorder, which
+    reads first on every round what it could not write, never got past it: no signal recorded and
+    no orphan watched from then on. The row is written as the deletion would have left it."""
+    found = _uuid(raw)
+    return found if found is not None and session.get(model, found) is not None else None
+
+
 def record_event(session: Session, fields: Mapping[str, str]) -> SignalRecord:
     """Fold one `signals.events` entry into its signal's row, made at the first event seen.
 
@@ -425,9 +438,9 @@ def record_event(session: Session, fields: Mapping[str, str]) -> SignalRecord:
     if row is None:
         row = SignalRecord(
             number=number,
-            setup_id=_uuid(fields.get("setup_id")),
-            strategy_id=_uuid(fields.get("strategy_id")),
-            instrument_id=_uuid(fields.get("instrument_id")),
+            setup_id=_still_there(session, LiveSetup, fields.get("setup_id")),
+            strategy_id=_still_there(session, Strategy, fields.get("strategy_id")),
+            instrument_id=_still_there(session, Instrument, fields.get("instrument_id")),
             symbol=fields.get("symbol", "?"),
             timeframe=fields.get("timeframe", ""),
             side=fields.get("side", "long"),
@@ -435,6 +448,8 @@ def record_event(session: Session, fields: Mapping[str, str]) -> SignalRecord:
             session_id=_uuid(fields.get("session_id")),
         )
         session.add(row)
+    if row.no_target_r is None:  # the R it was armed with, whatever its setup becomes
+        row.no_target_r = _decimal(fields.get("no_target_r"))
     if fields.get("order_type"):
         row.order_type = fields["order_type"]
     for name in ("entry", "stop", "target"):
@@ -491,8 +506,10 @@ _OpenRow = tuple[SignalRecord, str, str, Decimal]
 
 
 def _open_signals() -> Select[_OpenRow]:
+    # The signal's own no-target R; its setup's only for a row recorded before it kept one.
+    no_target_r = func.coalesce(SignalRecord.no_target_r, LiveSetup.no_target_r)
     return (
-        select(SignalRecord, Strategy.name, Broker.slug, LiveSetup.no_target_r)
+        select(SignalRecord, Strategy.name, Broker.slug, no_target_r)
         .outerjoin(Strategy, Strategy.id == SignalRecord.strategy_id)
         .outerjoin(Instrument, Instrument.id == SignalRecord.instrument_id)
         .outerjoin(Broker, Broker.id == Instrument.broker_id)

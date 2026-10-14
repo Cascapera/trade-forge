@@ -43,7 +43,9 @@ __all__ = ["ORPHAN_NOTE", "OrphanWatch", "annul", "orphan_brokers", "resolve_orp
 
 logger = logging.getLogger(__name__)
 
-ORPHAN_NOTE = "Acompanhado pelo preço: a sessão que anunciou este sinal foi reiniciada."
+ORPHAN_NOTE = "Acompanhado pelo preço: a sessão que anunciou este sinal parou."
+"""Said "parou", not "foi reiniciada" (13/10): a crash, a restart, a setup switched off, removed,
+deleted or edited all leave a signal to the watch, and only some of those restart anything."""
 
 _LEASE = 90.0
 """Seconds a market is asked of its live loop for an orphan in a trade — renewed every round."""
@@ -137,7 +139,7 @@ def _follow(redis: Redis, one: OpenSignal, watch: OrphanWatch) -> dict[str, str]
             "kind": "cancelled",
             "time": dt.datetime.now(dt.UTC).isoformat(),
             "clock": "wall",
-            "reason": "sessão reiniciada sem os níveis do trade para acompanhar",
+            "reason": "a sessão parou sem os níveis do trade para acompanhar",
         }
     if one.number not in watch.moved:
         watch.moved[one.number] = _moved_stop(redis, one)
@@ -190,7 +192,7 @@ def resolve_orphans(
                 "kind": "cancelled",
                 "time": dt.datetime.now(dt.UTC).isoformat(),
                 "clock": "wall",
-                "reason": "sessão reiniciada: a ordem deixou de ser acompanhada",
+                "reason": "a sessão parou: a ordem deixou de ser acompanhada",
             }
         else:
             if one.broker is not None:

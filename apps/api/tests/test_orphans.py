@@ -188,7 +188,7 @@ def test_an_armed_orphan_is_cancelled_with_the_clocks_time(found: list[OpenSigna
         "5",
         "wall",
     )
-    assert "sessão reiniciada" in cancelled["reason"]
+    assert "a sessão parou" in cancelled["reason"]
     assert "live:wanted:activtrades" not in redis.sets, "an order nobody holds needs no bars"
 
 

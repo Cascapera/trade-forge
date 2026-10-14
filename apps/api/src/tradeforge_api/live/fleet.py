@@ -36,6 +36,7 @@ from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
 
+from tradeforge_collector.restarts import RESTARTS_KEY, restart_field
 from tradeforge_db.live_setups import FollowedPair
 
 __all__ = [
@@ -68,15 +69,6 @@ MARKET_STATE_TTL = 180
 SUPERVISOR_STATE_KEY = "signals:supervisor"
 """The supervisor's own word, every round: what runs where. Lapsed means nobody supervises."""
 
-RESTARTS_KEY = "signals:restarts"
-"""The screen's restart requests: one hash, a field per market (`restart_field`) valued with when it
-was asked.
-
-⚠️ **One key, not one key per request (13/10).** Requests used to be keys of their own, found each
-round with a SCAN of the whole keyspace — instant while Redis held a few thousand keys, 68 s once
-a sweep's 2.3 million jobs were back in it: every round took over a minute, and the supervisor's
-word lapsed in the middle of each, so the screen read it as stopped."""
-
 RESTART_TTL = dt.timedelta(minutes=10)
 """How long a request is obeyed: a supervisor that was down longer does not act, when it comes
 back, on a click somebody made ten minutes earlier."""
@@ -85,11 +77,6 @@ back, on a click somebody made ten minutes earlier."""
 def market_state_key(process: str) -> str:
     """Where a market process says what it carries."""
     return f"signals:market:{process}"
-
-
-def restart_field(instrument_id: uuid.UUID, timeframe: str) -> str:
-    """A market's field in `RESTARTS_KEY`."""
-    return f"{instrument_id}:{timeframe}"
 
 
 @dataclass(frozen=True, slots=True, order=True)

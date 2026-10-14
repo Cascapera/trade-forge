@@ -47,24 +47,40 @@ The consequence worth naming: **filling a gap is not a special path for reconnec
 reconnection is one cause of a hole; the process being restarted is another, and a symbol that
 went quiet over a holiday is a third. They all arrive at the same comparison, so they are all
 repaired by the same few lines.
+
+## A broker that rewrites what was already published (14/10)
+
+XP's `WIN$` is adjusted by a ratio at every roll: when WINV26 expired, every past bar moved up
+2.1 %. The bars this loop had published, and the history the sessions warmed on, stayed in the
+old scale; the next bar came in the new one, and the step read as a break of structure the market
+never made. So, given an `on_rescale`, the loop remembers the last `MEMORY` bars it published (or,
+for a pair it starts watching, the newest of the stream's and the disk's) and, whenever a new bar
+closes, reads them again with it and compares (`rescale.compare`). Rewritten by one factor, the
+new bar is **held back** and `on_rescale` is told — which collects the series again and has the
+sessions restarted on it; once it has, the pair is watched again from scratch. A session never
+sees a bar in the new scale over a history in the old.
 """
 
 import datetime as dt
 import logging
 import time
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections import deque
+from collections.abc import Callable, Iterable, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
+from tradeforge_collector.rescale import Comparison, compare
 from tradeforge_collector.source import Candle
 from tradeforge_collector.timeframes import step
 
 __all__ = [
     "DEFAULT_MAX_BACKFILL",
     "DEFAULT_MAX_CATCH_UP",
+    "MEMORY",
     "Backoff",
     "CandlePublisher",
     "LiveSource",
+    "RescaledError",
     "Subscription",
     "TickerLiveSource",
     "poll_once",
@@ -86,6 +102,34 @@ DEFAULT_MAX_BACKFILL = 500
 # not this loop — and a session that warmed on it trades the hole as if it were a move: 20 000 bars
 # is ten weeks of M5, read in one call.
 DEFAULT_MAX_CATCH_UP = 20_000
+
+MEMORY = 30
+"""Bars of each pair the loop remembers having published and reads again at every new bar, to
+find out whether the broker rewrote them (14/10): enough for `rescale.ENOUGH` to be conclusive,
+few enough that a poll which found a bar asks for thirty more rows, not thousands."""
+
+Remembered = MutableMapping["Subscription", deque[Candle]]
+"""What the loop published last, per pair — what a broker that rewrote its past is caught by."""
+
+OnRescale = Callable[["Subscription", Comparison], bool]
+"""Told that the broker rewrote a pair's past; `True` once the series is collected again and its
+sessions restarted, and the pair can be watched again from scratch."""
+
+
+class RescaledError(Exception):
+    """The broker's bars for a pair are no longer the ones this loop published: one factor away."""
+
+    def __init__(
+        self, subscription: "Subscription", comparison: Comparison, fresh: list[Candle]
+    ) -> None:
+        super().__init__(
+            f"{subscription.symbol} {subscription.timeframe}: the broker's bars are "
+            f"{comparison.ratio:.4f} times the ones published"
+        )
+        self.subscription = subscription
+        self.comparison = comparison
+        self.fresh = fresh
+        """The bars just read, the new ones last — what is published if nobody can mend it."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -211,13 +255,16 @@ def stream_name(subscription: Subscription) -> str:
     return f"candles.{subscription.symbol}.{subscription.timeframe}"
 
 
-def poll_once(
+def poll_once(  # noqa: PLR0913 — keyword-only; the rescale's three are given together or not at all
     source: LiveSource,
     publisher: CandlePublisher,
     subscriptions: Iterable[Subscription],
     *,
     seen: dict[Subscription, dt.datetime] | None = None,
     max_backfill: int = DEFAULT_MAX_BACKFILL,
+    memory: Remembered | None = None,
+    on_rescale: OnRescale | None = None,
+    rescaled: set[Subscription] | None = None,
 ) -> Mapping[Subscription, list[Candle]]:
     """Ask every subscription what has closed since last time and publish what is new.
 
@@ -225,6 +272,11 @@ def poll_once(
     answer most of the time, because a poll is far more frequent than a bar. A list per
     subscription rather than a single candle, because a poll that follows an outage announces
     the whole run at once.
+
+    With `memory` and `on_rescale` (14/10), every new bar comes with the remembered ones read
+    again; a pair whose past the broker rewrote publishes nothing this poll and joins `rescaled`
+    once `on_rescale` has mended it — or, if it could not, publishes as before and is remembered
+    in the new scale, so it is not caught again at every bar.
 
     `seen` is an optional in-process memory of the last bar published per subscription. It is
     an optimisation and never the guarantee: the publisher is what decides newness, so a loop
@@ -245,10 +297,32 @@ def poll_once(
     published: dict[Subscription, list[Candle]] = {}
 
     for subscription in subscriptions:
+        if rescaled is not None and any(one.symbol == subscription.symbol for one in rescaled):
+            # Mended a moment ago for another timeframe: every one of the symbol was collected
+            # again, and is watched again from scratch next round.
+            continue
         try:
-            bars = _closed_since(source, subscription, seen=seen, max_backfill=max_backfill)
+            bars = _closed_since(
+                source, subscription, seen=seen, max_backfill=max_backfill, memory=memory
+            )
         except ConnectionError:
             raise
+        except RescaledError as rewritten:
+            logger.warning("%s; the new bar is held back", rewritten)
+            if on_rescale is not None and on_rescale(subscription, rewritten.comparison):
+                if rescaled is not None:
+                    rescaled.add(subscription)
+                continue
+            logger.error(
+                "%s %s: the series could not be collected again; publishing in the new scale "
+                "over sessions warmed in the old one — restart them by hand",
+                subscription.symbol,
+                subscription.timeframe,
+            )
+            last = None if seen is None else seen.get(subscription)
+            bars = [candle for candle in rewritten.fresh if last is None or candle.time > last]
+            if memory is not None:
+                memory[subscription] = deque(rewritten.fresh, maxlen=MEMORY)
         except Exception:
             logger.exception(
                 "could not read the last closed bar for %s %s",
@@ -272,6 +346,8 @@ def poll_once(
             )
         if seen is not None:
             seen[subscription] = bars[-1].time
+        if memory is not None:
+            memory.setdefault(subscription, deque(maxlen=MEMORY)).extend(bars)
 
     return published
 
@@ -282,6 +358,7 @@ def _closed_since(
     *,
     seen: Mapping[Subscription, dt.datetime] | None,
     max_backfill: int,
+    memory: Remembered | None = None,
 ) -> list[Candle]:
     """Every bar this subscription closed that has not been announced yet, oldest first.
 
@@ -306,23 +383,34 @@ def _closed_since(
     # exactly the number of bars owed when it is not. Both operands are instants the terminal
     # stated, so no clock — and no offset — takes part in the decision.
     owed = (newest.time - last) // bar
-    if owed <= 1:
+    remembered = None if memory is None else memory.get(subscription)
+    if owed <= 1 and not remembered:
         return latest
 
     wanted = min(owed, max_backfill)
-    logger.warning(
-        "%s %s: %d bar(s) owed since %s; asking the terminal for the last %d by position",
-        subscription.symbol,
-        subscription.timeframe,
-        owed,
-        last,
-        wanted,
+    if owed > 1:
+        logger.warning(
+            "%s %s: %d bar(s) owed since %s; asking the terminal for the last %d by position",
+            subscription.symbol,
+            subscription.timeframe,
+            owed,
+            last,
+            wanted,
+        )
+    # The remembered bars are read again with the new ones, by position like everything here:
+    # MEMORY more reach back past `last` over the bars that exist.
+    filled = source.recent_closed(
+        subscription.symbol, subscription.timeframe, wanted + (MEMORY if remembered else 0)
     )
-    filled = source.recent_closed(subscription.symbol, subscription.timeframe, wanted)
     if not filled:
         return latest
+    if remembered:
+        again = compare(list(remembered), [candle for candle in filled if candle.time <= last])
+        if again.rescaled:
+            raise RescaledError(subscription, again, filled)
 
-    _warn_if_short(subscription, filled=filled, last=last, bar=bar)
+    if owed > 1:
+        _warn_if_short(subscription, filled=filled, last=last, bar=bar)
     # Asked by position, so it reaches back past `last` whenever the market was shut for part of
     # the hole: only what came after is owed.
     return [candle for candle in filled if candle.time > last]
@@ -498,6 +586,8 @@ def run_on_demand(  # noqa: PLR0913 — the same seams as `run`, plus where the 
     max_backfill: int = DEFAULT_MAX_BACKFILL,
     on_disk: Callable[[Subscription], dt.datetime | None] | None = None,
     max_catch_up: int = DEFAULT_MAX_CATCH_UP,
+    tail: Callable[[Subscription], Sequence[Candle]] | None = None,
+    on_rescale: OnRescale | None = None,
 ) -> int:
     """`run`, watching whatever `demand` answers each round instead of a fixed list (ADR-0032).
 
@@ -509,6 +599,11 @@ def run_on_demand(  # noqa: PLR0913 — the same seams as `run`, plus where the 
     from its stream like a restart, so a pair asked for again after a pause gets its gap filled —
     and a pair no longer asked for stops. Returns how many candles were published.
 
+    With `on_rescale` (14/10) the loop watches for a broker that rewrites a pair's past: each
+    pair starts remembering `tail` (the newest of the stream's and the disk's last bars), and a
+    rewrite holds its new bar back until `on_rescale` has collected the series again and had its
+    sessions restarted; then every pair of that symbol is watched again from scratch.
+
     ⚠️ A pair the terminal refuses to select is set aside, not retried every five seconds, until
     it drops out of the demand: a refusal is configuration (a ticker the account cannot see), and
     hammering it would bury the log line that says so. A `ConnectionError` while selecting is the
@@ -517,6 +612,8 @@ def run_on_demand(  # noqa: PLR0913 — the same seams as `run`, plus where the 
     seen: dict[Subscription, dt.datetime] = {}
     watching: set[Subscription] = set()
     refused: set[Subscription] = set()
+    memory: Remembered | None = None if on_rescale is None else {}
+    rescaled: set[Subscription] = set()
     total = 0
     failures = 0
     polls_left = polls
@@ -524,6 +621,7 @@ def run_on_demand(  # noqa: PLR0913 — the same seams as `run`, plus where the 
     while True:
         last_round = polls_left is not None and polls_left <= 1
         try:
+            _forget_rescaled(rescaled, watching, seen, memory)
             asked = set(demand())
             for gone in (watching | refused) - asked:
                 seen.pop(gone, None)
@@ -531,41 +629,26 @@ def run_on_demand(  # noqa: PLR0913 — the same seams as `run`, plus where the 
             watching &= asked
             refused &= asked
             for new in sorted(asked - watching - refused, key=_by_name):
-                _resume(publisher, (new,), seen)
-                stored = None if new in seen or on_disk is None else on_disk(new)
-                try:
-                    source.subscribe(new.symbol)
-                except ConnectionError:
-                    raise
-                except Exception:
-                    logger.exception("%s %s: the terminal refused it", new.symbol, new.timeframe)
-                    refused.add(new)
-                    continue
-                watching.add(new)
-                logger.info("%s %s: now watched", new.symbol, new.timeframe)
-                if stored is not None:
-                    seen[new] = stored
-                    logger.info(
-                        "%s %s: catching up from the last bar on disk, %s",
-                        new.symbol,
-                        new.timeframe,
-                        stored,
-                    )
-                if new in seen:
-                    # Caught up as far as a first fill may reach, from the disk or from the
-                    # stream: a machine switched off for a week owes more than an outage does.
-                    total += sum(
-                        len(bars)
-                        for bars in poll_once(
-                            source, publisher, (new,), seen=seen, max_backfill=max_catch_up
-                        ).values()
-                    )
+                total += _start_watching(
+                    new,
+                    source=source,
+                    publisher=publisher,
+                    seen=seen,
+                    watching=watching,
+                    refused=refused,
+                    on_disk=on_disk,
+                    max_catch_up=max_catch_up,
+                    rescue=_Rescue(memory, tail, on_rescale, rescaled),
+                )
             published = poll_once(
                 source,
                 publisher,
-                sorted(watching, key=_by_name),
+                sorted(watching - rescaled, key=_by_name),
                 seen=seen,
                 max_backfill=max_backfill,
+                memory=memory,
+                on_rescale=on_rescale,
+                rescaled=rescaled,
             )
         except ConnectionError as error:
             if last_round:
@@ -591,6 +674,90 @@ def run_on_demand(  # noqa: PLR0913 — the same seams as `run`, plus where the 
             polls_left -= 1
 
     return total
+
+
+@dataclass(frozen=True, slots=True)
+class _Rescue:
+    """What `run_on_demand` watches a rescale with (14/10) — all of it `None` but the set when no
+    `on_rescale` was given, which leaves the loop as it was."""
+
+    memory: Remembered | None
+    tail: Callable[[Subscription], Sequence[Candle]] | None
+    on_rescale: OnRescale | None
+    rescaled: set[Subscription]
+
+
+def _start_watching(  # noqa: PLR0913 — keyword-only; the loop's state, handed over by name
+    new: Subscription,
+    *,
+    source: LiveSource,
+    publisher: CandlePublisher,
+    seen: dict[Subscription, dt.datetime],
+    watching: set[Subscription],
+    refused: set[Subscription],
+    on_disk: Callable[[Subscription], dt.datetime | None] | None,
+    max_catch_up: int,
+    rescue: _Rescue,
+) -> int:
+    """Start watching a pair just asked for: resumed from its stream or the disk and caught up at
+    once. Returns how many bars that published."""
+    _resume(publisher, (new,), seen)
+    stored = None if new in seen or on_disk is None else on_disk(new)
+    try:
+        source.subscribe(new.symbol)
+    except ConnectionError:
+        raise
+    except Exception:
+        logger.exception("%s %s: the terminal refused it", new.symbol, new.timeframe)
+        refused.add(new)
+        return 0
+    watching.add(new)
+    logger.info("%s %s: now watched", new.symbol, new.timeframe)
+    if rescue.memory is not None and rescue.tail is not None:
+        rescue.memory[new] = deque(rescue.tail(new), maxlen=MEMORY)
+    if stored is not None:
+        seen[new] = stored
+        logger.info(
+            "%s %s: catching up from the last bar on disk, %s", new.symbol, new.timeframe, stored
+        )
+    if new not in seen:
+        return 0
+    # Caught up as far as a first fill may reach, from the disk or from the stream: a machine
+    # switched off for a week owes more than an outage does.
+    return sum(
+        len(bars)
+        for bars in poll_once(
+            source,
+            publisher,
+            (new,),
+            seen=seen,
+            max_backfill=max_catch_up,
+            memory=rescue.memory,
+            on_rescale=rescue.on_rescale,
+            rescaled=rescue.rescaled,
+        ).values()
+    )
+
+
+def _forget_rescaled(
+    rescaled: set[Subscription],
+    watching: set[Subscription],
+    seen: dict[Subscription, dt.datetime],
+    memory: Remembered | None,
+) -> None:
+    """Every pair of a symbol whose series was collected again is watched again from scratch: its
+    position and its memory are of the old scale, and the next round resumes it from the stream
+    and remembers the newest of the stream and the disk — the disk, now, in the new scale."""
+    symbols = {pair.symbol for pair in rescaled}
+    for pair in [pair for pair in watching if pair.symbol in symbols]:
+        watching.discard(pair)
+        seen.pop(pair, None)
+        if memory is not None:
+            memory.pop(pair, None)
+        logger.info(
+            "%s %s: watched again from scratch after the rescale", pair.symbol, pair.timeframe
+        )
+    rescaled.clear()
 
 
 class TickerLiveSource:

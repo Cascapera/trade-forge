@@ -293,3 +293,13 @@ def test_a_market_process_word_and_a_restart_request_read_back() -> None:
     assert parse_restart_field(restart_field(WIN, "M15")) == MarketKey(WIN, "M15")
     assert parse_restart_field("not-an-id:M5") is None
     assert parse_restart_field(str(WIN)) is None
+
+
+def test_a_restart_the_collector_asks_for_is_one_the_supervisor_reads() -> None:
+    """Since 14/10 the live loop asks too, after collecting a rescaled series again: the field it
+    writes (`tradeforge_collector.restarts`) is the one parsed here."""
+    from tradeforge_collector.restarts import restart_field  # noqa: PLC0415
+
+    instrument = uuid.UUID("c3acc215-3158-492e-8263-df0e662b6429")
+
+    assert parse_restart_field(restart_field(instrument, "M5")) == MarketKey(instrument, "M5")

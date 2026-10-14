@@ -467,3 +467,55 @@ def test_a_market_asked_inside_its_warm_up_names_the_sessions_it_is_warming(
     warming = [sessions for phase, sessions in said if phase == "warming"]
     assert warming, "the warm-up said nothing"
     assert all(sessions == both for sessions in warming), said
+
+
+def test_a_session_asked_to_stop_in_its_warm_up_leaves_it_and_the_last_one_ends_the_market(
+    session: Session,
+    session_factory: Callable[[], Session],
+    plan: SessionPlan,
+    other: Strategy,
+    parquet_root: Path,
+) -> None:
+    """13/10: a restart pressed on WIN M5 at 20h, the B3 closed, would have waited for the next
+    morning — the warm-up ends only at the first bar past the cut, and nobody warming heard a stop
+    while the stream waited for it."""
+    history, live_bars, cut = split_at(CUT)
+    first, second = signal_plan(plan), signal_plan(plan, other)
+    assert first.session_id is not None
+    assert second.session_id is not None
+    asked: set[uuid.UUID] = set()
+    said: list[tuple[str, frozenset[uuid.UUID]]] = []
+    market = Market(
+        factory=factory_of(session_factory),
+        plans=[first, second],
+        parquet_root=parquet_root,
+        signals_for=lambda _one: Sink(),
+        signalled=lambda: False,
+        asked_to_stop=lambda session_id: session_id in asked,
+        now=lambda: cut,
+        publish=lambda phase, sessions: said.append((phase, frozenset(sessions))),
+    )
+    answers: list[bool] = []
+
+    class Closed(ListSource):
+        """A market at night: reads that come back empty, the stream asking between them as
+        `CandleStream` does, and ending when the answer is yes."""
+
+        def candles(self) -> Iterator[Candle]:
+            for leaving in (first, second):
+                asked.add(leaving.session_id)  # type: ignore[arg-type]
+                answers.append(market.should_stop())
+                if answers[-1]:
+                    return
+            yield from live_bars
+
+    outcomes = market.run(Closed(history, live_bars))
+
+    assert answers == [False, True], "the other was still warming; then nobody was"
+    assert said[-2:] == [("warming", frozenset({second.session_id})), ("warming", frozenset())]
+    assert outcomes == []
+    assert market.failures == 0, "asked to leave, not failed"
+    opened = session.scalars(
+        select(LiveSession).where(LiveSession.id.in_([first.session_id, second.session_id]))
+    ).all()
+    assert opened == [], "never opened: no row to leave behind"

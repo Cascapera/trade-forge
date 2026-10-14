@@ -130,13 +130,18 @@ class Market:
         """Handed to the stream, which asks between reads — every minute at most, bar or not.
 
         Finishes every session asked to stop, then says whether the market is done: signalled, or
-        with nobody left. ⚠️ **A session asked to stop is finished here, not at the next bar**: on
-        H4 that bar is four hours away, and the supervisor would have killed the whole market for
-        one setup turned off long before.
+        with nobody left, warming or not. ⚠️ **A session asked to stop is finished here, not at
+        the next bar**: on H4 that bar is four hours away, and the supervisor would have killed
+        the whole market for one setup turned off long before.
+
+        ⚠️ **The warm-up asks too, and is answered (13/10).** It ends only at the first bar past
+        the cut, and the stream asks while waiting for it — all night on a closed market. Its
+        sessions used to be left out of the answer, so a restart pressed on WIN at 20h waited for
+        the next morning's first bar, and the edited setup it was pressed for with it.
         """
         self._settle_stops()
         self._report()
-        return self._signalled() or (self._candles is not None and self.sessions == 0)
+        return self._signalled() or not self._carried()
 
     def run(self, source: BarSource) -> list[SessionOutcome]:
         """Warm every session over the market's history, then hand each live bar to each."""
@@ -154,16 +159,13 @@ class Market:
         self._warming = list(lives)
         self._report()
         warming = self._warm(candles)
+        if not warming:  # every one stopped or failed in its warm-up: nothing to open
+            return self.outcomes
         # The hole is the market's, not a session's: every one of them would read it.
         refuse_a_hole(candles, first.symbol, first.plan.timeframe)
         stream = candles.live()
         self._candles, self._opened_at = candles, opened_at
-        for life in warming:
-            trade = life.inherited_trade()
-            if trade is None:
-                self._open(life)
-            else:
-                self._following[life.session_id] = (life, trade)
+        self._open_or_follow(warming)
         self._report()
 
         failure: str | None = None
@@ -246,6 +248,15 @@ class Market:
                 del self._following[session_id]
                 self._open(life)
 
+    def _open_or_follow(self, warmed: Sequence[SessionLife]) -> None:
+        """Open each warmed session, or have it follow the trade its warm-up ended in first."""
+        for life in warmed:
+            trade = life.inherited_trade()
+            if trade is None:
+                self._open(life)
+            else:
+                self._following[life.session_id] = (life, trade)
+
     def _open(self, life: SessionLife) -> None:
         if self._candles is None or self._opened_at is None:
             raise RuntimeError("the market has not finished its warm-up")
@@ -270,23 +281,29 @@ class Market:
         sent from there named nobody, which the fleet reads as every session gone without being
         asked: failed, launched again elsewhere, while the first ones went on warming.
         """
-        carried = [
-            *self._warming,
-            *self._live,
-            *(life for life, _trade in self._following.values()),
-        ]
         try:
             self._publish(
                 "live" if self._candles is not None else "warming",
-                [life.session_id for life in carried],
+                [life.session_id for life in self._carried()],
             )
         except Exception:  # noqa: BLE001 — see the docstring
             self._telling.lost("telling the supervisor what this market carries")
         else:
             self._telling.back()
 
+    def _carried(self) -> list[SessionLife]:
+        """Every session still in this process: warming, live, or following its inherited trade."""
+        return [*self._warming, *self._live, *(life for life, _trade in self._following.values())]
+
     def _settle_stops(self) -> None:
         """Finish every session somebody asked to stop (`live-session:<id>:stop`)."""
+        for life in list(self._warming):
+            if self._asked_to_stop(life.session_id):
+                # Nothing opened and nothing posted yet — no row, no signal — so nothing to
+                # finish: it is dropped, and the warm-up goes on for the others.
+                logger.info("session %s stopped in its warm-up", life.session_id)
+                self._warming.remove(life)
+                life.close()
         for life in list(self._live):
             if self._asked_to_stop(life.session_id):
                 self._live.remove(life)

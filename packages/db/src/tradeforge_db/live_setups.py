@@ -303,7 +303,8 @@ def new_version(
     parent would otherwise collide with itself.
 
     The caller validates the document; this only records it. Every market of the setup switches
-    to the new version at once: the supervisor sees a different strategy and restarts its sessions.
+    to the new version at once: the supervisor sees each of its sessions launched with another
+    strategy and restarts it on its own, the other setups of that market untouched (`live.fleet`).
     """
     setup = _setup(session, setup_id)
     parent = session.get(Strategy, setup.strategy_id)

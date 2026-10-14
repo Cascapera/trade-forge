@@ -368,7 +368,7 @@ NOW = dt.datetime(2026, 10, 13, 21, 0, tzinfo=dt.UTC)
 def test_a_restart_request_is_taken_once_and_a_stale_or_garbled_one_is_dropped() -> None:
     """One hash read each round, not a SCAN of the whole keyspace: 68 s once a sweep's 2.3 M jobs
     were in Redis, every round over a minute and the supervisor's word lapsing (13/10)."""
-    fresh, stale = uuid.uuid4(), uuid.uuid4()
+    fresh, stale, naive = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
     redis = Said(
         {},
         {
@@ -376,6 +376,11 @@ def test_a_restart_request_is_taken_once_and_a_stale_or_garbled_one_is_dropped()
             restart_field(stale, "M5"): (NOW - dt.timedelta(minutes=11)).isoformat(),
             "garbage": NOW.isoformat(),
             restart_field(fresh, "M15"): "not a time",
+            # No zone: compared with an aware `now` it raised, and the round and every other
+            # request read with it were lost.
+            restart_field(naive, "M5"): (NOW - dt.timedelta(minutes=1))
+            .replace(tzinfo=None)
+            .isoformat(),
         },
     )
 

@@ -14,7 +14,7 @@ from tradeforge_api.config import Settings
 from tradeforge_api.main import create_app
 from tradeforge_db.brokers import broker_for_server
 from tradeforge_db.live_setups import followed_pairs, open_signal, orphan_signals, record_event
-from tradeforge_db.models import Backtest, BacktestStatus, Instrument, Strategy
+from tradeforge_db.models import Backtest, BacktestStatus, Instrument, SignalRecord, Strategy
 from tradeforge_engine.domain import AssetClass
 
 pytestmark = pytest.mark.integration
@@ -235,11 +235,63 @@ def test_a_setup_removed_keeps_its_history(
     removed = client.delete(f"/live-setups/{setup['id']}")
     assert removed.status_code == 204
     with session_factory() as session:
-        from tradeforge_db.models import SignalRecord  # noqa: PLC0415
-
         kept = session.query(SignalRecord).filter_by(number=7).one()
         assert kept.setup_id is None
         assert kept.symbol == "WIN"
+
+
+def test_a_signal_whose_setup_was_deleted_before_it_was_recorded_is_recorded_without_it(
+    client: TestClient, session_factory: Callable[[], Session]
+) -> None:
+    """13/10: the insert broke the setup's foreign key — and the recorder, which reads first on
+    every round what it could not write, would never have got past it."""
+    run, _ = a_run(session_factory)
+    setup = client.post("/live-setups/from-run", json={"backtest_id": str(run)}).json()
+    deleted = client.delete(f"/live-setups/{setup['id']}")
+    assert deleted.status_code == 204
+
+    with session_factory() as session:
+        record_event(session, event(setup, 8, "armed", entry="1000", stop="900", no_target_r="5"))
+        session.commit()
+        kept = session.query(SignalRecord).filter_by(number=8).one()
+
+    assert kept.setup_id is None, "as the deletion would have left it"
+    assert kept.strategy_id == uuid.UUID(setup["strategy_id"]), "what is still there is kept"
+    assert kept.no_target_r == Decimal(5)
+
+
+def test_a_trade_whose_setup_was_deleted_still_closes_at_its_no_target_r(
+    client: TestClient, session_factory: Callable[[], Session]
+) -> None:
+    """13/10: read through the setup, the R went with it when the setup was deleted, and the
+    orphan watch would have followed the trade to its stop alone."""
+    run, _ = a_run(session_factory)
+    setup = client.post("/live-setups/from-run", json={"backtest_id": str(run)}).json()
+    changed = client.patch(f"/live-setups/{setup['id']}", json={"no_target_r": "3"})
+    assert changed.status_code == 200
+    gone = uuid.uuid4()
+    with session_factory() as session:
+        record_event(
+            session,
+            event(
+                setup,
+                9,
+                "triggered",
+                entry="1000",
+                stop="900",
+                session_id=str(gone),
+                no_target_r="3",
+            ),
+        )
+        session.commit()
+
+    deleted = client.delete(f"/live-setups/{setup['id']}")
+    assert deleted.status_code == 204
+    with session_factory() as session:
+        (orphan,) = orphan_signals(session, set())
+
+    assert orphan.setup_id is None
+    assert orphan.no_target_r == Decimal(3)
 
 
 CHOCH: dict[str, Any] = {

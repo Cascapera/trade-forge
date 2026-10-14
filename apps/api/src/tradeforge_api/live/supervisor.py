@@ -391,6 +391,10 @@ def take_restarts(redis: Redis, *, now: dt.datetime) -> list[MarketKey]:
             when = dt.datetime.fromisoformat(at)
         except ValueError:
             when = None
+        if when is not None and when.tzinfo is None:
+            # The screen writes an aware instant; a naive one compared with `now` raises, losing
+            # the round — and the other requests, already deleted above, with it.
+            when = None
         if market is None or when is None or now - when > RESTART_TTL:
             logger.warning("restart request %s (asked %s) dropped: unreadable or stale", name, at)
             continue

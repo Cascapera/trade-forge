@@ -2525,6 +2525,12 @@ class SignalRecord(Base):
     triggered_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
     ended_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
     session_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    no_target_r: Mapped[Decimal | None] = mapped_column(RATIO)
+    """The R a signal with no target closes at, as it was when the signal was armed.
+
+    ⚠️ **Its own, not read through the setup (13/10).** A setup deleted with a signal in a trade
+    nulls `setup_id`, and a value read through it went with it: the orphan watch then followed the
+    trade to its stop alone, past the R it should have closed at."""
 
     __table_args__ = (
         CheckConstraint(

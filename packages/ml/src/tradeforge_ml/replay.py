@@ -113,6 +113,42 @@ def costs_from(spec: Mapping[str, Any]) -> CostModel:
     return CombinedCostModel(spread, commission)
 
 
+PROPORTIONAL = frozenset({AssetClass.STOCK, AssetClass.CRYPTO})
+"""The markets whose spread is charged in proportion to the price: their price moved by multiples
+over the years a base covers. The API does it for a crypto (02/10); a share is the same case, and
+in a split-adjusted history a worse one — NVDA's 2 ticks of $223 are 2.5 % of its 2016 price of
+$0.80 in today's shares."""
+
+
+def measured_costs(
+    run_costs: Mapping[str, Any],
+    *,
+    spread_ticks: Decimal,
+    asset_class: AssetClass,
+    last_close: Decimal,
+) -> dict[str, Any]:
+    """What a label charges (14/10): the market's measured spread (`instruments.
+    default_spread_points`), whatever the sweep was charged; its commission and swap are the run's.
+
+    ADR-0031, rule 4, wants the label net of costs. The runs did not all pay them: five of the
+    seventeen bases of 13/10 ran with none, and one had a spread typed per market at hundreds of
+    times its own (ENGI11, 642 ticks against 1). A label for every base charges the same thing,
+    and the cheapest thing a trade really pays is the spread.
+
+    A share's and a crypto's are quoted at the chart's last close (`PROPORTIONAL`): the measured
+    figure is today's, and the price it was measured at is about the newest bar's."""
+    model: dict[str, Any] = {
+        "type": "spread_commission",
+        "spread_points": str(spread_ticks),
+        "commission_per_unit": str(run_costs.get("commission_per_unit", "0")),
+    }
+    if asset_class in PROPORTIONAL:
+        model["spread_reference_price"] = str(last_close)
+    if run_costs.get("swap") is not None:
+        model["swap"] = dict(run_costs["swap"])
+    return model
+
+
 def swap_from(spec: Mapping[str, Any]) -> SwapRates | None:
     swap = spec.get("swap")
     if swap is None:
@@ -261,10 +297,12 @@ def replay(  # noqa: PLR0913 — keyword-only; one per input a run is made of
 __all__ = [
     "HORIZON",
     "LOT",
+    "PROPORTIONAL",
     "Proposal",
     "Replay",
     "costs_from",
     "instrument_from",
+    "measured_costs",
     "replay",
     "swap_from",
 ]

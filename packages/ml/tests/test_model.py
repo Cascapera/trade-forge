@@ -15,9 +15,12 @@ import pytest
 from tradeforge_ml.cli import span
 from tradeforge_ml.features import FEATURE_NAMES
 from tradeforge_ml.model import (
+    Floor,
+    Market,
     Rows,
     Split,
     evaluate,
+    executable,
     fit,
     kept,
     probabilities,
@@ -258,3 +261,89 @@ def test_the_chart_is_an_input_by_name() -> None:
 
     names = {name for name, _ in report.weights}
     assert {"timeframe_M15", "timeframe_H1"} <= names
+
+
+# --------------------------------------------------------------------------------------------
+# The stop floor (14/10)
+# --------------------------------------------------------------------------------------------
+
+CENT = Market(tick_size=0.01, tick_value=1.0)
+"""A market with a tick of 0.01 worth 1 a lot: a stop 0.1 away risks 10."""
+
+
+def _with_stops(rows: Rows, stops: list[float], costs: list[float]) -> tuple[pa.Table, pa.Table]:
+    """`_tables`, entered at 1.0 with these stops and these costs, on one lot."""
+    events, features = _tables(rows)
+    events = events.set_column(
+        events.schema.get_field_index("stop_loss"), "stop_loss", pa.array(stops)
+    )
+    events = events.append_column("costs", pa.array(costs))
+    return events.append_column("volume", pa.array([1.0] * len(stops))), features
+
+
+class TestTheFloor:
+    def test_a_stop_is_read_in_ticks_and_in_what_it_paid(self) -> None:
+        # 4 ticks, 5 ticks, then 10 ticks paying half the risk (two spreads), and 0.6 of it.
+        events, features = _with_stops(
+            synthetic(4, signal=False), [0.96, 0.95, 0.9, 0.9], [0.0, 0.0, 5.0, 6.0]
+        )
+
+        rows = rows_of(events, features, {"EURUSD": CENT, "GBPUSD": CENT})
+
+        assert rows.risk_ticks is not None
+        assert rows.paid_r is not None
+        assert rows.risk_ticks.tolist() == pytest.approx([4, 5, 10, 10])
+        assert rows.paid_r.tolist() == pytest.approx([0, 0, 0.5, 0.6])
+        assert executable(rows, Floor()).tolist() == [False, True, True, False]
+
+    def test_before_a_split_a_tick_was_a_fraction_of_todays(self) -> None:
+        """NVDA's 4-for-1 of 2021 and 10-for-1 of 2024: a 2020 tick is 1/40 of today's."""
+        splits = ((_us(dt.datetime(2021, 7, 20, tzinfo=UTC)), 4.0),
+                  (_us(dt.datetime(2024, 6, 10, tzinfo=UTC)), 10.0))  # fmt: skip
+        nvda = Market(tick_size=0.01, tick_value=0.01, splits=splits)
+        entries = [dt.datetime(year, 1, 2, tzinfo=UTC) for year in (2020, 2022, 2025)]
+
+        ticks = nvda.ticks_of_the_day(np.asarray([_us(when) for when in entries]))
+
+        assert ticks.tolist() == pytest.approx([0.01 / 40, 0.01 / 10, 0.01])
+
+    def test_a_market_without_its_tick_is_refused(self) -> None:
+        events, features = _with_stops(synthetic(4, signal=False), [0.9] * 4, [0.0] * 4)
+
+        with pytest.raises(ValueError, match="no tick for"):
+            rows_of(events, features, {"XAUUSD": CENT})
+        with pytest.raises(ValueError, match="tick"):
+            evaluate(rows_of(events, features), PLAN, floor=Floor())
+
+    def test_entries_below_it_leave_training_and_validation_and_are_counted(self) -> None:
+        rows = synthetic(4000, signal=True)
+        rows.risk_ticks = np.where(np.arange(4000) % 4 == 0, 3.0, 50.0)
+        rows.paid_r = np.zeros(4000)
+        _, whole = evaluate(replace(rows, risk_ticks=None, paid_r=None), PLAN)
+
+        _, floored = evaluate(rows, PLAN, floor=Floor())
+
+        assert floored.below_floor_training > 0
+        assert floored.below_floor_validation > 0
+        assert (
+            floored.validation_entries + floored.below_floor_validation == whole.validation_entries
+        )
+        assert floored.training_entries + floored.below_floor_training == whole.training_entries
+
+    def test_training_names_the_floor_and_the_markets_it_read(self, tmp_path: Path) -> None:
+        count = 3000
+        stops = [0.98 if n % 5 == 0 else 0.9 for n in range(count)]
+        events, features = _with_stops(synthetic(count, signal=True), stops, [0.0] * count)
+        pq.write_table(events, tmp_path / "events.parquet")
+        pq.write_table(features, tmp_path / "features.parquet")
+        markets = {"EURUSD": CENT, "GBPUSD": CENT, "USDJPY": Market(0.001, 1.0)}
+
+        name, report = train(tmp_path, PLAN, floor=Floor(), markets=markets)
+
+        assert name == "logistic-v2-val2023-2024-floor5t2s"
+        assert report.below_floor_validation > 0
+        written = json.loads((tmp_path / "models" / name / "report.json").read_text())
+        assert written["manifest"]["floor"] == {"min_ticks": 5.0, "min_spreads": 2.0}
+        assert sorted(written["manifest"]["markets"]) == ["EURUSD", "GBPUSD"]
+        text = (tmp_path / "models" / name / "report.md").read_text(encoding="utf-8")
+        assert "Stop floor: 5 ticks and 2 spreads" in text

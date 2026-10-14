@@ -28,6 +28,7 @@ from tradeforge_ml.replay_export import (
     replay_job,
     write_independent,
 )
+from tradeforge_ml.replay_export import Costs as CostSource
 
 BARS = list(ARMS_A_RESTING_LIMIT)
 """175 measured EURUSD H1 bars (the engine's own test market)."""
@@ -145,36 +146,47 @@ def test_a_charts_bars_are_read_with_their_spread(tmp_path: Path) -> None:
     assert candles_of(tmp_path, "GBPUSD", "H1") == []
 
 
+INSTRUMENT = {
+    "symbol": "EURUSD",
+    "name": "Euro",
+    "asset_class": "forex",
+    "currency_quote": "USD",
+    "currency_base": "EUR",
+    "tick_size": str(EURUSD.tick_size),
+    "tick_value": str(EURUSD.tick_value),
+    "contract_size": str(EURUSD.contract_size),
+    "digits": 5,
+    "exchange": None,
+}
+
+
+def job(
+    run_id: str,
+    configuration: dict[str, Any],
+    *,
+    costs: dict[str, Any] = COSTS,
+    spread_ticks: str | None = "10",
+) -> Job:
+    """A run of `mme9_turn` on EURUSD H1 over `BARS`, its market measured at `spread_ticks`."""
+    return Job(
+        run_id=run_id,
+        entry_id="mm9",
+        symbol="EURUSD",
+        timeframe="H1",
+        configuration=configuration,
+        definition=document("mme9_turn"),
+        instrument=INSTRUMENT,
+        costs=costs,
+        date_from=BARS[0].time,
+        date_to=BARS[-1].time,
+        spread_ticks=spread_ticks,
+    )
+
+
 def test_the_base_is_written_one_row_per_entry_with_the_configurations_that_took_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr("tradeforge_ml.replay_export.candles_of", lambda *_: BARS)
-    instrument = {
-        "symbol": "EURUSD",
-        "name": "Euro",
-        "asset_class": "forex",
-        "currency_quote": "USD",
-        "currency_base": "EUR",
-        "tick_size": str(EURUSD.tick_size),
-        "tick_value": str(EURUSD.tick_value),
-        "contract_size": str(EURUSD.contract_size),
-        "digits": 5,
-        "exchange": None,
-    }
-
-    def job(run_id: str, configuration: dict[str, Any]) -> Job:
-        return Job(
-            run_id=run_id,
-            entry_id="mm9",
-            symbol="EURUSD",
-            timeframe="H1",
-            configuration=configuration,
-            definition=document("mme9_turn"),
-            instrument=instrument,
-            costs=COSTS,
-            date_from=BARS[0].time,
-            date_to=BARS[-1].time,
-        )
 
     # Two configurations that propose the very same entries: one event each, both named.
     report = write_independent(
@@ -198,6 +210,40 @@ def test_the_base_is_written_one_row_per_entry_with_the_configurations_that_took
         20,
         report.events,
     )
+    assert manifest["costs"] == "measured"
+    charged = {"type": "spread_commission", "spread_points": "10", "commission_per_unit": "0"}
+    assert manifest["charged"] == {"EURUSD H1": charged}
+
+
+@pytest.mark.parametrize(("costs", "paid"), [("measured", 10), ("run", 0)])
+def test_the_label_charges_the_markets_measured_spread_not_what_the_run_paid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, costs: CostSource, paid: int
+) -> None:
+    """A run charged nothing (five of the seventeen bases of 13/10): its label pays the spread."""
+    monkeypatch.setattr("tradeforge_ml.replay_export.candles_of", lambda *_: BARS)
+
+    write_independent(
+        [job("free", {}, costs={"type": "none"})],
+        sweep_id="s",
+        out=tmp_path,
+        ohlcv=tmp_path,
+        horizon=20,
+        processes=1,
+        costs=costs,
+    )
+
+    events = pq.read_table(tmp_path / "sweep=s" / "independent-h20" / "events.parquet")
+    assert events.num_rows > 0
+    expected = float(paid * EURUSD.tick_value)  # half the spread in, half out, one lot
+    assert events.column("costs").to_pylist() == pytest.approx([expected] * events.num_rows)
+
+
+def test_a_market_without_a_measured_spread_refuses_the_base(tmp_path: Path) -> None:
+    unmeasured = [job("a", {}, spread_ticks=None)]
+
+    with pytest.raises(ValueError, match="no measured spread for: EURUSD"):
+        write_independent(unmeasured, sweep_id="s", out=tmp_path, ohlcv=tmp_path, processes=1)
+    assert not (tmp_path / "sweep=s").exists()
 
 
 def test_the_spread_costs_the_same_r_on_every_proposal() -> None:
@@ -266,6 +312,7 @@ def row(  # noqa: PLR0913 — one per column of the query a test varies
         cost_model=COSTS,
         date_from=BARS[0].time,
         date_to=BARS[-1].time,
+        default_spread_points=Decimal("9.0000000000"),
     )
 
 
@@ -312,6 +359,7 @@ def test_each_chart_and_each_row_once() -> None:
     )
 
     assert sorted(job.run_id for job in jobs) == ["gbp", "h1", "m15"]
+    assert {job.spread_ticks for job in jobs} == {"9.0000000000"}
 
 
 @pytest.mark.parametrize("kind", sorted(PARAMS))

@@ -4,8 +4,10 @@ columns as the run-based base (`export.EVENT_SCHEMA`), so `features` and `train`
 read that one.
 
 Read-only on the database: one run per entry (`choose_jobs`) gives its document, its instrument,
-its costs and its window; the bars come from the collector's Parquet. A chart's bars are read once
-and every run of that chart is replayed over them, the charts spread over processes.
+its window and its market's measured spread; the bars come from the collector's Parquet. The
+label charges that spread whatever the sweep was charged (`replay.measured_costs`, 14/10), and
+the manifest says what each chart paid. A chart's bars are read once and every run of that chart
+is replayed over them, the charts spread over processes.
 
 ⚠️ **Warm-up: `WARM_BARS` before the run's first day, not the run's own warm-up.** That one lives
 in the API (`warm_window`), which a shared package may not import; a thousand bars settle the
@@ -26,8 +28,9 @@ from collections.abc import Iterable, Sequence
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass, field
+from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
@@ -35,7 +38,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from tradeforge_db.models import Backtest, BacktestStatus, Instrument, Strategy, SweepPoint
-from tradeforge_engine.domain import Candle
+from tradeforge_engine.domain import AssetClass, Candle
 from tradeforge_engine.strategy import compile_strategy
 from tradeforge_ml.events import (
     TradeRecord,
@@ -45,12 +48,24 @@ from tradeforge_ml.events import (
     without_management,
 )
 from tradeforge_ml.export import EVENT_SCHEMA, _event_table
-from tradeforge_ml.replay import HORIZON, costs_from, instrument_from, replay, swap_from
+from tradeforge_ml.replay import (
+    HORIZON,
+    costs_from,
+    instrument_from,
+    measured_costs,
+    replay,
+    swap_from,
+)
 
 WARM_BARS = 1000
 """Bars before a run's first day the setup is shown before any entry counts."""
 
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
+"""2 (14/10): the label charges each market's measured spread, and the manifest says what."""
+
+Costs = Literal["measured", "run"]
+"""`measured`: each market's measured spread, the run's commission and swap (the default since
+14/10). `run`: what the run was charged, as before — for a base to be compared with an old one."""
 
 
 @dataclass(frozen=True)
@@ -68,6 +83,8 @@ class Job:
     costs: dict[str, Any]
     date_from: dt.datetime
     date_to: dt.datetime
+    spread_ticks: str | None = None
+    """The market's measured spread (`instruments.default_spread_points`); none when unmeasured."""
 
 
 def _spec_document(row: Any) -> dict[str, Any]:  # noqa: ANN401 — a result row
@@ -111,6 +128,7 @@ def jobs_of(session: Session, sweep_id: uuid.UUID) -> list[Job]:
             Instrument.digits,
             Instrument.exchange,
             Instrument.server_offset,
+            Instrument.default_spread_points,
         )
         .join(Instrument, Instrument.id == Backtest.instrument_id)
         .join(Strategy, Strategy.id == Backtest.strategy_id)
@@ -180,6 +198,9 @@ def choose_jobs(rows: Iterable[Any]) -> list[Job]:
             costs=dict(row.cost_model),
             date_from=row.date_from,
             date_to=row.date_to,
+            spread_ticks=(
+                None if row.default_spread_points is None else str(row.default_spread_points)
+            ),
         )
     return list(jobs.values())
 
@@ -216,16 +237,34 @@ def _window(candles: Sequence[Candle], job: Job) -> list[Candle]:
     return list(candles[max(0, first - WARM_BARS) : last])
 
 
-def replay_job(job: Job, candles: Sequence[Candle], horizon: int) -> list[TradeRecord]:
-    """One run's proposals, each traded alone, as the event base's records."""
+def charged(job: Job, candles: Sequence[Candle], costs: Costs) -> dict[str, Any]:
+    """The cost document `job` is replayed with: its market's measured spread, or its run's."""
+    if costs == "run":
+        return job.costs
+    if job.spread_ticks is None:
+        raise ValueError(f"{job.symbol} has no measured spread")
+    return measured_costs(
+        job.costs,
+        spread_ticks=Decimal(job.spread_ticks),
+        asset_class=AssetClass(job.instrument["asset_class"]),
+        last_close=candles[-1].close,
+    )
+
+
+def replay_job(
+    job: Job, candles: Sequence[Candle], horizon: int, costs: dict[str, Any] | None = None
+) -> list[TradeRecord]:
+    """One run's proposals, each traded alone, as the event base's records — charged `costs`, or
+    what the run was."""
     instrument = instrument_from(job.instrument)
     strategy = compile_strategy(job.definition, server_offset=instrument.server_offset)
+    document = job.costs if costs is None else costs
     proposals = replay(
         strategy=strategy,
         candles=_window(candles, job),
         instrument=instrument,
-        cost_model=costs_from(job.costs),
-        swap=swap_from(job.costs),
+        cost_model=costs_from(document),
+        swap=swap_from(document),
         horizon=horizon,
         entries_from=job.date_from,
     )
@@ -257,14 +296,22 @@ def replay_job(job: Job, candles: Sequence[Candle], horizon: int) -> list[TradeR
     ]
 
 
-def _chart(task: tuple[Path, int, list[Job]]) -> tuple[list[dict[str, Any]], int]:
-    """Every job of one chart over its bars, read once; the distinct entries and the proposals."""
-    ohlcv, horizon, jobs = task
+def _chart(
+    task: tuple[Path, int, Costs, list[Job]],
+) -> tuple[list[dict[str, Any]], int, dict[str, Any] | None]:
+    """Every job of one chart over its bars, read once: the distinct entries, the proposals, and
+    what the chart's first job was charged (with measured costs, what every job of it was)."""
+    ohlcv, horizon, costs, jobs = task
     candles = candles_of(ohlcv, jobs[0].symbol, jobs[0].timeframe)
+    if not candles:
+        return [], 0, None
     records: list[TradeRecord] = []
+    first: dict[str, Any] | None = None
     for job in jobs:
-        records.extend(replay_job(job, candles, horizon))
-    return distinct_entries(records), len(records)
+        document = charged(job, candles, costs)
+        first = first or document
+        records.extend(replay_job(job, candles, horizon, document))
+    return distinct_entries(records), len(records), first
 
 
 @dataclass
@@ -287,23 +334,39 @@ def write_independent(  # noqa: PLR0913 — keyword-only; the base, where, and h
     ohlcv: Path,
     horizon: int = HORIZON,
     processes: int | None = None,
+    costs: Costs = "measured",
 ) -> ReplayReport:
     """Replay every job, chart by chart over `processes`, and write the base under
-    `out/sweep=<id>/independent-h<horizon>/`."""
+    `out/sweep=<id>/independent-h<horizon>/`.
+
+    ⚠️ With `measured` costs, a market without a measured spread refuses the base before any bar
+    is read — as the sweep's API does — rather than label its trades as free."""
+    if costs == "measured":
+        unmeasured = sorted({job.symbol for job in jobs if job.spread_ticks is None})
+        if unmeasured:
+            raise ValueError(
+                "no measured spread for: " + ", ".join(unmeasured) + " (catalogue them while "
+                "their market is open, or replay with the runs' own costs)"
+            )
     target = out / f"sweep={sweep_id}" / f"independent-h{horizon}"
     target.mkdir(parents=True, exist_ok=True)
     charts: defaultdict[tuple[str, str], list[Job]] = defaultdict(list)
     for job in jobs:
         charts[(job.symbol, job.timeframe)].append(job)
     report = ReplayReport(sweep_id=sweep_id, horizon=horizon, runs=len(jobs), charts=len(charts))
-    tasks = [(ohlcv, horizon, chart_jobs) for chart_jobs in charts.values()]
+    tasks = [(ohlcv, horizon, costs, chart_jobs) for chart_jobs in charts.values()]
+    paid: dict[str, dict[str, Any]] = {}
     writer = pq.ParquetWriter(target / "events.parquet", EVENT_SCHEMA, compression="zstd")
     try:
         workers = processes or max(1, (os.cpu_count() or 2) // 2)
         # One process is this one: no pool to spawn, which is also what a test runs.
         pool = ProcessPoolExecutor(max_workers=workers) if workers > 1 else None
         with pool or nullcontext():
-            for rows, proposals in (pool.map if pool else map)(_chart, tasks):
+            for (symbol, timeframe), (rows, proposals, document) in zip(
+                charts, (pool.map if pool else map)(_chart, tasks), strict=True
+            ):
+                if document is not None:
+                    paid[f"{symbol} {timeframe}"] = document
                 report.proposals += proposals
                 if not rows:
                     continue
@@ -321,6 +384,8 @@ def write_independent(  # noqa: PLR0913 — keyword-only; the base, where, and h
         "sweep_id": sweep_id,
         "horizon_bars": horizon,
         "warm_bars": WARM_BARS,
+        "costs": costs,
+        "charged": paid,
         "written_at": dt.datetime.now(tz=dt.UTC).isoformat(),
         "runs": report.runs,
         "charts": report.charts,
@@ -336,9 +401,11 @@ def write_independent(  # noqa: PLR0913 — keyword-only; the base, where, and h
 
 __all__ = [
     "WARM_BARS",
+    "Costs",
     "Job",
     "ReplayReport",
     "candles_of",
+    "charged",
     "choose_jobs",
     "jobs_of",
     "replay_job",

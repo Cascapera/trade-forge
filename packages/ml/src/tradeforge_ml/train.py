@@ -10,6 +10,7 @@ setup it gets saved with the version it was trained on.
 import datetime as dt
 import hashlib
 import json
+from collections.abc import Mapping
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -18,18 +19,32 @@ import pyarrow.parquet as pq
 import sklearn
 
 from tradeforge_ml.features import FEATURES_VERSION
-from tradeforge_ml.model import KEEP, SEED, TARGETS, Kept, Kind, Report, Split, evaluate, rows_of
+from tradeforge_ml.model import (
+    KEEP,
+    SEED,
+    TARGETS,
+    Floor,
+    Kept,
+    Kind,
+    Market,
+    Report,
+    Split,
+    evaluate,
+    rows_of,
+)
 
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def name_of(plan: Split, kind: Kind = "logistic") -> str:
-    """`logistic-v2-val2023-2024`, and `-excl` when spans were left out of training."""
+def name_of(plan: Split, kind: Kind = "logistic", floor: Floor | None = None) -> str:
+    """`logistic-v2-val2023-2024`, `-excl` when spans were left out of training, and the floor
+    when there was one (`-floor5t2s`)."""
     last = (plan.validation_to - dt.timedelta(days=1)).year
     excluded = "-excl" if plan.excluded else ""
-    return f"{kind}-v{FEATURES_VERSION}-val{plan.validation_from.year}-{last}{excluded}"
+    floored = "" if floor is None else f"-floor{floor.min_ticks:g}t{floor.min_spreads:g}s"
+    return f"{kind}-v{FEATURES_VERSION}-val{plan.validation_from.year}-{last}{excluded}{floored}"
 
 
 def _line(kept: Kept, everything: Kept) -> str:
@@ -64,6 +79,16 @@ def markdown(report: Report, name: str, manifest: dict[str, Any]) -> str:
         f"({report.embargoed:,} dropped by the embargo), judged on "
         f"{report.validation_entries:,} from then to {manifest['validation_to']}.",
         "",
+        *(
+            []
+            if report.floor is None
+            else [
+                f"Stop floor: {report.floor.min_ticks:g} ticks and {report.floor.min_spreads:g} "
+                f"spreads — {report.below_floor_training:,} training and "
+                f"{report.below_floor_validation:,} validation entries below it left out.",
+                "",
+            ]
+        ),
         f"AUC: training {report.training_auc:.3f}, validation {report.validation_auc:.3f} "
         "(0.5 is a coin; a validation far below training is a model that memorised).",
         "",
@@ -111,12 +136,21 @@ def markdown(report: Report, name: str, manifest: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def train(sweep_dir: Path, plan: Split, kind: Kind = "logistic") -> tuple[str, Report]:
-    """Fit on `sweep_dir`'s events and variables, and write the report under `models/`."""
+def train(
+    sweep_dir: Path,
+    plan: Split,
+    kind: Kind = "logistic",
+    floor: Floor | None = None,
+    markets: Mapping[str, Market] | None = None,
+) -> tuple[str, Report]:
+    """Fit on `sweep_dir`'s events and variables, and write the report under `models/` — of the
+    entries above `floor`, read with the `markets`' ticks."""
     events_path, features_path = sweep_dir / "events.parquet", sweep_dir / "features.parquet"
-    rows = rows_of(pq.read_table(events_path), pq.read_table(features_path))
-    _, report = evaluate(rows, plan, kind)
-    name = name_of(plan, kind)
+    events = pq.read_table(events_path)
+    rows = rows_of(events, pq.read_table(features_path), markets)
+    _, report = evaluate(rows, plan, kind, floor)
+    name = name_of(plan, kind, floor)
+    present = set(events.column("symbol").to_pylist())
     manifest: dict[str, Any] = {
         "model": kind,
         "targets_r": [target for target in TARGETS if target is not None],
@@ -129,6 +163,12 @@ def train(sweep_dir: Path, plan: Split, kind: Kind = "logistic") -> tuple[str, R
             [left.date().isoformat(), right.date().isoformat()] for left, right in plan.excluded
         ],
         "keep": list(KEEP),
+        "floor": None if floor is None else asdict(floor),
+        "markets": {
+            symbol: asdict(market)
+            for symbol, market in sorted((markets or {}).items())
+            if symbol in present
+        },
         "events_sha256": _sha256(events_path),
         "features_sha256": _sha256(features_path),
         "written_at": dt.datetime.now(tz=dt.UTC).isoformat(),

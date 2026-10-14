@@ -108,3 +108,27 @@ As variáveis não precisam: são calculadas depois, dos candles e da hora de en
 O primeiro setup é o **MM9**: é o mais rodado e o que mais entra. Um banco "para ML" é bem menor
 que o banco de combinações do plano grande: poucas configurações em muitos ativos, não cada
 variação em cada ativo.
+
+## Atualização 14/10 — o rótulo cobra o spread medido e ignora stop inexecutável
+
+Treinando as 17 bases de 13/10, duas coisas apareceram no rótulo, e as duas violavam a regra 4:
+
+- **Nem toda varredura cobrou custo.** O replay cobrava o custo de cada run, e cinco bases rodaram
+  sem custo (o rótulo era bruto). Uma delas (9.4 nas ações BR) teve o spread digitado por mercado
+  centenas de vezes maior que o medido (ENGI11 com 642 ticks contra 1), e por isso dava −4,27 R
+  médio. **Decisão dele:** o replay passa a cobrar **o spread medido de cada mercado**
+  (`instruments.default_spread_points`), qualquer que tenha sido o custo da varredura. A comissão
+  e o swap continuam os do run. Ação e cripto pagam o spread **proporcional ao preço**, cotado
+  no último fechamento do gráfico: numa série ajustada por desdobramento, os 2 ticks de hoje do
+  NVDA seriam 2,5% do preço de 2016. Um mercado sem spread medido recusa a base. `--costs run`
+  mantém o comportamento antigo, para comparar.
+- **Stop dentro do spread.** O motor cobra o spread como custo e não deixa o bid tocar o stop de
+  uma compra. Por isso um stop menor que o spread só existe no papel: no Usa500, um stop de 0,05
+  fez +3.840 R. No FX/CFD, ~23% das entradas tinham stop menor que 2 spreads. **Decisão dele:** um
+  **piso de 5 ticks e 2 spreads**. As entradas abaixo dele saem do treino e da validação, e o
+  relatório informa quantas saíram. O tick é o do dia da entrada (antes de um desdobramento, uma
+  fração do de hoje). Os 2 spreads são lidos do que o trade pagou: a ida e volta é um spread
+  inteiro, então o custo não pode passar de meio R.
+
+O tamanho da posição **não** muda o rótulo. Spread, comissão e swap crescem junto com o volume,
+e o R se mantém (14/10, corrigindo o que eu tinha dito de manhã).

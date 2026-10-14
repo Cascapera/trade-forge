@@ -16,6 +16,11 @@ validation began is dropped (the embargo): its outcome was decided by validation
 target — which is how a choice is made, and every choice made there flatters it. Whether a choice
 holds is a question for years neither has seen.
 
+⚠️ **A stop the market could not honour is no entry** (`Floor`, 14/10). The engine charges the
+spread as a cost and never lets the bid touch a long's stop, so an entry whose stop sits inside the
+spread exists only on paper — and on Usa500 a stop of 0.05 made +3,840 R. Such entries are left
+out of training and of validation alike, and the report says how many.
+
 ⚠️ **The market's variables only, not the symbol.** A model that knows the symbol can learn "skip
 AUDNZD" from the training years and call it skill; the chart (`timeframe`) is in, as the
 variables mean different things on M15 and on D1.
@@ -28,7 +33,7 @@ from __future__ import annotations
 import datetime as dt
 import math
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -84,6 +89,35 @@ class Split:
     """Spans of entry time left out of training (a sensitivity check, never of validation)."""
 
 
+@dataclass(frozen=True)
+class Market:
+    """What the stop floor reads of a market: its tick, the money a price unit is worth, and its
+    splits."""
+
+    tick_size: float
+    tick_value: float
+    """Money per tick for one lot — with the tick, what the engine turns a price move into."""
+    splits: tuple[tuple[int, float], ...] = ()
+    """Each split's first day (µs) and its shares after for one before. A split-adjusted history
+    is in today's shares: before a 40-for-1, a tick of the day was 1/40 of today's."""
+
+    def ticks_of_the_day(self, entry_us: npt.NDArray[np.int64]) -> Floats:
+        """The tick each entry's market traded in, in the prices the bars are stored in."""
+        tick = np.full(len(entry_us), self.tick_size, dtype=np.float64)
+        for effective_us, ratio in self.splits:
+            tick = np.where(entry_us < effective_us, tick / ratio, tick)
+        return tick
+
+
+@dataclass(frozen=True)
+class Floor:
+    """The smallest stop an entry may have to count (his choice, 14/10): `min_ticks` ticks of its
+    day, and `min_spreads` spreads — read off what the trade paid, the round trip one spread."""
+
+    min_ticks: float = 5.0
+    min_spreads: float = 2.0
+
+
 @dataclass
 class Rows:
     """Entries as columns: the variables, the chart, the outcome, and where each one is."""
@@ -98,6 +132,10 @@ class Rows:
     """How far the trade went in its favour, in R of its risk (a price ratio)."""
     cost_r: Floats
     """What it paid — costs and swap — in R: its result as a price ratio less its R in money."""
+    risk_ticks: Floats | None = None
+    """The stop's distance in ticks of the entry's day; known when the markets were given."""
+    paid_r: Floats | None = None
+    """The costs alone (the spread and a commission, no swap), in R; as `risk_ticks`."""
 
     def take(self, mask: npt.NDArray[np.bool_]) -> Rows:
         return Rows(
@@ -109,6 +147,8 @@ class Rows:
             self.r[mask],
             self.mfe_r[mask],
             self.cost_r[mask],
+            None if self.risk_ticks is None else self.risk_ticks[mask],
+            None if self.paid_r is None else self.paid_r[mask],
         )
 
     @property
@@ -135,8 +175,11 @@ def _us(instant: dt.datetime) -> int:
     return int(instant.timestamp() * 1_000_000)
 
 
-def rows_of(events: pa.Table, features: pa.Table) -> Rows:
-    """Join `events.parquet` and `features.parquet` row by row, refusing files that do not match."""
+def rows_of(
+    events: pa.Table, features: pa.Table, markets: Mapping[str, Market] | None = None
+) -> Rows:
+    """Join `events.parquet` and `features.parquet` row by row, refusing files that do not match;
+    with the `markets`, each stop's size in ticks and spreads too (`executable`)."""
     if events.num_rows != features.num_rows:
         raise ValueError(f"{events.num_rows} events but {features.num_rows} rows of variables")
     for name in KEY:
@@ -161,15 +204,46 @@ def rows_of(events: pa.Table, features: pa.Table) -> Rows:
     sign = np.where(np.asarray(events.column("side").to_pylist()) == "long", 1.0, -1.0)
     with np.errstate(divide="ignore", invalid="ignore"):
         gross_r = sign * (exit_ - entry) / np.abs(entry - stop)
+    symbol = np.asarray(events.column("symbol").to_pylist(), dtype=np.str_)
+    entry_us = instants("entry_time")
+    risk_ticks = paid_r = None
+    if markets is not None:
+        unknown = sorted(set(symbol.tolist()) - set(markets))
+        if unknown:
+            raise ValueError(f"no tick for {', '.join(unknown)}: the floor cannot be read")
+        tick_size, tick_value, tick_of_the_day = (np.empty(len(r)) for _ in range(3))
+        for name in set(symbol.tolist()):
+            mask, market = symbol == name, markets[name]
+            tick_size[mask], tick_value[mask] = market.tick_size, market.tick_value
+            tick_of_the_day[mask] = market.ticks_of_the_day(entry_us[mask])
+        distance = np.abs(entry - stop)
+        risk_ticks = distance / tick_of_the_day
+        # The engine's own money: a price move over the tick, times the tick's value and the lots.
+        at_risk = distance / tick_size * tick_value * floats(events, "volume")
+        with np.errstate(divide="ignore", invalid="ignore"):
+            paid_r = floats(events, "costs") / at_risk
     return Rows(
         features=np.column_stack([floats(features, name) for name in FEATURE_NAMES]),
         timeframe=np.asarray(events.column("timeframe").to_pylist(), dtype=np.str_),
-        symbol=np.asarray(events.column("symbol").to_pylist(), dtype=np.str_),
-        entry_us=instants("entry_time"),
+        symbol=symbol,
+        entry_us=entry_us,
         exit_us=instants("exit_time"),
         r=r,
         mfe_r=floats(events, "mfe_r"),
         cost_r=gross_r - r,
+        risk_ticks=risk_ticks,
+        paid_r=paid_r,
+    )
+
+
+def executable(rows: Rows, floor: Floor) -> npt.NDArray[np.bool_]:
+    """The entries whose stop is at least `floor` away: `min_ticks` ticks of their day, and
+    `min_spreads` spreads — paying at most 1/`min_spreads` of the risk for the round trip."""
+    if rows.risk_ticks is None or rows.paid_r is None:
+        raise ValueError("the stop floor needs each market's tick (rows_of with markets)")
+    # A hair of slack: a stop exactly two spreads away pays half its risk, to the last bit.
+    return (rows.risk_ticks >= floor.min_ticks * (1 - 1e-9)) & (
+        rows.paid_r * floor.min_spreads <= 1 + 1e-9
     )
 
 
@@ -328,6 +402,10 @@ class Report:
     """Per symbol, per target: all and the best half."""
     weights: list[tuple[str, float]] = field(default_factory=list)
     """Coefficients (logistic) or the AUC each input's shuffle costs (boosting)."""
+    floor: Floor | None = None
+    below_floor_training: int = 0
+    below_floor_validation: int = 0
+    """Entries the floor left out — before the counts above, which are what was left."""
 
 
 def _groups(
@@ -347,9 +425,16 @@ def _groups(
     return out
 
 
-def evaluate(rows: Rows, plan: Split, kind: Kind = "logistic") -> tuple[Pipeline, Report]:
-    """Fit on the training years and report on validation."""
+def evaluate(
+    rows: Rows, plan: Split, kind: Kind = "logistic", floor: Floor | None = None
+) -> tuple[Pipeline, Report]:
+    """Fit on the training years and report on validation — of the entries above `floor`."""
     training, validation, embargoed = split(rows, plan)
+    below = (0, 0)
+    if floor is not None:
+        able, unseen_able = executable(training, floor), executable(validation, floor)
+        below = (int((~able).sum()), int((~unseen_able).sum()))
+        training, validation = training.take(able), validation.take(unseen_able)
     if len(training.r) == 0 or len(validation.r) == 0:
         raise ValueError("no training or no validation entries for these dates")
     pipeline = fit(training, kind)
@@ -384,6 +469,9 @@ def evaluate(rows: Rows, plan: Split, kind: Kind = "logistic") -> tuple[Pipeline
         weights=(
             coefficients(pipeline) if kind == "logistic" else importances(pipeline, validation)
         ),
+        floor=floor,
+        below_floor_training=below[0],
+        below_floor_validation=below[1],
     )
 
 
@@ -394,8 +482,10 @@ __all__ = [
     "KINDS",
     "SEED",
     "TARGETS",
+    "Floor",
     "Kept",
     "Kind",
+    "Market",
     "Report",
     "Rows",
     "Split",
@@ -403,6 +493,7 @@ __all__ = [
     "coefficients",
     "design",
     "evaluate",
+    "executable",
     "fit",
     "importances",
     "kept",

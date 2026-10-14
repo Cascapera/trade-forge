@@ -3044,3 +3044,15 @@ runs deveriam voltar a `queued`, não `failed`; `failed` só quando é a última
   Um detector de velas absurdas (fora de N ATR do vizinho) na coleta.
 - **Refazer o que foi calculado com os dados sem ajuste:** varreduras de ações EUA (92fdba03, d1118475, eac59511 e
   outras), as bases de ML delas e as telas de melhores. Decisão dele.
+
+## O rótulo cobra o spread medido (14/10, ADR-0031) — o que ficou para depois
+
+- **A API cobra o spread de ação em ticks fixos.** Só cripto é proporcional (`_priced`). Numa série
+  de ação ajustada por desdobramento (NVDA ×40 desde 2016), o spread de hoje em ticks vira vários
+  por cento do preço antigo. O ML já cobra proporcional; a varredura ainda não.
+- **Spread medido é uma leitura só.** O catálogo guarda um número. O das ações EUA foi a mediana de
+  10 leituras num pregão (14/10, Tradeview), e o do WIN/WDO/DOL/BIT foi lido do contrato vigente,
+  porque a série contínua da XP não tem bid/ask. Um spread por hora do dia, ou medido das velas, seria
+  mais fiel.
+- **A comissão das ações BR e dos futuros B3 não está no catálogo.** O rótulo cobra a do run, e quase
+  todas rodaram com 0.

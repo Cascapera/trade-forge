@@ -7,8 +7,19 @@ import {
 } from '@testing-library/react'
 
 import { ApiError } from '../api/client'
-import type { LiveMarketSetupOut, LiveMarketsOut, LiveSetup, SignalRow } from '../api/types'
+import type {
+  LiveAssetOut,
+  LiveMarketSetupOut,
+  LiveMarketsOut,
+  LiveSetup,
+  SignalRow,
+} from '../api/types'
 import { renderWithProviders } from '../test-utils'
+
+// The strategy behind a setup, which the editor waits for; none unless a test opens one.
+const { opened } = vi.hoisted(() => ({
+  opened: { definition: undefined as Record<string, unknown> | undefined },
+}))
 
 vi.mock('../api/hooks', () => ({
   useLiveSetups: vi.fn(),
@@ -22,7 +33,9 @@ vi.mock('../api/hooks', () => ({
     isPending: false,
     error: null,
   }),
-  useStrategy: () => ({ data: undefined }),
+  useStrategy: () => ({
+    data: opened.definition === undefined ? undefined : { definition: opened.definition },
+  }),
   useEditLiveSetup: () => ({ mutate: vi.fn(), isPending: false, error: null }),
 }))
 
@@ -66,6 +79,10 @@ import {
   useRestartMarket,
 } from '../api/hooks'
 import { LiveSignals } from './LiveSignals'
+
+afterEach(() => {
+  opened.definition = undefined
+})
 
 const setup: LiveSetup = {
   id: 's1',
@@ -116,11 +133,14 @@ const signal: SignalRow = {
   strategy_id: 'st1',
 }
 
-/** The screen on its "By setup" tab, which reads each setup over every market. */
-function mount(setups: LiveSetup[]): ReturnType<typeof vi.fn> {
+/**
+ * The screen on its "By setup" tab, which reads each setup over every market; `assets` is the
+ * reading by asset, where its confirmations count the signals under way.
+ */
+function mount(setups: LiveSetup[], assets: LiveAssetOut[] = []): ReturnType<typeof vi.fn> {
   const mutate = vi.fn()
   vi.mocked(useLiveMarkets).mockReturnValue({
-    data: { supervisor: { alive: true, at: null, reachable: true }, assets: [] },
+    data: { supervisor: { alive: true, at: null, reachable: true }, assets },
     isPending: false,
     isError: false,
   } as never)
@@ -183,6 +203,7 @@ describe('LiveSignals', () => {
     fireEvent.click(screen.getByRole('button', { name: 'done' }))
     fireEvent.click(screen.getByRole('button', { name: 'WDO' }))
     fireEvent.click(screen.getByRole('button', { name: 'Drop WIN' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Yes, remove from WIN' }))
 
     expect(mutate.mock.calls.map((call: unknown[]) => call[0])).toEqual([
       { kind: 'add-market', id: 's1', instrumentId: 'bit' },
@@ -209,6 +230,7 @@ describe('LiveSignals', () => {
     expect(screen.queryByRole('link', { name: 'run it came from' })).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Turn on' }))
     fireEvent.click(screen.getByRole('button', { name: 'Remove CHOCH BASE' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Yes, delete CHOCH BASE' }))
 
     expect(mutate.mock.calls.map((call: unknown[]) => call[0])).toEqual([
       { kind: 'setup', id: 's1', patch: { active: true } },
@@ -371,6 +393,34 @@ const markets: LiveMarketsOut = {
   ],
 }
 
+/** CHOCH - 5 MIN on WDO too, with a signal armed there: what deleting it from WIN reaches. */
+const onTwoAssets: LiveMarketsOut = {
+  ...markets,
+  assets: [
+    ...markets.assets,
+    {
+      instrument_id: 'wdo',
+      symbol: 'WDO',
+      broker: 'xp',
+      timeframes: [
+        {
+          timeframe: 'M5',
+          processes: [{ ...live, key: 'wdo:M5' }],
+          restarting: false,
+          setups: [
+            onMarket({
+              setup_id: 'm5a',
+              name: 'CHOCH - 5 MIN',
+              strategy_name: 'CHOCH',
+              under_way: [{ ...armed, number: 44, symbol: 'WDO' }],
+            }),
+          ],
+        },
+      ],
+    },
+  ],
+}
+
 /** The screen on its default tab, by asset; the setups are what "Add setup" offers. */
 function mountByAsset(
   data: LiveMarketsOut | undefined,
@@ -488,7 +538,8 @@ describe('LiveSignals by asset', () => {
   })
 
   it('removes a setup from this asset after saying what that does to its signals', () => {
-    const { mutate } = mountByAsset(markets)
+    // On WDO too, where one more is armed: removed from WIN, only WIN's signals are its price.
+    const { mutate } = mountByAsset(onTwoAssets)
     const m5 = market('WIN M5')
 
     fireEvent.click(m5.getAllByRole('button', { name: 'Remove from WIN' })[0]!)
@@ -513,7 +564,9 @@ describe('LiveSignals by asset', () => {
 
     fireEvent.click(m5.getAllByRole('button', { name: 'Delete setup' })[1]!)
     expect(m5.getByText(/CONTINUATION is deleted from every asset it follows/)).toBeInTheDocument()
-    expect(m5.getByText('No signal is under way here, so none is touched.')).toBeInTheDocument()
+    expect(
+      m5.getByText('No signal is under way on any of its assets, so none is touched.'),
+    ).toBeInTheDocument()
     fireEvent.click(m5.getByRole('button', { name: 'Keep it' }))
     expect(m5.queryByRole('button', { name: 'Yes, delete CONTINUATION' })).not.toBeInTheDocument()
     expect(mutate).not.toHaveBeenCalled()
@@ -523,6 +576,64 @@ describe('LiveSignals by asset', () => {
     expect(mutate.mock.calls.map((call: unknown[]) => call[0])).toEqual([
       { kind: 'remove-setup', id: 'm5b' },
     ])
+  })
+
+  it('counts the signals under way on every asset before deleting a setup from all of them', () => {
+    const { mutate } = mountByAsset(onTwoAssets)
+    const m5 = market('WIN M5')
+
+    fireEvent.click(m5.getAllByRole('button', { name: 'Delete setup' })[0]!)
+    // WIN's armed and in-trade signals, and the one armed on WDO, which the delete reaches too.
+    expect(
+      m5.getByText(
+        '2 armed signals will be cancelled on the channel; 1 in a trade will be followed by price.',
+      ),
+    ).toBeInTheDocument()
+    fireEvent.click(m5.getByRole('button', { name: 'Yes, delete CHOCH - 5 MIN' }))
+    expect(mutate.mock.calls.map((call: unknown[]) => call[0])).toEqual([
+      { kind: 'remove-setup', id: 'm5a' },
+    ])
+  })
+
+  it('says a setup removed from its only asset stops altogether', () => {
+    mountByAsset(markets)
+    const m5 = market('WIN M5')
+
+    fireEvent.click(m5.getAllByRole('button', { name: 'Remove from WIN' })[1]!)
+
+    expect(
+      m5.getByText(
+        /CONTINUATION follows no other asset, so it stops altogether; it stays in the setups list, with no asset\./,
+      ),
+    ).toBeInTheDocument()
+    expect(m5.queryByText(/it stays on its other assets/)).not.toBeInTheDocument()
+    expect(m5.getByText('No signal is under way on WIN, so none is touched.')).toBeInTheDocument()
+  })
+
+  it('offers nothing to add while the setups load, and says when they cannot be read', () => {
+    mountByAsset(markets)
+    vi.mocked(useLiveSetups).mockReturnValue({
+      data: undefined,
+      isPending: true,
+      isError: false,
+    } as never)
+    renderWithProviders(<LiveSignals />)
+
+    const loading = screen.getAllByRole('region', { name: 'WIN M5' })[1]!
+    expect(loading).toHaveTextContent('Loading setups…')
+    expect(loading).not.toHaveTextContent('Every M5 setup is already on WIN')
+
+    vi.mocked(useLiveSetups).mockReturnValue({
+      data: undefined,
+      isPending: false,
+      isError: true,
+      error: new ApiError(500, 'the database is down'),
+    } as never)
+    renderWithProviders(<LiveSignals />)
+
+    const failed = screen.getAllByRole('region', { name: 'WIN M5' })[2]!
+    expect(failed).toHaveTextContent('Could not read the setups, so none can be added here.')
+    expect(failed).not.toHaveTextContent('Every M5 setup is already on WIN')
   })
 
   it('says what a restart does to the signals under way, then asks for it', () => {
@@ -754,5 +865,95 @@ describe('LiveSignals by asset', () => {
     expect(screen.getByRole('heading', { name: 'CHOCH BASE' })).toBeInTheDocument()
     expect(screen.getByRole('heading', { name: 'BOS M5' })).toBeInTheDocument()
     expect(screen.queryByRole('region', { name: 'WIN M5' })).not.toBeInTheDocument()
+  })
+})
+
+/** CHOCH BASE on WIN, with a signal armed, and on WDO, switched off with one still in a trade. */
+function onBoth(): LiveAssetOut[] {
+  const h1 = (setups: LiveMarketSetupOut[]) => [
+    { timeframe: 'H1', processes: [], restarting: false, setups },
+  ]
+  return [
+    {
+      instrument_id: 'win',
+      symbol: 'WIN',
+      broker: 'xp',
+      timeframes: h1([onMarket({ under_way: [armed] })]),
+    },
+    {
+      instrument_id: 'wdo',
+      symbol: 'WDO',
+      broker: 'xp',
+      timeframes: h1([onMarket({ active: false, state: 'off', under_way: [inTrade] })]),
+    },
+  ]
+}
+
+describe('LiveSignals by setup, before removing or editing', () => {
+  it('asks before deleting a setup or dropping a market, with what each reaches', () => {
+    const mutate = mount([setup], onBoth())
+
+    fireEvent.click(screen.getByRole('button', { name: 'Remove CHOCH BASE' }))
+    expect(
+      screen.getByText(/CHOCH BASE is deleted from every asset it follows/),
+    ).toBeInTheDocument()
+    expect(
+      screen.getByText(
+        '1 armed signal will be cancelled on the channel; 1 in a trade will be followed by price.',
+      ),
+    ).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Keep it' }))
+    expect(screen.queryByRole('button', { name: 'Yes, delete CHOCH BASE' })).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Drop WIN' }))
+    expect(
+      screen.getByText(/CHOCH BASE stops following WIN; it stays on its other assets\./),
+    ).toBeInTheDocument()
+    expect(
+      screen.getByText(
+        '1 armed signal will be cancelled on the channel; 0 in a trade will be followed by price.',
+      ),
+    ).toBeInTheDocument()
+    expect(mutate).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Yes, remove from WIN' }))
+    expect(mutate.mock.calls.map((call: unknown[]) => call[0])).toEqual([
+      { kind: 'remove-market', id: 's1', instrumentId: 'win' },
+    ])
+  })
+
+  it('says the signals under way are unknown while the markets are not read', () => {
+    mount([setup])
+    vi.mocked(useLiveMarkets).mockReturnValue({
+      data: undefined,
+      isPending: true,
+      isError: false,
+    } as never)
+    renderWithProviders(<LiveSignals />)
+    fireEvent.click(screen.getAllByRole('tab', { name: 'By setup' })[1]!)
+
+    fireEvent.click(screen.getAllByRole('button', { name: 'Remove CHOCH BASE' })[1]!)
+    expect(screen.getByText(/Its signals under way are unknown right now/)).toBeInTheDocument()
+  })
+
+  it('says what saving an edit does to the setup’s signals on every asset', () => {
+    mount([setup], onBoth())
+    opened.definition = {
+      schema_version: '1.0',
+      name: 'CHOCH BASE',
+      timeframe: 'H1',
+      setup: { type: 'structure_choch', params: { side: 'long' } },
+      exit: { take_profit: { type: 'risk_multiple', params: { rr: 3 } } },
+    }
+
+    fireEvent.click(screen.getByRole('button', { name: 'Edit' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Save as a new version' }))
+
+    expect(
+      screen.getByText(
+        '1 armed signal will be cancelled on the channel; 1 in a trade will be followed by price.',
+      ),
+    ).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Yes, save the new version' })).toBeInTheDocument()
   })
 })

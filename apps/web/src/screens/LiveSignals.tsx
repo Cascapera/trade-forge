@@ -21,11 +21,15 @@ import type {
   SupervisorOut,
 } from '../api/types'
 import { BrokerTag } from '../components/BrokerTag'
+import { Confirm } from '../components/Confirm'
 import { MarketBrowser } from '../components/MarketBrowser'
 import { MAX_MARKETS, NewLiveSetup } from '../components/NewLiveSetup'
 import { SetupEditor } from '../components/SetupEditor'
 
 type View = 'asset' | 'setup'
+
+/** The setups as read: the query itself, so "not read yet" and "failed" are not taken for none. */
+type SetupsQuery = ReturnType<typeof useLiveSetups>
 
 const VIEWS: { id: View; label: string }[] = [
   { id: 'asset', label: 'By asset' },
@@ -103,7 +107,7 @@ export function LiveSignals(): React.JSX.Element {
       </div>
       {view === 'asset' ? (
         <div id="panel-asset" role="tabpanel" aria-labelledby="tab-asset" className="space-y-4">
-          <ByAsset setups={rows} />
+          <ByAsset setups={setups} />
         </div>
       ) : (
         <div id="panel-setup" role="tabpanel" aria-labelledby="tab-setup" className="space-y-4">
@@ -112,7 +116,7 @@ export function LiveSignals(): React.JSX.Element {
               {setups.isPending ? 'Loading…' : 'No setup is followed yet.'}
             </p>
           ) : (
-            rows.map((setup) => <SetupCard key={setup.id} setup={setup} />)
+            <BySetup setups={rows} />
           )}
         </div>
       )}
@@ -125,7 +129,7 @@ export function LiveSignals(): React.JSX.Element {
  * timeframe, each one process of the supervisor — and the setups on each, with what they have
  * under way and their record on that asset alone.
  */
-function ByAsset(props: { setups: LiveSetup[] }): React.JSX.Element {
+function ByAsset(props: { setups: SetupsQuery }): React.JSX.Element {
   const markets = useLiveMarkets()
   if (markets.data === undefined) {
     return markets.isError ? (
@@ -137,6 +141,7 @@ function ByAsset(props: { setups: LiveSetup[] }): React.JSX.Element {
     )
   }
   const { supervisor, assets } = markets.data
+  const footprint = footprints(assets)
   return (
     <>
       <Supervisor supervisor={supervisor} />
@@ -149,6 +154,7 @@ function ByAsset(props: { setups: LiveSetup[] }): React.JSX.Element {
             asset={asset}
             alive={supervisor.alive}
             setups={props.setups}
+            footprint={footprint}
           />
         ))
       )}
@@ -185,7 +191,8 @@ function Supervisor(props: { supervisor: SupervisorOut }): React.JSX.Element {
 function AssetCard(props: {
   asset: LiveAssetOut
   alive: boolean
-  setups: LiveSetup[]
+  setups: SetupsQuery
+  footprint: Footprint
 }): React.JSX.Element {
   const { asset } = props
   const rows = asset.timeframes.flatMap((market) => market.setups)
@@ -207,6 +214,7 @@ function AssetCard(props: {
           market={market}
           alive={props.alive}
           setups={props.setups}
+          footprint={props.footprint}
         />
       ))}
     </article>
@@ -226,6 +234,47 @@ function plural(count: number, noun: string): string {
   return `${String(count)} ${noun}${count === 1 ? '' : 's'}`
 }
 
+/** Every setup's row on each asset it is on — what removing, deleting or editing it reaches. */
+type Footprint = Map<string, { instrumentId: string; row: LiveMarketSetupOut }[]>
+
+/** Each setup's rows across every asset, from the reading by asset, which carries them all. */
+function footprints(assets: LiveAssetOut[]): Footprint {
+  const found: Footprint = new Map()
+  for (const asset of assets) {
+    for (const row of asset.timeframes.flatMap((market) => market.setups)) {
+      const places = found.get(row.setup_id) ?? []
+      places.push({ instrumentId: asset.instrument_id, row })
+      found.set(row.setup_id, places)
+    }
+  }
+  return found
+}
+
+/**
+ * What ending a setup's sessions does to its signals under way within the action's reach: one
+ * asset's when `asset` is given, every asset's otherwise — deleting or editing a setup ends its
+ * session everywhere, so a signal armed on another asset is cancelled too. Said as unknown while
+ * the markets are not read, never as none.
+ */
+function priceOf(
+  footprint: Footprint | undefined,
+  setupId: string,
+  asset?: { instrumentId: string; symbol: string },
+): string {
+  if (footprint === undefined) {
+    return 'Its signals under way are unknown right now; any armed one will be cancelled on the channel, any in a trade followed by price.'
+  }
+  const rows = (footprint.get(setupId) ?? [])
+    .filter((place) => asset === undefined || place.instrumentId === asset.instrumentId)
+    .map((place) => place.row)
+  const { armed, inTrade } = underWay(rows)
+  return consequence(
+    armed,
+    inTrade,
+    asset === undefined ? 'on any of its assets' : `on ${asset.symbol}`,
+  )
+}
+
 /**
  * One market — an asset on a timeframe — which is one process of the supervisor, and the setups
  * it runs. Restarting it is how a setup added since the last restart joins the others.
@@ -234,7 +283,8 @@ function MarketBlock(props: {
   asset: LiveAssetOut
   market: LiveTimeframeOut
   alive: boolean
-  setups: LiveSetup[]
+  setups: SetupsQuery
+  footprint: Footprint
 }): React.JSX.Element {
   const { asset, market, alive } = props
   const change = useChangeLive()
@@ -317,7 +367,13 @@ function MarketBlock(props: {
 
       <ul className="space-y-2">
         {market.setups.map((row) => (
-          <SetupOnMarket key={row.setup_id} asset={asset} row={row} change={change} />
+          <SetupOnMarket
+            key={row.setup_id}
+            asset={asset}
+            row={row}
+            footprint={props.footprint}
+            change={change}
+          />
         ))}
       </ul>
       <AddSetup asset={asset} market={market} setups={props.setups} change={change} />
@@ -350,9 +406,9 @@ function processState(market: LiveTimeframeOut, alive: boolean): [string, string
   return [`${phase} · ${count}`, live ? 'text-emerald-400' : 'text-sky-300']
 }
 
-/** What a restart does to a market's signals under way — said before it is asked for. */
-function consequence(armed: number, inTrade: number): string {
-  if (armed === 0 && inTrade === 0) return 'No signal is under way here, so none is touched.'
+/** What ending sessions does to their signals under way — said before it is asked for. */
+function consequence(armed: number, inTrade: number, where = 'here'): string {
+  if (armed === 0 && inTrade === 0) return `No signal is under way ${where}, so none is touched.`
   const cancelled = `${plural(armed, 'armed signal')} will be cancelled on the channel`
   return `${cancelled}; ${String(inTrade)} in a trade will be followed by price.`
 }
@@ -383,13 +439,13 @@ function StatePill(props: { row: LiveMarketSetupOut }): React.JSX.Element | null
 function SetupOnMarket(props: {
   asset: LiveAssetOut
   row: LiveMarketSetupOut
+  footprint: Footprint
   change: ReturnType<typeof useChangeLive>
 }): React.JSX.Element {
-  const { asset, row, change } = props
+  const { asset, row, footprint, change } = props
   const [history, setHistory] = useState(false)
   // Which destructive action is waiting for its confirmation, if any.
-  const [asking, setAsking] = useState<'remove' | 'delete' | null>(null)
-  const { armed, inTrade } = underWay([row])
+  const [asking, setAsking] = useState<Removal['kind'] | null>(null)
   return (
     <li
       className={`space-y-1 border-t border-slate-800 pt-2 text-sm ${
@@ -473,53 +529,78 @@ function SetupOnMarket(props: {
         </button>
       </div>
       {asking !== null && (
-        <div className="space-y-2 rounded border border-red-900 bg-slate-900 p-3 text-sm">
-          <p className="text-slate-300">
-            {asking === 'remove'
-              ? `${row.name} stops following ${asset.symbol}; it stays on its other assets.`
-              : `${row.name} is deleted from every asset it follows; its signals' history is kept.`}{' '}
-            <strong className="text-amber-200">{consequence(armed, inTrade)}</strong>
-          </p>
-          <div className="flex gap-2">
-            <button
-              type="button"
-              disabled={change.isPending}
-              onClick={() => {
-                change.mutate(
-                  asking === 'remove'
-                    ? {
-                        kind: 'remove-market',
-                        id: row.setup_id,
-                        instrumentId: asset.instrument_id,
-                      }
-                    : { kind: 'remove-setup', id: row.setup_id },
-                  {
-                    onSuccess: () => {
-                      setAsking(null)
-                    },
-                  },
-                )
-              }}
-              className="rounded bg-red-800 px-2 py-1 text-xs text-white disabled:bg-slate-700"
-            >
-              {asking === 'remove'
-                ? `Yes, remove from ${asset.symbol}`
-                : `Yes, delete ${row.name}`}
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                setAsking(null)
-              }}
-              className="text-xs text-slate-500 hover:text-slate-300"
-            >
-              Keep it
-            </button>
-          </div>
-        </div>
+        <ConfirmRemoval
+          setupId={row.setup_id}
+          name={row.name}
+          removal={
+            asking === 'delete'
+              ? { kind: 'delete' }
+              : {
+                  kind: 'remove',
+                  instrumentId: asset.instrument_id,
+                  symbol: asset.symbol,
+                  elsewhere: (footprint.get(row.setup_id) ?? []).some(
+                    (place) => place.instrumentId !== asset.instrument_id,
+                  ),
+                }
+          }
+          footprint={footprint}
+          change={change}
+          onClose={() => {
+            setAsking(null)
+          }}
+        />
       )}
       {history && <History setupId={row.setup_id} symbol={asset.symbol} />}
     </li>
+  )
+}
+
+/** A removal waiting for its confirmation: the setup off one asset, or deleted from all. */
+type Removal =
+  | { kind: 'remove'; instrumentId: string; symbol: string; elsewhere: boolean }
+  | { kind: 'delete' }
+
+/**
+ * The question before a setup is removed from an asset or deleted, on either tab: what else it
+ * reaches, and what it does to the signals under way within that reach — the one asset's when
+ * removed from it, every asset's when deleted.
+ */
+function ConfirmRemoval(props: {
+  setupId: string
+  name: string
+  removal: Removal
+  /** The setup's rows on every asset; undefined while the markets are not read. */
+  footprint: Footprint | undefined
+  change: ReturnType<typeof useChangeLive>
+  onClose: () => void
+}): React.JSX.Element {
+  const { setupId, name, change, onClose } = props
+  const from = props.removal.kind === 'remove' ? props.removal : undefined
+  // ⚠️ Off its last asset the setup is kept with no market, so no session runs it anywhere.
+  const reach =
+    from === undefined
+      ? `${name} is deleted from every asset it follows; its signals' history is kept.`
+      : from.elsewhere
+        ? `${name} stops following ${from.symbol}; it stays on its other assets.`
+        : `${name} follows no other asset, so it stops altogether; it stays in the setups list, with no asset.`
+  return (
+    <Confirm
+      reach={reach}
+      price={priceOf(props.footprint, setupId, from)}
+      yes={from === undefined ? `Yes, delete ${name}` : `Yes, remove from ${from.symbol}`}
+      keep="Keep it"
+      busy={change.isPending}
+      onYes={() => {
+        change.mutate(
+          from === undefined
+            ? { kind: 'remove-setup', id: setupId }
+            : { kind: 'remove-market', id: setupId, instrumentId: from.instrumentId },
+          { onSuccess: onClose },
+        )
+      }}
+      onKeep={onClose}
+    />
   )
 }
 
@@ -550,12 +631,23 @@ function record(m: LiveMetrics): string {
 function AddSetup(props: {
   asset: LiveAssetOut
   market: LiveTimeframeOut
-  setups: LiveSetup[]
+  setups: SetupsQuery
   change: ReturnType<typeof useChangeLive>
 }): React.JSX.Element {
-  const { asset, market, change } = props
+  const { asset, market, setups, change } = props
+  // ⚠️ Not read is not none: the setups come in a query of their own, which can answer after
+  // the markets, or fail, and "every setup is already here" would then be false.
+  if (setups.data === undefined) {
+    return setups.isError ? (
+      <p className="text-xs text-red-400">
+        Could not read the setups, so none can be added here.
+      </p>
+    ) : (
+      <p className="text-xs text-slate-500">Loading setups…</p>
+    )
+  }
   const here = new Set(market.setups.map((row) => row.setup_id))
-  const candidates = props.setups.filter(
+  const candidates = setups.data.filter(
     (setup) => setup.timeframe === market.timeframe && !here.has(setup.id),
   )
   if (candidates.length === 0) {
@@ -590,11 +682,52 @@ function AddSetup(props: {
   )
 }
 
-function SetupCard(props: { setup: LiveSetup }): React.JSX.Element {
-  const { setup } = props
+/**
+ * The setups one by one, each with its record over every market. The reading by asset is read
+ * here too, for the confirmations: what each setup has under way, asset by asset.
+ */
+function BySetup(props: { setups: LiveSetup[] }): React.JSX.Element {
+  const markets = useLiveMarkets()
+  const footprint = markets.data === undefined ? undefined : footprints(markets.data.assets)
+  return (
+    <>
+      {props.setups.map((setup) => (
+        <SetupCard key={setup.id} setup={setup} footprint={footprint} />
+      ))}
+    </>
+  )
+}
+
+/** A question open on a setup's card: deleting it, or dropping one of its markets. */
+type Asking = { kind: 'delete' } | { kind: 'remove'; instrumentId: string }
+
+/**
+ * The removal a card asks about, read from the setup's markets as they are now: the question
+ * keeps only which market, so its name and whether others remain never go stale.
+ */
+function removalOf(setup: LiveSetup, asking: Asking | null): Removal | null {
+  if (asking?.kind !== 'remove') return asking
+  const market = setup.markets.find((one) => one.instrument_id === asking.instrumentId)
+  if (market === undefined) return null
+  return {
+    kind: 'remove',
+    instrumentId: market.instrument_id,
+    symbol: market.symbol,
+    elsewhere: setup.markets.length > 1,
+  }
+}
+
+function SetupCard(props: {
+  setup: LiveSetup
+  /** Every setup's rows asset by asset; undefined while the markets are not read. */
+  footprint: Footprint | undefined
+}): React.JSX.Element {
+  const { setup, footprint } = props
   const change = useChangeLive()
   const [history, setHistory] = useState(false)
   const [editing, setEditing] = useState(false)
+  const [asking, setAsking] = useState<Asking | null>(null)
+  const removal = removalOf(setup, asking)
   const busy = change.isPending
 
   return (
@@ -644,7 +777,7 @@ function SetupCard(props: { setup: LiveSetup }): React.JSX.Element {
             type="button"
             disabled={busy}
             onClick={() => {
-              change.mutate({ kind: 'remove-setup', id: setup.id })
+              setAsking({ kind: 'delete' })
             }}
             aria-label={`Remove ${setup.name}`}
             className="rounded border border-slate-700 px-2 text-xs text-red-300 hover:bg-slate-800 disabled:opacity-40"
@@ -657,6 +790,7 @@ function SetupCard(props: { setup: LiveSetup }): React.JSX.Element {
       {editing && (
         <SetupEditor
           setup={setup}
+          price={priceOf(footprint, setup.id)}
           onClose={() => {
             setEditing(false)
           }}
@@ -665,7 +799,26 @@ function SetupCard(props: { setup: LiveSetup }): React.JSX.Element {
 
       <Metrics metrics={setup.metrics} />
 
-      <Markets setup={setup} busy={busy} change={change} />
+      <Markets
+        setup={setup}
+        busy={busy}
+        change={change}
+        onDrop={(instrumentId) => {
+          setAsking({ kind: 'remove', instrumentId })
+        }}
+      />
+      {removal !== null && (
+        <ConfirmRemoval
+          setupId={setup.id}
+          name={setup.name}
+          removal={removal}
+          footprint={footprint}
+          change={change}
+          onClose={() => {
+            setAsking(null)
+          }}
+        />
+      )}
 
       {change.error && <p className="text-sm text-red-400">{change.error.message}</p>}
 
@@ -723,6 +876,8 @@ function Markets(props: {
   setup: LiveSetup
   busy: boolean
   change: ReturnType<typeof useChangeLive>
+  /** A market's "×": asks first, on the card, what dropping it does. */
+  onDrop: (instrumentId: string) => void
 }): React.JSX.Element {
   const { setup, busy, change } = props
   const instruments = useInstruments()
@@ -782,11 +937,7 @@ function Markets(props: {
             type="button"
             disabled={busy}
             onClick={() => {
-              change.mutate({
-                kind: 'remove-market',
-                id: setup.id,
-                instrumentId: market.instrument_id,
-              })
+              props.onDrop(market.instrument_id)
             }}
             aria-label={`Drop ${market.symbol}`}
             className="text-slate-500 hover:text-red-300"

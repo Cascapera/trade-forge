@@ -83,6 +83,8 @@ class TradeRecord:
     swap: Any
     net_pnl: Any
     volume: Any
+    grid: tuple[Any, ...] = ()
+    """The entry under each stop of a replay's grid (`replay.Cell`); none from a run."""
 
     @property
     def key(self) -> tuple[Any, ...]:
@@ -114,6 +116,7 @@ def distinct_entries(trades: Iterable[TradeRecord]) -> list[dict[str, Any]]:
     the same entry should close it the same way. When they do not — a setup whose later decisions
     depend on its configuration can close a trade earlier — `outcomes_agree` is false and the row
     keeps the first, so a model never trains on a label the base itself contradicts unknowingly.
+    The first's `grid` too: the other stops' cells are decided by the entry alone.
     """
     rows: dict[tuple[Any, ...], dict[str, Any]] = {}
     outcomes: dict[tuple[Any, ...], tuple[Any, ...]] = {}
@@ -141,6 +144,7 @@ def distinct_entries(trades: Iterable[TradeRecord]) -> list[dict[str, Any]]:
                 "swap": trade.swap,
                 "net_pnl": trade.net_pnl,
                 "volume": trade.volume,
+                "grid": trade.grid,
                 "first_run_id": trade.run_id,
                 "configurations": [configuration],
                 "outcomes_agree": True,

@@ -15,7 +15,10 @@ the setup proposes, so this replays the setup **always flat** and trades each pr
   rules a run follows: nothing here re-implements them;
 * each trade has two ways out: its **initial stop**, never moved (the setup's trail depends on the
   path, and the label should not), and the **time barrier**: `horizon` bars after the entry bar,
-  closed at the next open.
+  closed at the next open;
+* each proposal is also traded under **other stops** (`STOPS`, 14/10): the same order with its stop
+  a multiple of the setup's distance away, each on a broker of its own (`Cell`). A target needs no
+  broker of its own: it is read off each stop's excursion afterwards (`excursion.with_target`).
 
 ⚠️ **Not what the setup would have made live.** Live, a running trade would block the next entry
 too. This is each proposal's own outcome — what a filter needs to judge — and the base says so in
@@ -25,8 +28,8 @@ its name (`independent-h<horizon>`).
 from __future__ import annotations
 
 import datetime as dt
-from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from decimal import Decimal, localcontext
 from typing import Any
 
@@ -46,7 +49,9 @@ from tradeforge_engine.domain import (
     Context,
     Fill,
     InstrumentSpec,
+    Money,
     OrderRequest,
+    Position,
     Signal,
     SignalKind,
 )
@@ -56,6 +61,13 @@ from tradeforge_engine.swap import SwapRates
 
 HORIZON = 150
 """Bars a trade may stay open after the bar it entered on (his choice, 06/10)."""
+
+STOPS: tuple[Decimal, ...] = tuple(Decimal(k) for k in ("0.5", "0.75", "1", "1.5", "2", "3"))
+"""The stops every proposal is also traded with, as multiples of the distance the setup put
+between the order's level and its stop (his idea, 14/10): a setup that wins one trade in five can
+still end positive with the right stop and target, and which ones is a question for each entry.
+`1` is the setup's own stop — the proposal itself. Up to 3: on 9.4 BR the mean R still rose from
+1.5 to 2 (-0.149 to -0.129, training years)."""
 
 LOT = Decimal(1)
 """Every proposal is traded with one lot: R is money over the money at risk, so the size cancels;
@@ -160,12 +172,55 @@ def swap_from(spec: Mapping[str, Any]) -> SwapRates | None:
 
 
 @dataclass(frozen=True)
+class Cell:
+    """A proposal under one stop of the grid: the trade it made, or why it made none."""
+
+    multiple: Decimal
+    trade: ClosedTrade | None
+    exit_reason: str
+    """`sl` or `time`, as a proposal's. Without a trade:
+
+    * `refused` — the broker would not fill the entry with this stop (a stop entry that slipped
+      more than half of this stop's risk, a limit that gapped through it), or the order had no
+      stop to scale. No trade is what a trader with this stop would have had;
+    * `open` — the bars ran out before it closed. Not known, which is not the same as nothing."""
+
+
+@dataclass(frozen=True)
 class Proposal:
     """One entry the setup proposed and the broker filled, with how it ended."""
 
     trade: ClosedTrade
     exit_reason: str
     """`sl` when its stop closed it, `time` when the barrier did."""
+    grid: tuple[Cell, ...] = ()
+    """The entry under each stop of the replay's grid, in its order; `1` is `trade` itself.
+    Empty for an entry before `entries_from`, which is left out anyway."""
+
+
+def scaled_stop(order: OrderRequest, decided_close: Money, multiple: Decimal) -> Money:
+    """`order`'s stop `multiple` times as far from where the order was planned to fill: its level
+    — a limit's or a stop's — or, at market, the close it was decided on (`Signal.
+    reference_price`, what sizing measures risk against). A trader places the stop with the
+    order, before the fill is known; a fill that gaps away from the level changes the risk of
+    every stop of the grid alike, as it does the setup's."""
+    if order.stop_loss is None:
+        raise ValueError("an order without a stop has no distance to scale")
+    level = order.limit_price if order.limit_price is not None else order.stop_price
+    planned = decided_close if level is None else level
+    return planned - multiple * (planned - order.stop_loss)
+
+
+def _time_exit(position: Position, candle: Candle) -> OrderRequest:
+    """The time barrier's exit, decided at `candle`'s close and filled at the next open."""
+    return OrderRequest(
+        symbol=position.symbol,
+        side=position.side,
+        intent=SignalKind.EXIT,
+        volume=position.volume,
+        decided_at=candle.time,
+        reason="time barrier",
+    )
 
 
 @dataclass
@@ -173,10 +228,18 @@ class _Ticket:
     """One proposal in flight: its own broker, from the order to the close."""
 
     broker: BacktestBroker
-    client_id: str | None
+    order: OrderRequest
+    stops: tuple[tuple[Decimal, Money | None], ...] = ()
+    """The grid's other stops for this order, by multiple; `None` when it has no stop to scale."""
     entered_at: int | None = None
     """The index of the bar the entry filled on, once it has."""
     timed_out: bool = False
+    grid: dict[Decimal, Cell] | None = None
+    """The other stops' cells, followed when the entry filled; `None` before `entries_from`."""
+
+    @property
+    def client_id(self) -> str | None:
+        return self.order.client_id
 
 
 def _order(signal: Signal, candle: Candle, instrument: InstrumentSpec) -> OrderRequest:
@@ -198,15 +261,30 @@ def _order(signal: Signal, candle: Candle, instrument: InstrumentSpec) -> OrderR
 
 @dataclass
 class Replay:
-    """Drive `strategy` flat over `candles`, trading each proposal on its own broker."""
+    """Drive `strategy` flat over `candles`, trading each proposal on its own broker — and, from
+    the bar it fills on, on one more broker for each other stop of `stops`."""
 
     strategy: Strategy
     instrument: InstrumentSpec
     cost_model: CostModel
     swap: SwapRates | None = None
     horizon: int = HORIZON
+    stops: Sequence[Decimal] = STOPS
+    entries_from: dt.datetime | None = None
+    """Entries before it are left out (`replay`), so their other stops are not followed."""
+    cells: dict[tuple[object, ...], Cell] = field(default_factory=dict)
+    """The other stops already followed, by what decides them — shared by the replays of one
+    chart over the same bars at the same costs (`replay_export`). A sweep proposes most entries
+    many times over: on 9.1 BR, 1.79 million proposals were 227 thousand entries."""
     done: list[Proposal] = field(default_factory=list)
     _tickets: list[_Ticket] = field(default_factory=list)
+    _candles: Sequence[Candle] = ()
+
+    def __post_init__(self) -> None:
+        if Decimal(1) not in self.stops:
+            raise ValueError("the grid must hold the setup's own stop (1): it is the proposal")
+        if any(multiple <= 0 for multiple in self.stops):
+            raise ValueError(f"a stop is a positive multiple of the setup's, got {self.stops}")
 
     def _broker(self) -> BacktestBroker:
         return BacktestBroker(
@@ -220,25 +298,27 @@ class Replay:
             if ticket.entered_at is None and fills:
                 ticket.entered_at = index
                 handed.extend(fill for fill in fills if fill.order.intent is SignalKind.ENTRY)
+                if self.entries_from is None or candle.time >= self.entries_from:
+                    ticket.grid = self._grid(ticket, index)
         for ticket in list(self._tickets):
             if ticket.entered_at is None:
                 continue
             if not ticket.broker.positions(self.instrument.symbol):
                 (trade,) = ticket.broker.trades()
-                self.done.append(Proposal(trade, "time" if ticket.timed_out else "sl"))
+                reason = "time" if ticket.timed_out else "sl"
+                grid = (
+                    ()
+                    if ticket.grid is None
+                    else tuple(
+                        Cell(multiple, trade, reason) if multiple == 1 else ticket.grid[multiple]
+                        for multiple in self.stops
+                    )
+                )
+                self.done.append(Proposal(trade, reason, grid))
                 self._tickets.remove(ticket)
             elif index - ticket.entered_at >= self.horizon and not ticket.timed_out:
                 (position,) = ticket.broker.positions(self.instrument.symbol)
-                ticket.broker.submit(
-                    OrderRequest(
-                        symbol=self.instrument.symbol,
-                        side=position.side,
-                        intent=SignalKind.EXIT,
-                        volume=position.volume,
-                        decided_at=candle.time,
-                        reason="time barrier",
-                    )
-                )
+                ticket.broker.submit(_time_exit(position, candle))
                 ticket.timed_out = True
 
         context = Context(
@@ -256,12 +336,76 @@ class Replay:
                     self._tickets.remove(ticket)
         elif signal.kind is SignalKind.ENTRY:
             broker = self._broker()
-            if broker.submit(_order(signal, candle, self.instrument)).accepted:
-                self._tickets.append(_Ticket(broker, signal.client_id))
+            order = _order(signal, candle, self.instrument)
+            if broker.submit(order).accepted:
+                stops = tuple(
+                    (
+                        multiple,
+                        None
+                        if order.stop_loss is None
+                        else scaled_stop(order, signal.reference_price, multiple),
+                    )
+                    for multiple in self.stops
+                    if multiple != 1
+                )
+                self._tickets.append(_Ticket(broker, order, stops))
         # MODIFY_STOP and EXIT act on a position, and a flat replay has none: the initial stop
         # and the time barrier are the only ways out.
 
-    def run(self, candles: Iterable[Candle]) -> list[Proposal]:
+    def _grid(self, ticket: _Ticket, filled_at: int) -> dict[Decimal, Cell]:
+        """The entry under each other stop, followed from the bar it filled on — once per entry
+        (`cells`): what decides a cell is the bars, the fill, the levels and the stop, never which
+        run proposed it."""
+        order, end = ticket.order, self._candles[-1].time
+        grid: dict[Decimal, Cell] = {}
+        for multiple, stop in ticket.stops:
+            if stop is None:
+                grid[multiple] = Cell(multiple, None, "refused")
+                continue
+            key = (
+                end,
+                self._candles[filled_at].time,
+                order.side,
+                order.limit_price,
+                order.stop_price,
+                stop,
+                multiple,
+            )
+            cell = self.cells.get(key)
+            if cell is None:
+                cell = self.cells[key] = self._follow(order, filled_at, stop, multiple)
+            grid[multiple] = cell
+        return grid
+
+    def _follow(self, order: OrderRequest, filled_at: int, stop: Money, multiple: Decimal) -> Cell:
+        """`order` with `stop`, on a broker of its own, from the bar the setup's own filled on.
+
+        ⚠️ **Submitted just before that bar, not when the setup decided it.** Only the stop
+        differs, and the broker never reads a stop to decide a fill — only to refuse one — so the
+        same order fills on the same bar at the same price, however long it rested before; and
+        the bars it rested through are most of a zone's order's life. A cell that did not fill
+        there was refused (`_survives_the_slip`, `_survives_the_gap`): a later fill would be
+        another entry."""
+        broker = self._broker()
+        if not broker.submit(replace(order, stop_loss=stop)).accepted:
+            return Cell(multiple, None, "refused")
+        timed_out = False
+        for index in range(filled_at, len(self._candles)):
+            candle = self._candles[index]
+            broker.on_bar(candle)
+            if broker.trades():
+                (trade,) = broker.trades()
+                return Cell(multiple, trade, "time" if timed_out else "sl")
+            positions = broker.positions(self.instrument.symbol)
+            if not positions:
+                return Cell(multiple, None, "refused")
+            if index - filled_at >= self.horizon and not timed_out:
+                broker.submit(_time_exit(positions[0], candle))
+                timed_out = True
+        return Cell(multiple, None, "open")
+
+    def run(self, candles: Sequence[Candle]) -> list[Proposal]:
+        self._candles = candles
         with localcontext(ENGINE_CONTEXT):
             for index, candle in enumerate(candles):
                 self._step(index, candle)
@@ -277,11 +421,24 @@ def replay(  # noqa: PLR0913 — keyword-only; one per input a run is made of
     swap: SwapRates | None = None,
     horizon: int = HORIZON,
     entries_from: dt.datetime | None = None,
+    stops: Sequence[Decimal] = STOPS,
+    cells: dict[tuple[object, ...], Cell] | None = None,
 ) -> list[Proposal]:
     """The setup's proposals over `candles` in entry order, each closed by its stop or the time
-    barrier. Trades still open when the bars run out are left out: their outcome is not known.
-    With `entries_from`, bars before it only warm the setup up — entries before it are left out."""
-    done = Replay(strategy, instrument, cost_model, swap, horizon).run(candles)
+    barrier, and each under every stop of `stops` too. Trades still open when the bars run out
+    are left out: their outcome is not known. With `entries_from`, bars before it only warm the
+    setup up — entries before it are left out. `cells` carries the stops already followed from
+    one replay of these bars to the next."""
+    done = Replay(
+        strategy,
+        instrument,
+        cost_model,
+        swap,
+        horizon,
+        stops,
+        entries_from,
+        {} if cells is None else cells,
+    ).run(candles)
     # In entry order: the replay finishes trades in the order they close, and a long one entered
     # first can close after several entered behind it.
     return sorted(
@@ -298,11 +455,14 @@ __all__ = [
     "HORIZON",
     "LOT",
     "PROPORTIONAL",
+    "STOPS",
+    "Cell",
     "Proposal",
     "Replay",
     "costs_from",
     "instrument_from",
     "measured_costs",
     "replay",
+    "scaled_stop",
     "swap_from",
 ]

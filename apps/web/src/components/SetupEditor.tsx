@@ -3,18 +3,26 @@ import { useState } from 'react'
 
 import { useEditLiveSetup, useStrategy } from '../api/hooks'
 import type { LiveSetup } from '../api/types'
+import { Confirm } from './Confirm'
 import { ParamField } from './ParamField'
 
 type Params = Record<string, unknown>
 
 /**
  * Edit a followed setup's parameters (09/10). Saving makes a **new version** of its strategy —
- * the signals already posted keep theirs — and the setup's sessions restart on it.
+ * the signals already posted keep theirs — and the setup's sessions restart on it (#453), on every
+ * asset it follows: its armed signals are cancelled on the channel, those in a trade followed by
+ * price. So saving says that first, with the count, and waits for a "yes".
  *
  * ⚠️ The fields are read from the schema (`setupSpec`), never listed here: a parameter added to a
  * setup in Python appears in this form with no code changed, with its own bounds and its own "off".
  */
-export function SetupEditor(props: { setup: LiveSetup; onClose: () => void }): React.JSX.Element {
+export function SetupEditor(props: {
+  setup: LiveSetup
+  /** What saving does to its signals under way, as the caller counted them on every asset. */
+  price: string
+  onClose: () => void
+}): React.JSX.Element {
   const strategy = useStrategy(props.setup.strategy_id)
   const definition = strategy.data?.definition
   if (definition === undefined) {
@@ -41,6 +49,7 @@ export function SetupEditor(props: { setup: LiveSetup; onClose: () => void }): R
       definition={definition}
       params={setup.params ?? {}}
       specParams={spec.params}
+      price={props.price}
       onClose={props.onClose}
     />
   )
@@ -56,10 +65,12 @@ function EditorForm(props: {
   definition: Params
   params: Params
   specParams: readonly SchemaParam[]
+  price: string
   onClose: () => void
 }): React.JSX.Element {
   const [params, setParams] = useState<Params>(props.params)
   const [rr, setRr] = useState<number | null>(rrOf(props.definition))
+  const [asking, setAsking] = useState(false)
   const edit = useEditLiveSetup()
 
   const save = (): void => {
@@ -87,7 +98,7 @@ function EditorForm(props: {
       className="space-y-3 rounded border border-slate-800 p-3"
       onSubmit={(event) => {
         event.preventDefault()
-        save()
+        setAsking(true)
       }}
     >
       <p className="text-xs text-slate-400">
@@ -113,14 +124,27 @@ function EditorForm(props: {
           }}
         />
       </div>
+      {asking && (
+        <Confirm
+          reach="Its session restarts on the new version on every asset it follows; the other setups of those markets are not touched."
+          price={props.price}
+          yes={edit.isPending ? 'Saving…' : 'Yes, save the new version'}
+          keep="Keep editing"
+          busy={edit.isPending}
+          onYes={save}
+          onKeep={() => {
+            setAsking(false)
+          }}
+        />
+      )}
       {edit.error && <p className="text-sm text-red-400">{edit.error.message}</p>}
       <div className="flex gap-2">
         <button
           type="submit"
-          disabled={edit.isPending}
+          disabled={edit.isPending || asking}
           className="rounded bg-sky-700 px-3 py-1 text-sm text-white hover:bg-sky-600 disabled:opacity-50"
         >
-          {edit.isPending ? 'Saving…' : 'Save as a new version'}
+          Save as a new version
         </button>
         <button
           type="button"

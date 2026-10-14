@@ -25,6 +25,9 @@ const definition = {
 
 const setup = { id: 's1', strategy_id: 'st1' } as LiveSetup
 
+const price =
+  '1 armed signal will be cancelled on the channel; 1 in a trade will be followed by price.'
+
 function mount(doc: Record<string, unknown> = definition): ReturnType<typeof vi.fn> {
   const mutate = vi.fn()
   vi.mocked(useStrategy).mockReturnValue({ data: { definition: doc } } as never)
@@ -33,8 +36,14 @@ function mount(doc: Record<string, unknown> = definition): ReturnType<typeof vi.
     isPending: false,
     error: null,
   } as never)
-  renderWithProviders(<SetupEditor setup={setup} onClose={vi.fn()} />)
+  renderWithProviders(<SetupEditor setup={setup} price={price} onClose={vi.fn()} />)
   return mutate
+}
+
+/** Save, and say yes to what saving does. */
+function save(): void {
+  fireEvent.click(screen.getByRole('button', { name: 'Save as a new version' }))
+  fireEvent.click(screen.getByRole('button', { name: 'Yes, save the new version' }))
 }
 
 function sent(mutate: ReturnType<typeof vi.fn>): Record<string, unknown> {
@@ -57,7 +66,7 @@ describe('SetupEditor', () => {
 
     fireEvent.change(screen.getByLabelText('side'), { target: { value: 'both' } })
     fireEvent.click(screen.getByLabelText('take profit (R) off'))
-    fireEvent.click(screen.getByRole('button', { name: 'Save as a new version' }))
+    save()
 
     const doc = sent(mutate)
     const params = (doc.setup as { params: Record<string, unknown> }).params
@@ -67,6 +76,23 @@ describe('SetupEditor', () => {
     expect(doc.risk).toEqual(definition.risk)
   })
 
+  it('says what saving does to the signals under way before it saves', () => {
+    const mutate = mount()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save as a new version' }))
+    expect(
+      screen.getByText(/Its session restarts on the new version on every asset/),
+    ).toBeInTheDocument()
+    expect(screen.getByText(price)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Save as a new version' })).toBeDisabled()
+    fireEvent.click(screen.getByRole('button', { name: 'Keep editing' }))
+    expect(screen.queryByText(price)).not.toBeInTheDocument()
+    expect(mutate).not.toHaveBeenCalled()
+
+    save()
+    expect(mutate).toHaveBeenCalledTimes(1)
+  })
+
   it('turns a parameter that may be off back on, at its default', () => {
     const mutate = mount({
       ...definition,
@@ -74,7 +100,7 @@ describe('SetupEditor', () => {
     })
 
     fireEvent.click(screen.getByLabelText('take profit (R) off'))
-    fireEvent.click(screen.getByRole('button', { name: 'Save as a new version' }))
+    save()
 
     const target = (sent(mutate).exit as { take_profit: { params: { rr: number } } }).take_profit
     expect(target.params.rr).toBeGreaterThan(0)
@@ -89,7 +115,7 @@ describe('SetupEditor', () => {
     fireEvent.change(screen.getByLabelText('htf'), { target: { value: '' } })
     fireEvent.change(screen.getByLabelText('stop_buffer'), { target: { value: '0.3' } })
     fireEvent.click(screen.getByLabelText('volume_filter'))
-    fireEvent.click(screen.getByRole('button', { name: 'Save as a new version' }))
+    save()
 
     const params = (sent(mutate).setup as { params: Record<string, unknown> }).params
     expect(params.htf).toBeNull()
@@ -100,7 +126,7 @@ describe('SetupEditor', () => {
   it('waits for the setup to load', () => {
     vi.mocked(useStrategy).mockReturnValue({ data: undefined } as never)
     vi.mocked(useEditLiveSetup).mockReturnValue({ mutate: vi.fn() } as never)
-    renderWithProviders(<SetupEditor setup={setup} onClose={vi.fn()} />)
+    renderWithProviders(<SetupEditor setup={setup} price={price} onClose={vi.fn()} />)
     expect(screen.getByText('Loading the setup…')).toBeInTheDocument()
   })
 

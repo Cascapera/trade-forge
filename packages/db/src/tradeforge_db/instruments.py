@@ -51,6 +51,9 @@ class CatalogueEntry:
     broker_symbol: str | None = None
     """The broker's own ticker when it is not `spec.symbol`, the internal name (ADR-0032):
     `WIN$` at XP is `WIN` here, because a `$` is no name for a folder or a URL."""
+    price_step: Decimal | None = None
+    """The step a price is quoted in at the venue when it is not the series' tick (14/10): 5 for
+    XP's `WIN$`, whose tick is 1. `None` — the tick is the step."""
 
 
 class ClockChangedError(ValueError):
@@ -178,6 +181,7 @@ def upsert_instruments(
             "default_spread_points": (
                 entry.default_spread_points if isinstance(entry, CatalogueEntry) else None
             ),
+            "price_step": entry.price_step if isinstance(entry, CatalogueEntry) else None,
             **(
                 {}
                 if broker_id is None
@@ -217,6 +221,8 @@ def upsert_instruments(
             "default_spread_points": func.coalesce(
                 statement.excluded.default_spread_points, Instrument.default_spread_points
             ),
+            # The same rule: a source that cannot say (any but MT5) keeps what one that could said.
+            "price_step": func.coalesce(statement.excluded.price_step, Instrument.price_step),
             **(
                 {}
                 if broker_id is None

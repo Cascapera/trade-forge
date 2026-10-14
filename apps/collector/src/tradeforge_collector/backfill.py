@@ -21,7 +21,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from tradeforge_collector.gaps import Gap, find_gaps
-from tradeforge_collector.source import MarketDataSource
+from tradeforge_collector.source import MarketDataSource, price_step_of
 from tradeforge_collector.splits import Split, adjust, refuse_unless_the_bars_split, straddled
 from tradeforge_collector.storage import write_candles
 from tradeforge_collector.timeframes import step
@@ -56,6 +56,8 @@ class BackfillReport:
     # instrument is free to trade. Beside the spec rather than inside it, because the engine
     # prices a move without consulting a spread: costs are plugged into a run (ADR-07).
     spread_points: Decimal | None = None
+    price_step: Decimal | None = None
+    """The venue's step when the series' tick is finer (`MT5Source.price_step`, 14/10)."""
 
 
 def backfill(  # noqa: PLR0913 — all keyword-only, and each one names a real axis of the job
@@ -126,6 +128,7 @@ def backfill(  # noqa: PLR0913 — all keyword-only, and each one names a real a
         parquet_path=parquet_path,
         gaps=gaps,
         spread_points=source.spread_points(symbol),
+        price_step=price_step_of(source, symbol),
     )
 
     if session is not None:
@@ -154,7 +157,10 @@ def adjusted(
 
 def _catalogue(session: Session, report: BackfillReport) -> None:
     """Record the instrument and the coverage. Both upserts — see `tradeforge_db`."""
-    upsert_instruments(session, (CatalogueEntry(report.instrument, report.spread_points),))
+    upsert_instruments(
+        session,
+        (CatalogueEntry(report.instrument, report.spread_points, price_step=report.price_step),),
+    )
 
     instrument_id = session.execute(
         select(Instrument.id).where(Instrument.symbol == report.instrument.symbol)

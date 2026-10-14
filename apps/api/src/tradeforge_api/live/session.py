@@ -197,6 +197,9 @@ class Prepared:
     strategy: CompiledStrategy
     risk: PercentRiskManager
     timeframe: dt.timedelta
+    price_step: Decimal | None = None
+    """The venue's step when it is not the series' tick (`Instrument.price_step`): a signal's
+    levels are put on it, as nobody can type 210 072 for a contract that trades in fives."""
 
 
 def prepare(
@@ -238,6 +241,7 @@ def prepare(
         spec = instrument_spec(instrument)
         symbol = instrument.symbol
         definition = dict(strategy.definition)
+        price_step = instrument.price_step
 
     # ⚠️ **Asked here for the same reason the promotion gate above is: it is knowable now.** A
     # document carries its own `timeframe` and this plan carries another, and a setup builds its
@@ -258,6 +262,7 @@ def prepare(
         strategy=compile_strategy(definition, server_offset=spec.server_offset),
         risk=PercentRiskManager(percent=risk_percent(definition)),
         timeframe=step(plan.timeframe),
+        price_step=price_step,
     )
 
 
@@ -488,6 +493,7 @@ class SessionLife:
             take_profit_rr=take_profit_rr(self.prepared.definition),
             signals=self._signals,
             recent=tuple(recent),
+            price_step=self.prepared.price_step,
         )
 
         # ⚠️ **Written before the hand-over, not after**, and in live that is the whole point of
@@ -690,6 +696,7 @@ def _broker_for(  # noqa: PLR0913 — the plan, the seam, and the four facts a p
     take_profit_rr: Decimal | None,
     signals: NumberedSink | None = None,
     recent: Sequence[Candle] = (),
+    price_step: Decimal | None = None,
 ) -> Broker:
     """The broker the session itself will trade through. Paper is local; live is the venue.
 
@@ -735,6 +742,7 @@ def _broker_for(  # noqa: PLR0913 — the plan, the seam, and the four facts a p
             no_target_r=plan.no_target_r,
             picture=render_signal_png,
             recent=recent,
+            price_step=price_step,
         )
     if venue is None:
         # ⚠️ Unreachable through `run_session`, which refuses before the warm-up — and kept, on

@@ -39,6 +39,7 @@ class SpyJournal:
     splits: tuple[Split, ...] = ()
     catalogued_coverage: Coverage | None = None
     catalogued_spread: Decimal | None = None
+    catalogued_step: Decimal | None = None
     finished_candles: int | None = None
     finished_gaps: int | None = None
     failure: str | None = None
@@ -58,10 +59,17 @@ class SpyJournal:
     def splits_for(self, symbol: str) -> tuple[Split, ...]:
         return self.splits
 
-    def catalogued(self, spec: InstrumentSpec, spread: Decimal | None, on_disk: Coverage) -> None:
+    def catalogued(
+        self,
+        spec: InstrumentSpec,
+        spread: Decimal | None,
+        on_disk: Coverage,
+        price_step: Decimal | None = None,
+    ) -> None:
         self.entries.append(f"catalogued {spec.symbol}")
         self.catalogued_coverage = on_disk
         self.catalogued_spread = spread
+        self.catalogued_step = price_step
 
     def failed(self, reason: str) -> None:
         self.entries.append("failed")
@@ -650,3 +658,32 @@ def test_the_comparison_is_made_at_the_newest_bars_on_disk_whatever_was_asked(
     first_start, first_end = source.asked[0]
     assert first_end == dt.datetime(2024, 12, 31, tzinfo=dt.UTC)
     assert first_end - first_start == step("H1") * 200
+
+
+class SteppedSource(Anchored):
+    """A continuous future whose venue trades in fives (`MT5Source.price_step`, 14/10)."""
+
+    def price_step(self, symbol: str) -> Decimal | None:
+        return Decimal(5)
+
+
+def test_the_venues_step_reaches_the_catalogue(tmp_path: Path) -> None:
+    spy = SpyJournal()
+
+    run_collection(
+        SteppedSource(), spy, root=tmp_path, symbol="EURUSD", timeframe="H1",
+        date_from=utc(2024), date_to=utc(2024, 12, 31),
+    )  # fmt: skip
+
+    assert spy.catalogued_step == Decimal(5)
+
+
+def test_a_source_that_cannot_say_catalogues_no_step(tmp_path: Path) -> None:
+    spy = SpyJournal()
+
+    run_collection(
+        Anchored(), spy, root=tmp_path, symbol="EURUSD", timeframe="H1",
+        date_from=utc(2024), date_to=utc(2024, 12, 31),
+    )  # fmt: skip
+
+    assert spy.catalogued_step is None

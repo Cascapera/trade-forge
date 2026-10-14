@@ -3,7 +3,13 @@
 import datetime as dt
 from decimal import Decimal
 
-from tradeforge_api.live.signals import RedisSignalSink, SignalBroker, SignalEvent, SignalKindOf
+from tradeforge_api.live.signals import (
+    RedisSignalSink,
+    SignalBroker,
+    SignalEvent,
+    SignalKindOf,
+    on_the_step,
+)
 from tradeforge_engine.backtest_broker import BacktestBroker
 from tradeforge_engine.domain import (
     AssetClass,
@@ -270,3 +276,95 @@ def test_a_breakeven_reaches_the_stream_with_where_the_stop_went() -> None:
     assert (entry["stop"], entry["moved_stop"]) == ("900", "1000")
     assert "target" not in entry, "an empty value is left out"
     assert streams.images[entry["image_key"]] == b"png"
+
+
+# --------------------------------------------------------------------------------------------
+# The venue's step (14/10): XP's WIN$ is adjusted at each roll, its contracts trade in fives
+# --------------------------------------------------------------------------------------------
+
+
+def an_event(  # noqa: PLR0913 — one per level a signal carries
+    side: Side,
+    *,
+    entry: Decimal,
+    stop: Decimal | None = None,
+    target: Decimal | None = None,
+    moved_stop: Decimal | None = None,
+    exit_price: Decimal | None = None,
+) -> SignalEvent:
+    return SignalEvent(
+        kind=SignalKindOf.ARMED,
+        number=38,
+        symbol="WIN",
+        side=side,
+        time=T0,
+        entry=entry,
+        stop=stop,
+        target=target,
+        moved_stop=moved_stop,
+        exit_price=exit_price,
+    )
+
+
+def test_a_long_on_the_step_never_risks_less_nor_aims_farther() -> None:
+    """Signal #38: a buy limit at 210 270, stop 210 072, target 211 260."""
+    event = an_event(
+        Side.LONG,
+        entry=Decimal(210_272),
+        stop=Decimal(210_072),
+        target=Decimal(211_262),
+        moved_stop=Decimal(210_274),
+        exit_price=Decimal(210_273),
+    )
+
+    stepped = on_the_step(event, Decimal(5))
+
+    assert stepped.entry == Decimal(210_270), "the nearest step"
+    assert stepped.stop == Decimal(210_070), "down, away from the trade: not a tighter stop"
+    assert stepped.target == Decimal(211_260), "down, toward the trade: not a farther target"
+    assert stepped.moved_stop == Decimal(210_270)
+    assert stepped.exit_price == Decimal(210_275)
+
+
+def test_a_short_rounds_its_stop_and_target_up() -> None:
+    event = an_event(
+        Side.SHORT, entry=Decimal("5052.2"), stop=Decimal("5061.1"), target=Decimal("5008.2")
+    )
+
+    stepped = on_the_step(event, Decimal("0.5"))
+
+    assert (stepped.entry, stepped.stop, stepped.target) == (
+        Decimal("5052.0"),
+        Decimal("5061.5"),
+        Decimal("5008.5"),
+    )
+
+
+def test_a_level_already_on_the_step_and_an_absent_one_stay_as_they_are() -> None:
+    event = an_event(Side.LONG, entry=Decimal(210_270), stop=Decimal(210_070), target=None)
+
+    stepped = on_the_step(event, Decimal(5))
+
+    assert (stepped.entry, stepped.stop, stepped.target) == (
+        Decimal(210_270),
+        Decimal(210_070),
+        None,
+    )
+
+
+def test_a_signal_broker_with_a_step_posts_every_level_on_it() -> None:
+    sink = Sink()
+    inner = BacktestBroker(instrument=WIN, initial_capital=Decimal(100_000))
+    signals = SignalBroker(
+        inner,
+        sink,
+        number=sink.number,
+        take_profit_rr=None,
+        no_target_r=Decimal(5),
+        price_step=Decimal(5),
+    )
+
+    signals.submit(armed_long(stop_price=Decimal(1002), stop_loss=Decimal(903)))
+
+    armed = sink.events[0]
+    assert (armed.entry, armed.stop) == (Decimal(1000), Decimal(900))

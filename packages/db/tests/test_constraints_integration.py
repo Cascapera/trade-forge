@@ -665,6 +665,25 @@ def test_a_measured_spread_survives_a_later_backfill_that_knows_nothing(
     )
 
 
+def test_a_venues_step_survives_a_later_backfill_that_knows_nothing(session: Session) -> None:
+    """The same rule as the spread (14/10): only MT5 can measure a step, and a collection from
+    any other source must not erase it."""
+    spec = INSTRUMENT_SEEDS[0]
+    upsert_instruments(session, (CatalogueEntry(spec, price_step=Decimal(5)),))
+    session.commit()
+
+    upsert_instruments(session, (spec,))
+    session.commit()
+
+    assert session.query(Instrument.price_step).scalar() == Decimal(5)
+
+
+def test_a_step_must_be_positive(session: Session) -> None:
+    spec = INSTRUMENT_SEEDS[0]
+    with pytest.raises(IntegrityError, match="price_step_positive"):
+        upsert_instruments(session, (CatalogueEntry(spec, price_step=Decimal(0)),))
+
+
 def test_a_zero_spread_is_allowed_but_a_negative_one_is_refused(session: Session) -> None:
     """Zero is a real quote on some instruments; negative would pay you for trading."""
     spec = INSTRUMENT_SEEDS[0]

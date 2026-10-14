@@ -25,7 +25,7 @@ import uuid
 from collections import deque
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
-from decimal import Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, Decimal
 from enum import StrEnum
 from typing import Protocol
 
@@ -172,6 +172,34 @@ class _Book:
     trades_seen: int = 0
 
 
+def on_the_step(event: SignalEvent, step: Decimal) -> SignalEvent:
+    """`event` with its levels on `step` (14/10): the venue's, when the series' tick is finer.
+
+    XP's `WIN$` is adjusted by a ratio at each roll, so a zone left by an older bar sits on any
+    point — signal #38's stop was 210 072, and the contract trades in fives. Every level is put
+    where it can be typed, and **the risk is never made smaller by it**: the entry and the exit
+    go to the nearest step; a stop goes away from the trade (down for a long, up for a short)
+    and a target toward it, so the stop a reader types is no tighter and the target no farther
+    than the setup's. The R reported stays the engine's, on its own prices."""
+
+    def nearest(price: Decimal | None) -> Decimal | None:
+        return None if price is None else (price / step).quantize(Decimal(1), ROUND_HALF_UP) * step
+
+    rounding = ROUND_FLOOR if event.side is Side.LONG else ROUND_CEILING
+
+    def against(price: Decimal | None) -> Decimal | None:
+        return None if price is None else (price / step).quantize(Decimal(1), rounding) * step
+
+    return dataclasses.replace(
+        event,
+        entry=nearest(event.entry),
+        stop=against(event.stop),
+        moved_stop=against(event.moved_stop),
+        target=against(event.target),
+        exit_price=nearest(event.exit_price),
+    )
+
+
 class SignalBroker:
     """A `Broker` that is `inner` exactly, and reports the four moments to `sink`."""
 
@@ -185,8 +213,10 @@ class SignalBroker:
         no_target_r: Decimal,
         picture: Picture | None = None,
         recent: Iterable[Candle] = (),
+        price_step: Decimal | None = None,
     ) -> None:
         self._inner = inner
+        self._step = price_step
         self._sink = sink
         self._number = number
         self._rr = take_profit_rr
@@ -308,7 +338,12 @@ class SignalBroker:
         """Hand the event on, with its picture when one can be drawn.
 
         ⚠️ A picture that fails is logged and the event goes without it: a signal posted as text
-        beats a session that stopped over a chart."""
+        beats a session that stopped over a chart.
+
+        The levels are put on the venue's step first (`on_the_step`), so the picture, the
+        message and the row all say the same prices."""
+        if self._step is not None:
+            event = on_the_step(event, self._step)
         if self._picture is not None and event.kind is not SignalKindOf.CANCELLED:
             bars = (
                 snapshot.bars

@@ -182,7 +182,13 @@ class CollectionJournal(Protocol):
         """The share splits recorded for `symbol`, which every slice is written adjusted for."""
         ...
 
-    def catalogued(self, spec: InstrumentSpec, spread: Decimal | None, on_disk: Coverage) -> None:
+    def catalogued(
+        self,
+        spec: InstrumentSpec,
+        spread: Decimal | None,
+        on_disk: Coverage,
+        price_step: Decimal | None = None,
+    ) -> None:
         """The instrument and what the files now hold, for the rest of the system to find."""
         ...
 
@@ -316,7 +322,7 @@ def _collect(  # noqa: PLR0913 — keyword-only; the same axes as `run_collectio
         journal.failed(f"{symbol} {timeframe} was written but nothing is on disk")
         return outcome
 
-    journal.catalogued(latest.instrument, latest.spread_points, on_disk)
+    journal.catalogued(latest.instrument, latest.spread_points, on_disk, latest.price_step)
     journal.finished(
         candles=on_disk.candle_count,
         gaps=_count_gaps(root, symbol, timeframe, on_disk.date_from, on_disk.date_to),
@@ -496,10 +502,20 @@ class DatabaseJournal:
     def splits_for(self, symbol: str) -> tuple[Split, ...]:
         return tuple(map(Split.of, splits_of(self._session, symbol)))
 
-    def catalogued(self, spec: InstrumentSpec, spread: Decimal | None, on_disk: Coverage) -> None:
+    def catalogued(
+        self,
+        spec: InstrumentSpec,
+        spread: Decimal | None,
+        on_disk: Coverage,
+        price_step: Decimal | None = None,
+    ) -> None:
         upsert_instruments(
             self._session,
-            (CatalogueEntry(spec, spread, broker_symbol=self._broker_symbol),),
+            (
+                CatalogueEntry(
+                    spec, spread, broker_symbol=self._broker_symbol, price_step=price_step
+                ),
+            ),
             broker_id=self._broker_id,
         )
         instrument_id = self._session.execute(

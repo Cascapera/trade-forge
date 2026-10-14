@@ -178,6 +178,18 @@ def test_the_stream_remembers_where_the_last_process_got_to(client: Redis) -> No
     assert publisher.last_published(SUBSCRIPTION) == candle(10).time
 
 
+def test_the_last_bars_come_back_oldest_first_as_they_were_published(client: Redis) -> None:
+    """What the live loop remembers of a pair it watches again (14/10): the stream's own bars, to
+    read again from the broker and catch one that rewrote its past."""
+    publisher = RedisCandlePublisher(client)
+    for minute in (5, 10, 15, 20):
+        publisher.publish(SUBSCRIPTION, candle(minute))
+
+    assert publisher.recent(SUBSCRIPTION, 3) == [candle(10), candle(15), candle(20)]
+    assert publisher.recent(SUBSCRIPTION, 10) == [candle(m) for m in (5, 10, 15, 20)]
+    assert publisher.recent(Subscription("NOTHING", "M5"), 3) == []
+
+
 def test_the_last_bar_is_read_from_the_field_and_not_rebuilt_from_the_id(client: Redis) -> None:
     """The id is a transport detail; the `time` field is the candle's own statement.
 

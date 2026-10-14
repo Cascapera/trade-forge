@@ -54,8 +54,15 @@ from tradeforge_db.splits import record_split, splits_of, stock_markets
 from tradeforge_engine.domain import AssetClass
 
 if TYPE_CHECKING:
+    import uuid
+
     from arq.typing import WorkerSettingsType
+    from redis import Redis
     from sqlalchemy.orm import Session, sessionmaker
+
+    from tradeforge_collector.publisher import RedisCandlePublisher
+    from tradeforge_collector.rescale import Comparison
+    from tradeforge_engine.domain import Candle
 
 DEFAULT_DATA_DIR = Path("data/ohlcv")
 
@@ -429,6 +436,26 @@ def _live(args: argparse.Namespace) -> int:
     return 0
 
 
+def _remembered(
+    root: Path, publisher: "RedisCandlePublisher", pair: Subscription
+) -> "list[Candle]":
+    """What the live loop remembers of a pair it starts watching (14/10): the newest of the
+    stream's last bars and the disk's — the disk's after the series was collected again in a new
+    scale, the stream's when the machine was off and the disk is behind it."""
+    from tradeforge_collector.live import MEMORY  # noqa: PLC0415
+    from tradeforge_collector.storage import coverage  # noqa: PLC0415 — pyarrow, only when live
+
+    streamed = publisher.recent(pair, MEMORY)
+    stored = coverage(root, pair.symbol, pair.timeframe)
+    if stored is None or (streamed and streamed[-1].time > stored.date_to):
+        return streamed
+    reach = TIMEFRAME_STEP[pair.timeframe] * MEMORY * 10  # past a weekend or a holiday's gap
+    tail = read_candles(
+        root, pair.symbol, pair.timeframe, start=stored.date_to - reach, end=stored.date_to
+    )
+    return tail[-MEMORY:]
+
+
 def _stored_until(root: Path, pair: Subscription) -> dt.datetime | None:
     """The last bar collected for this pair, or `None` when nothing was."""
     from tradeforge_collector.storage import coverage  # noqa: PLC0415 — pyarrow, only when live
@@ -457,6 +484,7 @@ def _live_broker(args: argparse.Namespace) -> int:
     with session_scope(factory) as session:
         broker = broker_by_slug(session, args.broker)
         slug, path, offset = broker.slug, broker.terminal_path, broker.server_offset
+        broker_id = broker.id
 
     terminal = MT5Source(server_offset=offset, path=path).connect()
     tickers: dict[str, str] = {}
@@ -481,6 +509,30 @@ def _live_broker(args: argparse.Namespace) -> int:
             asked.append(pair)
         return asked
 
+    def on_rescale(pair: Subscription, comparison: "Comparison") -> bool:
+        """The broker rewrote the series (14/10, a roll of `WIN$`): collect every timeframe of it
+        on disk again, whole and through this terminal, then have its sessions restarted on it."""
+        log.warning(
+            "%s: the broker's bars are %.4f times the ones published — collecting the series "
+            "again and restarting its sessions",
+            pair.symbol,
+            comparison.ratio,
+        )
+        try:
+            _collect_whole(
+                terminal,
+                factory,
+                root=args.data_dir,
+                symbol=pair.symbol,
+                ticker=tickers.get(pair.symbol, pair.symbol),
+                broker_id=broker_id,
+            )
+            _restart_markets(client, factory, slug, pair.symbol)
+        except Exception:
+            log.exception("%s: the rescaled series could not be collected again", pair.symbol)
+            return False
+        return True
+
     log.info("watching what is asked of %s, polling every %.0fs", slug, args.every)
     try:
         run_on_demand(
@@ -491,6 +543,8 @@ def _live_broker(args: argparse.Namespace) -> int:
             polls=1 if args.once else None,
             max_backfill=args.max_backfill,
             on_disk=lambda pair: _stored_until(args.data_dir, pair),
+            tail=lambda pair: _remembered(args.data_dir, publisher, pair),
+            on_rescale=on_rescale,
         )
     except KeyboardInterrupt:
         log.info("stopped")
@@ -499,6 +553,89 @@ def _live_broker(args: argparse.Namespace) -> int:
         terminal.close()
         engine.dispose()
     return 0
+
+
+def _collect_whole(  # noqa: PLR0913 — keyword-only; the series, where it is, and whose it is
+    terminal: MarketDataSource,
+    factory: "sessionmaker[Session]",
+    *,
+    root: Path,
+    symbol: str,
+    ticker: str,
+    broker_id: "uuid.UUID",
+) -> None:
+    """Collect every timeframe of `symbol` on disk again, from its first bar to now, as rows the
+    collections screen shows — through the live loop's own terminal, which a job of the agent
+    would attach and detach under it (`_live_broker`)."""
+    from tradeforge_collector.collect import (  # noqa: PLC0415 — pyarrow, only when live
+        DatabaseJournal,
+        run_collection,
+        year_slices,
+    )
+    from tradeforge_collector.source import TickerSource  # noqa: PLC0415
+    from tradeforge_collector.storage import coverage, symbol_path  # noqa: PLC0415
+    from tradeforge_db.collections import create_collection  # noqa: PLC0415
+
+    asked = terminal if ticker == symbol else TickerSource(terminal, internal=symbol, ticker=ticker)
+    now = dt.datetime.now(tz=dt.UTC)
+    for folder in sorted(symbol_path(root, symbol).glob("timeframe=*")):
+        timeframe = folder.name.removeprefix("timeframe=")
+        stored = coverage(root, symbol, timeframe)
+        if stored is None:
+            continue
+        session = factory()
+        try:
+            row = create_collection(
+                session,
+                symbol=symbol,
+                broker_symbol=None if ticker == symbol else ticker,
+                timeframe=timeframe,
+                date_from=stored.date_from,
+                date_to=now,
+                asset_class=None,
+                years_total=len(year_slices(stored.date_from, now)),
+            )
+            session.commit()
+            run_collection(
+                asked,
+                DatabaseJournal(
+                    session,
+                    row.id,
+                    root=root,
+                    timeframe=timeframe,
+                    broker_id=broker_id,
+                    broker_symbol=ticker,
+                ),
+                root=root,
+                symbol=symbol,
+                timeframe=timeframe,
+                date_from=stored.date_from,
+                date_to=now,
+            )
+        finally:
+            session.close()
+
+
+def _restart_markets(
+    client: "Redis", factory: "sessionmaker[Session]", slug: str, symbol: str
+) -> None:
+    """Ask the supervisor to restart every market of `symbol` this broker is watched for."""
+    from sqlalchemy import select  # noqa: PLC0415
+
+    from tradeforge_collector.demand import wanted  # noqa: PLC0415
+    from tradeforge_collector.restarts import request_restart  # noqa: PLC0415
+    from tradeforge_db.models import Instrument  # noqa: PLC0415
+
+    with session_scope(factory) as session:
+        instrument_id = session.execute(
+            select(Instrument.id).where(Instrument.symbol == symbol)
+        ).scalar_one()
+    now = dt.datetime.now(tz=dt.UTC)
+    for timeframe in sorted(
+        {pair.timeframe for pair in wanted(client, slug) if pair.symbol == symbol}
+    ):
+        request_restart(client, instrument_id, timeframe, at=now)
+        logging.getLogger(__name__).info("%s %s: restart asked for", symbol, timeframe)
 
 
 # Timeframes whose live stamp is known to be wrong, mapped to the sentence that says why.

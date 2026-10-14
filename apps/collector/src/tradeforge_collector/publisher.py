@@ -142,3 +142,12 @@ class RedisCandlePublisher:
             return None
         _id, fields = entries[0]
         return dt.datetime.fromisoformat(fields["time"])
+
+    def recent(self, subscription: Subscription, count: int) -> list[Candle]:
+        """The last `count` bars on this stream, oldest first — what the live loop remembers
+        having published when it starts watching a pair again (14/10, `live.MEMORY`)."""
+        entries = cast(
+            "list[tuple[str, dict[str, str]]]",
+            self._client.xrevrange(stream_name(subscription), count=count),
+        )
+        return [candle_from_fields(fields) for _id, fields in reversed(entries)]

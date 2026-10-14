@@ -303,7 +303,7 @@ class TestTheFloor:
         nvda = Market(tick_size=0.01, tick_value=0.01, splits=splits)
         entries = [dt.datetime(year, 1, 2, tzinfo=UTC) for year in (2020, 2022, 2025)]
 
-        ticks = nvda.ticks_of_the_day(np.asarray([_us(when) for when in entries]))
+        ticks = nvda.ticks_of_the_day(np.asarray([_us(when) for when in entries], dtype=np.int64))
 
         assert ticks.tolist() == pytest.approx([0.01 / 40, 0.01 / 10, 0.01])
 

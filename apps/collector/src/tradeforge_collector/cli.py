@@ -39,6 +39,7 @@ from tradeforge_collector.live import (
 from tradeforge_collector.source import MarketDataSource
 from tradeforge_collector.splits import (
     Split,
+    already_applied,
     bring_up_to_date,
     find_candidates,
     observed_gap,
@@ -623,7 +624,13 @@ def _detect_splits(factory: "sessionmaker[Session]", data_dir: Path, symbols: Se
 
 
 def _refuse_a_split_the_bars_do_not_show(data_dir: Path, symbol: str, split: Split) -> None:
-    """Only a gap on disk shows the stored bars are still raw on that day (see `splits.py`)."""
+    """Only a gap on disk shows the stored bars are still raw on that day (see `splits.py`).
+
+    Unless the files already name this split in their stamp: then they were adjusted for it and
+    only the record was missing, and the gap they no longer show is the proof, not a refusal.
+    """
+    if already_applied(data_dir, symbol, split):
+        return
     daily = read_candles(data_dir, symbol, "D1")
     if observed_gap(daily, split.effective_at, "D1") is None:
         raise ValueError(

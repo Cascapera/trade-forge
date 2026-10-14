@@ -44,6 +44,7 @@ __all__ = [
     "Rewritten",
     "Split",
     "adjust",
+    "already_applied",
     "applied_splits",
     "bring_up_to_date",
     "find_candidates",
@@ -62,7 +63,8 @@ class Split:
     """One split, as the bars see it: the instant the new price starts, and the ratio."""
 
     effective_at: dt.datetime
-    """UTC. Every bar opening before it is adjusted; the first one at or after it is not."""
+    """UTC. A bar that ends by then is scaled, one that starts at or after it is not, and one
+    it falls inside is rebuilt (`adjust`)."""
     shares_after: int
     shares_before: int
     key: str
@@ -169,7 +171,9 @@ def _scaled(candle: Candle, factor: Fraction) -> Candle:
 
     # ⚠️ The spread is an integer number of points, so a small one rounds: 3 points ÷ 20 is 0.15,
     # stored as 0. Half up rather than to even, so 0.5 point still costs one. The error is at most
-    # half a point either way, against a price the split made twenty times smaller.
+    # half a point either way, against a price the split made twenty times smaller — and, since it
+    # rounds at every step, a file adjusted one split at a time can sit one point off a fresh
+    # download adjusted for both (NVDA's 4:1 then 10:1). Prices keep ten places and do not drift.
     spread = (Decimal(candle.spread) * factor.numerator / factor.denominator).quantize(
         Decimal(1), rounding=ROUND_HALF_UP
     )
@@ -242,6 +246,17 @@ def refuse_unless_the_bars_split(
 # --------------------------------------------------------------------------- #
 # Files: what each one has been adjusted for, and bringing them up to date      #
 # --------------------------------------------------------------------------- #
+
+
+def already_applied(root: Path, symbol: str, split: Split) -> bool:
+    """Do the stored daily bars already carry this split in their stamp?
+
+    True when the files were adjusted for it and the record of it was lost — a database restored
+    from an older backup. Recording it again is then right, and checking the bars for its gap is
+    wrong: they no longer have one.
+    """
+    directory = symbol_path(root, symbol) / "timeframe=D1"
+    return any(split.key in applied_splits(year) for year in directory.glob("year=*"))
 
 
 def applied_splits(year_directory: Path) -> frozenset[str]:
@@ -328,7 +343,7 @@ _SMALLEST_GAP = math.log(1.3)
 
 _TOLERANCE = 0.04
 """How far, as a log ratio (~4 %), a gap may sit from a clean ratio and still be called one.
-The eleven real splits found on 14/10 sat within 2.5 %; the nearest earnings gap, AMD's +42.7 %
+The ten real splits found on 14/10 sat within 2.5 %; the nearest earnings gap, AMD's +42.7 %
 against 3:2's 50 %, sits at 5 %."""
 
 

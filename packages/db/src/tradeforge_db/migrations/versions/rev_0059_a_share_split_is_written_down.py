@@ -4,7 +4,7 @@ Revision ID: 0059
 Revises: 0058
 Create Date: 2026-10-14
 
-Tradeview's US shares come unadjusted: eleven splits across nine of them left a gap a backtest
+Tradeview's US shares come unadjusted: ten splits across eight of them left a gap a backtest
 read as a crash. `stock_splits` records each one the collector adjusts the stored bars for —
 every bar before `effective_on` divided by `shares_after / shares_before`.
 """

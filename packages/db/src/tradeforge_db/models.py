@@ -604,7 +604,7 @@ class StockSplit(Base):
 
     ⚠️ **Why this exists (14/10).** Tradeview hands over US shares' history *unadjusted*: on
     AMZN's 20-for-1 of June 2022 its price falls from 2 446 to 125 between two bars, and a position
-    held across it took a -500 R "loss" that never happened. Eleven of these across nine shares
+    held across it took a -500 R "loss" that never happened. Ten of these across eight shares
     were found by the gap they leave. The collector divides every bar before `effective_on` by the
     ratio when it writes them, so every reader — the engine, the ML features, the charts, the
     workers on other machines — sees one continuous series and none of them has to know.

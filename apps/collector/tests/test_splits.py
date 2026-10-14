@@ -16,6 +16,7 @@ from tradeforge_collector.cli import _day, _ratio
 from tradeforge_collector.splits import (
     Split,
     adjust,
+    already_applied,
     applied_splits,
     bring_up_to_date,
     find_candidates,
@@ -272,6 +273,18 @@ def test_a_split_recorded_later_is_applied_alone(tmp_path: Path) -> None:
     closes = [candle.close for candle in read_candles(tmp_path, "AMZN", "D1")]
     assert closes == [Decimal("82.5"), Decimal("61.173"), Decimal("62.6"), Decimal("85.82")]
     assert applied_splits(year_directory(tmp_path, 2022)) == {"2022-06-06=20:1", "2022-12-01=2:1"}
+
+
+def test_files_adjusted_for_a_split_say_so_after_its_record_is_lost(tmp_path: Path) -> None:
+    """A database restored from an older backup forgets the split; the stamp does not. `splits add`
+    then records it without asking the bars for a gap they no longer have."""
+    two_years_raw(tmp_path)
+    assert not already_applied(tmp_path, "AMZN", AMZN)
+
+    bring_up_to_date(tmp_path, "AMZN", [AMZN])
+
+    assert already_applied(tmp_path, "AMZN", AMZN)
+    assert not already_applied(tmp_path, "AMZN", split(dt.date(2022, 12, 1), 2, 1))
 
 
 def test_files_that_disagree_inside_one_year_are_refused(tmp_path: Path) -> None:

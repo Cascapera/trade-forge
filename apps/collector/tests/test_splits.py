@@ -316,7 +316,7 @@ def test_a_download_across_a_split_is_written_adjusted_and_stamped(tmp_path: Pat
     )
 
     backfill(
-        source,  # type: ignore[arg-type]  # the protocol's other methods are never called here
+        source,
         root=tmp_path,
         symbol="EURUSD",
         timeframe="D1",
@@ -338,7 +338,7 @@ def test_a_download_the_broker_already_adjusted_is_refused_and_nothing_written(
 
     with pytest.raises(ValueError, match="Already adjusted by the broker"):
         backfill(
-            source,  # type: ignore[arg-type]
+            source,
             root=tmp_path,
             symbol="EURUSD",
             timeframe="D1",
@@ -511,7 +511,7 @@ def test_a_weekly_download_rebuilds_the_split_week_from_the_broker_s_days(tmp_pa
     )
 
     backfill(
-        source,  # type: ignore[arg-type]
+        source,
         root=tmp_path,
         symbol="EURUSD",
         timeframe="W1",

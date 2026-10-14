@@ -14,6 +14,15 @@ theirs. They come together again at the next start, or when somebody asks for a 
 market (the screen's button): its processes are asked to stop, and nothing of it is launched until
 the last of them is gone.
 
+**An edited setup is a session launched with something that is no longer so** — another version
+of its strategy, another no-target R — and a session cannot take that in flight: its strategy is
+built when it starts. It is asked to stop inside its process, like a setup switched off, and once
+it has left the edited one starts in a process of its own, like a setup added; the others of its
+market are not touched. Not before it has left: one setup on one market would otherwise post its
+signals twice, once per version. ⚠️ Until 13/10 nothing noticed an edit at all — a session was
+known by its (setup, instrument) alone, and CONTINUAÇÃO, edited from a 2R target to 5R, went on at
+2R on its three markets until somebody pressed restart.
+
 **Who is alive is counted per session, not per process.** A market process publishes the
 sessions it still carries (`market_state_key`); one that left without being asked has failed, and
 is launched again on its own after a pause that doubles up to five minutes. Its signals meanwhile
@@ -146,6 +155,8 @@ class _Process:
     sessions: dict[Pair, uuid.UUID]
     """The sessions it still carries, by pair: those that left are taken out as they leave."""
     launch: Launch
+    launched: Mapping[Pair, FollowedPair]
+    """What each session was launched with — its strategy version, its no-target R, its costs."""
     asked: set[Pair] = field(default_factory=set)
     """Sessions asked to stop: no longer wanted here, still running until they leave."""
 
@@ -224,12 +235,15 @@ class Fleet:
                         self._failed(pair, now)
 
     def _ask_the_gone(
-        self, wanted: Mapping[Pair, object], ask_to_stop: Callable[[uuid.UUID], None]
+        self, wanted: Mapping[Pair, FollowedPair], ask_to_stop: Callable[[uuid.UUID], None]
     ) -> None:
-        """Ask to stop every session no longer wanted, and every one of a market restarting."""
+        """Ask to stop every session no longer wanted, every one launched with what has since
+        been edited, and every one of a market restarting."""
         for process in self.processes.values():
             for pair, session_id in process.sessions.items():
-                gone = pair not in wanted or process.market in self.restarting
+                gone = (
+                    wanted.get(pair) != process.launched[pair] or process.market in self.restarting
+                )
                 if gone and pair not in process.asked:
                     ask_to_stop(session_id)  # raises when Redis is gone: asked again next round
                     process.asked.add(pair)
@@ -328,6 +342,7 @@ class Fleet:
     def _launch(self, market: MarketKey, members: Iterable[FollowedPair]) -> Launch:
         key = self.new_key(market)
         sessions: dict[Pair, uuid.UUID] = {}
+        launched: dict[Pair, FollowedPair] = {}
         argv = [
             self.python,
             "-m",
@@ -347,6 +362,7 @@ class Fleet:
             # signals would never be seen as orphans — nobody watching them.
             session_id = uuid.uuid4()
             sessions[(item.setup_id, item.instrument_id)] = session_id
+            launched[(item.setup_id, item.instrument_id)] = item
             spread = item.cost_model.get("spread_points")
             argv += [
                 "--member",
@@ -366,7 +382,7 @@ class Fleet:
             ]
         launch = Launch(key=key, market=market, sessions=sessions, argv=tuple(argv))
         self.processes[key] = _Process(
-            key=key, market=market, sessions=dict(sessions), launch=launch
+            key=key, market=market, sessions=dict(sessions), launch=launch, launched=launched
         )
         return launch
 

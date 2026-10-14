@@ -1,5 +1,6 @@
 """The supervisor's book of market processes (ADR-0033): what to launch, keep, ask to stop."""
 
+import dataclasses
 import datetime as dt
 import json
 import uuid
@@ -111,6 +112,43 @@ def test_a_setup_switched_off_is_asked_to_stop_inside_its_process_and_leaves_wit
     book.round([staying], heard=carrying(launch, staying_id))
     assert book.fleet.alive() == {staying_id}
     assert book.fleet.waiting() == {}
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        {"strategy_id": uuid.uuid4()},  # its parameters edited: a new version of its strategy
+        {"no_target_r": Decimal(3)},
+    ],
+    ids=["new-version", "no-target-r"],
+)
+def test_an_edited_setup_is_asked_to_stop_and_comes_back_alone_once_it_has_left(
+    edit: dict[str, object],
+) -> None:
+    """13/10: CONTINUAÇÃO edited from a 2R target to 5R went on at 2R — the session was known by
+    its (setup, instrument) alone, so the edit looked like nothing at all."""
+    book = Book()
+    other, setup = item(), item()
+    (launch,) = book.round([other, setup])
+    old_id = launch.sessions[(setup.setup_id, setup.instrument_id)]
+    other_id = launch.sessions[(other.setup_id, other.instrument_id)]
+    edited = dataclasses.replace(setup, **edit)  # type: ignore[arg-type]
+
+    assert book.round([other, edited]) == [], (
+        "not while the old one runs: two would post its signals"
+    )
+    assert book.asked == [old_id], "only the edited one; the other's armed signals stay"
+
+    (again,) = book.round([other, edited], heard=carrying(launch, other_id))
+    assert list(again.sessions) == [(setup.setup_id, setup.instrument_id)]
+    (member,) = members(again)
+    assert member["strategy"] == str(edited.strategy_id)
+    assert member["no_target_r"] == str(edited.no_target_r)
+    assert member["session"] != str(old_id)
+    assert book.fleet.waiting() == {}, "asked to leave, not failed"
+
+    assert book.round([other, edited], heard=carrying(launch, other_id)) == []
+    assert book.asked == [old_id], "the new one is what is wanted now"
 
 
 def test_a_session_that_left_unasked_failed_and_comes_back_alone_later_under_a_new_id() -> None:

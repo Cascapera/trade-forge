@@ -909,8 +909,9 @@ class StructureParams(_Node):
     close of that bar, and a touch on it or before cancels the trade. `1` switches it off."""
     opening_gap: bool = False
     """His Profit indicator's opening gap (15/10, ADR-0035): after a pause in the chart — no bars
-    for longer than one bar and at least 30 minutes — a bar that opens beyond the last bar before
-    the pause marks that bar as a region, on the opening bar itself. Every other rule of a region
+    for longer than one bar and at least 30 minutes — an opening bar wholly beyond the last bar
+    before the pause (its low over that bar's high, or its high under its low) marks that bar as a
+    region, on the opening bar itself. Every other rule of a region
     applies to it unchanged, `min_bars_to_touch` included. Read from M1 to H4, on this chart and on
     the `htf` above it; off, the default, is the rule every recorded result ran under."""
 

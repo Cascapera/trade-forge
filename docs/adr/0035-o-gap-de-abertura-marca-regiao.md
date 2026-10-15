@@ -1,7 +1,8 @@
 # ADR-0035 — O gap de abertura marca região (opção do setup)
 
 - **Status**: aceito (15/10, por ele: "abertura como gap"; regra e forma escolhidas nas perguntas do
-  mesmo dia)
+  mesmo dia). Condição revista no mesmo dia (#465), pela resposta dele sobre a abertura que volta
+  até a vela: itens 1 e 5
 - **Data**: 2026-10-15
 - **Contexto do PR**: a entrada de continuação do WDO M5 na abertura de 15/10, que o ao vivo não
   pegou
@@ -37,13 +38,17 @@ oferecida por aquele BOS. A regra nova marca a região na própria barra de aber
 ## Decisão
 
 Uma opção `opening_gap` (desligada por padrão) nos setups de estrutura (CHoCH e continuação). Com
-ela ligada, depois de uma **pausa** no gráfico, uma barra que **abre** além da última barra antes da
-pausa (acima da máxima, ou abaixo da mínima) marca essa última barra como região, nascida na barra
-de abertura.
+ela ligada, depois de uma **pausa** no gráfico, uma barra de abertura que fica **inteira** além da
+última barra antes da pausa (a mínima acima da máxima dela, ou a máxima abaixo da mínima) marca
+essa última barra como região, nascida na barra de abertura.
 
 Os detalhes, e de quem é cada um:
 
-1. **A condição é a abertura**, não a mínima: abrir além da barra de fechamento (dele).
+1. **A condição é a barra de abertura inteira**, não só a abertura (dele). O indicador não desenha
+   *"se a mínima do candle fechar o gap ou não confirmar o rompimento pelo fechamento"*. A mínima
+   acima da máxima da última barra diz as duas coisas, porque o fechamento nunca fica abaixo da
+   mínima. É estrita como a regra das três velas: um pavio exatamente na borda fecha o gap. No #464
+   a condição era só a abertura, porque foi o que a primeira resposta dele descrevia.
 2. **Pausa** é ficar sem barras por mais de uma barra **e** por pelo menos 30 minutos
    (`SHORTEST_PAUSE`). O piso é meu: mercado ilíquido pula os minutos em que ninguém negociou, e um
    buraco de duas barras de M1 não é abertura de pregão. Toda pausa que ele lê é bem mais longa: a
@@ -52,8 +57,11 @@ Os detalhes, e de quem é cada um:
    é a regra das três velas que lê. Vale também no HTF do setup, com a mesma opção.
 4. **A idade mínima até o toque vale igual** (`min_bars_to_touch`, dele). A entrada de 15/10, com
    toque uma barra depois, continua cancelada com 7 barras (ou 3).
-5. **Tocada na própria barra de abertura, nasce tocada.** É consequência da regra do primeiro toque:
-   a região existe a partir dessa barra, e o pavio dela que volta até a borda é o primeiro toque.
+5. **A abertura que volta até a vela não marca nada** (dele, #465). Ela não é gap, então também não
+   segura a trava, e a barra seguinte fica com a regra das três velas, exatamente como com a opção
+   desligada. No #464 essa região nascia tocada e segurava a trava, e o guardian mostrou o efeito:
+   ligar a opção engolia o gap de três velas da barra seguinte e tirava uma região que a opção
+   desligada oferecia.
 6. **Uma trava só para as duas regras.** Um empurrão que salta a pausa e continua abrindo gaps é uma
    região, não uma por regra; sem isso a barra seguinte marcaria a mesma vela de novo como gap de
    três velas. Se as duas regras valem na mesma barra, a das três velas ganha: a vela que ela marca
@@ -65,7 +73,8 @@ Os detalhes, e de quem é cada um:
 |-------------|------|---------|
 | Regra fixa no motor, sempre ligada | como o indicador dele; menos código | muda o resultado de todo setup de estrutura em mercado com pausa (B3, ações, CFDs); a fila da varredura (1,55 mi de runs) roda no motor antigo até reconstruir os workers, e o ao vivo fica diferente do backtest até lá |
 | **Opção no setup, desligada por padrão (escolhida)** | resultados antigos e a fila continuam valendo; ele liga nos setups que quiser; dá para varrer ligada contra desligada | schema, fábrica, chave da leitura compartilhada; uma varredura que varie a opção lê o mercado duas vezes |
-| Condição na mínima (o buraco que sobra sem negociar) | mesmo espírito da regra das três velas | não é o que o indicador dele faz (ele escolheu a abertura); na prática a diferença some, porque a abertura que volta à borda deixa a região nascida tocada (item 5) |
+| Condição só na abertura, região nascida tocada se o pavio volta (o #464) | lia a primeira resposta dele ao pé da letra | não é o que o indicador desenha (a segunda resposta dele); a região nascida tocada segurava a trava e tirava a região que a barra seguinte marcaria |
+| **Condição na barra de abertura inteira (escolhida no #465)** | é o que o indicador dele faz; a abertura que volta não deixa rastro, e a barra seguinte lê como desligada | nenhum além do #464 |
 
 ## Trade-off aceito
 
@@ -79,16 +88,18 @@ Os detalhes, e de quem é cada um:
   só lê os parâmetros que conhece. Um run com `opening_gap` executado num worker antigo sairia sem
   o gap e com a mesma versão, e o reaproveitamento poderia copiá-lo depois. **Não lançar varredura
   com a opção ligada antes de reconstruir os workers** (aqui, no Xeon e onde mais houver).
-- **Ligar a opção também pode tirar uma região.** Se a abertura salta a última vela e o pavio
-  volta até a borda, a região nasce tocada e segura a trava. Aí o gap de três velas da vela
-  seguinte não marca nada. Desligada, esse gap marca a mesma vela uma barra depois, já depois do
-  toque, e ela é oferecida. É a consequência dos itens 5 e 6, e o teste
-  `test_switching_it_on_can_take_a_region_away` fixa esse caso. É também onde o v102 pode
-  divergir.
+- **Ligar a opção ainda pode tirar uma região, num caso só: a trava que atravessa a pausa** (item
+  6). Se o pregão termina num gap (basta um, cuja terceira vela é a última antes da pausa) e a
+  abertura também é gap, o empurrão continua do outro lado da pausa, e o gap de três velas da barra
+  seguinte não marca nada. Desligada, a abertura não é gap, o empurrão acaba nela, e esse gap marca
+  a última vela como uma segunda região. O teste
+  `test_a_run_carried_across_the_pause_is_one_region_where_off_reads_two` fixa esse caso, e é onde
+  o v102 ainda pode divergir. O outro caso, o da abertura que volta até a vela, deixou de existir
+  no #465 (item 5).
 - **Uma pausa que cabe dentro de uma barra não aparece.** No H4 de um CFD, a hora de pausa fica
   dentro da barra das 20:00, e o gráfico não mostra barra faltando.
-- **O código do v102 não foi lido.** Os itens 5 e 6 são a leitura coerente das regras que já temos.
-  Se o indicador divergir, ele ganha, e esta regra muda.
+- **O código do v102 não foi lido.** O item 5 veio dele (#465). O 6 é a leitura coerente das regras
+  que já temos. Se o indicador divergir, ele ganha, e esta regra muda.
 - **No D1/W1 a opção não faz nada, mas a varredura não sabe disso** (`unread_params` só olha o bloco
   do setup, sem o tempo gráfico). Uma varredura em D1 que varie a opção roda o par duas vezes.
 
@@ -103,6 +114,8 @@ Os detalhes, e de quem é cada um:
   novo no reinício do mercado (fora do pregão, porque o reinício cancela sinais armados). Os workers
   só depois que a fila permitir, e **antes** de qualquer varredura com a opção.
 - Testes de ouro: o caso real do WDO de 15/10, as bordas (pausa de 25/30 min, um tempo gráfico
-  exato, H4 sim e D1 não, toque na própria abertura na borda exata), as duas regras na mesma barra,
-  o empurrão que salta a pausa, o espelho de baixa; propriedades "sem pausa nada muda" e "desligada
-  nada muda"; lote igual a cada run sozinho em séries com pregões e saltos.
+  exato, H4 sim e D1 não, pavio da abertura na borda exata e meio ponto antes), as duas regras na
+  mesma barra, o empurrão que salta a pausa, a abertura que volta até a vela deixando a barra
+  seguinte ler como desligada, a trava que atravessa a pausa, o espelho de baixa; propriedades "sem
+  pausa nada muda" e "desligada nada muda"; lote igual a cada run sozinho em séries com pregões e
+  saltos.

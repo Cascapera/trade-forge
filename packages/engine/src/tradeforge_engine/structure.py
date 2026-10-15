@@ -1243,15 +1243,17 @@ class OrderBlockDetector:
     break, so a strategy still only ever acts from `confirmed_at` onward and acts at the next open.
 
     **The opening gap** (`opening_gap`, his Profit indicator's rule, 15/10 — ADR-0035) is a fifth
-    rule, off unless asked for. After a pause in the chart, a bar that **opens** beyond the last
-    bar before the pause marks that last bar as a region, on the opening bar itself. The three-bar
-    test cannot see this one: the leap is between two bars, and the bar before it never had to
-    close beyond anything. It is a gap like the others in every way that follows — the same latch,
-    the same leg, the same first touch, the same age counted from its own bar — so an opening bar
-    that already traded back to the region's entry edge leaves it born taken. A pause is a stretch
-    with **no bars** longer than one bar and at least `SHORTEST_PAUSE`; a break that fits inside a
-    bar is invisible on that chart. Read only up to `OPENING_GAP_LONGEST`: from D1 up every bar is
-    a whole session already, and the three-bar test reads the leap between them.
+    rule, off unless asked for. After a pause in the chart, an opening bar that stays **wholly
+    beyond** the last bar before the pause — its low over that bar's high, or its high under its
+    low — marks that last bar as a region, on the opening bar itself. The three-bar test cannot
+    see this one: the leap is between two bars, and the bar before it never had to close beyond
+    anything. An opening whose wick comes back to the last bar has closed its own gap, and his
+    indicator draws nothing there: it is no gap, so it holds no latch either. Past that it is a gap
+    like the others in every way — the same latch, the same leg, the same first touch, the same age
+    counted from its own bar. A pause is a stretch with **no bars** longer than one bar and at
+    least `SHORTEST_PAUSE`; a break that fits inside a bar is invisible on that chart. Read only up
+    to `OPENING_GAP_LONGEST`: from D1 up every bar is a whole session already, and the three-bar
+    test reads the leap between them.
     """
 
     # A leg longer than this is not an impulse any more; the cap also bounds memory when a long
@@ -1311,10 +1313,9 @@ class OrderBlockDetector:
         """
         self._index += 1
         self._window.append(candle)
-        # Everything already being followed advances *before* this bar can mark anything new. A
-        # three-bar region cannot be taken by the bar that created it — his gap condition puts
-        # price clear of the region on that bar. An opening gap's can, and is stamped where it is
-        # born (`_opening_region`).
+        # Everything already being followed advances *before* this bar can mark anything new. No
+        # region can be taken by the bar that created it — both his gap conditions, the three-bar
+        # one and the opening one, put price clear of the region on that bar.
         taken = False
         for tracked in self._live:
             self._advance(tracked, candle, self._index)
@@ -1388,9 +1389,11 @@ class OrderBlockDetector:
         """The region an opening gap marks on this bar, or `None` (ADR-0035).
 
         The bar before the pause is the region, and this bar is its gap's: the region is counted
-        from here, as a three-bar gap's is from its third candle. It is born taken when this bar
-        already traded back to its entry edge — opening beyond a bar says nothing about where the
-        bar went next, and a first touch is the first touch whichever bar it lands on.
+        from here, as a three-bar gap's is from its third candle. The gap is the whole bar's, not
+        its open's — his answer of 15/10: no region when the opening bar's wick closes the gap, or
+        when its close does not confirm the leap. A low clear of the last bar's high says both
+        (the close is never under the low), so it is the whole test, and strict as the three-bar
+        one is: a wick exactly on the edge is the first touch `TrackedZone` reads.
         """
         if self._opening is None or len(self._window) < 2:  # noqa: PLR2004 — this bar and the one before
             return None
@@ -1398,15 +1401,13 @@ class OrderBlockDetector:
         pause = candle.time - before.time
         if pause <= self._opening or pause < SHORTEST_PAUSE:
             return None
-        if candle.open > before.high:
+        if candle.low > before.high:
             kind = FVGKind.BULLISH
-        elif candle.open < before.low:
+        elif candle.high < before.low:
             kind = FVGKind.BEARISH
         else:
             return None
-        region = _Region(index=self._index, kind=kind, marking=before)
-        region.mitigated = region.touched_by(candle)
-        return region
+        return _Region(index=self._index, kind=kind, marking=before)
 
     @staticmethod
     def _advance(tracked: TrackedZone, candle: Candle, index: int) -> None:

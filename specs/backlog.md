@@ -3097,3 +3097,10 @@ runs deveriam voltar a `queued`, não `failed`; `failed` só quando é a última
 - [origem: gap de abertura] **Conferir os itens 5 e 6 do ADR com o indicador v102.** A região tocada
   na própria barra de abertura nasce tocada, e a trava é a mesma para as duas regras. São a leitura
   coerente das regras que já temos, mas o código do v102 não foi lido. Se divergir, o indicador ganha.
+  O caso mais sensível é a abertura que salta a vela e volta até a borda na mesma barra: com a opção
+  ligada essa região some (`test_switching_it_on_can_take_a_region_away`). Perguntar a ele o que o
+  indicador desenha nesse caso.
+- [origem: gap de abertura] **Trava no reaproveitamento para `opening_gap`.** Sugestão do
+  engine-guardian (15/10): não copiar um run com `opening_gap: true` feito antes de os workers
+  saberem da opção. Isso fecha o risco do worker antigo sem depender de disciplina. Adiado: os
+  workers não têm como dizer hoje se conhecem a opção, já que a versão é a mesma.

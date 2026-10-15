@@ -2089,13 +2089,57 @@ def test_a_bar_right_after_the_last_one_opens_no_session() -> None:
     assert _offered(candles) == []
 
 
-@pytest.mark.parametrize("open_", ["117", "109"])
-def test_an_opening_inside_the_last_bar_is_no_gap(open_: str) -> None:
-    """After the pause, a bar opening on the last bar's high or low — inside its range — leaps
-    nothing, however far it then runs. Strictly beyond, as his three-bar test is strict."""
-    candles = [*_SESSION, bar(20, open_=open_, close="124", high="125", low=open_)]
+def test_an_opening_on_the_last_bar_s_high_leaps_nothing() -> None:
+    """Strictly beyond, as his three-bar test is strict. An opening exactly on bar 7's high is no
+    gap — and the difference shows on the next bar, not on this one: read as a gap, its region
+    would be born taken by the opening bar's own wick and hold the latch, swallowing the three-bar
+    gap 7-20-21 that marks bar 7 the honest way (the guardian's mutant M4, 15/10)."""
+    candles = [
+        *_SESSION,
+        bar(20, open_="117", close="121", high="122", low="116.5"),  # opens on 117, dips under
+        bar(21, open_="121", close="124", high="125", low="120"),  # 117 < 120: gap 7-20-21; BOS
+    ]
+
+    assert _offered(candles) == [
+        (_at(21), _at(7), Decimal("117"), Decimal("109"), True, _at(21)),
+    ]
+
+
+def test_an_opening_continuing_a_three_bar_run_is_the_same_region() -> None:
+    """The latch both ways (ADR-0035, item 6): a session ending in a run of three-bar gaps — 4-5-6
+    marks bar 4, 5-6-7 continues it — and an opening that leaps bar 7 is one push, one region.
+    Read as a new event it would add bar 7 as a secondary (the guardian's mutant M7, 15/10)."""
+    candles = [
+        *_SESSION[:3],
+        bar(3, open_="99", close="99", high="100", low="98"),  # origin low 98
+        bar(4, open_="100", close="104", high="105", low="99"),
+        bar(5, open_="104", close="108", high="109", low="100"),
+        bar(6, open_="108", close="112", high="113", low="106"),  # 105 < 106: gap, marks bar 4
+        bar(7, open_="112", close="112", high="117", low="110"),  # 109 < 110: the run goes on
+        _OPENING,  # leaps 117, no three-bar gap (bar 7 closed under 113); BOS
+    ]
+    expected = [(_at(20), _at(4), Decimal("105"), Decimal("99"), True, _at(6))]
+
+    assert _offered(candles) == expected
+    assert _offered(candles, opening_gap=False) == expected
+
+
+def test_switching_it_on_can_take_a_region_away() -> None:
+    """Items 5 and 6 of ADR-0035 together, and the one place the rule removes rather than adds.
+    The opening leaps bar 7 and its wick comes back to the edge: the region is born taken and holds
+    the latch, so the three-bar gap 7-20-21 marks nothing. Off, that gap marks bar 7 one bar later,
+    after the touch, and the break offers it. Pinned because it is where his indicator could
+    differ — the backlog asks him."""
+    candles = [
+        *_SESSION,
+        bar(20, open_="118", close="121", high="122", low="116.5"),  # over 117, then back to it
+        bar(21, open_="121", close="124", high="125", low="120"),  # gap 7-20-21; BOS
+    ]
 
     assert _offered(candles) == []
+    assert _offered(candles, opening_gap=False) == [
+        (_at(21), _at(7), Decimal("117"), Decimal("109"), True, _at(21)),
+    ]
 
 
 def _restamped(candles: list[Candle], step: timedelta, pause: timedelta) -> list[Candle]:
@@ -2149,6 +2193,16 @@ def test_the_bearish_opening_gap_marks_supply() -> None:
     # Its entry edge is the bottom: an opening bar reaching back up to 103 takes it.
     retaken = [*candles[:-1], bar(20, open_="99", close="96", high="103", low="95")]
     assert _offered(retaken, prefix=[]) == []
+    # And an opening exactly on 103 leaps nothing (the guardian's mutant M5): the bars after mark
+    # bar 7 by the three-bar test, 7-20-21, as they would with the rule off.
+    on_the_edge = [
+        *candles[:-1],
+        bar(20, open_="103", close="99", high="103.5", low="98"),
+        bar(21, open_="99", close="96", high="100", low="95"),  # 103 > 100: gap 7-20-21; break
+    ]
+    assert _offered(on_the_edge, prefix=[]) == [
+        (_at(21), _at(7), Decimal("111"), Decimal("103"), True, _at(21)),
+    ]
 
 
 def test_the_case_that_asked_for_it_wdo_on_15_october() -> None:
@@ -2185,7 +2239,7 @@ def test_the_case_that_asked_for_it_wdo_on_15_october() -> None:
 
     def read(opening_gap: bool) -> tuple[list[OrderBlock], OrderBlockDetector]:
         blocks = OrderBlockDetector(timeframe=timedelta(minutes=5), opening_gap=opening_gap)
-        offered = []
+        offered: list[OrderBlock] = []
         for candle in candles:
             offered += blocks.update(candle, bos if candle is candles[6] else None)
         return offered, blocks

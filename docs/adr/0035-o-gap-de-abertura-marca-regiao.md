@@ -79,6 +79,12 @@ Os detalhes, e de quem é cada um:
   só lê os parâmetros que conhece. Um run com `opening_gap` executado num worker antigo sairia sem
   o gap e com a mesma versão, e o reaproveitamento poderia copiá-lo depois. **Não lançar varredura
   com a opção ligada antes de reconstruir os workers** (aqui, no Xeon e onde mais houver).
+- **Ligar a opção também pode tirar uma região.** Se a abertura salta a última vela e o pavio
+  volta até a borda, a região nasce tocada e segura a trava. Aí o gap de três velas da vela
+  seguinte não marca nada. Desligada, esse gap marca a mesma vela uma barra depois, já depois do
+  toque, e ela é oferecida. É a consequência dos itens 5 e 6, e o teste
+  `test_switching_it_on_can_take_a_region_away` fixa esse caso. É também onde o v102 pode
+  divergir.
 - **Uma pausa que cabe dentro de uma barra não aparece.** No H4 de um CFD, a hora de pausa fica
   dentro da barra das 20:00, e o gráfico não mostra barra faltando.
 - **O código do v102 não foi lido.** Os itens 5 e 6 são a leitura coerente das regras que já temos.

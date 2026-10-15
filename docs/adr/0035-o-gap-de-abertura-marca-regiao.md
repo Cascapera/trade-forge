@@ -65,8 +65,8 @@ Os detalhes, e de quem é cada um:
 6. **Uma trava só para as duas regras** (dele, #466). Um empurrão que salta a pausa e continua
    abrindo gaps é uma região, não uma por regra; sem isso a barra seguinte marcaria a mesma vela de
    novo como gap de três velas. Perguntado se o indicador desenha uma caixa ou duas quando o pregão
-   termina num gap e a abertura também é gap, ele respondeu: *"desenha 1, pq gaps contínuos não
-   geram outra região, somente se ocorrer uma pausa"*, isto é, uma barra sem gap que interrompe a
+   termina num gap e a abertura também é gap, ele respondeu: *"desenha 1 pq gaps continuos não gera
+   outra região somente se ocorrer uma pausa"*. A pausa ali é uma barra sem gap, que interrompe a
    sequência. A pausa do pregão não interrompe nada. Se as duas regras valem na mesma barra, a das
    três velas ganha: a vela que ela marca é onde o empurrão começou.
 
@@ -92,9 +92,9 @@ Os detalhes, e de quem é cada um:
   o gap e com a mesma versão, e o reaproveitamento poderia copiá-lo depois. **Não lançar varredura
   com a opção ligada antes de reconstruir os workers** (aqui, no Xeon e onde mais houver).
 - **Ligar a opção ainda tira uma região num caso só, e é a regra dele: a trava que atravessa a
-  pausa** (item 6). Se o pregão termina num gap (basta um, cuja terceira vela é a última antes da pausa) e a
-  abertura também é gap, o empurrão continua do outro lado da pausa, e o gap de três velas da barra
-  seguinte não marca nada. Desligada, a abertura não é gap, o empurrão acaba nela, e esse gap marca
+  pausa** (item 6). Se o pregão termina num gap (basta um, cuja terceira vela é a última antes da
+  pausa) e a abertura também é gap, o empurrão continua do outro lado da pausa, e o gap de três velas
+  da barra seguinte não marca nada. Desligada, a abertura não é gap, o empurrão acaba nela, e esse gap marca
   a última vela como uma segunda região. O teste
   `test_a_run_carried_across_the_pause_is_one_region_where_off_reads_two` fixa esse caso. Ligada,
   a opção desenha o que o v102 desenha (uma caixa), e a segunda região é a opção desligada que não

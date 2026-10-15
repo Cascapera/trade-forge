@@ -12,6 +12,11 @@
                                                       # every proposal, traded alone, and
                                                       # under each stop of the grid
                                                       #   -> sweep=<id>/independent-h150/
+    tradeforge-ml grid <sweep-id> [--out data/ml] [--base independent-h150]
+                      [--validation 2023-01-01:2025-01-01] [--min-trades 30]
+                      [--min-stop-ticks 5] [--min-stop-spreads 2] [--no-floor]
+                                                      # the grid's stops and targets, scored:
+                                                      # a fixed cell per market, no model
 
 `features` and `train` read the run-based base; `--base independent-h150` points them at the
 replayed one instead.
@@ -121,7 +126,30 @@ def _train(args: argparse.Namespace, base: Path) -> int:
     return 0
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def _grid(args: argparse.Namespace, base: Path) -> int:
+    from tradeforge_ml.grid_report import write_grid  # noqa: PLC0415 — the models are an extra
+    from tradeforge_ml.model import Floor, Split  # noqa: PLC0415
+
+    start, end = args.validation
+    floor = None if args.no_floor else Floor(args.min_stop_ticks, args.min_stop_spreads)
+    markets = None
+    if floor is not None:
+        with create_session_factory(create_db_engine())() as session:
+            markets = markets_of(session)
+    name, report = write_grid(
+        base, Split(start, end, tuple(args.exclude)), floor, markets, args.min_trades
+    )
+    print(f"{name}, validation:")
+    for rule in report.rules:
+        judged = rule.validation
+        print(
+            f"  {rule.name}: {judged.trades:,} trades, mean R {judged.mean_r:+.3f}, "
+            f"total R {judged.total_r:+,.1f}, longest losing run {judged.longest_losing_streak}"
+        )
+    return 0
+
+
+def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="tradeforge-ml", description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     export = commands.add_parser("export", help="write a sweep's event base in Parquet")
@@ -150,11 +178,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     again.add_argument("--processes", type=int, default=None)
     again.add_argument("--costs", choices=("measured", "run"), default="measured")
     again.add_argument("--stops", type=stops, default=STOPS)
-    args = parser.parse_args(argv)
+    scored = commands.add_parser("grid", help="score a replayed base's stops and targets")
+    scored.add_argument("sweep_id", type=uuid.UUID)
+    scored.add_argument("--out", type=Path, default=Path("data/ml"))
+    scored.add_argument("--base", default=f"independent-h{HORIZON}")
+    scored.add_argument("--validation", type=span, default=span("2023-01-01:2025-01-01"))
+    scored.add_argument("--exclude", type=span, action="append", default=[])
+    scored.add_argument("--min-trades", type=int, default=30)
+    scored.add_argument("--min-stop-ticks", type=float, default=5.0)
+    scored.add_argument("--min-stop-spreads", type=float, default=2.0)
+    scored.add_argument("--no-floor", action="store_true", help="keep every trade")
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
     base = args.out / f"sweep={args.sweep_id}" / getattr(args, "base", "")
 
     if args.command == "train":
         return _train(args, base)
+    if args.command == "grid":
+        return _grid(args, base)
 
     factory = create_session_factory(create_db_engine())
     if args.command == "replay":

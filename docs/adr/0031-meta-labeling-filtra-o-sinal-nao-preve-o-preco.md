@@ -163,3 +163,20 @@ A grade cobre **as entradas da base**: uma entrada que só um stop maior teria a
 recusado pelo escorregamento) não está nela. O relatório da grade (a melhor célula fixa
 escolhida nos anos de treino, julgada na validação) e o modelo que escolhe a célula por entrada
 vêm nos próximos PRs.
+
+### O relatório da grade: a régua antes do modelo
+
+`tradeforge-ml grid` lê o `grid.parquet` e compara, na validação, quatro regras escolhidas
+nos anos de treino, sem modelo:
+
+1. todas as entradas, com o stop do setup e sem alvo (o que o meta-label lia);
+2. só os mercados em que isso fechou o treino positivo;
+3. uma célula (stop × alvo) para a base inteira, a de mais R no treino;
+4. uma célula por mercado, entre as com pelo menos 30 trades no treino. O mercado sem célula
+   positiva não é operado.
+
+Um mercado é um setup num ativo e num gráfico. Cada regra é somada como uma conta: risco
+fixo por trade, na ordem em que os trades fecham, com drawdown e a maior sequência de perdas.
+O piso de stop vale célula por célula, e uma entrada com alguma célula "aberta" sai de todas,
+para que as células concorram nas mesmas entradas. **Um modelo que escolhe a célula por
+entrada só vale se bater a melhor dessas regras fora do treino.**

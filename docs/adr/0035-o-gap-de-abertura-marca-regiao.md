@@ -2,7 +2,7 @@
 
 - **Status**: aceito (15/10, por ele: "abertura como gap"; regra e forma escolhidas nas perguntas do
   mesmo dia). Condição revista no mesmo dia (#465), pela resposta dele sobre a abertura que volta
-  até a vela: itens 1 e 5
+  até a vela: itens 1 e 5. Item 6 confirmado por ele no mesmo dia (#466)
 - **Data**: 2026-10-15
 - **Contexto do PR**: a entrada de continuação do WDO M5 na abertura de 15/10, que o ao vivo não
   pegou
@@ -62,10 +62,13 @@ Os detalhes, e de quem é cada um:
    desligada. No #464 essa região nascia tocada e segurava a trava, e o guardian mostrou o efeito:
    ligar a opção engolia o gap de três velas da barra seguinte e tirava uma região que a opção
    desligada oferecia.
-6. **Uma trava só para as duas regras.** Um empurrão que salta a pausa e continua abrindo gaps é uma
-   região, não uma por regra; sem isso a barra seguinte marcaria a mesma vela de novo como gap de
-   três velas. Se as duas regras valem na mesma barra, a das três velas ganha: a vela que ela marca
-   é onde o empurrão começou.
+6. **Uma trava só para as duas regras** (dele, #466). Um empurrão que salta a pausa e continua
+   abrindo gaps é uma região, não uma por regra; sem isso a barra seguinte marcaria a mesma vela de
+   novo como gap de três velas. Perguntado se o indicador desenha uma caixa ou duas quando o pregão
+   termina num gap e a abertura também é gap, ele respondeu: *"desenha 1 pq gaps continuos não gera
+   outra região somente se ocorrer uma pausa"*. A pausa ali é uma barra sem gap, que interrompe a
+   sequência. A pausa do pregão não interrompe nada. Se as duas regras valem na mesma barra, a das
+   três velas ganha: a vela que ela marca é onde o empurrão começou.
 
 ## Alternativas consideradas
 
@@ -88,18 +91,19 @@ Os detalhes, e de quem é cada um:
   só lê os parâmetros que conhece. Um run com `opening_gap` executado num worker antigo sairia sem
   o gap e com a mesma versão, e o reaproveitamento poderia copiá-lo depois. **Não lançar varredura
   com a opção ligada antes de reconstruir os workers** (aqui, no Xeon e onde mais houver).
-- **Ligar a opção ainda pode tirar uma região, num caso só: a trava que atravessa a pausa** (item
-  6). Se o pregão termina num gap (basta um, cuja terceira vela é a última antes da pausa) e a
-  abertura também é gap, o empurrão continua do outro lado da pausa, e o gap de três velas da barra
-  seguinte não marca nada. Desligada, a abertura não é gap, o empurrão acaba nela, e esse gap marca
-  a última vela como uma segunda região. O teste
-  `test_a_run_carried_across_the_pause_is_one_region_where_off_reads_two` fixa esse caso, e é onde
-  o v102 ainda pode divergir. O outro caso, o da abertura que volta até a vela, deixou de existir
-  no #465 (item 5).
+- **Ligar a opção ainda tira uma região num caso só, e é a regra dele: a trava que atravessa a
+  pausa** (item 6). Se o pregão termina num gap (basta um, cuja terceira vela é a última antes da
+  pausa) e a abertura também é gap, o empurrão continua do outro lado da pausa, e o gap de três
+  velas da barra seguinte não marca nada. Desligada, a abertura não é gap, o empurrão acaba nela, e
+  esse gap marca a última vela como uma segunda região. O teste
+  `test_a_run_carried_across_the_pause_is_one_region_where_off_reads_two` fixa esse caso. Ligada, a
+  opção desenha o que o v102 desenha (uma caixa), e a segunda região é a opção desligada que não vê
+  o gap da abertura. O outro caso, o da abertura que volta até a vela, deixou de existir no #465
+  (item 5).
 - **Uma pausa que cabe dentro de uma barra não aparece.** No H4 de um CFD, a hora de pausa fica
   dentro da barra das 20:00, e o gráfico não mostra barra faltando.
-- **O código do v102 não foi lido.** O item 5 veio dele (#465). O 6 é a leitura coerente das regras
-  que já temos. Se o indicador divergir, ele ganha, e esta regra muda.
+- **O código do v102 não foi lido.** Os itens 5 e 6 vieram das respostas dele (#465, #466). Se o
+  indicador divergir em outro caso, ele ganha, e esta regra muda.
 - **No D1/W1 a opção não faz nada, mas a varredura não sabe disso** (`unread_params` só olha o bloco
   do setup, sem o tempo gráfico). Uma varredura em D1 que varie a opção roda o par duas vezes.
 

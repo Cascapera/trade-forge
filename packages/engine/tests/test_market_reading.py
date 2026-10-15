@@ -70,6 +70,30 @@ def _walk(seed: int, count: int = 1500) -> list[Candle]:
     return candles
 
 
+def _sessions(candles: list[Candle], seed: int, *, length: int = 9) -> list[Candle]:
+    """`candles` cut into sessions of `length` bars, a night of no bars between two, and each
+    session opening at a random leap from where the last one closed — the shape of B3's chart,
+    which leaves opening gaps (ADR-0035) where an unbroken walk leaves none."""
+    rng = random.Random(seed)  # noqa: S311 — a reproducible walk, not a secret
+    night = 15 * HOUR
+    shift = Decimal(0)
+    out = []
+    for index, candle in enumerate(candles):
+        if index and index % length == 0:
+            shift += Decimal(rng.choice([-1, 1]) * rng.randint(0, 200)) / 100_000
+        out.append(
+            Candle(
+                time=candle.time + (index // length) * night,
+                open=candle.open + shift,
+                high=candle.high + shift,
+                low=candle.low + shift,
+                close=candle.close + shift,
+                tick_volume=candle.tick_volume,
+            )
+        )
+    return out
+
+
 def _setup(point: dict[str, Any], *, htf: bool, reading: MarketReading | None) -> StructureStrategy:
     params: dict[str, object] = {
         "entry_point": point["entry_point"],

@@ -71,6 +71,7 @@ const PARAMS: Record<string, { label: string; say: Say }> = {
   gift_stop: { label: 'Stop do gift', say: oneOf({ gift: 'gift', forca: 'barra de força' }) },
   volume_filter: { label: 'Filtro de volume', say: yesNo('ligado', 'desligado') },
   allow_secondary: { label: 'Regiões secundárias', say: yesNo('aceitas', 'só primárias') },
+  opening_gap: { label: 'Gap de abertura', say: yesNo('marca região', 'desligado') },
   max_bos: { label: 'Máximo de BOS', say: orOff('sem limite') },
   corrections: { label: 'Correções', say: String },
   htf: { label: 'Tempo gráfico superior (HTF)', say: orOff('desligado') },

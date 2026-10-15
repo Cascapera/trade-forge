@@ -211,6 +211,8 @@ _PROBES: dict[str, dict[str, tuple[Any, Any]]] = {
         "htf_allow_secondary": (False, False),
         # His minimum age of a region (29/09), probed off its default of 7.
         "min_bars_to_touch": (3, 3),
+        # His opening gap (15/10, ADR-0035), probed on: off is what the class answers alone.
+        "opening_gap": (True, True),
     },
     "structure_continuation": {
         "allow_secondary": (True, True),
@@ -226,6 +228,8 @@ _PROBES: dict[str, dict[str, tuple[Any, Any]]] = {
         "htf_allow_secondary": (False, False),
         # His minimum age of a region (29/09), probed off its default of 7.
         "min_bars_to_touch": (3, 3),
+        # His opening gap (15/10, ADR-0035), probed on: off is what the class answers alone.
+        "opening_gap": (True, True),
     },
 }
 

@@ -278,10 +278,18 @@ class RegionTracker:
     ever asked about membership, so nothing about its order can reach a result (`AGENTS.md §5.2`).
     """
 
-    def __init__(self, *, base: dt.timedelta, target: dt.timedelta, offset: dt.timedelta) -> None:
+    def __init__(
+        self,
+        *,
+        base: dt.timedelta,
+        target: dt.timedelta,
+        offset: dt.timedelta,
+        opening_gap: bool = False,
+    ) -> None:
         self._bars = BarAggregator(base=base, target=target, offset=offset)
         self._structure = MarketStructure()
-        self._blocks = OrderBlockDetector()
+        # The bars above leave opening gaps too, read on their own length (ADR-0035).
+        self._blocks = OrderBlockDetector(timeframe=target, opening_gap=opening_gap)
         self._touched: set[OrderBlock] = set()
         # ⚠️ **The regions a base bar can still touch, in the detector's order.** Every region
         # already in `_touched` would be skipped anyway; asking the set about each of them on every

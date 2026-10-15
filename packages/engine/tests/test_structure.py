@@ -7,7 +7,8 @@ goldens pin exactly which update confirms which swing, so a change that let a sw
 — the anti-lookahead bug — fails loudly.
 """
 
-from datetime import datetime
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from itertools import pairwise
 
@@ -1965,6 +1966,369 @@ def test_an_impulse_without_a_gap_marks_no_zone() -> None:
     ]
     assert _breaks_from_bullish(candles) != []  # the break happened...
     assert _zones_from_bullish(candles) == []  # ...and left no footprint
+
+
+# --- The opening gap (ADR-0035) -----------------------------------------------------------------
+#
+# His Profit indicator's rule, asked for with `opening_gap` (15/10): after a pause in the chart, a
+# bar that opens beyond the last bar before the pause marks that bar as a region. The scenario is
+# the shortest one that breaks structure on an opening and leaves the three-bar test nothing::
+#
+#     bar 3   high 100  low  98   the impulse's origin
+#     bar 4   high 105  low  99   no gap: 100 < 99 is false
+#     bar 5   high 109  low 100   no gap: 100 < 100 is not strict
+#     bar 6   high 113  low 105   no gap: 105 < 105 is not strict
+#     bar 7   high 117  low 109   the session's last bar, closing 112 — under bar 6's high
+#     -- thirteen hours without a bar --
+#     bar 20  open 121  low 120   opens over 117: the opening gap marks bar 7. The three-bar test
+#                                 sees 113 < 120, but bar 7 closed under 113. Close 124 > 123: BOS
+_SESSION = [
+    bar(0, open_="122", close="122", high="123", low="120"),  # top 123
+    bar(1, open_="119", close="119", high="122", low="118"),  # correction 1
+    bar(2, open_="117", close="117", high="121", low="116"),  # correction 2 -> armed
+    bar(3, open_="99", close="99", high="100", low="98"),  # impulse starts; origin low 98
+    bar(4, open_="100", close="104", high="105", low="99"),
+    bar(5, open_="104", close="108", high="109", low="100"),
+    bar(6, open_="108", close="112", high="113", low="105"),
+    bar(7, open_="112", close="112", high="117", low="109"),  # the last bar before the pause
+]
+_OPENING = bar(20, open_="121", close="124", high="125", low="120")
+
+# (bar the break offered it on, marking bar, top, bottom, primary, bar its gap was counted on)
+type _Offered = tuple[datetime, datetime, Decimal, Decimal, bool, datetime]
+
+
+def _offered(
+    candles: list[Candle],
+    *,
+    opening_gap: bool = True,
+    timeframe: timedelta = HOUR,
+    prefix: list[Candle] = BULLISH_START,
+) -> list[_Offered]:
+    """`_zones`, on a detector told the chart's timeframe and whether opening gaps mark regions —
+    each zone reported with the bar its region's gap was counted on, so the bar it was born on is
+    asserted along with it."""
+    structure = MarketStructure()
+    blocks = OrderBlockDetector(timeframe=timeframe, opening_gap=opening_gap)
+    fed = [*prefix, *candles]
+    found = []
+    for candle in fed:
+        break_ = structure.update(candle)
+        for zone in blocks.update(candle, break_):
+            (tracked,) = (one for one in blocks.zones if one.block == zone)
+            assert tracked.gap_index is not None
+            born = fed[tracked.gap_index].time
+            found.append((candle.time, zone.time, zone.top, zone.bottom, zone.primary, born))
+    return found
+
+
+def test_an_opening_gap_marks_the_last_bar_before_the_pause() -> None:
+    """The rule, both ways: on, the session's last bar is a region born on the opening bar and
+    offered by the break that bar confirmed; off, the leg left no inefficiency and marks nothing."""
+    candles = [*_SESSION, _OPENING]
+
+    assert _offered(candles) == [
+        (_at(20), _at(7), Decimal("117"), Decimal("109"), True, _at(20)),
+    ]
+    assert _offered(candles, opening_gap=False) == []
+    # The detector everyone else builds — no timeframe, no rule — agrees with the rule off.
+    assert [zone for _, zone in _zones_from_bullish(candles)] == []
+
+
+def test_the_three_bar_gap_goes_first_when_both_hold() -> None:
+    """Bar 7 closing over bar 6's high makes 6-7-20 a three-bar gap on the same bar as the opening
+    one. The push began at bar 6, and the opening only continues it: one region, bar 6's."""
+    candles = [*_SESSION[:7], bar(7, open_="112", close="114", high="117", low="109"), _OPENING]
+    expected = [(_at(20), _at(6), Decimal("113"), Decimal("105"), True, _at(20))]
+
+    assert _offered(candles) == expected
+    assert _offered(candles, opening_gap=False) == expected
+
+
+def test_a_push_that_leaps_the_pause_and_goes_on_gapping_is_one_region() -> None:
+    """The latch is shared. With the top at 130 the break waits two bars, and both of them gap:
+    7-20-21 would mark bar 7 again, 20-21-22 continues the run. One region, born on the opening.
+
+    Off, the three-bar test finds the same bar 7 on bar 21 — one bar later, which is the whole
+    difference here: the age `min_bars_to_touch` counts starts one bar earlier with the rule on.
+    """
+    candles = [
+        bar(0, open_="128", close="128", high="130", low="126"),  # top 130
+        bar(1, open_="125", close="125", high="128", low="124"),  # correction 1
+        bar(2, open_="123", close="123", high="127", low="122"),  # correction 2 -> armed
+        *_SESSION[3:],
+        _OPENING,  # opening gap over 117; close 124 < 130
+        bar(21, open_="125", close="127", high="128", low="124"),  # 117 < 124: three-bar, latched
+        bar(22, open_="128", close="131", high="132", low="126"),  # 125 < 126, latched; BOS
+    ]
+
+    assert _offered(candles) == [
+        (_at(22), _at(7), Decimal("117"), Decimal("109"), True, _at(20)),
+    ]
+    assert _offered(candles, opening_gap=False) == [
+        (_at(22), _at(7), Decimal("117"), Decimal("109"), True, _at(21)),
+    ]
+
+
+@pytest.mark.parametrize(("low", "offered"), [("117", False), ("117.5", True)])
+def test_an_opening_bar_that_trades_back_to_the_edge_leaves_the_region_born_taken(
+    low: str, offered: bool
+) -> None:
+    """Opening over the bar says nothing about where the opening bar went next. A wick back to the
+    region's entry edge is its first touch, on the bar the region was born on — at the edge
+    exactly, as `TrackedZone`'s rule reads it, and not a half point short of it."""
+    candles = [*_SESSION, bar(20, open_="121", close="124", high="125", low=low)]
+
+    assert bool(_offered(candles)) is offered
+
+
+def test_a_bar_right_after_the_last_one_opens_no_session() -> None:
+    """The same leap with no pause between: a jump inside a session is no opening gap."""
+    candles = [*_SESSION, bar(8, open_="121", close="124", high="125", low="120")]
+
+    assert _offered(candles) == []
+
+
+def test_an_opening_on_the_last_bar_s_high_leaps_nothing() -> None:
+    """Strictly beyond, as his three-bar test is strict. An opening exactly on bar 7's high is no
+    gap — and the difference shows on the next bar, not on this one: read as a gap, its region
+    would be born taken by the opening bar's own wick and hold the latch, swallowing the three-bar
+    gap 7-20-21 that marks bar 7 the honest way (the guardian's mutant M4, 15/10)."""
+    candles = [
+        *_SESSION,
+        bar(20, open_="117", close="121", high="122", low="116.5"),  # opens on 117, dips under
+        bar(21, open_="121", close="124", high="125", low="120"),  # 117 < 120: gap 7-20-21; BOS
+    ]
+
+    assert _offered(candles) == [
+        (_at(21), _at(7), Decimal("117"), Decimal("109"), True, _at(21)),
+    ]
+
+
+def test_an_opening_continuing_a_three_bar_run_is_the_same_region() -> None:
+    """The latch both ways (ADR-0035, item 6): a session ending in a run of three-bar gaps — 4-5-6
+    marks bar 4, 5-6-7 continues it — and an opening that leaps bar 7 is one push, one region.
+    Read as a new event it would add bar 7 as a secondary (the guardian's mutant M7, 15/10)."""
+    candles = [
+        *_SESSION[:3],
+        bar(3, open_="99", close="99", high="100", low="98"),  # origin low 98
+        bar(4, open_="100", close="104", high="105", low="99"),
+        bar(5, open_="104", close="108", high="109", low="100"),
+        bar(6, open_="108", close="112", high="113", low="106"),  # 105 < 106: gap, marks bar 4
+        bar(7, open_="112", close="112", high="117", low="110"),  # 109 < 110: the run goes on
+        _OPENING,  # leaps 117, no three-bar gap (bar 7 closed under 113); BOS
+    ]
+    expected = [(_at(20), _at(4), Decimal("105"), Decimal("99"), True, _at(6))]
+
+    assert _offered(candles) == expected
+    assert _offered(candles, opening_gap=False) == expected
+
+
+def test_switching_it_on_can_take_a_region_away() -> None:
+    """Items 5 and 6 of ADR-0035 together, and the one place the rule removes rather than adds.
+    The opening leaps bar 7 and its wick comes back to the edge: the region is born taken and holds
+    the latch, so the three-bar gap 7-20-21 marks nothing. Off, that gap marks bar 7 one bar later,
+    after the touch, and the break offers it. Pinned because it is where his indicator could
+    differ — the backlog asks him."""
+    candles = [
+        *_SESSION,
+        bar(20, open_="118", close="121", high="122", low="116.5"),  # over 117, then back to it
+        bar(21, open_="121", close="124", high="125", low="120"),  # gap 7-20-21; BOS
+    ]
+
+    assert _offered(candles) == []
+    assert _offered(candles, opening_gap=False) == [
+        (_at(21), _at(7), Decimal("117"), Decimal("109"), True, _at(21)),
+    ]
+
+
+def _restamped(candles: list[Candle], step: timedelta, pause: timedelta) -> list[Candle]:
+    """`candles` one `step` apart, the last one `pause` after the one before it."""
+    times = [START + number * step for number in range(len(candles) - 1)]
+    times.append(times[-1] + pause)
+    return [replace(candle, time=time) for candle, time in zip(candles, times, strict=True)]
+
+
+@pytest.mark.parametrize(
+    ("timeframe", "pause", "marks"),
+    [
+        (timedelta(minutes=5), timedelta(minutes=25), False),  # a hole of thin trading
+        (timedelta(minutes=5), timedelta(minutes=30), True),  # SHORTEST_PAUSE, inclusive
+        (timedelta(minutes=30), timedelta(minutes=30), False),  # one bar: no bar is missing
+        (timedelta(minutes=30), timedelta(minutes=60), True),
+        (timedelta(hours=4), timedelta(hours=16), True),  # OPENING_GAP_LONGEST, inclusive
+        (timedelta(days=1), timedelta(days=3), False),  # D1: a weekend, and not read
+        (timedelta(weeks=1), timedelta(weeks=2), False),
+    ],
+)
+def test_a_pause_is_longer_than_a_bar_and_at_least_half_an_hour(
+    timeframe: timedelta, pause: timedelta, marks: bool
+) -> None:
+    candles = _restamped([*BULLISH_START, *_SESSION, _OPENING], timeframe, pause)
+
+    found = _offered(candles, timeframe=timeframe, prefix=[])
+
+    assert [(top, bottom) for _, _, top, bottom, _, _ in found] == (
+        [(Decimal("117"), Decimal("109"))] if marks else []
+    )
+
+
+def test_the_bearish_opening_gap_marks_supply() -> None:
+    """The mirror: a session falling to its last bar, and an opening under that bar's low."""
+    candles = [
+        bar(0, open_="98", close="98", high="100", low="97"),  # bottom 97
+        bar(1, open_="101", close="101", high="102", low="98"),  # up-correction 1
+        bar(2, open_="103", close="103", high="104", low="99"),  # up-correction 2 -> armed
+        bar(3, open_="121", close="121", high="122", low="120"),  # impulse starts; origin 122
+        bar(4, open_="120", close="116", high="121", low="115"),  # 120 > 120 is not strict
+        bar(5, open_="116", close="112", high="120", low="111"),  # 115 > 115 neither
+        bar(6, open_="112", close="108", high="115", low="107"),  # nor 111 > 111
+        bar(7, open_="108", close="108", high="111", low="103"),  # last bar; closes over 107
+        bar(20, open_="99", close="96", high="100", low="95"),  # opens under 103; 96 < 97
+    ]
+
+    found = _offered(candles, prefix=[])
+    assert found == [(_at(20), _at(7), Decimal("111"), Decimal("103"), True, _at(20))]
+    assert _offered(candles, prefix=[], opening_gap=False) == []
+    # Its entry edge is the bottom: an opening bar reaching back up to 103 takes it.
+    retaken = [*candles[:-1], bar(20, open_="99", close="96", high="103", low="95")]
+    assert _offered(retaken, prefix=[]) == []
+    # And an opening exactly on 103 leaps nothing (the guardian's mutant M5): the bars after mark
+    # bar 7 by the three-bar test, 7-20-21, as they would with the rule off.
+    on_the_edge = [
+        *candles[:-1],
+        bar(20, open_="103", close="99", high="103.5", low="98"),
+        bar(21, open_="99", close="96", high="100", low="95"),  # 103 > 100: gap 7-20-21; break
+    ]
+    assert _offered(on_the_edge, prefix=[]) == [
+        (_at(21), _at(7), Decimal("111"), Decimal("103"), True, _at(21)),
+    ]
+
+
+def test_the_case_that_asked_for_it_wdo_on_15_october() -> None:
+    """WDO M5, 14/10 18:00 to 15/10 09:05 BRT, the bars the engine read. The 18:00 bar is the
+    primary, marked by the three-bar gap of 18:10. His indicator drew a second region on the
+    18:25 bar (5.063-5.068), which the three-bar test refuses — the bar between closed at 5.066,
+    under 18:20's high — and which the opening at 5.080 marks. The 09:05 wick to 5.066 takes it,
+    one bar after it was born: with his minimum age of 7 bars no order was ever placed on it.
+
+    The break is the BOS the engine confirmed on 09:00; its level plays no part here."""
+    rows = [
+        (datetime(2026, 10, 14, 21, 0, tzinfo=UTC), "5044", "5046.5", "5043.5", "5045.5"),
+        (datetime(2026, 10, 14, 21, 5, tzinfo=UTC), "5045.5", "5061", "5045", "5053.5"),
+        (datetime(2026, 10, 14, 21, 10, tzinfo=UTC), "5053.5", "5064.5", "5052.5", "5061"),
+        (datetime(2026, 10, 14, 21, 15, tzinfo=UTC), "5061", "5064", "5059", "5061.5"),
+        (datetime(2026, 10, 14, 21, 20, tzinfo=UTC), "5061.5", "5068", "5060", "5067.5"),
+        (datetime(2026, 10, 14, 21, 25, tzinfo=UTC), "5067.5", "5068", "5063", "5066"),
+        (datetime(2026, 10, 15, 12, 0, tzinfo=UTC), "5080", "5083", "5072.5", "5075.5"),
+        (datetime(2026, 10, 15, 12, 5, tzinfo=UTC), "5075", "5078.5", "5066", "5073"),
+    ]
+    candles = [
+        Candle(time=t, open=Decimal(o), high=Decimal(h), low=Decimal(lo), close=Decimal(c))
+        for t, o, h, lo, c in rows
+    ]
+    bos = StructureBreak(
+        kind=StructureKind.BOS,
+        trend=Trend.BULLISH,
+        level=Decimal("5071"),
+        time=candles[6].time,
+        level_time=candles[0].time,
+        origin=Decimal("5043.5"),
+        origin_time=candles[0].time,
+    )
+
+    def read(opening_gap: bool) -> tuple[list[OrderBlock], OrderBlockDetector]:
+        blocks = OrderBlockDetector(timeframe=timedelta(minutes=5), opening_gap=opening_gap)
+        offered: list[OrderBlock] = []
+        for candle in candles:
+            offered += blocks.update(candle, bos if candle is candles[6] else None)
+        return offered, blocks
+
+    offered, blocks = read(opening_gap=True)
+    assert [(zone.time, zone.top, zone.bottom, zone.primary) for zone in offered] == [
+        (candles[0].time, Decimal("5046.5"), Decimal("5043.5"), True),
+        (candles[5].time, Decimal("5068"), Decimal("5063"), False),
+    ]
+    primary, secondary = blocks.zones
+    assert not primary.mitigated
+    assert (secondary.mitigated_at, secondary.gap_index, secondary.touched_index) == (
+        candles[7].time,
+        6,
+        7,
+    )
+    offered, _ = read(opening_gap=False)
+    assert [zone.time for zone in offered] == [candles[0].time]
+
+
+def test_an_opening_gap_needs_the_chart_s_timeframe() -> None:
+    with pytest.raises(ValueError, match="needs the timeframe"):
+        OrderBlockDetector(opening_gap=True)
+
+
+# Bars as hypothesis draws them: open, close, the wicks past them, and the hours since the bar
+# before — one most of the time, now and then a night.
+_DRAWN = st.lists(
+    st.tuples(
+        st.integers(90, 130),
+        st.integers(90, 130),
+        st.integers(0, 4),
+        st.integers(0, 4),
+        st.sampled_from([1, 1, 1, 1, 2, 15]),
+    ),
+    min_size=3,
+    max_size=80,
+)
+
+
+def _drawn(rows: list[tuple[int, int, int, int, int]], *, pauses: bool) -> list[Candle]:
+    candles = []
+    time = START
+    for open_, close, above, below, hours in rows:
+        candles.append(
+            Candle(
+                time=time,
+                open=Decimal(open_),
+                high=Decimal(max(open_, close) + above),
+                low=Decimal(min(open_, close) - below),
+                close=Decimal(close),
+            )
+        )
+        time += HOUR * (hours if pauses else 1)
+    return candles
+
+
+def _read(candles: list[Candle], blocks: OrderBlockDetector) -> tuple[object, ...]:
+    """Everything a detector says over `candles`: each bar's offer, then every region's fate."""
+    structure = MarketStructure()
+    said = [blocks.update(candle, structure.update(candle)) for candle in candles]
+    fates = [
+        (one.block, one.mitigated, one.mitigated_at, one.gap_index, one.touched_index)
+        for one in blocks.zones
+    ]
+    return (*said, *fates)
+
+
+@given(_DRAWN)
+def test_without_a_pause_the_opening_gap_changes_nothing(
+    rows: list[tuple[int, int, int, int, int]],
+) -> None:
+    candles = _drawn(rows, pauses=False)
+
+    assert _read(candles, OrderBlockDetector(timeframe=HOUR, opening_gap=True)) == _read(
+        candles, OrderBlockDetector()
+    )
+
+
+@given(_DRAWN)
+def test_off_the_timeframe_changes_nothing_pauses_or_not(
+    rows: list[tuple[int, int, int, int, int]],
+) -> None:
+    """The rule off is the detector every recorded result ran on, whatever the chart's spacing."""
+    candles = _drawn(rows, pauses=True)
+
+    assert _read(candles, OrderBlockDetector(timeframe=HOUR)) == _read(
+        candles, OrderBlockDetector()
+    )
 
 
 # --- Zone lifecycle -----------------------------------------------------------------------------

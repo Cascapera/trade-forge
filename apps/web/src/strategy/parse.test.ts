@@ -253,12 +253,15 @@ describe('the one document that comes back spelled out', () => {
     // same way; `true` (every region above) is the rule every recorded result ran under, and the
     // engine reads it only with an `htf`. Its sibling `htf_regions` is an enum with a default,
     // left out when untouched like `entry_point`.
+    // `opening_gap` joined on 2026-10-15 (ADR-0035), a flag written the same way; `false` is the
+    // rule every recorded result ran under.
     expect(rebuilt.setup.params).toEqual({
       allow_secondary: false,
       breakeven_at_r: null,
       htf: null,
       htf_allow_secondary: true,
       max_bos: null,
+      opening_gap: false,
       volume_filter: false,
     })
   })

@@ -2183,6 +2183,7 @@ class StructureStrategy:
         htf_regions: RegionChoice = RegionChoice.ANY,
         htf_allow_secondary: bool = True,
         min_bars_to_touch: int = DEFAULT_MIN_BARS_TO_TOUCH,
+        opening_gap: bool = False,
         timeframe: dt.timedelta | None = None,
         side: Side | None = None,
         reading: MarketReading | None = None,
@@ -2202,6 +2203,10 @@ class StructureStrategy:
         # better than guessing the base from the spacing of the first two candles.
         if htf is not None and timeframe is None:
             raise ValueError("a higher-timeframe filter needs the setup's own timeframe")
+        # His opening gap (15/10, ADR-0035) is read after a pause, and a pause is told from the
+        # spacing of this setup's own bars — the same refusal, for the same reason.
+        if opening_gap and timeframe is None:
+            raise ValueError("an opening gap needs the setup's own timeframe")
         # ⚠️ **The broker's clock comes from the instrument, not the document** (his rule, 30/09:
         # the MetaTrader server's time is the real one). The factory hands over the run's
         # `InstrumentSpec.server_offset`, so the bars above close where his chart closes them.
@@ -2228,7 +2233,9 @@ class StructureStrategy:
         offset = dt.timedelta(0) if htf_offset is None else htf_offset
         self._owns_reading = reading is None
         if reading is None:
-            reading = MarketReading(timeframe=timeframe, htf=htf, htf_offset=offset)
+            reading = MarketReading(
+                timeframe=timeframe, htf=htf, htf_offset=offset, opening_gap=opening_gap
+            )
         elif (reading.regions is None) != (htf is None) or (
             reading.regions is not None
             and (reading.regions.timeframe, reading.regions.offset) != (htf, offset)
@@ -2236,6 +2243,10 @@ class StructureStrategy:
             raise ValueError(
                 "a shared market reading has to read the timeframe this setup filters by"
             )
+        elif reading.opening_gap != opening_gap:
+            # ⚠️ The regions themselves differ, not a filter over them: a run reading another
+            # run's market would trade regions its own document never marks.
+            raise ValueError("a shared market reading has to read opening gaps as this setup does")
         self._reading = reading
         self._gate = (
             None

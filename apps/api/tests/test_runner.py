@@ -552,7 +552,7 @@ def test_a_batch_cuts_every_member_on_its_instruments_clock(
     )
 
     execute_batch(
-        key=(4 * HOUR, THREE_HOURS),
+        key=(4 * HOUR, THREE_HOURS, False),
         runs=[one, one],
         instrument=spec,
         timeframe="H1",
@@ -572,7 +572,7 @@ def test_a_batch_whose_reading_is_cut_on_another_clock_is_refused() -> None:
 
     with pytest.raises(ValueError, match="clock"):
         execute_batch(
-            key=(4 * HOUR, dt.timedelta(0)),
+            key=(4 * HOUR, dt.timedelta(0), False),
             runs=[one],
             instrument=spec,
             timeframe="H1",

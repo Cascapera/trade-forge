@@ -401,6 +401,11 @@
           "title": "Min Bars To Touch",
           "type": "integer"
         },
+        "opening_gap": {
+          "default": false,
+          "title": "Opening Gap",
+          "type": "boolean"
+        },
         "side": {
           "$ref": "#/$defs/TradeSide",
           "default": "both"
@@ -1415,6 +1420,11 @@
           "minimum": 1,
           "title": "Min Bars To Touch",
           "type": "integer"
+        },
+        "opening_gap": {
+          "default": false,
+          "title": "Opening Gap",
+          "type": "boolean"
         },
         "side": {
           "$ref": "#/$defs/TradeSide",

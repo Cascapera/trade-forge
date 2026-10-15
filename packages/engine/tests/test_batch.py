@@ -25,7 +25,7 @@ from tradeforge_engine.setups import ChochQualifier, ContinuationQualifier
 from tradeforge_engine.strategy import compile_strategy
 from tradeforge_engine.testing import EURUSD, HOUR
 
-from .test_market_reading import _walk
+from .test_market_reading import _sessions, _walk
 
 _KINDS = ("structure_choch", "structure_continuation")
 
@@ -43,9 +43,11 @@ def _document(kind: str, params: dict[str, object], *, rr: float | None = 2) -> 
     }
 
 
-def _grid(*, htf: bool) -> list[dict[str, Any]]:
+def _grid(*, htf: bool, opening_gap: bool = False) -> list[dict[str, Any]]:
     """What a sweep varies over one market: entry, side, breakeven, the ladder — not the reading."""
     filtered: dict[str, object] = {"htf": "H4"} if htf else {}
+    if opening_gap:
+        filtered["opening_gap"] = True
     return [
         _document(
             kind,
@@ -152,6 +154,32 @@ def test_every_member_comes_out_as_it_does_alone(
     assert sum(len(result.trades) for result in alone) > 0
 
 
+# (seed, filtered, bars a session, bars in all): walks cut into sessions with a leap at every
+# opening (ADR-0035), measured on 15/10 to be ones where the rule changes what is traded. A filter
+# above lets few entries through, so its walk is longer and its sessions fill whole H4 bars.
+_SESSIONS = [(0, False, 9, 1500), (7, False, 9, 1500), (9, False, 9, 1500), (4, True, 16, 3000)]
+
+
+@pytest.mark.parametrize(("seed", "htf", "length", "count"), _SESSIONS)
+def test_members_reading_opening_gaps_come_out_as_they_do_alone(
+    seed: int, htf: bool, length: int, count: int
+) -> None:
+    """The opening gap is part of the reading, so it is the reading a batch shares: every member
+    still comes out as it does alone — and the rule has to have changed what they traded, or
+    the equality says nothing about it."""
+    candles = _sessions(_walk(seed, count=count), seed, length=length)
+    documents = _grid(htf=htf, opening_gap=True)
+
+    outcomes = _batched(documents, candles, snapshots=False)
+
+    assert [outcome.error for outcome in outcomes] == [None] * len(documents)
+    alone = [_alone(document, candles, snapshots=False) for document in documents]
+    assert [outcome.result for outcome in outcomes] == alone
+    assert sum(len(result.trades) for result in alone) > 0
+    without = [_alone(document, candles, snapshots=False) for document in _grid(htf=htf)]
+    assert [result.trades for result in without] != [result.trades for result in alone]
+
+
 class _FailsOnBar:
     """A member whose strategy raises on the bar it is told to — any run's own failure."""
 
@@ -171,7 +199,7 @@ def test_a_member_that_fails_ends_alone_and_the_others_go_on() -> None:
     candles = _walk(0)
     documents = _grid(htf=True)[:4]
     reading = reading_for(
-        shared_reading(documents[0]["setup"], timeframe=HOUR) or (None, dt.timedelta(0)),
+        shared_reading(documents[0]["setup"], timeframe=HOUR) or (None, dt.timedelta(0), False),
         timeframe=HOUR,
     )
     strategies = [compile_strategy(document, reading=reading) for document in documents]
@@ -262,7 +290,7 @@ def test_every_member_reads_the_batch_s_reading_and_not_one_of_its_own() -> None
 class TestSharedReading:
     def test_what_a_sweep_varies_reads_the_same_market(self) -> None:
         keys = {shared_reading(document["setup"], timeframe=HOUR) for document in _grid(htf=True)}
-        assert keys == {(4 * HOUR, dt.timedelta(0))}
+        assert keys == {(4 * HOUR, dt.timedelta(0), False)}
 
     def test_a_filter_of_another_timeframe_or_clock_reads_another(self) -> None:
         def key(params: dict[str, object], clock: int = 0) -> object:
@@ -272,12 +300,33 @@ class TestSharedReading:
                 server_offset=dt.timedelta(hours=clock),
             )
 
-        assert key({}) == (None, dt.timedelta(0))
-        assert key({"htf": "H4"}) == (4 * HOUR, dt.timedelta(0))
+        assert key({}) == (None, dt.timedelta(0), False)
+        assert key({"htf": "H4"}) == (4 * HOUR, dt.timedelta(0), False)
         assert key({"htf": "D1"}) != key({"htf": "H4"})
         # The clock is the instrument's (30/09), and it still tells two readings apart.
-        assert key({"htf": "H4"}, clock=3) == (4 * HOUR, dt.timedelta(hours=3))
+        assert key({"htf": "H4"}, clock=3) == (4 * HOUR, dt.timedelta(hours=3), False)
         assert key({"htf": "H4"}, clock=3) != key({"htf": "H4"})
+
+    def test_an_opening_gap_reads_another_market(self) -> None:
+        """ADR-0035: the opening gap marks regions the other reading does not have, so a batch
+        must not hand one run's market to the other. Off, said or unsaid, is one market."""
+
+        def key(params: dict[str, object]) -> object:
+            return shared_reading({"type": "structure_choch", "params": params}, timeframe=HOUR)
+
+        assert key({"opening_gap": True}) == (None, dt.timedelta(0), True)
+        assert key({"opening_gap": True, "htf": "H4"}) == (4 * HOUR, dt.timedelta(0), True)
+        assert key({"opening_gap": False}) == key({}) == (None, dt.timedelta(0), False)
+        # A flag that is not a flag cannot share a reading: it fails alone, with its reason.
+        assert key({"opening_gap": "yes"}) is None
+
+    def test_a_setup_refuses_a_reading_of_the_other_opening_gap(self) -> None:
+        on = _document("structure_choch", {"opening_gap": True})
+        with pytest.raises(ValueError, match="opening gaps"):
+            compile_strategy(on, reading=MarketReading(timeframe=HOUR))
+        off = _document("structure_choch", {})
+        with pytest.raises(ValueError, match="opening gaps"):
+            compile_strategy(off, reading=MarketReading(timeframe=HOUR, opening_gap=True))
 
     def test_a_document_that_states_the_clock_cannot_share_a_reading(self) -> None:
         # Refused by the factory (30/09), so read as "cannot share" — the same answer as any
@@ -404,7 +453,7 @@ class TestQuietBars:
         above, or with a side released, the full bar could arm the rung, and skipping it would
         lose the trade from the batch alone."""
         candles = _walk(0, count=3)
-        reading = reading_for((4 * HOUR, dt.timedelta(0)), timeframe=HOUR)
+        reading = reading_for((4 * HOUR, dt.timedelta(0), False), timeframe=HOUR)
         strategy: Any = compile_strategy(_grid(htf=True)[0], reading=reading)
         with localcontext(ENGINE_CONTEXT):
             reading.advance(candles[0])

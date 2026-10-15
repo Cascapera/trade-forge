@@ -95,7 +95,7 @@ from tradeforge_engine import BacktestMetrics as EngineMetrics
 from tradeforge_engine import ClosedTrade
 from tradeforge_engine.domain import InstrumentSpec
 from tradeforge_engine.excursion import target_ladder
-from tradeforge_engine.setup_factory import shared_reading
+from tradeforge_engine.setup_factory import ReadingKey, shared_reading
 
 
 def _now() -> dt.datetime:
@@ -582,7 +582,7 @@ async def _fail_open(
 
 def shared_reading_of(
     definition: Mapping[str, Any], timeframe: str, server_offset: dt.timedelta
-) -> tuple[dt.timedelta | None, dt.timedelta] | None:
+) -> ReadingKey | None:
     """The reading of the market a stored document's setup shares (`shared_reading`), if any —
     its bars above cut on `server_offset`, the instrument's clock (30/09)."""
     setup = definition.get("setup")

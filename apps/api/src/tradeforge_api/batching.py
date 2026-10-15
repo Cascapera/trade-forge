@@ -1,10 +1,10 @@
 """Which runs of a launch go to a worker together, and how they are queued (ADR-0029).
 
 A sweep's runs over one market — one symbol, one chart, one window, one reading of the market
-(`shared_reading`: the timeframe above and the broker's clock) — run as a batch: one job, the
-market read once per bar for all of them (`runner.execute_batch`). Everything else runs as it
-always has, one job per run: a run whose document reads no shared market, and a run waiting for
-a download (its wait is `run_backtest`'s, per run).
+(`shared_reading`: the timeframe above, the broker's clock and the opening gap) — run as a batch:
+one job, the market read once per bar for all of them (`runner.execute_batch`). Everything else
+runs as it always has, one job per run: a run whose document reads no shared market, and a run
+waiting for a download (its wait is `run_backtest`'s, per run).
 
 ⚠️ **`BATCH_SIZE` is a trade, not a tuning knob.** Larger batches share the reading among more
 runs (the gain grows towards the setup's own cost), but a batch is also the unit that fails
@@ -33,8 +33,10 @@ def batch_size(timeframe: str) -> int:
     return _SMALLER.get(timeframe, BATCH_SIZE)
 
 
-BatchKey = tuple[str, str, dt.timedelta | None, WarmUp]
-"""(symbol, chart, timeframe above, warm-up) — every run of one launch already shares its window.
+BatchKey = tuple[str, str, dt.timedelta | None, bool, WarmUp]
+"""(symbol, chart, timeframe above, opening gap, warm-up) — every run of one launch already shares
+its window. The opening gap because it changes which regions the market has (ADR-0035): a run with
+it and one without read two different markets, and a batch reads one.
 The warm-up because a batch feeds one stream of bars to all its runs (ADR-0030, `warm_window`).
 The broker's clock the bars above are cut on is the symbol's (30/09), so the symbol already
 carries it; the worker reads it off the instrument when it builds the reading."""
@@ -46,7 +48,10 @@ def batch_key(document: Mapping[str, Any], symbol: str, timeframe: str) -> Batch
     if not isinstance(setup, Mapping):
         return None
     reading = shared_reading(setup, timeframe=step(timeframe))
-    return None if reading is None else (symbol, timeframe, reading[0], warmup_for(document))
+    if reading is None:
+        return None
+    htf, _clock, opening_gap = reading
+    return (symbol, timeframe, htf, opening_gap, warmup_for(document))
 
 
 class Batcher:
@@ -68,7 +73,7 @@ class Batcher:
         """Each job's runs: batches of up to `size` per key in the order the keys were met, then
         the runs that go alone, one each. A batch of one is a run alone."""
         jobs = []
-        for (_symbol, timeframe, _reading, _warmup), runs in self._groups.items():
+        for (_symbol, timeframe, _htf, _opening_gap, _warmup), runs in self._groups.items():
             size = self._size or batch_size(timeframe)
             jobs += [runs[start : start + size] for start in range(0, len(runs), size)]
         return jobs + [[run_id] for run_id in self._alone]

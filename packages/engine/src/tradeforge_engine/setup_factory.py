@@ -290,6 +290,14 @@ def _structure_kwargs(
     _flag(params, "volume_filter", kwargs)
     # His minimum age of a region before it may be traded (29/09), counted in bars.
     _int(params, "min_bars_to_touch", kwargs)
+    # His opening gap (15/10, ADR-0035): read after a pause, so it needs this setup's own
+    # timeframe. Passed only when switched on — off is the class's default, and a keyword the
+    # document never asked for is a place a default could hide.
+    _flag(params, "opening_gap", kwargs)
+    if kwargs.get("opening_gap") is False:
+        del kwargs["opening_gap"]
+    elif kwargs.get("opening_gap") is True:
+        kwargs["timeframe"] = timeframe
     # The timeframe above, and this setup's own for it to build on. The base is passed only
     # when the document set a filter: the class accepts it unused, but a keyword the document
     # never asked for is a third place a default could hide (see the module docstring).
@@ -407,12 +415,16 @@ def build_setup(
     return build(_params(node), timeframe)
 
 
+ReadingKey = tuple[dt.timedelta | None, dt.timedelta, bool]
+"""(timeframe above, broker's clock, opening gap) — what of the market a structure setup reads."""
+
+
 def shared_reading(
     node: Mapping[str, object],
     *,
     timeframe: dt.timedelta,
     server_offset: dt.timedelta = dt.timedelta(0),
-) -> tuple[dt.timedelta | None, dt.timedelta] | None:
+) -> ReadingKey | None:
     """What of the market this setup block reads, as a key — or `None` if it cannot share one.
 
     Two blocks with the same key, over the same bars, read the same market: the same structure and
@@ -420,6 +432,9 @@ def shared_reading(
     it is cut on, the instrument's since 30/09). That is what a batch groups runs by (ADR-0029),
     and `MarketReading` is built from it. `None` for a setup that builds no reading, and for a
     block too malformed to parse — running it on its own is never wrong, only slower.
+
+    ⚠️ **The opening gap is part of the key** (ADR-0035): it changes which regions are marked, on
+    the chart and above it, so a run with it on and one with it off read two different markets.
     """
     kind = node.get("type")
     if not isinstance(kind, str) or kind not in _READING_BUILDERS:
@@ -428,15 +443,13 @@ def shared_reading(
         kwargs = _structure_kwargs(_params(node), timeframe, server_offset)
     except (EngineError, ValueError):
         return None
-    return (kwargs.get("htf"), server_offset)
+    return (kwargs.get("htf"), server_offset, kwargs.get("opening_gap", False))
 
 
-def reading_for(
-    key: tuple[dt.timedelta | None, dt.timedelta], *, timeframe: dt.timedelta
-) -> MarketReading:
+def reading_for(key: ReadingKey, *, timeframe: dt.timedelta) -> MarketReading:
     """The reading a batch whose members share `key` (`shared_reading`) advances once per bar."""
-    htf, offset = key
-    return MarketReading(timeframe=timeframe, htf=htf, htf_offset=offset)
+    htf, offset, opening_gap = key
+    return MarketReading(timeframe=timeframe, htf=htf, htf_offset=offset, opening_gap=opening_gap)
 
 
 HTF_CHOICES = frozenset({"htf_regions", "htf_allow_secondary"})
@@ -481,4 +494,4 @@ def unread_params(node: Mapping[str, object]) -> frozenset[str]:
     return frozenset()
 
 
-__all__ = ["build_setup", "reading_for", "shared_reading", "unread_params"]
+__all__ = ["ReadingKey", "build_setup", "reading_for", "shared_reading", "unread_params"]

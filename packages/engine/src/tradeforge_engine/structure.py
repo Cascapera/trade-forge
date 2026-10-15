@@ -28,7 +28,7 @@ context.
 from collections import deque
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import Final, Self
 
@@ -1202,6 +1202,18 @@ def holding(zones: Sequence[TrackedZone], block: OrderBlock) -> tuple[TrackedZon
     return tuple(tracked for tracked in zones if tracked.block == block)
 
 
+OPENING_GAP_LONGEST: Final = timedelta(hours=4)
+"""The longest bar an opening gap is read on (his choice, 15/10): M1 to H4. From D1 up every bar is
+a whole session, and the leap from one to the next is the three-bar test's to read."""
+
+SHORTEST_PAUSE: Final = timedelta(minutes=30)
+"""How long a chart has to go without a bar for the next one to open a session (ADR-0035).
+
+Longer than one bar is not enough on its own: an illiquid market skips the minutes nobody traded,
+and a hole of two M1 bars is not a session opening. Every pause he reads is far longer — B3's night,
+the CFDs' hour, FX's weekend — so the floor only refuses the holes of thin trading."""
+
+
 class OrderBlockDetector:
     """Marks supply and demand zones from the impulse legs that break structure.
 
@@ -1229,6 +1241,17 @@ class OrderBlockDetector:
     So a region has two lives. It is *followed* from its gap, by anyone or no one; it is *offered*
     when a break reveals it, and only if it is still standing then. Nothing is reported before the
     break, so a strategy still only ever acts from `confirmed_at` onward and acts at the next open.
+
+    **The opening gap** (`opening_gap`, his Profit indicator's rule, 15/10 — ADR-0035) is a fifth
+    rule, off unless asked for. After a pause in the chart, a bar that **opens** beyond the last
+    bar before the pause marks that last bar as a region, on the opening bar itself. The three-bar
+    test cannot see this one: the leap is between two bars, and the bar before it never had to
+    close beyond anything. It is a gap like the others in every way that follows — the same latch,
+    the same leg, the same first touch, the same age counted from its own bar — so an opening bar
+    that already traded back to the region's entry edge leaves it born taken. A pause is a stretch
+    with **no bars** longer than one bar and at least `SHORTEST_PAUSE`; a break that fits inside a
+    bar is invisible on that chart. Read only up to `OPENING_GAP_LONGEST`: from D1 up every bar is
+    a whole session already, and the three-bar test reads the leap between them.
     """
 
     # A leg longer than this is not an impulse any more; the cap also bounds memory when a long
@@ -1237,7 +1260,21 @@ class OrderBlockDetector:
     # Offered regions stay readable to strategies for a while after they die; keep the recent ones.
     _MAX_ZONES: Final = 200
 
-    def __init__(self) -> None:
+    def __init__(self, *, timeframe: timedelta | None = None, opening_gap: bool = False) -> None:
+        """`timeframe` is how long one of these bars lasts, and only the opening gap reads it: a
+        pause is told from the bars' spacing, so a detector asked for one without it is refused
+        rather than left to guess the spacing from the first two bars."""
+        if opening_gap and timeframe is None:
+            raise ValueError(
+                "an opening gap is read after a pause, and a pause needs the timeframe"
+            )
+        # The bar length the opening gap is read on, or `None` with the rule off — asked for on a
+        # chart above `OPENING_GAP_LONGEST` included, where it is off by his choice (15/10).
+        self._opening: timedelta | None = (
+            timeframe
+            if opening_gap and timeframe is not None and timeframe <= OPENING_GAP_LONGEST
+            else None
+        )
         self._fvgs = FVGDetector()
         self._window: deque[Candle] = deque(maxlen=3)
         self._regions: list[_Region] = []
@@ -1275,8 +1312,9 @@ class OrderBlockDetector:
         self._index += 1
         self._window.append(candle)
         # Everything already being followed advances *before* this bar can mark anything new. A
-        # region cannot be taken by the bar that created it — his gap condition puts price clear
-        # of the region on that bar, so the first touch can only come later.
+        # three-bar region cannot be taken by the bar that created it — his gap condition puts
+        # price clear of the region on that bar. An opening gap's can, and is stamped where it is
+        # born (`_opening_region`).
         taken = False
         for tracked in self._live:
             self._advance(tracked, candle, self._index)
@@ -1287,13 +1325,28 @@ class OrderBlockDetector:
             region.mitigated = region.mitigated or region.touched_by(candle)
 
         gap = self._fvgs.update(candle)
+        opening = self._opening_region(candle)
+        # ⚠️ **One latch for both rules.** A bar gapping either way keeps the run alive, so a push
+        # that leaps the pause and goes on gapping is one region, not one per rule — the bar after
+        # an opening gap would otherwise mark the very same candle again as a three-bar gap. With
+        # the opening gap off `opening` is always `None`, and this is the latch it always was.
+        gapping: set[FVGKind] = set()
+        if gap is not None:
+            gapping.add(gap.kind)
+        if opening is not None:
+            gapping.add(opening.kind)
         for kind in self._gapping:
-            self._gapping[kind] = self._gapping[kind] and gap is not None and gap.kind is kind
+            self._gapping[kind] = self._gapping[kind] and kind in gapping
         if gap is not None and not self._gapping[gap.kind]:
             if len(self._window) == self._window.maxlen:
                 marking, _impulse, _third = self._window
                 self._regions.append(_Region(index=self._index, kind=gap.kind, marking=marking))
             self._gapping[gap.kind] = True
+        # The three-bar gap goes first: on a bar where both hold the same way, its marking candle
+        # is where the push began, and the opening bar only continues it.
+        if opening is not None and not self._gapping[opening.kind]:
+            self._regions.append(opening)
+            self._gapping[opening.kind] = True
         self._regions = [r for r in self._regions if self._index - r.index <= self._MAX_LOOKBACK]
 
         if break_ is None:
@@ -1331,6 +1384,30 @@ class OrderBlockDetector:
             self._view = ZoneView(self._zones)
         return marked
 
+    def _opening_region(self, candle: Candle) -> _Region | None:
+        """The region an opening gap marks on this bar, or `None` (ADR-0035).
+
+        The bar before the pause is the region, and this bar is its gap's: the region is counted
+        from here, as a three-bar gap's is from its third candle. It is born taken when this bar
+        already traded back to its entry edge — opening beyond a bar says nothing about where the
+        bar went next, and a first touch is the first touch whichever bar it lands on.
+        """
+        if self._opening is None or len(self._window) < 2:  # noqa: PLR2004 — this bar and the one before
+            return None
+        before = self._window[-2]
+        pause = candle.time - before.time
+        if pause <= self._opening or pause < SHORTEST_PAUSE:
+            return None
+        if candle.open > before.high:
+            kind = FVGKind.BULLISH
+        elif candle.open < before.low:
+            kind = FVGKind.BEARISH
+        else:
+            return None
+        region = _Region(index=self._index, kind=kind, marking=before)
+        region.mitigated = region.touched_by(candle)
+        return region
+
     @staticmethod
     def _advance(tracked: TrackedZone, candle: Candle, index: int) -> None:
         """Fold one candle into an offered region: the first touch of its entry edge takes it.
@@ -1367,6 +1444,8 @@ class OrderBlockDetector:
 
 
 __all__ = [
+    "OPENING_GAP_LONGEST",
+    "SHORTEST_PAUSE",
     "FVGDetector",
     "FVGKind",
     "FairValueGap",

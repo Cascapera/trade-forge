@@ -1,11 +1,11 @@
 """The market as a structure setup reads it: its breaks, its regions, and the regions above.
 
-⚠️ **Pure: a function of the bars, the setup's own timeframe, the timeframe above and the broker's
-clock** — nothing a setup does reaches it (ADR-0029). That is what lets one reading serve many
-runs of a sweep over the same market: a leader advances it once per bar, and every run reads it.
-A run that is not part of a batch — a backtest on its own, paper, live — builds its own and
-advances it itself, which is what every run did before 27/09, with the same objects in the same
-order.
+⚠️ **Pure: a function of the bars, the setup's own timeframe, the timeframe above, the broker's
+clock and whether opening gaps mark regions** — nothing a setup does reaches it (ADR-0029). That
+is what lets one reading serve many runs of a sweep over the same market: a leader advances it
+once per bar, and every run reads it. A run that is not part of a batch — a backtest on its own,
+paper, live — builds its own and advances it itself, which is what every run did before 27/09,
+with the same objects in the same order.
 """
 
 import datetime as dt
@@ -37,11 +37,15 @@ class MarketReading:
         timeframe: dt.timedelta | None = None,
         htf: dt.timedelta | None = None,
         htf_offset: dt.timedelta | None = None,
+        opening_gap: bool = False,
     ) -> None:
         if htf is not None and timeframe is None:
             raise ValueError("a higher-timeframe reading needs the setup's own timeframe")
         self._structure = MarketStructure()
-        self._blocks = OrderBlockDetector()
+        # His opening gap (ADR-0035) on both charts or on neither: the regions above are his
+        # regions too, read by the same rule on their own bars.
+        self._opening_gap = opening_gap
+        self._blocks = OrderBlockDetector(timeframe=timeframe, opening_gap=opening_gap)
         # ⚠️ No broker clock means UTC — the setup's default; a run hands over its instrument's.
         self._regions = (
             None
@@ -50,6 +54,7 @@ class MarketReading:
                 base=timeframe,
                 target=htf,
                 offset=dt.timedelta(0) if htf_offset is None else htf_offset,
+                opening_gap=opening_gap,
             )
         )
         self._break: StructureBreak | None = None
@@ -59,6 +64,11 @@ class MarketReading:
     @property
     def structure(self) -> MarketStructure:
         return self._structure
+
+    @property
+    def opening_gap(self) -> bool:
+        """Whether an opening gap marks a region on this reading's charts (ADR-0035)."""
+        return self._opening_gap
 
     @property
     def blocks(self) -> OrderBlockDetector:

@@ -49,7 +49,7 @@ from tradeforge_engine.batch import BatchMember, run_batch
 from tradeforge_engine.domain import AssetClass
 from tradeforge_engine.loop import RunResult
 from tradeforge_engine.protocols import CostModel
-from tradeforge_engine.setup_factory import reading_for
+from tradeforge_engine.setup_factory import ReadingKey, reading_for
 from tradeforge_schema import SemanticValidationError, assert_executable
 from tradeforge_schema import Strategy as StrategyDSL
 
@@ -403,7 +403,7 @@ class Measured(NamedTuple):
 
 def execute_batch(  # noqa: PLR0913 — keyword-only; each names one axis the batch shares
     *,
-    key: tuple[dt.timedelta | None, dt.timedelta],
+    key: ReadingKey,
     runs: Sequence[BatchRun],
     instrument: InstrumentSpec,
     timeframe: str,

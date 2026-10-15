@@ -333,11 +333,23 @@ class TestTheLaunchCutsBatches:
         assert batch_key(mme9, "EURUSD", "H1") is None
         assert batch_key({"entry": {}}, "EURUSD", "H1") is None
 
+    def test_an_opening_gap_is_another_batch(self) -> None:
+        """ADR-0035: the opening gap changes which regions the market has, so a run with it and
+        one without never share a batch's reading."""
+
+        def key(params: dict[str, object]) -> object:
+            return batch_key(
+                {"setup": {"type": "structure_choch", "params": params}}, "EURUSD", "H1"
+            )
+
+        assert key({"opening_gap": True}) != key({})
+        assert key({"opening_gap": False}) == key({})
+
     def test_runs_are_cut_by_market_in_batches_of_at_most_the_size(self) -> None:
         batcher = Batcher(size=2)
         eur, gbp = (
-            ("EURUSD", "H1", None, _NO_WARMUP),
-            ("GBPUSD", "H1", None, _NO_WARMUP),
+            ("EURUSD", "H1", None, False, _NO_WARMUP),
+            ("GBPUSD", "H1", None, False, _NO_WARMUP),
         )
         ids = [uuid.uuid4() for _ in range(6)]
         for run_id, key in zip(ids, [eur, gbp, eur, None, eur, gbp], strict=True):
@@ -354,7 +366,7 @@ class TestTheLaunchCutsBatches:
         batcher = Batcher()
         ids = [uuid.uuid4() for _ in range(13)]
         for run_id in ids:
-            batcher.add(run_id, ("EURUSD", "M1", None, _NO_WARMUP))
+            batcher.add(run_id, ("EURUSD", "M1", None, False, _NO_WARMUP))
         assert [len(job) for job in batcher.jobs()] == [6, 6, 1]
 
     def test_switched_off_every_run_goes_alone(self) -> None:
@@ -362,7 +374,7 @@ class TestTheLaunchCutsBatches:
         batcher = Batcher(enabled=False)
         ids = [uuid.uuid4() for _ in range(3)]
         for run_id in ids:
-            batcher.add(run_id, ("EURUSD", "H1", None, _NO_WARMUP))
+            batcher.add(run_id, ("EURUSD", "H1", None, False, _NO_WARMUP))
         assert batcher.jobs() == [[one] for one in ids]
 
 

@@ -3083,3 +3083,17 @@ runs deveriam voltar a `queued`, não `failed`; `failed` só quando é a última
 - **O drawdown das regras soma mercados que rodam juntos.** O relatório soma todos os trades da base
   numa conta só, em ordem de fechamento. É a conta de quem opera todos os mercados com o mesmo risco
   por trade, sem limite de posições abertas. Uma conta real teria limite de exposição.
+
+## Gap de abertura (ADR-0035, 15/10)
+
+- [origem: gap de abertura] **Não lançar varredura com `opening_gap` antes de reconstruir os workers.** O
+  worker não valida o documento, e o motor antigo ignora parâmetros que não conhece. O run sairia sem o
+  gap, com a mesma versão 0.6.0, e o reaproveitamento poderia copiá-lo depois. Uma trava de verdade
+  seria o worker recusar parâmetro desconhecido (validar com o schema, como o `timeframe_refusal` da
+  API já faz). Adiado: pede revisar o custo dessa validação em milhões de runs.
+- [origem: gap de abertura] **`unread_params` não sabe que a opção é inerte no D1/W1.** Ele só lê o
+  bloco do setup, sem o tempo gráfico. Uma varredura em D1 que varie a opção roda o par duas vezes.
+  Adiado: ninguém varre essa opção em D1 hoje.
+- [origem: gap de abertura] **Conferir os itens 5 e 6 do ADR com o indicador v102.** A região tocada
+  na própria barra de abertura nasce tocada, e a trava é a mesma para as duas regras. São a leitura
+  coerente das regras que já temos, mas o código do v102 não foi lido. Se divergir, o indicador ganha.

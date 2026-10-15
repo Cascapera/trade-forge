@@ -3097,7 +3097,7 @@ runs deveriam voltar a `queued`, não `failed`; `failed` só quando é a última
 - [origem: gap de abertura] **Conferir o item 6 do ADR com o indicador v102: a trava atravessa a
   pausa?** O item 5 ele respondeu em 15/10 ("não desenha se a mínima do candle fechar o gap ou não
   confirmar o rompimento pelo fechamento"), e o #465 o aplicou. Resta o caso em que o pregão termina
-  numa sequência de gaps e a abertura também é gap. Hoje é um empurrão só, uma região. Desligada, a
+  num gap (basta um) e a abertura também é gap. Hoje é um empurrão só, uma região. Desligada, a
   última vela vira uma segunda região
   (`test_a_run_carried_across_the_pause_is_one_region_where_off_reads_two`). Perguntar a ele se o
   Profit desenha uma caixa ou duas nesse caso.

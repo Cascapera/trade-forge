@@ -89,10 +89,10 @@ Os detalhes, e de quem é cada um:
   o gap e com a mesma versão, e o reaproveitamento poderia copiá-lo depois. **Não lançar varredura
   com a opção ligada antes de reconstruir os workers** (aqui, no Xeon e onde mais houver).
 - **Ligar a opção ainda pode tirar uma região, num caso só: a trava que atravessa a pausa** (item
-  6). Se o pregão termina numa sequência de gaps e a abertura também é gap, o empurrão continua do
-  outro lado da pausa, e o gap de três velas da barra seguinte não marca nada. Desligada, a abertura
-  não é gap, a sequência acaba nela, e esse gap marca a última vela como uma segunda região. O
-  teste `test_a_run_carried_across_the_pause_is_one_region_where_off_reads_two` fixa esse caso, e
+  6). Se o pregão termina num gap (basta um, cuja terceira vela é a última antes da pausa) e a
+  abertura também é gap, o empurrão continua do outro lado da pausa, e o gap de três velas da barra
+  seguinte não marca nada. Desligada, a abertura não é gap, o empurrão acaba nela, e esse gap marca
+  a última vela como uma segunda região. O teste `test_a_run_carried_across_the_pause_is_one_region_where_off_reads_two` fixa esse caso, e
   é onde o v102 ainda pode divergir. O outro caso, o da abertura que volta até a vela, deixou de
   existir no #465 (item 5).
 - **Uma pausa que cabe dentro de uma barra não aparece.** No H4 de um CFD, a hora de pausa fica

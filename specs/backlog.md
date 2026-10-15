@@ -3094,12 +3094,13 @@ runs deveriam voltar a `queued`, não `failed`; `failed` só quando é a última
 - [origem: gap de abertura] **`unread_params` não sabe que a opção é inerte no D1/W1.** Ele só lê o
   bloco do setup, sem o tempo gráfico. Uma varredura em D1 que varie a opção roda o par duas vezes.
   Adiado: ninguém varre essa opção em D1 hoje.
-- [origem: gap de abertura] **Conferir os itens 5 e 6 do ADR com o indicador v102.** A região tocada
-  na própria barra de abertura nasce tocada, e a trava é a mesma para as duas regras. São a leitura
-  coerente das regras que já temos, mas o código do v102 não foi lido. Se divergir, o indicador ganha.
-  O caso mais sensível é a abertura que salta a vela e volta até a borda na mesma barra: com a opção
-  ligada essa região some (`test_switching_it_on_can_take_a_region_away`). Perguntar a ele o que o
-  indicador desenha nesse caso.
+- [origem: gap de abertura] **Conferir o item 6 do ADR com o indicador v102: a trava atravessa a
+  pausa?** O item 5 ele respondeu em 15/10 ("não desenha se a mínima do candle fechar o gap ou não
+  confirmar o rompimento pelo fechamento"), e o #465 o aplicou. Resta o caso em que o pregão termina
+  numa sequência de gaps e a abertura também é gap. Hoje é um empurrão só, uma região. Desligada, a
+  última vela vira uma segunda região
+  (`test_a_run_carried_across_the_pause_is_one_region_where_off_reads_two`). Perguntar a ele se o
+  Profit desenha uma caixa ou duas nesse caso.
 - [origem: gap de abertura] **Trava no reaproveitamento para `opening_gap`.** Sugestão do
   engine-guardian (15/10): não copiar um run com `opening_gap: true` feito antes de os workers
   saberem da opção. Isso fecha o risco do worker antigo sem depender de disciplina. Adiado: os

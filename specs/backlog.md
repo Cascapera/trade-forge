@@ -3090,17 +3090,12 @@ runs deveriam voltar a `queued`, não `failed`; `failed` só quando é a última
   worker não valida o documento, e o motor antigo ignora parâmetros que não conhece. O run sairia sem o
   gap, com a mesma versão 0.6.0, e o reaproveitamento poderia copiá-lo depois. Uma trava de verdade
   seria o worker recusar parâmetro desconhecido (validar com o schema, como o `timeframe_refusal` da
-  API já faz). Adiado: pede revisar o custo dessa validação em milhões de runs.
+  API já faz). Adiado: pede revisar o custo dessa validação em milhões de runs. **15/10:** workers
+  daqui e do Xeon reconstruídos no e93b77f. A Contabo (desligada desde 14/10) ainda tem o código
+  antigo: atualizar antes de religá-la, ou não religar.
 - [origem: gap de abertura] **`unread_params` não sabe que a opção é inerte no D1/W1.** Ele só lê o
   bloco do setup, sem o tempo gráfico. Uma varredura em D1 que varie a opção roda o par duas vezes.
   Adiado: ninguém varre essa opção em D1 hoje.
-- [origem: gap de abertura] **Conferir o item 6 do ADR com o indicador v102: a trava atravessa a
-  pausa?** O item 5 ele respondeu em 15/10 ("não desenha se a mínima do candle fechar o gap ou não
-  confirmar o rompimento pelo fechamento"), e o #465 o aplicou. Resta o caso em que o pregão termina
-  num gap (basta um) e a abertura também é gap. Hoje é um empurrão só, uma região. Desligada, a
-  última vela vira uma segunda região
-  (`test_a_run_carried_across_the_pause_is_one_region_where_off_reads_two`). Perguntar a ele se o
-  Profit desenha uma caixa ou duas nesse caso.
 - [origem: gap de abertura] **Trava no reaproveitamento para `opening_gap`.** Sugestão do
   engine-guardian (15/10): não copiar um run com `opening_gap: true` feito antes de os workers
   saberem da opção. Isso fecha o risco do worker antigo sem depender de disciplina. Adiado: os

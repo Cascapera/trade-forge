@@ -2133,8 +2133,9 @@ def test_a_run_carried_across_the_pause_is_one_region_where_off_reads_two() -> N
     ends in a run of three-bar gaps — 4-5-6 marks bar 4, 5-6-7 continues it — and the opening
     clears bar 7: on, the run goes on across the pause, so 7-20-21 is the same push and marks
     nothing. Off, the opening bar is no gap, the run ends on it, and 7-20-21 marks bar 7 as a
-    second region. One push, one region is his latch; whether his indicator carries it across the
-    pause is the part not read off it — the backlog asks him."""
+    second region. One push, one region is his latch, and his indicator carries it across the
+    pause: "it draws 1, because continuous gaps make no other region, only if a pause occurs" —
+    a bar that gaps nothing, not the session's pause (his answer, 15/10)."""
     candles = [
         bar(0, open_="128", close="128", high="130", low="126"),  # top 130
         bar(1, open_="125", close="125", high="128", low="124"),  # correction 1

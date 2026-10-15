@@ -3059,15 +3059,24 @@ runs deveriam voltar a `queued`, não `failed`; `failed` só quando é a última
 
 ## Série reescalada pela corretora (14/10) — o que ficou para depois
 
-- **A sessão ao vivo ainda não percebe a rolagem sozinha.** A coleta agora não deixa degrau no disco, mas
-  uma sessão que atravessa o vencimento (o WDO vence todo mês) recebe as velas novas na escala nova sobre o
-  histórico velho que tem na memória. PR B: o publicador relê as velas anteriores a cada vela nova; a sessão
-  compara as velas repetidas do disco e do stream ao aquecer; o supervisor para o ativo, recoleta e reinicia.
-- **Sinais no tick do contrato.** A série ajustada (`WIN$`, tick 1) gera stop como 210 072, que não é
-  múltiplo de 5. PR C: arredondar entrada, stop e alvo ao tick do contrato.
+- ~~**A sessão ao vivo ainda não percebe a rolagem sozinha.**~~ FEITO no PR-460: o publicador relê as 30
+  velas anteriores a cada vela nova, segura a vela reescalada, recoleta o ativo e pede o reinício.
+- ~~**Sinais no tick do contrato.**~~ FEITO no PR-461 (`instruments.price_step`, `on_the_step`).
 - **Os anos que a corretora não entrega mais.** Reescalada a série, a coleta recusa se a corretora não serve
   os anos mais antigos em disco (escreveria um degrau). Hoje é decisão à mão: mover os arquivos antigos e
   coletar do começo da corretora. Daria para reescalar os anos antigos pela razão medida.
-- **A imagem da API ainda tem a regra antiga do spread** (uma leitura vazia apagava o medido) até o próximo
-  build da API.
+- ~~**A imagem da API ainda tem a regra antiga do spread.**~~ FEITO: a API foi reconstruída no deploy do
+  PR-461.
 
+## A grade de stops do ML (14/10, ADR-0031) — o que ficou para depois
+
+- **O swap de uma célula com alvo é o do trade inteiro.** O alvo é lido da MFE, sem broker próprio, e
+  o trade que bate o alvo no 3º dia paga o swap dos 150 dias. Com swap negativo, a célula sai pior do
+  que seria; com swap positivo (raro), melhor. Guardar a barra em que cada alvo foi atingido resolveria.
+- **Entradas que só um stop maior aceitaria não estão na base.** Uma ordem stop com escorregamento entre
+  meio R do setup e meio R de um stop 2× é recusada no 1×, e a grade só cobre as entradas da base.
+- **O stop multiplicado não é arredondado ao tick.** O motor aceita qualquer preço, e a diferença é menor
+  que um tick. Para levar a célula escolhida ao ao vivo, ela precisa do passo do contrato (`on_the_step`).
+- **O relatório da grade e o modelo por célula** são os próximos PRs: a melhor célula fixa por setup e
+  mercado, escolhida nos anos de treino e julgada na validação, com drawdown e a maior sequência de
+  perdas; depois, o modelo que estima o R esperado de cada célula por entrada.

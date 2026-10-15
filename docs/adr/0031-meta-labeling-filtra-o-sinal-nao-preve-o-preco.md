@@ -132,3 +132,34 @@ Treinando as 17 bases de 13/10, duas coisas apareceram no rótulo, e as duas vio
 
 O tamanho da posição **não** muda o rótulo. Spread, comissão e swap crescem junto com o volume,
 e o R se mantém (14/10, corrigindo o que eu tinha dito de manhã).
+
+## Atualização 14/10 — cada entrada também com outros stops
+
+Com o rótulo corrigido, o modelo quase não separa mais as entradas: a metade que ele escolhe
+melhora no máximo 0,10 a 0,14 R, e em dois setups de FX não melhora nada. **A ideia dele:** setups
+que acertam 20% fecham positivos quando o risco-retorno é alto, então a pergunta passa a ser
+**qual stop e qual alvo** usar em cada entrada, e não só "pega ou pula".
+
+**Decisão:** o replay troca cada entrada também com o stop a **0,5×, 0,75×, 1,5×, 2× e 3×** a
+distância do setup (`replay.STOPS`), cada um num `BacktestBroker` próprio, e grava
+`grid.parquet` ao lado da base, com uma linha por entrada e stop, na ordem dos eventos. O
+`events.parquet` não muda: o 1× é o próprio trade.
+
+- **A distância é medida do nível da ordem** (o gatilho, o limite ou o fechamento da decisão a
+  mercado), porque o stop vai junto com a ordem, antes de se saber onde ela executa.
+- **O alvo continua lido da MFE** de cada stop (`excursion.with_target`), sem broker próprio. O
+  único erro é o swap: a célula com alvo paga o swap do trade inteiro.
+- **Uma célula pode não ter trade.** "Recusada" quando o motor não executa a entrada com aquele
+  stop: escorregamento de mais de meio R numa ordem stop, ou gap através do stop numa limitada.
+  "Aberta" quando as barras acabaram com o trade de stop maior ainda vivo: o resultado não é
+  conhecido.
+- **Os outros stops são seguidos a partir da barra em que a entrada do setup executou**, uma vez
+  por entrada distinta do gráfico. O motor só lê o stop para recusar uma execução, nunca para
+  decidir quando ela acontece. Um teste prova, nos setups MM9 reais, que isso dá o mesmo trade
+  da ordem com aquele stop esperando desde a barra da decisão. Na 9.4 BR, o replay passou de 125 s
+  para 163 s.
+
+A grade cobre **as entradas da base**: uma entrada que só um stop maior teria aceitado (o 1×
+recusado pelo escorregamento) não está nela. O relatório da grade (a melhor célula fixa
+escolhida nos anos de treino, julgada na validação) e o modelo que escolhe a célula por entrada
+vêm nos próximos PRs.

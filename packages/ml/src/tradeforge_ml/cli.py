@@ -8,8 +8,9 @@
                        [--min-stop-ticks 5] [--min-stop-spreads 2] [--no-floor]
                                                       # the first meta-label, judged
     tradeforge-ml replay <sweep-id> [--out data/ml] [--ohlcv data/ohlcv] [--horizon 150]
-                         [--processes N] [--costs measured|run]
-                                                      # every proposal, traded alone
+                         [--processes N] [--costs measured|run] [--stops 0.5,0.75,1,1.5,2,3]
+                                                      # every proposal, traded alone, and
+                                                      # under each stop of the grid
                                                       #   -> sweep=<id>/independent-h150/
 
 `features` and `train` read the run-based base; `--base independent-h150` points them at the
@@ -25,6 +26,7 @@ import datetime as dt
 import sys
 import uuid
 from collections.abc import Sequence
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -34,7 +36,7 @@ from tradeforge_db.models import Instrument, StockSplit
 from tradeforge_db.session import create_db_engine, create_session_factory
 from tradeforge_ml.export import export_sweep
 from tradeforge_ml.feature_export import write_features
-from tradeforge_ml.replay import HORIZON
+from tradeforge_ml.replay import HORIZON, STOPS
 from tradeforge_ml.replay_export import jobs_of, write_independent
 
 if TYPE_CHECKING:
@@ -51,6 +53,17 @@ def span(text: str) -> tuple[dt.datetime, dt.datetime]:
     if right <= left:
         raise argparse.ArgumentTypeError(f"{text}: the end must come after the start")
     return left, right
+
+
+def stops(text: str) -> tuple[Decimal, ...]:
+    """`0.5,1,2` — the grid's stops, as multiples of the setup's; its own (`1`) among them."""
+    try:
+        multiples = tuple(Decimal(part) for part in text.split(","))
+    except InvalidOperation as error:
+        raise argparse.ArgumentTypeError(f"{text}: multiples separated by commas") from error
+    if Decimal(1) not in multiples or any(multiple <= 0 for multiple in multiples):
+        raise argparse.ArgumentTypeError(f"{text}: positive, and the setup's own stop (1) in it")
+    return multiples
 
 
 def markets_of(session: "Session") -> dict[str, "Market"]:
@@ -136,6 +149,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     again.add_argument("--horizon", type=int, default=HORIZON)
     again.add_argument("--processes", type=int, default=None)
     again.add_argument("--costs", choices=("measured", "run"), default="measured")
+    again.add_argument("--stops", type=stops, default=STOPS)
     args = parser.parse_args(argv)
     base = args.out / f"sweep={args.sweep_id}" / getattr(args, "base", "")
 
@@ -154,11 +168,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             horizon=args.horizon,
             processes=args.processes,
             costs=args.costs,
+            stops=args.stops,
         )
         print(
             f"runs {replayed.runs}, charts {replayed.charts}, proposals {replayed.proposals}, "
             f"events {replayed.events} ({replayed.events_disagreeing} disagreeing), "
-            f"exits {replayed.exits}"
+            f"exits {replayed.exits}, stops {replayed.cells}"
         )
         return 0
     if args.command == "features":

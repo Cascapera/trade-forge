@@ -9,17 +9,22 @@ from types import SimpleNamespace
 from typing import Any
 
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import pytest
 
 from tradeforge_engine.backtest_broker import BacktestBroker
 from tradeforge_engine.costs import SpreadCostModel
+from tradeforge_engine.domain import Context, Signal, SignalKind
 from tradeforge_engine.loop import run
+from tradeforge_engine.protocols import Strategy
 from tradeforge_engine.strategy import compile_strategy
 from tradeforge_engine.testing import ARMS_A_RESTING_LIMIT, EURUSD, HOUR, FixedRisk
 from tradeforge_ml.export import EVENT_SCHEMA
-from tradeforge_ml.replay import costs_from, replay
+from tradeforge_ml.feature_export import KEY
+from tradeforge_ml.replay import STOPS, costs_from, replay
 from tradeforge_ml.replay_export import (
+    GRID_SCHEMA,
     WARM_BARS,
     Job,
     _window,
@@ -389,3 +394,107 @@ def test_a_managed_run_replays_to_exactly_its_unmanaged_siblings_entries(kind: s
     )
     assert standing_in == unmanaged
     assert replay_job(kept_on, BARS, horizon=20) == unmanaged
+
+
+# --------------------------------------------------------------------------------------------
+# The grid of stops (14/10)
+# --------------------------------------------------------------------------------------------
+
+
+def test_the_grid_is_written_beside_the_events_one_row_per_event_and_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("tradeforge_ml.replay_export.candles_of", lambda *_: BARS)
+
+    report = write_independent(
+        [job("a", {"x": 1}), job("b", {"x": 2})],
+        sweep_id="s",
+        out=tmp_path,
+        ohlcv=tmp_path,
+        horizon=20,
+        processes=1,
+    )
+
+    base = tmp_path / "sweep=s" / "independent-h20"
+    events = pq.read_table(base / "events.parquet")
+    grid = pq.read_table(base / "grid.parquet")
+    assert grid.schema == GRID_SCHEMA
+    assert grid.num_rows == len(STOPS) * events.num_rows > 0
+    for name in KEY:
+        repeated = [value for value in events.column(name).to_pylist() for _ in STOPS]
+        assert grid.column(name).to_pylist() == repeated, name
+    assert grid.column("stop_multiple").to_pylist() == [float(k) for k in STOPS] * events.num_rows
+    own = grid.filter(pc.equal(grid.column("stop_multiple"), 1.0))
+    names = ("entry_price", "stop_loss", "exit_time", "exit_reason", "r_multiple", "mfe_r", "costs")
+    for name in names:
+        assert own.column(name).to_pylist() == events.column(name).to_pylist(), name
+    manifest = json.loads((base / "manifest.json").read_text())
+    assert manifest["format_version"] == 3
+    assert manifest["stops"] == ["0.5", "0.75", "1", "1.5", "2", "3"]
+    assert manifest["cells"] == report.cells
+    assert {sum(ended.values()) for ended in report.cells.values()} == {report.events}
+    assert len(manifest["grid_sha256"]) == 64
+
+
+def test_a_grid_without_the_setups_own_stop_refuses_the_base(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="setup's own"):
+        write_independent(
+            [job("a", {})], sweep_id="s", out=tmp_path, ohlcv=tmp_path, stops=(Decimal(2),)
+        )
+    assert not (tmp_path / "sweep=s").exists()
+
+
+class _ScaledStops:
+    """A setup whose every entry carries its stop `multiple` times as far: what the grid's cell
+    for that multiple must be, traded by a replay from the bar the setup decided on."""
+
+    def __init__(self, inner: Strategy, multiple: Decimal) -> None:
+        self.inner, self.multiple = inner, multiple
+
+    def on_bar(self, context: Context) -> list[Signal]:
+        out = []
+        for signal in self.inner.on_bar(context):
+            if signal.kind is SignalKind.ENTRY and signal.stop_loss is not None:
+                level = signal.limit_price or signal.stop_price or signal.reference_price
+                stop = level - self.multiple * (level - signal.stop_loss)
+                signal = replace(signal, stop_loss=stop)  # noqa: PLW2901 — the same signal, moved
+            out.append(signal)
+        return out
+
+
+@pytest.mark.parametrize("kind", sorted(PARAMS))
+@pytest.mark.parametrize("multiple", [Decimal("0.5"), Decimal(2)])
+def test_a_cell_is_the_entry_its_setup_would_have_made_with_that_stop(
+    kind: str, multiple: Decimal
+) -> None:
+    """⚠️ The claim the grid's shortcut rests on (`Replay._follow`), on the real setups and real
+    bars: an order followed from the bar it filled on is the same trade as the order with that
+    stop resting from the bar it was decided on."""
+    grid = replay(
+        strategy=compile_strategy(document(kind)),
+        candles=BARS,
+        instrument=EURUSD,
+        cost_model=costs_from(COSTS),
+        horizon=20,
+    )
+    scaled = replay(
+        strategy=_ScaledStops(compile_strategy(document(kind)), multiple),
+        candles=BARS,
+        instrument=EURUSD,
+        cost_model=costs_from(COSTS),
+        horizon=20,
+        stops=(Decimal(1),),
+    )
+
+    by_entry = {(p.trade.entry_time, p.trade.side, p.trade.entry_price): p for p in scaled}
+    compared = 0
+    for proposal in grid:
+        (cell,) = (cell for cell in proposal.grid if cell.multiple == multiple)
+        if cell.trade is None:
+            continue
+        twin = by_entry.get((cell.trade.entry_time, cell.trade.side, cell.trade.entry_price))
+        if twin is None:
+            continue  # the setup, handed another fill, can propose another entry after
+        assert (cell.trade, cell.exit_reason) == (twin.trade, twin.exit_reason)
+        compared += 1
+    assert compared, "no cell could be compared: the scenario proves nothing"

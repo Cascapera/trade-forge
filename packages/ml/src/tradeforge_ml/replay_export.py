@@ -1,7 +1,8 @@
 """Write a sweep's independent event base: every proposal of every entry it tried, replayed flat
 and traded alone (`replay`), as `out/sweep=<id>/independent-h<horizon>/events.parquet` — the same
 columns as the run-based base (`export.EVENT_SCHEMA`), so `features` and `train` read it as they
-read that one.
+read that one — and beside it `grid.parquet`: each event under every stop of the grid
+(`replay.STOPS`), one row per event and stop, in the events' order (`GRID_SCHEMA`).
 
 Read-only on the database: one run per entry (`choose_jobs`) gives its document, its instrument,
 its window and its market's measured spread; the bars come from the collector's Parquet. The
@@ -32,6 +33,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Literal
 
+import pyarrow as pa
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 from sqlalchemy import select
@@ -47,9 +49,12 @@ from tradeforge_ml.events import (
     is_unmanaged,
     without_management,
 )
-from tradeforge_ml.export import EVENT_SCHEMA, _event_table
+from tradeforge_ml.export import EVENT_SCHEMA, _event_table, _float
+from tradeforge_ml.feature_export import KEY
 from tradeforge_ml.replay import (
     HORIZON,
+    STOPS,
+    Cell,
     costs_from,
     instrument_from,
     measured_costs,
@@ -60,8 +65,33 @@ from tradeforge_ml.replay import (
 WARM_BARS = 1000
 """Bars before a run's first day the setup is shown before any entry counts."""
 
-FORMAT_VERSION = 2
-"""2 (14/10): the label charges each market's measured spread, and the manifest says what."""
+FORMAT_VERSION = 3
+"""2 (14/10): the label charges each market's measured spread, and the manifest says what.
+3 (14/10): `grid.parquet`, each event under the grid's stops."""
+
+GRID_SCHEMA = pa.schema(
+    [
+        *((name, EVENT_SCHEMA.field(name).type) for name in KEY),
+        ("stop_multiple", pa.float64()),
+        ("entry_price", pa.float64()),
+        ("stop_loss", pa.float64()),
+        ("exit_time", pa.timestamp("us", tz="UTC")),
+        ("exit_price", pa.float64()),
+        ("exit_reason", pa.string()),
+        ("r_multiple", pa.float64()),
+        ("mfe_r", pa.float64()),
+        ("mae_r", pa.float64()),
+        ("gross_pnl", pa.float64()),
+        ("costs", pa.float64()),
+        ("swap", pa.float64()),
+        ("net_pnl", pa.float64()),
+        ("volume", pa.float64()),
+    ]
+)
+"""One row per event and stop, the stops in the grid's order: rows `n * len(stops)` onward are
+the `n`-th event's. The event's key is repeated, to be joined back and checked; the trade is the
+cell's, from its entry price on — empty, with `refused` or `open` as its reason, when it made
+none (`replay.Cell`). The setup's own stop (`1`) repeats the event."""
 
 Costs = Literal["measured", "run"]
 """`measured`: each market's measured spread, the run's commission and swap (the default since
@@ -251,11 +281,18 @@ def charged(job: Job, candles: Sequence[Candle], costs: Costs) -> dict[str, Any]
     )
 
 
-def replay_job(
-    job: Job, candles: Sequence[Candle], horizon: int, costs: dict[str, Any] | None = None
+def replay_job(  # noqa: PLR0913 — the job, its bars, and how to replay it
+    job: Job,
+    candles: Sequence[Candle],
+    horizon: int,
+    costs: dict[str, Any] | None = None,
+    *,
+    stops: Sequence[Decimal] = STOPS,
+    cells: dict[tuple[object, ...], Cell] | None = None,
 ) -> list[TradeRecord]:
-    """One run's proposals, each traded alone, as the event base's records — charged `costs`, or
-    what the run was."""
+    """One run's proposals, each traded alone and under every stop of `stops`, as the event
+    base's records — charged `costs`, or what the run was. `cells`: the stops already followed
+    on these bars at these costs, by an earlier job of the chart."""
     instrument = instrument_from(job.instrument)
     strategy = compile_strategy(job.definition, server_offset=instrument.server_offset)
     document = job.costs if costs is None else costs
@@ -267,6 +304,8 @@ def replay_job(
         swap=swap_from(document),
         horizon=horizon,
         entries_from=job.date_from,
+        stops=stops,
+        cells=cells,
     )
     return [
         TradeRecord(
@@ -290,6 +329,7 @@ def replay_job(
             swap=proposal.trade.swap,
             net_pnl=proposal.trade.net_pnl,
             volume=proposal.trade.volume,
+            grid=proposal.grid,
         )
         for proposal in proposals
         if proposal.trade.entry_time <= job.date_to
@@ -297,21 +337,62 @@ def replay_job(
 
 
 def _chart(
-    task: tuple[Path, int, Costs, list[Job]],
+    task: tuple[Path, int, Costs, tuple[Decimal, ...], list[Job]],
 ) -> tuple[list[dict[str, Any]], int, dict[str, Any] | None]:
     """Every job of one chart over its bars, read once: the distinct entries, the proposals, and
-    what the chart's first job was charged (with measured costs, what every job of it was)."""
-    ohlcv, horizon, costs, jobs = task
+    what the chart's first job was charged (with measured costs, what every job of it was).
+
+    The other stops are followed once per entry of the chart (`replay.Replay.cells`), for each
+    cost document its jobs are charged: with measured costs one, the run's commission and swap
+    being a sweep's."""
+    ohlcv, horizon, costs, stops, jobs = task
     candles = candles_of(ohlcv, jobs[0].symbol, jobs[0].timeframe)
     if not candles:
         return [], 0, None
     records: list[TradeRecord] = []
     first: dict[str, Any] | None = None
+    followed: dict[str, dict[tuple[object, ...], Cell]] = {}
     for job in jobs:
         document = charged(job, candles, costs)
         first = first or document
-        records.extend(replay_job(job, candles, horizon, document))
+        cells = followed.setdefault(json.dumps(document, sort_keys=True), {})
+        records.extend(replay_job(job, candles, horizon, document, stops=stops, cells=cells))
     return distinct_entries(records), len(records), first
+
+
+_TRADE_FLOATS = (
+    "entry_price",
+    "stop_loss",
+    "exit_price",
+    "r_multiple",
+    "mfe_r",
+    "mae_r",
+    "gross_pnl",
+    "costs",
+    "swap",
+    "net_pnl",
+    "volume",
+)
+"""What a cell's row reads of its trade, as `GRID_SCHEMA` names it."""
+
+
+def _grid_table(rows: Sequence[dict[str, Any]], stops: Sequence[Decimal]) -> pa.Table:
+    """`GRID_SCHEMA`'s rows for `rows`, each event's cells in the order of `stops`."""
+    columns: dict[str, list[Any]] = {name: [] for name in GRID_SCHEMA.names}
+    for row in rows:
+        cells: tuple[Cell, ...] = row["grid"]
+        if tuple(cell.multiple for cell in cells) != tuple(stops):
+            raise ValueError(f"an event of {row['symbol']} has no cell for every stop")
+        for cell in cells:
+            for name in KEY:
+                columns[name].append(row[name])
+            columns["stop_multiple"].append(float(cell.multiple))
+            columns["exit_reason"].append(cell.exit_reason)
+            trade = cell.trade
+            columns["exit_time"].append(None if trade is None else trade.exit_time)
+            for name in _TRADE_FLOATS:
+                columns[name].append(None if trade is None else _float(getattr(trade, name)))
+    return pa.table(columns, schema=GRID_SCHEMA)
 
 
 @dataclass
@@ -324,6 +405,8 @@ class ReplayReport:
     events: int = 0
     events_disagreeing: int = 0
     exits: dict[str, int] = field(default_factory=dict)
+    cells: dict[str, dict[str, int]] = field(default_factory=dict)
+    """How each stop of the grid ended, by reason: `{"0.5": {"sl": ..., "refused": ...}}`."""
 
 
 def write_independent(  # noqa: PLR0913 — keyword-only; the base, where, and how to run it
@@ -335,12 +418,16 @@ def write_independent(  # noqa: PLR0913 — keyword-only; the base, where, and h
     horizon: int = HORIZON,
     processes: int | None = None,
     costs: Costs = "measured",
+    stops: Sequence[Decimal] = STOPS,
 ) -> ReplayReport:
     """Replay every job, chart by chart over `processes`, and write the base under
-    `out/sweep=<id>/independent-h<horizon>/`.
+    `out/sweep=<id>/independent-h<horizon>/`, with each event under every stop of `stops`.
 
     ⚠️ With `measured` costs, a market without a measured spread refuses the base before any bar
     is read — as the sweep's API does — rather than label its trades as free."""
+    grid = tuple(stops)
+    if Decimal(1) not in grid or any(multiple <= 0 for multiple in grid):
+        raise ValueError(f"the stops must be positive and hold the setup's own (1), got {grid}")
     if costs == "measured":
         unmeasured = sorted({job.symbol for job in jobs if job.spread_ticks is None})
         if unmeasured:
@@ -354,9 +441,10 @@ def write_independent(  # noqa: PLR0913 — keyword-only; the base, where, and h
     for job in jobs:
         charts[(job.symbol, job.timeframe)].append(job)
     report = ReplayReport(sweep_id=sweep_id, horizon=horizon, runs=len(jobs), charts=len(charts))
-    tasks = [(ohlcv, horizon, costs, chart_jobs) for chart_jobs in charts.values()]
+    tasks = [(ohlcv, horizon, costs, grid, chart_jobs) for chart_jobs in charts.values()]
     paid: dict[str, dict[str, Any]] = {}
     writer = pq.ParquetWriter(target / "events.parquet", EVENT_SCHEMA, compression="zstd")
+    cells = pq.ParquetWriter(target / "grid.parquet", GRID_SCHEMA, compression="zstd")
     try:
         workers = processes or max(1, (os.cpu_count() or 2) // 2)
         # One process is this one: no pool to spawn, which is also what a test runs.
@@ -371,13 +459,18 @@ def write_independent(  # noqa: PLR0913 — keyword-only; the base, where, and h
                 if not rows:
                     continue
                 writer.write_table(_event_table(rows))
+                cells.write_table(_grid_table(rows, grid))
                 report.events += len(rows)
                 report.events_disagreeing += sum(1 for row in rows if not row["outcomes_agree"])
                 for row in rows:
                     reason = str(row["exit_reason"])
                     report.exits[reason] = report.exits.get(reason, 0) + 1
+                    for cell in row["grid"]:
+                        ended = report.cells.setdefault(str(cell.multiple), {})
+                        ended[cell.exit_reason] = ended.get(cell.exit_reason, 0) + 1
     finally:
         writer.close()
+        cells.close()
     manifest = {
         "format_version": FORMAT_VERSION,
         "kind": "independent",
@@ -393,13 +486,17 @@ def write_independent(  # noqa: PLR0913 — keyword-only; the base, where, and h
         "events": report.events,
         "events_disagreeing": report.events_disagreeing,
         "exits": report.exits,
+        "stops": [str(multiple) for multiple in grid],
+        "cells": report.cells,
         "events_sha256": hashlib.sha256((target / "events.parquet").read_bytes()).hexdigest(),
+        "grid_sha256": hashlib.sha256((target / "grid.parquet").read_bytes()).hexdigest(),
     }
     (target / "manifest.json").write_text(json.dumps(manifest, indent=2))
     return report
 
 
 __all__ = [
+    "GRID_SCHEMA",
     "WARM_BARS",
     "Costs",
     "Job",

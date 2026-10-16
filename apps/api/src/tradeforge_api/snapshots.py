@@ -25,6 +25,7 @@ import multiprocessing
 import uuid
 from collections.abc import Callable
 from concurrent.futures import Executor, ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from typing import Any
 
 from sqlalchemy import func, select
@@ -48,6 +49,36 @@ def child_pool() -> Executor:
     return ProcessPoolExecutor(
         max_workers=1, mp_context=multiprocessing.get_context("spawn"), max_tasks_per_child=1
     )
+
+
+class ChildPool:
+    """The loop's pool, made again when a child dies (15/10).
+
+    ⚠️ **A pool whose child was killed is broken for good.** On 15/10 the kernel, out of memory,
+    killed the child computing a summary; from then on every `submit` raised `BrokenProcessPool`
+    at once, without starting a process, and no summary or map was computed again until the API
+    restarted — three quarters of an hour of pages served stale, with an error logged every two
+    minutes. Here a broken pool is replaced and the error goes on up: the tick that met it fails
+    as before, and the next one, `SUMMARY_EVERY` later, runs on the new pool. Not at once: a
+    child killed for memory would be the same computation asking for the same memory again.
+    """
+
+    def __init__(self, make: Callable[[], Executor] = child_pool) -> None:
+        self._make = make
+        self._pool = make()
+
+    def run(self, fn: Callable[..., Any], *args: Any) -> Any:  # noqa: ANN401 — a pickled call's result
+        """`fn(*args)` in the child, waited for; a broken pool is replaced before raising."""
+        try:
+            return self._pool.submit(fn, *args).result()
+        except BrokenProcessPool:
+            self._pool.shutdown(wait=False, cancel_futures=True)
+            self._pool = self._make()
+            raise
+
+    def shutdown(self) -> None:
+        """Stop the child, if one is running — the API is going away."""
+        self._pool.shutdown(wait=False, cancel_futures=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -185,16 +216,14 @@ def refresh_best(
 
 
 async def refresh_forever(
-    session_factory: Callable[[], Session], store: SnapshotStore, pool: Executor
+    session_factory: Callable[[], Session], store: SnapshotStore, pool: ChildPool
 ) -> None:
     """The API's background loop: summaries every `SUMMARY_EVERY`, maps every `BEST_EVERY`.
 
     A failure is logged and the loop goes on — a snapshot a few minutes old is the worst it costs.
+    A child killed mid-computation is one of them: `pool` is made again for the next tick.
     """
-
-    def run(fn: Callable[..., Any], *args: Any) -> Any:  # noqa: ANN401 — a pickled call's result
-        return pool.submit(fn, *args).result()
-
+    run = pool.run
     best_due = dt.datetime.now(tz=dt.UTC)
     while True:
         await asyncio.sleep(SUMMARY_EVERY.total_seconds())
@@ -211,6 +240,7 @@ async def refresh_forever(
 __all__ = [
     "BEST_EVERY",
     "SUMMARY_EVERY",
+    "ChildPool",
     "best_in_child",
     "child_pool",
     "in_child",

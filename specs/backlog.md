@@ -3100,3 +3100,20 @@ runs deveriam voltar a `queued`, não `failed`; `failed` só quando é a última
   engine-guardian (15/10): não copiar um run com `opening_gap: true` feito antes de os workers
   saberem da opção. Isso fecha o risco do worker antigo sem depender de disciplina. Adiado: os
   workers não têm como dizer hoje se conhecem a opção, já que a versão é a mesma.
+
+## Memória do worker num lote longo (15/10) — o que ficou para depois
+
+Seis workers num lote de M5 de 11 anos chegaram a ~3 GB cada e travaram a VM de 24 GB (Postgres e Redis
+juntos, sinais sem vela por 14 min). O teto por worker (`TRADEFORGE_WORKER_MEMORY`, 5 GB) isola o estrago,
+mas não reduz o consumo. Medido num worker, lote de 24 runs do Usa500 M5 de 2015–2025:
+
+- [origem: VM travada 15/10] **Cada vela custa ~0,9 KB em memória.** As 607 mil barras foram de 156 MB
+  para 719 MB. São objetos `Candle` com campos `Decimal`. Guardar a série em colunas (arrays) cortaria
+  isso muitas vezes, mas mexe no coletor, no cache e na leitura do motor.
+- [origem: VM travada 15/10] **O lote cresce com combinações × barras.** O pico foi 3,1 GB, quase
+  todo nos resultados das 24 combinações, que ficam juntos até a gravação. O tamanho do lote é fixo por
+  tempo gráfico (24, e 6 no M1). Ele poderia ser medido pelo número de barras da janela, para um lote de
+  série longa sair menor.
+- [origem: VM travada 15/10] **A soma ainda tem de caber no teto do WSL.** O limite protege de um worker,
+  não de todos: workers × ~3 GB + os 6 GB do Postgres tem de caber no `.wslconfig` antes de lançar M5
+  longo. O Xeon, com 10 workers em 26 GB, não cabe se todos pegarem lotes desses ao mesmo tempo.

@@ -177,11 +177,25 @@ services:
     # (32 threads) 12 workers hold a sweep near 40% of the CPU.
     # ⚠️ Changing either value recreates the workers, and a recreated worker drops the run it was
     # in the middle of: change it with the queue empty.
+    #
+    # ⚠️ **A memory ceiling per worker, swap included** (15/10). Six workers on a sweep of eleven
+    # years of M5 grew to ~3 GB each; with Postgres' 6 GB of buffers that was the whole 24 GB VM,
+    # and the VM froze — Postgres and Redis with it, and the live signals went without candles
+    # for fourteen minutes. With a ceiling, the kernel kills the one worker that crossed it, in
+    # its own cgroup; arq hands its batch to another worker when the job's lease runs out, and
+    # the database stays up. Measured on 15/10 inside a worker: a batch of 24 Usa500 M5 runs over
+    # 2015–2025 (607 thousand bars) peaked at 3.1 GB; with the batch's writes and the candle
+    # cache's other series, the kernel saw ~3.5 GB. 5 GB is that with room, not an estimate of a
+    # heavier chart: an M1 batch is already cut to six runs (`batching._SMALLER`). `memswap_limit`
+    # equal to the ceiling means no swap at all: a worker that swaps slows the whole VM down
+    # before it is ever killed.
     deploy:
       replicas: ${TRADEFORGE_WORKERS:-1}
       resources:
         limits:
           cpus: '1'
+          memory: ${TRADEFORGE_WORKER_MEMORY:-5g}
+    memswap_limit: ${TRADEFORGE_WORKER_MEMORY:-5g}
     volumes:
       - ./data:/data:ro
     depends_on:

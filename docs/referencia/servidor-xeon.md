@@ -26,26 +26,27 @@ Nomes usados abaixo:
 
 Cada um sai sozinho, com testes e lição, e já vale no i9 antes da virada (nada deles depende do Xeon).
 
-### PR 1 — `fix(repo)`: memória do Postgres pelo `.env`; workers esperam o lote ao parar
+### PR 1 (#470) — `fix(repo)`: memória do Postgres pelo `.env`
 
 - `shared_buffers` e `effective_cache_size` vêm de `POSTGRES_SHARED_BUFFERS` e
   `POSTGRES_EFFECTIVE_CACHE_SIZE`, com os valores de hoje como padrão (6GB/20GB). O Xeon com 32 GB
   usa algo como 3GB/10GB.
-- Workers (nos dois composes) com `stop_grace_period` maior que o lote mais longo, para o Docker não
-  matar o processo enquanto o PR 2 o deixa terminar.
 - **Aceite:** `docker compose config` mostra os valores do `.env` e os padrões sem ele; nada muda no
   i9 enquanto o `.env` não tiver as variáveis.
 
-### PR 2 — `feat(api)`: um worker parado termina o que está fazendo e sai
+### PR 2 (#471) — `feat(api)`: um worker parado termina o que está fazendo e sai
 
 - SIGTERM durante um job: o worker para de pegar jobs, deixa o job em andamento terminar e só então
-  sai. Hoje o arq cancela o job, e os runs do lote que ainda não tinham sido gravados viram `failed`
-  ("the batch was stopped").
-- Um segundo SIGTERM, ou o fim do `stop_grace_period`, continua matando na hora; nesse caso o que não
-  foi gravado **volta para a fila** em vez de virar `failed`.
-- **Aceite:** teste com um lote de verdade: SIGTERM no meio, o lote termina, todos os runs `done`, o
-  worker sai com código 0; teste do segundo sinal: os runs não gravados voltam a `queued` e o job é
-  devolvido ao arq.
+  sai (`job_completion_wait` do arq, 14 min). Antes o arq cancelava o job, e os runs do lote que ainda
+  não tinham sido gravados viravam `failed` ("the batch was stopped") e se perdiam.
+- Workers (nos dois composes) com `stop_grace_period: 15m`, acima da espera, para o Docker não matar o
+  processo antes; um teste segura essa ordem.
+- Passou da espera e o lote foi cancelado mesmo assim: o que não foi gravado **volta para a fila** em
+  vez de virar `failed`. Cancelado pelo timeout do próprio job (2 h), continua `failed`, porque o arq
+  não roda esse job de novo.
+- **Aceite:** teste com um lote de verdade: cancelado com o worker parando, os runs voltam a `queued` e
+  a rodada seguinte termina todos; cancelado sem parada, `failed` com o motivo; teste do worker de
+  verdade no Redis: termina o job, não pega o próximo.
 
 ### PR 3 — `feat(repo)`: `tradeforge.ps1 up` sobe o servidor inteiro, e se religa sozinho
 

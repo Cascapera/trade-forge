@@ -102,10 +102,11 @@ máquina é a principal**, e o que falta para essa troca ser segura:
 
 **Código (cinco PRs depois do aceite):**
 
-1. `fix(repo)`: a memória do Postgres (`shared_buffers`, `effective_cache_size`) vem do `.env`, com o
-   padrão de hoje; os workers ganham um `stop_grace_period` do tamanho de um lote.
-2. `feat(api)`: o worker que recebe SIGTERM termina o job em andamento, não pega outro e sai. Nenhum
-   run fica `failed` por causa de uma parada; o que não terminou volta para a fila.
+1. `fix(repo)` (#470): a memória do Postgres (`shared_buffers`, `effective_cache_size`) vem do
+   `.env`, com o padrão de hoje.
+2. `feat(api)` (#471): o worker que recebe SIGTERM termina o job em andamento, não pega outro e sai;
+   o Docker espera por ele (`stop_grace_period`). Nenhum run fica `failed` por causa de uma parada; o
+   que não terminou volta para a fila.
 3. `feat(repo)`: `tradeforge.ps1 up` sobe o servidor inteiro (Docker, terminais MT5, um agente por
    corretora, sinais e notificador) e `tradeforge.ps1 autostart` registra isso no logon do Windows.
 4. `feat(repo)`: `tradeforge.ps1 workers <n>|auto` para máquinas só de workers, com o modo automático

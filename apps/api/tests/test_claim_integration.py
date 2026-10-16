@@ -15,6 +15,8 @@ Run with:  docker compose up -d  &&  POSTGRES_DB=tradeforge_test uv run pytest -
 """
 
 import asyncio
+import contextlib
+import signal
 import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -25,7 +27,7 @@ from arq.connections import ArqRedis, RedisSettings
 from arq.constants import in_progress_key_prefix
 from arq.worker import Worker, func
 
-from tradeforge_api.claim import OneTripWorker
+from tradeforge_api.claim import STOPPING, OneTripWorker
 from tradeforge_api.config import Settings
 
 pytestmark = pytest.mark.integration
@@ -183,5 +185,55 @@ def test_an_arq_worker_and_a_one_trip_worker_never_take_the_same_job(settings: S
 
         assert sorted(job_id for _, job_id in ran) == ids
         assert {name for name, _ in ran} == {"arq", "one-trip"}
+
+    _in_sandbox(settings, scenario)
+
+
+def test_a_worker_told_to_stop_finishes_its_job_takes_no_other_and_says_so(
+    settings: Settings,
+) -> None:
+    """Workers come and go through the day (ADR-0036): stopping one must not cancel what it holds.
+
+    Told to stop, it lets the job it holds finish, claims nothing after it, and tells that job it
+    was told — the flag a batch cancelled anyway reads to hand its runs back (`process_batch`).
+    """
+
+    async def scenario(pool: ArqRedis, token: str) -> None:
+        queue = f"{token}:queue"
+        started, release = asyncio.Event(), asyncio.Event()
+        told: list[bool] = []
+
+        async def hold(ctx: dict[str, Any]) -> str:
+            started.set()
+            await release.wait()
+            told.append(ctx[STOPPING].is_set())
+            return "finished"
+
+        first, second = f"{token}-first", f"{token}-second"
+        for job_id in (first, second):
+            assert await pool.enqueue_job("hold", _job_id=job_id, _queue_name=queue)
+        worker = OneTripWorker(
+            functions=[func(hold, name="hold")],
+            redis_pool=pool,
+            queue_name=queue,
+            handle_signals=False,
+            max_jobs=1,
+            poll_delay=0.01,
+            job_completion_wait=30,
+        )
+        running = asyncio.create_task(worker.async_run())
+        await asyncio.wait_for(started.wait(), timeout=10)
+
+        worker.handle_sig_wait_for_completion(signal.SIGTERM)
+        release.set()
+        # The worker ends by cancelling its own main task, once the job is done.
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait_for(running, timeout=30)
+
+        assert told == [True]
+        assert (worker.jobs_complete, worker.jobs_failed, worker.jobs_retried) == (1, 0, 0)
+        # The other job is still queued and nobody holds it: the next worker takes it.
+        assert await pool.zscore(queue, second) is not None
+        assert not await pool.exists(in_progress_key_prefix + second)
 
     _in_sandbox(settings, scenario)

@@ -14,6 +14,7 @@ import uuid
 from collections.abc import Callable
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -21,6 +22,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from tradeforge_api import worker as worker_module
 from tradeforge_api.batching import BATCH_SIZE, Batcher, batch_key
 from tradeforge_api.candle_cache import CandleCache
 from tradeforge_api.config import Settings
@@ -295,6 +297,99 @@ def test_a_batch_skips_runs_already_finished_and_runs_the_rest(
         assert kept.error == "finished before the batch came back"
     assert statuses[0] is BacktestStatus.FAILED
     assert set(statuses[1:]) == {BacktestStatus.DONE}
+
+
+def _cancelled(*_args: Any, **_kwargs: Any) -> Any:
+    """A reader the cancellation lands in: where arq's `CancelledError` reaches a batch."""
+    raise asyncio.CancelledError
+
+
+def _cancel_a_batch(
+    session_factory: Callable[[], Session], queue: _Queue, tmp_path: Path, *, stopping: bool
+) -> list[uuid.UUID]:
+    (_name, args, _options) = next(job for job in queue.jobs if job[0] == RUN_BACKTEST_BATCH)
+    ids = [uuid.UUID(one) for one in args[0]]
+    with session_factory() as session, pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            process_batch(
+                session=session,
+                redis=queue,  # type: ignore[arg-type]
+                parquet_root=tmp_path,
+                run_ids=ids,
+                read=_cancelled,
+                reuse=False,
+                stopping=lambda: stopping,
+            )
+        )
+    return ids
+
+
+def test_a_batch_cancelled_because_its_worker_stops_hands_its_runs_back(
+    client: Any, session_factory: Callable[[], Session], queue: _Queue, tmp_path: Path
+) -> None:
+    """arq runs the job again after this cancellation, and its second run finds the runs open.
+
+    Failed, they would be skipped by that second run (the test above) and lost (16/10, ADR-0036).
+    """
+    _launch(client, _entry(client))
+    ids = _cancel_a_batch(session_factory, queue, tmp_path, stopping=True)
+    with session_factory() as session:
+        handed_back = [session.get(Backtest, one) for one in ids]
+        assert {run.status for run in handed_back if run} == {BacktestStatus.QUEUED}
+        assert all(run is not None and run.started_at is None for run in handed_back)
+        assert all(run is not None and run.error is None for run in handed_back)
+
+    with session_factory() as session:
+        asyncio.run(
+            process_batch(
+                session=session,
+                redis=queue,  # type: ignore[arg-type]
+                parquet_root=tmp_path,
+                run_ids=ids,
+                read=CandleCache().read,
+                reuse=False,
+            )
+        )
+    with session_factory() as session:
+        statuses = {session.get(Backtest, one).status for one in ids}  # type: ignore[union-attr]
+    assert statuses == {BacktestStatus.DONE}
+
+
+def test_a_batch_cancelled_by_its_timeout_fails_its_runs_with_the_reason(
+    client: Any, session_factory: Callable[[], Session], queue: _Queue, tmp_path: Path
+) -> None:
+    """arq records a timed-out job as failed and never runs it again: queued, the runs would wait
+    for a job that no longer exists."""
+    _launch(client, _entry(client))
+    ids = _cancel_a_batch(session_factory, queue, tmp_path, stopping=False)
+    with session_factory() as session:
+        failed = [session.get(Backtest, one) for one in ids]
+    assert {run.status for run in failed if run} == {BacktestStatus.FAILED}
+    assert all(run is not None and "the batch was stopped" in (run.error or "") for run in failed)
+
+
+def test_a_batch_that_meets_its_timeout_while_its_worker_stops_still_fails(
+    client: Any,
+    session_factory: Callable[[], Session],
+    queue: _Queue,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Told to stop, a worker waits for its batch; a batch already stuck can reach arq's ceiling
+    in that wait, and arq never runs a timed-out job again — so its runs fail, not wait queued."""
+    ticks = iter([0.0])
+
+    def clock() -> float:
+        # The batch's start, then every later look: at the ceiling.
+        return next(ticks, float(worker_module.BATCH_TIMEOUT_SECONDS))
+
+    # Only the worker's own `time`: asyncio's loop reads `time.monotonic` too.
+    monkeypatch.setattr(worker_module, "time", SimpleNamespace(monotonic=clock))
+    _launch(client, _entry(client))
+    ids = _cancel_a_batch(session_factory, queue, tmp_path, stopping=True)
+    with session_factory() as session:
+        failed = [session.get(Backtest, one) for one in ids]
+    assert {run.status for run in failed if run} == {BacktestStatus.FAILED}
 
 
 def test_runs_of_different_markets_handed_as_one_batch_run_each_on_its_own(

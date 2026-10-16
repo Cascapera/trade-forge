@@ -22,10 +22,12 @@ database takes that write. Nothing here can record anything in a database that r
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import datetime as dt
 import json
 import os
+import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from decimal import Decimal
@@ -42,6 +44,7 @@ from tradeforge_api.batching import enqueue_runs
 from tradeforge_api.candle_cache import CandleCache, CandleReader, read_window
 from tradeforge_api.candle_sync import URL_ENV as CANDLES_URL_ENV
 from tradeforge_api.candle_sync import FetchingReader
+from tradeforge_api.claim import STOPPING
 from tradeforge_api.cluster_job import process_cluster
 from tradeforge_api.collector import running as collector_running
 from tradeforge_api.config import RedisConfig, Settings
@@ -381,8 +384,12 @@ async def process_batch(  # noqa: PLR0913 — keyword-only; each names one thing
     retry_unreachable: bool = True,
     read: CandleReader = read_candles,
     reuse: bool = True,
+    stopping: Callable[[], bool] = lambda: False,
 ) -> None:
     """Run a batch of runs over one market together, the market read once per bar (ADR-0029).
+
+    `stopping` says whether the worker was told to stop (`claim.STOPPING`): a batch cancelled then
+    is run again by arq, so the runs it had not written go back to the queue instead of failing.
 
     ⚠️ **A batch refuses to guess.** Its runs are meant to share a symbol, a chart, a window, an
     instrument and a reading of the market (`batching.batch_key`); if they do not — a hand-made
@@ -393,6 +400,8 @@ async def process_batch(  # noqa: PLR0913 — keyword-only; each names one thing
     ⚠️ **Each run's result is its own.** A run whose document will not compile, or that raised,
     fails alone with its reason; the others are written as they finish (`_record_done`).
     """
+    # When the job started, near enough: a cancellation at arq's ceiling is its timeout, not a stop.
+    began = time.monotonic()
     runs = [
         run
         for run in (session.get(Backtest, run_id) for run_id in run_ids)
@@ -509,10 +518,14 @@ async def process_batch(  # noqa: PLR0913 — keyword-only; each names one thing
         # ⚠️ **Cancelled by arq's timeout, or the worker told to stop** (27/09). The batch is
         # synchronous CPU, so arq's `wait_for` only lands on the first `await` after it — in the
         # middle of writing the runs. Left alone, the runs not yet written would stay `running`
-        # for good, with nothing to close them; they are failed with the reason, and the
-        # cancellation goes on up.
+        # for good, with nothing to close them; the cancellation goes on up either way.
+        #
+        # Which of the two it was decides what the runs become (`_close_stopped`). A worker told
+        # to stop can still meet the timeout while it waits — a batch already stuck — and that
+        # job arq will not run again, so the clock has the last word.
         session.rollback()
-        await _fail_open(session, redis, ids, RuntimeError(f"the batch was stopped: {exc!r}"))
+        timed_out = time.monotonic() - began >= BATCH_TIMEOUT_SECONDS - _TIMEOUT_MARGIN_SECONDS
+        await _close_stopped(session, redis, ids, exc, told_to_stop=stopping() and not timed_out)
         raise
 
 
@@ -562,6 +575,45 @@ async def _write_one(  # noqa: PLR0913 — one run of a batch and what it came t
         await _announce(redis, run.id, {"status": "failed", "error": _reason(exc)})
         return
     await _announce(redis, run.id, {"status": "done", "progress": 1.0})
+
+
+async def _close_stopped(
+    session: Session,
+    redis: Redis,
+    ids: Sequence[uuid.UUID],
+    exc: BaseException,
+    *,
+    told_to_stop: bool,
+) -> None:
+    """The runs of a batch stopped before it wrote them all: back to the queue, or failed.
+
+    ⚠️ **Which stop it was decides** (16/10, ADR-0036). After a timeout arq records the job as
+    failed and never runs it again: the runs are failed with the reason. A worker told to stop
+    that could not wait for the batch has it cancelled, and arq runs the job again ("cancelled,
+    will be run again"); failed, the runs would be skipped by that second run (`process_batch`)
+    and lost — so they go back to the queue. Both arrive as `CancelledError`; only the worker
+    knows it was told to stop.
+    """
+    if isinstance(exc, asyncio.CancelledError) and told_to_stop:
+        await _requeue_open(session, redis, ids)
+    else:
+        await _fail_open(session, redis, ids, RuntimeError(f"the batch was stopped: {exc!r}"))
+
+
+async def _requeue_open(session: Session, redis: Redis, ids: Sequence[uuid.UUID]) -> None:
+    """Put every run of the batch not yet finished back to `queued`, for the job's next run."""
+    reopened = []
+    for run_id in ids:
+        run = session.get(Backtest, run_id)
+        if run is None or run.status in (BacktestStatus.DONE, BacktestStatus.FAILED):
+            continue
+        run.status = BacktestStatus.QUEUED
+        run.started_at = None
+        reopened.append(run_id)
+    session.commit()
+    for run_id in reopened:
+        with contextlib.suppress(Exception):
+            await _announce(redis, run_id, {"status": "queued", "progress": 0.0})
 
 
 async def _fail_open(
@@ -845,6 +897,20 @@ BATCH_TIMEOUT_SECONDS = 2 * 60 * 60
 seconds; a batch still computing past it would be handed to a second worker and run twice. The
 batches are sized so none comes near it (`batching.batch_size`): a batch of M5 is minutes."""
 
+STOP_WAIT_SECONDS = 14 * 60
+"""How long a worker told to stop waits for the job it holds before cancelling it (16/10, ADR-0036).
+
+A batch of twenty-four M5 runs over eleven years takes a few minutes on the i9 and about three
+times that on the Xeon; fourteen minutes covers it with room. ⚠️ Docker must wait longer than this
+before it kills the container: `stop_grace_period` of the worker service in both compose files,
+which `tests/test_worker_stop_grace.py` holds above this number."""
+
+_TIMEOUT_MARGIN_SECONDS = 60
+"""How close to `BATCH_TIMEOUT_SECONDS` a cancelled batch is taken for one arq timed out.
+
+arq's clock starts a moment before `process_batch`'s; a minute of slack keeps a timeout from being
+read as a stop. A batch stopped in its last minute before the ceiling is failed — it was stuck."""
+
 OFF_GRACE = dt.timedelta(minutes=2)
 """How long a run waits for a download before an agent that is not running gives it up.
 
@@ -1047,6 +1113,9 @@ async def run_backtest_batch(ctx: dict[str, Any], run_ids: list[str]) -> None:
     session: Session = ctx["session_factory"]()
     settings: Settings = ctx["settings"]
     ids = [uuid.UUID(one) for one in run_ids]
+    # Only `OneTripWorker` sets it; under the plain `arq` command a cancelled batch fails its runs,
+    # as it did before (16/10).
+    told_to_stop = ctx.get(STOPPING)
     try:
         await process_batch(
             session=session,
@@ -1056,6 +1125,7 @@ async def run_backtest_batch(ctx: dict[str, Any], run_ids: list[str]) -> None:
             retry_unreachable=ctx.get("job_try", 1) < MAX_TRIES,
             read=ctx["candles"].read,
             reuse=settings.tradeforge_reuse,
+            stopping=told_to_stop.is_set if told_to_stop is not None else lambda: False,
         )
     except DBAPIError as exc:
         job_try: int = ctx.get("job_try", 1)
@@ -1216,12 +1286,20 @@ class WorkerSettings:
     # The cost is an idle worker asking Redis twenty times a second instead of two, which is
     # nothing to Redis even with forty workers asking.
     poll_delay = 0.05
+    # ⚠️ **Told to stop, a worker finishes what it holds** (16/10, ADR-0036). arq's default
+    # cancels the job at once: a batch then failed its unwritten runs, and nothing ran them again.
+    # That was rare while a worker only stopped for a rebuild; with machines that scale their
+    # workers up and down through the day it would lose runs every time. With a wait, a SIGTERM
+    # stops the claiming, lets the job finish and then exits. The signal itself is only seen once
+    # the batch's synchronous CPU hands the event loop back — the wait counts from there.
+    job_completion_wait = STOP_WAIT_SECONDS
     on_startup = startup
     on_shutdown = shutdown
 
 
 __all__ = [
     "MAX_TRIES",
+    "STOP_WAIT_SECONDS",
     "WorkerSettings",
     "database_unreachable",
     "process_backtest",

@@ -27,6 +27,7 @@ import contextlib
 import datetime as dt
 import json
 import os
+import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from decimal import Decimal
@@ -399,6 +400,8 @@ async def process_batch(  # noqa: PLR0913 — keyword-only; each names one thing
     ⚠️ **Each run's result is its own.** A run whose document will not compile, or that raised,
     fails alone with its reason; the others are written as they finish (`_record_done`).
     """
+    # When the job started, near enough: a cancellation at arq's ceiling is its timeout, not a stop.
+    began = time.monotonic()
     runs = [
         run
         for run in (session.get(Backtest, run_id) for run_id in run_ids)
@@ -517,9 +520,12 @@ async def process_batch(  # noqa: PLR0913 — keyword-only; each names one thing
         # middle of writing the runs. Left alone, the runs not yet written would stay `running`
         # for good, with nothing to close them; the cancellation goes on up either way.
         #
-        # Which of the two it was decides what the runs become (`_close_stopped`).
+        # Which of the two it was decides what the runs become (`_close_stopped`). A worker told
+        # to stop can still meet the timeout while it waits — a batch already stuck — and that
+        # job arq will not run again, so the clock has the last word.
         session.rollback()
-        await _close_stopped(session, redis, ids, exc, told_to_stop=stopping())
+        timed_out = time.monotonic() - began >= BATCH_TIMEOUT_SECONDS - _TIMEOUT_MARGIN_SECONDS
+        await _close_stopped(session, redis, ids, exc, told_to_stop=stopping() and not timed_out)
         raise
 
 
@@ -885,18 +891,25 @@ def _reason(exc: Exception) -> str:
 WAIT_POLL_SECONDS = 30
 
 BATCH_TIMEOUT_SECONDS = 2 * 60 * 60
-
-# How long a worker told to stop waits for the job it holds before cancelling it (16/10,
-# ADR-0036). A batch of twenty-four M5 runs over eleven years takes a few minutes on the i9 and
-# about three times that on the Xeon; fourteen minutes covers it with room. ⚠️ Docker must wait
-# longer than this before it kills the container: `stop_grace_period` of the worker service in
-# both compose files, which `tests/test_worker_stop_grace.py` holds above this number.
-STOP_WAIT_SECONDS = 14 * 60
 """How long one batch may run before arq ends it — a ceiling for a batch stuck, not an estimate.
 
 ⚠️ **Well above any batch, on purpose.** arq also keeps a job "in progress" for this long plus ten
 seconds; a batch still computing past it would be handed to a second worker and run twice. The
 batches are sized so none comes near it (`batching.batch_size`): a batch of M5 is minutes."""
+
+STOP_WAIT_SECONDS = 14 * 60
+"""How long a worker told to stop waits for the job it holds before cancelling it (16/10, ADR-0036).
+
+A batch of twenty-four M5 runs over eleven years takes a few minutes on the i9 and about three
+times that on the Xeon; fourteen minutes covers it with room. ⚠️ Docker must wait longer than this
+before it kills the container: `stop_grace_period` of the worker service in both compose files,
+which `tests/test_worker_stop_grace.py` holds above this number."""
+
+_TIMEOUT_MARGIN_SECONDS = 60
+"""How close to `BATCH_TIMEOUT_SECONDS` a cancelled batch is taken for one arq timed out.
+
+arq's clock starts a moment before `process_batch`'s; a minute of slack keeps a timeout from being
+read as a stop. A batch stopped in its last minute before the ceiling is failed — it was stuck."""
 
 OFF_GRACE = dt.timedelta(minutes=2)
 """How long a run waits for a download before an agent that is not running gives it up.

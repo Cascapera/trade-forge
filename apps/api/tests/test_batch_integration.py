@@ -14,6 +14,7 @@ import uuid
 from collections.abc import Callable
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -21,6 +22,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from tradeforge_api import worker as worker_module
 from tradeforge_api.batching import BATCH_SIZE, Batcher, batch_key
 from tradeforge_api.candle_cache import CandleCache
 from tradeforge_api.config import Settings
@@ -364,6 +366,30 @@ def test_a_batch_cancelled_by_its_timeout_fails_its_runs_with_the_reason(
         failed = [session.get(Backtest, one) for one in ids]
     assert {run.status for run in failed if run} == {BacktestStatus.FAILED}
     assert all(run is not None and "the batch was stopped" in (run.error or "") for run in failed)
+
+
+def test_a_batch_that_meets_its_timeout_while_its_worker_stops_still_fails(
+    client: Any,
+    session_factory: Callable[[], Session],
+    queue: _Queue,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Told to stop, a worker waits for its batch; a batch already stuck can reach arq's ceiling
+    in that wait, and arq never runs a timed-out job again — so its runs fail, not wait queued."""
+    ticks = iter([0.0])
+
+    def clock() -> float:
+        # The batch's start, then every later look: at the ceiling.
+        return next(ticks, float(worker_module.BATCH_TIMEOUT_SECONDS))
+
+    # Only the worker's own `time`: asyncio's loop reads `time.monotonic` too.
+    monkeypatch.setattr(worker_module, "time", SimpleNamespace(monotonic=clock))
+    _launch(client, _entry(client))
+    ids = _cancel_a_batch(session_factory, queue, tmp_path, stopping=True)
+    with session_factory() as session:
+        failed = [session.get(Backtest, one) for one in ids]
+    assert {run.status for run in failed if run} == {BacktestStatus.FAILED}
 
 
 def test_runs_of_different_markets_handed_as_one_batch_run_each_on_its_own(

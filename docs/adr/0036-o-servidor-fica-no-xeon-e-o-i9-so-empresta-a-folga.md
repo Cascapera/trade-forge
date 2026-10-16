@@ -70,7 +70,7 @@ máquina é a principal**, e o que falta para essa troca ser segura:
 | Postgres, Redis, API, web | Workers: 0 a 16, conforme o uso | Workers, quando ele liberar |
 | Terminais MT5 e um agente de coleta por corretora | Cópia dos candles (`candle-sync`, como os outros workers) | Cópia dos candles |
 | Supervisor dos sinais e notificador | Tarefas pesadas e ML, lendo o banco do Xeon pela rede | |
-| Poucos workers (4 com 32 GB; mais com 64 GB) | O navegador com a web do Xeon | |
+| 1 ou 2 workers no máximo (32 GB; decisão dele em 16/10) | O navegador com a web do Xeon | |
 | Os candles "oficiais" (`data/ohlcv`) e a base de ML | | |
 
 ## Alternativas consideradas
@@ -85,10 +85,11 @@ máquina é a principal**, e o que falta para essa troca ser segura:
 
 ## Trade-off aceito
 
-- **Menos workers no Xeon** enquanto ele tiver 32 GB: o servidor (Postgres, API, Redis, web, cerca
-  de 9 GB na VM), os terminais e os sinais no Windows (cerca de 4 GB) vêm antes. A conta é a mesma
-  de sempre: workers × 3 GB + o resto < teto do WSL (`.wslconfig`). Os workers que saem de lá voltam
-  em dobro no i9 quando ele não está usando a máquina.
+- **O Xeon quase sem workers**: 1 ou 2 no máximo (decisão dele em 16/10), porque os 32 GB ficam
+  como estão por enquanto. O servidor (Postgres, API, Redis, web, cerca de 9 GB na VM), os terminais
+  e os sinais no Windows (cerca de 4 GB) vêm antes. A conta é a mesma de sempre: workers × 3 GB + o
+  resto < teto do WSL (`.wslconfig`). Os 10 workers que saem de lá voltam com sobra no i9 quando ele
+  não está usando a máquina (16 no nível "ausente").
 - **O Xeon passa a ser o ponto único de falha.** Isso já era verdade com o i9, mas agora o servidor
   fica na máquina que ele não usa no dia a dia, com reinício automático controlado (as mesmas
   políticas do Windows Update do i9) e religamento sozinho depois de qualquer reinício.

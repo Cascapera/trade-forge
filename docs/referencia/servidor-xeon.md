@@ -68,7 +68,7 @@ Cada um sai sozinho, com testes e lição, e já vale no i9 antes da virada (nad
 - `tradeforge.ps1 workers auto`: a cada minuto escolhe um de três níveis, com os números no
   `worker.env`:
 
-  | Nível | Quando | Workers (sugestão para o i9) |
+  | Nível | Quando | Workers no i9 (aprovados por ele em 16/10) |
   |---|---|---|
   | ausente | sem teclado e mouse há ≥ 10 min | 16 |
   | folga | em uso, outros programas usando < 35% da CPU nos últimos 3 min e ≥ 12 GB livres | 6 |
@@ -91,10 +91,10 @@ Cada um sai sozinho, com testes e lição, e já vale no i9 antes da virada (nad
 
 | Item | Por quê | Como conferir |
 |---|---|---|
-| **RAM**: 64 GB, ou 32 GB com 4 workers | Servidor + terminais + sinais vêm antes dos workers | Gerenciador de Tarefas |
-| **Disco**: SSD com ≥ 300 GB livres onde fica a VM do Docker | Banco de 81 GB crescendo (era 11 GB em 04/10), mais o dump na virada | `Get-PSDrive` |
-| `.wslconfig` | 32 GB: `memory=22GB`; 64 GB: `memory=48GB` | `wsl -d docker-desktop free -g` |
-| **Logon automático** do Windows | Docker Desktop e MT5 precisam de uma sessão aberta | Reiniciar e ver o desktop aparecer sozinho |
+| **RAM**: 32 GB (16/10: fica assim por enquanto) → **1 ou 2 workers** no Xeon | Servidor + terminais + sinais vêm antes dos workers | Gerenciador de Tarefas |
+| **Disco**: mais de 700 GB livres (16/10); conferir que a VM do Docker fica nesse disco | Banco de 81 GB crescendo (era 11 GB em 04/10), mais o dump na virada | `Get-PSDrive` |
+| `.wslconfig` | 32 GB: `memory=22GB` (Postgres 3GB/10GB pelo `.env`, #470) | `wsl -d docker-desktop free -g` |
+| **Logon automático** do Windows (aprovado por ele, 16/10) | Docker Desktop e MT5 precisam de uma sessão aberta | Reiniciar e ver o desktop aparecer sozinho |
 | **Energia**: nunca suspender, nunca desligar o disco | Servidor | `powercfg /query` |
 | **Windows Update**: as políticas do i9 (16/10): sem drivers pelo WU, prazo com "não reiniciar automaticamente", AUOptions=3 | Os dois reinícios de madrugada do i9 | ETL do USO depois da próxima busca |
 | **Reserva de DHCP** no roteador (ou só usar o endereço da VPN) | A web e os workers acham o servidor sempre no mesmo lugar | `ipconfig` depois de religar |
@@ -146,8 +146,8 @@ do i9 estão como foram deixados no passo 6; o que o Xeon gravou depois disso se
 ## Riscos e o que observar
 
 - **RAM do Xeon com 32 GB.** O limite de 5 GB por worker (#467) mata um worker por vez em vez de
-  travar a VM, mas o Windows também precisa de folga para os terminais e os sinais (~4 GB). Começar
-  com 4 workers e subir olhando a memória.
+  travar a VM, mas o Windows também precisa de folga para os terminais e os sinais (~4 GB). Por isso
+  o Xeon fica com 1 ou 2 workers (decisão dele, 16/10); subir só se a memória sobrar por dias.
 - **O banco cresce rápido** (11 GB em 04/10, 81 GB em 16/10). A regra de exportar para a base de ML e
   limpar perto de 200 GB continua; o disco do Xeon decide quando.
 - **Um reinício do Xeon** passa a derrubar o servidor: por isso logon automático, `autostart` e as

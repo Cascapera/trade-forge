@@ -39,12 +39,16 @@ services:
     # waiting on it and runs failed with `Cannot allocate memory`. Sized for the 43 GB the Docker
     # VM has (`.wslconfig`): 6 GB of buffers leave room for the workers (~0.6 GB each) and the
     # API. `random_page_cost` 1.1 because the disk is an SSD. Takes effect when recreated.
+    #
+    # The two sizes come from `.env` since 16/10 (ADR-0036): the server moves to a machine with
+    # 32 GB for everything, where 6 GB of buffers would leave no room for the workers beside it.
+    # Unset, they are the i9's values above, so a machine that never sets them sees no change.
     command:
       - postgres
       - -c
-      - shared_buffers=6GB
+      - shared_buffers=${POSTGRES_SHARED_BUFFERS:-6GB}
       - -c
-      - effective_cache_size=20GB
+      - effective_cache_size=${POSTGRES_EFFECTIVE_CACHE_SIZE:-20GB}
       - -c
       - work_mem=32MB
       - -c

@@ -1,6 +1,6 @@
 # ADR-0036 — O servidor fica no Xeon e o i9 só empresta a folga
 
-- **Status**: proposto
+- **Status**: aceito (16/10, por ele)
 - **Data**: 2026-10-16
 - **Contexto do PR**: pedido dele de 16/10, depois do segundo reinício de madrugada por Windows Update
   em três dias ("o xeon é melhor para ficar ligado direto e este eu preciso muitas vezes fazer

@@ -16,14 +16,29 @@ worker still started with the `arq` command sees this one's claims, and this one
 ⚠️ **It replaces one method of arq's `Worker`** (`start_jobs`, arq 0.28) and leans on its
 bookkeeping (`sem`, `job_counter`, `tasks`, `run_job`). arq is pinned in `uv.lock`; the
 integration test runs the real worker on a real Redis and fails if an upgrade moves any of it.
+
+**It also tells its jobs when it was told to stop** (16/10, ADR-0036). A worker asked to stop
+finishes the job it holds (`WorkerSettings.job_completion_wait`); only one that could not wait has
+it cancelled, and then arq runs the job again. A batch cancelled that way has to hand its unwritten
+runs back rather than fail them (`process_batch`), and it cannot tell that cancellation from its
+own timeout's without being told: both reach it as `CancelledError`. The flag is a
+`threading.Event` in the worker's context because arq hands each job a shallow copy of it — a
+bool set after the job started would never reach the copy; the one object both share does.
 """
 
 from __future__ import annotations
+
+import threading
+from signal import Signals
+from typing import Any
 
 from arq.constants import in_progress_key_prefix
 from arq.utils import timestamp_ms
 from arq.worker import Worker
 from redis.commands.core import AsyncScript
+
+# The key of the worker's context that holds its "told to stop" `threading.Event`.
+STOPPING = "stopping"
 
 # KEYS[1] the queue · ARGV[1] now (ms) · ARGV[2] the in-progress key's lifetime (ms) ·
 # ARGV[3] the in-progress key prefix · ARGV[4…] the candidate ids, in queue order.
@@ -50,6 +65,22 @@ class OneTripWorker(Worker):
 
     # Registered on the pool at the first claim: arq makes the pool in `main`, after `__init__`.
     _claim: AsyncScript | None = None
+
+    # arq's own long list of settings, passed through untouched (`get_kwargs(WorkerSettings)`).
+    def __init__(self, *args: Any, **kwargs: Any) -> None:  # noqa: ANN401
+        super().__init__(*args, **kwargs)
+        # Before any job: each job's context is copied from this one when it starts.
+        self.ctx[STOPPING] = threading.Event()
+
+    def handle_sig_wait_for_completion(self, signum: Signals) -> None:
+        """Told to stop with time to finish: say so to the jobs, then arq's own handling."""
+        self.ctx[STOPPING].set()
+        super().handle_sig_wait_for_completion(signum)
+
+    def handle_sig(self, signum: Signals) -> None:
+        """Told to stop at once: say so to the jobs, then arq's own handling."""
+        self.ctx[STOPPING].set()
+        super().handle_sig(signum)
 
     async def claim(self, job_ids: list[str]) -> tuple[str, int] | None:
         """Take the first job of `job_ids` nobody holds and whose time has come, or None."""
@@ -93,4 +124,4 @@ class OneTripWorker(Worker):
             self.tasks[job_id] = task
 
 
-__all__ = ["CLAIM_SCRIPT", "OneTripWorker"]
+__all__ = ["CLAIM_SCRIPT", "STOPPING", "OneTripWorker"]

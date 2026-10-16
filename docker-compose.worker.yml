@@ -53,6 +53,9 @@ services:
           cpus: '1'
           memory: ${TRADEFORGE_WORKER_MEMORY:-5g}
     memswap_limit: ${TRADEFORGE_WORKER_MEMORY:-5g}
+    # Long enough for the batch it holds (16/10, ADR-0036): told to stop, a worker finishes its
+    # job first (`STOP_WAIT_SECONDS`). As on the main machine; see there.
+    stop_grace_period: 15m
     # Writable since 09/10: a worker saves the series it fetched, for every run after it.
     volumes:
       - ${TRADEFORGE_CANDLES:-./data/ohlcv}:/data/ohlcv

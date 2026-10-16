@@ -179,8 +179,9 @@ services:
     # is synchronous CPU: one worker runs one at a time on one core, so the count is the speed and
     # the cap is what leaves the rest of the machine to whoever is using it. On his i9-14900K
     # (32 threads) 12 workers hold a sweep near 40% of the CPU.
-    # ⚠️ Changing either value recreates the workers, and a recreated worker drops the run it was
-    # in the middle of: change it with the queue empty.
+    # ⚠️ Changing either value recreates the workers. Since 16/10 a recreated worker first
+    # finishes the batch it holds (`stop_grace_period` below), so nothing is lost, but the change
+    # can take as long as the longest batch in flight.
     #
     # ⚠️ **A memory ceiling per worker, swap included** (15/10). Six workers on a sweep of eleven
     # years of M5 grew to ~3 GB each; with Postgres' 6 GB of buffers that was the whole 24 GB VM,
@@ -200,6 +201,11 @@ services:
           cpus: '1'
           memory: ${TRADEFORGE_WORKER_MEMORY:-5g}
     memswap_limit: ${TRADEFORGE_WORKER_MEMORY:-5g}
+    # ⚠️ **Long enough for the batch it holds** (16/10, ADR-0036). Told to stop, a worker
+    # finishes its job before it exits (`STOP_WAIT_SECONDS`, 14 min); Docker's default ten
+    # seconds would kill it in the middle. This has to stay above that number
+    # (`tests/test_worker_stop_grace.py`). `docker compose stop -t N` still overrides it.
+    stop_grace_period: 15m
     volumes:
       - ./data:/data:ro
     depends_on:

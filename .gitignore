@@ -5,6 +5,11 @@
 # The remote workers' settings (docker-compose.worker.yml): the database password.
 worker.env
 
+# --- Local Compose overrides ---
+# Compose reads this automatically on top of docker-compose.yml. Each host picks a shape of the
+# stack (Xeon=0 workers, i9/others=N workers, etc.) without touching the shared file.
+docker-compose.override.yml
+
 # --- Python ---
 __pycache__/
 *.py[cod]
@@ -40,6 +45,9 @@ data/
 
 # --- Teaching notes: generated for the author, not part of the public repo ---
 docs/aulas/
+
+# --- Local runbooks for the author's own machines (migration plans, pause/resume notes) ---
+docs/localdocs/
 
 # --- The author's own copyrighted books (SMC method source material) — never publish ---
 docs/livros/

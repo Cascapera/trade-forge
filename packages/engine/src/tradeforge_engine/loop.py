@@ -273,7 +273,7 @@ def run(  # noqa: PLR0913 — keyword-only; each one names a real axis of a back
     record-keeping switch and **nothing else**: the window is only ever copied into the order,
     never read by a decision, so trades, fills and equity come out identical either way
     (`test_snapshots_off_change_nothing_but_the_snapshots`). It is not built and dropped later
-    because the copy is the cost — up to 51 bars per entry, over millions of runs.
+    because the copy is the cost — up to 151 bars per entry, over millions of runs.
     """
     recorder = RunRecorder(book_from=getattr(broker, "book_from", None))
     for outcome in iter_run(

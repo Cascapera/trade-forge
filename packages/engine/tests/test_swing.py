@@ -238,7 +238,8 @@ def test_the_average_trail_spans_exactly_the_snapshot_window() -> None:
     difference nobody notices and no golden covers. It is the buffer's own claim, so it is
     asserted against the buffer.
 
-    `SNAPSHOT_BARS_BEFORE + 1` on both sides: fifty bars before the decision, plus the decision.
+    `SNAPSHOT_BARS_BEFORE + 1` on both sides: a hundred and fifty bars before the decision,
+    plus the decision.
     """
     trail = _AverageTrail()
     fed = [bar(i, open_="100", close="100", high="101", low="99") for i in range(200)]

@@ -446,9 +446,10 @@ def test_the_arming_window_ends_on_the_decision_bar() -> None:
         (0, 1),  # the first bar of the run: the decision bar is the whole window
         (5, 6),
         (49, 50),
-        (50, SNAPSHOT_BARS_BEFORE + 1),  # exactly full
-        (51, SNAPSHOT_BARS_BEFORE + 1),  # saturated
-        (120, SNAPSHOT_BARS_BEFORE + 1),  # still saturated, far into the run
+        (149, 150),  # one short of saturating
+        (SNAPSHOT_BARS_BEFORE, SNAPSHOT_BARS_BEFORE + 1),  # exactly full
+        (SNAPSHOT_BARS_BEFORE + 1, SNAPSHOT_BARS_BEFORE + 1),  # saturated
+        (SNAPSHOT_BARS_BEFORE + 70, SNAPSHOT_BARS_BEFORE + 1),  # still saturated, far into the run
     ],
 )
 def test_the_arming_window_grows_to_the_cap_and_stops(
@@ -583,7 +584,7 @@ def test_re_arming_every_bar_does_not_pin_the_whole_stream() -> None:
 
     `maxlen` bounds **one** window; it does not bound how many windows are alive. A flat
     strategy re-arms on most bars, so an order kept for inspection with its snapshot attached
-    pins ~50 candles per bar — which pins the entire stream, and hands back exactly the cost
+    pins ~150 candles per bar — which pins the entire stream, and hands back exactly the cost
     `run()` takes an `Iterable` to avoid. Nothing computes a wrong number when this regresses;
     a long backtest simply dies of `MemoryError` at a length that used to pass.
 

@@ -81,8 +81,8 @@ def _for_the_record(order: OrderRequest) -> OrderRequest:
     `submitted` is the only list here that grows with the **length of the run** — every other
     retainer is bounded by open orders or by trades. A strategy that is flat re-arms on most
     bars (`swing.py` replaces its resting order as the reference moves), so an entry snapshot
-    left attached would pin roughly fifty candles per bar, which pins the whole stream: the
-    exact cost `run()` takes an `Iterable` to avoid, given back through a side door.
+    left attached would pin a hundred and fifty candles per bar, which pins the whole stream:
+    the exact cost `run()` takes an `Iterable` to avoid, given back through a side door.
 
     Measured before the strip, on a 3 000-bar run that re-armed every bar: 151 725 candle
     references held, keeping 100% of the stream alive. Nothing computed a wrong number — the

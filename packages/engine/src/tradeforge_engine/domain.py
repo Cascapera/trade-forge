@@ -243,12 +243,17 @@ class Candle:
 
 
 # How many bars before the decision an entry's snapshot carries (`EntrySnapshot`) — enough to
-# read the swing the setup claims to be trading, and no more.
+# read the swing the setup claims to be trading **and** the context before it. Was fifty until
+# 19/10/2026, when live signals of the average and ponto-contínuo setups started posting pictures
+# that showed only the breakout bar and three or four behind it: the setup is tight by design, so
+# fifty bars with its drawing in the last ten left most of the chart empty of story. One hundred
+# fifty gives the eye something to measure the breakout against, and still fits the live buffer
+# the splice already keeps (`RECENT_KEPT = 150`).
 #
 # It lives here, with the type it describes, rather than with the loop that fills the window:
 # the strategies size their own indicator buffers against it, and a strategy reaching into the
 # event loop for a constant would be the tail wagging the dog.
-SNAPSHOT_BARS_BEFORE = 50
+SNAPSHOT_BARS_BEFORE = 150
 
 
 @dataclass(frozen=True, slots=True)
@@ -523,9 +528,9 @@ class EntrySnapshot:
 
     Also the strategy's, and for a stronger reason than the regions: an indicator cannot be
     recovered from the bars here. A moving average carries the whole run's history in it, so a
-    reader recomputing one from a fifty-bar window would get a different number from a different
-    seed — a curve that looks right and does not pass through the value the entry was judged
-    against. See `SnapshotSeries`."""
+    reader recomputing one from a hundred-and-fifty-bar window would get a different number from
+    a different seed — a curve that looks right and does not pass through the value the entry
+    was judged against. See `SnapshotSeries`."""
 
     def __post_init__(self) -> None:
         # An empty window is not a snapshot, it is a wiring bug that would reach the screen

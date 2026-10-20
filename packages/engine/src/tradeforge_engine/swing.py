@@ -159,9 +159,9 @@ class _AverageTrail:
     it, at what angle, how far it had run away first.
 
     **The strategy has to be the one keeping it.** An average carries the whole run's history:
-    an EMA seeded thousands of bars ago is not the EMA of the last fifty, so a reader
-    recomputing one from the snapshot's window would draw a curve that never passes through the
-    value the entry was actually judged against. Plausible, and wrong.
+    an EMA seeded thousands of bars ago is not the EMA of the last hundred and fifty, so a
+    reader recomputing one from the snapshot's window would draw a curve that never passes
+    through the value the entry was actually judged against. Plausible, and wrong.
 
     Bounded to the same span as the snapshot window (`SNAPSHOT_BARS_BEFORE`) — the same argument
     as the loop's buffer, and the reason the constant lives in `domain` rather than in the loop:
